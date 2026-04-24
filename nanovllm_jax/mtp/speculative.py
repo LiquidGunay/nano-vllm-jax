@@ -51,13 +51,12 @@ def generate_draft_tokens(
     """
     batch, seq_len, _ = hidden_state.shape
     
-    # Get embedding of confirmed tokens
-    confirmed_embed = embed_tokens[confirmed_token_ids]  # [batch, seq_len, hidden_size]
-    
     # MTP forward pass to get draft logits
-    draft_logits = mtp_params.mtp_forward(
+    # Note: mtp_forward returns (logits, hidden_state) tuple
+    draft_logits, _ = mtp_forward(
         hidden_state=hidden_state,
-        next_token_embed=confirmed_embed,
+        next_token_ids=confirmed_token_ids,
+        embed_tokens=embed_tokens,
         params=mtp_params,
         config=config,
         positions=positions,

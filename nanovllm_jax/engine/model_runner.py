@@ -805,7 +805,8 @@ class ModelRunner:
         # MTP forward pass
         # Predicts token at position t+1
         # Signature: mtp_forward(hidden_state, next_token_ids, embed_tokens, params, config, positions)
-        draft_logits = mtp_forward(
+        # Returns (logits, hidden_state) tuple
+        draft_logits, _ = mtp_forward(
             hidden_state=hidden_state,
             next_token_ids=jnp.array([[confirmed_token_id]]),
             embed_tokens=self.params.embed_tokens,
