@@ -54,7 +54,7 @@ def load_models_with_mtp(model_name="Qwen/Qwen3.5-0.8B"):
     # Load JAX model with MTP
     print("  Loading JAX model with MTP...")
     config = Qwen3_5Config.qwen3_5_0_8b()
-    params = load_weights_from_hf(None, model_name, config, load_mtp=True)
+    params = load_weights_from_hf(model_name, config, load_mtp=True)
     
     # Check if MTP params are loaded
     if hasattr(params, 'mtp_params') and params.mtp_params is not None:

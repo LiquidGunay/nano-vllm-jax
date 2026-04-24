@@ -52,8 +52,8 @@ class Qwen3_5Config:
     attention_bias: bool = False
     tie_word_embeddings: bool = True
     
-    # Computation dtype (bfloat16 for CPU/CUDA, float16 for Metal)
-    dtype: str = "bfloat16"  # Options: "bfloat16", "float16", "float32"
+    # Computation dtype (bfloat16 for CPU/CUDA, float32 for Metal)
+    dtype: str = "float32"  # Options: "bfloat16", "float16", "float32"
     
     # MTP config
     mtp_num_hidden_layers: int = 1

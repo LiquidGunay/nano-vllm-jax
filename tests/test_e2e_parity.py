@@ -50,7 +50,7 @@ def load_models(model_name="Qwen/Qwen3.5-0.8B"):
     # Load JAX model with HF weights
     print("  Loading JAX model...")
     config = Qwen3_5Config.qwen3_5_0_8b()
-    params = load_weights_from_hf(None, model_name, config)
+    params = load_weights_from_hf(model_name, config)
     
     print("  ✓ Models loaded")
     return hf_model, tokenizer, config, params

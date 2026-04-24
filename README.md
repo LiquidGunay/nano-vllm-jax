@@ -2,16 +2,37 @@
 
 A pedagogical nano-vllm style implementation of **Qwen3.5** in JAX with paged attention, speculative decoding, and complete JIT compilation.
 
+## Status: Working Prototype
+
+This is a **pedagogical implementation** with **partial parity validation**.
+
+### What Works ✓
+- Model loads weights from HuggingFace
+- Basic forward pass produces logits
+- KV cache shapes are correct
+- Formal verification test passes for short sequences (<128 tokens)
+
+### Under Active Development ⚠
+- Full KV cache parity for sequences > 128 tokens
+- Real paged attention with non-identity block tables
+- MTP speculative decoding (experimental)
+- Complete HuggingFace output parity
+
+### Known Issues ⚠
+See [BUG_FIXES.md](BUG_FIXES.md) for detailed issue tracking.
+
+**Not production-ready.** Use for learning and experimentation only.
+
 ## Overview
 
 This project implements Qwen3.5-0.8B model in pure JAX with:
 
 - **Hybrid Attention Architecture**: 18 linear attention + 6 full attention layers
-- **Paged Attention**: Block-based KV cache for efficient memory usage
+- **Paged Attention**: Block-based KV cache (identity block tables only, under development)
 - **Linear Attention States**: Recurrent state management for Gated DeltaNet layers
-- **MTP Speculative Decoding**: Multi-Token Prediction for faster inference
+- **MTP Speculative Decoding**: Experimental, partially integrated
 - **Server-Style Compilation**: JIT compile once at startup, serve many requests
-- **HF Parity**: Exact match with HuggingFace outputs
+- **HF Parity**: Partial match, under active validation
 
 ## Project Structure
 
@@ -165,21 +186,27 @@ python tests/test_mtp.py
 - **E2E Parity**: Top 5 logits match exactly, total MSE < 1e-4
 - **MTP**: Speedup > 1.05x
 
-## MTP Speculative Decoding
+## MTP Speculative Decoding (Experimental)
+
+⚠️ **Status**: MTP integration is experimental and has known API mismatches.
 
 The Multi-Token Prediction (MTP) head generates draft tokens for speculative decoding:
 
 - **Mechanism**: Predicts token T+2 (not T+1) using hidden state at T + embedding of T+1
-- **Speedup**: 1.10x over baseline decode (10% improvement)
-- **Match rate**: ~12% (acceptance rate)
-- **Forward passes reduced**: 13% (26 vs 30)
+- **Speedup**: Preliminary results show 1.10x over baseline (requires verification)
+- **Match rate**: ~12% (requires verification)
 - **Architecture**: 1 transformer layer + LM head
 
-Combined with JAX optimizations, total speedup is **1.45x vs HuggingFace**.
+### Known Issues
+- Return value unpacking inconsistent between modules
+- Call signature mismatches
+- Tests verify structure, not correctness
+
+**Do not use in production** until MTP integration is complete.
 
 ## Performance
 
-### JAX + MTP vs HuggingFace (Final Results)
+### JAX + MTP vs HuggingFace (Preliminary Results)
 
 **CPU Performance (5 prompt tokens, 10 decode tokens):**
 
@@ -190,6 +217,12 @@ Combined with JAX optimizations, total speedup is **1.45x vs HuggingFace**.
 | JAX + MTP | ~0.71 | 1.45x |
 
 **Combined speedup: 45% faster than HuggingFace**
+
+⚠️ **Methodology Limitations**:
+- Tested only on short sequences (5-10 prompt tokens)
+- Uses identity block tables (not real paged attention)
+- CPU-only testing
+- **Do not extrapolate** to production workloads
 
 ### Speedup Breakdown
 
@@ -203,13 +236,13 @@ Combined with JAX optimizations, total speedup is **1.45x vs HuggingFace**.
   - Reduces forward passes by 13%
   - Lightweight (1 layer vs 24 layers)
 
-### Verified
-- ✅ Exact match with HF outputs (100% parity)
-- ✅ JAX is 31% faster than HuggingFace
-- ✅ MTP adds 10% speedup on top of JAX
-- ✅ Combined: 45% faster than HuggingFace
+### Verified (Preliminary)
+- ⚠️ Partial match with HF outputs (for short sequences only)
+- ✅ JAX is 31% faster than HuggingFace (tested configurations)
+- ⚠️ MTP adds 10% speedup (requires verification)
+- ⚠️ Combined: 45% faster than HuggingFace (tested configurations)
 - ✅ Server-style compilation works
-- ✅ API server ready for deployment
+- ⚠️ API server functional but experimental
 
 ### Expected Performance
 - **CPU**: ~0.6-0.7 tokens/second

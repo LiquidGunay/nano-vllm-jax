@@ -21,10 +21,10 @@ Build a pedagogical nano-vllm style implementation of Qwen3.5 in JAX with:
 ### Must Have
 - [x] Clean package structure (`nanovllm_jax/`)
 - [x] Exactly 4 test files
-- [ ] Layer-wise parity: MSE < 1e-5 per layer
-- [ ] End-to-end parity: top 5 logits exact match, total MSE < 1e-4
-- [ ] KV cache tests: paged attention works, linear attention states correct
-- [ ] MTP tests: acceptance > 20%, speedup > 1.2x
+- [ ] Layer-wise parity: MSE < 1e-5 per layer (IN PROGRESS)
+- [ ] End-to-end parity: top 5 logits exact match, total MSE < 1e-4 (IN PROGRESS)
+- [ ] KV cache tests: paged attention works (PARTIAL - identity blocks only)
+- [ ] MTP tests: acceptance > 20%, speedup > 1.2x (STRUCTURAL ONLY - needs verification)
 - [x] All imports updated to `nanovllm_jax`
 - [x] Documentation: PLAN.md, INDEX.md, two status MD files
 
@@ -123,6 +123,28 @@ The 24-layer model requires significant JIT compilation time on CPU.
 1. Use GPU/TPU for development
 2. Create smaller test configs (4 layers)
 3. Use JAX persistent cache
+
+### Critical Issues (Blocking Production Use)
+
+#### 1. Weight Loading API Mismatches
+- Multiple loaders with incompatible signatures
+- Silent fallback to random weights in LLMEngine (FIXED - now fails loudly)
+- **Status**: ✅ FIXED
+
+#### 2. Paged Attention Not Fully Wired
+- `slot_mapping = positions` (identity mapping) - FIXED
+- Real vLLM-style paging now implemented via `compute_slot_mapping()`
+- **Status**: ✅ FIXED
+
+#### 3. Decode Attention WINDOW_SIZE Bug
+- Only attended to positions 0-127
+- Fixed: Now attends to ALL positions (no windowing)
+- **Status**: ✅ FIXED
+
+#### 4. MTP Integration Incomplete
+- API mismatches between modules
+- Tests don't verify correctness
+- **Status**: ⚠️ EXPERIMENTAL - needs fixing
 
 ---
 

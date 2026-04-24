@@ -9,9 +9,8 @@ from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.engine.sequence import Sequence, SamplingParams
 from nanovllm_jax.engine.scheduler import Scheduler
 from nanovllm_jax.engine.model_runner import ModelRunner
-from nanovllm_jax.model import init_params, ModelParams
+from nanovllm_jax.model import ModelParams
 from nanovllm_jax.load_weights import load_weights_from_hf
-import jax.random
 
 try:
     from transformers import AutoTokenizer
@@ -64,16 +63,10 @@ class LLMEngine:
         if self.config.eos is None:
             self.config.eos = self.tokenizer.eos_token_id
         
-        # Initialize model parameters - try to load from HF
-        try:
-            print(f"Loading pretrained weights from {model_path}...")
-            self.params = load_weights_from_hf(model_path, self.config)
-            print("✓ Using pretrained weights")
-        except Exception as e:
-            print(f"Warning: Could not load pretrained weights ({e})")
-            print("  Falling back to random initialization")
-            key = jax.random.PRNGKey(42)
-            self.params = init_params(key, self.config)
+        # Initialize model parameters - load from HF (no silent fallback)
+        print(f"Loading pretrained weights from {model_path}...")
+        self.params = load_weights_from_hf(model_path, self.config)
+        print("✓ Using pretrained weights")
         
         # Initialize components
         self.scheduler = Scheduler(self.config)

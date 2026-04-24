@@ -250,7 +250,7 @@ def test_kv_cache_block_allocation():
         head_dim=config.head_dim,
         max_seqs=2,
         max_blocks_per_seq=32,
-        dtype=jnp.bfloat16,
+        dtype=jnp.float32,  # Use float32 for Metal compatibility
     )
     
     print(f"  Num blocks: {num_blocks}")
@@ -276,8 +276,8 @@ def test_kv_cache_block_allocation():
     print(f"  Expected: block {expected_block}, slot {expected_slot}")
     print(f"  Slot mapping: {slot_mapping}")
     
-    # Verify shapes
-    expected_shape = (num_blocks, block_size, config.num_key_value_heads, config.head_dim)
+    # Verify shapes (note: KV cache has num_layers dimension)
+    expected_shape = (24, num_blocks, block_size, config.num_key_value_heads, config.head_dim)
     if kv_cache.k_cache.shape == expected_shape:
         print("  ✓ PASS: KV cache shapes correct")
         return True
@@ -305,10 +305,10 @@ def test_multi_layer_linear_attention_states():
         head_dim=config.head_dim,
         max_seqs=1,
         max_blocks_per_seq=64,
-        dtype=jnp.bfloat16,
+        dtype=jnp.float32,  # Use float32 for Metal compatibility
     )
     
-    kv_cache = init_linear_attention_states(kv_cache, config, batch_size)
+    kv_cache = init_linear_attention_states(kv_cache, config, batch_size, dtype=jnp.float32)
     
     print(f"  Total layers: {config.num_hidden_layers}")
     print(f"  Linear attention layers: {num_linear_layers}")
@@ -335,6 +335,134 @@ def test_multi_layer_linear_attention_states():
         return True
 
 
+def test_paged_attention_non_identity_blocks():
+    """Test that paged attention works with non-identity block tables."""
+    print("\n=== Testing Paged Attention with Non-Identity Blocks ===")
+    
+    config = Qwen3_5Config.qwen3_5_0_8b()
+    
+    # Create non-identity block table
+    # Sequence A: uses blocks [5, 2, 8, 1, 3]
+    # Sequence B: uses blocks [7, 4, 6, 0, 9]
+    block_table = jnp.array([
+        [5, 2, 8, 1, 3],  # Seq 0
+        [7, 4, 6, 0, 9],  # Seq 1
+    ], dtype=jnp.int32)
+    
+    block_size = 16
+    num_blocks = 10
+    
+    # Initialize KV cache
+    kv_cache = init_kv_cache(
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        max_seqs=2,
+        max_blocks_per_seq=5,
+        num_layers=config.num_hidden_layers,
+        dtype=jnp.float32,
+    )
+    
+    # Test position 25 for both sequences (should map to different physical blocks)
+    positions = jnp.array([[25], [25]], dtype=jnp.int32)
+    
+    slot_mapping = compute_slot_mapping(
+        positions=positions,
+        block_table=block_table,
+        block_size=block_size,
+    )
+    
+    # Seq 0: position 25 -> logical block 1 -> physical block 2 -> slot 9
+    # Physical index = 2 * 16 + 9 = 41
+    expected_slot_seq0 = block_table[0, 1] * block_size + (25 % block_size)
+    
+    # Seq 1: position 25 -> logical block 1 -> physical block 4 -> slot 9
+    # Physical index = 4 * 16 + 9 = 73
+    expected_slot_seq1 = block_table[1, 1] * block_size + (25 % block_size)
+    
+    print(f"  Block table seq 0: {block_table[0]}")
+    print(f"  Block table seq 1: {block_table[1]}")
+    print(f"  Position: 25")
+    print(f"  Expected slot seq 0: {expected_slot_seq0} (block {block_table[0, 1]}, slot {25 % block_size})")
+    print(f"  Expected slot seq 1: {expected_slot_seq1} (block {block_table[1, 1]}, slot {25 % block_size})")
+    print(f"  Actual slot seq 0: {slot_mapping[0, 0]}")
+    print(f"  Actual slot seq 1: {slot_mapping[1, 0]}")
+    
+    if slot_mapping[0, 0] == expected_slot_seq0 and slot_mapping[1, 0] == expected_slot_seq1:
+        print("  ✓ PASS: Non-identity block tables work correctly")
+        return True
+    else:
+        print("  ✗ FAIL: Slot mapping incorrect")
+        return False
+
+
+def test_decode_attention_long_sequences():
+    """Test decode attention with sequences > 128 tokens."""
+    print("\n=== Testing Decode Attention with Long Sequences ===")
+    
+    config = Qwen3_5Config.qwen3_5_0_8b()
+    
+    # Create sequence with 200 tokens
+    seq_len = 200
+    batch_size = 1
+    
+    # Initialize KV cache with enough blocks
+    block_size = 16
+    num_blocks = 20  # 20 blocks * 16 tokens = 320 tokens capacity
+    
+    kv_cache = init_kv_cache(
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        max_seqs=1,
+        max_blocks_per_seq=20,
+        num_layers=config.num_hidden_layers,
+        dtype=jnp.float32,
+    )
+    
+    # Simulate decode at position 199 (200th token)
+    query = jnp.ones((batch_size, 1, config.num_attention_heads, config.head_dim), dtype=jnp.float32)
+    kv_lens = jnp.array([200])  # 200 tokens in cache
+    block_table = jnp.array([list(range(20))])  # Uses blocks 0-12 (200 tokens)
+    
+    # Run decode attention
+    try:
+        output = paged_attention_decode(
+            query=query,
+            k_cache=kv_cache.k_cache,
+            v_cache=kv_cache.v_cache,
+            block_table=block_table,
+            kv_lens=kv_lens,
+            block_size=block_size,
+            scale=1.0 / jnp.sqrt(config.head_dim),
+            num_key_value_groups=config.num_attention_heads // config.num_key_value_heads,
+            max_kv_len=200,
+        )
+        
+        print(f"  Sequence length: {seq_len}")
+        print(f"  Output shape: {output.shape}")
+        
+        # Verify output is valid (no NaN/Inf)
+        has_nan = jnp.any(jnp.isnan(output))
+        has_inf = jnp.any(jnp.isinf(output))
+        
+        if has_nan:
+            print("  ✗ FAIL: Output contains NaN")
+            return False
+        elif has_inf:
+            print("  ✗ FAIL: Output contains Inf")
+            return False
+        else:
+            print("  ✓ PASS: Long sequence decode produces valid output")
+            return True
+            
+    except Exception as e:
+        print(f"  ✗ FAIL: Exception during long sequence decode: {e}")
+        return False
+
+
 def run_all_tests():
     """Run all KV cache tests."""
     print("=" * 80)
@@ -347,6 +475,8 @@ def run_all_tests():
         "Linear Attention State Persistence": test_linear_attention_state_persistence(),
         "KV Cache Block Allocation": test_kv_cache_block_allocation(),
         "Multi-Layer Linear Attention States": test_multi_layer_linear_attention_states(),
+        "Paged Attention Non-Identity Blocks": test_paged_attention_non_identity_blocks(),
+        "Decode Attention Long Sequences": test_decode_attention_long_sequences(),
     }
     
     print("\n" + "=" * 80)

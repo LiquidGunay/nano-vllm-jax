@@ -62,8 +62,19 @@ def convert_hf_to_jax_float16(hf_weights: Dict[str, torch.Tensor], config: Dict[
 
 
 def load_weights_from_hf_float16(model_name: str = "Qwen/Qwen3.5-0.8B", verbose: bool = True):
-    """Load weights from HuggingFace cache with float16."""
-    config, snapshot_dir = load_config(model_name)
+    """Load weights from HuggingFace cache with float16.
+    
+    This is a compatibility wrapper that returns raw weight dict and config.
+    For ModelParams, use load_weights_from_hf() instead.
+    
+    Args:
+        model_name: HuggingFace model identifier
+        verbose: Print loading progress
+        
+    Returns:
+        Tuple of (jax_weights_dict, config_dict)
+    """
+    config_dict, snapshot_dir = load_config(model_name)
     
     if verbose:
         print(f"Loading {model_name} with float16...")
@@ -86,9 +97,9 @@ def load_weights_from_hf_float16(model_name: str = "Qwen/Qwen3.5-0.8B", verbose:
         print(f"Loaded {len(hf_weights)} tensors")
     
     # Convert to JAX format
-    jax_params = convert_hf_to_jax_float16(hf_weights, config, verbose=verbose)
+    jax_params = convert_hf_to_jax_float16(hf_weights, config_dict, verbose=verbose)
     
-    return jax_params, config
+    return jax_params, config_dict
 
 
 if __name__ == "__main__":

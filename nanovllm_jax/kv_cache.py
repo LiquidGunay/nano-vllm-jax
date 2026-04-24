@@ -43,7 +43,7 @@ def _kv_cache_state_flatten(state: KVCacheState):
         state.block_table,
         state.kv_lens,
         state.slot_mapping,
-        state.conv_state if state.conv_state is not None else jnp.zeros((1,), dtype=jnp.bfloat16),
+        state.conv_state if state.conv_state is not None else jnp.zeros((1,), dtype=jnp.float32),
         state.recurrent_state if state.recurrent_state is not None else jnp.zeros((1,), dtype=jnp.float32),
     )
     aux_data = (
@@ -85,7 +85,7 @@ def init_kv_cache(
     max_seqs: int,
     max_blocks_per_seq: int,
     num_layers: int = 24,
-    dtype=jnp.bfloat16,
+    dtype=jnp.float32,
 ) -> KVCacheState:
     """Initialize empty KV cache.
     
@@ -129,13 +129,13 @@ def init_linear_attention_states(
         cache: Existing KVCacheState
         config: Model config with linear attention parameters
         batch_size: Batch size
-        dtype: Data type for conv_state (defaults to config.get_dtype() or bfloat16)
+        dtype: Data type for conv_state (defaults to config.get_dtype() or float32)
         
     Returns:
         Updated KVCacheState with initialized linear states
     """
     if dtype is None:
-        dtype = getattr(config, 'get_dtype', lambda: jnp.bfloat16)()
+        dtype = getattr(config, 'get_dtype', lambda: jnp.float32)()
     
     # Compute conv_dim = key_dim * 2 + value_dim
     key_dim = config.linear_num_key_heads * config.linear_key_head_dim
@@ -384,70 +384,76 @@ def paged_attention_decode(
     if max_kv_len is None:
         max_kv_len = num_blocks * block_size_cache
     
-    # For faster compilation, use a fixed window size
-    # This is a trade-off: smaller window = faster compilation but may miss some context
-    # For typical decode scenarios, 128-256 tokens is usually sufficient
-    WINDOW_SIZE = 128
+    # Attend to ALL positions 0 to kv_lens[b] for each batch element
+    # This is the correct implementation - no windowing
     
     # Flatten cache: [num_blocks * block_size, num_kv_heads, head_dim]
     k_flat = k_cache_layer.reshape(-1, num_kv_heads, head_dim)
     v_flat = v_cache_layer.reshape(-1, num_kv_heads, head_dim)
     
-    # Create window of positions to attend to
-    # For each sequence, we attend to the last WINDOW_SIZE tokens (or all if shorter)
-    # Start position: max(0, kv_lens - WINDOW_SIZE)
-    # But for JIT, we use fixed-size window
+    # For each batch, attend to positions 0..kv_lens[b]-1
+    # Use max_kv_len as the static shape dimension
+    max_seq_len = jnp.max(kv_lens)  # Maximum sequence length in batch
     
-    # Positions to attend to [WINDOW_SIZE]
-    window_positions = jnp.arange(WINDOW_SIZE)
+    # Positions: [batch, max_seq_len] - all positions 0 to max_seq_len-1
+    positions_2d = jnp.arange(max_kv_len)[None, :]  # [1, max_kv_len]
+    positions_2d = jnp.broadcast_to(positions_2d, (batch, max_kv_len))
     
-    # For each batch, compute the actual positions (relative to kv_lens)
-    # This creates [batch, WINDOW_SIZE] of absolute positions
-    # For seq with kv_len=10, we want positions 0-9 (padded with 0)
-    # For seq with kv_len=100, we want positions 0-127 (most recent)
-    
-    # Simple approach: attend to positions 0 to WINDOW_SIZE-1
-    # Mask out positions >= kv_lens
-    
-    # Compute block and slot indices for each position
-    block_indices = window_positions // block_size  # [WINDOW_SIZE]
-    slot_indices = window_positions % block_size  # [WINDOW_SIZE]
+    # Compute block and slot indices
+    block_indices = positions_2d // block_size  # [batch, max_kv_len]
+    slot_indices = positions_2d % block_size  # [batch, max_kv_len]
     
     # Gather physical block IDs for each sequence
     # block_table: [batch, max_blocks_per_seq]
-    # block_indices: [WINDOW_SIZE]
-    physical_blocks = block_table[:, block_indices]  # [batch, WINDOW_SIZE]
+    # For each position, we need block_table[batch_idx, block_idx]
+    # Work around Metal bug: use gather instead of take_along_axis
+    batch_indices = jnp.arange(batch)[:, None]  # [batch, 1]
+    batch_indices = jnp.broadcast_to(batch_indices, (batch, max_kv_len))  # [batch, max_kv_len]
     
-    # Compute slot mapping: [batch, WINDOW_SIZE]
+    # Manual gather: block_table[batch_indices, block_indices]
+    # Reshape to 2D for indexing, then reshape back
+    block_table_flat = block_table.reshape(-1)  # [batch * max_blocks_per_seq]
+    flat_indices = batch_indices * block_table.shape[1] + block_indices  # [batch, max_kv_len]
+    physical_blocks = block_table_flat[flat_indices]  # [batch, max_kv_len]
+    
+    # Compute slot mapping: [batch, max_kv_len]
     slot_mapping = physical_blocks * block_size + slot_indices
     
-    # Gather K and V for all positions in window
-    # k_flat[slot_mapping] -> [batch, WINDOW_SIZE, num_kv_heads, head_dim]
-    k_gathered = k_flat[slot_mapping]
-    v_gathered = v_flat[slot_mapping]
+    # Gather K and V for all positions
+    # Need to flatten slot_mapping for indexing, then reshape back
+    # slot_mapping_flat: [batch * max_kv_len]
+    slot_mapping_flat = slot_mapping.reshape(-1)
     
-    # Create validity mask: position is valid if < kv_lens
-    # [batch, WINDOW_SIZE]
-    valid_mask = window_positions[None, :] < kv_lens[:, None]
+    # k_flat[slot_mapping_flat] -> [batch * max_kv_len, num_kv_heads, head_dim]
+    k_gathered_flat = k_flat[slot_mapping_flat]
+    v_gathered_flat = v_flat[slot_mapping_flat]
+    
+    # Reshape back to [batch, max_kv_len, num_kv_heads, head_dim]
+    k_gathered = k_gathered_flat.reshape(batch, max_kv_len, num_kv_heads, head_dim)
+    v_gathered = v_gathered_flat.reshape(batch, max_kv_len, num_kv_heads, head_dim)
+    
+    # Create validity mask: position < kv_lens
+    # [batch, max_kv_len]
+    valid_mask = positions_2d < kv_lens[:, None]
     
     # Expand KV for GQA if needed
     if num_key_value_groups > 1:
         k_gathered = jnp.repeat(k_gathered, num_key_value_groups, axis=2)
         v_gathered = jnp.repeat(v_gathered, num_key_value_groups, axis=2)
     
-    # k_gathered, v_gathered: [batch, WINDOW_SIZE, num_heads, head_dim]
-    # Transpose to [batch, num_heads, WINDOW_SIZE, head_dim]
+    # k_gathered, v_gathered: [batch, max_kv_len, num_heads, head_dim]
+    # Transpose to [batch, num_heads, max_kv_len, head_dim]
     k_for_attn = k_gathered.transpose(0, 2, 1, 3)
     v_for_attn = v_gathered.transpose(0, 2, 1, 3)
     
     # query: [batch, 1, num_heads, head_dim] -> [batch, num_heads, 1, head_dim]
     query_t = query.transpose(0, 2, 1, 3)
     
-    # Compute attention scores: [batch, num_heads, 1, WINDOW_SIZE]
+    # Compute attention scores: [batch, num_heads, 1, max_kv_len]
     attn_scores = jnp.einsum("bh1d,bhkd->bh1k", query_t, k_for_attn) * scale
     
     # Apply validity mask
-    # valid_mask: [batch, WINDOW_SIZE] -> [batch, 1, 1, WINDOW_SIZE]
+    # valid_mask: [batch, max_kv_len] -> [batch, 1, 1, max_kv_len]
     valid_mask_expanded = valid_mask[:, None, None, :]
     attn_scores = jnp.where(valid_mask_expanded, attn_scores, -1e10)
     

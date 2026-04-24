@@ -321,8 +321,13 @@ class ModelRunner:
         block_table = jnp.array(block_tables, dtype=jnp.int32)  # [batch, max_blocks]
         kv_lens = jnp.array(kv_lens, dtype=jnp.int32)  # [batch]
         
-        # Use positions as slot_mapping directly (simpler, avoids compute_slot_mapping hang)
-        slot_mapping = positions
+        # Compute slot_mapping from block_table (real paged attention)
+        slot_mapping = compute_slot_mapping(
+            positions=positions,
+            block_table=block_table,
+            block_size=self.block_size,
+            is_prefill=is_prefill,
+        )
         
         # Update KV cache state
         kv_state = replace(

@@ -56,32 +56,44 @@ def convert_hf_to_jax(hf_weights: dict, config: Qwen3_5Config, verbose: bool = F
         import warnings
         warnings.filterwarnings('ignore')
     
-    # Import ml_dtypes for bfloat16 support in JAX
     import ml_dtypes
     
+    # Get target dtype from config
+    target_dtype = config.get_dtype()
+    if target_dtype == jnp.bfloat16:
+        # Use ml_dtypes for bfloat16 support
+        np_dtype = ml_dtypes.bfloat16
+        jax_dtype = jnp.bfloat16
+    elif target_dtype == jnp.float16:
+        np_dtype = np.float16
+        jax_dtype = jnp.float16
+    else:
+        np_dtype = np.float32
+        jax_dtype = jnp.float32
+    
     # Extract text model weights (prefix "model.language_model." or "model.")
-    # HF loads ALL weights as bfloat16, so we keep them as bfloat16 in JAX
     text_weights = {}
     
     for key, value in hf_weights.items():
-        # Get as bfloat16 numpy directly
+        # Get as numpy array
         if hasattr(value, 'cpu'):  # torch tensor
-            # Convert to bfloat16 if not already
-            if value.dtype != torch.bfloat16:
-                value = value.bfloat16()
             # Convert via float32 intermediate (torch can't directly numpy() bfloat16)
-            value_np = value.float().cpu().numpy()
-            # Convert back to bfloat16 numpy using ml_dtypes
-            value_np = value_np.astype(ml_dtypes.bfloat16)
+            if value.dtype == torch.bfloat16:
+                value_np = value.float().cpu().numpy()
+            else:
+                value_np = value.cpu().numpy()
         else:
-            # Already numpy (possibly ml_dtypes.bfloat16 from safetensors)
             value_np = np.asarray(value)
-            if value_np.dtype != np.dtype('bfloat16'):
-                # Convert to bfloat16
-                value_torch = torch.from_numpy(value_np).bfloat16()
-                value_np = value_torch.float().numpy().astype(ml_dtypes.bfloat16)
         
-        value_jax = jnp.array(value_np, dtype=jnp.bfloat16)
+        # Convert to target dtype
+        if value_np.dtype != np_dtype:
+            # Convert via float32 intermediate for bfloat16
+            if np_dtype == ml_dtypes.bfloat16:
+                value_np = value_np.astype(np.float32).astype(np_dtype)
+            else:
+                value_np = value_np.astype(np_dtype)
+        
+        value_jax = jnp.array(value_np, dtype=jax_dtype)
         
         if key.startswith("model.language_model."):
             new_key = key[21:]  # Remove "model.language_model." prefix
@@ -194,23 +206,26 @@ def convert_hf_to_jax(hf_weights: dict, config: Qwen3_5Config, verbose: bool = F
     )
 
 
-def load_weights_from_hf(params, model_name: str, config: Qwen3_5Config = None, verbose: bool = False, load_mtp: bool = False) -> ModelParams:
-    """Load weights from HuggingFace for a given model.
+def load_weights_from_hf(model_name: str, config: Qwen3_5Config, *, verbose: bool = False, load_mtp: bool = False) -> ModelParams:
+    """Load weights from HuggingFace for Qwen3.5 model.
     
     Args:
-        params: Existing ModelParams (ignored, kept for API compatibility)
         model_name: HuggingFace model identifier (e.g., "Qwen/Qwen3.5-0.8B")
-        config: Model configuration (required)
+        config: Model configuration (REQUIRED)
         verbose: Whether to print detailed weight info
         load_mtp: Whether to load MTP weights for speculative decoding
         
     Returns:
         ModelParams with loaded weights (and optional mtp_params attribute)
+        
+    Raises:
+        ValueError: If model not found in cache or weights invalid
+        RuntimeError: If weight conversion fails
     """
-    print(f"Loading weights for {model_name}...")
-    
     if config is None:
-        config = Qwen3_5Config.qwen3_5_0_8b()
+        raise ValueError("config is required - cannot be None")
+    
+    print(f"Loading weights for {model_name}...")
     
     # Download from HF
     hf_path = download_hf_weights(model_name)

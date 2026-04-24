@@ -1,5 +1,20 @@
 # JAX Implementation vs HuggingFace: Performance Comparison
 
+## Important Disclaimers
+
+⚠️ **Methodology Limitations**:
+- Tested only on short sequences (5-10 prompt tokens, 10 decode tokens)
+- Uses identity block tables (not real paged attention)
+- CPU-only testing
+- **Do not extrapolate** to production workloads without additional validation
+
+### Not Yet Verified
+- Long sequences (>128 tokens)
+- Non-identity block tables (prefix caching)
+- MTP speculative decoding integration
+- Batch processing
+- GPU/TPU performance
+
 ## Executive Summary
 
 This document compares the throughput of our JAX implementation against HuggingFace Transformers for the Qwen3.5-0.8B model.
@@ -84,37 +99,52 @@ Combined:            1.45x (45% faster than HuggingFace)
 3. **Optimized Operations**: Custom implementations for conv1d and attention
 4. **Lower Overhead**: JAX has less Python overhead compared to PyTorch's eager mode
 
-## MTP Speculative Decoding
+## MTP Speculative Decoding (Experimental)
 
-We also implemented Multi-Token Prediction (MTP) speculative decoding:
+⚠️ **Status**: MTP integration is experimental and has known API mismatches.
 
-### Results
+We implemented Multi-Token Prediction (MTP) speculative decoding:
+
+### Preliminary Results (Require Verification)
 - **Speedup**: 1.10x (10% improvement)
-- **MTP match rate**: 12%
+- **MTP match rate**: ~12%
 - **Forward passes reduced**: 26 vs 30 (13% reduction)
+
+### Known Issues
+- Return value unpacking inconsistent between modules
+- Call signature mismatches in speculative.py
+- Tests verify structure, not correctness
+- Acceptance rate calculation may be incorrect
 
 ### Combined with JAX
 - **JAX + MTP total speedup**: 1.45x vs HuggingFace (45% faster)
 - **Breakdown**: JAX (1.31x) × MTP (1.10x) = 1.45x
 
-### How MTP Works
+⚠️ **These results are preliminary and require verification before production use.**
+
+### How MTP Works (Theoretical)
 Qwen3.5's MTP predicts **token T+2** (not T+1) using:
 - Hidden state from position T
 - Embedding of token T+1
 
 This is "lookahead decoding" rather than traditional speculative decoding.
 
-## Correctness Verification
+## Correctness Verification (Partial)
 
-All tests pass with **exact token matching** between:
+Limited tests show **exact token matching** between:
 - JAX implementation (with KV cache)
 - JAX implementation (without KV cache)
 - HuggingFace Transformers
 
-Test cases:
+**Test limitations**:
+- Only tested on short sequences (5-20 tokens)
+- Only tested with identity block tables
+- Does not cover all model configurations
+
+**Test cases**:
 - Various prompt lengths (5, 10, 20 tokens)
 - Different decode lengths (5, 10, 20 tokens)
-- All produce identical outputs
+- Results show identical outputs **for tested configurations only**
 
 ## Architecture Details
 
@@ -162,14 +192,20 @@ Test cases:
 
 ## Conclusion
 
-Our JAX implementation with MTP achieves:
+Our JAX implementation with MTP achieves (for tested configurations):
 - ✓ **45% faster** than HuggingFace on CPU (combined JAX + MTP)
 - ✓ **31% faster** with JAX alone
-- ✓ **10% additional speedup** from MTP speculative decoding
-- ✓ **100% output parity** with HuggingFace
-- ✓ **KV cache working correctly**
-- ✓ **MTP speculative decoding functional**
-- ✓ **API server ready for deployment**
-- ✓ **Comprehensive documentation and tests**
+- ⚠️ **10% additional speedup** from MTP speculative decoding (requires verification)
+- ⚠️ **Partial output parity** with HuggingFace (short sequences only)
+- ✓ **KV cache working correctly** (for identity block tables)
+- ⚠️ **MTP speculative decoding experimental** (API mismatches exist)
+- ⚠️ **API server functional but not production-ready**
 
-The implementation is production-ready and provides significant performance improvements over the HuggingFace baseline.
+**Status**: Working prototype, not production-ready. Significant correctness and integration issues remain.
+
+**Next Steps**:
+1. Fix paged attention to use non-identity block tables
+2. Verify parity for long sequences (>128 tokens)
+3. Complete MTP integration and verification
+4. Add comprehensive test coverage
+5. GPU/TPU benchmarking
