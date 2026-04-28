@@ -114,16 +114,35 @@ runner.warmup_compilation(max_prefill_len=64, max_batch=1)
 ### API Server
 
 ```bash
-# Start the server
-python server.py
+# Start the LLMEngine-backed server with startup-compiled static shapes
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export TF_GPU_ALLOCATOR=cuda_malloc_async
+export XLA_FLAGS=--xla_gpu_autotune_level=0
+
+python server.py \
+  --dtype float16 \
+  --jax-execution jit \
+  --prefill-buckets 16 \
+  --batch-size-buckets 1 \
+  --max-num-seqs 1 \
+  --max-kv-cache-mb 64 \
+  --num-kvcache-blocks 8
+
+# Optional greedy MTP1 speculative decoding, if the checkpoint has mtp.* weights
+# Add: --num-speculative-tokens 1
 
 # Test health endpoint
-curl http://localhost:5000/health
+curl http://localhost:8080/health
 
 # Generate text
-curl -X POST http://localhost:5000/v1/generate \
+curl -X POST http://localhost:8080/v1/generate \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Hello, world!", "max_tokens": 50}'
+  -d '{"prompt": "Hello, world!", "max_tokens": 4, "temperature": 0.0}'
+
+# Explicit batched generation; set --max-num-seqs and --batch-size-buckets accordingly
+curl -X POST http://localhost:8080/v1/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": ["Hello", "Explain JAX in one sentence"], "max_tokens": 4}'
 ```
 
 ### Benchmarks
@@ -138,6 +157,42 @@ python benchmark_quick_combined.py
 # MTP performance
 python benchmark_mtp_v3.py
 ```
+
+### Current KV-Cache GPU Benchmark
+
+`benchmark_real_kv_hf.py` uses the canonical `ModelExecutor` path, validates
+prefill logits and greedy tokens against HuggingFace, and can split HF/JAX into
+separate processes to avoid mixed-runtime GPU memory pressure.
+
+Tested on a 6 GiB GTX 1660 Ti under WSL. This GPU does not support native bf16,
+so the benchmark uses float16 weights.
+
+```bash
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export TF_GPU_ALLOCATOR=cuda_malloc_async
+export XLA_FLAGS=--xla_gpu_autotune_level=0
+
+python benchmark_real_kv_hf.py \
+  --target hf \
+  --max-new-tokens 4 \
+  --prompt 'Tell me a joke about compilers.' \
+  --output-npz /tmp/qwen_hf_ref.npz
+
+python benchmark_real_kv_hf.py \
+  --target jax \
+  --jax-execution jit \
+  --prefill-bucket 16 \
+  --max-new-tokens 4 \
+  --max-kv-cache-mb 64 \
+  --prompt 'Tell me a joke about compilers.' \
+  --compare-npz /tmp/qwen_hf_ref.npz
+```
+
+Observed for that prompt with an exact prefill shape: HF cache 1.32 tok/s
+end-to-end, JAX full startup-JIT 13.93 tok/s end-to-end. With
+`--prefill-bucket 16`, JAX full startup-JIT measured 8.65 tok/s end-to-end.
+Both JAX runs had exact greedy-token match, top-5 prefill logits match, and
+`jit_compiled_during_measure=False`.
 
 ## Model Architecture: Qwen3.5-0.8B
 
@@ -188,19 +243,19 @@ python tests/test_mtp.py
 
 ## MTP Speculative Decoding (Experimental)
 
-⚠️ **Status**: MTP integration is experimental and has known API mismatches.
+⚠️ **Status**: MTP integration is experimental.
 
 The Multi-Token Prediction (MTP) head generates draft tokens for speculative decoding:
 
-- **Mechanism**: Predicts token T+2 (not T+1) using hidden state at T + embedding of T+1
-- **Speedup**: Preliminary results show 1.10x over baseline (requires verification)
-- **Match rate**: ~12% (requires verification)
-- **Architecture**: 1 transformer layer + LM head
+- **Mechanism**: MTP1 keeps one pending draft token, verifies it on the next target pass, and commits a bonus token when the greedy draft is accepted.
+- **Scope**: Config gated with `num_speculative_tokens=1`; the server exposes this as `--num-speculative-tokens 1`.
+- **Fallbacks**: Batched decode, non-greedy sampling, missing MTP weights, and boundary cases fall back to normal decoding.
+- **Architecture**: 1 transformer layer + LM head.
 
 ### Known Issues
-- Return value unpacking inconsistent between modules
-- Call signature mismatches
-- Tests verify structure, not correctness
+- Current MTP1 path is greedy-only.
+- The first implementation is single-sequence only.
+- Broader correctness/performance validation still needs a real checkpoint with MTP weights.
 
 **Do not use in production** until MTP integration is complete.
 

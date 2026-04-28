@@ -2,8 +2,64 @@
 
 import jax
 import jax.numpy as jnp
-from typing import Tuple, Optional, Dict
+from typing import Any, List, Optional, Tuple
 from dataclasses import dataclass, replace
+
+
+@dataclass
+class KVCacheSpec:
+    """Logical KV cache shape requested by the engine."""
+
+    num_layers: int
+    num_blocks: int
+    block_size: int
+    num_kv_heads: int
+    head_dim: int
+    dtype: Any = jnp.float32
+    max_kv_cache_bytes: Optional[int] = None
+
+
+@dataclass
+class KVCacheStorage:
+    """Backend-owned physical KV arrays.
+
+    The pure JAX backend uses the canonical teaching layout:
+    [num_layers, num_blocks, block_size, num_kv_heads, head_dim].
+    GPU/TPU backends can use different physical layouts behind this boundary.
+    """
+
+    k_cache: jnp.ndarray
+    v_cache: jnp.ndarray
+
+
+@dataclass
+class AttentionMetadata:
+    """Per-step paged/ragged attention metadata."""
+
+    slot_mapping: jnp.ndarray
+    block_tables: jnp.ndarray
+    seq_lens: jnp.ndarray
+    query_start_loc: jnp.ndarray
+    num_prefill_tokens: int
+    num_decode_tokens: int
+    positions: Optional[jnp.ndarray] = None
+
+
+@dataclass
+class BlockTables:
+    """Python/runtime-owned logical allocation state."""
+
+    tables: List[List[int]]
+    ref_counts: Optional[Any] = None
+    hashes: Optional[Any] = None
+
+
+@dataclass
+class HybridLayerState:
+    """Qwen3.5 linear/GDN state kept separate from full-attention KV storage."""
+
+    conv_state: Optional[jnp.ndarray] = None
+    recurrent_state: Optional[jnp.ndarray] = None
 
 
 @dataclass
@@ -32,6 +88,60 @@ class KVCacheState:
     slot_mapping: jnp.ndarray  # [batch, seq_len]
     conv_state: Optional[jnp.ndarray] = None  # [batch, conv_dim, kernel_size]
     recurrent_state: Optional[jnp.ndarray] = None  # [batch, num_heads, k_dim, v_dim]
+
+    @property
+    def storage(self) -> KVCacheStorage:
+        return KVCacheStorage(self.k_cache, self.v_cache)
+
+    @property
+    def attention_metadata(self) -> AttentionMetadata:
+        query_len = self.slot_mapping.shape[1]
+        batch = self.slot_mapping.shape[0]
+        query_start_loc = jnp.arange(batch + 1, dtype=jnp.int32) * query_len
+        return AttentionMetadata(
+            slot_mapping=self.slot_mapping,
+            block_tables=self.block_table,
+            seq_lens=self.kv_lens,
+            query_start_loc=query_start_loc,
+            num_prefill_tokens=int(batch * query_len),
+            num_decode_tokens=0,
+            positions=None,
+        )
+
+    @property
+    def hybrid_state(self) -> HybridLayerState:
+        return HybridLayerState(self.conv_state, self.recurrent_state)
+
+
+def estimate_kv_cache_bytes(spec: KVCacheSpec) -> int:
+    """Return total bytes for K and V arrays for a cache spec."""
+    dtype = jnp.dtype(spec.dtype)
+    elements_per_cache = (
+        spec.num_layers
+        * spec.num_blocks
+        * spec.block_size
+        * spec.num_kv_heads
+        * spec.head_dim
+    )
+    return int(elements_per_cache * dtype.itemsize * 2)
+
+
+def cap_num_kv_cache_blocks(spec: KVCacheSpec) -> int:
+    """Return the largest block count that fits the configured byte cap."""
+    if spec.max_kv_cache_bytes is None:
+        return spec.num_blocks
+
+    bytes_per_block = estimate_kv_cache_bytes(replace(spec, num_blocks=1))
+    if bytes_per_block <= 0:
+        raise ValueError("Invalid KV cache spec: bytes_per_block must be positive")
+
+    capped_blocks = spec.max_kv_cache_bytes // bytes_per_block
+    if capped_blocks < 1:
+        raise ValueError(
+            "max_kv_cache_bytes is too small for one KV block "
+            f"({spec.max_kv_cache_bytes} < {bytes_per_block})"
+        )
+    return min(spec.num_blocks, int(capped_blocks))
 
 
 # Register KVCacheState as a JAX pytree node for JIT compatibility
@@ -86,6 +196,7 @@ def init_kv_cache(
     max_blocks_per_seq: int,
     num_layers: int = 24,
     dtype=jnp.float32,
+    max_kv_cache_bytes: Optional[int] = None,
 ) -> KVCacheState:
     """Initialize empty KV cache.
     
@@ -102,8 +213,19 @@ def init_kv_cache(
     Returns:
         Initialized KVCacheState with zeros
     """
-    k_cache = jnp.zeros((num_layers, num_blocks, block_size, num_kv_heads, head_dim), dtype=dtype)
-    v_cache = jnp.zeros((num_layers, num_blocks, block_size, num_kv_heads, head_dim), dtype=dtype)
+    spec = KVCacheSpec(
+        num_layers=num_layers,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        max_kv_cache_bytes=max_kv_cache_bytes,
+    )
+    capped_num_blocks = cap_num_kv_cache_blocks(spec)
+
+    k_cache = jnp.zeros((num_layers, capped_num_blocks, block_size, num_kv_heads, head_dim), dtype=dtype)
+    v_cache = jnp.zeros((num_layers, capped_num_blocks, block_size, num_kv_heads, head_dim), dtype=dtype)
     block_table = jnp.zeros((max_seqs, max_blocks_per_seq), dtype=jnp.int32)
     kv_lens = jnp.zeros(max_seqs, dtype=jnp.int32)
     slot_mapping = jnp.zeros((max_seqs, 1), dtype=jnp.int32)  # Will be expanded
@@ -134,38 +256,44 @@ def init_linear_attention_states(
     Returns:
         Updated KVCacheState with initialized linear states
     """
+    hybrid_state = init_hybrid_state(config, batch_size=batch_size, dtype=dtype)
+
+    return replace(
+        cache,
+        conv_state=hybrid_state.conv_state,
+        recurrent_state=hybrid_state.recurrent_state,
+    )
+
+
+def init_hybrid_state(
+    config,
+    batch_size: int = 1,
+    dtype=None,
+) -> HybridLayerState:
+    """Initialize GDN conv/recurrent state separately from the KV cache."""
     if dtype is None:
-        dtype = getattr(config, 'get_dtype', lambda: jnp.float32)()
-    
-    # Compute conv_dim = key_dim * 2 + value_dim
+        dtype = getattr(config, "get_dtype", lambda: jnp.float32)()
+
     key_dim = config.linear_num_key_heads * config.linear_key_head_dim
     value_dim = config.linear_num_value_heads * config.linear_value_head_dim
     conv_dim = key_dim * 2 + value_dim
-    
-    # Count number of linear attention layers
     num_linear_layers = sum(1 for lt in config.layer_types if lt == "linear_attention")
-    
-    # Initialize conv state: [batch, num_linear_layers, conv_dim, kernel_size]
-    # Each linear layer has its own conv state
+
     conv_state = jnp.zeros(
         (batch_size, num_linear_layers, conv_dim, config.linear_conv_kernel_size),
-        dtype=dtype
+        dtype=dtype,
     )
-    
-    # Initialize recurrent state: [batch, num_linear_layers, num_heads, k_dim, v_dim]
-    # This stores per-layer state for all linear attention layers
     recurrent_state = jnp.zeros(
-        (batch_size, num_linear_layers,
-         config.linear_num_key_heads,
-         config.linear_key_head_dim, config.linear_value_head_dim),
-        dtype=jnp.float32  # HF uses float32 for recurrent state
+        (
+            batch_size,
+            num_linear_layers,
+            config.linear_num_key_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+        ),
+        dtype=jnp.float32,
     )
-    
-    return replace(
-        cache,
-        conv_state=conv_state,
-        recurrent_state=recurrent_state,
-    )
+    return HybridLayerState(conv_state=conv_state, recurrent_state=recurrent_state)
 
 
 def compute_slot_mapping(
@@ -214,6 +342,7 @@ def update_kv_cache(
     new_k: jnp.ndarray,  # [batch, seq_len, num_kv_heads, head_dim]
     new_v: jnp.ndarray,
     layer_idx: int = 0,
+    valid_mask: Optional[jnp.ndarray] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Update KV cache with new key/value pairs.
     
@@ -244,10 +373,36 @@ def update_kv_cache(
     slot_flat = slot_mapping.reshape(-1)
     k_flat = new_k.reshape(-1, num_kv_heads, head_dim)
     v_flat = new_v.reshape(-1, num_kv_heads, head_dim)
-    
-    # Scatter update
-    k_cache_flat = k_cache_flat.at[slot_flat].set(k_flat)
-    v_cache_flat = v_cache_flat.at[slot_flat].set(v_flat)
+    if valid_mask is not None:
+        valid_flat = valid_mask.reshape(-1)
+        # Do not scatter padded tokens. Writing "old" values for invalid
+        # tokens is not sufficient because padded slots can alias real slots.
+        def update_one(carry, i):
+            k_flat_carry, v_flat_carry = carry
+
+            def write_valid(inner):
+                k_inner, v_inner = inner
+                return (
+                    k_inner.at[slot_flat[i]].set(k_flat[i]),
+                    v_inner.at[slot_flat[i]].set(v_flat[i]),
+                )
+
+            return jax.lax.cond(
+                valid_flat[i],
+                write_valid,
+                lambda inner: inner,
+                (k_flat_carry, v_flat_carry),
+            ), None
+
+        (k_cache_flat, v_cache_flat), _ = jax.lax.scan(
+            update_one,
+            (k_cache_flat, v_cache_flat),
+            jnp.arange(slot_flat.shape[0]),
+        )
+    else:
+        # Scatter update
+        k_cache_flat = k_cache_flat.at[slot_flat].set(k_flat)
+        v_cache_flat = v_cache_flat.at[slot_flat].set(v_flat)
     
     # Reshape back
     k_cache_layer = k_cache_flat.reshape(num_blocks, block_size, num_kv_heads, head_dim)
@@ -332,6 +487,63 @@ def paged_attention(
     out = out.transpose(0, 1, 2, 3).reshape(batch, seq_len, num_heads * head_dim)
     
     return out
+
+
+def paged_attention_prefill(
+    query: jnp.ndarray,
+    k_cache: jnp.ndarray,
+    v_cache: jnp.ndarray,
+    block_table: jnp.ndarray,
+    kv_lens: jnp.ndarray,
+    positions: jnp.ndarray,
+    block_size: int,
+    scale: float,
+    num_key_value_groups: int,
+    layer_idx: int = 0,
+) -> jnp.ndarray:
+    """Reference paged prefill attention that supports cached prefixes.
+
+    Query positions may be an uncached suffix of a larger logical sequence.
+    """
+
+    batch, query_len, num_heads, head_dim = query.shape
+
+    if k_cache.ndim == 5:
+        k_cache_layer = k_cache[layer_idx]
+        v_cache_layer = v_cache[layer_idx]
+    else:
+        k_cache_layer = k_cache
+        v_cache_layer = v_cache
+
+    _, block_size_cache, num_kv_heads, _ = k_cache_layer.shape
+    max_kv_len = block_table.shape[1] * block_size
+    key_positions = jnp.arange(max_kv_len, dtype=jnp.int32)[None, :]
+    key_positions = jnp.broadcast_to(key_positions, (batch, max_kv_len))
+
+    block_indices = key_positions // block_size
+    slot_indices = key_positions % block_size
+    batch_indices = jnp.arange(batch, dtype=jnp.int32)[:, None]
+    flat_indices = batch_indices * block_table.shape[1] + block_indices
+    physical_blocks = block_table.reshape(-1)[flat_indices]
+    slot_mapping = physical_blocks * block_size_cache + slot_indices
+
+    k_flat = k_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    v_flat = v_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    k_gathered = k_flat[slot_mapping.reshape(-1)].reshape(batch, max_kv_len, num_kv_heads, head_dim)
+    v_gathered = v_flat[slot_mapping.reshape(-1)].reshape(batch, max_kv_len, num_kv_heads, head_dim)
+
+    if num_key_value_groups > 1:
+        k_gathered = jnp.repeat(k_gathered, num_key_value_groups, axis=2)
+        v_gathered = jnp.repeat(v_gathered, num_key_value_groups, axis=2)
+
+    attn_scores = jnp.einsum("btnh,bknh->btnk", query, k_gathered) * scale
+    valid_keys = key_positions < kv_lens[:, None]
+    causal_keys = key_positions[:, None, :] <= positions[:, :, None]
+    attn_mask = valid_keys[:, None, :] & causal_keys
+    attn_scores = jnp.where(attn_mask[:, :, None, :], attn_scores, -1e10)
+    attn_weights = jax.nn.softmax(attn_scores, axis=-1)
+    out = jnp.einsum("btnk,bknh->btnh", attn_weights, v_gathered)
+    return out.reshape(batch, query_len, num_heads * head_dim)
 
 
 def paged_attention_decode(

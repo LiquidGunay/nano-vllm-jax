@@ -5,9 +5,10 @@ import jax.numpy as jnp
 from jax import nn, lax
 from typing import Tuple, Optional, List, Dict
 from dataclasses import dataclass, replace
+from nanovllm_jax.backends import InferenceBackend, select_backend
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.layers import rms_norm, apply_rope, repeat_kv, causal_mask, get_activation, l2norm, causal_conv1d_update
-from nanovllm_jax.kv_cache import KVCacheState, update_kv_cache, paged_attention, paged_attention_decode, init_linear_attention_states
+from nanovllm_jax.kv_cache import AttentionMetadata, HybridLayerState, KVCacheState, init_linear_attention_states
 from nanovllm_jax.conv1d_metal import causal_conv1d_metal
 
 
@@ -417,7 +418,9 @@ def gated_deltanet_block(
     config,
     layer_idx: int,
     is_prefill: bool = True,
-    kv_cache_state: Optional[KVCacheState] = None,
+    hybrid_state: Optional[HybridLayerState] = None,
+    valid_token_mask: Optional[jnp.ndarray] = None,
+    backend: Optional[InferenceBackend] = None,
 ):
     """Gated DeltaNet block with decode mode support.
     
@@ -428,12 +431,14 @@ def gated_deltanet_block(
         config: Model config
         layer_idx: Layer index (0-based)
         is_prefill: Whether this is prefill (True) or decode (False)
-        kv_cache_state: Optional cache state (None for prefill)
+        hybrid_state: Optional linear-attention state for this batch
         
     Returns:
-        tuple: (output, updated_kv_cache_state) or just output for prefill
+        tuple: (output, updated_hybrid_state) or just output for prefill
     """
     batch, seq_len, _ = x.shape
+    if backend is None:
+        backend = select_backend("pure_jax")
     
     # Cast to target dtype (bfloat16 for CPU/CUDA, float16 for Metal)
     dtype = config.get_dtype()
@@ -447,10 +452,19 @@ def gated_deltanet_block(
     # Check if we can use cached states
     use_cached = (
         not is_prefill and 
-        kv_cache_state is not None and 
-        kv_cache_state.conv_state is not None and
+        hybrid_state is not None and 
+        hybrid_state.conv_state is not None and
         seq_len == 1
     )
+    use_cached_prefill = (
+        is_prefill
+        and hybrid_state is not None
+        and hybrid_state.conv_state is not None
+        and hybrid_state.recurrent_state is not None
+    )
+    recurrent_prefill_threshold = int(getattr(config, "linear_recurrent_prefill_threshold", config.linear_chunk_size))
+    use_recurrent_prefill = use_cached_prefill and seq_len <= recurrent_prefill_threshold
+    linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
     
     # === PROJECTIONS (same for both modes) ===
     mixed_qkv = jnp.dot(x_cast, params["in_proj_qkv"])
@@ -460,14 +474,11 @@ def gated_deltanet_block(
     
     if use_cached:
         # === DECODE MODE ===
-        # Compute layer index for this linear attention layer
-        linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
-        
         mixed_qkv_t = mixed_qkv.transpose(0, 2, 1)  # [B, D, 1]
         
         # 1. Convolution update - use per-layer conv_state
         # conv_state shape: [batch, num_linear_layers, conv_dim, kernel_size]
-        layer_conv_state = kv_cache_state.conv_state[:, linear_layer_idx]  # [batch, conv_dim, kernel_size]
+        layer_conv_state = hybrid_state.conv_state[:, linear_layer_idx]  # [batch, conv_dim, kernel_size]
         conv_out, new_layer_conv_state = causal_conv1d_update(
             mixed_qkv_t,
             layer_conv_state,
@@ -502,27 +513,27 @@ def gated_deltanet_block(
         # recurrent_state shape: [batch, num_layers, num_heads, k_dim, v_dim]
         # Extract recurrent state for this layer: [batch, num_heads, k_dim, v_dim]
         # linear_layer_idx computed above
-        initial_recurrent = kv_cache_state.recurrent_state[:, linear_layer_idx] if kv_cache_state.recurrent_state is not None else None
-        
-        core_attn_out, new_recurrent_state_single = jax_recurrent_gated_delta_rule(
+        initial_recurrent = hybrid_state.recurrent_state[:, linear_layer_idx] if hybrid_state.recurrent_state is not None else None
+
+        core_attn_out, new_recurrent_state_single = backend.gated_delta_decode(
             query, key, value, g, beta,
             initial_state=initial_recurrent,
-            use_qk_l2norm_in_kernel=True
+            use_qk_l2norm_in_kernel=True,
         )
         # new_recurrent_state_single has shape [batch, num_heads, k_dim, v_dim]
         
         # Update cache with new recurrent state and conv state for this layer
-        if kv_cache_state.recurrent_state is not None:
-            new_recurrent_state = kv_cache_state.recurrent_state.at[:, linear_layer_idx].set(new_recurrent_state_single)
-            new_conv_state = kv_cache_state.conv_state.at[:, linear_layer_idx].set(new_layer_conv_state)
+        if hybrid_state.recurrent_state is not None:
+            new_recurrent_state = hybrid_state.recurrent_state.at[:, linear_layer_idx].set(new_recurrent_state_single)
+            new_conv_state = hybrid_state.conv_state.at[:, linear_layer_idx].set(new_layer_conv_state)
         else:
             new_recurrent_state = new_recurrent_state_single[jnp.newaxis, :, :, :, :]  # Add layer dim
             new_conv_state = new_layer_conv_state[jnp.newaxis, :, :, :]  # Add layer dim
         
-        kv_cache_state = replace(
-            kv_cache_state,
+        hybrid_state = replace(
+            hybrid_state,
             conv_state=new_conv_state,
-            recurrent_state=new_recurrent_state
+            recurrent_state=new_recurrent_state,
         )
         
         # core_attn_out is [B, H, T=1, D_v] - transpose to [B, T, H, D_v] for reshaping
@@ -531,12 +542,23 @@ def gated_deltanet_block(
     else:
         # === PREFILL MODE (Metal-compatible implementation) ===
         mixed_qkv_t = mixed_qkv.transpose(0, 2, 1)  # [B, D, T]
-        # Use Metal-compatible conv1d (no lax.conv_general_dilated)
-        conv_out = causal_conv1d_metal(
-            mixed_qkv_t,
-            params["conv1d_weight"],
-            activation="silu"
-        )
+        if use_cached_prefill:
+            layer_conv_state = hybrid_state.conv_state[:, linear_layer_idx]
+            conv_input = jnp.concatenate([layer_conv_state, mixed_qkv_t], axis=-1)
+            conv_out = causal_conv1d_metal(
+                conv_input,
+                params["conv1d_weight"],
+                params.get("conv1d_bias"),
+                activation="silu",
+            )[:, :, -seq_len:]
+        else:
+            # Use Metal-compatible conv1d (no lax.conv_general_dilated)
+            conv_out = causal_conv1d_metal(
+                mixed_qkv_t,
+                params["conv1d_weight"],
+                params.get("conv1d_bias"),
+                activation="silu",
+            )
         conv_out = conv_out.transpose(0, 2, 1)  # [B, T, D]
         
         query = conv_out[:, :, :key_dim].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
@@ -545,6 +567,14 @@ def gated_deltanet_block(
         
         beta = nn.sigmoid(b)
         g = -params["A"] * nn.softplus(a + params["dt_bias"])
+
+        if valid_token_mask is not None:
+            valid = valid_token_mask.astype(jnp.bool_)
+            query = jnp.where(valid[:, :, None, None], query, 0.0)
+            key = jnp.where(valid[:, :, None, None], key, 0.0)
+            value = jnp.where(valid[:, :, None, None], value, 0.0)
+            beta = jnp.where(valid[:, :, None], beta, 0.0)
+            g = jnp.where(valid[:, :, None], g, 0.0)
         
         if v_heads_per_k > 1:
             query = jnp.repeat(query, v_heads_per_k, axis=2)
@@ -557,44 +587,79 @@ def gated_deltanet_block(
         g = g.transpose(0, 2, 1)
         beta = beta.transpose(0, 2, 1)
         
-        # Use chunk-based gated delta rule with L2 norm inside kernel (matching HF)
-        core_attn_out, final_state = jax_chunk_gated_delta_rule(
-            query, key, value, g, beta, 
-            chunk_size=config.linear_chunk_size,
-            use_qk_l2norm_in_kernel=True,
-            output_final_state=True
+        initial_recurrent = (
+            hybrid_state.recurrent_state[:, linear_layer_idx]
+            if use_cached_prefill
+            else None
         )
+        if use_recurrent_prefill:
+            core_attn_out, final_state = backend.gated_delta_decode(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                initial_state=initial_recurrent,
+                use_qk_l2norm_in_kernel=True,
+            )
+        else:
+            # Chunked rule is the right path for prompt/chunk prefill. Short
+            # cached suffixes use the recurrent path above to avoid padding a
+            # tiny verifier suffix up to the chunk size.
+            core_attn_out, final_state = backend.gated_delta_prefill(
+                query, key, value, g, beta,
+                chunk_size=config.linear_chunk_size,
+                initial_state=initial_recurrent,
+                use_qk_l2norm_in_kernel=True,
+            )
         
         # Save final state to cache for decode mode
-        if kv_cache_state is not None:
-            # Extract conv_state from last kernel_size tokens
-            # mixed_qkv_t has shape [B, D, T], we need last kernel_size tokens: [B, D, K]
-            if seq_len >= config.linear_conv_kernel_size:
-                layer_conv_state = mixed_qkv_t[:, :, -(config.linear_conv_kernel_size):]  # [B, D, K]
+        if hybrid_state is not None:
+            # Extract the last real kernel_size inputs. Bucket padding is not
+            # part of the convolution history used by recurrent decode.
+            kernel_size = config.linear_conv_kernel_size
+            if valid_token_mask is not None:
+                valid_lens = valid_token_mask.astype(jnp.int32).sum(axis=1)
+                gather_idx = valid_lens[:, None] - kernel_size + jnp.arange(kernel_size, dtype=jnp.int32)[None, :]
+                gather_valid = gather_idx >= 0
+                gather_idx = jnp.clip(gather_idx, 0, max(seq_len - 1, 0))
+                gather_idx = jnp.broadcast_to(gather_idx[:, None, :], (batch, conv_dim, kernel_size))
+                layer_conv_state = jnp.take_along_axis(mixed_qkv_t, gather_idx, axis=2)
+                layer_conv_state = jnp.where(gather_valid[:, None, :], layer_conv_state, 0.0)
+            elif seq_len >= kernel_size:
+                layer_conv_state = mixed_qkv_t[:, :, -kernel_size:]  # [B, D, K]
             else:
                 # If sequence is shorter than kernel_size, pad with zeros
-                pad_width = config.linear_conv_kernel_size - seq_len
+                pad_width = kernel_size - seq_len
                 layer_conv_state = jnp.pad(mixed_qkv_t, ((0, 0), (0, 0), (pad_width, 0)))
             
             # Compute layer index for this linear attention layer
-            linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
-            
             # Update recurrent state and conv_state at this layer index
             # recurrent_state shape: [batch, num_linear_layers, num_heads, k_dim, v_dim]
             # final_state shape: [batch, num_heads, k_dim, v_dim]
             # conv_state shape: [batch, num_linear_layers, conv_dim, kernel_size]
-            if kv_cache_state.recurrent_state is not None:
-                new_recurrent_state = kv_cache_state.recurrent_state.at[:, linear_layer_idx].set(final_state)
-                new_conv_state = kv_cache_state.conv_state.at[:, linear_layer_idx].set(layer_conv_state.astype(dtype))
+            if hybrid_state.recurrent_state is not None:
+                if use_cached_prefill:
+                    kernel_size = config.linear_conv_kernel_size
+                    conv_input = jnp.concatenate([hybrid_state.conv_state[:, linear_layer_idx], mixed_qkv_t], axis=-1)
+                    if valid_token_mask is not None:
+                        valid_lens = valid_token_mask.astype(jnp.int32).sum(axis=1)
+                    else:
+                        valid_lens = jnp.full((batch,), seq_len, dtype=jnp.int32)
+                    gather_idx = valid_lens[:, None] + jnp.arange(kernel_size, dtype=jnp.int32)[None, :]
+                    gather_idx = jnp.broadcast_to(gather_idx[:, None, :], (batch, conv_dim, kernel_size))
+                    layer_conv_state = jnp.take_along_axis(conv_input, gather_idx, axis=2)
+                new_recurrent_state = hybrid_state.recurrent_state.at[:, linear_layer_idx].set(final_state)
+                new_conv_state = hybrid_state.conv_state.at[:, linear_layer_idx].set(layer_conv_state.astype(dtype))
             else:
                 # Should not happen if init_linear_attention_states was called
                 new_recurrent_state = final_state[jnp.newaxis, :, :, :, :]
                 new_conv_state = layer_conv_state.astype(dtype)[jnp.newaxis, :, :, :]
             
-            kv_cache_state = replace(
-                kv_cache_state,
+            hybrid_state = replace(
+                hybrid_state,
                 conv_state=new_conv_state,
-                recurrent_state=new_recurrent_state
+                recurrent_state=new_recurrent_state,
             )
         
         # Output is [B, H, T, D] - transpose to [B, T, H, D] for reshaping
@@ -617,10 +682,10 @@ def gated_deltanet_block(
     attn_out = jnp.dot(core_attn_out, params["out_proj"])
     
     if use_cached:
-        return attn_out, kv_cache_state
-    elif kv_cache_state is not None:
+        return attn_out, hybrid_state
+    elif hybrid_state is not None:
         # Prefill mode with cache - return state for decode
-        return attn_out, kv_cache_state
+        return attn_out, hybrid_state
     else:
         # No cache - just return output
         return attn_out
@@ -635,6 +700,8 @@ def full_attention_block(
     kv_cache_state: Optional[KVCacheState] = None,
     is_prefill: bool = True,
     layer_idx: int = 0,
+    attention_metadata: Optional[AttentionMetadata] = None,
+    backend: Optional[InferenceBackend] = None,
 ):
     """Full attention block with optional KV cache support.
     
@@ -687,56 +754,45 @@ def full_attention_block(
     num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
     
     if kv_cache_state is not None:
+        if backend is None:
+            backend = select_backend("pure_jax")
+
         # Transpose K, V back to [B, T, K, H] for cache storage
         k_cache_input = k.transpose(0, 2, 1, 3)  # [B, T, K, H]
         v_cache_input = v.transpose(0, 2, 1, 3)  # [B, T, K, H]
-        
-        # Update KV cache
-        k_cache, v_cache = update_kv_cache(
-            kv_cache_state.k_cache,
-            kv_cache_state.v_cache,
-            kv_cache_state.slot_mapping,
-            k_cache_input,
-            v_cache_input,
-            layer_idx=layer_idx,
+
+        metadata = attention_metadata
+        if metadata is None:
+            metadata_positions = positions[0] if positions.ndim == 3 else positions
+            metadata = backend.build_attention_metadata(
+                positions=metadata_positions,
+                block_tables=kv_cache_state.block_table,
+                seq_lens=kv_cache_state.kv_lens,
+                block_size=config.block_size,
+                is_prefill=is_prefill,
+            )
+        cache_storage = backend.write_kv(
+            layer_id=layer_idx,
+            k=k_cache_input,
+            v=v_cache_input,
+            cache=kv_cache_state.storage,
+            metadata=metadata,
         )
         
-        # Use different attention kernels for prefill vs decode
         # query is currently [batch, num_heads, seq_len, head_dim] (BHTD)
-        # paged_attention expects [batch, seq_len, num_heads, head_dim] (BTNH)
+        # Backend attention expects [batch, seq_len, num_heads, head_dim] (BTNH)
         query_btnh = query.transpose(0, 2, 1, 3)  # [batch, seq_len, num_heads, head_dim]
-        
-        if is_prefill:
-            # Prefill: use standard paged attention (all tokens in slot_mapping)
-            attn_out_btnh = paged_attention(
-                query=query_btnh,  # [batch, seq_len, num_heads, head_dim]
-                k_cache=k_cache,
-                v_cache=v_cache,
-                slot_mapping=kv_cache_state.slot_mapping,
-                kv_lens=kv_cache_state.kv_lens,
-                scale=1.0 / jnp.sqrt(config.head_dim),
-                num_key_value_groups=num_key_value_groups,
-                layer_idx=layer_idx,
-            )
-            # Output is [batch, seq_len, hidden_dim]
-            # Transpose back to [batch, seq_len, hidden_dim] - already correct
-            out = attn_out_btnh
-        else:
-            # Decode: use decode-specific paged attention (attend to all cached tokens)
-            # query_btnh: [batch, 1, num_heads, head_dim]
-            attn_out_btnh = paged_attention_decode(
-                query=query_btnh,  # [batch, 1, num_heads, head_dim]
-                k_cache=k_cache,
-                v_cache=v_cache,
-                block_table=kv_cache_state.block_table,
-                kv_lens=kv_cache_state.kv_lens,
-                block_size=config.block_size,
-                scale=1.0 / jnp.sqrt(config.head_dim),
-                num_key_value_groups=num_key_value_groups,
-                layer_idx=layer_idx,
-            )
-            # Output is [batch, 1, hidden_dim]
-            out = attn_out_btnh
+
+        out = backend.attention(
+            layer_id=layer_idx,
+            query=query_btnh,
+            cache=cache_storage,
+            metadata=metadata,
+            block_size=config.block_size,
+            scale=1.0 / jnp.sqrt(config.head_dim),
+            num_key_value_groups=num_key_value_groups,
+            is_prefill=is_prefill,
+        )
         
         # Reshape out to [batch, seq_len, hidden_dim]
         # For prefill: out is [batch, seq_len, hidden_dim]
@@ -746,8 +802,9 @@ def full_attention_block(
         # Update KV cache state (preserve linear attention states)
         kv_cache_state = replace(
             kv_cache_state,
-            k_cache=k_cache,
-            v_cache=v_cache,
+            k_cache=cache_storage.k_cache,
+            v_cache=cache_storage.v_cache,
+            slot_mapping=metadata.slot_mapping,
         )
     else:
         # No cache - standard attention (for prefill without caching)
@@ -771,7 +828,10 @@ def transformer_block(
     layer_idx=0,
     config=None,
     kv_cache_state=None,
+    attention_metadata: Optional[AttentionMetadata] = None,
+    hybrid_state: Optional[HybridLayerState] = None,
     is_prefill=True,
+    backend: Optional[InferenceBackend] = None,
 ):
     """Matches HF Qwen3_5DecoderLayer - applies norms and residuals.
     
@@ -786,7 +846,7 @@ def transformer_block(
         is_prefill: Whether this is prefill
     
     Returns:
-        tuple: (output, updated_kv_cache_state)
+        tuple: (output, updated_kv_cache_state, updated_hybrid_state)
     """
     residual = x
     
@@ -794,20 +854,36 @@ def transformer_block(
     # HF applies input_layernorm before both layer types
     x = rms_norm(x, params["input_norm"], config.rms_norm_eps)
     
+    valid_token_mask = None
+    if attention_metadata is not None and is_prefill:
+        query_lens = jnp.diff(attention_metadata.query_start_loc).astype(jnp.int32)
+        valid_token_mask = jnp.arange(x.shape[1], dtype=jnp.int32)[None, :] < query_lens[:, None]
+
     # Apply attention/linear_attn
     if config.layer_types[layer_idx] == "full_attention":
         x, kv_cache_state = full_attention_block(
-            x, params, positions, mask, config, kv_cache_state, is_prefill, layer_idx=layer_idx
+            x,
+            params,
+            positions,
+            mask,
+            config,
+            kv_cache_state,
+            is_prefill,
+            layer_idx=layer_idx,
+            attention_metadata=attention_metadata,
+            backend=backend,
         )
     else:
         # Linear attention with decode mode support
         result = gated_deltanet_block(
             x, params, positions, config, layer_idx,
             is_prefill=is_prefill,
-            kv_cache_state=kv_cache_state
+            hybrid_state=hybrid_state,
+            valid_token_mask=valid_token_mask,
+            backend=backend,
         )
         if isinstance(result, tuple):
-            x, kv_cache_state = result
+            x, hybrid_state = result
         else:
             x = result
     
@@ -826,7 +902,70 @@ def transformer_block(
     
     x = residual + x
     
-    return x, kv_cache_state
+    return x, kv_cache_state, hybrid_state
+
+
+def forward_step(
+    tokens,
+    params,
+    config,
+    *,
+    positions=None,
+    kv_cache_state: Optional[KVCacheState] = None,
+    attention_metadata: Optional[AttentionMetadata] = None,
+    hybrid_state: Optional[HybridLayerState] = None,
+    is_prefill: bool = True,
+    return_hidden: bool = False,
+    last_logits_only: bool = False,
+    logit_positions: Optional[jnp.ndarray] = None,
+    backend: Optional[InferenceBackend] = None,
+):
+    """Canonical forward step shared by cached and non-cached inference paths."""
+    batch, seq_len = tokens.shape
+    dtype = config.get_dtype()
+    x = params.embed_tokens[tokens].astype(dtype)
+
+    if positions is None:
+        positions_2d = jnp.broadcast_to(jnp.arange(seq_len)[None, :], (batch, seq_len))
+    elif positions.ndim == 3:
+        positions_2d = positions[0]
+    else:
+        positions_2d = positions
+    positions_mrope = jnp.stack([positions_2d, positions_2d, positions_2d], axis=0)
+    mask = causal_mask(seq_len, seq_len)
+
+    for i, lp in enumerate(params.layers):
+        x, kv_cache_state, hybrid_state = transformer_block(
+            x,
+            lp,
+            positions_mrope,
+            mask,
+            i,
+            config,
+            kv_cache_state,
+            attention_metadata=attention_metadata,
+            hybrid_state=hybrid_state,
+            is_prefill=is_prefill,
+            backend=backend,
+        )
+
+    hidden_pre = x
+    x = rms_norm(x, params.norm_weight, config.rms_norm_eps)
+
+    if return_hidden:
+        return hidden_pre, kv_cache_state, hybrid_state
+
+    x = x.astype(jnp.float32)
+    if last_logits_only:
+        if logit_positions is None:
+            x = x[:, -1:, :]
+        else:
+            gather_idx = jnp.clip(logit_positions, 0, seq_len - 1).astype(jnp.int32)
+            gather_idx = gather_idx[:, None, None]
+            gather_idx = jnp.broadcast_to(gather_idx, (batch, 1, x.shape[-1]))
+            x = jnp.take_along_axis(x, gather_idx, axis=1)
+    logits = jnp.dot(x, params.lm_head) if params.lm_head is not None else jnp.dot(x, params.embed_tokens.T)
+    return logits, kv_cache_state, hybrid_state
 
 
 def forward(
@@ -836,94 +975,60 @@ def forward(
     kv_cache_state=None,
     is_prefill=True,
     return_hidden=False,
+    last_logits_only: bool = False,
+    logit_positions: Optional[jnp.ndarray] = None,
+    positions=None,
+    attention_metadata: Optional[AttentionMetadata] = None,
+    hybrid_state: Optional[HybridLayerState] = None,
+    backend: Optional[InferenceBackend] = None,
 ):
-    """Forward pass with optional KV cache.
-    
-    Args:
-        tokens: Input token IDs [batch, seq_len]
-        params: Model parameters
-        config: Model config
-        kv_cache_state: Optional KV cache state (None for no cache)
-        is_prefill: Whether this is prefill vs decode
-        return_hidden: If True, return pre-norm hidden states (for MTP)
-    
-    Returns:
-        tuple: (logits, updated_kv_cache_state) or (pre_norm_hidden, kv_cache_state)
-    """
-    batch, seq_len = tokens.shape
-    # Cast embeddings to target dtype (bfloat16 for CPU/CUDA, float16 for Metal)
-    dtype = config.get_dtype()
-    x = params.embed_tokens[tokens].astype(dtype)
-    
-    # Create 3D position IDs for mrope: (3, batch, seq_len)
-    positions_1d = jnp.broadcast_to(jnp.arange(seq_len)[None, :], (batch, seq_len))
-    positions = jnp.stack([positions_1d, positions_1d, positions_1d], axis=0)
-    
-    mask = causal_mask(seq_len, seq_len)
-    
-    # FIX: Initialize linear attention states during prefill
-    if is_prefill and kv_cache_state is not None:
-        kv_cache_state = init_linear_attention_states(kv_cache_state, config, batch_size=batch)
-    
-    for i, lp in enumerate(params.layers):
-        x, kv_cache_state = transformer_block(
-            x, lp, positions, mask, i, config, kv_cache_state, is_prefill
+    """Compatibility wrapper over the canonical forward step."""
+    if is_prefill and kv_cache_state is not None and hybrid_state is None:
+        kv_cache_state = init_linear_attention_states(
+            kv_cache_state,
+            config,
+            batch_size=tokens.shape[0],
         )
-    
-    # Save pre-norm hidden for MTP
-    hidden_pre = x
-    x = rms_norm(x, params.norm_weight, config.rms_norm_eps)
-    
-    if return_hidden:
-        # Return pre-norm hidden state for MTP (mlx-lm convention)
-        # MTP will apply its own pre_fc_norm_hidden on top of this
-        return hidden_pre, kv_cache_state
-    
-    # Cast to float32 for logits to match HF output
-    x = x.astype(jnp.float32)
-    logits = jnp.dot(x, params.lm_head) if params.lm_head is not None else jnp.dot(x, params.embed_tokens.T)
-    
-    return logits, kv_cache_state
+        hybrid_state = kv_cache_state.hybrid_state
+    elif hybrid_state is None and kv_cache_state is not None:
+        hybrid_state = kv_cache_state.hybrid_state
+
+    result, updated_kv_state, updated_hybrid_state = forward_step(
+        tokens,
+        params,
+        config,
+        positions=positions,
+        kv_cache_state=kv_cache_state,
+        attention_metadata=attention_metadata,
+        hybrid_state=hybrid_state,
+        is_prefill=is_prefill,
+        return_hidden=return_hidden,
+        last_logits_only=last_logits_only,
+        logit_positions=logit_positions,
+        backend=backend,
+    )
+
+    if updated_kv_state is not None and updated_hybrid_state is not None:
+        updated_kv_state = replace(
+            updated_kv_state,
+            conv_state=updated_hybrid_state.conv_state,
+            recurrent_state=updated_hybrid_state.recurrent_state,
+        )
+
+    return result, updated_kv_state
 
 
 class Qwen3_5:
     def __init__(self, config, key):
         self.config, self.params = config, init_params(key, config)
     
-    def forward(self, tokens, kv_cache_state=None, is_prefill=True):
-        """Forward pass with optional KV cache.
-        
-        Args:
-            tokens: Input token IDs [batch, seq_len]
-            kv_cache_state: Optional KV cache state
-            is_prefill: Whether this is prefill vs decode
-        
-        Returns:
-            tuple: (logits, updated_kv_cache_state)
-        """
-        batch, seq_len = tokens.shape
-        # Cast embeddings to target dtype (bfloat16 for CPU/CUDA, float16 for Metal)
-        dtype = self.config.get_dtype()
-        x = self.params.embed_tokens[tokens].astype(dtype)
-        
-        # Create 3D position IDs for mrope: (3, batch, seq_len)
-        positions_1d = jnp.broadcast_to(jnp.arange(seq_len)[None, :], (batch, seq_len))
-        positions = jnp.stack([positions_1d, positions_1d, positions_1d], axis=0)
-        
-        mask = causal_mask(seq_len, seq_len)
-        
-        # FIX: Initialize linear attention states during prefill
-        if is_prefill and kv_cache_state is not None:
-            kv_cache_state = init_linear_attention_states(kv_cache_state, self.config, batch_size=batch)
-        
-        for i, lp in enumerate(self.params.layers):
-            x, kv_cache_state = transformer_block(
-                x, lp, positions, mask, i, self.config, kv_cache_state, is_prefill
-            )
-        
-        x = rms_norm(x, self.params.norm_weight, self.config.rms_norm_eps)
-        # Cast to float32 for logits
-        x = x.astype(jnp.float32)
-        logits = jnp.dot(x, self.params.lm_head) if self.params.lm_head is not None else jnp.dot(x, self.params.embed_tokens.T)
-        
-        return logits, kv_cache_state
+    def forward(self, tokens, kv_cache_state=None, is_prefill=True, backend: Optional[InferenceBackend] = None):
+        """Forward pass with optional KV cache."""
+        return forward(
+            tokens,
+            self.params,
+            self.config,
+            kv_cache_state=kv_cache_state,
+            is_prefill=is_prefill,
+            backend=backend,
+        )

@@ -32,6 +32,7 @@ class Qwen3_5Config:
     linear_value_head_dim: int = 128
     linear_conv_kernel_size: int = 4
     linear_chunk_size: int = 64
+    linear_recurrent_prefill_threshold: int = 8
     use_qk_norm_in_gdn: bool = True
     
     # RoPE config
@@ -58,15 +59,21 @@ class Qwen3_5Config:
     # MTP config
     mtp_num_hidden_layers: int = 1
     mtp_use_dedicated_embeddings: bool = False
+    num_speculative_tokens: int = 0
     
     # KV cache config (for vLLM paging)
     block_size: int = 16
     num_kvcache_blocks: int = 1024
+    max_kv_cache_bytes: int = 512 * 1024 * 1024
     
     # Scheduler config
     max_num_seqs: int = 16
     max_num_batched_tokens: int = 2048
     eos: Optional[int] = None
+    prefill_buckets: tuple = field(default_factory=tuple)
+    batch_size_buckets: tuple = field(default_factory=tuple)
+    max_blocks_per_seq: Optional[int] = None
+    jax_execution: str = "eager"
     
     # Vision config (for multimodal)
     vision_depth: int = 12
@@ -111,6 +118,7 @@ class Qwen3_5Config:
             self.linear_value_head_dim,
             self.linear_conv_kernel_size,
             self.linear_chunk_size,
+            self.linear_recurrent_prefill_threshold,
             self.use_qk_norm_in_gdn,
             self.rope_theta,
             self.partial_rotary_factor,
@@ -123,7 +131,9 @@ class Qwen3_5Config:
             self.dtype,
             self.mtp_num_hidden_layers,
             self.mtp_use_dedicated_embeddings,
+            self.num_speculative_tokens,
             self.block_size,
+            self.max_kv_cache_bytes,
         ))
     
     def get_dtype(self):
@@ -223,6 +233,7 @@ class Qwen3_5Config:
             "linear_value_head_dim": self.linear_value_head_dim,
             "linear_conv_kernel_size": self.linear_conv_kernel_size,
             "linear_chunk_size": self.linear_chunk_size,
+            "linear_recurrent_prefill_threshold": self.linear_recurrent_prefill_threshold,
             "use_qk_norm_in_gdn": self.use_qk_norm_in_gdn,
             "rope_theta": self.rope_theta,
             "partial_rotary_factor": self.partial_rotary_factor,
@@ -235,6 +246,12 @@ class Qwen3_5Config:
             "tie_word_embeddings": self.tie_word_embeddings,
             "mtp_num_hidden_layers": self.mtp_num_hidden_layers,
             "mtp_use_dedicated_embeddings": self.mtp_use_dedicated_embeddings,
+            "num_speculative_tokens": self.num_speculative_tokens,
+            "max_kv_cache_bytes": self.max_kv_cache_bytes,
+            "prefill_buckets": self.prefill_buckets,
+            "batch_size_buckets": self.batch_size_buckets,
+            "max_blocks_per_seq": self.max_blocks_per_seq,
+            "jax_execution": self.jax_execution,
         }
     
     @classmethod

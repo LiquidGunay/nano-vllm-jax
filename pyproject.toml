@@ -14,10 +14,23 @@ dependencies = [
     "tqdm>=4.66.4",
     "sentencepiece>=0.2.0",
     "optax>=0.2.2",
-    "torch>=2.0.0",
     "flask>=2.0.0",
     "xxhash>=3.0.0",
     "huggingface_hub>=0.20.0",
+]
+
+[project.optional-dependencies]
+cuda13 = [
+    "jax-cuda13-plugin[with-cuda]>=0.10.0; python_version >= '3.11'",
+    "jax-cuda13-pjrt>=0.10.0; python_version >= '3.11'",
+]
+hf-parity = [
+    "torch>=2.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
 ]
 
 [build-system]

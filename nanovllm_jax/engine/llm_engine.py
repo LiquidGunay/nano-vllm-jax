@@ -6,11 +6,12 @@ from typing import List, Dict, Optional, Union
 from tqdm.auto import tqdm
 
 from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.kv_cache import KVCacheSpec, cap_num_kv_cache_blocks
 from nanovllm_jax.engine.sequence import Sequence, SamplingParams
 from nanovllm_jax.engine.scheduler import Scheduler
 from nanovllm_jax.engine.model_runner import ModelRunner
 from nanovllm_jax.model import ModelParams
-from nanovllm_jax.load_weights import load_weights_from_hf
+from nanovllm_jax.load_weights import load_weights_from_hf_streaming
 
 try:
     from transformers import AutoTokenizer
@@ -38,6 +39,7 @@ class LLMEngine:
     def __init__(
         self, 
         model_path: str,
+        backend: str = "auto",
         **kwargs,
     ):
         """Initialize LLM engine.
@@ -50,6 +52,18 @@ class LLMEngine:
         config_fields = {f.name for f in Qwen3_5Config.__dataclass_fields__.values()}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         self.config = Qwen3_5Config(**config_kwargs)
+        kv_spec = KVCacheSpec(
+            num_layers=self.config.num_hidden_layers,
+            num_blocks=self.config.num_kvcache_blocks,
+            block_size=self.config.block_size,
+            num_kv_heads=self.config.num_key_value_heads,
+            head_dim=self.config.head_dim,
+            dtype=self.config.get_dtype(),
+            max_kv_cache_bytes=self.config.max_kv_cache_bytes,
+        )
+        self.config.num_kvcache_blocks = cap_num_kv_cache_blocks(kv_spec)
+        if self.config.max_blocks_per_seq is None:
+            self.config.max_blocks_per_seq = max(1, self.config.num_kvcache_blocks // self.config.max_num_seqs)
         
         # Initialize tokenizer
         if not HAS_TRANSFORMERS:
@@ -65,12 +79,16 @@ class LLMEngine:
         
         # Initialize model parameters - load from HF (no silent fallback)
         print(f"Loading pretrained weights from {model_path}...")
-        self.params = load_weights_from_hf(model_path, self.config)
+        self.params = load_weights_from_hf_streaming(
+            model_path,
+            self.config,
+            load_mtp=self.config.num_speculative_tokens > 0,
+        )
         print("✓ Using pretrained weights")
         
         # Initialize components
         self.scheduler = Scheduler(self.config)
-        self.model_runner = ModelRunner(self.config, self.params)
+        self.model_runner = ModelRunner(self.config, self.params, backend=backend)
         
         # Register cleanup
         atexit.register(self.exit)
@@ -95,6 +113,13 @@ class LLMEngine:
             # TODO: Use proper tokenizer
             # For now, simple placeholder
             prompt = self._tokenize(prompt)
+
+        if not prompt:
+            raise ValueError("prompt must contain at least one token")
+        if sampling_params.max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if sampling_params.temperature < 0:
+            raise ValueError("temperature must be non-negative")
         
         # Create sequence
         seq = Sequence(prompt, sampling_params)
@@ -109,13 +134,16 @@ class LLMEngine:
             - num_tokens: Number of tokens processed (positive for prefill, negative for decode)
         """
         # Schedule sequences
-        seqs, is_prefill = self.scheduler.schedule()
-        
+        seqs, scheduled_batch = self.scheduler.schedule()
+
         # Run model
-        token_ids = self.model_runner.run(seqs, is_prefill)
-        
+        token_ids = self.model_runner.run(seqs, batch=scheduled_batch)
+
         # Post-process
-        self.scheduler.postprocess(seqs, token_ids)
+        finished_flags = self.scheduler.postprocess(seqs, token_ids)
+        finished_seq_ids = [seq.seq_id for seq, is_finished in zip(seqs, finished_flags) if is_finished]
+        if finished_seq_ids:
+            self.model_runner.release(finished_seq_ids)
         
         # Collect outputs
         outputs = [
@@ -125,10 +153,10 @@ class LLMEngine:
         ]
         
         # Track throughput
-        if is_prefill:
-            num_tokens = sum(len(seq) for seq in seqs)
+        if scheduled_batch.is_prefill:
+            num_tokens = scheduled_batch.num_prefill_tokens
         else:
-            num_tokens = -len(seqs)  # Negative for decode
+            num_tokens = -getattr(self.scheduler, "last_num_generated_tokens", scheduled_batch.num_decode_tokens)
         
         return outputs, num_tokens
 
@@ -157,13 +185,28 @@ class LLMEngine:
         
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        elif len(sampling_params) != len(prompts):
+            raise ValueError("sampling_params length must match prompts length")
+
+        request_inputs: List[List[int]] = []
+        for prompt in prompts:
+            token_ids = self._tokenize(prompt) if isinstance(prompt, str) else list(prompt)
+            if not token_ids:
+                raise ValueError("prompt must contain at least one token")
+            request_inputs.append(token_ids)
+
+        for sp in sampling_params:
+            if sp.max_tokens <= 0:
+                raise ValueError("max_tokens must be positive")
+            if sp.temperature < 0:
+                raise ValueError("temperature must be non-negative")
         
         # Setup progress bar
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         
         # Add all requests
-        for prompt, sp in zip(prompts, sampling_params):
+        for prompt, sp in zip(request_inputs, sampling_params):
             self.add_request(prompt, sp)
         
         # Generation loop

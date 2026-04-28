@@ -8,17 +8,17 @@ from typing import List, Tuple, Dict, Optional, Any
 from functools import partial
 from dataclasses import replace
 
+from nanovllm_jax.backends import select_backend
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.model import ModelParams, full_attention_block, gated_deltanet_block, transformer_block, forward as model_forward
 from nanovllm_jax.engine.sequence import Sequence
 from nanovllm_jax.kv_cache import (
     KVCacheState, 
+    KVCacheSpec,
+    cap_num_kv_cache_blocks,
     init_kv_cache, 
     init_linear_attention_states,
     compute_slot_mapping,
-    update_kv_cache,
-    paged_attention,
-    paged_attention_decode,
 )
 from nanovllm_jax.mtp.mtp_layer import MTPParams, mtp_forward
 from nanovllm_jax.mtp.speculative import generate_draft_tokens, verify_draft_tokens, apply_acceptance
@@ -34,23 +34,47 @@ class ModelRunner:
     - Logits computation and sampling
     """
 
-    def __init__(self, config: Qwen3_5Config, params: ModelParams):
+    def __init__(self, config: Qwen3_5Config, params: ModelParams, backend: str = "auto"):
         self.config = config
         self.params = params
+        self.backend = select_backend(backend)
         self.block_size = config.block_size
         
         # Initialize KV cache state
         max_seqs = getattr(config, 'max_num_seqs', 16)
-        self.max_blocks_per_seq = config.num_kvcache_blocks // max_seqs
+        kv_spec = KVCacheSpec(
+            num_layers=config.num_hidden_layers,
+            num_blocks=config.num_kvcache_blocks,
+            block_size=config.block_size,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            dtype=config.get_dtype(),
+            max_kv_cache_bytes=config.max_kv_cache_bytes,
+        )
+        effective_num_blocks = cap_num_kv_cache_blocks(kv_spec)
+        if effective_num_blocks != config.num_kvcache_blocks:
+            print(
+                "KV cache capped: "
+                f"{config.num_kvcache_blocks} -> {effective_num_blocks} blocks "
+                f"({config.max_kv_cache_bytes} byte cap)"
+            )
+            config.num_kvcache_blocks = effective_num_blocks
+        self.max_blocks_per_seq = getattr(config, "max_blocks_per_seq", None)
+        if self.max_blocks_per_seq is None:
+            self.max_blocks_per_seq = max(1, effective_num_blocks // max_seqs)
+            config.max_blocks_per_seq = self.max_blocks_per_seq
+        self.execution = getattr(config, "jax_execution", "eager")
         
         self.kv_state = init_kv_cache(
-            num_blocks=config.num_kvcache_blocks,
+            num_blocks=effective_num_blocks,
             block_size=config.block_size,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             max_seqs=max_seqs,
             max_blocks_per_seq=self.max_blocks_per_seq,
+            num_layers=config.num_hidden_layers,
             dtype=config.get_dtype(),
+            max_kv_cache_bytes=config.max_kv_cache_bytes,
         )
         
         # Initialize linear attention states
@@ -215,6 +239,8 @@ class ModelRunner:
                             config=config,
                             kv_cache_state=kv_state,
                             is_prefill=is_prefill,
+                            layer_idx=i,
+                            backend=self.backend,
                         )
                     else:
                         if is_prefill:
@@ -271,7 +297,7 @@ class ModelRunner:
         self, 
         seqs: List[Sequence], 
         is_prefill: bool,
-    ) -> List[int]:
+    ) -> List[int | List[int]]:
         """Run model on scheduled sequences.
         
         Args:
@@ -441,6 +467,8 @@ class ModelRunner:
                     config=self.config,
                     kv_cache_state=kv_state,
                     is_prefill=is_prefill,
+                    layer_idx=i,
+                    backend=self.backend,
                 )
             else:
                 # Linear attention with decode mode support
@@ -644,7 +672,7 @@ class ModelRunner:
     def run_speculative(
         self,
         seqs: List[Sequence],
-    ) -> List[int]:
+    ) -> List[int | List[int]]:
         """Run speculative decoding with MTP.
         
         Speculative decoding workflow (K=1):
@@ -820,7 +848,7 @@ class ModelRunner:
         
         return draft_token, draft_logits
     
-    def _verify_draft_token(
+def _verify_draft_token(
         self,
         main_logits: jnp.ndarray,
         draft_logits: jnp.ndarray,
@@ -859,3 +887,776 @@ class ModelRunner:
             # Greedy: accept if draft matches main argmax
             main_token = jnp.argmax(main_logits)
             return int(main_token) == int(draft_token)
+
+
+from nanovllm_jax.engine.model_executor import ModelExecutor
+from nanovllm_jax.engine.scheduled_batch import ScheduledBatch
+from nanovllm_jax.kv_cache import HybridLayerState, KVCacheStorage, init_hybrid_state
+
+
+class CanonicalModelRunner:
+    """Canonical engine runner built around ModelExecutor.forward_step()."""
+
+    def __init__(self, config: Qwen3_5Config, params: ModelParams, backend: str = "auto"):
+        self.config = config
+        self.params = params
+        self.backend = select_backend(backend)
+        self.executor = ModelExecutor(config, params, self.backend)
+        self.block_size = config.block_size
+
+        max_seqs = getattr(config, "max_num_seqs", 16)
+        kv_spec = KVCacheSpec(
+            num_layers=config.num_hidden_layers,
+            num_blocks=config.num_kvcache_blocks,
+            block_size=config.block_size,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            dtype=config.get_dtype(),
+            max_kv_cache_bytes=config.max_kv_cache_bytes,
+        )
+        effective_num_blocks = cap_num_kv_cache_blocks(kv_spec)
+        if effective_num_blocks != config.num_kvcache_blocks:
+            print(
+                "KV cache capped: "
+                f"{config.num_kvcache_blocks} -> {effective_num_blocks} blocks "
+                f"({config.max_kv_cache_bytes} byte cap)"
+            )
+            config.num_kvcache_blocks = effective_num_blocks
+        self.max_blocks_per_seq = getattr(config, "max_blocks_per_seq", None)
+        if self.max_blocks_per_seq is None:
+            self.max_blocks_per_seq = max(1, effective_num_blocks // max_seqs)
+            config.max_blocks_per_seq = self.max_blocks_per_seq
+        self.execution = getattr(config, "jax_execution", "eager")
+
+        self.cache_storage = self.backend.allocate_kv_cache(
+            replace(kv_spec, num_blocks=effective_num_blocks),
+            max_seqs=max_seqs,
+            max_blocks_per_seq=self.max_blocks_per_seq,
+        )
+        self.hybrid_states: Dict[int, HybridLayerState] = {}
+
+        self.kv_state = init_kv_cache(
+            num_blocks=effective_num_blocks,
+            block_size=config.block_size,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            max_seqs=max_seqs,
+            max_blocks_per_seq=self.max_blocks_per_seq,
+            num_layers=config.num_hidden_layers,
+            dtype=config.get_dtype(),
+            max_kv_cache_bytes=config.max_kv_cache_bytes,
+        )
+        self.kv_state = init_linear_attention_states(
+            cache=self.kv_state,
+            config=config,
+            batch_size=1,
+            dtype=config.get_dtype(),
+        )
+        self._empty_hybrid_state = self.kv_state.hybrid_state
+        self._sample_fn = jax.jit(self._sample_logits)
+        self.mtp_enabled = hasattr(params, "mtp_params") and params.mtp_params is not None
+        self.num_speculative_tokens = int(getattr(config, "num_speculative_tokens", 0) or 0)
+        self.mtp1_enabled = self.mtp_enabled and self.num_speculative_tokens == 1
+        self._mtp1_forward_jit = None
+        self._mtp1_token_jit = None
+        self._hidden_token_jit = None
+        self._mtp1_drafts: Dict[int, int] = {}
+        self._mtp1_draft_debug: Dict[int, Dict[str, Any]] = {}
+        self._mtp1_debug_events: List[Dict[str, Any]] = []
+        self.reset_speculative_stats()
+        self._warmup_compiled = False
+
+    def reset_speculative_stats(self):
+        self.speculative_stats = {
+            "enabled": False,
+            "drafts_proposed": 0,
+            "drafts_accepted": 0,
+            "drafts_rejected": 0,
+            "bonus_tokens": 0,
+            "fallback_steps": 0,
+        }
+        if not hasattr(self, "_mtp1_debug_events"):
+            self._mtp1_debug_events = []
+        if not hasattr(self, "_mtp1_draft_debug"):
+            self._mtp1_draft_debug = {}
+        self._mtp1_debug_events.clear()
+        self._mtp1_draft_debug.clear()
+
+    def get_speculative_stats(self) -> Dict[str, int | bool | float]:
+        if not hasattr(self, "speculative_stats"):
+            self.reset_speculative_stats()
+        stats = dict(self.speculative_stats)
+        stats["enabled"] = bool(self.mtp1_enabled)
+        proposed = stats["drafts_proposed"]
+        stats["acceptance_rate"] = stats["drafts_accepted"] / proposed if proposed else 0.0
+        stats["debug_events"] = list(getattr(self, "_mtp1_debug_events", [])[-16:])
+        return stats
+
+    def _speculative_stats(self) -> Dict[str, int | bool]:
+        if not hasattr(self, "speculative_stats"):
+            self.reset_speculative_stats()
+        return self.speculative_stats
+
+    def _mtp1_debug_state(self) -> tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]]]:
+        if not hasattr(self, "_mtp1_draft_debug"):
+            self._mtp1_draft_debug = {}
+        if not hasattr(self, "_mtp1_debug_events"):
+            self._mtp1_debug_events = []
+        return self._mtp1_draft_debug, self._mtp1_debug_events
+
+    def warmup_compilation(self, max_prefill_len: int = 64, max_batch: int = 1):
+        """Compile configured static shapes through the canonical executor path."""
+        if self._warmup_compiled:
+            return
+        if self.execution not in {"decode-jit", "jit"}:
+            self._warmup_compiled = True
+            return
+
+        prefill_buckets = tuple(getattr(self.config, "prefill_buckets", ())) or (max_prefill_len,)
+        batch_buckets = tuple(getattr(self.config, "batch_size_buckets", ())) or (max_batch,)
+
+        for prefill_len in prefill_buckets:
+            if self.execution != "jit":
+                break
+            for batch_size in batch_buckets:
+                batch = self._dummy_batch(batch_size=batch_size, query_len=prefill_len, is_prefill=True)
+                hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
+                _ = self.executor.forward_step_jit(
+                    batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state=hybrid_state,
+                    last_logits_only=True,
+                ).activations.block_until_ready()
+
+        for batch_size in batch_buckets:
+            batch = self._dummy_batch(batch_size=batch_size, query_len=1, is_prefill=False)
+            hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
+            _ = self.executor.forward_step_jit(
+                batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=hybrid_state,
+                last_logits_only=True,
+            ).activations.block_until_ready()
+            self._sample_fn(
+                jnp.zeros((batch_size, self.config.vocab_size), dtype=jnp.float32),
+                jnp.zeros((batch_size,), dtype=jnp.float32),
+            ).block_until_ready()
+        self._warmup_compiled = True
+
+    def _dummy_batch(self, *, batch_size: int, query_len: int, is_prefill: bool) -> ScheduledBatch:
+        block_tables = []
+        for row in range(batch_size):
+            start = row * self.max_blocks_per_seq
+            block_tables.append(list(range(start, start + self.max_blocks_per_seq)))
+        query_lens = [query_len if is_prefill else 1] * batch_size
+        query_start_loc = [0]
+        for qlen in query_lens:
+            query_start_loc.append(query_start_loc[-1] + qlen)
+        positions = [list(range(query_len)) for _ in range(batch_size)]
+        return ScheduledBatch(
+            tokens=jnp.zeros((batch_size, query_len), dtype=jnp.int32),
+            positions=jnp.array(positions, dtype=jnp.int32),
+            seq_ids=jnp.arange(batch_size, dtype=jnp.int32),
+            query_start_loc=jnp.array(query_start_loc, dtype=jnp.int32),
+            is_prefill=is_prefill,
+            num_prefill_tokens=sum(query_lens) if is_prefill else 0,
+            num_decode_tokens=0 if is_prefill else batch_size,
+            block_tables=jnp.array(block_tables, dtype=jnp.int32),
+            seq_lens=jnp.full((batch_size,), query_len if is_prefill else 1, dtype=jnp.int32),
+        )
+
+    def release(self, seq_ids: List[int]):
+        """Release per-sequence hybrid state once a request is finished."""
+        for seq_id in seq_ids:
+            self.hybrid_states.pop(seq_id, None)
+            self._mtp1_drafts.pop(seq_id, None)
+
+    def _build_scheduled_batch(self, seqs: List[Sequence], is_prefill: bool) -> ScheduledBatch:
+        query_tokens: List[List[int]] = []
+        query_positions: List[List[int]] = []
+        block_tables: List[List[int]] = []
+        seq_lens: List[int] = []
+        query_lens: List[int] = []
+
+        max_blocks = max(1, max(len(seq.block_table) for seq in seqs))
+        if self.max_blocks_per_seq is not None:
+            if max_blocks > self.max_blocks_per_seq:
+                raise ValueError(
+                    f"scheduled block table needs {max_blocks} blocks but bucket has {self.max_blocks_per_seq}"
+                )
+            max_blocks = self.max_blocks_per_seq
+        for seq in seqs:
+            if is_prefill:
+                start = seq.num_cached_tokens
+                tokens = seq.token_ids[start:]
+                positions = list(range(start, seq.num_tokens))
+            else:
+                tokens = [seq.last_token]
+                positions = [seq.num_tokens - 1]
+            if not tokens:
+                raise ValueError(f"Scheduled sequence {seq.seq_id} has no executable tokens")
+            query_tokens.append(tokens)
+            query_positions.append(positions)
+            block_tables.append(seq.block_table + [0] * (max_blocks - len(seq.block_table)))
+            seq_lens.append(seq.num_tokens)
+            query_lens.append(len(tokens))
+
+        max_query_len = max(query_lens)
+        query_len_bucket = max_query_len
+        prefill_buckets = tuple(getattr(self.config, "prefill_buckets", ()))
+        if is_prefill and prefill_buckets:
+            query_len_bucket = self._select_bucket(max_query_len, prefill_buckets, "prefill")
+
+        batch_size_bucket = len(seqs)
+        batch_size_buckets = tuple(getattr(self.config, "batch_size_buckets", ()))
+        if batch_size_buckets:
+            batch_size_bucket = self._select_bucket(len(seqs), batch_size_buckets, "batch")
+
+        padded_tokens = [tokens + [0] * (query_len_bucket - len(tokens)) for tokens in query_tokens]
+        padded_positions = [positions + [0] * (query_len_bucket - len(positions)) for positions in query_positions]
+        query_start_loc = [0]
+        for qlen in query_lens:
+            query_start_loc.append(query_start_loc[-1] + qlen)
+        for _ in range(batch_size_bucket - len(seqs)):
+            padded_tokens.append([0] * query_len_bucket)
+            padded_positions.append([0] * query_len_bucket)
+            block_tables.append([0] * max_blocks)
+            seq_lens.append(0)
+            query_lens.append(0)
+            query_start_loc.append(query_start_loc[-1])
+
+        return ScheduledBatch(
+            tokens=jnp.array(padded_tokens, dtype=jnp.int32),
+            positions=jnp.array(padded_positions, dtype=jnp.int32),
+            seq_ids=jnp.array([seq.seq_id for seq in seqs] + [-1] * (batch_size_bucket - len(seqs)), dtype=jnp.int32),
+            query_start_loc=jnp.array(query_start_loc, dtype=jnp.int32),
+            is_prefill=is_prefill,
+            num_prefill_tokens=sum(query_lens) if is_prefill else 0,
+            num_decode_tokens=0 if is_prefill else len(seqs),
+            block_tables=jnp.array(block_tables, dtype=jnp.int32),
+            seq_lens=jnp.array(seq_lens, dtype=jnp.int32),
+        )
+
+    @staticmethod
+    def _select_bucket(size: int, buckets: tuple[int, ...], name: str) -> int:
+        for bucket in sorted(buckets):
+            if size <= bucket:
+                return bucket
+        raise ValueError(f"{name} size {size} exceeds configured buckets {buckets}")
+
+    def _get_hybrid_state(self, seq_id: int) -> HybridLayerState:
+        if seq_id < 0:
+            zero_state = init_hybrid_state(self.config, batch_size=1, dtype=self.config.get_dtype())
+            return zero_state
+        if seq_id not in self.hybrid_states:
+            zero_state = init_hybrid_state(self.config, batch_size=1, dtype=self.config.get_dtype())
+            self.hybrid_states[seq_id] = HybridLayerState(
+                conv_state=zero_state.conv_state[0],
+                recurrent_state=zero_state.recurrent_state[0],
+            )
+        state = self.hybrid_states[seq_id]
+        return HybridLayerState(
+            conv_state=state.conv_state[None, ...] if state.conv_state is not None else None,
+            recurrent_state=state.recurrent_state[None, ...] if state.recurrent_state is not None else None,
+        )
+
+    def _set_hybrid_state(self, seq_id: int, state: HybridLayerState | None):
+        if state is None or seq_id < 0:
+            return
+        self.hybrid_states[seq_id] = HybridLayerState(
+            conv_state=state.conv_state[0] if state.conv_state is not None else None,
+            recurrent_state=state.recurrent_state[0] if state.recurrent_state is not None else None,
+        )
+
+    def _slice_batch(self, batch: ScheduledBatch, idx: int) -> ScheduledBatch:
+        query_len = int(batch.query_lens[idx])
+        return ScheduledBatch(
+            tokens=batch.tokens[idx : idx + 1, :query_len],
+            positions=batch.positions[idx : idx + 1, :query_len],
+            seq_ids=batch.seq_ids[idx : idx + 1],
+            query_start_loc=jnp.array([0, query_len], dtype=jnp.int32),
+            is_prefill=batch.is_prefill,
+            num_prefill_tokens=query_len if batch.is_prefill else 0,
+            num_decode_tokens=0 if batch.is_prefill else 1,
+            block_tables=batch.block_tables[idx : idx + 1],
+            seq_lens=batch.seq_lens[idx : idx + 1],
+        )
+
+    def _batch_hybrid_state(self, batch: ScheduledBatch) -> HybridLayerState:
+        conv_states = []
+        recurrent_states = []
+        for seq_id in [int(x) for x in batch.seq_ids.tolist()]:
+            state = self._get_hybrid_state(seq_id)
+            conv_states.append(state.conv_state[0])
+            recurrent_states.append(state.recurrent_state[0])
+        return HybridLayerState(
+            conv_state=jnp.stack(conv_states, axis=0),
+            recurrent_state=jnp.stack(recurrent_states, axis=0),
+        )
+
+    def _store_batch_hybrid_state(self, batch: ScheduledBatch, state: HybridLayerState | None):
+        if state is None:
+            return
+        for row, seq_id in enumerate([int(x) for x in batch.seq_ids.tolist()]):
+            if seq_id < 0:
+                continue
+            self.hybrid_states[seq_id] = HybridLayerState(
+                conv_state=state.conv_state[row] if state.conv_state is not None else None,
+                recurrent_state=state.recurrent_state[row] if state.recurrent_state is not None else None,
+            )
+
+    def _refresh_kv_snapshot(self, batch: ScheduledBatch, hybrid_state: HybridLayerState | None = None):
+        if hybrid_state is None:
+            hybrid_state = self._batch_hybrid_state(batch)
+        metadata = self.backend.build_attention_metadata(
+            positions=batch.positions,
+            block_tables=batch.block_tables,
+            seq_lens=batch.seq_lens,
+            block_size=self.config.block_size,
+            is_prefill=batch.is_prefill,
+            query_start_loc=batch.query_start_loc,
+            num_prefill_tokens=batch.num_prefill_tokens,
+            num_decode_tokens=batch.num_decode_tokens,
+        )
+        self.kv_state = KVCacheState(
+            k_cache=self.cache_storage.k_cache,
+            v_cache=self.cache_storage.v_cache,
+            block_table=batch.block_tables,
+            kv_lens=batch.seq_lens,
+            slot_mapping=metadata.slot_mapping,
+            conv_state=hybrid_state.conv_state,
+            recurrent_state=hybrid_state.recurrent_state,
+        )
+
+    def _step_fn(self, batch: ScheduledBatch):
+        execution = getattr(self, "execution", "eager")
+        if execution == "jit" or (execution == "decode-jit" and not batch.is_prefill):
+            return self.executor.forward_step_jit
+        return self.executor.forward_step
+
+    def _mtp1_verifier_step_fn(self):
+        if getattr(self, "execution", "eager") in {"decode-jit", "jit"}:
+            return self.executor.forward_step_jit
+        return self.executor.forward_step
+
+    def _logits_from_hidden(self, hidden: jnp.ndarray) -> jnp.ndarray:
+        hidden = self._final_norm_hidden(hidden)
+        if self.params.lm_head is not None:
+            return jnp.dot(hidden, self.params.lm_head)
+        return jnp.dot(hidden, self.params.embed_tokens.T)
+
+    def _final_norm_hidden(self, hidden: jnp.ndarray) -> jnp.ndarray:
+        from nanovllm_jax.layers import rms_norm
+
+        return rms_norm(hidden, self.params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+
+    def _hidden_for_mtp(self, hidden: jnp.ndarray) -> jnp.ndarray:
+        if getattr(self, "mtp_hidden_source", "final_normed") == "final_normed":
+            return self._final_norm_hidden(hidden)
+        return hidden
+
+    @staticmethod
+    def _topk_debug(logits: jnp.ndarray, k: int = 5) -> Dict[str, List[int] | List[float]]:
+        values, ids = jax.lax.top_k(logits.astype(jnp.float32), min(k, logits.shape[-1]))
+        return {
+            "ids": [int(x) for x in ids.tolist()],
+            "values": [float(x) for x in values.tolist()],
+        }
+
+    @staticmethod
+    def _token_rank(logits: jnp.ndarray, token_id: int) -> int:
+        logits = logits.astype(jnp.float32)
+        token_logit = logits[token_id]
+        return int((jnp.sum(logits > token_logit) + 1).item())
+
+    def _mtp1_params_tree(self):
+        params = self.params.mtp_params
+        return (
+            params.eh_proj,
+            tuple(params.layers),
+            params.pre_fc_norm_hidden,
+            params.pre_fc_norm_embedding,
+            params.final_norm,
+            params.lm_head,
+        )
+
+    @staticmethod
+    def _mtp1_params_from_tree(tree) -> MTPParams:
+        eh_proj, layers, pre_fc_norm_hidden, pre_fc_norm_embedding, final_norm, lm_head = tree
+        return MTPParams(
+            eh_proj=eh_proj,
+            layers=list(layers),
+            pre_fc_norm_hidden=pre_fc_norm_hidden,
+            pre_fc_norm_embedding=pre_fc_norm_embedding,
+            final_norm=final_norm,
+            lm_head=lm_head,
+        )
+
+    def _mtp1_logits(self, hidden_state: jnp.ndarray, token_ids: jnp.ndarray, positions: jnp.ndarray) -> jnp.ndarray:
+        def forward(hidden_arg, token_arg, position_arg, embed_tokens_arg, mtp_params_tree):
+            logits, _ = mtp_forward(
+                hidden_state=hidden_arg,
+                next_token_ids=token_arg,
+                embed_tokens=embed_tokens_arg,
+                params=self._mtp1_params_from_tree(mtp_params_tree),
+                config=self.config,
+                positions=position_arg,
+            )
+            return logits
+
+        mtp_params_tree = self._mtp1_params_tree()
+        if getattr(self, "mtp_compile_draft", False) and getattr(self, "execution", "eager") in {"decode-jit", "jit"}:
+            if getattr(self, "_mtp1_forward_jit", None) is None:
+                self._mtp1_forward_jit = jax.jit(forward)
+            return self._mtp1_forward_jit(hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
+        return forward(hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
+
+    def _mtp1_draft_token(self, hidden_state: jnp.ndarray, token_ids: jnp.ndarray, positions: jnp.ndarray) -> jnp.ndarray:
+        def forward(hidden_arg, token_arg, position_arg, embed_tokens_arg, mtp_params_tree):
+            logits, _ = mtp_forward(
+                hidden_state=hidden_arg,
+                next_token_ids=token_arg,
+                embed_tokens=embed_tokens_arg,
+                params=self._mtp1_params_from_tree(mtp_params_tree),
+                config=self.config,
+                positions=position_arg,
+            )
+            return jnp.argmax(logits[:, 0], axis=-1).astype(jnp.int32)
+
+        mtp_params_tree = self._mtp1_params_tree()
+        if getattr(self, "mtp_compile_draft", False) and getattr(self, "execution", "eager") in {"decode-jit", "jit"}:
+            if getattr(self, "_mtp1_token_jit", None) is None:
+                self._mtp1_token_jit = jax.jit(forward)
+            return self._mtp1_token_jit(hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
+        return forward(hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
+
+    def _greedy_tokens_from_hidden(self, hidden: jnp.ndarray) -> jnp.ndarray:
+        from nanovllm_jax.layers import rms_norm
+
+        output_weight = self.params.lm_head if self.params.lm_head is not None else self.params.embed_tokens.T
+
+        def forward(hidden_arg, norm_weight_arg, output_weight_arg):
+            hidden_norm = rms_norm(hidden_arg, norm_weight_arg, self.config.rms_norm_eps).astype(jnp.float32)
+            logits = jnp.dot(hidden_norm, output_weight_arg)
+            return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+        if getattr(self, "execution", "eager") in {"decode-jit", "jit"}:
+            if getattr(self, "_hidden_token_jit", None) is None:
+                self._hidden_token_jit = jax.jit(forward)
+            return self._hidden_token_jit(hidden, self.params.norm_weight, output_weight)
+        return forward(hidden, self.params.norm_weight, output_weight)
+
+    @staticmethod
+    def _last_query_activations(activations: jnp.ndarray, batch: ScheduledBatch, num_seqs: int) -> jnp.ndarray:
+        query_lens = batch.query_lens[:num_seqs]
+        gather_idx = jnp.clip(query_lens - 1, 0, activations.shape[1] - 1).astype(jnp.int32)
+        return activations[jnp.arange(num_seqs), gather_idx]
+
+    def _run_main_and_sample(
+        self,
+        seqs: List[Sequence],
+        batch: ScheduledBatch,
+        *,
+        seed_mtp1: bool,
+    ) -> List[int]:
+        hybrid_state = self._batch_hybrid_state(batch)
+        output = self._step_fn(batch)(
+            batch,
+            cache_storage=self.cache_storage,
+            hybrid_state=hybrid_state,
+            return_hidden=seed_mtp1,
+            last_logits_only=not seed_mtp1,
+        )
+        self.cache_storage = output.cache_storage
+        self._store_batch_hybrid_state(batch, output.hybrid_state)
+        self._refresh_kv_snapshot(batch, output.hybrid_state)
+
+        if seed_mtp1:
+            last_hidden = self._last_query_activations(output.activations, batch, len(seqs))
+            last_logits = self._logits_from_hidden(last_hidden[:, None, :])[:, 0]
+        else:
+            last_hidden = None
+            last_logits = output.activations[: len(seqs), 0]
+
+        temperatures = jnp.array([seq.temperature for seq in seqs], dtype=jnp.float32)
+        token_ids = self._sample_fn(last_logits, temperatures)
+        token_list = [int(token_id) for token_id in token_ids.tolist()]
+        if seed_mtp1 and last_hidden is not None:
+            self._seed_mtp1_drafts(seqs, self._hidden_for_mtp(last_hidden[:, None, :])[:, 0], token_list)
+        return token_list
+
+    def _seed_mtp1_drafts(
+        self,
+        seqs: List[Sequence],
+        hidden: jnp.ndarray,
+        confirmed_token_ids: List[int],
+    ):
+        for row, seq in enumerate(seqs):
+            confirmed_token_id = confirmed_token_ids[row]
+            position = seq.num_tokens
+            if getattr(self, "mtp_token_source", "generated") == "current":
+                confirmed_token_id = seq.last_token
+                position = seq.num_tokens - 1
+            self._seed_mtp1_draft(
+                seq,
+                hidden[row],
+                confirmed_token_id,
+                position=position,
+            )
+
+    def _seed_mtp1_draft(
+        self,
+        seq: Sequence,
+        hidden: jnp.ndarray,
+        confirmed_token_id: int,
+        position: int,
+    ):
+        if not self.mtp1_enabled or seq.temperature != 0:
+            self._mtp1_drafts.pop(seq.seq_id, None)
+            self._mtp1_debug_state()[0].pop(seq.seq_id, None)
+            return
+        if seq.num_completion_tokens + 1 >= seq.max_tokens:
+            self._mtp1_drafts.pop(seq.seq_id, None)
+            self._mtp1_debug_state()[0].pop(seq.seq_id, None)
+            return
+
+        hidden_input = hidden[None, None, :]
+        token_input = jnp.array([[confirmed_token_id]], dtype=jnp.int32)
+        position_input = jnp.array([[position + int(getattr(self, "mtp_position_offset", 0))]], dtype=jnp.int32)
+        if getattr(self, "mtp_debug", False):
+            draft_logits = self._mtp1_logits(
+                hidden_state=hidden_input,
+                token_ids=token_input,
+                positions=position_input,
+            )
+            draft_vector = draft_logits[0, 0]
+            draft_token = int(jnp.argmax(draft_vector))
+        else:
+            draft_token = int(self._mtp1_draft_token(
+                hidden_state=hidden_input,
+                token_ids=token_input,
+                positions=position_input,
+            )[0])
+        self._mtp1_drafts[seq.seq_id] = draft_token
+        if getattr(self, "mtp_debug", False):
+            draft_debug, _ = self._mtp1_debug_state()
+            draft_debug[seq.seq_id] = {
+                "confirmed_token_id": int(confirmed_token_id),
+                "draft_token": draft_token,
+                "position": int(position),
+                "position_offset": int(getattr(self, "mtp_position_offset", 0)),
+                "token_source": str(getattr(self, "mtp_token_source", "generated")),
+                "hidden_source": str(getattr(self, "mtp_hidden_source", "final_normed")),
+                "mtp_top": self._topk_debug(draft_vector),
+            }
+        self._speculative_stats()["drafts_proposed"] += 1
+
+    def _can_run_mtp1(self, seqs: List[Sequence], batch: ScheduledBatch) -> bool:
+        if not self.mtp1_enabled or batch.is_prefill or len(seqs) != 1:
+            if self.mtp1_enabled and not batch.is_prefill:
+                self._speculative_stats()["fallback_steps"] += 1
+            return False
+        seq = seqs[0]
+        if seq.temperature != 0 or seq.seq_id not in self._mtp1_drafts:
+            self._speculative_stats()["fallback_steps"] += 1
+            return False
+        if seq.num_completion_tokens + 2 > seq.max_tokens:
+            self._speculative_stats()["fallback_steps"] += 1
+            return False
+        if int(batch.query_lens[0]) != 1:
+            self._speculative_stats()["fallback_steps"] += 1
+            return False
+        required_blocks = (seq.num_tokens + 1 + self.block_size - 1) // self.block_size
+        can_run = len(seq.block_table) >= required_blocks
+        if not can_run:
+            self._speculative_stats()["fallback_steps"] += 1
+        return can_run
+
+    def _mtp1_verification_batch(self, seq: Sequence, batch: ScheduledBatch, draft_token: int) -> ScheduledBatch:
+        return ScheduledBatch(
+            tokens=jnp.array([[seq.last_token, draft_token]], dtype=jnp.int32),
+            positions=jnp.array([[seq.num_tokens - 1, seq.num_tokens]], dtype=jnp.int32),
+            seq_ids=jnp.array([seq.seq_id], dtype=jnp.int32),
+            query_start_loc=jnp.array([0, 2], dtype=jnp.int32),
+            is_prefill=True,
+            num_prefill_tokens=2,
+            num_decode_tokens=0,
+            block_tables=batch.block_tables[:1],
+            seq_lens=jnp.array([seq.num_tokens + 1], dtype=jnp.int32),
+        )
+
+    def _run_mtp1(self, seqs: List[Sequence], batch: ScheduledBatch) -> List[List[int] | int]:
+        seq = seqs[0]
+        draft_token = self._mtp1_drafts.pop(seq.seq_id)
+        draft_debug_by_seq, debug_events = self._mtp1_debug_state()
+        draft_debug = draft_debug_by_seq.pop(seq.seq_id, {}) if getattr(self, "mtp_debug", False) else {}
+        verifier_batch = self._mtp1_verification_batch(seq, batch, draft_token)
+        hybrid_state = self._batch_hybrid_state(verifier_batch)
+        use_debug = getattr(self, "mtp_debug", False)
+        use_fused_step = (
+            not use_debug
+            and getattr(self, "execution", "eager") in {"decode-jit", "jit"}
+            and hasattr(self.executor, "mtp1_greedy_step_jit")
+        )
+        if use_fused_step:
+            output = self.executor.mtp1_greedy_step_jit(
+                verifier_batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=hybrid_state,
+                draft_token=draft_token,
+                next_mtp_position=seq.num_tokens + 1 + int(getattr(self, "mtp_position_offset", 0)),
+                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+            )
+            logits = None
+            verify_logits = None
+            token_ids = None
+            target_token = int(output.target_token.item())
+            accepted = bool(output.accepted.item())
+        else:
+            output = self._mtp1_verifier_step_fn()(
+                verifier_batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=hybrid_state,
+                return_hidden=True,
+                last_logits_only=False,
+            )
+            use_direct_tokens = not use_debug and hasattr(self, "params")
+            if use_direct_tokens:
+                token_ids = self._greedy_tokens_from_hidden(output.activations)
+                logits = None
+                verify_logits = None
+                target_token = int(token_ids[0, 0])
+            else:
+                token_ids = None
+                logits = self._logits_from_hidden(output.activations)
+                verify_logits = logits[0, 0]
+                target_token = int(jnp.argmax(verify_logits))
+            accepted = target_token == draft_token
+        if use_debug:
+            logits = self._logits_from_hidden(output.activations)
+            verify_logits = logits[0, 0]
+            target_token = int(jnp.argmax(verify_logits))
+            accepted = target_token == draft_token
+            event = {
+                **draft_debug,
+                "target_token": target_token,
+                "accepted": bool(accepted),
+                "draft_rank_in_main": self._token_rank(verify_logits, draft_token),
+                "main_top": self._topk_debug(verify_logits),
+                "target_in_mtp_top5": target_token in draft_debug.get("mtp_top", {}).get("ids", []),
+            }
+            debug_events.append(event)
+        if not accepted:
+            self._speculative_stats()["drafts_rejected"] += 1
+            return self._run_main_and_sample(seqs, batch, seed_mtp1=True)
+
+        stats = self._speculative_stats()
+        stats["drafts_accepted"] += 1
+        stats["bonus_tokens"] += 1
+        self.cache_storage = output.cache_storage
+        self._store_batch_hybrid_state(verifier_batch, output.hybrid_state)
+        self._refresh_kv_snapshot(verifier_batch, output.hybrid_state)
+
+        if use_fused_step:
+            bonus_token = int(output.bonus_token.item())
+            if self.mtp1_enabled and seq.temperature == 0 and seq.num_completion_tokens + 1 < seq.max_tokens:
+                self._mtp1_drafts[seq.seq_id] = int(output.next_draft_token.item())
+                self._speculative_stats()["drafts_proposed"] += 1
+            else:
+                self._mtp1_drafts.pop(seq.seq_id, None)
+                self._mtp1_debug_state()[0].pop(seq.seq_id, None)
+        elif logits is not None:
+            bonus_token = int(self._sample_fn(logits[:, 1], jnp.array([seq.temperature], dtype=jnp.float32))[0])
+            self._seed_mtp1_draft(
+                seq,
+                self._hidden_for_mtp(output.activations[:, 1:2, :])[0, 0],
+                bonus_token,
+                position=seq.num_tokens + 1,
+            )
+        else:
+            bonus_token = int(token_ids[0, 1])
+            self._seed_mtp1_draft(
+                seq,
+                self._hidden_for_mtp(output.activations[:, 1:2, :])[0, 0],
+                bonus_token,
+                position=seq.num_tokens + 1,
+            )
+        return [[draft_token, bonus_token]]
+
+    def run(
+        self,
+        seqs: List[Sequence],
+        is_prefill: bool | None = None,
+        *,
+        batch: ScheduledBatch | None = None,
+    ) -> List[int | List[int]]:
+        """Run one engine step through the canonical executor path."""
+        if batch is None:
+            if is_prefill is None:
+                raise ValueError("Either is_prefill or batch must be provided")
+            batch = self._build_scheduled_batch(seqs, is_prefill=is_prefill)
+
+        if self._can_run_mtp1(seqs, batch):
+            return self._run_mtp1(seqs, batch)
+        return self._run_main_and_sample(seqs, batch, seed_mtp1=self.mtp1_enabled)
+
+    def forward(
+        self,
+        input_ids: jnp.ndarray,
+        positions: jnp.ndarray,
+        kv_state: KVCacheState,
+        is_prefill: bool,
+    ) -> jnp.ndarray:
+        batch = ScheduledBatch(
+            tokens=input_ids,
+            positions=positions,
+            seq_ids=jnp.arange(input_ids.shape[0], dtype=jnp.int32),
+            query_start_loc=jnp.arange(input_ids.shape[0] + 1, dtype=jnp.int32) * input_ids.shape[1],
+            is_prefill=is_prefill,
+            num_prefill_tokens=int(input_ids.size) if is_prefill else 0,
+            num_decode_tokens=0 if is_prefill else input_ids.shape[0],
+            block_tables=kv_state.block_table[: input_ids.shape[0]],
+            seq_lens=kv_state.kv_lens[: input_ids.shape[0]],
+        )
+        output = self.executor.forward_step(
+            batch,
+            cache_storage=KVCacheStorage(kv_state.k_cache, kv_state.v_cache),
+            hybrid_state=kv_state.hybrid_state,
+        )
+        return output.activations
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _sample_logits(
+        self,
+        logits: jnp.ndarray,
+        temperatures: jnp.ndarray,
+    ) -> jnp.ndarray:
+        import jax.lax as lax
+
+        def sample_single(logit, temp):
+            def greedy(_):
+                return jnp.argmax(logit)
+
+            def sample(_):
+                scaled = logit / temp
+                return jax.random.categorical(jax.random.PRNGKey(0), scaled)
+
+            return lax.cond(temp == 0.0, greedy, sample, None)
+
+        return jax.vmap(sample_single)(logits, temperatures)
+
+    def call(self, method: str, *args):
+        if method == "run":
+            return self.run(*args)
+        if method == "exit":
+            return None
+        raise ValueError(f"Unknown method: {method}")
+
+    def run_speculative(
+        self,
+        seqs: List[Sequence],
+    ) -> List[int | List[int]]:
+        return self.run(seqs, is_prefill=False)
+
+
+ModelRunner = CanonicalModelRunner

@@ -160,6 +160,20 @@ def init_mtp_layer(key: jax.Array, config: Qwen3_5Config) -> Dict[str, jnp.ndarr
         "k_norm": jnp.ones(config.head_dim),
         "input_norm": jnp.ones(config.hidden_size),
         "post_attn_norm": jnp.ones(config.hidden_size),
+
+        # Feed-forward block
+        "gate_proj": jax.random.normal(
+            keys[4],
+            (config.hidden_size, config.intermediate_size),
+        ) * (config.hidden_size ** -0.5),
+        "up_proj": jax.random.normal(
+            keys[5],
+            (config.hidden_size, config.intermediate_size),
+        ) * (config.hidden_size ** -0.5),
+        "down_proj": jax.random.normal(
+            keys[6],
+            (config.intermediate_size, config.hidden_size),
+        ) * (config.intermediate_size ** -0.5),
     }
 
 

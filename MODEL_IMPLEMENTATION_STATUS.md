@@ -155,6 +155,90 @@
 
 ---
 
+## 2026-04-28 13:55:00 - Static Execution, Server Surface, and MTP1 Handoff
+
+### Current Repository State
+- The canonical inference path now routes through `ModelExecutor.forward_step()`.
+- Static-shape scheduled batches are represented by `ScheduledBatch`, with padded tokens/positions and explicit `query_start_loc`.
+- Backend responsibilities are separated behind `nanovllm_jax/backends.py`, including paged full-attention metadata, KV writes, and Gated DeltaNet backend calls.
+- The engine supports bucketed prefill/decode execution through `jax_execution` modes:
+  - `eager`: normal Python/JAX execution
+  - `decode-jit`: compile decode steps only
+  - `jit`: compile prefill and decode bucket shapes
+- `server.py` exposes a basic pedagogical serving surface with health, config, stats, and generation endpoints. It intentionally stays simple rather than growing a production API layer.
+- `README.md` includes the current server startup and benchmark commands.
+
+### KV Cache and Hybrid State
+- KV storage is separated from runtime metadata with `KVCacheStorage`, `KVCacheState`, and `AttentionMetadata`.
+- Block-table based paged attention works with non-identity block tables in the pure JAX backend.
+- Hybrid Qwen3.5 state for linear attention is tracked per sequence outside the full-attention KV cache.
+- Cached short suffix prefill for linear attention is recurrent-state-aware, which fixed the MTP verifier path that needs a two-token cached suffix.
+- `linear_recurrent_prefill_threshold` controls when short cached linear-attention suffixes use recurrent decode-style state updates.
+
+### MTP1 Speculative Decoding
+- Qwen3.5 MTP weights are loaded from checkpoint when `num_speculative_tokens=1`.
+- The implementation currently supports greedy K=1 MTP speculative decoding.
+- Correctness issue fixed: the verifier now uses a cache/state path that matches sequential decode, so acceptance is no longer stuck at zero.
+- The runner tracks speculative stats:
+  - `drafts_proposed`
+  - `drafts_accepted`
+  - `drafts_rejected`
+  - `bonus_tokens`
+  - `fallback_steps`
+  - `acceptance_rate`
+- Debug mode can record MTP/main top-k and draft rank diagnostics, but it is off by default because it adds synchronization and extra work.
+- A fused JIT accepted-path helper, `ModelExecutor.mtp1_greedy_step_jit()`, now combines verifier forward, greedy target/bonus selection, and next MTP draft generation in one compiled call for `decode-jit`/`jit`.
+
+### Validation Completed
+- Local boundary/cache tests passed after the latest changes:
+  - `uv run pytest -q tests/test_backend_boundaries.py tests/test_kv_cache.py`
+  - Result: `38 passed, 9 warnings`
+- The warnings are existing `tests/test_kv_cache.py` tests returning bools instead of using `assert`, plus SWIG deprecation warnings.
+- Real-checkpoint GPU smoke benchmarks on the GTX 1660 Ti used the existing HuggingFace cache only; no extra model copy was created.
+- Representative `jit`, float16, Qwen3.5-0.8B MTP1 results for 16 generated tokens:
+  - Numeric prompt: correct, acceptance `7/9 = 77.8%`, warmed MTP roughly matched baseline (`~8.9 tok/s` vs `~9.1 tok/s` in the last run)
+  - France prompt: correct, acceptance `4/12 = 33.3%`, MTP remained slower
+  - Story prompt: correct, acceptance `7/9 = 77.8%`, MTP remained slower than baseline
+
+### Performance Diagnosis
+- The main correctness problems are resolved; the remaining issue is performance.
+- K=1 MTP has a limited speedup ceiling because each speculative step still pays:
+  - a two-token verifier path
+  - at least one target vocab projection
+  - an MTP vocab projection
+  - fallback main-model work on rejection
+- Qwen3.5-0.8B has a small transformer body relative to its large vocabulary projection, so extra vocab projections can erase the saved target forward on a small GPU.
+- JAX compilation happens on the host CPU even when the executable targets the GPU. In-memory compiled functions are reused only inside the same Python process. Separate `uv run python ...` invocations should be expected to recompile unless a persistent JAX compilation cache is explicitly configured.
+- Persistent JAX compilation caching was not enabled because it can consume disk and should be configured deliberately on the larger machine.
+
+### Disk and Process Notes
+- No nano-vLLM server or benchmark process was left running at handoff.
+- `/tmp` was intentionally not touched.
+- `uv` cache was cleaned and explicitly configured to use shared global cache path `/root/.cache/uv`.
+- The redundant `.venv-cuda13` environment was removed locally; the active `.venv` remains.
+
+### Recommended Next Steps on Larger GPU/TPU
+1. Run longer single-process benchmarks so compilation is paid once and warmed repeats are meaningful.
+2. Consider enabling a bounded persistent JAX compilation cache on the larger machine, with an explicit cache directory and cleanup policy.
+3. Add benchmark instrumentation that separates:
+   - prefill time
+   - first compile time
+   - warmed baseline decode time
+   - warmed MTP accepted-step time
+   - warmed MTP rejected-step time
+   - MTP draft-head time
+   - verifier time
+4. Benchmark `decode-jit` and `jit` separately on the larger device.
+5. Keep MTP1 as the correctness baseline, then evaluate whether K>1 speculative decoding is worth implementing. K>1 should only be added after the K=1 accepted/rejected step costs are measured clearly.
+6. For TPU, compare against MaxText/vLLM TPU patterns:
+   - static shape buckets
+   - device-side control where practical
+   - minimized host synchronization
+   - long-lived process/server execution rather than repeated process startup
+7. Clean up old compatibility code once the canonical executor path is stable enough to be the only supported runtime path.
+
+---
+
 ## 2026-04-23 23:30:00 - MTP Speculative Decoding Complete
 
 ### Changes Made
@@ -503,4 +587,3 @@ Speculative decoding with JIT also works (test_spec_decode_jit.py runs successfu
 - Moved 22 MD files to `docs/archive/`
 - Kept only essential docs: PLAN.md, INDEX.md, README.md, MODEL_IMPLEMENTATION_STATUS.md
 - Updated INDEX.md with new structure
-

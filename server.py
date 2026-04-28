@@ -1,388 +1,323 @@
 #!/usr/bin/env python3
-"""
-Simple API server for nano-vllm-jax with resource limiting.
+"""Flask API server backed by the canonical LLMEngine path."""
 
-Usage:
-    python server.py --port 8080 --memory-limit 4G --cpu-percent 50
+from __future__ import annotations
 
-The server will:
-1. Load model and pre-compile during startup (can take 2-5 min)
-2. Limit memory usage via JAX memory_fraction
-3. Limit CPU usage via nice priority (Unix only)
-"""
-
-import os
-os.environ['JAX_PLATFORMS'] = 'cpu'
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1'
-
-import sys
 import argparse
+import os
+from threading import Lock
 import time
-import json
-import resource
-from functools import lru_cache
-from dataclasses import replace
+import traceback
+from typing import Any
 
-import jax
-import jax.numpy as jnp
-import numpy as np
-from flask import Flask, request, jsonify
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 
-from nanovllm_jax.config import Qwen3_5Config
-from nanovllm_jax.load_weights_float16 import load_weights_from_hf_float16
-from nanovllm_jax.model import ModelParams
-from nanovllm_jax.model_simple_jit import forward_simple_jit
-from nanovllm_jax.kv_cache import init_kv_cache, init_linear_attention_states, KVCacheState
+from flask import Flask, jsonify, request
+
+from nanovllm_jax.engine.llm_engine import LLMEngine
+from nanovllm_jax.engine.sequence import SamplingParams
+
 
 app = Flask(__name__)
-
-params = None
-config = None
-tokenizer = None
-compiled_prefill = None
-compiled_decode = None
+app.config.setdefault("MAX_TOKENS_DEFAULT", 16)
+engine: LLMEngine | None = None
+engine_lock = Lock()
 
 
-def limit_memory(memory_gb: float):
-    """Limit process memory usage."""
-    max_bytes = int(memory_gb * 1024 * 1024 * 1024)
-    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (max_bytes, hard))
-        print(f"Memory limit set to {memory_gb}GB")
-    except Exception as e:
-        print(f"Warning: Could not set memory limit: {e}")
+def _parse_buckets(value: str) -> tuple[int, ...]:
+    if not value:
+        return ()
+    buckets = tuple(int(part) for part in value.split(",") if part.strip())
+    if any(bucket <= 0 for bucket in buckets):
+        raise ValueError("bucket sizes must be positive integers")
+    return buckets
 
 
-def limit_cpu(nice_value: int = 10):
-    """Lower process priority to reduce CPU contention."""
-    try:
-        os.nice(nice_value)
-        print(f"CPU priority set to nice={nice_value}")
-    except Exception as e:
-        print(f"Warning: Could not set CPU priority: {e}")
+def _validate_server_args(args):
+    prefill_buckets = _parse_buckets(args.prefill_buckets)
+    batch_size_buckets = _parse_buckets(args.batch_size_buckets)
+    if batch_size_buckets and max(batch_size_buckets) > args.max_num_seqs:
+        raise ValueError("--batch-size-buckets cannot exceed --max-num-seqs")
+    if getattr(args, "max_tokens_default", app.config["MAX_TOKENS_DEFAULT"]) <= 0:
+        raise ValueError("--max-tokens-default must be positive")
+    return prefill_buckets, batch_size_buckets
 
 
-def get_layer_params(jax_weights, layer_idx, config):
-    """Extract layer parameters from JAX weights."""
-    prefix = f'model.language_model.layers.{layer_idx}'
-    if layer_idx in config.linear_attn_layers:
-        return {
-            'type': 'linear',
-            'in_proj_qkv': jax_weights[f'{prefix}.linear_attn.in_proj_qkv.weight'].T,
-            'in_proj_z': jax_weights[f'{prefix}.linear_attn.in_proj_z.weight'].T,
-            'in_proj_a': jax_weights[f'{prefix}.linear_attn.in_proj_a.weight'].T,
-            'in_proj_b': jax_weights[f'{prefix}.linear_attn.in_proj_b.weight'].T,
-            'out_proj': jax_weights[f'{prefix}.linear_attn.out_proj.weight'].T,
-            'conv1d_weight': jax_weights[f'{prefix}.linear_attn.conv1d.weight'].squeeze(1),
-            'conv1d_bias': jax_weights.get(f'{prefix}.linear_attn.conv1d.bias'),
-            'norm_weight': jax_weights[f'{prefix}.linear_attn.norm.weight'],
-            'A': jnp.exp(jax_weights[f'{prefix}.linear_attn.A_log']),
-            'dt_bias': jax_weights[f'{prefix}.linear_attn.dt_bias'],
-            'input_norm': jax_weights[f'{prefix}.input_layernorm.weight'],
-            'ffn_norm': jax_weights[f'{prefix}.post_attention_layernorm.weight'],
-            'gate_proj': jax_weights[f'{prefix}.mlp.gate_proj.weight'].T,
-            'up_proj': jax_weights[f'{prefix}.mlp.up_proj.weight'].T,
-            'down_proj': jax_weights[f'{prefix}.mlp.down_proj.weight'].T,
-        }
-    else:
-        return {
-            'type': 'full',
-            'q_proj': jax_weights[f'{prefix}.self_attn.q_proj.weight'].T,
-            'k_proj': jax_weights[f'{prefix}.self_attn.k_proj.weight'].T,
-            'v_proj': jax_weights[f'{prefix}.self_attn.v_proj.weight'].T,
-            'o_proj': jax_weights[f'{prefix}.self_attn.o_proj.weight'].T,
-            'q_norm': jax_weights[f'{prefix}.self_attn.q_norm.weight'],
-            'k_norm': jax_weights[f'{prefix}.self_attn.k_norm.weight'],
-            'input_norm': jax_weights[f'{prefix}.input_layernorm.weight'],
-            'ffn_norm': jax_weights[f'{prefix}.post_attention_layernorm.weight'],
-            'gate_proj': jax_weights[f'{prefix}.mlp.gate_proj.weight'].T,
-            'up_proj': jax_weights[f'{prefix}.mlp.up_proj.weight'].T,
-            'down_proj': jax_weights[f'{prefix}.mlp.down_proj.weight'].T,
-        }
+def _is_token_ids(value: Any) -> bool:
+    return isinstance(value, list) and bool(value) and all(isinstance(token, int) for token in value)
 
 
-def load_model(memory_fraction: float = 0.5):
-    """Load model with memory fraction limit."""
-    global params, config
-    
-    print(f"\n{'='*60}")
-    print("Loading model...")
-    print(f"{'='*60}")
-    
-    t0 = time.time()
-    
-    config = Qwen3_5Config(dtype='float16')
-    
-    print(f"  Model: Qwen3.5-0.8B")
-    print(f"  Layers: {config.num_hidden_layers}")
-    print(f"  Memory fraction: {memory_fraction*100:.0f}%")
-    print(f"  Dtype: {config.dtype}")
-    
-    print("\n  [1/2] Loading weights from HuggingFace...")
-    jax_weights, _ = load_weights_from_hf_float16('Qwen/Qwen3.5-0.8B', verbose=True)
-    
-    print("  [2/2] Creating model parameters...")
-    params = ModelParams(
-        embed_tokens=jax_weights['model.language_model.embed_tokens.weight'],
-        layers=[get_layer_params(jax_weights, i, config) for i in range(config.num_hidden_layers)],
-        norm_weight=jax_weights['model.language_model.norm.weight'],
-        lm_head=None,
-        mtp_params=None,
+def _is_batched_token_ids(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(row, list) and bool(row) and all(isinstance(token, int) for token in row) for row in value)
     )
-    
-    print(f"\n  Model loaded in {time.time()-t0:.1f}s")
-    print(f"{'='*60}\n")
-    
-    return params
 
 
-def precompile(max_prefill: int = 64):
-    """Pre-compile common shapes for faster inference."""
-    global compiled_prefill, compiled_decode, params, config
-    
-    if params is None or config is None:
-        return
-    
-    print(f"\n{'='*60}")
-    print("Pre-compiling JIT functions...")
-    print(f"{'='*60}")
-    print("  This takes time but ensures fast inference later.")
-    print("  Compiling for:")
-    print(f"    - Prefill lengths: 16, {max_prefill}")
-    print(f"    - Decode step: 1 token")
-    print()
-    
-    t0 = time.time()
-    
-    num_blocks = 100
-    dtype = config.get_dtype()
-    
-    kv = init_kv_cache(
-        num_blocks, config.block_size, config.num_key_value_heads, config.head_dim,
-        1, 100, num_layers=config.num_hidden_layers, dtype=dtype
-    )
-    kv = KVCacheState(
-        k_cache=kv.k_cache, v_cache=kv.v_cache,
-        block_table=jnp.arange(num_blocks)[jnp.newaxis, :],
-        kv_lens=jnp.array([0]),
-        slot_mapping=jnp.zeros((1, max_prefill), dtype=jnp.int32),  # Will be overwritten per-shape
-        conv_state=kv.conv_state, recurrent_state=kv.recurrent_state,
-    )
-    
-    print("  Compiling prefill shapes...")
-    compiled_fns = {}
-    for seq_len in [16, max_prefill]:
-        print(f"    Prefill: batch=1, seq_len={seq_len}...", end=" ", flush=True)
-        t1 = time.time()
-        tokens = jnp.zeros((1, seq_len), dtype=jnp.int32)
-        kv_prefill = replace(kv, slot_mapping=jnp.arange(seq_len, dtype=jnp.int32)[jnp.newaxis, :])
-        _, _ = forward_simple_jit(tokens, params, config, kv_cache_state=kv_prefill, is_prefill=True)
-        compiled_fns[('prefill', seq_len)] = True
-        print(f"{time.time()-t1:.1f}s")
-    
-    print("  Compiling decode shape...")
-    print(f"    Decode: batch=1, seq_len=1...", end=" ", flush=True)
-    t1 = time.time()
-    kv_decode = replace(kv, kv_lens=jnp.array([seq_len]))
-    tokens = jnp.zeros((1, 1), dtype=jnp.int32)
-    _, _ = forward_simple_jit(tokens, params, config, kv_cache_state=kv_decode, is_prefill=False)
-    print(f"{time.time()-t1:.1f}s")
-    
-    compiled_prefill = compiled_fns
-    compiled_decode = True
-    
-    print(f"\n  Compilation complete in {time.time()-t0:.1f}s")
-    print(f"{'='*60}\n")
+def _normalize_generation_inputs(data: dict) -> tuple[list[str | list[int]], bool]:
+    prompt = data.get("prompt")
+    input_ids = data.get("input_ids")
+    if prompt is None and input_ids is None:
+        raise ValueError("provide either prompt or input_ids")
+    if prompt is not None and input_ids is not None:
+        raise ValueError("provide only one of prompt or input_ids")
+
+    if input_ids is not None:
+        if _is_token_ids(input_ids):
+            return [input_ids], False
+        if _is_batched_token_ids(input_ids):
+            return input_ids, True
+        raise ValueError("input_ids must be a non-empty list of token ids or list of token-id lists")
+
+    if isinstance(prompt, str):
+        if not prompt:
+            raise ValueError("prompt must be non-empty")
+        return [prompt], False
+    if isinstance(prompt, list) and prompt and all(isinstance(item, str) and item for item in prompt):
+        return prompt, True
+    raise ValueError("prompt must be a non-empty string or list of strings")
 
 
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint."""
-    return jsonify({
-        'status': 'healthy',
-        'model_loaded': params is not None,
-    })
+def _token_counts(inputs: list[str | list[int]]) -> list[int]:
+    if engine is None:
+        raise RuntimeError("Model is not loaded")
+    return [len(item) if isinstance(item, list) else len(engine._tokenize(item)) for item in inputs]
 
 
-@app.route('/v1/completions', methods=['POST'])
-def completions():
-    """OpenAI-compatible completion endpoint."""
-    global params, config, tokenizer
-    
-    if params is None:
-        return jsonify({'error': 'Model not loaded'}), 503
-    
-    data = request.get_json()
-    
-    prompt = data.get('prompt', '')
-    max_tokens = data.get('max_tokens', 32)
-    temperature = data.get('temperature', 0.0)
-    
-    if isinstance(prompt, list):
-        prompt = prompt[0] if prompt else ''
-    
-    try:
-        from transformers import AutoTokenizer
-        if tokenizer is None:
-            tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen3.5-0.8B', trust_remote_code=True)
-        
-        input_ids = tokenizer.encode(prompt, return_tensors='np')[0].tolist()
-    except Exception as e:
-        input_ids = [760, 6511]
-    
-    try:
-        t0 = time.time()
-        output_ids = generate_tokens(input_ids, max_tokens, temperature)
-        gen_time = time.time() - t0
-        
-        output_text = tokenizer.decode(output_ids[len(input_ids):]) if tokenizer else str(output_ids)
-        
-        return jsonify({
-            'id': 'cmpl-' + str(int(time.time())),
-            'object': 'text_completion',
-            'created': int(time.time()),
-            'model': 'Qwen3.5-0.8B',
-            'choices': [{
-                'text': output_text,
-                'index': 0,
-                'finish_reason': 'length',
-            }],
-            'usage': {
-                'prompt_tokens': len(input_ids),
-                'completion_tokens': len(output_ids) - len(input_ids),
-                'total_tokens': len(output_ids),
-            },
-            'stats': {
-                'generation_time_ms': int(gen_time * 1000),
-                'tokens_per_second': (len(output_ids) - len(input_ids)) / gen_time if gen_time > 0 else 0,
-            }
-        })
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+def _validate_inputs_fit_config(inputs: list[str | list[int]], prompt_tokens: list[int], max_tokens: int):
+    if engine is None:
+        raise RuntimeError("Model is not loaded")
 
+    if prompt_tokens:
+        max_total_tokens = max(prompt_tokens) + max_tokens
+        max_blocks_per_seq = getattr(engine.config, "max_blocks_per_seq", None)
+        if max_blocks_per_seq is not None:
+            max_tokens_per_seq = max_blocks_per_seq * engine.config.block_size
+            if max_total_tokens > max_tokens_per_seq:
+                raise ValueError(
+                    f"request needs {max_total_tokens} total tokens, exceeding per-sequence KV capacity "
+                    f"{max_tokens_per_seq}"
+                )
 
-@app.route('/v1/generate', methods=['POST'])
-def generate():
-    """Simple generate endpoint (token-based)."""
-    global params, config
-    
-    if params is None:
-        return jsonify({'error': 'Model not loaded'}), 503
-    
-    data = request.get_json()
-    
-    input_ids = data.get('input_ids', [760, 6511])
-    max_tokens = data.get('max_tokens', 32)
-    temperature = data.get('temperature', 0.0)
-    
-    try:
-        t0 = time.time()
-        output_ids = generate_tokens(input_ids, max_tokens, temperature)
-        gen_time = time.time() - t0
-        
-        return jsonify({
-            'input_ids': input_ids,
-            'output_ids': output_ids,
-            'new_tokens': output_ids[len(input_ids):],
-            'stats': {
-                'generation_time_ms': int(gen_time * 1000),
-                'tokens_per_second': (len(output_ids) - len(input_ids)) / gen_time if gen_time > 0 else 0,
-            }
-        })
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+    prefill_buckets = tuple(getattr(engine.config, "prefill_buckets", ()))
+    if prefill_buckets and prompt_tokens:
+        max_prompt_tokens = max(prompt_tokens)
+        max_prefill_bucket = max(prefill_buckets)
+        if max_prompt_tokens > max_prefill_bucket:
+            raise ValueError(
+                f"prompt has {max_prompt_tokens} tokens, exceeding largest prefill bucket {max_prefill_bucket}"
+            )
 
-
-def generate_tokens(input_ids, max_tokens, temperature=0.0):
-    """Generate tokens using the model."""
-    global params, config
-    
-    num_blocks = 100
-    dtype = config.get_dtype()
-    
-    kv = init_kv_cache(
-        num_blocks, config.block_size, config.num_key_value_heads, config.head_dim,
-        1, 100, num_layers=config.num_hidden_layers, dtype=dtype
-    )
-    
-    kv = KVCacheState(
-        k_cache=kv.k_cache, v_cache=kv.v_cache,
-        block_table=jnp.arange(num_blocks)[jnp.newaxis, :],
-        kv_lens=jnp.array([0]),
-        slot_mapping=jnp.arange(len(input_ids), dtype=jnp.int32)[jnp.newaxis, :],
-        conv_state=kv.conv_state, recurrent_state=kv.recurrent_state,
-    )
-    
-    tokens = jnp.array([input_ids])
-    logits, kv = forward_simple_jit(tokens, params, config, kv_cache_state=kv, is_prefill=True)
-    
-    output_ids = list(input_ids)
-    
-    for i in range(max_tokens):
-        if temperature > 0:
-            raise NotImplementedError("Temperature sampling not implemented")
-        
-        next_token = int(jnp.argmax(logits[0, -1, :]))
-        output_ids.append(next_token)
-        
-        kv_decode = replace(
-            kv,
-            kv_lens=jnp.array([len(output_ids) - 1]),
-            slot_mapping=jnp.array([[len(input_ids) + i]]),
+    max_num_seqs = getattr(engine.config, "max_num_seqs", None)
+    if max_num_seqs is not None and len(inputs) > max_num_seqs:
+        raise ValueError(f"request has {len(inputs)} prompts, exceeding max_num_seqs {max_num_seqs}")
+    batch_size_buckets = tuple(getattr(engine.config, "batch_size_buckets", ()))
+    if batch_size_buckets and len(inputs) > max(batch_size_buckets):
+        raise ValueError(
+            f"request has {len(inputs)} prompts, exceeding largest batch-size bucket {max(batch_size_buckets)}"
         )
-        tokens = jnp.array([[next_token]])
-        logits, kv = forward_simple_jit(tokens, params, config, kv_cache_state=kv_decode, is_prefill=False)
-    
-    return output_ids
+
+
+def _sampling_from_request(data: dict) -> tuple[int, float]:
+    try:
+        max_tokens = int(data.get("max_tokens", app.config["MAX_TOKENS_DEFAULT"]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_tokens must be an integer") from exc
+    try:
+        temperature = float(data.get("temperature", 0.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("temperature must be a number") from exc
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative")
+    return max_tokens, temperature
+
+
+def load_engine(args) -> LLMEngine:
+    global engine
+    prefill_buckets, batch_size_buckets = _validate_server_args(args)
+    max_kv_cache_bytes = int(args.max_kv_cache_mb * 1024 * 1024)
+    engine = LLMEngine(
+        args.model,
+        backend=args.backend,
+        dtype=args.dtype,
+        max_kv_cache_bytes=max_kv_cache_bytes,
+        num_kvcache_blocks=args.num_kvcache_blocks,
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        prefill_buckets=prefill_buckets,
+        batch_size_buckets=batch_size_buckets,
+        jax_execution=args.jax_execution,
+        num_speculative_tokens=args.num_speculative_tokens,
+    )
+    if not args.skip_compile:
+        engine.model_runner.warmup_compilation(
+            max_prefill_len=max(prefill_buckets or (args.max_prefill,)),
+            max_batch=max(batch_size_buckets or (args.max_num_seqs,)),
+        )
+    return engine
+
+
+def _run_generation(inputs: list[str | list[int]], max_tokens: int, temperature: float):
+    if engine is None:
+        raise RuntimeError("Model is not loaded")
+    sampling = SamplingParams(
+        temperature=temperature,
+        max_tokens=max_tokens,
+        ignore_eos=False,
+    )
+    with engine_lock:
+        return engine.generate(inputs, sampling_params=sampling, use_tqdm=False)
+
+
+def _generation_payload(results, prompt_tokens: list[int], elapsed: float, is_batch: bool):
+    completion_tokens = [len(result["token_ids"]) for result in results]
+    items = [
+        {
+            "text": result["text"],
+            "token_ids": result["token_ids"],
+            "new_tokens": result["token_ids"],
+            "usage": {
+                "prompt_tokens": prompt_count,
+                "completion_tokens": completion_count,
+                "total_tokens": prompt_count + completion_count,
+            },
+        }
+        for result, prompt_count, completion_count in zip(results, prompt_tokens, completion_tokens)
+    ]
+    stats = {
+        "generation_time_ms": int(elapsed * 1000),
+        "tokens_per_second": sum(completion_tokens) / elapsed if elapsed > 0 else 0.0,
+        "jit_cache_entries": len(engine.model_runner.executor._jit_cache) if engine is not None else 0,
+    }
+    if engine is not None and hasattr(engine.model_runner, "get_speculative_stats"):
+        stats["speculative"] = engine.model_runner.get_speculative_stats()
+    if not is_batch:
+        payload = dict(items[0])
+        payload["stats"] = stats
+        return payload
+    return {
+        "results": items,
+        "usage": {
+            "prompt_tokens": sum(prompt_tokens),
+            "completion_tokens": sum(completion_tokens),
+            "total_tokens": sum(prompt_tokens) + sum(completion_tokens),
+        },
+        "stats": stats,
+    }
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify(
+        {
+            "status": "healthy" if engine is not None else "loading",
+            "model_loaded": engine is not None,
+            "jax_execution": getattr(engine.config, "jax_execution", None) if engine is not None else None,
+            "jit_cache_entries": len(engine.model_runner.executor._jit_cache) if engine is not None else 0,
+        }
+    )
+
+
+@app.route("/v1/generate", methods=["POST"])
+def generate():
+    data = request.get_json(force=True) or {}
+    try:
+        inputs, is_batch = _normalize_generation_inputs(data)
+        max_tokens, temperature = _sampling_from_request(data)
+        prompt_tokens = _token_counts(inputs)
+        _validate_inputs_fit_config(inputs, prompt_tokens, max_tokens)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+
+    try:
+        t0 = time.perf_counter()
+        results = _run_generation(inputs, max_tokens=max_tokens, temperature=temperature)
+        elapsed = time.perf_counter() - t0
+        return jsonify(_generation_payload(results, prompt_tokens, elapsed, is_batch))
+    except Exception as exc:
+        return jsonify({"error": str(exc), "traceback": traceback.format_exc()}), 500
+
+
+@app.route("/v1/completions", methods=["POST"])
+def completions():
+    data = request.get_json(force=True) or {}
+    try:
+        inputs, _ = _normalize_generation_inputs({"prompt": data.get("prompt", "")})
+        max_tokens, temperature = _sampling_from_request(data)
+        prompt_tokens = _token_counts(inputs)
+        _validate_inputs_fit_config(inputs, prompt_tokens, max_tokens)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+
+    try:
+        t0 = time.perf_counter()
+        results = _run_generation(inputs, max_tokens=max_tokens, temperature=temperature)
+        elapsed = time.perf_counter() - t0
+        completion_tokens = [len(result["token_ids"]) for result in results]
+        return jsonify(
+            {
+                "id": f"cmpl-{int(time.time())}",
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": engine.config.__class__.__name__ if engine is not None else "unknown",
+                "choices": [
+                    {"text": result["text"], "index": idx, "finish_reason": "length"}
+                    for idx, result in enumerate(results)
+                ],
+                "usage": {
+                    "prompt_tokens": sum(prompt_tokens),
+                    "completion_tokens": sum(completion_tokens),
+                    "total_tokens": sum(prompt_tokens) + sum(completion_tokens),
+                },
+                "stats": {
+                    "generation_time_ms": int(elapsed * 1000),
+                    "tokens_per_second": sum(completion_tokens) / elapsed if elapsed > 0 else 0.0,
+                    "jit_cache_entries": len(engine.model_runner.executor._jit_cache),
+                },
+            }
+        )
+    except Exception as exc:
+        return jsonify({"error": str(exc), "traceback": traceback.format_exc()}), 500
 
 
 def main():
-    parser = argparse.ArgumentParser(description='nano-vllm-jax API server')
-    parser.add_argument('--port', type=int, default=8080, help='Server port')
-    parser.add_argument('--host', type=str, default='127.0.0.1', help='Server host')
-    parser.add_argument('--memory-limit', type=float, default=4.0, help='Memory limit in GB')
-    parser.add_argument('--memory-fraction', type=float, default=0.5, help='JAX memory fraction (0-1)')
-    parser.add_argument('--cpu-nice', type=int, default=10, help='CPU nice value (higher = lower priority)')
-    parser.add_argument('--max-prefill', type=int, default=64, help='Max prefill length to pre-compile')
-    parser.add_argument('--skip-compile', action='store_true', help='Skip pre-compilation')
+    parser = argparse.ArgumentParser(description="nano-vllm-jax LLMEngine API server")
+    parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--backend", default="auto")
+    parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float16")
+    parser.add_argument("--jax-execution", choices=["eager", "decode-jit", "jit"], default="jit")
+    parser.add_argument("--prefill-buckets", default="16")
+    parser.add_argument("--batch-size-buckets", default="1")
+    parser.add_argument("--max-prefill", type=int, default=16)
+    parser.add_argument("--max-kv-cache-mb", type=int, default=64)
+    parser.add_argument("--num-kvcache-blocks", type=int, default=8)
+    parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=16)
+    parser.add_argument("--max-tokens-default", type=int, default=16)
+    parser.add_argument("--num-speculative-tokens", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--skip-compile", action="store_true")
     args = parser.parse_args()
-    
-    print(f"\n{'='*60}")
-    print("nano-vllm-jax API Server")
-    print(f"{'='*60}")
-    print(f"  Host: {args.host}")
-    print(f"  Port: {args.port}")
-    print(f"  Memory limit: {args.memory_limit}GB")
-    print(f"  Memory fraction: {args.memory_fraction*100:.0f}%")
-    print(f"  CPU nice: {args.cpu_nice}")
-    print(f"{'='*60}\n")
-    
-    limit_memory(args.memory_limit)
-    limit_cpu(args.cpu_nice)
-    
-    load_model(args.memory_fraction)
-    
-    if not args.skip_compile:
-        precompile(args.max_prefill)
-    
-    print(f"\n{'='*60}")
-    print("Server ready!")
-    print(f"{'='*60}")
-    print(f"  Endpoints:")
-    print(f"    GET  /health")
-    print(f"    POST /v1/completions")
-    print(f"    POST /v1/generate")
-    print(f"\n  Example:")
-    print(f'    curl -X POST http://{args.host}:{args.port}/v1/generate \\')
-    print(f'         -H "Content-Type: application/json" \\')
-    print(f'         -d \'{{"input_ids": [760, 6511], "max_tokens": 10}}\'')
-    print(f"{'='*60}\n")
-    
+    app.config["MAX_TOKENS_DEFAULT"] = args.max_tokens_default
+
+    print("nano-vllm-jax LLMEngine server")
+    print(f"model={args.model} dtype={args.dtype} execution={args.jax_execution}")
+    print(f"prefill_buckets={args.prefill_buckets} batch_size_buckets={args.batch_size_buckets}")
+    load_engine(args)
+    print(f"server_ready=http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, threaded=False)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

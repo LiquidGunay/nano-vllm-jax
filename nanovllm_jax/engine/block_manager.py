@@ -5,6 +5,7 @@ import xxhash
 import numpy as np
 from typing import Dict, List, Set, Deque
 
+from nanovllm_jax.kv_cache import BlockTables
 from nanovllm_jax.engine.sequence import Sequence
 
 
@@ -69,9 +70,38 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    def _num_blocks(self, seq: Sequence) -> int:
+        return (seq.num_tokens + self.block_size - 1) // self.block_size
+
+    def _block_tokens(self, seq: Sequence, block_idx: int) -> List[int]:
+        start = block_idx * self.block_size
+        end = (block_idx + 1) * self.block_size
+        return seq.token_ids[start:end]
+
     def can_allocate(self, seq: Sequence) -> bool:
         """Check if we can allocate blocks for sequence."""
-        return len(self.free_block_ids) >= seq.num_blocks
+        return len(self.free_block_ids) >= self._num_required_blocks(seq)
+
+    def _num_required_blocks(self, seq: Sequence) -> int:
+        """Count physical free blocks needed for allocation.
+
+        Full-block prefix-cache hits that are already in use do not consume a
+        free block; cache misses and request-local partial blocks do.
+        """
+        h = -1
+        required = 0
+        for i in range(self._num_blocks(seq)):
+            token_ids = self._block_tokens(seq, i)
+            if len(token_ids) != self.block_size:
+                required += 1
+                continue
+
+            h = self.compute_hash(token_ids, h)
+            block_id = self.hash_to_block_id.get(h, -1)
+            cache_hit = block_id != -1 and self.blocks[block_id].token_ids == token_ids
+            if not cache_hit or block_id not in self.used_block_ids:
+                required += 1
+        return required
 
     def allocate(self, seq: Sequence):
         """Allocate blocks for a sequence.
@@ -82,11 +112,12 @@ class BlockManager:
         - Allocates new blocks for cache misses
         """
         assert not seq.block_table
+        seq.block_size = self.block_size
         h = -1
         cache_miss = False
         
-        for i in range(seq.num_blocks):
-            token_ids = seq.block(i)
+        for i in range(self._num_blocks(seq)):
+            token_ids = self._block_tokens(seq, i)
             
             # Compute hash only for full blocks
             if len(token_ids) == self.block_size:
@@ -116,8 +147,9 @@ class BlockManager:
                     # Block is free - allocate it
                     block = self._allocate_block(block_id)
             
-            # Update block hash if computed
-            if h != -1:
+            # Only full blocks are content-addressed. Partial tail blocks are
+            # request-local and must not overwrite the prefix-cache hash map.
+            if len(token_ids) == self.block_size and h != -1:
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
             
@@ -139,6 +171,14 @@ class BlockManager:
         # Need new block if current block is full
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
+    def snapshot(self, seqs: List[Sequence] | None = None) -> BlockTables:
+        """Expose Python-side prefix-cache state without touching JAX arrays."""
+        return BlockTables(
+            tables=[list(seq.block_table) for seq in seqs] if seqs is not None else [],
+            ref_counts=[block.ref_count for block in self.blocks],
+            hashes=[block.hash for block in self.blocks],
+        )
+
     def may_append(self, seq: Sequence):
         """Append a token to sequence, allocating new block if needed.
         
@@ -157,8 +197,29 @@ class BlockManager:
         elif len(seq) % self.block_size == 0:
             # Completed a block - update its hash
             assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks - 1)
+            token_ids = self._block_tokens(seq, len(seq) // self.block_size - 1)
             prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
             h = self.compute_hash(token_ids, prefix)
             last_block.update(h, token_ids)
             self.hash_to_block_id[h] = last_block.block_id
+
+    def commit_processed_token(self, seq: Sequence):
+        """Record metadata for an already-processed appended token.
+
+        Speculative decoding can commit a draft token in the same target pass
+        that processed it. The block is already allocated and written in the
+        device cache, so this only refreshes the Python prefix-cache metadata
+        when that token completes a block.
+        """
+        if len(seq) % self.block_size != 0:
+            return
+        block_idx = len(seq) // self.block_size - 1
+        block_id = seq.block_table[block_idx]
+        block = self.blocks[block_id]
+        if block.hash != -1:
+            return
+        token_ids = self._block_tokens(seq, block_idx)
+        prefix = self.blocks[seq.block_table[block_idx - 1]].hash if block_idx > 0 else -1
+        h = self.compute_hash(token_ids, prefix)
+        block.update(h, token_ids)
+        self.hash_to_block_id[h] = block.block_id

@@ -5,7 +5,6 @@ import time
 import json
 from pathlib import Path
 
-import torch
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,17 +15,25 @@ from nanovllm_jax.mtp.mtp_layer import MTPParams
 
 
 def download_hf_weights(model_name: str, cache_dir: str = None):
-    """Load model path from HF cache."""
-    from huggingface_hub import scan_cache_dir
-    print(f"Loading {model_name} from cache...")
-    cache = scan_cache_dir()
-    # Find the repo in the cache
-    for repo in cache.repos:
-        if repo.repo_id == model_name:
-            path = list(repo.revisions)[0].snapshot_path
-            print(f"Using cached snapshot: {path}")
-            return Path(path)
-    raise ValueError(f"Model {model_name} not found in cache")
+    """Download or reuse a Hugging Face snapshot."""
+    from huggingface_hub import snapshot_download
+
+    print(f"Resolving {model_name} from Hugging Face cache...")
+    path = snapshot_download(
+        repo_id=model_name,
+        cache_dir=cache_dir,
+        allow_patterns=[
+            "*.json",
+            "*.safetensors",
+            "*.model",
+            "tokenizer.*",
+            "vocab.*",
+            "merges.txt",
+            "generation_config.json",
+        ],
+    )
+    print(f"Using snapshot: {path}")
+    return Path(path)
 
 def load_safetensors(model_path: Path):
     """Load weights from safetensors files."""
@@ -41,12 +48,196 @@ def load_safetensors(model_path: Path):
     weights = {}
     for st_file in model_path.glob("*.safetensors"):
         print(f"  Loading {st_file.name}...")
-        # Use torch framework to properly handle bfloat16
-        with safe_open(st_file, framework="pt") as f:
+        with safe_open(st_file, framework="np") as f:
             for key in f.keys():
                 weights[key] = f.get_tensor(key)
     
     return weights
+
+
+class _SafeTensorReader:
+    """Small random-access wrapper that does not keep all checkpoint tensors live."""
+
+    def __init__(self, model_path: Path):
+        from safetensors import safe_open
+
+        self._safe_open = safe_open
+        self._key_to_file = {}
+        for st_file in model_path.glob("*.safetensors"):
+            with safe_open(st_file, framework="np") as f:
+                for key in f.keys():
+                    normalized = _normalize_hf_key(key)
+                    self._key_to_file[normalized] = (st_file, key)
+                    self._key_to_file[key] = (st_file, key)
+
+    def get(self, key: str):
+        try:
+            st_file, real_key = self._key_to_file[key]
+        except KeyError as exc:
+            raise KeyError(f"Weight {key!r} not found in safetensors checkpoint") from exc
+        with self._safe_open(st_file, framework="np") as f:
+            return f.get_tensor(real_key)
+
+    def has(self, key: str) -> bool:
+        return key in self._key_to_file
+
+
+def _normalize_hf_key(key: str) -> str:
+    if key.startswith("model.language_model."):
+        return key[21:]
+    if key.startswith("model."):
+        return key[6:]
+    return key
+
+
+def _checkpoint_dtypes(config: Qwen3_5Config):
+    import ml_dtypes
+
+    target_dtype = config.get_dtype()
+    if target_dtype == jnp.bfloat16:
+        return ml_dtypes.bfloat16, jnp.bfloat16
+    if target_dtype == jnp.float16:
+        return np.float16, jnp.float16
+    return np.float32, jnp.float32
+
+
+def _to_jax_weight(
+    reader: _SafeTensorReader,
+    key: str,
+    config: Qwen3_5Config,
+    *,
+    transpose: bool = False,
+    squeeze_axis: int | None = None,
+    exp: bool = False,
+):
+    np_dtype, jax_dtype = _checkpoint_dtypes(config)
+    value = np.asarray(reader.get(key))
+    if squeeze_axis is not None and value.ndim > squeeze_axis:
+        value = np.squeeze(value, axis=squeeze_axis)
+    if transpose:
+        value = value.T
+    if value.dtype != np_dtype:
+        if jax_dtype == jnp.bfloat16:
+            value = value.astype(np.float32).astype(np_dtype)
+        else:
+            value = value.astype(np_dtype)
+    if transpose and not value.flags.c_contiguous:
+        value = np.ascontiguousarray(value)
+    arr = jnp.array(value, dtype=jax_dtype)
+    if exp:
+        arr = jnp.exp(arr)
+    return arr
+
+
+def load_weights_from_hf_streaming(
+    model_name: str,
+    config: Qwen3_5Config,
+    *,
+    verbose: bool = False,
+    cache_dir: str = None,
+    load_mtp: bool = False,
+) -> ModelParams:
+    """Load HF weights one tensor at a time to keep peak memory bounded."""
+    if config is None:
+        raise ValueError("config is required - cannot be None")
+
+    print(f"Loading weights for {model_name}...")
+    hf_path = download_hf_weights(model_name, cache_dir=cache_dir)
+    reader = _SafeTensorReader(hf_path)
+
+    print("Converting weights...")
+    embed_tokens = _to_jax_weight(reader, "embed_tokens.weight", config)
+
+    layers = []
+    for i in range(config.num_hidden_layers):
+        layer_prefix = f"layers.{i}."
+        layer_params = {}
+        layer_type = config.layer_types[i]
+
+        if layer_type == "full_attention":
+            layer_params["q_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.q_proj.weight", config, transpose=True)
+            layer_params["k_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.k_proj.weight", config, transpose=True)
+            layer_params["v_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.v_proj.weight", config, transpose=True)
+            layer_params["o_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.o_proj.weight", config, transpose=True)
+            layer_params["q_norm"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.q_norm.weight", config)
+            layer_params["k_norm"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.k_norm.weight", config)
+            layer_params["input_norm"] = _to_jax_weight(reader, f"{layer_prefix}input_layernorm.weight", config)
+            layer_params["post_attn_norm"] = _to_jax_weight(reader, f"{layer_prefix}post_attention_layernorm.weight", config)
+            layer_params["gate_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.gate_proj.weight", config, transpose=True)
+            layer_params["up_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.up_proj.weight", config, transpose=True)
+            layer_params["down_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.down_proj.weight", config, transpose=True)
+            layer_params["ffn_norm"] = _to_jax_weight(reader, f"{layer_prefix}post_attention_layernorm.weight", config)
+        else:
+            linear_prefix = f"{layer_prefix}linear_attn."
+            layer_params["in_proj_qkv"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_qkv.weight", config, transpose=True)
+            layer_params["in_proj_a"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_a.weight", config, transpose=True)
+            layer_params["in_proj_b"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_b.weight", config, transpose=True)
+            layer_params["in_proj_z"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_z.weight", config, transpose=True)
+            layer_params["conv1d_weight"] = _to_jax_weight(reader, f"{linear_prefix}conv1d.weight", config, squeeze_axis=1)
+            layer_params["dt_bias"] = _to_jax_weight(reader, f"{linear_prefix}dt_bias", config)
+            layer_params["A"] = _to_jax_weight(reader, f"{linear_prefix}A_log", config, exp=True)
+            layer_params["norm_weight"] = _to_jax_weight(reader, f"{linear_prefix}norm.weight", config)
+            layer_params["out_proj"] = _to_jax_weight(reader, f"{linear_prefix}out_proj.weight", config, transpose=True)
+            layer_params["input_norm"] = _to_jax_weight(reader, f"{layer_prefix}input_layernorm.weight", config)
+            layer_params["ffn_norm"] = _to_jax_weight(reader, f"{layer_prefix}post_attention_layernorm.weight", config)
+            layer_params["gate_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.gate_proj.weight", config, transpose=True)
+            layer_params["up_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.up_proj.weight", config, transpose=True)
+            layer_params["down_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.down_proj.weight", config, transpose=True)
+
+        layers.append(layer_params)
+        if verbose:
+            print(f"  converted layer {i}: {layer_type}")
+
+    norm_weight = _to_jax_weight(reader, "norm.weight", config) if reader.has("norm.weight") else jnp.ones(config.hidden_size)
+    lm_head = _to_jax_weight(reader, "lm_head.weight", config, transpose=True) if reader.has("lm_head.weight") else None
+    mtp_params = _load_mtp_weights_from_reader(reader, config, embed_tokens, lm_head) if load_mtp else None
+
+    print(f"✓ Loaded weights: {len(layers)} layers")
+    return ModelParams(
+        embed_tokens=embed_tokens,
+        layers=layers,
+        norm_weight=norm_weight,
+        lm_head=lm_head,
+        mtp_params=mtp_params,
+    )
+
+
+def _load_mtp_weights_from_reader(
+    reader: _SafeTensorReader,
+    config: Qwen3_5Config,
+    embed_tokens: jnp.ndarray,
+    lm_head: jnp.ndarray | None,
+) -> MTPParams:
+    """Load MTP weights through the streaming reader."""
+    if not reader.has("mtp.fc.weight"):
+        raise ValueError("MTP speculative decoding was requested, but no mtp.* weights were found")
+
+    layers = []
+    for i in range(config.mtp_num_hidden_layers):
+        prefix = f"mtp.layers.{i}."
+        layers.append({
+            "q_proj": _to_jax_weight(reader, f"{prefix}self_attn.q_proj.weight", config, transpose=True),
+            "k_proj": _to_jax_weight(reader, f"{prefix}self_attn.k_proj.weight", config, transpose=True),
+            "v_proj": _to_jax_weight(reader, f"{prefix}self_attn.v_proj.weight", config, transpose=True),
+            "o_proj": _to_jax_weight(reader, f"{prefix}self_attn.o_proj.weight", config, transpose=True),
+            "q_norm": _to_jax_weight(reader, f"{prefix}self_attn.q_norm.weight", config),
+            "k_norm": _to_jax_weight(reader, f"{prefix}self_attn.k_norm.weight", config),
+            "input_norm": _to_jax_weight(reader, f"{prefix}input_layernorm.weight", config),
+            "post_attn_norm": _to_jax_weight(reader, f"{prefix}post_attention_layernorm.weight", config),
+            "gate_proj": _to_jax_weight(reader, f"{prefix}mlp.gate_proj.weight", config, transpose=True),
+            "up_proj": _to_jax_weight(reader, f"{prefix}mlp.up_proj.weight", config, transpose=True),
+            "down_proj": _to_jax_weight(reader, f"{prefix}mlp.down_proj.weight", config, transpose=True),
+            "ffn_norm": _to_jax_weight(reader, f"{prefix}post_attention_layernorm.weight", config),
+        })
+
+    return MTPParams(
+        eh_proj=_to_jax_weight(reader, "mtp.fc.weight", config, transpose=True),
+        layers=layers,
+        pre_fc_norm_hidden=_to_jax_weight(reader, "mtp.pre_fc_norm_hidden.weight", config),
+        pre_fc_norm_embedding=_to_jax_weight(reader, "mtp.pre_fc_norm_embedding.weight", config),
+        final_norm=_to_jax_weight(reader, "mtp.norm.weight", config),
+        lm_head=lm_head if lm_head is not None else embed_tokens.T,
+    )
 
 
 def convert_hf_to_jax(hf_weights: dict, config: Qwen3_5Config, verbose: bool = False) -> ModelParams:
@@ -75,15 +266,7 @@ def convert_hf_to_jax(hf_weights: dict, config: Qwen3_5Config, verbose: bool = F
     text_weights = {}
     
     for key, value in hf_weights.items():
-        # Get as numpy array
-        if hasattr(value, 'cpu'):  # torch tensor
-            # Convert via float32 intermediate (torch can't directly numpy() bfloat16)
-            if value.dtype == torch.bfloat16:
-                value_np = value.float().cpu().numpy()
-            else:
-                value_np = value.cpu().numpy()
-        else:
-            value_np = np.asarray(value)
+        value_np = np.asarray(value)
         
         # Convert to target dtype
         if value_np.dtype != np_dtype:
@@ -195,8 +378,9 @@ def convert_hf_to_jax(hf_weights: dict, config: Qwen3_5Config, verbose: bool = F
         lm_head = jnp.array(lm_head_val).T
     # Tie weights if no separate LM head
     elif config.tie_word_embeddings:
-        # embed_tokens is [vocab_size, hidden_size], lm_head needs [hidden_size, vocab_size]
-        lm_head = embed_tokens.T
+        # Keep tied weights implicit. Materializing embed_tokens.T costs ~485 MiB
+        # for Qwen3.5-0.8B and is unnecessary because forward() handles None.
+        lm_head = None
     
     return ModelParams(
         embed_tokens=embed_tokens,
@@ -206,7 +390,14 @@ def convert_hf_to_jax(hf_weights: dict, config: Qwen3_5Config, verbose: bool = F
     )
 
 
-def load_weights_from_hf(model_name: str, config: Qwen3_5Config, *, verbose: bool = False, load_mtp: bool = False) -> ModelParams:
+def load_weights_from_hf(
+    model_name: str,
+    config: Qwen3_5Config,
+    *,
+    verbose: bool = False,
+    load_mtp: bool = False,
+    cache_dir: str = None,
+) -> ModelParams:
     """Load weights from HuggingFace for Qwen3.5 model.
     
     Args:
@@ -214,6 +405,7 @@ def load_weights_from_hf(model_name: str, config: Qwen3_5Config, *, verbose: boo
         config: Model configuration (REQUIRED)
         verbose: Whether to print detailed weight info
         load_mtp: Whether to load MTP weights for speculative decoding
+        cache_dir: Optional Hugging Face cache directory
         
     Returns:
         ModelParams with loaded weights (and optional mtp_params attribute)
@@ -228,7 +420,7 @@ def load_weights_from_hf(model_name: str, config: Qwen3_5Config, *, verbose: boo
     print(f"Loading weights for {model_name}...")
     
     # Download from HF
-    hf_path = download_hf_weights(model_name)
+    hf_path = download_hf_weights(model_name, cache_dir=cache_dir)
     
     # Load safetensors
     hf_weights = load_safetensors(hf_path)
@@ -283,6 +475,8 @@ def load_mtp_weights_from_hf(hf_weights: dict, config: Qwen3_5Config, verbose: b
     
     # Convert to JAX format (handle bfloat16)
     def convert_tensor(value):
+        import torch
+
         if hasattr(value, 'cpu'):
             value = value.cpu().float().numpy()
         else:
