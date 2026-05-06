@@ -1,6 +1,7 @@
 """Model runner for JAX inference with paged KV cache."""
 
 import time
+import os
 import jax
 import jax.numpy as jnp
 import sys
@@ -24,7 +25,7 @@ from nanovllm_jax.mtp.mtp_layer import MTPParams, mtp_forward
 from nanovllm_jax.mtp.speculative import generate_draft_tokens, verify_draft_tokens, apply_acceptance
 
 
-class ModelRunner:
+class _LegacyModelRunner:
     """Runs JAX model with paged KV cache.
     
     Handles:
@@ -934,6 +935,9 @@ class CanonicalModelRunner:
             max_blocks_per_seq=self.max_blocks_per_seq,
         )
         self.hybrid_states: Dict[int, HybridLayerState] = {}
+        self._max_hybrid_slots = max_seqs
+        self._hybrid_slots: Dict[int, int] = {}
+        self._free_hybrid_slots: List[int] = list(range(max_seqs))
 
         self.kv_state = init_kv_cache(
             num_blocks=effective_num_blocks,
@@ -953,10 +957,15 @@ class CanonicalModelRunner:
             dtype=config.get_dtype(),
         )
         self._empty_hybrid_state = self.kv_state.hybrid_state
+        self._hybrid_state_table = init_hybrid_state(
+            self.config,
+            batch_size=max_seqs,
+            dtype=self.config.get_dtype(),
+        )
         self._sample_fn = jax.jit(self._sample_logits)
         self.mtp_enabled = hasattr(params, "mtp_params") and params.mtp_params is not None
         self.num_speculative_tokens = int(getattr(config, "num_speculative_tokens", 0) or 0)
-        self.mtp1_enabled = self.mtp_enabled and self.num_speculative_tokens == 1
+        self.mtp1_enabled = self.mtp_enabled and self.num_speculative_tokens > 0
         self._mtp1_forward_jit = None
         self._mtp1_token_jit = None
         self._hidden_token_jit = None
@@ -974,6 +983,8 @@ class CanonicalModelRunner:
             "drafts_rejected": 0,
             "bonus_tokens": 0,
             "fallback_steps": 0,
+            "draft_position_proposed": [],
+            "draft_position_accepted": [],
         }
         if not hasattr(self, "_mtp1_debug_events"):
             self._mtp1_debug_events = []
@@ -996,6 +1007,21 @@ class CanonicalModelRunner:
         if not hasattr(self, "speculative_stats"):
             self.reset_speculative_stats()
         return self.speculative_stats
+
+    def _record_draft_position_acceptance(self, accepted_matrix: List[List[bool]]):
+        if not accepted_matrix:
+            return
+        stats = self._speculative_stats()
+        max_width = max(len(row) for row in accepted_matrix)
+        proposed = stats.setdefault("draft_position_proposed", [])
+        accepted = stats.setdefault("draft_position_accepted", [])
+        while len(proposed) < max_width:
+            proposed.append(0)
+            accepted.append(0)
+        for row in accepted_matrix:
+            for idx, value in enumerate(row):
+                proposed[idx] += 1
+                accepted[idx] += int(bool(value))
 
     def _mtp1_debug_state(self) -> tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]]]:
         if not hasattr(self, "_mtp1_draft_debug"):
@@ -1021,22 +1047,26 @@ class CanonicalModelRunner:
             for batch_size in batch_buckets:
                 batch = self._dummy_batch(batch_size=batch_size, query_len=prefill_len, is_prefill=True)
                 hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
-                _ = self.executor.forward_step_jit(
+                output = self.executor.forward_step_jit(
                     batch,
                     cache_storage=self.cache_storage,
                     hybrid_state=hybrid_state,
                     last_logits_only=True,
-                ).activations.block_until_ready()
+                )
+                output.activations.block_until_ready()
+                self.cache_storage = output.cache_storage
 
         for batch_size in batch_buckets:
             batch = self._dummy_batch(batch_size=batch_size, query_len=1, is_prefill=False)
             hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
-            _ = self.executor.forward_step_jit(
+            output = self.executor.forward_step_jit(
                 batch,
                 cache_storage=self.cache_storage,
                 hybrid_state=hybrid_state,
                 last_logits_only=True,
-            ).activations.block_until_ready()
+            )
+            output.activations.block_until_ready()
+            self.cache_storage = output.cache_storage
             self._sample_fn(
                 jnp.zeros((batch_size, self.config.vocab_size), dtype=jnp.float32),
                 jnp.zeros((batch_size,), dtype=jnp.float32),
@@ -1069,6 +1099,10 @@ class CanonicalModelRunner:
         """Release per-sequence hybrid state once a request is finished."""
         for seq_id in seq_ids:
             self.hybrid_states.pop(seq_id, None)
+            slot = self._hybrid_slots.pop(seq_id, None)
+            if slot is not None:
+                self._zero_hybrid_slot(slot)
+                self._free_hybrid_slots.append(slot)
             self._mtp1_drafts.pop(seq_id, None)
 
     def _build_scheduled_batch(self, seqs: List[Sequence], is_prefill: bool) -> ScheduledBatch:
@@ -1144,28 +1178,63 @@ class CanonicalModelRunner:
                 return bucket
         raise ValueError(f"{name} size {size} exceeds configured buckets {buckets}")
 
+    def _zero_hybrid_slot(self, slot: int):
+        if slot < 0:
+            return
+        self._hybrid_state_table = HybridLayerState(
+            conv_state=self._hybrid_state_table.conv_state.at[slot].set(
+                jnp.zeros_like(self._hybrid_state_table.conv_state[slot])
+            )
+            if self._hybrid_state_table.conv_state is not None
+            else None,
+            recurrent_state=self._hybrid_state_table.recurrent_state.at[slot].set(
+                jnp.zeros_like(self._hybrid_state_table.recurrent_state[slot])
+            )
+            if self._hybrid_state_table.recurrent_state is not None
+            else None,
+        )
+
+    def _ensure_hybrid_slot(self, seq_id: int) -> int:
+        if seq_id < 0:
+            return -1
+        slot = self._hybrid_slots.get(seq_id)
+        if slot is not None:
+            return slot
+        if not self._free_hybrid_slots:
+            raise RuntimeError("No free hybrid-state slots; max_num_seqs is exhausted")
+        if seq_id < self._max_hybrid_slots and seq_id in self._free_hybrid_slots:
+            slot = seq_id
+            self._free_hybrid_slots.remove(slot)
+        else:
+            slot = self._free_hybrid_slots.pop()
+        self._zero_hybrid_slot(slot)
+        self._hybrid_slots[seq_id] = slot
+        return slot
+
     def _get_hybrid_state(self, seq_id: int) -> HybridLayerState:
         if seq_id < 0:
-            zero_state = init_hybrid_state(self.config, batch_size=1, dtype=self.config.get_dtype())
-            return zero_state
-        if seq_id not in self.hybrid_states:
-            zero_state = init_hybrid_state(self.config, batch_size=1, dtype=self.config.get_dtype())
-            self.hybrid_states[seq_id] = HybridLayerState(
-                conv_state=zero_state.conv_state[0],
-                recurrent_state=zero_state.recurrent_state[0],
-            )
-        state = self.hybrid_states[seq_id]
+            return self._empty_hybrid_state
+        slot = self._ensure_hybrid_slot(seq_id)
         return HybridLayerState(
-            conv_state=state.conv_state[None, ...] if state.conv_state is not None else None,
-            recurrent_state=state.recurrent_state[None, ...] if state.recurrent_state is not None else None,
+            conv_state=self._hybrid_state_table.conv_state[slot : slot + 1]
+            if self._hybrid_state_table.conv_state is not None
+            else None,
+            recurrent_state=self._hybrid_state_table.recurrent_state[slot : slot + 1]
+            if self._hybrid_state_table.recurrent_state is not None
+            else None,
         )
 
     def _set_hybrid_state(self, seq_id: int, state: HybridLayerState | None):
         if state is None or seq_id < 0:
             return
-        self.hybrid_states[seq_id] = HybridLayerState(
-            conv_state=state.conv_state[0] if state.conv_state is not None else None,
-            recurrent_state=state.recurrent_state[0] if state.recurrent_state is not None else None,
+        slot = self._ensure_hybrid_slot(seq_id)
+        self._hybrid_state_table = HybridLayerState(
+            conv_state=self._hybrid_state_table.conv_state.at[slot].set(state.conv_state[0])
+            if self._hybrid_state_table.conv_state is not None and state.conv_state is not None
+            else self._hybrid_state_table.conv_state,
+            recurrent_state=self._hybrid_state_table.recurrent_state.at[slot].set(state.recurrent_state[0])
+            if self._hybrid_state_table.recurrent_state is not None and state.recurrent_state is not None
+            else self._hybrid_state_table.recurrent_state,
         )
 
     def _slice_batch(self, batch: ScheduledBatch, idx: int) -> ScheduledBatch:
@@ -1183,27 +1252,61 @@ class CanonicalModelRunner:
         )
 
     def _batch_hybrid_state(self, batch: ScheduledBatch) -> HybridLayerState:
-        conv_states = []
-        recurrent_states = []
-        for seq_id in [int(x) for x in batch.seq_ids.tolist()]:
-            state = self._get_hybrid_state(seq_id)
-            conv_states.append(state.conv_state[0])
-            recurrent_states.append(state.recurrent_state[0])
-        return HybridLayerState(
-            conv_state=jnp.stack(conv_states, axis=0),
-            recurrent_state=jnp.stack(recurrent_states, axis=0),
-        )
+        slot_values = [self._ensure_hybrid_slot(int(seq_id)) for seq_id in batch.seq_ids.tolist()]
+        slot_ids = jnp.array(slot_values, dtype=jnp.int32)
+        safe_slot_ids = jnp.maximum(slot_ids, 0)
+        valid = slot_ids >= 0
+        conv_state = None
+        recurrent_state = None
+        if self._hybrid_state_table.conv_state is not None:
+            conv_state = self._hybrid_state_table.conv_state[safe_slot_ids]
+            conv_state = jnp.where(
+                valid.reshape((valid.shape[0],) + (1,) * (conv_state.ndim - 1)),
+                conv_state,
+                jnp.zeros_like(conv_state),
+            )
+        if self._hybrid_state_table.recurrent_state is not None:
+            recurrent_state = self._hybrid_state_table.recurrent_state[safe_slot_ids]
+            recurrent_state = jnp.where(
+                valid.reshape((valid.shape[0],) + (1,) * (recurrent_state.ndim - 1)),
+                recurrent_state,
+                jnp.zeros_like(recurrent_state),
+            )
+        return HybridLayerState(conv_state=conv_state, recurrent_state=recurrent_state)
 
     def _store_batch_hybrid_state(self, batch: ScheduledBatch, state: HybridLayerState | None):
         if state is None:
             return
+        valid_rows: List[int] = []
+        slot_values: List[int] = []
         for row, seq_id in enumerate([int(x) for x in batch.seq_ids.tolist()]):
             if seq_id < 0:
                 continue
-            self.hybrid_states[seq_id] = HybridLayerState(
-                conv_state=state.conv_state[row] if state.conv_state is not None else None,
-                recurrent_state=state.recurrent_state[row] if state.recurrent_state is not None else None,
-            )
+            valid_rows.append(row)
+            slot_values.append(self._ensure_hybrid_slot(seq_id))
+        if not valid_rows:
+            return
+        row_ids = jnp.array(valid_rows, dtype=jnp.int32)
+        slot_ids = jnp.array(slot_values, dtype=jnp.int32)
+        if (
+            self._hybrid_state_table.conv_state is not None
+            and self._hybrid_state_table.recurrent_state is not None
+            and state.conv_state is not None
+            and state.recurrent_state is not None
+            and len(valid_rows) == len(slot_values) == state.conv_state.shape[0]
+            and state.conv_state.shape[0] == self._hybrid_state_table.conv_state.shape[0]
+            and slot_values == list(range(len(slot_values)))
+        ):
+            self._hybrid_state_table = state
+            return
+        self._hybrid_state_table = HybridLayerState(
+            conv_state=self._hybrid_state_table.conv_state.at[slot_ids].set(state.conv_state[row_ids])
+            if self._hybrid_state_table.conv_state is not None and state.conv_state is not None
+            else self._hybrid_state_table.conv_state,
+            recurrent_state=self._hybrid_state_table.recurrent_state.at[slot_ids].set(state.recurrent_state[row_ids])
+            if self._hybrid_state_table.recurrent_state is not None and state.recurrent_state is not None
+            else self._hybrid_state_table.recurrent_state,
+        )
 
     def _refresh_kv_snapshot(self, batch: ScheduledBatch, hybrid_state: HybridLayerState | None = None):
         if hybrid_state is None:
@@ -1228,6 +1331,29 @@ class CanonicalModelRunner:
             recurrent_state=hybrid_state.recurrent_state,
         )
 
+    def _record_kv_snapshot(self, batch: ScheduledBatch, hybrid_state: HybridLayerState | None = None):
+        """Update the legacy KV snapshot without rebuilding attention metadata.
+
+        The canonical serving path uses ``cache_storage`` plus scheduled
+        per-step metadata, not ``self.kv_state``, for execution. This snapshot is
+        kept for compatibility/introspection only; rebuilding slot metadata here
+        is avoidable hot-path work for speculative decode.
+        """
+        if hybrid_state is None:
+            hybrid_state = self._batch_hybrid_state(batch)
+        slot_mapping = getattr(self.kv_state, "slot_mapping", None)
+        if slot_mapping is None:
+            slot_mapping = jnp.zeros_like(batch.positions, dtype=jnp.int32)
+        self.kv_state = KVCacheState(
+            k_cache=self.cache_storage.k_cache,
+            v_cache=self.cache_storage.v_cache,
+            block_table=batch.block_tables,
+            kv_lens=batch.seq_lens,
+            slot_mapping=slot_mapping,
+            conv_state=hybrid_state.conv_state,
+            recurrent_state=hybrid_state.recurrent_state,
+        )
+
     def _step_fn(self, batch: ScheduledBatch):
         execution = getattr(self, "execution", "eager")
         if execution == "jit" or (execution == "decode-jit" and not batch.is_prefill):
@@ -1241,6 +1367,9 @@ class CanonicalModelRunner:
 
     def _logits_from_hidden(self, hidden: jnp.ndarray) -> jnp.ndarray:
         hidden = self._final_norm_hidden(hidden)
+        return self._logits_from_normed_hidden(hidden)
+
+    def _logits_from_normed_hidden(self, hidden: jnp.ndarray) -> jnp.ndarray:
         if self.params.lm_head is not None:
             return jnp.dot(hidden, self.params.lm_head)
         return jnp.dot(hidden, self.params.embed_tokens.T)
@@ -1330,6 +1459,42 @@ class CanonicalModelRunner:
             return self._mtp1_token_jit(hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
         return forward(hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
 
+    def _mtp1_draft_chain(
+        self,
+        hidden_state: jnp.ndarray,
+        token_ids: jnp.ndarray,
+        positions: jnp.ndarray,
+        draft_len: int,
+    ) -> jnp.ndarray:
+        def forward(hidden_arg, token_arg, position_arg, embed_tokens_arg, mtp_params_tree):
+            mtp_params = self._mtp1_params_from_tree(mtp_params_tree)
+            current_hidden = hidden_arg
+            current_token = token_arg
+            current_position = position_arg
+            drafts = []
+            for _ in range(draft_len):
+                logits, current_hidden = mtp_forward(
+                    hidden_state=current_hidden,
+                    next_token_ids=current_token,
+                    embed_tokens=embed_tokens_arg,
+                    params=mtp_params,
+                    config=self.config,
+                    positions=current_position,
+                )
+                current_token = jnp.argmax(logits[:, 0], axis=-1).astype(jnp.int32)[:, None]
+                drafts.append(current_token[:, 0])
+                current_position = current_position + 1
+            return jnp.stack(drafts, axis=1)
+
+        mtp_params_tree = self._mtp1_params_tree()
+        if getattr(self, "execution", "eager") in {"decode-jit", "jit"}:
+            if not hasattr(self, "_mtp1_chain_jit"):
+                self._mtp1_chain_jit = {}
+            if draft_len not in self._mtp1_chain_jit:
+                self._mtp1_chain_jit[draft_len] = jax.jit(forward)
+            return self._mtp1_chain_jit[draft_len](hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
+        return forward(hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
+
     def _greedy_tokens_from_hidden(self, hidden: jnp.ndarray) -> jnp.ndarray:
         from nanovllm_jax.layers import rms_norm
 
@@ -1358,51 +1523,473 @@ class CanonicalModelRunner:
         batch: ScheduledBatch,
         *,
         seed_mtp1: bool,
-    ) -> List[int]:
+    ) -> List[int | List[int]]:
+        def _replay_copy(value):
+            if value is None:
+                return None
+            copied = jnp.array(value, copy=True)
+            copied.block_until_ready()
+            return copied
+
+        def _replay_copy_tree(value):
+            if value is None:
+                return None
+            if hasattr(value, "k_cache") and hasattr(value, "v_cache"):
+                return type(value)(
+                    k_cache=_replay_copy(value.k_cache),
+                    v_cache=_replay_copy(value.v_cache),
+                )
+            if hasattr(value, "conv_state") and hasattr(value, "recurrent_state"):
+                return type(value)(
+                    conv_state=_replay_copy(value.conv_state),
+                    recurrent_state=_replay_copy(value.recurrent_state),
+                )
+            return jax.tree_util.tree_map(_replay_copy, value)
+
         hybrid_state = self._batch_hybrid_state(batch)
+        if batch.is_prefill:
+            prefill_final_flags = list(batch.prefill_final_flags)[: len(seqs)]
+            if len(prefill_final_flags) < len(seqs):
+                prefill_final_flags.extend([True] * (len(seqs) - len(prefill_final_flags)))
+        else:
+            prefill_final_flags = [True] * len(seqs)
+
+        return_hidden_for_seed = bool(seed_mtp1)
         output = self._step_fn(batch)(
             batch,
             cache_storage=self.cache_storage,
             hybrid_state=hybrid_state,
-            return_hidden=seed_mtp1,
-            last_logits_only=not seed_mtp1,
+            return_hidden=return_hidden_for_seed,
+            return_hidden_with_logits=return_hidden_for_seed,
+            last_logits_only=True,
         )
         self.cache_storage = output.cache_storage
         self._store_batch_hybrid_state(batch, output.hybrid_state)
         self._refresh_kv_snapshot(batch, output.hybrid_state)
 
-        if seed_mtp1:
-            last_hidden = self._last_query_activations(output.activations, batch, len(seqs))
-            last_logits = self._logits_from_hidden(last_hidden[:, None, :])[:, 0]
+        last_hidden = None
+        seed_hidden = None
+        if return_hidden_for_seed:
+            hidden_activations, logits = output.activations
+            last_logits = logits[: len(seqs), 0]
+            last_hidden = self._last_query_activations(hidden_activations, batch, len(seqs))
+            seed_hidden = self._hidden_for_mtp(last_hidden[:, None, :])[:, 0]
         else:
-            last_hidden = None
             last_logits = output.activations[: len(seqs), 0]
+        if batch.is_prefill:
+            prefill_logits_by_seq = getattr(self, "_last_prefill_logits_by_seq", None)
+            if prefill_logits_by_seq is None:
+                prefill_logits_by_seq = {}
+                self._last_prefill_logits_by_seq = prefill_logits_by_seq
+            for row, seq in enumerate(seqs):
+                if row < len(prefill_final_flags) and prefill_final_flags[row]:
+                    prefill_logits_by_seq[int(seq.seq_id)] = last_logits[row]
 
         temperatures = jnp.array([seq.temperature for seq in seqs], dtype=jnp.float32)
         token_ids = self._sample_fn(last_logits, temperatures)
         token_list = [int(token_id) for token_id in token_ids.tolist()]
-        if seed_mtp1 and last_hidden is not None:
-            self._seed_mtp1_drafts(seqs, self._hidden_for_mtp(last_hidden[:, None, :])[:, 0], token_list)
-        return token_list
+
+        outputs: List[int | List[int]] = []
+        for row, (seq, token_id) in enumerate(zip(seqs, token_list)):
+            if batch.is_prefill and not prefill_final_flags[row]:
+                outputs.append([])
+                continue
+
+            outputs.append(token_id)
+
+            if seed_hidden is not None:
+                self._seed_mtp1_drafts([seq], seed_hidden[row : row + 1], [token_id])
+
+        return outputs
+
+    def _run_main_and_sample_with_mtp1_reuse(
+        self,
+        seqs: List[Sequence],
+        batch: ScheduledBatch,
+        *,
+        seed_mtp1: bool,
+    ) -> List[int | List[int]]:
+        """Decode once with the target model and verify any stored MTP1 drafts.
+
+        The previous MTP1 serving path verified a draft by running a two-token
+        target-model prefill on ``[last_token, draft]``. That recomputed the
+        existing decode forward for ``last_token``. This path instead uses the
+        logits from the normal scheduled decode step to verify the stored draft.
+
+        For accepted rows, this then runs one normal target decode on the draft
+        token to produce the speculative bonus token. That preserves the usual
+        K=1 speculative contract without recomputing the current token.
+        """
+        def _replay_copy(value):
+            if value is None:
+                return None
+            copied = jnp.array(value, copy=True)
+            copied.block_until_ready()
+            return copied
+
+        def _replay_copy_tree(value):
+            if value is None:
+                return None
+            if hasattr(value, "k_cache") and hasattr(value, "v_cache"):
+                return type(value)(
+                    k_cache=_replay_copy(value.k_cache),
+                    v_cache=_replay_copy(value.v_cache),
+                )
+            if hasattr(value, "conv_state") and hasattr(value, "recurrent_state"):
+                return type(value)(
+                    conv_state=_replay_copy(value.conv_state),
+                    recurrent_state=_replay_copy(value.recurrent_state),
+                )
+            return jax.tree_util.tree_map(_replay_copy, value)
+
+        hybrid_state = self._batch_hybrid_state(batch)
+        return_hidden_for_seed = bool(seed_mtp1)
+        output = self._step_fn(batch)(
+            batch,
+            cache_storage=self.cache_storage,
+            hybrid_state=hybrid_state,
+            return_hidden=return_hidden_for_seed,
+            return_hidden_with_logits=return_hidden_for_seed,
+            last_logits_only=True,
+        )
+        self.cache_storage = output.cache_storage
+        self._store_batch_hybrid_state(batch, output.hybrid_state)
+        self._refresh_kv_snapshot(batch, output.hybrid_state)
+
+        last_hidden = None
+        seed_hidden = None
+        if return_hidden_for_seed:
+            hidden_activations, logits = output.activations
+            last_logits = logits[: len(seqs), 0]
+            last_hidden = self._last_query_activations(hidden_activations, batch, len(seqs))
+            seed_hidden = self._hidden_for_mtp(last_hidden[:, None, :])[:, 0]
+        else:
+            last_logits = output.activations[: len(seqs), 0]
+
+        temperatures = jnp.array([seq.temperature for seq in seqs], dtype=jnp.float32)
+        token_ids = self._sample_fn(last_logits, temperatures)
+        target_tokens = [int(token_id) for token_id in token_ids.tolist()]
+
+        main_lookahead_all = os.environ.get("NANO_VLLM_JAX_MAIN_LOOKAHEAD_ALL", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }
+        if (
+            main_lookahead_all
+            and not batch.is_prefill
+            and all(seq.temperature == 0 for seq in seqs)
+            and all(seq.num_completion_tokens + 2 <= seq.max_tokens for seq in seqs)
+            and all(int(length) == 1 for length in batch.query_lens[: len(seqs)].tolist())
+        ):
+            lookahead_batch = ScheduledBatch(
+                tokens=token_ids[:, None].astype(jnp.int32),
+                positions=batch.positions[: len(seqs)] + 1,
+                seq_ids=batch.seq_ids[: len(seqs)],
+                query_start_loc=jnp.arange(len(seqs) + 1, dtype=jnp.int32),
+                is_prefill=False,
+                num_prefill_tokens=0,
+                num_decode_tokens=len(seqs),
+                block_tables=batch.block_tables[: len(seqs)],
+                seq_lens=batch.seq_lens[: len(seqs)] + 1,
+            )
+            lookahead_hybrid = self._batch_hybrid_state(lookahead_batch)
+            lookahead_output = self._step_fn(lookahead_batch)(
+                lookahead_batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=lookahead_hybrid,
+                return_hidden=False,
+                last_logits_only=True,
+            )
+            self.cache_storage = lookahead_output.cache_storage
+            self._store_batch_hybrid_state(lookahead_batch, lookahead_output.hybrid_state)
+            self._refresh_kv_snapshot(lookahead_batch, lookahead_output.hybrid_state)
+            lookahead_logits = lookahead_output.activations[:, 0]
+            bonus_token_ids = self._sample_fn(lookahead_logits, temperatures)
+            bonus_tokens = [int(token_id) for token_id in bonus_token_ids.tolist()]
+            return [[target_tokens[row], bonus_tokens[row]] for row in range(len(seqs))]
+
+        outputs: List[int | List[int] | None] = [None] * len(seqs)
+        stats = self._speculative_stats()
+        debug_by_seq, debug_events = self._mtp1_debug_state()
+        accepted_rows: List[int] = []
+        accepted_drafts: List[int] = []
+        draft_chains_by_row: dict[int, List[int]] = {}
+        seed_normal_rows: List[int] = []
+        seed_normal_tokens: List[int] = []
+
+        for row, (seq, target_token) in enumerate(zip(seqs, target_tokens)):
+            draft_value = self._mtp1_drafts.pop(seq.seq_id, None)
+            draft_tokens = (
+                [int(token) for token in draft_value]
+                if isinstance(draft_value, list)
+                else ([int(draft_value)] if draft_value is not None else [])
+            )
+            first_draft = draft_tokens[0] if draft_tokens else None
+            # Accepted MTP emits the draft plus a bonus token. The verifier
+            # writes KV only through the draft token, but Python advances the
+            # sequence by both emitted tokens before the next scheduled decode.
+            required_blocks = (seq.num_tokens + 2 + self.block_size - 1) // self.block_size
+            can_verify = (
+                first_draft is not None
+                and self.mtp1_enabled
+                and not batch.is_prefill
+                and seq.temperature == 0
+                and int(batch.query_lens[row]) == 1
+                and seq.num_completion_tokens + 2 <= seq.max_tokens
+                and len(seq.block_table) >= required_blocks
+            )
+
+            if not can_verify:
+                if self.mtp1_enabled and not batch.is_prefill:
+                    stats["fallback_steps"] += 1
+                outputs[row] = target_token
+                seed_normal_rows.append(row)
+                seed_normal_tokens.append(target_token)
+                continue
+
+            draft_chains_by_row[row] = draft_tokens
+            accepted = int(target_token) == int(first_draft)
+            if accepted:
+                stats["drafts_accepted"] += 1
+                accepted_rows.append(row)
+                accepted_drafts.append(int(first_draft))
+            else:
+                stats["drafts_rejected"] += 1
+                outputs[row] = target_token
+                seed_normal_rows.append(row)
+                seed_normal_tokens.append(target_token)
+
+            if getattr(self, "mtp_debug", False):
+                draft_debug = debug_by_seq.pop(seq.seq_id, {})
+                verify_logits = last_logits[row]
+                debug_events.append(
+                    {
+                        **draft_debug,
+                        "target_token": int(target_token),
+                        "accepted": bool(accepted),
+                        "draft_rank_in_main": self._token_rank(verify_logits, int(first_draft)),
+                        "main_top": self._topk_debug(verify_logits),
+                        "target_in_mtp_top5": int(target_token) in draft_debug.get("mtp_top", {}).get("ids", []),
+                        "verifier_reused_decode": True,
+                    }
+                )
+
+        emit_bonus = os.environ.get("NANO_VLLM_JAX_MTP_EMIT_BONUS", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }
+        if accepted_rows and not emit_bonus:
+            for local_row, row in enumerate(accepted_rows):
+                outputs[row] = accepted_drafts[local_row]
+            accepted_rows = []
+
+        if accepted_rows:
+            accepted_idx = jnp.array(accepted_rows, dtype=jnp.int32)
+            draft_batch = ScheduledBatch(
+                tokens=jnp.array(accepted_drafts, dtype=jnp.int32)[:, None],
+                positions=batch.positions[accepted_idx] + 1,
+                seq_ids=batch.seq_ids[accepted_idx],
+                query_start_loc=jnp.arange(len(accepted_rows) + 1, dtype=jnp.int32),
+                is_prefill=False,
+                num_prefill_tokens=0,
+                num_decode_tokens=len(accepted_rows),
+                block_tables=batch.block_tables[accepted_idx],
+                seq_lens=batch.seq_lens[accepted_idx] + 1,
+            )
+            draft_hybrid_state = self._batch_hybrid_state(draft_batch)
+            draft_output = self._step_fn(draft_batch)(
+                draft_batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=draft_hybrid_state,
+                return_hidden=False,
+                last_logits_only=True,
+            )
+            self.cache_storage = draft_output.cache_storage
+            self._store_batch_hybrid_state(draft_batch, draft_output.hybrid_state)
+            self._refresh_kv_snapshot(draft_batch, draft_output.hybrid_state)
+
+            bonus_hidden = None
+            bonus_logits = draft_output.activations[:, 0]
+            bonus_temperatures = jnp.array([seqs[row].temperature for row in accepted_rows], dtype=jnp.float32)
+            bonus_token_ids = self._sample_fn(bonus_logits, bonus_temperatures)
+            bonus_tokens = [int(token_id) for token_id in bonus_token_ids.tolist()]
+            second_accept_rows: List[int] = []
+            second_accept_drafts: List[int] = []
+            enable_second_accept = False
+
+            # Build second-token acceptance using the draft chains collected
+            # during first-token verification.
+            for local_row, row in enumerate(accepted_rows):
+                seq = seqs[row]
+                draft_chain = draft_chains_by_row.get(row, [])
+                if (
+                    enable_second_accept
+                    and len(draft_chain) >= 2
+                    and seq.num_completion_tokens + 3 <= seq.max_tokens
+                    and int(bonus_tokens[local_row]) == int(draft_chain[1])
+                ):
+                    stats["drafts_accepted"] += 1
+                    second_accept_rows.append(row)
+                    second_accept_drafts.append(int(draft_chain[1]))
+                else:
+                    if len(draft_chain) >= 2:
+                        stats["drafts_rejected"] += 1
+                    outputs[row] = [accepted_drafts[local_row], bonus_tokens[local_row]]
+                    stats["bonus_tokens"] += 1
+
+            if second_accept_rows:
+                second_idx = jnp.array(second_accept_rows, dtype=jnp.int32)
+                second_batch = ScheduledBatch(
+                    tokens=jnp.array(second_accept_drafts, dtype=jnp.int32)[:, None],
+                    positions=batch.positions[second_idx] + 2,
+                    seq_ids=batch.seq_ids[second_idx],
+                    query_start_loc=jnp.arange(len(second_accept_rows) + 1, dtype=jnp.int32),
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=len(second_accept_rows),
+                    block_tables=batch.block_tables[second_idx],
+                    seq_lens=batch.seq_lens[second_idx] + 2,
+                )
+                second_hybrid_state = self._batch_hybrid_state(second_batch)
+                second_output = self._step_fn(second_batch)(
+                    second_batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state=second_hybrid_state,
+                    return_hidden=True,
+                    last_logits_only=False,
+                )
+                self.cache_storage = second_output.cache_storage
+                self._store_batch_hybrid_state(second_batch, second_output.hybrid_state)
+                self._refresh_kv_snapshot(second_batch, second_output.hybrid_state)
+                second_bonus_hidden = second_output.activations[:, 0]
+                second_bonus_logits = self._logits_from_hidden(second_bonus_hidden[:, None, :])[:, 0]
+                second_bonus_temps = jnp.array([seqs[row].temperature for row in second_accept_rows], dtype=jnp.float32)
+                second_bonus_ids = self._sample_fn(second_bonus_logits, second_bonus_temps)
+                second_bonus_tokens = [int(token_id) for token_id in second_bonus_ids.tolist()]
+                accepted_draft_by_row = dict(zip(accepted_rows, accepted_drafts))
+                for local_row, row in enumerate(second_accept_rows):
+                    chain = draft_chains_by_row[row]
+                    outputs[row] = [accepted_draft_by_row[row], chain[1], second_bonus_tokens[local_row]]
+                    stats["bonus_tokens"] += 1
+                if seed_mtp1:
+                    self._seed_mtp1_drafts(
+                        [seqs[row] for row in second_accept_rows],
+                        self._hidden_for_mtp(second_bonus_hidden[:, None, :])[:, 0],
+                        second_bonus_tokens,
+                    )
+
+            first_only_rows = [
+                row
+                for row in accepted_rows
+                if row not in second_accept_rows
+            ]
+            if seed_mtp1 and first_only_rows:
+                if bonus_hidden is not None:
+                    first_only_indices = jnp.array([accepted_rows.index(row) for row in first_only_rows], dtype=jnp.int32)
+                    self._seed_mtp1_drafts(
+                        [seqs[row] for row in first_only_rows],
+                        self._hidden_for_mtp(bonus_hidden[:, None, :])[:, 0][first_only_indices],
+                        [bonus_tokens[accepted_rows.index(row)] for row in first_only_rows],
+                        positions=[
+                            int(batch.positions[row, 0]) + 2
+                            for row in first_only_rows
+                        ],
+                    )
+
+        if seed_hidden is not None and seed_normal_rows:
+            normal_row_index = jnp.array(seed_normal_rows, dtype=jnp.int32)
+            self._seed_mtp1_drafts(
+                [seqs[row] for row in seed_normal_rows],
+                seed_hidden[normal_row_index],
+                seed_normal_tokens,
+            )
+
+        resolved_outputs: List[int | List[int]] = []
+        for output_token in outputs:
+            if output_token is None:
+                raise RuntimeError("MTP decode reuse path produced no output for a scheduled sequence")
+            resolved_outputs.append(output_token)
+
+        return resolved_outputs
 
     def _seed_mtp1_drafts(
         self,
         seqs: List[Sequence],
         hidden: jnp.ndarray,
         confirmed_token_ids: List[int],
+        positions: List[int] | None = None,
     ):
+        seed_rows: List[int] = []
+        token_values: List[int] = []
+        position_values: List[int] = []
         for row, seq in enumerate(seqs):
             confirmed_token_id = confirmed_token_ids[row]
-            position = seq.num_tokens
+            position = int(positions[row]) if positions is not None else seq.num_tokens
             if getattr(self, "mtp_token_source", "generated") == "current":
                 confirmed_token_id = seq.last_token
                 position = seq.num_tokens - 1
-            self._seed_mtp1_draft(
-                seq,
-                hidden[row],
-                confirmed_token_id,
-                position=position,
+            if not self.mtp1_enabled or seq.temperature != 0:
+                self._mtp1_drafts.pop(seq.seq_id, None)
+                self._mtp1_debug_state()[0].pop(seq.seq_id, None)
+                continue
+            if seq.num_completion_tokens + 1 >= seq.max_tokens:
+                self._mtp1_drafts.pop(seq.seq_id, None)
+                self._mtp1_debug_state()[0].pop(seq.seq_id, None)
+                continue
+            seed_rows.append(row)
+            token_values.append(int(confirmed_token_id))
+            position_values.append(int(position + int(getattr(self, "mtp_position_offset", 0))))
+
+        if not seed_rows:
+            return
+
+        row_index = jnp.array(seed_rows, dtype=jnp.int32)
+        hidden_input = hidden[row_index][:, None, :]
+        token_input = jnp.array(token_values, dtype=jnp.int32)[:, None]
+        position_input = jnp.array(position_values, dtype=jnp.int32)[:, None]
+        draft_len = max(1, int(getattr(self, "num_speculative_tokens", 1) or 1))
+        if getattr(self, "mtp_debug", False):
+            draft_logits = self._mtp1_logits(
+                hidden_state=hidden_input,
+                token_ids=token_input,
+                positions=position_input,
             )
+            draft_tokens = jnp.argmax(draft_logits[:, 0], axis=-1).astype(jnp.int32)
+            draft_chains = draft_tokens[:, None]
+        else:
+            draft_logits = None
+            draft_chains = self._mtp1_draft_chain(
+                hidden_state=hidden_input,
+                token_ids=token_input,
+                positions=position_input,
+                draft_len=draft_len,
+            )
+
+        draft_chain_list = [[int(token) for token in chain] for chain in draft_chains.tolist()]
+        for local_row, row in enumerate(seed_rows):
+            seq = seqs[row]
+            draft_chain = draft_chain_list[local_row]
+            self._mtp1_drafts[seq.seq_id] = draft_chain if len(draft_chain) > 1 else draft_chain[0]
+            if getattr(self, "mtp_debug", False):
+                draft_token = draft_chain[0]
+                draft_vector = draft_logits[local_row, 0]
+                draft_debug, _ = self._mtp1_debug_state()
+                draft_debug[seq.seq_id] = {
+                    "confirmed_token_id": int(token_values[local_row]),
+                    "draft_token": draft_token,
+                    "position": int(position_values[local_row] - int(getattr(self, "mtp_position_offset", 0))),
+                    "position_offset": int(getattr(self, "mtp_position_offset", 0)),
+                    "token_source": str(getattr(self, "mtp_token_source", "generated")),
+                    "hidden_source": str(getattr(self, "mtp_hidden_source", "final_normed")),
+                    "mtp_top": self._topk_debug(draft_vector),
+                }
+            self._speculative_stats()["drafts_proposed"] += len(draft_chain)
 
     def _seed_mtp1_draft(
         self,
@@ -1466,7 +2053,37 @@ class CanonicalModelRunner:
         if int(batch.query_lens[0]) != 1:
             self._speculative_stats()["fallback_steps"] += 1
             return False
-        required_blocks = (seq.num_tokens + 1 + self.block_size - 1) // self.block_size
+        # MTP K=1 can emit [draft, bonus]. Even though the verifier only writes
+        # KV through the draft token, Sequence.num_tokens advances by both
+        # emitted tokens before the next scheduled decode.
+        required_blocks = (seq.num_tokens + 2 + self.block_size - 1) // self.block_size
+        can_run = len(seq.block_table) >= required_blocks
+        if not can_run:
+            self._speculative_stats()["fallback_steps"] += 1
+        return can_run
+
+    def _can_run_mtp1_for_row(self, seq: Sequence, batch: ScheduledBatch, row: int) -> bool:
+        if not self.mtp1_enabled or batch.is_prefill:
+            if self.mtp1_enabled and not batch.is_prefill:
+                self._speculative_stats()["fallback_steps"] += 1
+            return False
+
+        if seq.temperature != 0 or seq.seq_id not in self._mtp1_drafts:
+            self._speculative_stats()["fallback_steps"] += 1
+            return False
+
+        if seq.num_completion_tokens + 2 > seq.max_tokens:
+            self._speculative_stats()["fallback_steps"] += 1
+            return False
+
+        if int(batch.query_lens[row]) != 1:
+            self._speculative_stats()["fallback_steps"] += 1
+            return False
+
+        # MTP K=1 can emit [draft, bonus]. Even though the verifier only writes
+        # KV through the draft token, Sequence.num_tokens advances by both
+        # emitted tokens before the next scheduled decode.
+        required_blocks = (seq.num_tokens + 2 + self.block_size - 1) // self.block_size
         can_run = len(seq.block_table) >= required_blocks
         if not can_run:
             self._speculative_stats()["fallback_steps"] += 1
@@ -1484,6 +2101,395 @@ class CanonicalModelRunner:
             block_tables=batch.block_tables[:1],
             seq_lens=jnp.array([seq.num_tokens + 1], dtype=jnp.int32),
         )
+
+    def _mtp1_verification_batch_for_rows(
+        self,
+        seqs: List[Sequence],
+        batch: ScheduledBatch,
+        rows: List[int],
+        draft_tokens: List[int],
+    ) -> ScheduledBatch:
+        tokens = []
+        positions = []
+        seq_ids = []
+        seq_lens = []
+        block_tables = []
+        query_start_loc = [0]
+        for seq, row, draft_token in zip(seqs, rows, draft_tokens):
+            tokens.append([seq.last_token, draft_token])
+            positions.append([seq.num_tokens - 1, seq.num_tokens])
+            seq_ids.append(seq.seq_id)
+            seq_lens.append(seq.num_tokens + 1)
+            block_tables.append(batch.block_tables[row].tolist())
+            query_start_loc.append(query_start_loc[-1] + 2)
+
+        return ScheduledBatch(
+            tokens=jnp.array(tokens, dtype=jnp.int32),
+            positions=jnp.array(positions, dtype=jnp.int32),
+            seq_ids=jnp.array(seq_ids, dtype=jnp.int32),
+            query_start_loc=jnp.array(query_start_loc, dtype=jnp.int32),
+            is_prefill=True,
+            num_prefill_tokens=2 * len(rows),
+            num_decode_tokens=0,
+            block_tables=jnp.array(block_tables, dtype=jnp.int32),
+            seq_lens=jnp.array(seq_lens, dtype=jnp.int32),
+        )
+
+    def _run_mtp1_batched(
+        self,
+        seqs: List[Sequence],
+        batch: ScheduledBatch,
+        rows: List[int],
+    ) -> dict[int, List[int] | int] | None:
+        if not rows:
+            return {}
+        if os.environ.get("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "0") not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }:
+            return None
+        profile_mtp = os.environ.get("NANO_VLLM_JAX_PROFILE_MTP_RUN", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }
+
+        def _ready(value):
+            if not profile_mtp:
+                return
+            for leaf in jax.tree_util.tree_leaves(value):
+                ready = getattr(leaf, "block_until_ready", None)
+                if ready is not None:
+                    ready()
+
+        def _mark(label: str, start: float) -> float:
+            if profile_mtp:
+                now = time.perf_counter()
+                print(f"[MTP_RUN] {label}={(now - start) * 1000:.3f}ms", flush=True)
+                return now
+            return start
+
+        t_profile = time.perf_counter()
+        use_debug = getattr(self, "mtp_debug", False)
+        force_scalar_mtp = os.environ.get("NANO_VLLM_JAX_MTP_FORCE_SCALAR", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }
+        use_fused_step = (
+            not use_debug
+            and not force_scalar_mtp
+            and getattr(self, "execution", "eager") in {"decode-jit", "jit"}
+            and hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
+            and len(rows) == len(seqs)
+            and rows == list(range(len(seqs)))
+            and len(seqs) == batch.tokens.shape[0]
+        )
+        if not use_fused_step:
+            for row in rows:
+                draft_value = self._mtp1_drafts.get(seqs[row].seq_id)
+                if isinstance(draft_value, list) and len(draft_value) > 1:
+                    return None
+            return {
+                row: self._run_mtp1([seqs[row]], self._slice_batch(batch, row))[0]
+                for row in rows
+            }
+
+        mtp_seqs = [seqs[row] for row in rows]
+        draft_chains: List[List[int]] = []
+        for seq in mtp_seqs:
+            draft_value = self._mtp1_drafts[seq.seq_id]
+            if isinstance(draft_value, list):
+                draft_chains.append([int(token) for token in draft_value])
+            else:
+                draft_chains.append([int(draft_value)])
+        draft_len = min(len(chain) for chain in draft_chains)
+        draft_len = min(draft_len, max(1, int(getattr(self, "num_speculative_tokens", 1) or 1)))
+        if draft_len < 1:
+            return {}
+        draft_token_chains = [chain[:draft_len] for chain in draft_chains]
+        draft_tokens = [chain[0] for chain in draft_token_chains]
+        decode_batch = self._slice_batch(batch, 0) if len(rows) == 1 else batch
+        hybrid_state = self._batch_hybrid_state(decode_batch)
+        _ready(hybrid_state)
+        t_profile = _mark("batch_hybrid_state", t_profile)
+        next_mtp_positions = jnp.array(
+            [
+                seq.num_tokens + draft_len + int(getattr(self, "mtp_position_offset", 0))
+                for seq in mtp_seqs
+            ],
+            dtype=jnp.int32,
+        )
+        use_commit_select = (
+            draft_len == 1
+            and os.environ.get("NANO_VLLM_JAX_MTP_COMMIT_SELECT", "0")
+            in {"1", "true", "yes", "on", "True"}
+            and hasattr(self.executor, "mtp1_commit_select_greedy_step_jit")
+        )
+        use_mtp2_commit_select = (
+            draft_len == 2
+            and hasattr(self.executor, "mtp2_commit_select_greedy_step_jit")
+        )
+        use_fast_all_accept = (
+            draft_len == 1
+            and not use_commit_select
+            and os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_FAST_ALL_ACCEPT", "0")
+            in {"1", "true", "yes", "on", "True"}
+            and os.environ.get("NANO_VLLM_JAX_MTP_PREFIX_SAFE", "0")
+            not in {"1", "true", "yes", "on", "True"}
+            and hasattr(self.executor, "mtp1_two_decode_greedy_fast_step_jit")
+        )
+        use_prefix_two_decode = (
+            draft_len == 1
+            and not use_commit_select
+            and os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_PREFIX_TWO_DECODE", "0")
+            in {"1", "true", "yes", "on", "True"}
+            and hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
+        )
+        if use_commit_select:
+            output = self.executor.mtp1_commit_select_greedy_step_jit(
+                decode_batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=hybrid_state,
+                draft_token=jnp.array(draft_tokens, dtype=jnp.int32),
+                next_mtp_position=next_mtp_positions,
+                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+            )
+            _ready(output)
+            t_profile = _mark("executor_mtp1_commit_select", t_profile)
+        elif use_fast_all_accept:
+            output = self.executor.mtp1_two_decode_greedy_fast_step_jit(
+                decode_batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=hybrid_state,
+                draft_token=jnp.array(draft_tokens, dtype=jnp.int32),
+                next_mtp_position=next_mtp_positions,
+                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+            )
+            _ready(output)
+            t_profile = _mark("executor_mtp1_two_decode_fast", t_profile)
+            accepted_all = bool(jnp.all(output.accepted).item())
+        elif draft_len == 1 and use_prefix_two_decode:
+            output = self.executor.mtp1_two_decode_greedy_step_jit(
+                decode_batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=hybrid_state,
+                draft_token=jnp.array(draft_tokens, dtype=jnp.int32),
+                next_mtp_position=next_mtp_positions,
+                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+            )
+            _ready(output)
+            t_profile = _mark("executor_mtp1_two_decode", t_profile)
+        elif draft_len == 1:
+            return None
+        elif use_mtp2_commit_select:
+            output = self.executor.mtp2_commit_select_greedy_step_jit(
+                decode_batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=hybrid_state,
+                draft_tokens=jnp.array(draft_token_chains, dtype=jnp.int32),
+                next_mtp_position=next_mtp_positions,
+                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+            )
+            _ready(output)
+            t_profile = _mark("executor_mtp2_commit_select", t_profile)
+            accepted_all = bool(jnp.all(output.accepted).item())
+        else:
+            output = self.executor.mtp_k_decode_greedy_step_jit(
+                decode_batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=hybrid_state,
+                draft_tokens=jnp.array(draft_token_chains, dtype=jnp.int32),
+                next_mtp_position=next_mtp_positions,
+                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+            )
+            _ready(output)
+            t_profile = _mark("executor_mtp_k_decode", t_profile)
+            accepted_all = bool(jnp.all(output.accepted).item())
+        t_profile = _mark("host_result_transfer", t_profile)
+
+        accepted_all = bool(jnp.all(output.accepted).item())
+        if not accepted_all and not use_commit_select and draft_len == 1:
+            # Correctness first: the verifier may have physically written KV /
+            # hybrid state for rejected draft slots. Do not install those side
+            # effects. Let the canonical main-model reuse path verify the
+            # stored drafts against an ordinary decode from the original state.
+            return None
+
+        if draft_len > 1 and not use_mtp2_commit_select and not use_commit_select and not accepted_all:
+            accepted_matrix = [
+                [bool(value) for value in row_acceptance]
+                for row_acceptance in output.accepted.tolist()
+            ]
+            self._record_draft_position_acceptance(accepted_matrix)
+            full_accept_locals = [
+                local_row
+                for local_row, row_acceptance in enumerate(accepted_matrix)
+                if all(row_acceptance)
+            ]
+            repair_locals = [
+                local_row
+                for local_row, row_acceptance in enumerate(accepted_matrix)
+                if not all(row_acceptance)
+            ]
+
+            # Physical verifier writes for repair rows are safe: those slots
+            # remain logically unreachable and K=1 repair rewrites the current
+            # token / first draft before they can be read.
+            self.cache_storage = output.cache_storage
+
+            outputs: dict[int, List[int] | int] = {}
+            stats = self._speculative_stats()
+            if full_accept_locals:
+                full_accept_rows = [rows[local_row] for local_row in full_accept_locals]
+                full_accept_idx = jnp.array(full_accept_locals, dtype=jnp.int32)
+                accepted_batch = ScheduledBatch(
+                    tokens=decode_batch.tokens[full_accept_idx],
+                    positions=decode_batch.positions[full_accept_idx],
+                    seq_ids=decode_batch.seq_ids[full_accept_idx],
+                    query_start_loc=jnp.arange(len(full_accept_locals) + 1, dtype=jnp.int32),
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=len(full_accept_locals),
+                    block_tables=decode_batch.block_tables[full_accept_idx],
+                    seq_lens=decode_batch.seq_lens[full_accept_idx] + draft_len,
+                )
+                accepted_hybrid = HybridLayerState(
+                    conv_state=output.hybrid_state.conv_state[full_accept_idx]
+                    if output.hybrid_state.conv_state is not None
+                    else None,
+                    recurrent_state=output.hybrid_state.recurrent_state[full_accept_idx]
+                    if output.hybrid_state.recurrent_state is not None
+                    else None,
+                )
+                self._store_batch_hybrid_state(accepted_batch, accepted_hybrid)
+                self._record_kv_snapshot(accepted_batch, accepted_hybrid)
+
+                bonus_values = [int(value) for value in output.bonus_token.tolist()]
+                next_draft_values = [
+                    [int(token) for token in chain]
+                    for chain in output.next_draft_token.tolist()
+                ]
+                for local_row, row in zip(full_accept_locals, full_accept_rows):
+                    seq = seqs[row]
+                    self._mtp1_drafts.pop(seq.seq_id, None)
+                    stats["drafts_accepted"] += draft_len
+                    stats["bonus_tokens"] += 1
+                    emitted_len = draft_len + 1
+                    outputs[row] = draft_token_chains[local_row] + [bonus_values[local_row]]
+                    if self.mtp1_enabled and seq.temperature == 0 and seq.num_completion_tokens + emitted_len < seq.max_tokens:
+                        next_chain = next_draft_values[local_row]
+                        self._mtp1_drafts[seq.seq_id] = next_chain if len(next_chain) > 1 else next_chain[0]
+                        stats["drafts_proposed"] += len(next_chain)
+
+            if repair_locals:
+                repair_rows = [rows[local_row] for local_row in repair_locals]
+                for local_row, row in zip(repair_locals, repair_rows):
+                    seq = seqs[row]
+                    self._mtp1_drafts[seq.seq_id] = draft_token_chains[local_row][0]
+                repair_outputs = self._run_mtp1_batched(seqs, batch, repair_rows)
+                if repair_outputs is None:
+                    return None
+                outputs.update(repair_outputs)
+            return outputs
+
+        self.cache_storage = output.cache_storage
+        committed_batch = decode_batch
+        if getattr(output, "committed_seq_lens", None) is not None:
+            committed_batch = replace(decode_batch, seq_lens=output.committed_seq_lens)
+        self._store_batch_hybrid_state(committed_batch, output.hybrid_state)
+        _ready(self._hybrid_state_table)
+        t_profile = _mark("store_hybrid_state", t_profile)
+        self._record_kv_snapshot(committed_batch, output.hybrid_state)
+        t_profile = _mark("record_kv_snapshot", t_profile)
+        target_token_values = output.target_token.tolist()
+        if draft_len > 1:
+            target_token_rows = [[int(token) for token in row] for row in target_token_values]
+            target_tokens = [row[0] for row in target_token_rows]
+        else:
+            target_token_rows = [[int(x)] for x in target_token_values]
+            target_tokens = [row[0] for row in target_token_rows]
+        bonus_tokens = [int(x) for x in output.bonus_token.tolist()]
+        if draft_len > 1:
+            accepted_matrix = [
+                [bool(value) for value in row_acceptance]
+                for row_acceptance in output.accepted.tolist()
+            ]
+            prefix_lengths = []
+            for row_acceptance in accepted_matrix:
+                prefix_len = 0
+                for value in row_acceptance:
+                    if not value:
+                        break
+                    prefix_len += 1
+                prefix_lengths.append(prefix_len)
+            accepted_flags = [prefix_len == draft_len for prefix_len in prefix_lengths]
+            self._record_draft_position_acceptance(
+                accepted_matrix
+            )
+        else:
+            accepted_flags = [bool(x) for x in output.accepted.tolist()]
+            prefix_lengths = [1 if accepted else 0 for accepted in accepted_flags]
+        if draft_len == 1:
+            next_draft_chains = [[int(x)] for x in output.next_draft_token.tolist()]
+        else:
+            next_draft_chains = [[int(token) for token in chain] for chain in output.next_draft_token.tolist()]
+        t_profile = _mark("accepted_result_transfer", t_profile)
+        outputs: dict[int, List[int] | int] = {}
+        stats = self._speculative_stats()
+        seed_after_bonus = os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }
+
+        for local_row, row in enumerate(rows):
+            seq = seqs[row]
+            self._mtp1_drafts.pop(seq.seq_id, None)
+
+            accepted = accepted_flags[local_row]
+            prefix_len = prefix_lengths[local_row]
+            if draft_len > 1 and prefix_len < draft_len:
+                stats["drafts_accepted"] += prefix_len
+                stats["drafts_rejected"] += 1
+                emitted_len = prefix_len + 1
+                if prefix_len == 0:
+                    outputs[row] = target_token_rows[local_row][0]
+                else:
+                    outputs[row] = (
+                        draft_token_chains[local_row][:prefix_len]
+                        + [target_token_rows[local_row][prefix_len]]
+                    )
+            elif accepted:
+                stats["drafts_accepted"] += draft_len
+                stats["bonus_tokens"] += 1
+                emitted_len = draft_len + 1
+                outputs[row] = draft_token_chains[local_row] + [bonus_tokens[local_row]]
+            else:
+                stats["drafts_rejected"] += 1
+                emitted_len = 1
+                outputs[row] = target_tokens[local_row]
+
+            if (
+                self.mtp1_enabled
+                and seq.temperature == 0
+                and seq.num_completion_tokens + emitted_len < seq.max_tokens
+                and (prefix_len == 0 or seed_after_bonus)
+            ):
+                next_chain = next_draft_chains[local_row]
+                self._mtp1_drafts[seq.seq_id] = next_chain if len(next_chain) > 1 else next_chain[0]
+                stats["drafts_proposed"] += len(next_chain)
+
+        return outputs
 
     def _run_mtp1(self, seqs: List[Sequence], batch: ScheduledBatch) -> List[List[int] | int]:
         seq = seqs[0]
@@ -1510,8 +2516,8 @@ class CanonicalModelRunner:
             logits = None
             verify_logits = None
             token_ids = None
-            target_token = int(output.target_token.item())
-            accepted = bool(output.accepted.item())
+            target_token = int(output.target_token[0].item())
+            accepted = bool(output.accepted[0].item())
         else:
             output = self._mtp1_verifier_step_fn()(
                 verifier_batch,
@@ -1532,6 +2538,7 @@ class CanonicalModelRunner:
                 verify_logits = logits[0, 0]
                 target_token = int(jnp.argmax(verify_logits))
             accepted = target_token == draft_token
+
         if use_debug:
             logits = self._logits_from_hidden(output.activations)
             verify_logits = logits[0, 0]
@@ -1550,17 +2557,18 @@ class CanonicalModelRunner:
             self._speculative_stats()["drafts_rejected"] += 1
             return self._run_main_and_sample(seqs, batch, seed_mtp1=True)
 
-        stats = self._speculative_stats()
-        stats["drafts_accepted"] += 1
-        stats["bonus_tokens"] += 1
         self.cache_storage = output.cache_storage
         self._store_batch_hybrid_state(verifier_batch, output.hybrid_state)
         self._refresh_kv_snapshot(verifier_batch, output.hybrid_state)
 
+        stats = self._speculative_stats()
+        stats["drafts_accepted"] += 1
+        stats["bonus_tokens"] += 1
+
         if use_fused_step:
-            bonus_token = int(output.bonus_token.item())
+            bonus_token = int(output.bonus_token[0].item())
             if self.mtp1_enabled and seq.temperature == 0 and seq.num_completion_tokens + 1 < seq.max_tokens:
-                self._mtp1_drafts[seq.seq_id] = int(output.next_draft_token.item())
+                self._mtp1_drafts[seq.seq_id] = int(output.next_draft_token[0].item())
                 self._speculative_stats()["drafts_proposed"] += 1
             else:
                 self._mtp1_drafts.pop(seq.seq_id, None)
@@ -1596,9 +2604,80 @@ class CanonicalModelRunner:
                 raise ValueError("Either is_prefill or batch must be provided")
             batch = self._build_scheduled_batch(seqs, is_prefill=is_prefill)
 
-        if self._can_run_mtp1(seqs, batch):
-            return self._run_mtp1(seqs, batch)
-        return self._run_main_and_sample(seqs, batch, seed_mtp1=self.mtp1_enabled)
+        seed_mtp1 = True
+        if batch.is_prefill:
+            prefill_final_flags = [
+                bool(flag) for flag in (batch.prefill_final_flags[: len(seqs)] if len(batch.prefill_final_flags) >= len(seqs) else batch.prefill_final_flags)
+            ]
+            seed_mtp1 = all(prefill_final_flags)
+
+        if self.mtp1_enabled and not batch.is_prefill:
+            fused_rows: List[int] = []
+            profile_mtp = os.environ.get("NANO_VLLM_JAX_PROFILE_MTP_RUN", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+            not_fused_reasons: Dict[str, int] = {}
+            for row, seq in enumerate(seqs):
+                draft_value = self._mtp1_drafts.get(seq.seq_id)
+                draft_len = len(draft_value) if isinstance(draft_value, list) else (1 if draft_value is not None else 0)
+                draft_len = min(draft_len, max(1, int(getattr(self, "num_speculative_tokens", 1) or 1)))
+                # MTP can emit all accepted drafts plus one bonus token. Require
+                # block-table capacity for the post-emit logical length, not
+                # just the verifier-written draft positions.
+                required_blocks = (seq.num_tokens + draft_len + 1 + self.block_size - 1) // self.block_size
+                can_fuse = (
+                    draft_value is not None
+                    and draft_len > 0
+                    and seq.temperature == 0
+                    and seq.num_completion_tokens + draft_len + 1 <= seq.max_tokens
+                    and int(batch.query_lens[row]) == 1
+                    and len(seq.block_table) >= required_blocks
+                )
+                if can_fuse:
+                    fused_rows.append(row)
+                elif profile_mtp:
+                    if draft_value is None:
+                        reason = "missing_draft"
+                    elif draft_len <= 0:
+                        reason = "empty_draft"
+                    elif seq.temperature != 0:
+                        reason = "temperature"
+                    elif seq.num_completion_tokens + draft_len + 1 > seq.max_tokens:
+                        reason = "max_tokens"
+                    elif int(batch.query_lens[row]) != 1:
+                        reason = "query_len"
+                    elif len(seq.block_table) < required_blocks:
+                        reason = "blocks"
+                    else:
+                        reason = "other"
+                    not_fused_reasons[reason] = not_fused_reasons.get(reason, 0) + 1
+
+            if fused_rows and len(fused_rows) == len(seqs):
+                fused_outputs = self._run_mtp1_batched(seqs, batch, fused_rows)
+                if fused_outputs is not None:
+                    return [fused_outputs[row] for row in range(len(seqs))]
+            elif profile_mtp:
+                print(
+                    f"[MTP_RUN] fused_rows={len(fused_rows)}/{len(seqs)} "
+                    f"batch_shape={tuple(batch.tokens.shape)} reasons={not_fused_reasons}",
+                    flush=True,
+                )
+
+            # Correctness first: when the whole scheduled batch cannot use the
+            # fused verifier path, use the state-preserving main-decode reuse
+            # path. This keeps ordinary target decode as the verifier and only
+            # advances speculative state for rows that are actually committed.
+            return self._run_main_and_sample_with_mtp1_reuse(
+                seqs,
+                batch,
+                seed_mtp1=self.mtp1_enabled and seed_mtp1,
+            )
+
+        return self._run_main_and_sample(seqs, batch, seed_mtp1=self.mtp1_enabled and seed_mtp1)
 
     def forward(
         self,
@@ -1659,4 +2738,8 @@ class CanonicalModelRunner:
         return self.run(seqs, is_prefill=False)
 
 
-ModelRunner = CanonicalModelRunner
+class ModelRunner(CanonicalModelRunner):
+    """Backward-compatible facade over the canonical executor implementation."""
+
+    def __init__(self, config: Qwen3_5Config, params: ModelParams, backend: str = "auto"):
+        super().__init__(config=config, params=params, backend=backend)

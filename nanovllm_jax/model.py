@@ -331,7 +331,8 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
 def jax_recurrent_gated_delta_rule(
     query, key, value, g, beta, 
     initial_state=None,
-    use_qk_l2norm_in_kernel=False
+    use_qk_l2norm_in_kernel=False,
+    return_state_sequence: bool = False,
 ):
     """
     JAX implementation of recurrent gated delta rule (matching HF torch_recurrent_gated_delta_rule).
@@ -366,6 +367,34 @@ def jax_recurrent_gated_delta_rule(
         state = initial_state.astype(jnp.float32)
     
     # Process each time step
+    if return_state_sequence:
+        def step_fn(carry, t):
+            state = carry  # [B, H, K, V]
+            
+            q_t = query[:, :, t, :]
+            k_t = key[:, :, t, :]
+            v_t = value[:, :, t, :]
+            g_t = jnp.exp(g[:, :, t])
+            beta_t = beta[:, :, t]
+            
+            g_t_exp = g_t[:, :, None, None]
+            beta_t_exp = beta_t[:, :, None]
+            k_t_exp = k_t[:, :, :, None]
+            
+            state = state * g_t_exp
+            kv_mem = jnp.einsum('bhkv,bhk->bhv', state, k_t)
+            delta = (v_t - kv_mem) * beta_t_exp
+            state = state + k_t_exp * delta[:, :, None, :]
+            out_t = jnp.einsum('bhkv,bhk->bhv', state, q_t)
+            
+            return state, (out_t, state)
+
+        final_state, (all_outputs, all_states) = lax.scan(step_fn, state, jnp.arange(time_dim))
+        output = all_outputs.transpose(1, 2, 0, 3)
+        state_sequence = all_states.transpose(1, 0, 2, 3, 4)
+        output = output.astype(initial_dtype)
+        return output, final_state, state_sequence
+
     def step_fn(carry, t):
         state = carry  # [B, H, K, V]
         
@@ -421,6 +450,7 @@ def gated_deltanet_block(
     hybrid_state: Optional[HybridLayerState] = None,
     valid_token_mask: Optional[jnp.ndarray] = None,
     backend: Optional[InferenceBackend] = None,
+    return_prefix_state: bool = False,
 ):
     """Gated DeltaNet block with decode mode support.
     
@@ -439,6 +469,7 @@ def gated_deltanet_block(
     batch, seq_len, _ = x.shape
     if backend is None:
         backend = select_backend("pure_jax")
+    prefix_layer_state = None
     
     # Cast to target dtype (bfloat16 for CPU/CUDA, float16 for Metal)
     dtype = config.get_dtype()
@@ -454,7 +485,8 @@ def gated_deltanet_block(
         not is_prefill and 
         hybrid_state is not None and 
         hybrid_state.conv_state is not None and
-        seq_len == 1
+        hybrid_state.recurrent_state is not None and
+        seq_len <= max(2, 1 + int(getattr(config, "num_speculative_tokens", 0) or 0))
     )
     use_cached_prefill = (
         is_prefill
@@ -462,8 +494,10 @@ def gated_deltanet_block(
         and hybrid_state.conv_state is not None
         and hybrid_state.recurrent_state is not None
     )
-    recurrent_prefill_threshold = int(getattr(config, "linear_recurrent_prefill_threshold", config.linear_chunk_size))
-    use_recurrent_prefill = use_cached_prefill and seq_len <= recurrent_prefill_threshold
+    # The chunked Gated DeltaNet prefill path currently diverges from the
+    # recurrent/HF path for long bucketed prefill. Keep cached prefill on the
+    # recurrent path until the chunk kernel is fixed.
+    use_recurrent_prefill = use_cached_prefill
     linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
     
     # === PROJECTIONS (same for both modes) ===
@@ -474,24 +508,53 @@ def gated_deltanet_block(
     
     if use_cached:
         # === DECODE MODE ===
-        mixed_qkv_t = mixed_qkv.transpose(0, 2, 1)  # [B, D, 1]
+        mixed_qkv_t = mixed_qkv.transpose(0, 2, 1)  # [B, D, T]
         
         # 1. Convolution update - use per-layer conv_state
         # conv_state shape: [batch, num_linear_layers, conv_dim, kernel_size]
         layer_conv_state = hybrid_state.conv_state[:, linear_layer_idx]  # [batch, conv_dim, kernel_size]
-        conv_out, new_layer_conv_state = causal_conv1d_update(
-            mixed_qkv_t,
-            layer_conv_state,
-            params["conv1d_weight"].reshape(conv_dim, config.linear_conv_kernel_size),
-            params.get("conv1d_bias"),
-            "silu"
-        )
-        conv_out = conv_out.transpose(0, 2, 1)  # [B, 1, D]
+        conv_weight = params["conv1d_weight"].reshape(conv_dim, config.linear_conv_kernel_size)
+        conv_bias = params.get("conv1d_bias")
+
+        def conv_step(state, t):
+            mixed_qkv_t_step = lax.dynamic_slice(
+                mixed_qkv_t,
+                (0, 0, t),
+                (batch, conv_dim, 1),
+            )
+            conv_out_t, next_state = causal_conv1d_update(
+                mixed_qkv_t_step,
+                state,
+                conv_weight,
+                conv_bias,
+                "silu",
+            )
+            return next_state, conv_out_t
+
+        if return_prefix_state:
+            def conv_step_with_state(state, t):
+                next_state, conv_out_t = conv_step(state, t)
+                return next_state, (conv_out_t, next_state)
+
+            new_layer_conv_state, (conv_out_steps, conv_state_steps) = lax.scan(
+                conv_step_with_state,
+                layer_conv_state,
+                jnp.arange(seq_len),
+            )
+            prefix_layer_conv_state = conv_state_steps[0]
+        else:
+            new_layer_conv_state, conv_out_steps = lax.scan(
+                conv_step,
+                layer_conv_state,
+                jnp.arange(seq_len),
+            )
+            prefix_layer_conv_state = None
+        conv_out = conv_out_steps.transpose(1, 0, 2, 3).reshape(batch, seq_len, conv_dim)
         
         # 2. Split q, k, v
-        query = conv_out[:, :, :key_dim].reshape(batch, 1, config.linear_num_key_heads, config.linear_key_head_dim)
-        key = conv_out[:, :, key_dim:key_dim*2].reshape(batch, 1, config.linear_num_key_heads, config.linear_key_head_dim)
-        value = conv_out[:, :, key_dim*2:].reshape(batch, 1, config.linear_num_value_heads, config.linear_value_head_dim)
+        query = conv_out[:, :, :key_dim].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
+        key = conv_out[:, :, key_dim:key_dim*2].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
+        value = conv_out[:, :, key_dim*2:].reshape(batch, seq_len, config.linear_num_value_heads, config.linear_value_head_dim)
         
         # 3. Compute gates
         beta = nn.sigmoid(b)  # [B, 1, H_v]
@@ -502,12 +565,12 @@ def gated_deltanet_block(
             query = jnp.repeat(query, v_heads_per_k, axis=2)
             key = jnp.repeat(key, v_heads_per_k, axis=2)
         
-        # 5. Transpose to [B, H, T, D] format (keep T=1 dimension)
-        query = query.transpose(0, 2, 1, 3)  # [B, H, 1, D_k]
-        key = key.transpose(0, 2, 1, 3)  # [B, H, 1, D_k]
-        value = value.transpose(0, 2, 1, 3)  # [B, H, 1, D_v]
-        g = g.transpose(0, 2, 1)  # [B, H, 1]
-        beta = beta.transpose(0, 2, 1)  # [B, H, 1]
+        # 5. Transpose to [B, H, T, D] format.
+        query = query.transpose(0, 2, 1, 3)  # [B, H, T, D_k]
+        key = key.transpose(0, 2, 1, 3)  # [B, H, T, D_k]
+        value = value.transpose(0, 2, 1, 3)  # [B, H, T, D_v]
+        g = g.transpose(0, 2, 1)  # [B, H, T]
+        beta = beta.transpose(0, 2, 1)  # [B, H, T]
         
         # 6. Recurrent update
         # recurrent_state shape: [batch, num_layers, num_heads, k_dim, v_dim]
@@ -515,11 +578,25 @@ def gated_deltanet_block(
         # linear_layer_idx computed above
         initial_recurrent = hybrid_state.recurrent_state[:, linear_layer_idx] if hybrid_state.recurrent_state is not None else None
 
-        core_attn_out, new_recurrent_state_single = backend.gated_delta_decode(
-            query, key, value, g, beta,
-            initial_state=initial_recurrent,
-            use_qk_l2norm_in_kernel=True,
-        )
+        if return_prefix_state:
+            core_attn_out, new_recurrent_state_single, recurrent_state_steps = jax_recurrent_gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                initial_state=initial_recurrent,
+                use_qk_l2norm_in_kernel=True,
+                return_state_sequence=True,
+            )
+            prefix_recurrent_state_single = recurrent_state_steps[:, 0]
+        else:
+            core_attn_out, new_recurrent_state_single = backend.gated_delta_decode(
+                query, key, value, g, beta,
+                initial_state=initial_recurrent,
+                use_qk_l2norm_in_kernel=True,
+            )
+            prefix_recurrent_state_single = None
         # new_recurrent_state_single has shape [batch, num_heads, k_dim, v_dim]
         
         # Update cache with new recurrent state and conv state for this layer
@@ -535,9 +612,17 @@ def gated_deltanet_block(
             conv_state=new_conv_state,
             recurrent_state=new_recurrent_state,
         )
+        prefix_layer_state = (
+            HybridLayerState(
+                conv_state=prefix_layer_conv_state,
+                recurrent_state=prefix_recurrent_state_single,
+            )
+            if return_prefix_state
+            else None
+        )
         
-        # core_attn_out is [B, H, T=1, D_v] - transpose to [B, T, H, D_v] for reshaping
-        core_attn_out = core_attn_out.transpose(0, 2, 1, 3)  # [B, 1, H, D_v]
+        # core_attn_out is [B, H, T, D_v] - transpose to [B, T, H, D_v] for reshaping
+        core_attn_out = core_attn_out.transpose(0, 2, 1, 3)  # [B, T, H, D_v]
         
     else:
         # === PREFILL MODE (Metal-compatible implementation) ===
@@ -551,6 +636,12 @@ def gated_deltanet_block(
                 params.get("conv1d_bias"),
                 activation="silu",
             )[:, :, -seq_len:]
+            prefix_layer_conv_state = None
+            if return_prefix_state:
+                kernel_size = config.linear_conv_kernel_size
+                gather_idx = 1 + jnp.arange(kernel_size, dtype=jnp.int32)[None, :]
+                gather_idx = jnp.broadcast_to(gather_idx[:, None, :], (batch, conv_dim, kernel_size))
+                prefix_layer_conv_state = jnp.take_along_axis(conv_input, gather_idx, axis=2)
         else:
             # Use Metal-compatible conv1d (no lax.conv_general_dilated)
             conv_out = causal_conv1d_metal(
@@ -592,75 +683,102 @@ def gated_deltanet_block(
             if use_cached_prefill
             else None
         )
+        prefix_recurrent_state_single = None
         if use_recurrent_prefill:
-            core_attn_out, final_state = backend.gated_delta_decode(
+            # Small cached suffixes can use the recurrent path directly and remain
+            # aligned with iterative decode.
+            if return_prefix_state and use_cached_prefill:
+                core_attn_out, final_state, recurrent_state_steps = jax_recurrent_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    initial_state=initial_recurrent,
+                    use_qk_l2norm_in_kernel=True,
+                    return_state_sequence=True,
+                )
+                prefix_recurrent_state_single = recurrent_state_steps[:, 0]
+            else:
+                core_attn_out, final_state = backend.gated_delta_decode(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    initial_state=initial_recurrent,
+                    use_qk_l2norm_in_kernel=True,
+                )
+        else:
+            # Longer prefill chunks use chunked prefill to amortize work.
+            core_attn_out, final_state = backend.gated_delta_prefill(
                 query,
                 key,
                 value,
                 g,
                 beta,
-                initial_state=initial_recurrent,
-                use_qk_l2norm_in_kernel=True,
-            )
-        else:
-            # Chunked rule is the right path for prompt/chunk prefill. Short
-            # cached suffixes use the recurrent path above to avoid padding a
-            # tiny verifier suffix up to the chunk size.
-            core_attn_out, final_state = backend.gated_delta_prefill(
-                query, key, value, g, beta,
                 chunk_size=config.linear_chunk_size,
                 initial_state=initial_recurrent,
                 use_qk_l2norm_in_kernel=True,
             )
         
         # Save final state to cache for decode mode
-        if hybrid_state is not None:
+        if (
+            hybrid_state is not None
+            and hybrid_state.conv_state is not None
+            and hybrid_state.recurrent_state is not None
+        ):
             # Extract the last real kernel_size inputs. Bucket padding is not
             # part of the convolution history used by recurrent decode.
             kernel_size = config.linear_conv_kernel_size
+            prev_conv_state = hybrid_state.conv_state[:, linear_layer_idx]
+
             if valid_token_mask is not None:
-                valid_lens = valid_token_mask.astype(jnp.int32).sum(axis=1)
-                gather_idx = valid_lens[:, None] - kernel_size + jnp.arange(kernel_size, dtype=jnp.int32)[None, :]
-                gather_valid = gather_idx >= 0
-                gather_idx = jnp.clip(gather_idx, 0, max(seq_len - 1, 0))
-                gather_idx = jnp.broadcast_to(gather_idx[:, None, :], (batch, conv_dim, kernel_size))
-                layer_conv_state = jnp.take_along_axis(mixed_qkv_t, gather_idx, axis=2)
-                layer_conv_state = jnp.where(gather_valid[:, None, :], layer_conv_state, 0.0)
-            elif seq_len >= kernel_size:
-                layer_conv_state = mixed_qkv_t[:, :, -kernel_size:]  # [B, D, K]
+                valid = valid_token_mask.astype(jnp.bool_)
+                # Keep prior cache context and only write new valid positions.
+                masked_mixed_qkv_t = jnp.where(
+                    valid[:, None, :],
+                    mixed_qkv_t,
+                    jnp.zeros_like(mixed_qkv_t),
+                )
             else:
-                # If sequence is shorter than kernel_size, pad with zeros
-                pad_width = kernel_size - seq_len
-                layer_conv_state = jnp.pad(mixed_qkv_t, ((0, 0), (0, 0), (pad_width, 0)))
-            
-            # Compute layer index for this linear attention layer
-            # Update recurrent state and conv_state at this layer index
-            # recurrent_state shape: [batch, num_linear_layers, num_heads, k_dim, v_dim]
-            # final_state shape: [batch, num_heads, k_dim, v_dim]
-            # conv_state shape: [batch, num_linear_layers, conv_dim, kernel_size]
-            if hybrid_state.recurrent_state is not None:
-                if use_cached_prefill:
-                    kernel_size = config.linear_conv_kernel_size
-                    conv_input = jnp.concatenate([hybrid_state.conv_state[:, linear_layer_idx], mixed_qkv_t], axis=-1)
-                    if valid_token_mask is not None:
-                        valid_lens = valid_token_mask.astype(jnp.int32).sum(axis=1)
-                    else:
-                        valid_lens = jnp.full((batch,), seq_len, dtype=jnp.int32)
-                    gather_idx = valid_lens[:, None] + jnp.arange(kernel_size, dtype=jnp.int32)[None, :]
-                    gather_idx = jnp.broadcast_to(gather_idx[:, None, :], (batch, conv_dim, kernel_size))
-                    layer_conv_state = jnp.take_along_axis(conv_input, gather_idx, axis=2)
-                new_recurrent_state = hybrid_state.recurrent_state.at[:, linear_layer_idx].set(final_state)
-                new_conv_state = hybrid_state.conv_state.at[:, linear_layer_idx].set(layer_conv_state.astype(dtype))
+                masked_mixed_qkv_t = mixed_qkv_t
+
+            valid_lens = (
+                valid_token_mask.astype(jnp.int32).sum(axis=1)
+                if valid_token_mask is not None
+                else jnp.full((batch,), seq_len, dtype=jnp.int32)
+            )
+            if use_cached_prefill:
+                conv_input = jnp.concatenate([prev_conv_state, masked_mixed_qkv_t], axis=-1)
+                gather_start = valid_lens
             else:
-                # Should not happen if init_linear_attention_states was called
-                new_recurrent_state = final_state[jnp.newaxis, :, :, :, :]
-                new_conv_state = layer_conv_state.astype(dtype)[jnp.newaxis, :, :, :]
-            
+                conv_input = jnp.concatenate(
+                    [
+                        jnp.zeros((batch, conv_dim, kernel_size), dtype=masked_mixed_qkv_t.dtype),
+                        masked_mixed_qkv_t,
+                    ],
+                    axis=-1,
+                )
+                gather_start = valid_lens
+            gather_idx = gather_start[:, None] + jnp.arange(kernel_size, dtype=jnp.int32)[None, :]
+            gather_idx = jnp.broadcast_to(gather_idx[:, None, :], (batch, conv_dim, kernel_size))
+            layer_conv_state = jnp.take_along_axis(conv_input, gather_idx, axis=2)
+
+            new_recurrent_state = hybrid_state.recurrent_state.at[:, linear_layer_idx].set(final_state)
+            new_conv_state = hybrid_state.conv_state.at[:, linear_layer_idx].set(layer_conv_state.astype(dtype))
             hybrid_state = replace(
                 hybrid_state,
                 conv_state=new_conv_state,
                 recurrent_state=new_recurrent_state,
             )
+            if return_prefix_state and use_cached_prefill:
+                prefix_layer_state = HybridLayerState(
+                    conv_state=prefix_layer_conv_state.astype(dtype)
+                    if prefix_layer_conv_state is not None
+                    else None,
+                    recurrent_state=prefix_recurrent_state_single,
+                )
         
         # Output is [B, H, T, D] - transpose to [B, T, H, D] for reshaping
         core_attn_out = core_attn_out.transpose(0, 2, 1, 3)  # [B, H, T, D] -> [B, T, H, D]
@@ -682,9 +800,13 @@ def gated_deltanet_block(
     attn_out = jnp.dot(core_attn_out, params["out_proj"])
     
     if use_cached:
+        if return_prefix_state:
+            return attn_out, hybrid_state, prefix_layer_state
         return attn_out, hybrid_state
     elif hybrid_state is not None:
         # Prefill mode with cache - return state for decode
+        if return_prefix_state and prefix_layer_state is not None:
+            return attn_out, hybrid_state, prefix_layer_state
         return attn_out, hybrid_state
     else:
         # No cache - just return output
@@ -723,20 +845,33 @@ def full_attention_block(
     # Cast to target dtype (bfloat16 for CPU/CUDA, float16 for Metal)
     dtype = config.get_dtype()
     x_cast = x.astype(dtype)
+
+    def _proj(inp: jnp.ndarray, weight: jnp.ndarray) -> jnp.ndarray:
+        """Project a [B, T, D] tensor with a linear matrix [D, O].
+
+        Using an explicit flatten+dot keeps row-wise projection numerically aligned
+        between full-sequence and single-token calls across backends.
+        """
+        out = jnp.dot(inp.reshape(-1, inp.shape[-1]), weight)
+        return out.reshape(batch, seq_len, -1)
     
     # Qwen3.5 full attention uses fused Q + gate projection
     # q_proj: [hidden_size, hidden_size] -> output split into query and gate
     # query: [batch, seq_len, num_attention_heads * head_dim]
     # gate: [batch, seq_len, num_attention_heads * head_dim]
-    q_gate = jnp.dot(x_cast, params["q_proj"])
+    q_gate = _proj(x_cast, params["q_proj"])
     attn_out_dim = config.num_attention_heads * config.head_dim
     
     q_gate_reshaped = q_gate.reshape(batch, seq_len, config.num_attention_heads, 2 * config.head_dim)
     query, gate = jnp.split(q_gate_reshaped, 2, axis=-1)
     gate = gate.reshape(batch, seq_len, -1)
     
-    k = jnp.dot(x_cast, params["k_proj"]).reshape(batch, seq_len, config.num_key_value_heads, config.head_dim)
-    v = jnp.dot(x_cast, params["v_proj"]).reshape(batch, seq_len, config.num_key_value_heads, config.head_dim)
+    k = _proj(x_cast, params["k_proj"]).reshape(
+        batch, seq_len, config.num_key_value_heads, config.head_dim
+    )
+    v = _proj(x_cast, params["v_proj"]).reshape(
+        batch, seq_len, config.num_key_value_heads, config.head_dim
+    )
     
     # Apply RMSNorm BEFORE transpose (on head dimension, in [B, T, H, D] layout)
     query = rms_norm(query, params["q_norm"], config.rms_norm_eps)
@@ -830,8 +965,10 @@ def transformer_block(
     kv_cache_state=None,
     attention_metadata: Optional[AttentionMetadata] = None,
     hybrid_state: Optional[HybridLayerState] = None,
+    prefix_hybrid_state: Optional[HybridLayerState] = None,
     is_prefill=True,
     backend: Optional[InferenceBackend] = None,
+    return_prefix_hybrid: bool = False,
 ):
     """Matches HF Qwen3_5DecoderLayer - applies norms and residuals.
     
@@ -881,9 +1018,30 @@ def transformer_block(
             hybrid_state=hybrid_state,
             valid_token_mask=valid_token_mask,
             backend=backend,
+            return_prefix_state=return_prefix_hybrid,
         )
         if isinstance(result, tuple):
-            x, hybrid_state = result
+            if return_prefix_hybrid and len(result) == 3:
+                x, hybrid_state, prefix_layer_state = result
+                if prefix_hybrid_state is not None and prefix_layer_state is not None:
+                    linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
+                    prefix_hybrid_state = replace(
+                        prefix_hybrid_state,
+                        conv_state=prefix_hybrid_state.conv_state.at[:, linear_layer_idx].set(
+                            prefix_layer_state.conv_state
+                        )
+                        if prefix_hybrid_state.conv_state is not None
+                        and prefix_layer_state.conv_state is not None
+                        else prefix_hybrid_state.conv_state,
+                        recurrent_state=prefix_hybrid_state.recurrent_state.at[:, linear_layer_idx].set(
+                            prefix_layer_state.recurrent_state
+                        )
+                        if prefix_hybrid_state.recurrent_state is not None
+                        and prefix_layer_state.recurrent_state is not None
+                        else prefix_hybrid_state.recurrent_state,
+                    )
+            else:
+                x, hybrid_state = result
         else:
             x = result
     
@@ -902,6 +1060,8 @@ def transformer_block(
     
     x = residual + x
     
+    if return_prefix_hybrid:
+        return x, kv_cache_state, hybrid_state, prefix_hybrid_state
     return x, kv_cache_state, hybrid_state
 
 
@@ -916,9 +1076,11 @@ def forward_step(
     hybrid_state: Optional[HybridLayerState] = None,
     is_prefill: bool = True,
     return_hidden: bool = False,
+    return_hidden_with_logits: bool = False,
     last_logits_only: bool = False,
     logit_positions: Optional[jnp.ndarray] = None,
     backend: Optional[InferenceBackend] = None,
+    return_prefix_hybrid: bool = False,
 ):
     """Canonical forward step shared by cached and non-cached inference paths."""
     batch, seq_len = tokens.shape
@@ -933,9 +1095,10 @@ def forward_step(
         positions_2d = positions
     positions_mrope = jnp.stack([positions_2d, positions_2d, positions_2d], axis=0)
     mask = causal_mask(seq_len, seq_len)
+    prefix_hybrid_state = hybrid_state if return_prefix_hybrid else None
 
     for i, lp in enumerate(params.layers):
-        x, kv_cache_state, hybrid_state = transformer_block(
+        block_result = transformer_block(
             x,
             lp,
             positions_mrope,
@@ -945,14 +1108,22 @@ def forward_step(
             kv_cache_state,
             attention_metadata=attention_metadata,
             hybrid_state=hybrid_state,
+            prefix_hybrid_state=prefix_hybrid_state,
             is_prefill=is_prefill,
             backend=backend,
+            return_prefix_hybrid=return_prefix_hybrid,
         )
+        if return_prefix_hybrid:
+            x, kv_cache_state, hybrid_state, prefix_hybrid_state = block_result
+        else:
+            x, kv_cache_state, hybrid_state = block_result
 
     hidden_pre = x
     x = rms_norm(x, params.norm_weight, config.rms_norm_eps)
 
-    if return_hidden:
+    if return_hidden and not return_hidden_with_logits:
+        if return_prefix_hybrid:
+            return hidden_pre, kv_cache_state, hybrid_state, prefix_hybrid_state
         return hidden_pre, kv_cache_state, hybrid_state
 
     x = x.astype(jnp.float32)
@@ -965,6 +1136,13 @@ def forward_step(
             gather_idx = jnp.broadcast_to(gather_idx, (batch, 1, x.shape[-1]))
             x = jnp.take_along_axis(x, gather_idx, axis=1)
     logits = jnp.dot(x, params.lm_head) if params.lm_head is not None else jnp.dot(x, params.embed_tokens.T)
+    if return_hidden:
+        hidden_result = (hidden_pre, logits) if return_hidden_with_logits else hidden_pre
+        if return_prefix_hybrid:
+            return hidden_result, kv_cache_state, hybrid_state, prefix_hybrid_state
+        return hidden_result, kv_cache_state, hybrid_state
+    if return_prefix_hybrid:
+        return logits, kv_cache_state, hybrid_state, prefix_hybrid_state
     return logits, kv_cache_state, hybrid_state
 
 
@@ -975,6 +1153,7 @@ def forward(
     kv_cache_state=None,
     is_prefill=True,
     return_hidden=False,
+    return_hidden_with_logits: bool = False,
     last_logits_only: bool = False,
     logit_positions: Optional[jnp.ndarray] = None,
     positions=None,
@@ -1003,6 +1182,7 @@ def forward(
         hybrid_state=hybrid_state,
         is_prefill=is_prefill,
         return_hidden=return_hidden,
+        return_hidden_with_logits=return_hidden_with_logits,
         last_logits_only=last_logits_only,
         logit_positions=logit_positions,
         backend=backend,
