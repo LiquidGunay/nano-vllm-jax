@@ -34,6 +34,12 @@ This project implements Qwen3.5-0.8B model in pure JAX with:
 - **Server-Style Compilation**: JIT compile once at startup, serve many requests
 - **HF Parity**: Partial match, under active validation
 
+## Canonical Execution Path
+
+The canonical runtime path is `LLMEngine -> ModelRunner -> ModelExecutor`.
+`ModelRunner` is kept as a compatibility façade that preserves legacy method names, while delegating execution to `ModelExecutor`.
+Server and benchmark paths explicitly read speculative/JIT state from `engine.model_runner.executor`.
+
 ## Project Structure
 
 ```
@@ -46,7 +52,7 @@ nano-vllm-jax/
 │   ├── kv_cache.py            # 5D per-layer KV cache
 │   ├── load_weights_float16.py # HF weight loader
 │   ├── engine/
-│   │   ├── model_runner.py    # JIT-compiled inference engine
+│   │   ├── model_runner.py    # Compatibility façade (delegates to model_executor.py)
 │   │   ├── block_manager.py   # Paged attention blocks
 │   │   ├── sequence.py        # Sequence state tracking
 │   │   └── scheduler.py       # Request scheduling
@@ -94,6 +100,7 @@ Dependencies:
 ### Basic Usage
 
 ```python
+from nanovllm_jax.engine.llm_engine import LLMEngine
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.load_weights import load_weights_from_hf
 from nanovllm_jax.engine.model_runner import ModelRunner
@@ -102,8 +109,13 @@ from nanovllm_jax.engine.model_runner import ModelRunner
 config = Qwen3_5Config.qwen3_5_0_8b()
 params = load_weights_from_hf("Qwen/Qwen3.5-0.8B", config)
 
-# Initialize model runner
+# Initialize runner (delegates into ModelExecutor)
 runner = ModelRunner(config, params)
+assert hasattr(runner, "executor")
+
+# Optional direct executor:
+from nanovllm_jax.engine.model_executor import ModelExecutor
+executor = ModelExecutor(config, params)
 
 # Server-style warmup compilation (one-time startup cost)
 runner.warmup_compilation(max_prefill_len=64, max_batch=1)

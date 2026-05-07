@@ -135,6 +135,17 @@ class PureJAXBackend:
         num_prefill_tokens: int | None = None,
         num_decode_tokens: int | None = None,
     ) -> AttentionMetadata:
+        if positions.ndim != 2:
+            raise ValueError("positions must be a 2D tensor [batch, query_len]")
+        if block_tables.ndim != 2:
+            raise ValueError("block_tables must be a 2D tensor [batch, max_blocks_per_seq]")
+        if positions.shape[0] != block_tables.shape[0]:
+            raise ValueError(
+                "positions and block_tables batch dimensions must match"
+            )
+        if positions.shape[0] != seq_lens.shape[0]:
+            raise ValueError("positions and seq_lens batch dimensions must match")
+
         slot_mapping = compute_slot_mapping(
             positions=positions,
             block_table=block_tables,
@@ -162,6 +173,7 @@ class PureJAXBackend:
             num_prefill_tokens=num_prefill_tokens,
             num_decode_tokens=num_decode_tokens,
             positions=positions,
+            max_kv_len=block_tables.shape[1] * block_size if not is_prefill else None,
         )
 
     def write_kv(
@@ -221,6 +233,10 @@ class PureJAXBackend:
                 layer_idx=layer_id,
             )
 
+        if metadata.positions is None:
+            raise ValueError("metadata.positions is required for decode attention")
+        if metadata.positions.shape[0] != metadata.block_tables.shape[0]:
+            raise ValueError("positions and block_tables batch dimensions must match")
         return paged_attention_decode(
             query=query,
             k_cache=cache.k_cache,
@@ -231,6 +247,8 @@ class PureJAXBackend:
             scale=scale,
             num_key_value_groups=num_key_value_groups,
             layer_idx=layer_id,
+            max_kv_len=metadata.max_kv_len,
+            positions=metadata.positions,
         )
 
     def gated_delta_prefill(

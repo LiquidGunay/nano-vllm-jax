@@ -38,33 +38,63 @@ def forward_simple_jit(
     # Embedding lookup
     x = params.embed_tokens[tokens].astype(dtype)
     
-    # Position IDs - for decode, start from current sequence position
-    if is_prefill:
-        positions_1d = jnp.broadcast_to(jnp.arange(seq_len)[None, :], (batch, seq_len))
+    # Position IDs - for decode, start from current sequence position. For prefill,
+    # position IDs may include a cached prefix offset.
+    if kv_cache_state is not None:
+        current_kv_lens = kv_cache_state.kv_lens
+        if is_prefill:
+            start_positions = current_kv_lens[:, None]
+            next_kv_lens = current_kv_lens + seq_len
+        else:
+            start_positions = current_kv_lens[:, None]
+            next_kv_lens = current_kv_lens + 1
+        kv_cache_state = replace(kv_cache_state, kv_lens=next_kv_lens)
     else:
-        # Decode: position is (kv_lens) before increment = position of NEW token
-        # kv_lens will be incremented before attention, so position is current kv_lens
-        positions_1d = kv_cache_state.kv_lens[:, None]
+        current_kv_lens = jnp.zeros((batch,), dtype=jnp.int32)
+        start_positions = jnp.zeros((batch, 1), dtype=jnp.int32)
+
+    if is_prefill:
+        positions_1d = jnp.broadcast_to(
+            jnp.arange(seq_len, dtype=current_kv_lens.dtype)[None, :] + start_positions,
+            (batch, seq_len),
+        )
+    else:
+        # Decode: position is (kv_lens before increment) = position of NEW token.
+        positions_1d = current_kv_lens[:, None]
     positions = jnp.stack([positions_1d, positions_1d, positions_1d], axis=0)
     
     # Causal mask
     mask = causal_mask(seq_len, seq_len)
     
+    # Thread linear attention states through prefill and decode.
+    hybrid_state = kv_cache_state.hybrid_state if kv_cache_state is not None else None
+
     # Initialize linear attention states during prefill
     if is_prefill and kv_cache_state is not None:
-        kv_cache_state = init_linear_attention_states(kv_cache_state, config, batch_size=batch, dtype=dtype)
-        # Set kv_lens to prefill sequence length
-        kv_cache_state = replace(kv_cache_state, kv_lens=jnp.full((batch,), seq_len, dtype=jnp.int32))
-    
-    # For decode: increment kv_lens BEFORE attention so new K/V is visible
-    # kv_lens represents the TOTAL sequence length including the new token
-    if not is_prefill and kv_cache_state is not None:
-        kv_cache_state = replace(kv_cache_state, kv_lens=kv_cache_state.kv_lens + 1)
+        kv_cache_state = init_linear_attention_states(
+            kv_cache_state, config, batch_size=batch, dtype=dtype
+        )
+        hybrid_state = kv_cache_state.hybrid_state
     
     # Process layers
     for i, lp in enumerate(params.layers):
-        x, kv_cache_state = transformer_block(
-            x, lp, positions, mask, i, config, kv_cache_state, is_prefill
+        x, kv_cache_state, hybrid_state = transformer_block(
+            x=x,
+            params=lp,
+            positions=positions,
+            mask=mask,
+            layer_idx=i,
+            config=config,
+            kv_cache_state=kv_cache_state,
+            hybrid_state=hybrid_state,
+            is_prefill=is_prefill,
+        )
+
+    if kv_cache_state is not None and hybrid_state is not None:
+        kv_cache_state = replace(
+            kv_cache_state,
+            conv_state=hybrid_state.conv_state,
+            recurrent_state=hybrid_state.recurrent_state,
         )
     
     # Final norm

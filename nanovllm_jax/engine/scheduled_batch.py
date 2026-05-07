@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import jax.numpy as jnp
+import numpy as np
 
 
 @dataclass
@@ -24,6 +25,7 @@ class ScheduledBatch:
     num_decode_tokens: int
     block_tables: jnp.ndarray
     seq_lens: jnp.ndarray
+    prefill_is_final: list[bool] | tuple[bool, ...] | None = None
 
     @property
     def batch_size(self) -> int:
@@ -32,3 +34,15 @@ class ScheduledBatch:
     @property
     def query_lens(self) -> jnp.ndarray:
         return jnp.diff(self.query_start_loc).astype(jnp.int32)
+
+    @property
+    def prefill_final_flags(self) -> list[bool]:
+        if self.prefill_is_final is None:
+            return [True] * self.batch_size
+        if isinstance(self.prefill_is_final, np.ndarray):
+            return [bool(x) for x in np.array(self.prefill_is_final, dtype=bool).tolist()]
+        if isinstance(self.prefill_is_final, tuple):
+            return list(self.prefill_is_final)
+        if isinstance(self.prefill_is_final, jnp.ndarray):
+            return [bool(x) for x in list(np.array(self.prefill_is_final, dtype=bool).tolist())]
+        return list(self.prefill_is_final)

@@ -22,29 +22,61 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import jax
 import jax.numpy as jnp
 import numpy as np
-import torch
+import pytest
+torch = pytest.importorskip("torch")
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from typing import List, Tuple
-
+from typing import List, Optional
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.load_weights import load_weights_from_hf
-from nanovllm_jax.model import forward, ModelParams
-from nanovllm_jax.kv_cache import init_kv_cache, init_linear_attention_states
+from nanovllm_jax.model import forward
+ 
+MODEL_NAME = os.getenv("HF_PARITY_MODEL", "Qwen/Qwen3.5-0.8B")
 
 
-def load_models(model_name="Qwen/Qwen3.5-0.8B"):
+def resolve_hf_device() -> torch.device:
+    requested = os.getenv("HF_TEST_DEVICE", "cpu").lower()
+    if requested in {"auto", "cuda", "gpu"}:
+        if not torch.cuda.is_available() or torch.version.cuda is None:
+            print(
+                "HF_TEST_DEVICE requested CUDA/GPU but CUDA is unavailable; "
+                "falling back to CPU for parity tests."
+            )
+            return torch.device("cpu")
+        return torch.device("cuda")
+    if requested == "cpu":
+        return torch.device("cpu")
+    pytest.skip(f"Unknown HF_TEST_DEVICE={requested}")
+
+
+def load_models(model_name: str = MODEL_NAME):
     """Load both HF and JAX models."""
+    hf_device = resolve_hf_device()
     print(f"\nLoading models from {model_name}...")
     
     # Load HF model
     print("  Loading HF model...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="cpu",
-        trust_remote_code=True,
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        ).to(hf_device)
+    except ValueError as exc:
+        # Newer/older transformers versions gate Qwen3.5 support differently.
+        msg = str(exc).lower()
+        if (
+            "does not recognize" in msg
+            or "does not recogniz" in msg
+            or "not recognized" in msg
+            or "model_type" in msg
+        ):
+            pytest.skip(
+                f"HF config mapping missing for {model_name}; update transformers version or set HF_PARITY_MODEL to a supported checkpoint."
+            )
+        raise
+    except OSError as exc:
+        pytest.skip(f"Could not load local HF artifacts for {model_name}: {exc}")
     hf_model.eval()
     
     # Load JAX model with HF weights
@@ -53,30 +85,53 @@ def load_models(model_name="Qwen/Qwen3.5-0.8B"):
     params = load_weights_from_hf(model_name, config)
     
     print("  ✓ Models loaded")
-    return hf_model, tokenizer, config, params
+    return hf_model, tokenizer, config, params, hf_device
+
+
+@pytest.fixture(scope="session")
+def e2e_models():
+    """Load shared HF/JAX artifacts for the module."""
+    return load_models()
+
+
+def _default_prompts() -> List[str]:
+    return [
+        "The future of artificial intelligence is poised to revolutionize",
+        "In the beginning, there was nothing but an infinite void of darkness",
+        "The most important discovery in physics was the theory of relativity",
+        "When we consider the nature of consciousness, we must ask fundamental",
+        "The economic implications of climate change are profound and far-reaching",
+        "Programming languages have evolved significantly since the early days of",
+        "The human brain processes information through complex neural networks",
+        "Mathematical proofs require rigorous logical reasoning and careful",
+        "The history of civilization demonstrates that human societies continually",
+        "Scientific progress depends on careful observation and systematic analysis",
+    ]
 
 
 def test_logits_parity(
-    hf_model,
-    tokenizer,
-    config: Qwen3_5Config,
-    params: ModelParams,
-    prompts: List[str],
+    e2e_models,
+    prompts: Optional[List[str]] = None,
 ):
     """Test that top 5 logits match exactly between HF and JAX."""
+    hf_model, tokenizer, config, params, hf_device = e2e_models
+    prompts = prompts or _default_prompts()
     print("\n" + "=" * 80)
     print("TESTING LOGITS PARITY")
     print("=" * 80)
-    
-    all_pass = True
+
     total_mse = 0.0
-    num_tests = len(prompts)
+    num_tests = 0
     
     for i, prompt in enumerate(prompts):
-        print(f"\n[Prompt {i+1}/{num_tests}] \"{prompt[:50]}...\"" if len(prompt) > 50 else f"\n[Prompt {i+1}/{num_tests}] \"{prompt}\"")
+        print(
+            f"\n[Prompt {i+1}/{len(prompts)}] \"{prompt[:50]}...\""
+            if len(prompt) > 50
+            else f"\n[Prompt {i+1}/{len(prompts)}] \"{prompt}\""
+        )
         
         # Tokenize
-        inputs = tokenizer(prompt, return_tensors="pt")
+        inputs = tokenizer(prompt, return_tensors="pt").to(hf_device)
         input_ids = inputs["input_ids"]
         
         if input_ids.shape[1] < 10:
@@ -86,10 +141,10 @@ def test_logits_parity(
         # HF forward
         with torch.no_grad():
             hf_outputs = hf_model(input_ids)
-            hf_logits = hf_outputs.logits[0, -1, :].float().numpy()  # Last token logits
+            hf_logits = hf_outputs.logits[0, -1, :].float().cpu().numpy()  # Last token logits
         
         # JAX forward (prefill mode) - no KV cache for simple test
-        input_ids_jax = jnp.array(input_ids.numpy())
+        input_ids_jax = jnp.array(input_ids.cpu().numpy())
         
         # Forward pass (no KV cache for simple logits test)
         logits_jax, _ = forward(
@@ -109,54 +164,42 @@ def test_logits_parity(
         hf_top5 = np.argsort(hf_logits)[-5:][::-1].copy()
         jax_top5 = np.argsort(jax_logits)[-5:][::-1].copy()
         
-        hf_top5_probs = torch.nn.functional.softmax(torch.from_numpy(hf_logits.copy()), dim=0)[hf_top5]
-        jax_top5_probs = jax.nn.softmax(jnp.array(jax_logits))[jax_top5]
-        
         top5_match = np.array_equal(hf_top5, jax_top5)
         
         print(f"  HF top 5 tokens: {hf_top5}")
         print(f"  JAX top 5 tokens: {jax_top5}")
         print(f"  MSE: {mse:.2e}")
         print(f"  Top 5 match: {'✓' if top5_match else '✗'}")
-        
-        if not top5_match:
-            all_pass = False
-            print(f"  ✗ FAIL: Top 5 tokens do not match")
-        elif mse >= 1e-4:
-            all_pass = False
-            print(f"  ✗ FAIL: MSE {mse:.2e} >= 1e-4")
-        else:
-            print(f"  ✓ PASS")
+
+        assert top5_match, f"Top 5 tokens do not match for prompt {i}"
+        assert mse < 1e-4, f"MSE {mse:.2e} >= 1e-4 for prompt {i}"
+        num_tests += 1
     
     avg_mse = total_mse / num_tests if num_tests > 0 else 0.0
     
     print("\n" + "-" * 80)
     print(f"Average MSE: {avg_mse:.2e}")
     print(f"Target: MSE < 1e-4")
-    
-    return all_pass and avg_mse < 1e-4
+    assert num_tests > 0
 
 
 def test_generation_parity(
-    hf_model,
-    tokenizer,
-    config: Qwen3_5Config,
-    params: ModelParams,
-    prompts: List[str],
+    e2e_models,
+    prompts: Optional[List[str]] = None,
     max_new_tokens: int = 10,
 ):
     """Test that generated tokens match between HF and JAX."""
+    hf_model, tokenizer, config, params, hf_device = e2e_models
+    prompts = prompts or _default_prompts()[:3]
     print("\n" + "=" * 80)
     print("TESTING GENERATION PARITY")
     print("=" * 80)
-    
-    all_pass = True
-    
+
     for i, prompt in enumerate(prompts):
         print(f"\n[Prompt {i+1}/{len(prompts)}] \"{prompt[:50]}...\"" if len(prompt) > 50 else f"\n[Prompt {i+1}/{len(prompts)}] \"{prompt}\"")
         
         # HF generation
-        inputs = tokenizer(prompt, return_tensors="pt")
+        inputs = tokenizer(prompt, return_tensors="pt").to(hf_device)
         with torch.no_grad():
             hf_output_ids = hf_model.generate(
                 inputs["input_ids"],
@@ -167,7 +210,7 @@ def test_generation_parity(
         hf_generated = tokenizer.decode(hf_output_ids[0], skip_special_tokens=True)
         
         # JAX generation (simplified greedy decoding)
-        input_ids = inputs["input_ids"].numpy()
+        input_ids = inputs["input_ids"].cpu().numpy()
         generated_ids = list(input_ids[0])
         
         # Prefill (no KV cache for simplicity)
@@ -202,65 +245,4 @@ def test_generation_parity(
         print(f"  HF:  \"{hf_generated}\"")
         print(f"  JAX: \"{jax_generated}\"")
         print(f"  Match: {'✓' if match else '✗'}")
-        
-        if not match:
-            all_pass = False
-            print(f"  ✗ FAIL: Generated text does not match")
-        else:
-            print(f"  ✓ PASS")
-    
-    return all_pass
-
-
-def run_all_tests():
-    """Run all end-to-end parity tests."""
-    print("=" * 80)
-    print("END-TO-END PARITY TESTS")
-    print("=" * 80)
-    
-    # Load models
-    hf_model, tokenizer, config, params = load_models()
-    
-    # Test prompts (at least 10 tokens each after tokenization)
-    test_prompts = [
-        "The future of artificial intelligence is poised to revolutionize",
-        "In the beginning, there was nothing but an infinite void of darkness",
-        "The most important discovery in physics was the theory of relativity",
-        "When we consider the nature of consciousness, we must ask fundamental",
-        "The economic implications of climate change are profound and far-reaching",
-        "Programming languages have evolved significantly since the early days of",
-        "The human brain processes information through complex neural networks",
-        "Mathematical proofs require rigorous logical reasoning and careful",
-        "The history of civilization demonstrates that human societies continually",
-        "Scientific progress depends on careful observation and systematic analysis",
-    ]
-    
-    # Run logits parity test
-    logits_pass = test_logits_parity(hf_model, tokenizer, config, params, test_prompts)
-    
-    # Run generation parity test (use fewer prompts for speed)
-    generation_pass = test_generation_parity(
-        hf_model, tokenizer, config, params, 
-        test_prompts[:3],  # Test first 3 prompts
-        max_new_tokens=10,
-    )
-    
-    print("\n" + "=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
-    print(f"  Logits parity (top 5 exact match): {'✓ PASS' if logits_pass else '✗ FAIL'}")
-    print(f"  Generation parity: {'✓ PASS' if generation_pass else '✗ FAIL'}")
-    
-    all_pass = logits_pass and generation_pass
-    
-    if all_pass:
-        print("\n✅ All end-to-end parity tests PASSED!")
-        return True
-    else:
-        print("\n❌ Some tests FAILED")
-        return False
-
-
-if __name__ == "__main__":
-    success = run_all_tests()
-    exit(0 if success else 1)
+        assert match

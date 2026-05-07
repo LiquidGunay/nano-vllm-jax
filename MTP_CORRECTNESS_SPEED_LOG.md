@@ -333,3 +333,27 @@
   - K=1 main-decode-reuse with emitted bonus: incorrect on B=4 and B=50.
   - K=2 all-at-once verifier: incorrect at token 52 before sequential commit-select.
 - Math: for a sequential verifier with K drafts, each speculative step costs `K+1` target decodes and emits at most `1 + accepted_drafts` tokens. For K=1 the ideal zero-overhead ceiling is `(1+a)/2 <= 1`; with measured `a=0.62`, ceiling is `0.81x`. For K=2 the ideal ceiling is `(1+a0+a1)/3 <= 1`; with measured B=4 accepted positions `[54,33]` over 80 proposals, ceiling is about `(1+0.675+0.4125)/3 = 0.696x`. Any real overhead pushes below that. Therefore a true speedup is impossible for the currently correct sequential K<=2 verifier; speedup requires a correct one-pass verifier with selectable hybrid prefix states or a dense-only model path without hybrid state.
+
+## K=1 one-pass verifier implementation with per-token hybrid prefix states
+
+- Change: `forward_step(..., return_prefix_hybrid=True)` now returns token-indexed hybrid prefix states with shape `[batch, query_token, linear_layer, ...]` instead of only a single token-0 snapshot.
+- Change: `mtp1_two_decode_greedy_step_jit` now runs a single two-token decode verifier over `[current_token, draft_token]` with decode metadata, then selects token-0 hybrid state for rejected rows and token-1 hybrid state for accepted rows.
+- Change: rejected rows keep the current-token KV write while restoring the rejected draft KV slot; accepted rows keep both verifier KV writes and commit `seq_lens + 1`.
+- Change: the batched K=1 fused runner now prefers the one-pass prefix verifier by default. The older sequential commit-select verifier is still available by setting `NANO_VLLM_JAX_MTP_COMMIT_SELECT=1`; the new path can be disabled with `NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1=1`.
+- Status: not benchmarked in this edit pass. The next TPU correctness gate should compare long greedy outputs against baseline before measuring speedup.
+
+## K=1 bonus-margin gate
+
+- Finding: Qwen/Qwen3.5-2B diverged on expanded 4-prompt validation at request `2`, token `32`, with baseline token `6093` and MTP token `4087`. The same divergence appeared with the older sequential commit-select path, so the issue is not isolated to the new token-indexed hybrid prefix extraction.
+- Hypothesis: emitting verifier bonus tokens on low-margin logits lets tiny numerical/state differences compound into a different greedy branch. Treating those accepts as one-token emissions preserves the ordinary next decode for the risky position.
+- Change: K=1 one-pass and sequential commit-select now support `NANO_VLLM_JAX_MTP_BONUS_MARGIN=<float>`. If set above `0`, an otherwise accepted draft only commits/emits the bonus when the verifier bonus logit margin `top1 - top2` meets the threshold; otherwise it emits only the target/draft token and commits state after the current token.
+- Status: threshold sweep pending on TPU.
+
+## K=1 one-pass verifier correctness diagnosis
+
+- Added `--trace-steps` to `benchmark_mtp1_engine.py` so TPU-side correctness runs can record per-step emitted token deltas and branch labels.
+- Targeted 2B prompt `"Complete this JSON object: {\"name\": \"compiler\", \"features\": ["` diverged at generated token 7:
+  - baseline: `[16, 11, 220, 17, 11, 220, 18, 1089, ...]`
+  - MTP K=1 one-pass: `[16, 11, 220, 17, 11, 220, 18, 13587, ...]`
+  - the divergent token was emitted by an `mtp_rejected` step after the visible prefix still matched, so earlier accepted two-token verifier steps had drifted internal model state.
+- Patch: the K=1 one-pass verifier now runs the two-token target suffix as cached prefill (`is_prefill=True`, `num_prefill_tokens=2 * batch`) instead of decode metadata. This is intended to make full-attention KV for the draft token causal/exact while still returning per-token hybrid prefix states for accept/reject commit selection.

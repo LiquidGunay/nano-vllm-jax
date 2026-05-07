@@ -43,6 +43,7 @@ class AttentionMetadata:
     num_prefill_tokens: int
     num_decode_tokens: int
     positions: Optional[jnp.ndarray] = None
+    max_kv_len: Optional[int] = None
 
 
 @dataclass
@@ -81,8 +82,12 @@ class KVCacheState:
     
     This dataclass is registered as a JAX pytree node for JIT compatibility.
     """
-    k_cache: jnp.ndarray  # [num_blocks, block_size, num_kv_heads, head_dim]
-    v_cache: jnp.ndarray  # [num_blocks, block_size, num_kv_heads, head_dim]
+    # For num_layers == 1 we keep flat slots:
+    # [1, num_blocks * block_size, num_kv_heads, head_dim]
+    # For num_layers > 1 we keep block-grouped layout:
+    # [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+    k_cache: jnp.ndarray
+    v_cache: jnp.ndarray
     block_table: jnp.ndarray  # [max_seqs, max_blocks_per_seq]
     kv_lens: jnp.ndarray  # [max_seqs]
     slot_mapping: jnp.ndarray  # [batch, seq_len]
@@ -111,6 +116,9 @@ class KVCacheState:
     @property
     def hybrid_state(self) -> HybridLayerState:
         return HybridLayerState(self.conv_state, self.recurrent_state)
+
+    def replace(self, **kwargs) -> "KVCacheState":
+        return replace(self, **kwargs)
 
 
 def estimate_kv_cache_bytes(spec: KVCacheSpec) -> int:
@@ -224,8 +232,14 @@ def init_kv_cache(
     )
     capped_num_blocks = cap_num_kv_cache_blocks(spec)
 
-    k_cache = jnp.zeros((num_layers, capped_num_blocks, block_size, num_kv_heads, head_dim), dtype=dtype)
-    v_cache = jnp.zeros((num_layers, capped_num_blocks, block_size, num_kv_heads, head_dim), dtype=dtype)
+    k_cache = jnp.zeros(
+        (num_layers, capped_num_blocks, block_size, num_kv_heads, head_dim),
+        dtype=dtype,
+    )
+    v_cache = jnp.zeros(
+        (num_layers, capped_num_blocks, block_size, num_kv_heads, head_dim),
+        dtype=dtype,
+    )
     block_table = jnp.zeros((max_seqs, max_blocks_per_seq), dtype=jnp.int32)
     kv_lens = jnp.zeros(max_seqs, dtype=jnp.int32)
     slot_mapping = jnp.zeros((max_seqs, 1), dtype=jnp.int32)  # Will be expanded
@@ -265,6 +279,37 @@ def init_linear_attention_states(
     )
 
 
+def _resolve_kv_layer(
+    cache: jnp.ndarray,
+    layer_idx: int,
+) -> Tuple[jnp.ndarray, bool]:
+    """Resolve per-layer cache tensor.
+
+    Returns:
+        layer_cache: Cache for a single layer.
+            - Flat layout: [num_slots, num_kv_heads, head_dim]
+            - Block layout: [num_blocks, block_size, num_kv_heads, head_dim]
+        flat: True when layer_cache is already flat [num_slots, ...]
+    """
+    if layer_idx < 0:
+        raise ValueError("layer_idx must be non-negative")
+
+    if cache.ndim == 5:
+        if layer_idx >= cache.shape[0]:
+            raise ValueError(
+                f"layer_idx {layer_idx} is out of bounds for {cache.shape[0]} layers"
+            )
+        return cache[layer_idx], False
+    if cache.ndim == 4:
+        if layer_idx >= cache.shape[0]:
+            raise ValueError(
+                f"layer_idx {layer_idx} is out of bounds for {cache.shape[0]} layers"
+            )
+        return cache[layer_idx], True
+
+    raise ValueError(f"Unsupported KV cache rank: {cache.ndim}")
+
+
 def init_hybrid_state(
     config,
     batch_size: int = 1,
@@ -287,7 +332,7 @@ def init_hybrid_state(
         (
             batch_size,
             num_linear_layers,
-            config.linear_num_key_heads,
+            config.linear_num_value_heads,
             config.linear_key_head_dim,
             config.linear_value_head_dim,
         ),
@@ -359,54 +404,65 @@ def update_kv_cache(
     Returns:
         Updated k_cache, v_cache
     """
-    num_layers, num_blocks, block_size, num_kv_heads, head_dim = k_cache.shape
-    
-    # Get layer-specific cache
-    k_cache_layer = k_cache[layer_idx]  # [num_blocks, block_size, num_kv_heads, head_dim]
-    v_cache_layer = v_cache[layer_idx]
-    
-    # Reshape cache to flat form for easier indexing
-    k_cache_flat = k_cache_layer.reshape(-1, num_kv_heads, head_dim)
-    v_cache_flat = v_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    if k_cache.shape != v_cache.shape:
+        raise ValueError("k_cache and v_cache must have the same shape")
+
+    k_cache_layer, cache_is_flat = _resolve_kv_layer(k_cache, layer_idx)
+    v_cache_layer, _ = _resolve_kv_layer(v_cache, layer_idx)
+
+    num_kv_heads = k_cache_layer.shape[-2]
+    head_dim = k_cache_layer.shape[-1]
+
+    k_cache_flat = (
+        k_cache_layer
+        if cache_is_flat
+        else k_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    )
+    v_cache_flat = (
+        v_cache_layer
+        if cache_is_flat
+        else v_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    )
     
     # Flatten slot_mapping and new_k/v
     slot_flat = slot_mapping.reshape(-1)
     k_flat = new_k.reshape(-1, num_kv_heads, head_dim)
     v_flat = new_v.reshape(-1, num_kv_heads, head_dim)
     if valid_mask is not None:
+        # Preserve invalid padded entries by redirecting them to a sentinel
+        # slot that is removed before returning to cache shape.
         valid_flat = valid_mask.reshape(-1)
-        # Do not scatter padded tokens. Writing "old" values for invalid
-        # tokens is not sufficient because padded slots can alias real slots.
-        def update_one(carry, i):
-            k_flat_carry, v_flat_carry = carry
-
-            def write_valid(inner):
-                k_inner, v_inner = inner
-                return (
-                    k_inner.at[slot_flat[i]].set(k_flat[i]),
-                    v_inner.at[slot_flat[i]].set(v_flat[i]),
-                )
-
-            return jax.lax.cond(
-                valid_flat[i],
-                write_valid,
-                lambda inner: inner,
-                (k_flat_carry, v_flat_carry),
-            ), None
-
-        (k_cache_flat, v_cache_flat), _ = jax.lax.scan(
-            update_one,
-            (k_cache_flat, v_cache_flat),
-            jnp.arange(slot_flat.shape[0]),
-        )
+        sentinel_idx = k_cache_flat.shape[0]
+        safe_slots = jnp.where(valid_flat, slot_flat, sentinel_idx)
+        pad_row = jnp.zeros((1, num_kv_heads, head_dim), dtype=k_cache_flat.dtype)
+        k_cache_flat_ext = jnp.concatenate([k_cache_flat, pad_row], axis=0)
+        v_cache_flat_ext = jnp.concatenate([v_cache_flat, pad_row], axis=0)
+        k_cache_flat_ext = k_cache_flat_ext.at[safe_slots].set(k_flat)
+        v_cache_flat_ext = v_cache_flat_ext.at[safe_slots].set(v_flat)
+        k_cache_flat = k_cache_flat_ext[:-1]
+        v_cache_flat = v_cache_flat_ext[:-1]
     else:
         # Scatter update
         k_cache_flat = k_cache_flat.at[slot_flat].set(k_flat)
         v_cache_flat = v_cache_flat.at[slot_flat].set(v_flat)
     
-    # Reshape back
-    k_cache_layer = k_cache_flat.reshape(num_blocks, block_size, num_kv_heads, head_dim)
-    v_cache_layer = v_cache_flat.reshape(num_blocks, block_size, num_kv_heads, head_dim)
+    if not cache_is_flat:
+        _, num_blocks, block_size, _, _ = k_cache.shape
+        k_cache_layer = k_cache_flat.reshape(
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_dim,
+        )
+        v_cache_layer = v_cache_flat.reshape(
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_dim,
+        )
+    else:
+        k_cache_layer = k_cache_flat
+        v_cache_layer = v_cache_flat
     
     # Update the layer cache in the full cache
     k_cache = k_cache.at[layer_idx].set(k_cache_layer)
@@ -445,46 +501,55 @@ def paged_attention(
     """
     batch, seq_len, num_heads, head_dim = query.shape
     
-    # Check if cache has layer dimension
-    if k_cache.ndim == 5:
-        # Per-layer cache: [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
-        k_cache_layer = k_cache[layer_idx]
-        v_cache_layer = v_cache[layer_idx]
-    else:
-        # Legacy cache: [num_blocks, block_size, num_kv_heads, head_dim]
-        k_cache_layer = k_cache
-        v_cache_layer = v_cache
-    
-    num_blocks, block_size, num_kv_heads, _ = k_cache_layer.shape
-    
+    k_cache_layer, cache_is_flat = _resolve_kv_layer(k_cache, layer_idx)
+    v_cache_layer, _ = _resolve_kv_layer(v_cache, layer_idx)
+
+    num_kv_heads = k_cache_layer.shape[-2]
+    head_dim = k_cache_layer.shape[-1]
+
+    k_flat = (
+        k_cache_layer
+        if cache_is_flat
+        else k_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    )
+    v_flat = (
+        v_cache_layer
+        if cache_is_flat
+        else v_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    )
+
     # Gather KV pairs for all positions using slot_mapping
-    # slot_mapping maps each (batch, seq_pos) to a flat index in the KV cache
-    # k_cache_layer.reshape(-1, num_kv_heads, head_dim) gives us [num_blocks * block_size, K, H]
-    k_gathered = k_cache_layer.reshape(-1, num_kv_heads, head_dim)[slot_mapping]
-    v_gathered = v_cache_layer.reshape(-1, num_kv_heads, head_dim)[slot_mapping]
+    # slot_mapping maps each (batch, seq_pos) to a flat index in the KV cache.
+    k_gathered = k_flat[slot_mapping]
+    v_gathered = v_flat[slot_mapping]
     
-    # Expand KV for GQA
-    if num_key_value_groups > 1:
-        # Repeat KV for GQA: [B, T, K, H] -> [B, T, K*n_rep, H] = [B, T, N, H]
-        k_gathered = jnp.repeat(k_gathered, num_key_value_groups, axis=2)
-        v_gathered = jnp.repeat(v_gathered, num_key_value_groups, axis=2)
-    
-    # Compute attention scores
-    # query: [B, T, N, H], k_gathered: [B, T, N, H]
-    # Need: [B, N, T, T] scores
-    attn_scores = jnp.einsum("btnh,bsnh->bnts", query, k_gathered) * scale
+    # Expand KV for grouped GQA without materializing repeated values.
+    query_grouped = query.reshape(batch, seq_len, num_kv_heads, num_key_value_groups, head_dim)
+    k_gathered_grouped = k_gathered[:, :, :, None, :]
+    v_gathered_grouped = v_gathered[:, :, :, None, :]
+
+    # Shape: [B, T, KV_heads, G, T]
+    attn_scores = jnp.einsum(
+        "btkgd,bskgd->btkgs",
+        query_grouped,
+        k_gathered_grouped,
+    ) * scale
     
     # Apply causal mask
     mask = jnp.triu(jnp.ones((seq_len, seq_len)), k=1)
-    attn_scores = jnp.where(mask == 1, -1e10, attn_scores)
+    attn_scores = jnp.where(mask[None, :, None, None, :], -1e10, attn_scores)
     
     # Softmax and output
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
     # attn_weights: [B, N, T, T], v_gathered: [B, T, N, H]
     # Output: [B, N, T, H]
-    out = jnp.einsum("bnts,bsnh->btnh", attn_weights, v_gathered)
+    out = jnp.einsum("btkgs,bskgd->btkgd", attn_weights, v_gathered_grouped)
     # Reshape to [B, T, N*H]
-    out = out.transpose(0, 1, 2, 3).reshape(batch, seq_len, num_heads * head_dim)
+    out = out.reshape(batch, seq_len, num_heads, head_dim).reshape(
+        batch,
+        seq_len,
+        num_heads * head_dim,
+    )
     
     return out
 
@@ -508,14 +573,22 @@ def paged_attention_prefill(
 
     batch, query_len, num_heads, head_dim = query.shape
 
-    if k_cache.ndim == 5:
-        k_cache_layer = k_cache[layer_idx]
-        v_cache_layer = v_cache[layer_idx]
-    else:
-        k_cache_layer = k_cache
-        v_cache_layer = v_cache
+    k_cache_layer, cache_is_flat = _resolve_kv_layer(k_cache, layer_idx)
+    v_cache_layer, _ = _resolve_kv_layer(v_cache, layer_idx)
+    num_kv_heads = k_cache_layer.shape[-2]
+    head_dim = k_cache_layer.shape[-1]
 
-    _, block_size_cache, num_kv_heads, _ = k_cache_layer.shape
+    k_flat = (
+        k_cache_layer
+        if cache_is_flat
+        else k_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    )
+    v_flat = (
+        v_cache_layer
+        if cache_is_flat
+        else v_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    )
+
     max_kv_len = block_table.shape[1] * block_size
     key_positions = jnp.arange(max_kv_len, dtype=jnp.int32)[None, :]
     key_positions = jnp.broadcast_to(key_positions, (batch, max_kv_len))
@@ -525,29 +598,35 @@ def paged_attention_prefill(
     batch_indices = jnp.arange(batch, dtype=jnp.int32)[:, None]
     flat_indices = batch_indices * block_table.shape[1] + block_indices
     physical_blocks = block_table.reshape(-1)[flat_indices]
-    slot_mapping = physical_blocks * block_size_cache + slot_indices
+    slot_mapping = physical_blocks * block_size + slot_indices
 
-    k_flat = k_cache_layer.reshape(-1, num_kv_heads, head_dim)
-    v_flat = v_cache_layer.reshape(-1, num_kv_heads, head_dim)
-    k_gathered = k_flat[slot_mapping.reshape(-1)].reshape(batch, max_kv_len, num_kv_heads, head_dim)
-    v_gathered = v_flat[slot_mapping.reshape(-1)].reshape(batch, max_kv_len, num_kv_heads, head_dim)
+    k_gathered = k_flat[slot_mapping.reshape(-1)].reshape(
+        batch, max_kv_len, num_kv_heads, head_dim
+    )
+    v_gathered = v_flat[slot_mapping.reshape(-1)].reshape(
+        batch, max_kv_len, num_kv_heads, head_dim
+    )
 
-    if num_key_value_groups > 1:
-        k_gathered = jnp.repeat(k_gathered, num_key_value_groups, axis=2)
-        v_gathered = jnp.repeat(v_gathered, num_key_value_groups, axis=2)
+    query_grouped = query.reshape(batch, query_len, num_kv_heads, num_key_value_groups, head_dim)
+    k_gathered_grouped = k_gathered[:, :, :, None, :]
+    v_gathered_grouped = v_gathered[:, :, :, None, :]
 
-    attn_scores = jnp.einsum("btnh,bknh->btnk", query, k_gathered) * scale
+    attn_scores = jnp.einsum(
+        "btkgd,bskgd->btkgs",
+        query_grouped,
+        k_gathered_grouped,
+    ) * scale
     valid_keys = key_positions < kv_lens[:, None]
     causal_keys = key_positions[:, None, :] <= positions[:, :, None]
     attn_mask = valid_keys[:, None, :] & causal_keys
-    attn_scores = jnp.where(attn_mask[:, :, None, :], attn_scores, -1e10)
+    attn_scores = jnp.where(attn_mask[:, :, None, None, :], attn_scores, -1e10)
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-    out = jnp.einsum("btnk,bknh->btnh", attn_weights, v_gathered)
+    out = jnp.einsum("btkgs,bskgd->btkgd", attn_weights, v_gathered_grouped)
     return out.reshape(batch, query_len, num_heads * head_dim)
 
 
 def paged_attention_decode(
-    query: jnp.ndarray,  # [batch, 1, num_heads, head_dim]
+    query: jnp.ndarray,  # [batch, query_len, num_heads, head_dim]
     k_cache: jnp.ndarray,  # [num_layers, num_blocks, block_size, num_kv_heads, head_dim] or [num_blocks, block_size, num_kv_heads, head_dim]
     v_cache: jnp.ndarray,
     block_table: jnp.ndarray,  # [batch, max_blocks_per_seq]
@@ -557,14 +636,17 @@ def paged_attention_decode(
     num_key_value_groups: int,
     max_kv_len: int = None,  # Optional: static max length for JIT compatibility
     layer_idx: int = 0,  # Layer index for per-layer cache
+    positions: Optional[jnp.ndarray] = None,  # [batch, query_len]
 ) -> jnp.ndarray:
-    """Paged attention for decode step (single token).
+    """Paged attention for decode steps with a bounded paged window.
     
-    Simple and fast version using direct gather with limited window.
-    For long sequences, uses a sliding window of most recent tokens.
+    This path is optimized for fixed-width decode buckets. It supports
+    query_len > 1 for speculative verification by applying an explicit causal
+    mask from the runtime query positions while keeping the materialized KV
+    window static from the block-table width.
     
     Args:
-        query: Single token query [batch, 1, num_heads, head_dim]
+        query: Query tensor [batch, query_len, num_heads, head_dim]
         k_cache: Key cache (with optional layer dimension)
         v_cache: Value cache
         block_table: Block assignments per sequence
@@ -572,40 +654,59 @@ def paged_attention_decode(
         block_size: Tokens per block
         scale: Attention scale
         num_key_value_groups: GQA groups
-        max_kv_len: Static maximum KV length (if None, uses num_blocks * block_size)
+        max_kv_len: Static maximum KV length (if None, derived from block_table width and block_size)
         layer_idx: Layer index for per-layer cache
+        positions: Runtime query positions used for multi-token causal masking
     
     Returns:
-        Attention output [batch, 1, hidden_dim]
+        Attention output [batch, query_len, hidden_dim]
     """
-    batch, _, num_heads, head_dim = query.shape
+    batch, query_len, num_heads, head_dim = query.shape
+
+    if query_len < 1:
+        raise ValueError("decode attention requires query_len >= 1")
+    if block_table.shape[0] != batch:
+        raise ValueError(
+            f"query batch {batch} must match block_tables batch {block_table.shape[0]}"
+        )
+    if block_table.ndim != 2:
+        raise ValueError("block_tables must be a 2D tensor [batch, max_blocks_per_seq]")
+    if kv_lens.shape[0] != batch:
+        raise ValueError("seq_lens shape must align with query batch")
+    if positions is not None and positions.shape != (batch, query_len):
+        raise ValueError("positions must have shape [batch, query_len]")
+    if positions is None and query_len != 1:
+        raise ValueError("positions are required for multi-token decode attention")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+
+    if max_kv_len is None:
+        max_kv_len = block_table.shape[1] * block_size
     
     # Check if cache has layer dimension
-    if k_cache.ndim == 5:
-        # Per-layer cache: [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
-        k_cache_layer = k_cache[layer_idx]
-        v_cache_layer = v_cache[layer_idx]
-    else:
-        # Legacy cache: [num_blocks, block_size, num_kv_heads, head_dim]
-        k_cache_layer = k_cache
-        v_cache_layer = v_cache
+    k_cache_layer, cache_is_flat = _resolve_kv_layer(k_cache, layer_idx)
+    v_cache_layer, _ = _resolve_kv_layer(v_cache, layer_idx)
+    num_kv_heads = k_cache_layer.shape[-2]
+    head_dim = k_cache_layer.shape[-1]
+
+    k_flat = (
+        k_cache_layer
+        if cache_is_flat
+        else k_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    )
+    v_flat = (
+        v_cache_layer
+        if cache_is_flat
+        else v_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    )
+    num_slots = k_flat.shape[0]
     
-    num_blocks, block_size_cache, num_kv_heads, _ = k_cache_layer.shape
-    
-    # Use static max_kv_len for JIT compatibility
-    if max_kv_len is None:
-        max_kv_len = num_blocks * block_size_cache
-    
-    # Attend to ALL positions 0 to kv_lens[b] for each batch element
-    # This is the correct implementation - no windowing
-    
-    # Flatten cache: [num_blocks * block_size, num_kv_heads, head_dim]
-    k_flat = k_cache_layer.reshape(-1, num_kv_heads, head_dim)
-    v_flat = v_cache_layer.reshape(-1, num_kv_heads, head_dim)
-    
-    # For each batch, attend to positions 0..kv_lens[b]-1
-    # Use max_kv_len as the static shape dimension
-    max_seq_len = jnp.max(kv_lens)  # Maximum sequence length in batch
+    if max_kv_len <= 0:
+        raise ValueError("max_kv_len must be positive")
+    if max_kv_len > block_table.shape[1] * block_size:
+        raise ValueError("max_kv_len exceeds the physical cache span covered by block_tables")
+    if max_kv_len > num_slots:
+        raise ValueError("max_kv_len exceeds the physical cache slot capacity")
     
     # Positions: [batch, max_seq_len] - all positions 0 to max_seq_len-1
     positions_2d = jnp.arange(max_kv_len)[None, :]  # [1, max_kv_len]
@@ -644,38 +745,30 @@ def paged_attention_decode(
     k_gathered = k_gathered_flat.reshape(batch, max_kv_len, num_kv_heads, head_dim)
     v_gathered = v_gathered_flat.reshape(batch, max_kv_len, num_kv_heads, head_dim)
     
-    # Create validity mask: position < kv_lens
-    # [batch, max_kv_len]
     valid_mask = positions_2d < kv_lens[:, None]
-    
-    # Expand KV for GQA if needed
-    if num_key_value_groups > 1:
-        k_gathered = jnp.repeat(k_gathered, num_key_value_groups, axis=2)
-        v_gathered = jnp.repeat(v_gathered, num_key_value_groups, axis=2)
-    
-    # k_gathered, v_gathered: [batch, max_kv_len, num_heads, head_dim]
-    # Transpose to [batch, num_heads, max_kv_len, head_dim]
-    k_for_attn = k_gathered.transpose(0, 2, 1, 3)
-    v_for_attn = v_gathered.transpose(0, 2, 1, 3)
-    
-    # query: [batch, 1, num_heads, head_dim] -> [batch, num_heads, 1, head_dim]
-    query_t = query.transpose(0, 2, 1, 3)
-    
-    # Compute attention scores: [batch, num_heads, 1, max_kv_len]
-    attn_scores = jnp.einsum("bh1d,bhkd->bh1k", query_t, k_for_attn) * scale
-    
-    # Apply validity mask
-    # valid_mask: [batch, max_kv_len] -> [batch, 1, 1, max_kv_len]
-    valid_mask_expanded = valid_mask[:, None, None, :]
-    attn_scores = jnp.where(valid_mask_expanded, attn_scores, -1e10)
-    
-    # Softmax and output
+    if positions is not None:
+        causal_mask = positions_2d[:, None, :] <= positions[:, :, None]
+        attn_mask = valid_mask[:, None, :] & causal_mask
+    else:
+        attn_mask = valid_mask[:, None, :]
+
+    query_grouped = query.reshape(batch, query_len, num_kv_heads, num_key_value_groups, head_dim)
+    k_gathered_grouped = k_gathered[:, :, :, None, :]
+    v_gathered_grouped = v_gathered[:, :, :, None, :]
+
+    attn_scores = jnp.einsum(
+        "btkgd,bskgd->btkgs",
+        query_grouped,
+        k_gathered_grouped,
+    ) * scale
+    attn_scores = jnp.where(
+        attn_mask[:, :, None, None, :],
+        attn_scores,
+        -1e10,
+    )
     attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-    
-    # out: [batch, num_heads, 1, head_dim]
-    out = jnp.einsum("bh1k,bhkd->bh1d", attn_weights, v_for_attn)
-    
-    # Transpose back: [batch, num_heads, 1, head_dim] -> [batch, 1, hidden_dim]
-    out = out.transpose(0, 2, 1, 3).reshape(batch, 1, -1)
+
+    out = jnp.einsum("btkgs,bskgd->btkgd", attn_weights, v_gathered_grouped)
+    out = out.reshape(batch, query_len, num_heads, head_dim).reshape(batch, query_len, num_heads * head_dim)
     
     return out

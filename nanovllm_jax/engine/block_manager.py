@@ -168,8 +168,18 @@ class BlockManager:
 
     def can_append(self, seq: Sequence) -> bool:
         """Check if we can append a token to sequence."""
-        # Need new block if current block is full
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        return self.can_append_slots(seq, 1)
+
+    def can_append_slots(self, seq: Sequence, num_slots: int) -> bool:
+        """Check if blocks exist/can be allocated for a decode lookahead window.
+
+        ``seq`` already contains the scheduled decode token as ``last_token``.
+        ``num_slots`` counts that scheduled token plus any speculative draft
+        tokens that may be processed by the same target-model call.
+        """
+        target_tokens = len(seq) + max(0, int(num_slots) - 1)
+        required_blocks = (target_tokens + self.block_size - 1) // self.block_size
+        return len(self.free_block_ids) >= max(0, required_blocks - len(seq.block_table))
 
     def snapshot(self, seqs: List[Sequence] | None = None) -> BlockTables:
         """Expose Python-side prefix-cache state without touching JAX arrays."""
@@ -184,24 +194,44 @@ class BlockManager:
         
         Updates hash for completed blocks.
         """
+        self.may_append_slots(seq, 1)
+
+    def may_append_slots(self, seq: Sequence, num_slots: int):
+        """Reserve block-table entries for a decode lookahead window.
+
+        The scheduled decode token is already present in ``seq.token_ids``.
+        Speculative decoding can process one or more additional draft tokens
+        before Python postprocess appends them to ``seq``. Their physical cache
+        rows must therefore be allocated before the executor writes them.
+        """
         block_table = seq.block_table
-        last_block = self.blocks[block_table[-1]]
+        current_required_blocks = (len(seq) + self.block_size - 1) // self.block_size
         
-        if len(seq) % self.block_size == 1:
+        if current_required_blocks > len(block_table):
             # Just crossed block boundary - allocate new block
+            last_block = self.blocks[block_table[-1]]
             assert last_block.hash != -1
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
             
-        elif len(seq) % self.block_size == 0:
+        if len(seq) % self.block_size == 0:
             # Completed a block - update its hash
-            assert last_block.hash == -1
-            token_ids = self._block_tokens(seq, len(seq) // self.block_size - 1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
+            block_idx = len(seq) // self.block_size - 1
+            block = self.blocks[block_table[block_idx]]
+            if block.hash == -1:
+                token_ids = self._block_tokens(seq, block_idx)
+                prefix = self.blocks[block_table[block_idx - 1]].hash if block_idx > 0 else -1
+                h = self.compute_hash(token_ids, prefix)
+                block.update(h, token_ids)
+                self.hash_to_block_id[h] = block.block_id
+
+        target_tokens = len(seq) + max(0, int(num_slots) - 1)
+        required_blocks = (target_tokens + self.block_size - 1) // self.block_size
+        while len(block_table) < required_blocks:
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            block_table.append(block_id)
 
     def commit_processed_token(self, seq: Sequence):
         """Record metadata for an already-processed appended token.

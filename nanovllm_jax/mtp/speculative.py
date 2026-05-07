@@ -6,6 +6,7 @@ from typing import Tuple, Optional, NamedTuple
 from dataclasses import dataclass
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.mtp.mtp_layer import MTPParams
+from nanovllm_jax.mtp.mtp_layer import mtp_forward
 
 
 @dataclass

@@ -227,8 +227,11 @@ def mtp_forward(
     # Apply final norm after MTP layers (ALWAYS, as in mlx-lm)
     x_normed = rms_norm(x, params.final_norm, config.rms_norm_eps)
     
-    # Output projection to vocab
-    logits = jnp.dot(x_normed, params.lm_head)
+    # Output projection to vocab. MTP checkpoints may omit lm_head when
+    # embeddings are shared with the main model, so fallback to tied
+    # embedding weights in that case.
+    output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
+    logits = jnp.dot(x_normed, output_weight)
     
     return logits, x
 
@@ -301,16 +304,22 @@ def mtp_layer_forward(
     # Causal mask
     mask = causal_mask(seq_len, seq_len)
     
-    # GQA: repeat KV to match Q heads
+    # GQA: group query heads by KV head without materializing repeated K/V.
     num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-    k = jnp.repeat(k, num_key_value_groups, axis=1)
-    v = jnp.repeat(v, num_key_value_groups, axis=1)
+    query = query.reshape(
+        batch,
+        config.num_key_value_heads,
+        num_key_value_groups,
+        seq_len,
+        config.head_dim,
+    )
     
-    # Attention: [B, H, T, D]
-    attn_weights = jnp.einsum("bhtd,bhsd->bhts", query, k) / jnp.sqrt(config.head_dim)
+    # Attention: query [B, KVH, G, T, D], KV [B, KVH, S, D].
+    attn_weights = jnp.einsum("bkgtd,bksd->bkgts", query, k) / jnp.sqrt(config.head_dim)
     attn_weights = attn_weights + mask
     attn_probs = jax.nn.softmax(attn_weights, axis=-1)
-    attn_out = jnp.einsum("bhts,bhsd->bhtd", attn_probs, v)
+    attn_out = jnp.einsum("bkgts,bksd->bkgtd", attn_probs, v)
+    attn_out = attn_out.reshape(batch, config.num_attention_heads, seq_len, config.head_dim)
     
     # Transpose back to [B, T, H, D]
     attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq_len, -1)

@@ -145,6 +145,7 @@ def _apply_attention_with_cache(
                 block_table=kv_cache_state.block_table,
                 kv_lens=kv_cache_state.kv_lens,
                 block_size=config.block_size,
+                max_kv_len=kv_cache_state.block_table.shape[1] * config.block_size,
                 scale=1.0 / jnp.sqrt(config.head_dim),
                 num_key_value_groups=num_key_value_groups,
             )

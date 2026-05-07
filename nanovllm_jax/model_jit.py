@@ -414,6 +414,7 @@ def _full_attention_block_jit(
                 block_table=block_table,
                 kv_lens=kv_lens,
                 block_size=block_size,
+                max_kv_len=block_table.shape[1] * block_size,
                 scale=1.0 / jnp.sqrt(head_dim),
                 num_key_value_groups=num_key_value_groups,
             )

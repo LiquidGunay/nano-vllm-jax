@@ -105,7 +105,9 @@ def test_paged_attention_vs_standard():
     # Note: Full paged attention test requires proper slot mapping and block tables
     # This is a structural test
     print("  ✓ PASS: Paged attention structure verified")
-    return True
+    assert standard_output.shape == (batch_size, seq_len, num_heads, head_dim)
+    assert not bool(jnp.any(jnp.isnan(standard_output)))
+    assert not bool(jnp.any(jnp.isinf(standard_output)))
 
 
 def test_linear_attention_chunked_vs_recurrent():
@@ -165,12 +167,8 @@ def test_linear_attention_chunked_vs_recurrent():
     print(f"  MSE: {mse:.2e}")
     print(f"  Max diff: {max_diff:.2e}")
     
-    if mse < 1e-6:
-        print("  ✓ PASS: Chunked and recurrent match (MSE < 1e-6)")
-        return True
-    else:
-        print(f"  ✗ FAIL: MSE {mse:.2e} >= 1e-6")
-        return False
+    assert mse < 1e-6
+    print("  ✓ PASS: Chunked and recurrent match (MSE < 1e-6)")
 
 
 def test_linear_attention_state_persistence():
@@ -214,23 +212,15 @@ def test_linear_attention_state_persistence():
     print(f"  State shape: {states[0].shape}")
     print(f"  State norms: {[f'{n:.4f}' for n in state_norms[:5]]}...")
     
-    # State should change at each step
-    changes = [states[i] is not states[i+1] for i in range(len(states)-1)]
-    
     # Check for NaN/Inf
     final_state = states[-1]
     has_nan = jnp.any(jnp.isnan(final_state))
     has_inf = jnp.any(jnp.isinf(final_state))
-    
-    if has_nan:
-        print("  ✗ FAIL: State contains NaN")
-        return False
-    elif has_inf:
-        print("  ✗ FAIL: State contains Inf")
-        return False
-    else:
-        print("  ✓ PASS: State persists correctly, no NaN/Inf")
-        return True
+
+    assert not bool(has_nan)
+    assert not bool(has_inf)
+    assert not bool(jnp.allclose(states[0], final_state))
+    print("  ✓ PASS: State persists correctly, no NaN/Inf")
 
 
 def test_kv_cache_block_allocation():
@@ -277,13 +267,10 @@ def test_kv_cache_block_allocation():
     print(f"  Slot mapping: {slot_mapping}")
     
     # Verify shapes (note: KV cache has num_layers dimension)
-    expected_shape = (24, num_blocks, block_size, config.num_key_value_heads, config.head_dim)
-    if kv_cache.k_cache.shape == expected_shape:
-        print("  ✓ PASS: KV cache shapes correct")
-        return True
-    else:
-        print(f"  ✗ FAIL: Expected shape {expected_shape}, got {kv_cache.k_cache.shape}")
-        return False
+    expected_shape = (config.num_hidden_layers, num_blocks, block_size, config.num_key_value_heads, config.head_dim)
+    assert kv_cache.k_cache.shape == expected_shape
+    assert kv_cache.v_cache.shape == expected_shape
+    print("  ✓ PASS: KV cache shapes correct")
 
 
 def test_multi_layer_linear_attention_states():
@@ -323,16 +310,11 @@ def test_multi_layer_linear_attention_states():
         print(f"  Expected recurrent state shape: {expected_shape}")
         print(f"  Actual recurrent state shape: {actual_shape}")
         
-        if actual_shape == expected_shape:
-            print("  ✓ PASS: Multi-layer states initialized correctly")
-            return True
-        else:
-            print("  ✗ FAIL: Shape mismatch")
-            return False
+        assert actual_shape == expected_shape
+        print("  ✓ PASS: Multi-layer states initialized correctly")
     else:
         print("  ⚠ No recurrent state found (may not be initialized)")
         print("  ✓ PASS: Structure verified")
-        return True
 
 
 def test_paged_attention_non_identity_blocks():
@@ -389,12 +371,9 @@ def test_paged_attention_non_identity_blocks():
     print(f"  Actual slot seq 0: {slot_mapping[0, 0]}")
     print(f"  Actual slot seq 1: {slot_mapping[1, 0]}")
     
-    if slot_mapping[0, 0] == expected_slot_seq0 and slot_mapping[1, 0] == expected_slot_seq1:
-        print("  ✓ PASS: Non-identity block tables work correctly")
-        return True
-    else:
-        print("  ✗ FAIL: Slot mapping incorrect")
-        return False
+    np.testing.assert_array_equal(np.array(slot_mapping[0, 0]), np.array(expected_slot_seq0))
+    np.testing.assert_array_equal(np.array(slot_mapping[1, 0]), np.array(expected_slot_seq1))
+    print("  ✓ PASS: Non-identity block tables work correctly")
 
 
 def test_decode_attention_long_sequences():
@@ -428,78 +407,225 @@ def test_decode_attention_long_sequences():
     block_table = jnp.array([list(range(20))])  # Uses blocks 0-12 (200 tokens)
     
     # Run decode attention
-    try:
-        output = paged_attention_decode(
-            query=query,
-            k_cache=kv_cache.k_cache,
-            v_cache=kv_cache.v_cache,
-            block_table=block_table,
-            kv_lens=kv_lens,
+    output = paged_attention_decode(
+        query=query,
+        k_cache=kv_cache.k_cache,
+        v_cache=kv_cache.v_cache,
+        block_table=block_table,
+        kv_lens=kv_lens,
+        block_size=block_size,
+        scale=1.0 / jnp.sqrt(config.head_dim),
+        num_key_value_groups=config.num_attention_heads // config.num_key_value_heads,
+        max_kv_len=200,
+    )
+
+    print(f"  Sequence length: {seq_len}")
+    print(f"  Output shape: {output.shape}")
+
+    # Verify output is valid (no NaN/Inf)
+    has_nan = jnp.any(jnp.isnan(output))
+    has_inf = jnp.any(jnp.isinf(output))
+    assert not bool(has_nan)
+    assert not bool(has_inf)
+    print("  ✓ PASS: Long sequence decode produces valid output")
+
+
+def test_paged_decode_attention_independent_of_physical_cache_capacity():
+    """Decode attention output depends on logical block-table width, not physical capacity."""
+    batch_size = 1
+    num_heads = 4
+    num_kv_heads = 2
+    head_dim = 8
+    block_size = 16
+    max_blocks_per_seq = 4
+    num_kv_blocks_small = 4
+    num_kv_blocks_large = 8
+    kv_len = 6
+
+    query = jnp.array(np.random.randn(batch_size, 1, num_heads, head_dim).astype(np.float32))
+    keys = jnp.array(np.random.randn(batch_size, kv_len, num_kv_heads, head_dim).astype(np.float32))
+    values = jnp.array(np.random.randn(batch_size, kv_len, num_kv_heads, head_dim).astype(np.float32))
+    block_tables = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
+    kv_lens = jnp.array([kv_len], dtype=jnp.int32)
+    max_kv_len = block_tables.shape[1] * block_size
+    positions = jnp.arange(kv_len, dtype=jnp.int32)[None, :]
+    slot_mapping = compute_slot_mapping(
+        positions=positions,
+        block_table=block_tables,
+        block_size=block_size,
+    )
+
+    def write_cache(num_blocks):
+        kv_cache = init_kv_cache(
+            num_blocks=num_blocks,
             block_size=block_size,
-            scale=1.0 / jnp.sqrt(config.head_dim),
-            num_key_value_groups=config.num_attention_heads // config.num_key_value_heads,
-            max_kv_len=200,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            max_seqs=batch_size,
+            max_blocks_per_seq=max_blocks_per_seq,
+            num_layers=1,
+            dtype=jnp.float32,
         )
-        
-        print(f"  Sequence length: {seq_len}")
-        print(f"  Output shape: {output.shape}")
-        
-        # Verify output is valid (no NaN/Inf)
-        has_nan = jnp.any(jnp.isnan(output))
-        has_inf = jnp.any(jnp.isinf(output))
-        
-        if has_nan:
-            print("  ✗ FAIL: Output contains NaN")
-            return False
-        elif has_inf:
-            print("  ✗ FAIL: Output contains Inf")
-            return False
-        else:
-            print("  ✓ PASS: Long sequence decode produces valid output")
-            return True
-            
-    except Exception as e:
-        print(f"  ✗ FAIL: Exception during long sequence decode: {e}")
-        return False
+        layer_k = kv_cache.k_cache[0].reshape(-1, num_kv_heads, head_dim)
+        layer_v = kv_cache.v_cache[0].reshape(-1, num_kv_heads, head_dim)
+        slot_flat = slot_mapping.reshape(-1)
+        layer_k = layer_k.at[slot_flat].set(keys.reshape(-1, num_kv_heads, head_dim))
+        layer_v = layer_v.at[slot_flat].set(values.reshape(-1, num_kv_heads, head_dim))
+        return kv_cache.replace(
+            k_cache=kv_cache.k_cache.at[0].set(
+                layer_k.reshape(kv_cache.k_cache[0].shape)
+            ),
+            v_cache=kv_cache.v_cache.at[0].set(
+                layer_v.reshape(kv_cache.v_cache[0].shape)
+            ),
+        )
+
+    kv_cache_small = write_cache(num_kv_blocks_small)
+    kv_cache_large = write_cache(num_kv_blocks_large)
+
+    out_small = paged_attention_decode(
+        query=query,
+        k_cache=kv_cache_small.k_cache,
+        v_cache=kv_cache_small.v_cache,
+        block_table=block_tables,
+        kv_lens=kv_lens,
+        block_size=block_size,
+        scale=1.0 / jnp.sqrt(head_dim),
+        num_key_value_groups=num_heads // num_kv_heads,
+        max_kv_len=max_kv_len,
+        layer_idx=0,
+    )
+    out_large = paged_attention_decode(
+        query=query,
+        k_cache=kv_cache_large.k_cache,
+        v_cache=kv_cache_large.v_cache,
+        block_table=block_tables,
+        kv_lens=kv_lens,
+        block_size=block_size,
+        scale=1.0 / jnp.sqrt(head_dim),
+        num_key_value_groups=num_heads // num_kv_heads,
+        max_kv_len=max_kv_len,
+        layer_idx=0,
+    )
+
+    assert out_small.shape == out_large.shape == (batch_size, 1, num_heads * head_dim)
+    np.testing.assert_allclose(np.array(out_small), np.array(out_large), rtol=1e-6, atol=1e-6)
 
 
-def run_all_tests():
-    """Run all KV cache tests."""
-    print("=" * 80)
-    print("KV CACHE TESTS")
-    print("=" * 80)
-    
-    results = {
-        "Paged Attention vs Standard": test_paged_attention_vs_standard(),
-        "Linear Attention Chunked vs Recurrent": test_linear_attention_chunked_vs_recurrent(),
-        "Linear Attention State Persistence": test_linear_attention_state_persistence(),
-        "KV Cache Block Allocation": test_kv_cache_block_allocation(),
-        "Multi-Layer Linear Attention States": test_multi_layer_linear_attention_states(),
-        "Paged Attention Non-Identity Blocks": test_paged_attention_non_identity_blocks(),
-        "Decode Attention Long Sequences": test_decode_attention_long_sequences(),
-    }
-    
-    print("\n" + "=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
-    
-    for test_name, passed in results.items():
-        status = "✓ PASS" if passed else "✗ FAIL"
-        print(f"  {test_name}: {status}")
-    
-    total = len(results)
-    passed = sum(results.values())
-    
-    print(f"\nTotal: {passed}/{total} tests passed")
-    
-    if passed == total:
-        print("\n✅ All KV cache tests PASSED!")
-        return True
-    else:
-        print(f"\n❌ {total - passed} test(s) FAILED")
-        return False
+def test_paged_attention_grouped_gqa_matches_repeat_reference():
+    """Grouped-head paged attention matches the repeat-based GQA reference."""
+    batch_size = 2
+    num_heads = 8
+    num_kv_heads = 2
+    num_key_value_groups = num_heads // num_kv_heads
+    head_dim = 4
+    seq_len = 6
+    block_size = 16
+    max_blocks_per_seq = 1
+    num_blocks = 4
+
+    query = jnp.array(np.random.randn(batch_size, seq_len, num_heads, head_dim).astype(np.float32))
+    key = jnp.array(np.random.randn(batch_size, seq_len, num_kv_heads, head_dim).astype(np.float32))
+    value = jnp.array(np.random.randn(batch_size, seq_len, num_kv_heads, head_dim).astype(np.float32))
+
+    kv_cache = init_kv_cache(
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        max_seqs=batch_size,
+        max_blocks_per_seq=max_blocks_per_seq,
+        num_layers=1,
+        dtype=jnp.float32,
+    )
+    block_tables = jnp.array([[0], [1]], dtype=jnp.int32)
+    positions = jnp.arange(seq_len, dtype=jnp.int32)[None, :].repeat(batch_size, axis=0)
+    slot_mapping = compute_slot_mapping(
+        positions=positions,
+        block_table=block_tables,
+        block_size=block_size,
+    )
+    slot_flat = slot_mapping.reshape(-1)
+
+    layer_k = kv_cache.k_cache[0].reshape(-1, num_kv_heads, head_dim)
+    layer_v = kv_cache.v_cache[0].reshape(-1, num_kv_heads, head_dim)
+    layer_k = layer_k.at[slot_flat].set(key.reshape(-1, num_kv_heads, head_dim))
+    layer_v = layer_v.at[slot_flat].set(value.reshape(-1, num_kv_heads, head_dim))
+    kv_cache = kv_cache.replace(
+        k_cache=kv_cache.k_cache.at[0].set(layer_k.reshape(kv_cache.k_cache[0].shape)),
+        v_cache=kv_cache.v_cache.at[0].set(layer_v.reshape(kv_cache.v_cache[0].shape)),
+    )
+
+    out_grouped = paged_attention(
+        query=query,
+        k_cache=kv_cache.k_cache,
+        v_cache=kv_cache.v_cache,
+        slot_mapping=slot_mapping,
+        kv_lens=jnp.array([seq_len, seq_len], dtype=jnp.int32),
+        scale=1.0 / jnp.sqrt(head_dim),
+        num_key_value_groups=num_key_value_groups,
+        layer_idx=0,
+    )
+
+    key_rep = jnp.repeat(key, repeats=num_key_value_groups, axis=2)
+    value_rep = jnp.repeat(value, repeats=num_key_value_groups, axis=2)
+    scores = jnp.einsum("btmd,bkmd->btmk", query, key_rep) / jnp.sqrt(head_dim)
+    causal = jnp.triu(jnp.ones((seq_len, seq_len)), k=1)
+    scores = jnp.where(causal[None, :, None, :] == 1, -1e10, scores)
+    weights = jax.nn.softmax(scores, axis=-1)
+    expected = jnp.einsum("btmk,bkmd->btmd", weights, value_rep).reshape(batch_size, seq_len, -1)
+
+    np.testing.assert_allclose(np.array(out_grouped), np.array(expected), rtol=1e-6, atol=1e-6)
 
 
-if __name__ == "__main__":
-    success = run_all_tests()
-    exit(0 if success else 1)
+def test_masked_update_kv_cache_preserves_invalid_and_duplicate_slots():
+    """Masked cache writes never mutate invalid slots and respect duplicate slots."""
+    num_blocks = 4
+    block_size = 8
+    num_kv_heads = 2
+    head_dim = 3
+    seq_len = 4
+
+    initial_k = jnp.arange(num_blocks * block_size * num_kv_heads * head_dim, dtype=jnp.float32).reshape(
+        1,
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_dim,
+    )
+    initial_v = (jnp.arange(num_blocks * block_size * num_kv_heads * head_dim, dtype=jnp.float32) + 1_000.0).reshape(
+        1,
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_dim,
+    )
+
+    slot_mapping = jnp.array([[2, 2, 3, 5]], dtype=jnp.int32)
+    valid_mask = jnp.array([[1, 0, 1, 0]], dtype=jnp.bool_)
+    new_k = jnp.array(np.random.randn(1, seq_len, num_kv_heads, head_dim).astype(np.float32))
+    new_v = jnp.array(np.random.randn(1, seq_len, num_kv_heads, head_dim).astype(np.float32))
+
+    updated_k, updated_v = update_kv_cache(
+        k_cache=initial_k,
+        v_cache=initial_v,
+        slot_mapping=slot_mapping,
+        new_k=new_k,
+        new_v=new_v,
+        layer_idx=0,
+        valid_mask=valid_mask,
+    )
+
+    updated_k_layer = updated_k[0].reshape(-1, num_kv_heads, head_dim)
+    updated_v_layer = updated_v[0].reshape(-1, num_kv_heads, head_dim)
+    initial_k_layer = initial_k[0].reshape(-1, num_kv_heads, head_dim)
+    initial_v_layer = initial_v[0].reshape(-1, num_kv_heads, head_dim)
+    new_k_flat = new_k.reshape(-1, num_kv_heads, head_dim)
+    new_v_flat = new_v.reshape(-1, num_kv_heads, head_dim)
+
+    np.testing.assert_allclose(np.array(updated_k_layer[2]), np.array(new_k_flat[0]))
+    np.testing.assert_allclose(np.array(updated_k_layer[3]), np.array(new_k_flat[2]))
+    np.testing.assert_allclose(np.array(updated_k_layer[5]), np.array(initial_k_layer[5]))
+    np.testing.assert_allclose(np.array(updated_v_layer[2]), np.array(new_v_flat[0]))
+    np.testing.assert_allclose(np.array(updated_v_layer[3]), np.array(new_v_flat[2]))
+    np.testing.assert_allclose(np.array(updated_v_layer[5]), np.array(initial_v_layer[5]))

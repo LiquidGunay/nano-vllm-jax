@@ -5,6 +5,17 @@
 
 ---
 
+## 2026-05-01 00:00:00 - KV Contract and Executor Canonicalization Follow-up
+
+- Marked `ModelExecutor` as the canonical serving path in `README.md` and documented that
+  `ModelRunner` is a compatibility façade.
+- Added strict KV-cache invariants in `tests/test_kv_cache.py`:
+  - decode attention output invariance to physical cache capacity when `block_tables.shape[1]` is fixed,
+  - grouped-GQA paged-attention equivalence against repeat-based reference math,
+  - masked KV cache update correctness with duplicate/invalid slot indices.
+- Kept scheduler chunked-prefill and MTP boundary tests in `tests/test_backend_boundaries.py` as the canonical integration coverage for commit/fallback behavior.
+- Confirmed this work remains implementation-only; no behavior changes to external APIs were introduced.
+
 ## 2026-04-23 19:55:00 - Project Cleanup and Reorganization
 
 ### Package Reorganization

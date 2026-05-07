@@ -103,15 +103,6 @@ def _validate_inputs_fit_config(inputs: list[str | list[int]], prompt_tokens: li
                     f"{max_tokens_per_seq}"
                 )
 
-    prefill_buckets = tuple(getattr(engine.config, "prefill_buckets", ()))
-    if prefill_buckets and prompt_tokens:
-        max_prompt_tokens = max(prompt_tokens)
-        max_prefill_bucket = max(prefill_buckets)
-        if max_prompt_tokens > max_prefill_bucket:
-            raise ValueError(
-                f"prompt has {max_prompt_tokens} tokens, exceeding largest prefill bucket {max_prefill_bucket}"
-            )
-
     max_num_seqs = getattr(engine.config, "max_num_seqs", None)
     if max_num_seqs is not None and len(inputs) > max_num_seqs:
         raise ValueError(f"request has {len(inputs)} prompts, exceeding max_num_seqs {max_num_seqs}")

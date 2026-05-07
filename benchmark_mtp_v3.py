@@ -15,7 +15,9 @@ where we use MTP to predict the next-next token while we're generating the next 
 """
 
 import os
-os.environ['JAX_PLATFORMS'] = 'cpu'
+_platform = os.getenv("NANO_VLLM_JAX_PLATFORMS")
+if _platform:
+    os.environ["JAX_PLATFORMS"] = _platform
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 import sys

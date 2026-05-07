@@ -565,15 +565,12 @@ class ModelExecutor:
         next_mtp_position: jnp.ndarray,
         mtp_hidden_final_normed: bool,
     ) -> MTP1GreedyOutput:
-        """K=1 greedy MTP verifier using one cached two-token decode.
-
-        If all rows accept, the runner commits the target cache update for the
-        draft token and carries the next MTP draft forward. If any row rejects,
-        the runner discards this speculative output and falls back to the
-        canonical decode repair path.
+        """K=1 greedy MTP verifier using one two-token target decode.
 
         1. Hidden at position 0 verifies the stored draft.
         2. Hidden at position 1 produces the target bonus token.
+        3. Per-token hybrid prefix states select the committed state:
+           rejected rows commit after position 0, accepted rows after position 1.
         """
         if hybrid_state.conv_state is None or hybrid_state.recurrent_state is None:
             raise ValueError("mtp1_two_decode_greedy_step_jit requires initialized hybrid_state")
@@ -583,13 +580,17 @@ class ModelExecutor:
         self._validate_batch_contract(batch)
 
         key = (
-            "mtp1-two-token-next-draft-greedy",
+            "mtp1-one-pass-prefix-prefill-greedy",
             tuple(batch.tokens.shape),
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
+            float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0")),
+            os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
         )
         if key not in self._jit_cache:
+            bonus_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0"))
+            batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
 
             def compiled(
                 params,
@@ -609,19 +610,25 @@ class ModelExecutor:
             ):
                 verify_tokens = jnp.concatenate([tokens, draft_token_arg[:, None]], axis=1)
                 verify_positions = jnp.concatenate([positions, positions + 1], axis=1)
-                verify_query_start_loc = (
-                    jnp.arange(tokens.shape[0] + 1, dtype=jnp.int32) * 2
+                row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                row_valid = row_query_lens > 0
+                verify_query_lens = row_query_lens * 2
+                verify_query_start_loc = jnp.concatenate(
+                    [
+                        jnp.zeros((1,), dtype=jnp.int32),
+                        jnp.cumsum(verify_query_lens),
+                    ]
                 )
                 verify_batch = ScheduledBatch(
                     tokens=verify_tokens,
                     positions=verify_positions,
                     seq_ids=seq_ids,
                     query_start_loc=verify_query_start_loc,
-                    is_prefill=False,
-                    num_prefill_tokens=0,
-                    num_decode_tokens=num_decode_tokens * 2,
+                    is_prefill=True,
+                    num_prefill_tokens=jnp.sum(verify_query_lens),
+                    num_decode_tokens=0,
                     block_tables=block_tables,
-                    seq_lens=seq_lens + 1,
+                    seq_lens=seq_lens + row_valid.astype(jnp.int32),
                 )
                 verify_metadata = self.backend.build_attention_metadata(
                     positions=verify_batch.positions,
@@ -658,8 +665,16 @@ class ModelExecutor:
                 hidden_norm = rms_norm(hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                 token_ids = jnp.argmax(verify_logits[:, :2], axis=-1).astype(jnp.int32)
                 target_token = token_ids[:, 0]
-                accepted = target_token == draft_token_arg
                 bonus_token = token_ids[:, 1]
+                accepted = (target_token == draft_token_arg) & row_valid
+                if batch_accept_policy == "all_or_none":
+                    accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
+                if bonus_margin_threshold > 0:
+                    bonus_top2, _ = jax.lax.top_k(verify_logits[:, 1].astype(jnp.float32), 2)
+                    bonus_margin = bonus_top2[:, 0] - bonus_top2[:, 1]
+                    accepted = accepted & (bonus_margin >= bonus_margin_threshold)
+                    if batch_accept_policy == "all_or_none":
+                        accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
 
                 def accepted_next_draft():
                     mtp_hidden = hidden_norm[:, 1:2, :] if mtp_hidden_final_normed else hidden[:, 1:2, :]
@@ -673,8 +688,7 @@ class ModelExecutor:
                     )
                     return jnp.argmax(mtp_logits[:, 0], axis=-1).astype(jnp.int32)
 
-                def mixed_next_draft():
-                    accepted_draft = accepted_next_draft()
+                def rejected_next_draft():
                     rejected_hidden = hidden_norm[:, 0:1, :] if mtp_hidden_final_normed else hidden[:, 0:1, :]
                     rejected_logits, _ = mtp_forward(
                         hidden_state=rejected_hidden,
@@ -684,45 +698,81 @@ class ModelExecutor:
                         config=self.config,
                         positions=(next_mtp_position_arg - 1)[:, None],
                     )
-                    rejected_draft = jnp.argmax(rejected_logits[:, 0], axis=-1).astype(jnp.int32)
+                    return jnp.argmax(rejected_logits[:, 0], axis=-1).astype(jnp.int32)
+
+                def mixed_next_draft():
+                    accepted_draft = accepted_next_draft()
+                    rejected_draft = rejected_next_draft()
                     return jnp.where(accepted, accepted_draft, rejected_draft)
 
-                next_draft_token = jax.lax.cond(
-                    jnp.all(accepted),
-                    lambda _: accepted_next_draft(),
-                    lambda _: mixed_next_draft(),
-                    operand=None,
+                accepted_all_valid = jnp.all(jnp.where(row_valid, accepted, True))
+                if batch_accept_policy == "all_or_none":
+                    next_draft_token = jax.lax.cond(
+                        accepted_all_valid,
+                        lambda _: accepted_next_draft(),
+                        lambda _: rejected_next_draft(),
+                        operand=None,
+                    )
+                else:
+                    next_draft_token = jax.lax.cond(
+                        accepted_all_valid,
+                        lambda _: accepted_next_draft(),
+                        lambda _: mixed_next_draft(),
+                        operand=None,
+                    )
+
+                hybrid_after_draft = HybridLayerState(
+                    conv_state=prefix_hybrid_state.conv_state[:, 1]
+                    if prefix_hybrid_state.conv_state is not None
+                    else updated_hybrid_state.conv_state,
+                    recurrent_state=prefix_hybrid_state.recurrent_state[:, 1]
+                    if prefix_hybrid_state.recurrent_state is not None
+                    else updated_hybrid_state.recurrent_state,
                 )
 
-                conv_mask = accepted.reshape((accepted.shape[0],) + (1,) * (updated_hybrid_state.conv_state.ndim - 1))
-                recurrent_mask = accepted.reshape(
-                    (accepted.shape[0],) + (1,) * (updated_hybrid_state.recurrent_state.ndim - 1)
-                )
-                selected_conv = jnp.where(
-                    conv_mask,
-                    updated_hybrid_state.conv_state,
-                    prefix_hybrid_state.conv_state,
-                )
-                selected_recurrent = jnp.where(
-                    recurrent_mask,
-                    updated_hybrid_state.recurrent_state,
-                    prefix_hybrid_state.recurrent_state,
-                )
-                draft_slots = verify_metadata.slot_mapping[:, 1]
-
-                def restore_rejected_draft_slots(new_cache, old_cache):
+                def restore_rejected_slots(new_cache, old_cache, slots, slot_accept):
                     leading_shape = new_cache.shape[:-4] if new_cache.ndim == 5 else new_cache.shape[:-3]
                     flat_new = new_cache.reshape(leading_shape + (-1,) + new_cache.shape[-2:])
                     flat_old = old_cache.reshape(leading_shape + (-1,) + old_cache.shape[-2:])
-                    new_values = flat_new[..., draft_slots, :, :]
-                    old_values = flat_old[..., draft_slots, :, :]
-                    slot_mask = accepted.reshape((1,) * len(leading_shape) + (accepted.shape[0], 1, 1))
+                    new_values = flat_new[..., slots, :, :]
+                    old_values = flat_old[..., slots, :, :]
+                    slot_mask = slot_accept.reshape((1,) * len(leading_shape) + (slot_accept.shape[0], 1, 1))
                     selected_values = jnp.where(slot_mask, new_values, old_values)
-                    flat_new = flat_new.at[..., draft_slots, :, :].set(selected_values)
+                    flat_new = flat_new.at[..., slots, :, :].set(selected_values)
                     return flat_new.reshape(new_cache.shape)
 
-                selected_k_cache = restore_rejected_draft_slots(updated_kv_state.k_cache, k_cache)
-                selected_v_cache = restore_rejected_draft_slots(updated_kv_state.v_cache, v_cache)
+                conv_mask = accepted.reshape((accepted.shape[0],) + (1,) * (hybrid_after_draft.conv_state.ndim - 1))
+                recurrent_mask = accepted.reshape(
+                    (accepted.shape[0],) + (1,) * (hybrid_after_draft.recurrent_state.ndim - 1)
+                )
+                if batch_accept_policy == "rowwise":
+                    restore_slots = verify_metadata.slot_mapping[:, :2].reshape((-1,))
+                    restore_accept = jnp.repeat(accepted, 2)
+                    selected_conv = jnp.where(conv_mask, hybrid_after_draft.conv_state, conv_state)
+                    selected_recurrent = jnp.where(recurrent_mask, hybrid_after_draft.recurrent_state, recurrent_state)
+                else:
+                    hybrid_after_current = HybridLayerState(
+                        conv_state=prefix_hybrid_state.conv_state[:, 0]
+                        if prefix_hybrid_state.conv_state is not None
+                        else None,
+                        recurrent_state=prefix_hybrid_state.recurrent_state[:, 0]
+                        if prefix_hybrid_state.recurrent_state is not None
+                        else None,
+                    )
+                    restore_slots = verify_metadata.slot_mapping[:, 1]
+                    restore_accept = accepted
+                    selected_conv = jnp.where(
+                        conv_mask,
+                        hybrid_after_draft.conv_state,
+                        hybrid_after_current.conv_state,
+                    )
+                    selected_recurrent = jnp.where(
+                        recurrent_mask,
+                        hybrid_after_draft.recurrent_state,
+                        hybrid_after_current.recurrent_state,
+                    )
+                selected_k_cache = restore_rejected_slots(updated_kv_state.k_cache, k_cache, restore_slots, restore_accept)
+                selected_v_cache = restore_rejected_slots(updated_kv_state.v_cache, v_cache, restore_slots, restore_accept)
                 committed_seq_lens = seq_lens + accepted.astype(jnp.int32)
                 return (
                     target_token,
@@ -808,8 +858,12 @@ class ModelExecutor:
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
+            float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0")),
+            os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
         )
         if key not in self._jit_cache:
+            bonus_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0"))
+            batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
 
             def compiled(
                 params,
@@ -829,7 +883,15 @@ class ModelExecutor:
             ):
                 verify_tokens = jnp.concatenate([tokens, draft_token_arg[:, None]], axis=1)
                 verify_positions = jnp.concatenate([positions, positions + 1], axis=1)
-                verify_query_start_loc = jnp.arange(tokens.shape[0] + 1, dtype=jnp.int32) * 2
+                row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                row_valid = row_query_lens > 0
+                verify_query_lens = row_query_lens * 2
+                verify_query_start_loc = jnp.concatenate(
+                    [
+                        jnp.zeros((1,), dtype=jnp.int32),
+                        jnp.cumsum(verify_query_lens),
+                    ]
+                )
                 verify_batch = ScheduledBatch(
                     tokens=verify_tokens,
                     positions=verify_positions,
@@ -837,9 +899,9 @@ class ModelExecutor:
                     query_start_loc=verify_query_start_loc,
                     is_prefill=False,
                     num_prefill_tokens=0,
-                    num_decode_tokens=num_decode_tokens * 2,
+                    num_decode_tokens=jnp.sum(verify_query_lens),
                     block_tables=block_tables,
-                    seq_lens=seq_lens + 1,
+                    seq_lens=seq_lens + row_valid.astype(jnp.int32),
                 )
                 verify_metadata = self.backend.build_attention_metadata(
                     positions=verify_batch.positions,
@@ -876,7 +938,15 @@ class ModelExecutor:
                 token_ids = jnp.argmax(verify_logits[:, :2], axis=-1).astype(jnp.int32)
                 target_token = token_ids[:, 0]
                 bonus_token = token_ids[:, 1]
-                accepted = target_token == draft_token_arg
+                accepted = (target_token == draft_token_arg) & row_valid
+                if batch_accept_policy == "all_or_none":
+                    accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
+                if bonus_margin_threshold > 0:
+                    bonus_top2, _ = jax.lax.top_k(verify_logits[:, 1].astype(jnp.float32), 2)
+                    bonus_margin = bonus_top2[:, 0] - bonus_top2[:, 1]
+                    accepted = accepted & (bonus_margin >= bonus_margin_threshold)
+                    if batch_accept_policy == "all_or_none":
+                        accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
                 mtp_hidden = hidden_norm[:, 1:2, :] if mtp_hidden_final_normed else hidden[:, 1:2, :]
                 mtp_logits, _ = mtp_forward(
                     hidden_state=mtp_hidden,
@@ -887,16 +957,39 @@ class ModelExecutor:
                     positions=next_mtp_position_arg[:, None],
                 )
                 next_draft_token = jnp.argmax(mtp_logits[:, 0], axis=-1).astype(jnp.int32)
+                output_accepted = jnp.where(row_valid, accepted, True)
+                verify_slots = verify_metadata.slot_mapping[:, :2].reshape((-1,))
+                slot_accept = jnp.repeat(accepted, 2)
+
+                def restore_rejected_slots(new_cache, old_cache):
+                    leading_shape = new_cache.shape[:-4] if new_cache.ndim == 5 else new_cache.shape[:-3]
+                    flat_new = new_cache.reshape(leading_shape + (-1,) + new_cache.shape[-2:])
+                    flat_old = old_cache.reshape(leading_shape + (-1,) + old_cache.shape[-2:])
+                    new_values = flat_new[..., verify_slots, :, :]
+                    old_values = flat_old[..., verify_slots, :, :]
+                    slot_mask = slot_accept.reshape((1,) * len(leading_shape) + (slot_accept.shape[0], 1, 1))
+                    selected_values = jnp.where(slot_mask, new_values, old_values)
+                    flat_new = flat_new.at[..., verify_slots, :, :].set(selected_values)
+                    return flat_new.reshape(new_cache.shape)
+
+                selected_k_cache = restore_rejected_slots(updated_kv_state.k_cache, k_cache)
+                selected_v_cache = restore_rejected_slots(updated_kv_state.v_cache, v_cache)
+                conv_mask = accepted.reshape((accepted.shape[0],) + (1,) * (updated_hybrid_state.conv_state.ndim - 1))
+                recurrent_mask = accepted.reshape(
+                    (accepted.shape[0],) + (1,) * (updated_hybrid_state.recurrent_state.ndim - 1)
+                )
+                selected_conv = jnp.where(conv_mask, updated_hybrid_state.conv_state, conv_state)
+                selected_recurrent = jnp.where(recurrent_mask, updated_hybrid_state.recurrent_state, recurrent_state)
                 return (
                     target_token,
                     bonus_token,
                     next_draft_token,
-                    accepted,
-                    updated_kv_state.k_cache,
-                    updated_kv_state.v_cache,
-                    updated_hybrid_state.conv_state,
-                    updated_hybrid_state.recurrent_state,
-                    seq_lens + 1,
+                    output_accepted,
+                    selected_k_cache,
+                    selected_v_cache,
+                    selected_conv,
+                    selected_recurrent,
+                    seq_lens + accepted.astype(jnp.int32),
                 )
 
             self._jit_cache[key] = jax.jit(compiled)
@@ -977,8 +1070,12 @@ class ModelExecutor:
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
+            float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0")),
+            os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
         )
         if key not in self._jit_cache:
+            bonus_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0"))
+            batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
 
             def _expand_row_mask(mask: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
                 return mask.reshape((mask.shape[0],) + (1,) * (target.ndim - 1))
@@ -1044,19 +1141,29 @@ class ModelExecutor:
                 hidden0_norm = rms_norm(hidden0, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                 target_token = jnp.argmax(jnp.dot(hidden0_norm[:, 0], output_weight), axis=-1).astype(jnp.int32)
                 accepted = target_token == draft_token_arg
+                if batch_accept_policy == "all_or_none":
+                    accepted = accepted & jnp.all(accepted)
 
                 second_tokens = target_token[:, None]
                 second_positions = positions + 1
+                second_query_lens = accepted.astype(jnp.int32)
+                second_query_start_loc = jnp.concatenate(
+                    [
+                        jnp.zeros((1,), dtype=jnp.int32),
+                        jnp.cumsum(second_query_lens),
+                    ]
+                )
+                second_seq_lens = jnp.where(accepted, seq_lens + 1, seq_lens)
                 second_batch = ScheduledBatch(
                     tokens=second_tokens,
                     positions=second_positions,
                     seq_ids=seq_ids,
-                    query_start_loc=query_start_loc,
+                    query_start_loc=second_query_start_loc,
                     is_prefill=False,
                     num_prefill_tokens=0,
-                    num_decode_tokens=num_decode_tokens,
+                    num_decode_tokens=jnp.sum(second_query_lens),
                     block_tables=block_tables,
-                    seq_lens=seq_lens + 1,
+                    seq_lens=second_seq_lens,
                 )
                 second_metadata = self.backend.build_attention_metadata(
                     positions=second_batch.positions,
@@ -1091,6 +1198,12 @@ class ModelExecutor:
                 )
 
                 bonus_token = jnp.argmax(bonus_logits[:, 0], axis=-1).astype(jnp.int32)
+                if bonus_margin_threshold > 0:
+                    bonus_top2, _ = jax.lax.top_k(bonus_logits[:, 0].astype(jnp.float32), 2)
+                    bonus_margin = bonus_top2[:, 0] - bonus_top2[:, 1]
+                    accepted = accepted & (bonus_margin >= bonus_margin_threshold)
+                    if batch_accept_policy == "all_or_none":
+                        accepted = accepted & jnp.all(accepted)
 
                 hidden1_norm = rms_norm(hidden1, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                 accept_mask = accepted[:, None, None]

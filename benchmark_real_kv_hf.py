@@ -20,6 +20,9 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+_platform = os.getenv("NANO_VLLM_JAX_JAX_PLATFORMS") or os.getenv("NANO_VLLM_JAX_PLATFORMS")
+if _platform:
+    os.environ["JAX_PLATFORMS"] = _platform
 
 import jax
 import jax.numpy as jnp
@@ -52,10 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default="Tell me a joke about compilers and coffee.")
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="auto")
+    parser.add_argument("--require-tpu", action="store_true")
+    parser.add_argument("--compile-iterations", type=int, default=2, help="JIT compile warmup passes")
     parser.add_argument("--hf-device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--max-kv-cache-mb", type=int, default=96)
     parser.add_argument("--warmup", action="store_true", help="Run one untimed JAX and HF pass first.")
-    parser.add_argument("--jax-execution", choices=["eager", "decode-jit", "jit"], default="eager")
+    parser.add_argument("--jax-execution", choices=["eager", "decode-jit", "jit"], default="jit")
     parser.add_argument("--prefill-bucket", type=int, help="Pad JAX prefill to this static token length.")
     parser.add_argument("--target", choices=["both", "hf", "jax"], default="both")
     parser.add_argument("--output-npz", type=Path, help="Write target result arrays and timing metadata.")
@@ -67,17 +72,7 @@ def choose_dtype(requested: str, target: str) -> str:
     if requested != "auto":
         return requested
     if target == "jax":
-        if jax.default_backend() != "gpu":
-            return "float32"
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                major, _ = torch.cuda.get_device_capability(0)
-                return "bfloat16" if major >= 8 else "float16"
-        except ImportError:
-            pass
-        return "float16"
+        return "bfloat16" if jax.default_backend() in {"gpu", "tpu"} else "float16"
     import torch
 
     if torch.cuda.is_available():
@@ -334,6 +329,8 @@ def print_metrics(name: str, result: RunResult, prompt_tokens: int, max_new_toke
 
 def main():
     args = parse_args()
+    if args.require_tpu and jax.default_backend() != "tpu":
+        raise SystemExit("require_tpu was set but JAX backend is not TPU")
     dtype = choose_dtype(args.dtype, args.target)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     input_ids = tokenizer(args.prompt, add_special_tokens=False)["input_ids"]
@@ -400,7 +397,8 @@ def main():
     )
     if args.jax_execution in {"decode-jit", "jit"}:
         print("jax_compile_startup=begin")
-        jax_model.compile_startup(input_ids, compile_decode=args.max_new_tokens > 1)
+        for _ in range(max(1, args.compile_iterations)):
+            jax_model.compile_startup(input_ids, compile_decode=args.max_new_tokens > 1)
         print(f"jax_compile_startup=done cache_entries={jax_model.compiled_entries}")
     elif args.warmup:
         _ = jax_model.generate(input_ids, max_new_tokens=max(1, min(args.max_new_tokens, 2)))

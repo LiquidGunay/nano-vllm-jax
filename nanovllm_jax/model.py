@@ -541,7 +541,7 @@ def gated_deltanet_block(
                 layer_conv_state,
                 jnp.arange(seq_len),
             )
-            prefix_layer_conv_state = conv_state_steps[0]
+            prefix_layer_conv_state = conv_state_steps.transpose(1, 0, 2, 3)
         else:
             new_layer_conv_state, conv_out_steps = lax.scan(
                 conv_step,
@@ -589,7 +589,7 @@ def gated_deltanet_block(
                 use_qk_l2norm_in_kernel=True,
                 return_state_sequence=True,
             )
-            prefix_recurrent_state_single = recurrent_state_steps[:, 0]
+            prefix_recurrent_state_single = recurrent_state_steps
         else:
             core_attn_out, new_recurrent_state_single = backend.gated_delta_decode(
                 query, key, value, g, beta,
@@ -598,7 +598,22 @@ def gated_deltanet_block(
             )
             prefix_recurrent_state_single = None
         # new_recurrent_state_single has shape [batch, num_heads, k_dim, v_dim]
-        
+        if valid_token_mask is not None:
+            row_valid = (valid_token_mask.astype(jnp.int32).sum(axis=1) > 0)
+            conv_keep = row_valid[:, None, None]
+            recurrent_keep = row_valid[:, None, None, None]
+            new_layer_conv_state = jnp.where(
+                conv_keep,
+                new_layer_conv_state,
+                layer_conv_state,
+            )
+            if initial_recurrent is not None:
+                new_recurrent_state_single = jnp.where(
+                    recurrent_keep,
+                    new_recurrent_state_single,
+                    initial_recurrent,
+                )
+
         # Update cache with new recurrent state and conv state for this layer
         if hybrid_state.recurrent_state is not None:
             new_recurrent_state = hybrid_state.recurrent_state.at[:, linear_layer_idx].set(new_recurrent_state_single)
@@ -639,9 +654,21 @@ def gated_deltanet_block(
             prefix_layer_conv_state = None
             if return_prefix_state:
                 kernel_size = config.linear_conv_kernel_size
-                gather_idx = 1 + jnp.arange(kernel_size, dtype=jnp.int32)[None, :]
-                gather_idx = jnp.broadcast_to(gather_idx[:, None, :], (batch, conv_dim, kernel_size))
-                prefix_layer_conv_state = jnp.take_along_axis(conv_input, gather_idx, axis=2)
+                step_starts = jnp.arange(seq_len, dtype=jnp.int32)[:, None] + 1
+                gather_idx = step_starts + jnp.arange(kernel_size, dtype=jnp.int32)[None, :]
+                gather_idx = jnp.broadcast_to(
+                    gather_idx[None, :, None, :],
+                    (batch, seq_len, conv_dim, kernel_size),
+                )
+                conv_input_expanded = jnp.broadcast_to(
+                    conv_input[:, None, :, :],
+                    (batch, seq_len, conv_dim, conv_input.shape[-1]),
+                )
+                prefix_layer_conv_state = jnp.take_along_axis(
+                    conv_input_expanded,
+                    gather_idx,
+                    axis=3,
+                )
         else:
             # Use Metal-compatible conv1d (no lax.conv_general_dilated)
             conv_out = causal_conv1d_metal(
@@ -698,7 +725,7 @@ def gated_deltanet_block(
                     use_qk_l2norm_in_kernel=True,
                     return_state_sequence=True,
                 )
-                prefix_recurrent_state_single = recurrent_state_steps[:, 0]
+                prefix_recurrent_state_single = recurrent_state_steps
             else:
                 core_attn_out, final_state = backend.gated_delta_decode(
                     query,
@@ -992,7 +1019,7 @@ def transformer_block(
     x = rms_norm(x, params["input_norm"], config.rms_norm_eps)
     
     valid_token_mask = None
-    if attention_metadata is not None and is_prefill:
+    if attention_metadata is not None:
         query_lens = jnp.diff(attention_metadata.query_start_loc).astype(jnp.int32)
         valid_token_mask = jnp.arange(x.shape[1], dtype=jnp.int32)[None, :] < query_lens[:, None]
 
@@ -1027,13 +1054,13 @@ def transformer_block(
                     linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
                     prefix_hybrid_state = replace(
                         prefix_hybrid_state,
-                        conv_state=prefix_hybrid_state.conv_state.at[:, linear_layer_idx].set(
+                        conv_state=prefix_hybrid_state.conv_state.at[:, :, linear_layer_idx].set(
                             prefix_layer_state.conv_state
                         )
                         if prefix_hybrid_state.conv_state is not None
                         and prefix_layer_state.conv_state is not None
                         else prefix_hybrid_state.conv_state,
-                        recurrent_state=prefix_hybrid_state.recurrent_state.at[:, linear_layer_idx].set(
+                        recurrent_state=prefix_hybrid_state.recurrent_state.at[:, :, linear_layer_idx].set(
                             prefix_layer_state.recurrent_state
                         )
                         if prefix_hybrid_state.recurrent_state is not None
@@ -1095,7 +1122,22 @@ def forward_step(
         positions_2d = positions
     positions_mrope = jnp.stack([positions_2d, positions_2d, positions_2d], axis=0)
     mask = causal_mask(seq_len, seq_len)
-    prefix_hybrid_state = hybrid_state if return_prefix_hybrid else None
+    prefix_hybrid_state = None
+    if return_prefix_hybrid and hybrid_state is not None:
+        prefix_hybrid_state = HybridLayerState(
+            conv_state=jnp.broadcast_to(
+                hybrid_state.conv_state[:, None, ...],
+                (batch, seq_len) + hybrid_state.conv_state.shape[1:],
+            )
+            if hybrid_state.conv_state is not None
+            else None,
+            recurrent_state=jnp.broadcast_to(
+                hybrid_state.recurrent_state[:, None, ...],
+                (batch, seq_len) + hybrid_state.recurrent_state.shape[1:],
+            )
+            if hybrid_state.recurrent_state is not None
+            else None,
+        )
 
     for i, lp in enumerate(params.layers):
         block_result = transformer_block(

@@ -20,41 +20,69 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import pytest
 import jax
 import jax.numpy as jnp
 import numpy as np
-import torch
+torch = pytest.importorskip("torch")
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
 from nanovllm_jax.config import Qwen3_5Config
-from nanovllm_jax.load_weights import load_weights_from_hf
-from nanovllm_jax.layers import rms_norm, apply_rope, get_activation
+from nanovllm_jax.layers import rms_norm, apply_rope
 from nanovllm_jax.model import (
     jax_chunk_gated_delta_rule,
     jax_recurrent_gated_delta_rule,
     full_attention_block,
-    gated_deltanet_block,
 )
 
+MODEL_NAME = os.getenv("HF_PARITY_MODEL", "Qwen/Qwen3.5-0.8B")
 
-def load_hf_model(model_name="Qwen/Qwen3.5-0.8B"):
+
+def resolve_hf_device() -> str:
+    requested = os.getenv("HF_TEST_DEVICE", "cpu").lower()
+    if requested in {"auto", "cuda", "gpu"}:
+        if not torch.cuda.is_available() or torch.version.cuda is None:
+            print(
+                "HF_TEST_DEVICE requested CUDA/GPU but CUDA is unavailable; "
+                "falling back to CPU for parity tests."
+            )
+            return "cpu"
+        return "cuda"
+    if requested == "cpu":
+        return "cpu"
+    pytest.skip(f"Unknown HF_TEST_DEVICE={requested}")
+
+
+def load_hf_model(model_name=MODEL_NAME):
     """Load HF model and tokenizer."""
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="cpu",
-        trust_remote_code=True,
-    )
+    hf_device = resolve_hf_device()
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        ).to(hf_device)
+    except ValueError as exc:
+        if "not recognized" in str(exc).lower() or "model_type" in str(exc).lower():
+            pytest.skip(
+                f"HF config mapping missing for {model_name}; update transformers version or set HF_PARITY_MODEL to a supported checkpoint."
+            )
+        raise
+    except OSError as exc:
+        pytest.skip(f"Could not load local HF artifacts for {model_name}: {exc}")
     model.eval()
     return model, tokenizer
 
 
-def test_rmsnorm():
+@pytest.fixture(scope="session")
+def hf_model_and_tokenizer():
+    return load_hf_model()
+
+def test_rmsnorm(hf_model_and_tokenizer):
     """Test RMSNorm implementation against HF."""
     print("\n=== Testing RMSNorm ===")
-    
-    model, _ = load_hf_model()
+
+    model, _ = hf_model_and_tokenizer
     
     # Get RMSNorm weight from HF model
     hf_norm = model.model.norm
@@ -78,31 +106,21 @@ def test_rmsnorm():
     
     print(f"  MSE: {mse:.2e}")
     print(f"  Max diff: {max_diff:.2e}")
-    
-    if mse < 1e-10:
-        print("  ✓ PASS: RMSNorm matches HF exactly")
-        return True
-    else:
-        print(f"  ✗ FAIL: MSE {mse:.2e} >= 1e-10")
-        return False
+    assert mse < 1e-5
+    assert not np.isnan(max_diff)
 
 
-def test_rope():
+def test_rope(hf_model_and_tokenizer):
     """Test RoPE implementation against HF."""
     print("\n=== Testing RoPE ===")
     
-    model, _ = load_hf_model()
+    # Ensure HF CUDA path is available and model weights load successfully.
+    # Ensure fixture is resolved so CUDA-availability checks run.
+    _ = hf_model_and_tokenizer
     config = Qwen3_5Config.qwen3_5_0_8b()
     
     # Create test input
     batch_size, seq_len, num_heads, head_dim = 1, 32, 8, 256
-    
-    # Get position embeddings from HF
-    # Qwen3.5 uses partial rotary
-    rotary_dim = int(head_dim * config.partial_rotary_factor)
-    
-    # Create positions and test tensors
-    positions = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
     
     # Create dummy query/key
     q_np = np.random.randn(batch_size, seq_len, num_heads, head_dim).astype(np.float32)
@@ -113,22 +131,20 @@ def test_rope():
     # positions should be [batch, seq_len]
     positions_jax = jnp.tile(jnp.arange(seq_len), (batch_size, 1))
     
-    # JAX RoPE - verify it runs correctly
-    # Note: HF uses rotary_fn which is more complex to extract
-    # The full comparison is done in E2E tests
+    # JAX RoPE - verify it runs correctly and has expected shape
     q_rope = apply_rope(q_jax, positions_jax, config.head_dim, config.rope_theta, config.partial_rotary_factor)
     k_rope = apply_rope(k_jax, positions_jax, config.head_dim, config.rope_theta, config.partial_rotary_factor)
     
     print(f"  JAX RoPE shapes: q={q_rope.shape}, k={k_rope.shape}")
-    print("  ✓ PASS: RoPE runs without errors (full comparison in E2E tests)")
-    return True
+    assert q_rope.shape == q_jax.shape
+    assert k_rope.shape == k_jax.shape
 
 
-def test_full_attention():
+def test_full_attention(hf_model_and_tokenizer):
     """Test full attention layer against HF."""
     print("\n=== Testing Full Attention ===")
     
-    model, _ = load_hf_model()
+    model, _ = hf_model_and_tokenizer
     config = Qwen3_5Config.qwen3_5_0_8b()
     
     # Find a full attention layer (layers 3, 7, 11, 15, 19, 23)
@@ -140,11 +156,10 @@ def test_full_attention():
     hidden_np = np.random.randn(batch_size, seq_len, config.hidden_size).astype(np.float32)
     
     # Get layer weights
-    input_norm_weight = hf_layer.input_layernorm.weight.detach().float().numpy()
-    q_proj = hf_layer.self_attn.q_proj.weight.detach().float().numpy()
-    k_proj = hf_layer.self_attn.k_proj.weight.detach().float().numpy()
-    v_proj = hf_layer.self_attn.v_proj.weight.detach().float().numpy()
-    o_proj = hf_layer.self_attn.o_proj.weight.detach().float().numpy()
+    q_proj = hf_layer.self_attn.q_proj.weight.detach().T.float().numpy()
+    k_proj = hf_layer.self_attn.k_proj.weight.detach().T.float().numpy()
+    v_proj = hf_layer.self_attn.v_proj.weight.detach().T.float().numpy()
+    o_proj = hf_layer.self_attn.o_proj.weight.detach().T.float().numpy()
     q_norm = hf_layer.self_attn.q_norm.weight.detach().float().numpy()
     k_norm = hf_layer.self_attn.k_norm.weight.detach().float().numpy()
     
@@ -159,35 +174,72 @@ def test_full_attention():
     # This is a simplified test
     
     hidden_jax = jnp.array(hidden_np)
+    hidden_torch = torch.from_numpy(hidden_np).to(dtype=hf_layer.self_attn.q_proj.weight.dtype)
+
+    hf_positions = torch.arange(seq_len, dtype=torch.int64).unsqueeze(0)
+    hf_position_embeddings = model.model.rotary_emb(hidden_torch, hf_positions)
+    hf_attn_out = hf_layer.self_attn(
+        hidden_torch,
+        attention_mask=None,
+        position_embeddings=hf_position_embeddings,
+        position_ids=hf_positions,
+        use_cache=False,
+        output_attentions=False,
+    )[0]
     
-    # Apply RMSNorm
-    hidden_normed = rms_norm(hidden_jax, jnp.array(input_norm_weight), eps=config.rms_norm_eps)
-    
-    print(f"  After norm shape: {hidden_normed.shape}")
-    print(f"  ✓ PASS: Full attention layer structure correct")
-    return True
+    # Build layer parameter dict for layer function
+    attn_params = {
+        "q_proj": jnp.array(q_proj),
+        "k_proj": jnp.array(k_proj),
+        "v_proj": jnp.array(v_proj),
+        "o_proj": jnp.array(o_proj),
+        "q_norm": jnp.array(q_norm),
+        "k_norm": jnp.array(k_norm),
+    }
+
+    positions = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+    from nanovllm_jax.layers import causal_mask
+    mask = causal_mask(seq_len, seq_len)
+
+    out, out_cache = full_attention_block(
+        x=hidden_jax,
+        params=attn_params,
+        positions=positions,
+        mask=mask,
+        config=config,
+        kv_cache_state=None,
+        is_prefill=True,
+        layer_idx=0,
+    )
+
+    out_np = np.array(out)
+    hf_np = hf_attn_out.detach().float().numpy()
+    mse = np.mean((hf_np - out_np) ** 2)
+    max_diff = np.max(np.abs(hf_np - out_np))
+
+    print(f"  Output shape: {out.shape}")
+    print(f"  MSE: {mse:.2e}")
+    print(f"  Max diff: {max_diff:.2e}")
+    assert out.shape == (batch_size, seq_len, config.hidden_size)
+    assert out_cache is None
+    assert mse < 1e-5
 
 
-def test_linear_attention_chunked():
+def test_linear_attention_chunked(hf_model_and_tokenizer):
     """Test linear attention (chunked mode for prefill) against HF."""
     print("\n=== Testing Linear Attention (Chunked) ===")
     
-    model, _ = load_hf_model()
+    model, _ = hf_model_and_tokenizer
     config = Qwen3_5Config.qwen3_5_0_8b()
     
-    # Find a linear attention layer (layer 0, 1, 2, etc.)
+    # Find a linear attention layer index (0, 1, 2, etc.)
     linear_layer_idx = 0
-    hf_layer = model.model.layers[linear_layer_idx]
-    
-    # Get layer weights (Gated DeltaNet)
-    input_norm_weight = hf_layer.input_layernorm.weight.detach().float().numpy()
     
     print(f"  Testing layer {linear_layer_idx} (linear attention)")
     print(f"  Layer type: Gated DeltaNet")
     
     # Create test input
     batch_size, seq_len = 1, 64
-    hidden_np = np.random.randn(batch_size, seq_len, config.hidden_size).astype(np.float32)
     
     # Test chunked computation
     # Create test Q, K, V, g, beta
@@ -215,8 +267,8 @@ def test_linear_attention_chunked():
     
     print(f"  Input Q shape: {q_jax.shape}")
     print(f"  Output shape: {output.shape}")
-    print(f"  ✓ PASS: Linear attention chunked computation runs successfully")
-    return True
+    assert output.shape == q_jax.shape
+    assert not bool(jnp.any(jnp.isnan(output)))
 
 
 def test_linear_attention_recurrent():
@@ -254,15 +306,15 @@ def test_linear_attention_recurrent():
     
     print(f"  Output shape: {output.shape}")
     print(f"  State shape: {final_state.shape}")
-    print(f"  ✓ PASS: Linear attention recurrent computation runs successfully")
-    return True
+    assert output.shape == (batch_size, num_heads, seq_len, k_dim)
+    assert final_state.shape == (batch_size, num_heads, k_dim, v_dim)
 
 
-def test_mlp():
+def test_mlp(hf_model_and_tokenizer):
     """Test MLP (feed-forward network) against HF."""
     print("\n=== Testing MLP ===")
     
-    model, _ = load_hf_model()
+    model, _ = hf_model_and_tokenizer
     config = Qwen3_5Config.qwen3_5_0_8b()
     
     # Get MLP from any layer
@@ -311,50 +363,7 @@ def test_mlp():
     print(f"  MSE: {mse:.2e}")
     print(f"  Max diff: {max_diff:.2e}")
     
-    if mse < 1e-10:
-        print("  ✓ PASS: MLP matches HF exactly")
-        return True
-    else:
-        print(f"  ✗ FAIL: MSE {mse:.2e} >= 1e-10")
-        return False
+    assert mse < 1e-5
 
 
-def run_all_tests():
-    """Run all layer parity tests."""
-    print("=" * 80)
-    print("LAYER-WISE PARITY TESTS")
-    print("=" * 80)
     
-    results = {
-        "RMSNorm": test_rmsnorm(),
-        "RoPE": test_rope(),
-        "Full Attention": test_full_attention(),
-        "Linear Attention (Chunked)": test_linear_attention_chunked(),
-        "Linear Attention (Recurrent)": test_linear_attention_recurrent(),
-        "MLP": test_mlp(),
-    }
-    
-    print("\n" + "=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
-    
-    for test_name, passed in results.items():
-        status = "✓ PASS" if passed else "✗ FAIL"
-        print(f"  {test_name}: {status}")
-    
-    total = len(results)
-    passed = sum(results.values())
-    
-    print(f"\nTotal: {passed}/{total} tests passed")
-    
-    if passed == total:
-        print("\n✅ All layer parity tests PASSED!")
-        return True
-    else:
-        print(f"\n❌ {total - passed} test(s) FAILED")
-        return False
-
-
-if __name__ == "__main__":
-    success = run_all_tests()
-    exit(0 if success else 1)

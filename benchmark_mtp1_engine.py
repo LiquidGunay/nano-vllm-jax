@@ -87,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sweep-alignments", action="store_true")
     parser.add_argument("--exec-log-steps", action="store_true", help="Enable executor per-step logging")
     parser.add_argument("--step-profile", action="store_true", help="Collect per-step decode profiling")
+    parser.add_argument("--trace-steps", action="store_true",
+                        help="Include per-step emitted token deltas in JSON output for correctness debugging")
     parser.add_argument("--hf-offline", action="store_true")
     parser.add_argument("--check-hf-logits", action="store_true",
                         help="Compare HF final-prefill logits against the JAX baseline model before trusting throughput")
@@ -920,6 +922,37 @@ def _summarize_branch(step_records: list[dict]) -> dict:
     }
 
 
+def reset_engine_runtime(engine: LLMEngine):
+    """Reset per-request runtime state while preserving loaded weights/JIT cache."""
+    from itertools import count
+
+    from nanovllm_jax.engine.block_manager import BlockManager
+    from nanovllm_jax.engine.sequence import Sequence
+
+    scheduler = engine.scheduler
+    scheduler.waiting.clear()
+    scheduler.running.clear()
+    scheduler.block_manager = BlockManager(
+        engine.config.num_kvcache_blocks,
+        engine.config.block_size,
+    )
+    scheduler.last_num_generated_tokens = 0
+    Sequence.counter = count()
+
+    runner = engine.model_runner
+    runner._mtp1_drafts.clear()
+    runner._last_prefill_logits_by_seq = {}
+    runner.reset_speculative_stats()
+    if hasattr(runner, "hybrid_states"):
+        runner.hybrid_states.clear()
+    if hasattr(runner, "_hybrid_slots"):
+        runner._hybrid_slots.clear()
+    if hasattr(runner, "_max_hybrid_slots"):
+        runner._free_hybrid_slots = list(range(runner._max_hybrid_slots))
+        for slot in range(runner._max_hybrid_slots):
+            runner._zero_hybrid_slot(slot)
+
+
 def run_generation_batch(
     engine: LLMEngine,
     prompts: list[str | list[int]],
@@ -935,6 +968,7 @@ def run_generation_batch(
     return_step_records: bool = True,
     return_prefill_logits: bool = False,
 ):
+    reset_engine_runtime(engine)
     runner = engine.model_runner
     runner.mtp1_enabled = bool(mtp1 and runner.mtp_enabled and runner.num_speculative_tokens > 0)
     runner.mtp_position_offset = mtp_position_offset
@@ -991,6 +1025,28 @@ def run_generation_batch(
             return 0.0
         return values.pop(0)
 
+    def _active_trace_outputs():
+        seen: set[int] = set()
+        trace_outputs = []
+        for attr in ("running", "waiting", "finished"):
+            collection = getattr(scheduler, attr, None)
+            if collection is None:
+                continue
+            values = collection.values() if isinstance(collection, dict) else collection
+            for seq in values:
+                seq_id = getattr(seq, "seq_id", getattr(seq, "id", None))
+                completion = getattr(seq, "completion_token_ids", None)
+                if completion is None:
+                    completion = getattr(seq, "output_token_ids", None)
+                if seq_id is None or completion is None:
+                    continue
+                seq_id = int(seq_id)
+                if seq_id in seen:
+                    continue
+                seen.add(seq_id)
+                trace_outputs.append((seq_id, list(completion)))
+        return trace_outputs
+
     try:
         for prompt in prompts:
             engine.add_request(prompt, sampling)
@@ -998,6 +1054,7 @@ def run_generation_batch(
         step_records = []
         elapsed = 0.0
         completion_by_seq: dict[int, list[int]] = {}
+        last_completion_lens: dict[int, int] = {}
         accepted_steps: list[dict] = []
         rejected_steps: list[dict] = []
         fallback_steps: list[dict] = []
@@ -1048,6 +1105,23 @@ def run_generation_batch(
             else:
                 step_record["mtp_branch"] = "prefill"
                 prefill_steps.append(step_record)
+
+            if return_step_records:
+                step_outputs = []
+                trace_outputs = _active_trace_outputs()
+                if not trace_outputs:
+                    trace_outputs = [(int(seq_id), list(completion)) for seq_id, completion in _outputs]
+                for seq_id, completion in trace_outputs:
+                    seq_id = int(seq_id)
+                    previous_len = last_completion_lens.get(seq_id, 0)
+                    current_completion = list(completion)
+                    step_outputs.append({
+                        "seq_id": seq_id,
+                        "completion_len": len(current_completion),
+                        "delta_tokens": current_completion[previous_len:],
+                    })
+                    last_completion_lens[seq_id] = len(current_completion)
+                step_record["outputs"] = step_outputs
 
             step_records.append(step_record)
 
@@ -1283,7 +1357,7 @@ def _run_benchmark_for_prompts(
             compile_mtp_draft=args.compile_mtp_draft,
             debug_spec=args.debug_spec,
             step_profile=step_profile,
-            return_step_records=False,
+            return_step_records=bool(getattr(args, "trace_steps", False)),
         )
         runs.append(run)
     return runs[-1]
@@ -1308,6 +1382,18 @@ def _build_variant_rows(
     warmup: bool,
     step_profile: bool,
 ):
+    if warmup:
+        _run_benchmark_for_prompts(
+            engine,
+            prompts,
+            args=args,
+            mtp1_variant=None,
+            repeats=1,
+            mtp_position_offset=0,
+            mtp_token_source=args.mtp_token_source,
+            mtp_hidden_source=args.mtp_hidden_source,
+            step_profile=False,
+        )
     baseline = _run_benchmark_for_prompts(
         engine,
         prompts,
@@ -1322,7 +1408,7 @@ def _build_variant_rows(
 
     variant_rows = []
     for token_source, position_offset, hidden_source in variants:
-        if warmup and args.max_tokens > 1 and args.num_speculative_tokens > 0:
+        if warmup:
             _run_benchmark_for_prompts(
                 engine,
                 prompts,
@@ -1380,8 +1466,13 @@ def _build_variant_rows(
             "mtp_rejected_latency_ms_per_token_p50": rejected_profile.get("ms_per_decode_token_p50", 0.0),
             "mtp_fallback_decode_tokens_per_second": fallback_profile.get("decode_tokens_per_second", 0.0),
             "baseline_decode_tps": baseline["decode_tokens_per_second"],
+            "decode_speedup": speculative["decode_tokens_per_second"] / max(1e-9, baseline["decode_tokens_per_second"]),
             "baseline_prefill_ms_per_token_p50": baseline_prefill_profile.get("ms_per_token_p50", 0.0),
             "mtp_prefill_ms_per_token_p50": prefill_profile.get("ms_per_token_p50", 0.0),
+            "baseline_seconds": baseline["seconds"],
+            "mtp_seconds": speculative["seconds"],
+            "baseline_prefill_seconds": baseline.get("prefill_seconds", 0.0),
+            "mtp_prefill_seconds": speculative.get("prefill_seconds", 0.0),
             "speedup": baseline["seconds"] / max(1e-9, speculative["seconds"]),
             "correct": correct,
             "first_diff": first_diff,
@@ -1427,7 +1518,8 @@ def main():
     batch_size_buckets = parse_buckets(args.batch_size_buckets)
     dtype = choose_dtype(args.dtype, jax.default_backend())
     batch_prompts = max(1, int(args.batch_prompts))
-    use_batch = batch_prompts > 1
+    requested_prompt_lengths = parse_prompt_lengths(args.prompt_lengths)
+    use_batch = batch_prompts > 1 or bool(requested_prompt_lengths)
     if use_batch:
         batch_size_buckets = tuple(sorted(set(batch_size_buckets + (batch_prompts,))))
     if use_batch and not prefill_buckets:
@@ -1479,7 +1571,7 @@ def main():
 
     if use_batch:
         batch_prompt_lengths = make_prompt_lengths(
-            parse_prompt_lengths(args.prompt_lengths),
+            requested_prompt_lengths,
             count=batch_prompts,
             min_tokens=args.prompt_length_min,
             max_tokens=args.prompt_length_max,

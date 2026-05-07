@@ -1251,6 +1251,22 @@ class CanonicalModelRunner:
             seq_lens=batch.seq_lens[idx : idx + 1],
         )
 
+    def _compact_decode_batch(self, batch: ScheduledBatch, rows: List[int]) -> ScheduledBatch:
+        if not rows:
+            raise ValueError("rows must not be empty")
+        row_ids = jnp.array(rows, dtype=jnp.int32)
+        return ScheduledBatch(
+            tokens=batch.tokens[row_ids, :1],
+            positions=batch.positions[row_ids, :1],
+            seq_ids=batch.seq_ids[row_ids],
+            query_start_loc=jnp.arange(len(rows) + 1, dtype=jnp.int32),
+            is_prefill=False,
+            num_prefill_tokens=0,
+            num_decode_tokens=len(rows),
+            block_tables=batch.block_tables[row_ids],
+            seq_lens=batch.seq_lens[row_ids],
+        )
+
     def _batch_hybrid_state(self, batch: ScheduledBatch) -> HybridLayerState:
         slot_values = [self._ensure_hybrid_slot(int(seq_id)) for seq_id in batch.seq_ids.tolist()]
         slot_ids = jnp.array(slot_values, dtype=jnp.int32)
@@ -1732,6 +1748,7 @@ class CanonicalModelRunner:
             # writes KV only through the draft token, but Python advances the
             # sequence by both emitted tokens before the next scheduled decode.
             required_blocks = (seq.num_tokens + 2 + self.block_size - 1) // self.block_size
+            unsafe_bonus_boundary = (seq.num_tokens + 2) % self.block_size == 0
             can_verify = (
                 first_draft is not None
                 and self.mtp1_enabled
@@ -1740,6 +1757,7 @@ class CanonicalModelRunner:
                 and int(batch.query_lens[row]) == 1
                 and seq.num_completion_tokens + 2 <= seq.max_tokens
                 and len(seq.block_table) >= required_blocks
+                and not unsafe_bonus_boundary
             )
 
             if not can_verify:
@@ -2143,6 +2161,12 @@ class CanonicalModelRunner:
     ) -> dict[int, List[int] | int] | None:
         if not rows:
             return {}
+        # K=1 MTP may run one target-model token ahead of the canonical
+        # decode stream. Avoid doing that on the same step that starts from a
+        # just-completed KV block; the ordinary decode path will process the
+        # boundary token, refresh block metadata, and MTP can resume next step.
+        if any(seqs[row].num_tokens % self.block_size == 0 for row in rows):
+            return None
         if os.environ.get("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "0") not in {
             "1",
             "true",
@@ -2183,14 +2207,13 @@ class CanonicalModelRunner:
             "on",
             "True",
         }
+        partial_physical_batch = len(rows) < int(batch.tokens.shape[0])
         use_fused_step = (
             not use_debug
             and not force_scalar_mtp
             and getattr(self, "execution", "eager") in {"decode-jit", "jit"}
-            and hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
-            and len(rows) == len(seqs)
-            and rows == list(range(len(seqs)))
-            and len(seqs) == batch.tokens.shape[0]
+            and hasattr(self.executor, "mtp1_commit_select_greedy_step_jit")
+            and all(int(batch.query_lens[row]) == 1 for row in rows)
         )
         if not use_fused_step:
             for row in rows:
@@ -2214,23 +2237,77 @@ class CanonicalModelRunner:
         draft_len = min(draft_len, max(1, int(getattr(self, "num_speculative_tokens", 1) or 1)))
         if draft_len < 1:
             return {}
+        if any((seqs[row].num_tokens + draft_len + 1) % self.block_size == 0 for row in rows):
+            return None
         draft_token_chains = [chain[:draft_len] for chain in draft_chains]
         draft_tokens = [chain[0] for chain in draft_token_chains]
-        decode_batch = self._slice_batch(batch, 0) if len(rows) == 1 else batch
+        verifier_draft_tokens = draft_tokens
+        if os.environ.get("NANO_VLLM_JAX_MTP_FORCE_REJECT", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }:
+            verifier_draft_tokens = [-1 for _ in draft_tokens]
+        decode_batch = batch if partial_physical_batch else self._compact_decode_batch(batch, rows)
         hybrid_state = self._batch_hybrid_state(decode_batch)
         _ready(hybrid_state)
         t_profile = _mark("batch_hybrid_state", t_profile)
-        next_mtp_positions = jnp.array(
-            [
-                seq.num_tokens + draft_len + int(getattr(self, "mtp_position_offset", 0))
-                for seq in mtp_seqs
-            ],
-            dtype=jnp.int32,
+        physical_batch_size = int(decode_batch.tokens.shape[0])
+        verifier_draft_tokens_for_batch = [0 for _ in range(physical_batch_size)]
+        next_mtp_positions_for_batch = [0 for _ in range(physical_batch_size)]
+        for local_row, row in enumerate(rows):
+            verifier_draft_tokens_for_batch[row if partial_physical_batch else local_row] = verifier_draft_tokens[local_row]
+            next_mtp_positions_for_batch[row if partial_physical_batch else local_row] = (
+                mtp_seqs[local_row].num_tokens
+                + draft_len
+                + int(getattr(self, "mtp_position_offset", 0))
+            )
+        next_mtp_positions = jnp.array(next_mtp_positions_for_batch, dtype=jnp.int32)
+        force_commit_select = (
+            os.environ.get("NANO_VLLM_JAX_MTP_COMMIT_SELECT", "0")
+            in {"1", "true", "yes", "on", "True"}
+        )
+        disable_one_pass_k1 = (
+            os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1", "0")
+            in {"1", "true", "yes", "on", "True"}
+        )
+        enable_one_pass_k1 = (
+            os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_ONE_PASS_K1", "0")
+            in {"1", "true", "yes", "on", "True"}
+        )
+        allow_mixed_fused_k1 = (
+            os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "0")
+            in {"1", "true", "yes", "on", "True"}
+        )
+        enable_fast_all_accept = (
+            (
+                allow_mixed_fused_k1
+                or os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_FAST_ALL_ACCEPT", "0")
+                in {"1", "true", "yes", "on", "True"}
+            )
+            and os.environ.get("NANO_VLLM_JAX_MTP_PREFIX_SAFE", "0")
+            not in {"1", "true", "yes", "on", "True"}
+            and hasattr(self.executor, "mtp1_two_decode_greedy_fast_step_jit")
+        )
+        batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
+        enable_rowwise_repair = (
+            os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_ROWWISE_REPAIR", "0")
+            in {"1", "true", "yes", "on", "True"}
+        )
+        use_one_pass_k1 = (
+            draft_len == 1
+            and not enable_fast_all_accept
+            and (not force_commit_select or allow_mixed_fused_k1 or partial_physical_batch)
+            and not disable_one_pass_k1
+            and (enable_one_pass_k1 or allow_mixed_fused_k1 or partial_physical_batch)
+            and hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
         )
         use_commit_select = (
             draft_len == 1
-            and os.environ.get("NANO_VLLM_JAX_MTP_COMMIT_SELECT", "0")
-            in {"1", "true", "yes", "on", "True"}
+            and not use_one_pass_k1
+            and not enable_fast_all_accept
             and hasattr(self.executor, "mtp1_commit_select_greedy_step_jit")
         )
         use_mtp2_commit_select = (
@@ -2239,26 +2316,35 @@ class CanonicalModelRunner:
         )
         use_fast_all_accept = (
             draft_len == 1
+            and not use_one_pass_k1
             and not use_commit_select
-            and os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_FAST_ALL_ACCEPT", "0")
-            in {"1", "true", "yes", "on", "True"}
-            and os.environ.get("NANO_VLLM_JAX_MTP_PREFIX_SAFE", "0")
-            not in {"1", "true", "yes", "on", "True"}
-            and hasattr(self.executor, "mtp1_two_decode_greedy_fast_step_jit")
+            and enable_fast_all_accept
         )
         use_prefix_two_decode = (
             draft_len == 1
+            and not use_one_pass_k1
             and not use_commit_select
             and os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_PREFIX_TWO_DECODE", "0")
             in {"1", "true", "yes", "on", "True"}
             and hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
         )
-        if use_commit_select:
+        if use_one_pass_k1:
+            output = self.executor.mtp1_two_decode_greedy_step_jit(
+                decode_batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=hybrid_state,
+                draft_token=jnp.array(verifier_draft_tokens_for_batch, dtype=jnp.int32),
+                next_mtp_position=next_mtp_positions,
+                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+            )
+            _ready(output)
+            t_profile = _mark("executor_mtp1_one_pass_prefix", t_profile)
+        elif use_commit_select:
             output = self.executor.mtp1_commit_select_greedy_step_jit(
                 decode_batch,
                 cache_storage=self.cache_storage,
                 hybrid_state=hybrid_state,
-                draft_token=jnp.array(draft_tokens, dtype=jnp.int32),
+                draft_token=jnp.array(verifier_draft_tokens_for_batch, dtype=jnp.int32),
                 next_mtp_position=next_mtp_positions,
                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
             )
@@ -2269,7 +2355,7 @@ class CanonicalModelRunner:
                 decode_batch,
                 cache_storage=self.cache_storage,
                 hybrid_state=hybrid_state,
-                draft_token=jnp.array(draft_tokens, dtype=jnp.int32),
+                draft_token=jnp.array(verifier_draft_tokens_for_batch, dtype=jnp.int32),
                 next_mtp_position=next_mtp_positions,
                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
             )
@@ -2281,7 +2367,7 @@ class CanonicalModelRunner:
                 decode_batch,
                 cache_storage=self.cache_storage,
                 hybrid_state=hybrid_state,
-                draft_token=jnp.array(draft_tokens, dtype=jnp.int32),
+                draft_token=jnp.array(verifier_draft_tokens_for_batch, dtype=jnp.int32),
                 next_mtp_position=next_mtp_positions,
                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
             )
@@ -2316,7 +2402,67 @@ class CanonicalModelRunner:
         t_profile = _mark("host_result_transfer", t_profile)
 
         accepted_all = bool(jnp.all(output.accepted).item())
-        if not accepted_all and not use_commit_select and draft_len == 1:
+        if (
+            enable_rowwise_repair
+            and (use_fast_all_accept or use_one_pass_k1)
+            and draft_len == 1
+            and not accepted_all
+        ):
+            output_acceptance = [bool(x) for x in output.accepted.tolist()]
+            accepted_flags_local = [
+                output_acceptance[row if partial_physical_batch else local_row]
+                for local_row, row in enumerate(rows)
+            ]
+            if not any(accepted_flags_local):
+                return None
+
+            committed_batch = replace(decode_batch, seq_lens=output.committed_seq_lens)
+            self.cache_storage = output.cache_storage
+            self._store_batch_hybrid_state(committed_batch, output.hybrid_state)
+            _ready(self._hybrid_state_table)
+            self._record_kv_snapshot(committed_batch, output.hybrid_state)
+
+            bonus_values = [int(value) for value in output.bonus_token.tolist()]
+            next_draft_values = [int(value) for value in output.next_draft_token.tolist()]
+            outputs: dict[int, List[int] | int] = {}
+            repair_rows: List[int] = []
+            stats = self._speculative_stats()
+            for local_row, row in enumerate(rows):
+                seq = seqs[row]
+                self._mtp1_drafts.pop(seq.seq_id, None)
+                if accepted_flags_local[local_row]:
+                    idx = row if partial_physical_batch else local_row
+                    stats["drafts_accepted"] += 1
+                    stats["bonus_tokens"] += 1
+                    emitted_len = 2
+                    outputs[row] = draft_token_chains[local_row] + [bonus_values[idx]]
+                    if (
+                        self.mtp1_enabled
+                        and seq.temperature == 0
+                        and seq.num_completion_tokens + emitted_len < seq.max_tokens
+                    ):
+                        self._mtp1_drafts[seq.seq_id] = next_draft_values[idx]
+                        stats["drafts_proposed"] += 1
+                else:
+                    stats["drafts_rejected"] += 1
+                    repair_rows.append(row)
+
+            if repair_rows:
+                repair_seqs = [seqs[row] for row in repair_rows]
+                repair_batch = self._compact_decode_batch(batch, repair_rows)
+                repair_outputs = self._run_main_and_sample(
+                    repair_seqs,
+                    repair_batch,
+                    seed_mtp1=self.mtp1_enabled,
+                )
+                for row, repair_output in zip(repair_rows, repair_outputs):
+                    outputs[row] = repair_output
+            return outputs
+
+        if batch_accept_policy == "rowwise" and not enable_rowwise_repair and not accepted_all:
+            return None
+
+        if not accepted_all and not (use_one_pass_k1 or use_commit_select) and draft_len == 1:
             # Correctness first: the verifier may have physically written KV /
             # hybrid state for rejected draft slots. Do not install those side
             # effects. Let the canonical main-model reuse path verify the
@@ -2451,6 +2597,11 @@ class CanonicalModelRunner:
             "on",
             "True",
         }
+        disable_bonus = (
+            draft_len == 1
+            and os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_BONUS", "0")
+            in {"1", "true", "yes", "on", "True"}
+        )
 
         for local_row, row in enumerate(rows):
             seq = seqs[row]
@@ -2471,9 +2622,13 @@ class CanonicalModelRunner:
                     )
             elif accepted:
                 stats["drafts_accepted"] += draft_len
-                stats["bonus_tokens"] += 1
-                emitted_len = draft_len + 1
-                outputs[row] = draft_token_chains[local_row] + [bonus_tokens[local_row]]
+                if disable_bonus:
+                    emitted_len = draft_len
+                    outputs[row] = draft_token_chains[local_row]
+                else:
+                    stats["bonus_tokens"] += 1
+                    emitted_len = draft_len + 1
+                    outputs[row] = draft_token_chains[local_row] + [bonus_tokens[local_row]]
             else:
                 stats["drafts_rejected"] += 1
                 emitted_len = 1
@@ -2610,6 +2765,27 @@ class CanonicalModelRunner:
                 bool(flag) for flag in (batch.prefill_final_flags[: len(seqs)] if len(batch.prefill_final_flags) >= len(seqs) else batch.prefill_final_flags)
             ]
             seed_mtp1 = all(prefill_final_flags)
+            allow_mixed_fused_prefill = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+            homogeneous_full_prefill = (
+                len(seqs) == batch.tokens.shape[0]
+                and len({seq.num_tokens for seq in seqs}) == 1
+            )
+            if not (allow_mixed_fused_prefill or homogeneous_full_prefill):
+                seed_mtp1 = False
+            if os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_PREFILL_SEED", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }:
+                seed_mtp1 = False
 
         if self.mtp1_enabled and not batch.is_prefill:
             fused_rows: List[int] = []
@@ -2629,6 +2805,7 @@ class CanonicalModelRunner:
                 # block-table capacity for the post-emit logical length, not
                 # just the verifier-written draft positions.
                 required_blocks = (seq.num_tokens + draft_len + 1 + self.block_size - 1) // self.block_size
+                unsafe_bonus_boundary = (seq.num_tokens + draft_len + 1) % self.block_size == 0
                 can_fuse = (
                     draft_value is not None
                     and draft_len > 0
@@ -2636,6 +2813,7 @@ class CanonicalModelRunner:
                     and seq.num_completion_tokens + draft_len + 1 <= seq.max_tokens
                     and int(batch.query_lens[row]) == 1
                     and len(seq.block_table) >= required_blocks
+                    and not unsafe_bonus_boundary
                 )
                 if can_fuse:
                     fused_rows.append(row)
@@ -2652,14 +2830,62 @@ class CanonicalModelRunner:
                         reason = "query_len"
                     elif len(seq.block_table) < required_blocks:
                         reason = "blocks"
+                    elif unsafe_bonus_boundary:
+                        reason = "bonus_boundary"
                     else:
                         reason = "other"
                     not_fused_reasons[reason] = not_fused_reasons.get(reason, 0) + 1
 
-            if fused_rows and len(fused_rows) == len(seqs):
+            allow_mixed_fused = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+            force_reuse_fallback = os.environ.get("NANO_VLLM_JAX_MTP_FORCE_REUSE_FALLBACK", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+            homogeneous_full_batch = (
+                len(seqs) == batch.tokens.shape[0]
+                and len({seq.num_tokens for seq in seqs}) == 1
+            )
+            full_physical_batch = len(seqs) == batch.tokens.shape[0]
+            partial_prefix_verifier = (
+                not full_physical_batch
+                and hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
+                and os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1", "0")
+                not in {"1", "true", "yes", "on", "True"}
+            )
+            can_run_fused_batch = (
+                not force_reuse_fallback
+                and
+                fused_rows
+                and fused_rows == list(range(len(seqs)))
+                and (full_physical_batch or partial_prefix_verifier)
+                and (allow_mixed_fused or homogeneous_full_batch)
+            )
+            if can_run_fused_batch:
                 fused_outputs = self._run_mtp1_batched(seqs, batch, fused_rows)
                 if fused_outputs is not None:
-                    return [fused_outputs[row] for row in range(len(seqs))]
+                    outputs: List[int | List[int] | None] = [None] * len(seqs)
+                    for row, value in fused_outputs.items():
+                        outputs[row] = value
+                    fallback_rows = [row for row in range(len(seqs)) if outputs[row] is None]
+                    if fallback_rows:
+                        fallback_batch = self._compact_decode_batch(batch, fallback_rows)
+                        fallback_outputs = self._run_main_and_sample(
+                            [seqs[row] for row in fallback_rows],
+                            fallback_batch,
+                            seed_mtp1=self.mtp1_enabled and seed_mtp1,
+                        )
+                        for row, value in zip(fallback_rows, fallback_outputs):
+                            outputs[row] = value
+                    return [outputs[row] for row in range(len(seqs))]  # type: ignore[list-item]
             elif profile_mtp:
                 print(
                     f"[MTP_RUN] fused_rows={len(fused_rows)}/{len(seqs)} "
@@ -2667,14 +2893,26 @@ class CanonicalModelRunner:
                     flush=True,
                 )
 
-            # Correctness first: when the whole scheduled batch cannot use the
-            # fused verifier path, use the state-preserving main-decode reuse
-            # path. This keeps ordinary target decode as the verifier and only
-            # advances speculative state for rows that are actually committed.
-            return self._run_main_and_sample_with_mtp1_reuse(
+            if os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_REUSE_FALLBACK", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }:
+                return self._run_main_and_sample_with_mtp1_reuse(
+                    seqs,
+                    batch,
+                    seed_mtp1=self.mtp1_enabled and seed_mtp1,
+                )
+
+            return self._run_main_and_sample(
                 seqs,
                 batch,
-                seed_mtp1=self.mtp1_enabled and seed_mtp1,
+                seed_mtp1=self.mtp1_enabled
+                and seed_mtp1
+                and (full_physical_batch or partial_prefix_verifier)
+                and (allow_mixed_fused or homogeneous_full_batch),
             )
 
         return self._run_main_and_sample(seqs, batch, seed_mtp1=self.mtp1_enabled and seed_mtp1)

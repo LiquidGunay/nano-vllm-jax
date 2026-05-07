@@ -140,7 +140,10 @@ class LLMEngine:
         token_ids = self.model_runner.run(seqs, batch=scheduled_batch)
 
         # Post-process
-        finished_flags = self.scheduler.postprocess(seqs, token_ids)
+        prefill_chunk_lengths: list[int] | None = None
+        if scheduled_batch.is_prefill:
+            prefill_chunk_lengths = [int(x) for x in scheduled_batch.query_lens.tolist()[:len(seqs)]]
+        finished_flags = self.scheduler.postprocess(seqs, token_ids, prefill_chunk_lengths=prefill_chunk_lengths)
         finished_seq_ids = [seq.seq_id for seq, is_finished in zip(seqs, finished_flags) if is_finished]
         if finished_seq_ids:
             self.model_runner.release(finished_seq_ids)

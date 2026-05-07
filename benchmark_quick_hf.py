@@ -2,7 +2,9 @@
 """Quick JAX vs HuggingFace comparison."""
 
 import os
-os.environ['JAX_PLATFORMS'] = 'cpu'
+_platform = os.getenv("NANO_VLLM_JAX_PLATFORMS")
+if _platform:
+    os.environ["JAX_PLATFORMS"] = _platform
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 import sys
@@ -77,9 +79,9 @@ jax_params = ModelParams(
 hf_model = AutoModelForCausalLM.from_pretrained(
     'Qwen/Qwen3.5-0.8B',
     torch_dtype=torch.float16,
-    device_map='cpu',
     trust_remote_code=True,
 )
+hf_model.to("cpu")
 hf_model.eval()
 
 # Warmup

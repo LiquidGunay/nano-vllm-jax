@@ -177,10 +177,10 @@ class Qwen3_5Config:
         return cls(
             vocab_size=248320,
             hidden_size=2048,
-            intermediate_size=5632,
+            intermediate_size=6144,
             num_hidden_layers=24,
-            num_attention_heads=16,
-            num_key_value_heads=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
             head_dim=256,
             linear_num_key_heads=16,
             linear_num_value_heads=16,
