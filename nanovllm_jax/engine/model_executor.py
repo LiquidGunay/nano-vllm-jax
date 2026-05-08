@@ -137,6 +137,12 @@ class ModelExecutor:
             expected_decode = int(jnp.sum(query_lens))
             if int(batch.num_decode_tokens) != expected_decode:
                 raise ValueError("Decode num_decode_tokens must match query lens sum")
+            active_rows = query_lens > 0
+            real_rows = batch.seq_ids >= 0
+            if bool(jnp.any(active_rows != real_rows)):
+                raise ValueError("Decode rows must use seq_id=-1 exactly when query_len is 0")
+            if bool(jnp.any(jnp.where(active_rows, batch.seq_lens < 1, batch.seq_lens != 0))):
+                raise ValueError("Decode inactive rows must have seq_len=0 and active rows must have seq_len>=1")
 
     def _jit_metric(self, key: tuple) -> dict:
         return self._jit_metrics.setdefault(
@@ -676,6 +682,10 @@ class ModelExecutor:
                     if batch_accept_policy == "all_or_none":
                         accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
 
+                pos_current = verify_positions[:, 0]
+                pos_next_after_reject = pos_current + jnp.asarray(1, dtype=pos_current.dtype)
+                pos_next_after_accept = pos_current + jnp.asarray(2, dtype=pos_current.dtype)
+
                 def accepted_next_draft():
                     mtp_hidden = hidden_norm[:, 1:2, :] if mtp_hidden_final_normed else hidden[:, 1:2, :]
                     mtp_logits, _ = mtp_forward(
@@ -684,7 +694,7 @@ class ModelExecutor:
                         embed_tokens=params.embed_tokens,
                         params=params.mtp_params,
                         config=self.config,
-                        positions=next_mtp_position_arg[:, None],
+                        positions=pos_next_after_accept[:, None],
                     )
                     return jnp.argmax(mtp_logits[:, 0], axis=-1).astype(jnp.int32)
 
@@ -696,7 +706,7 @@ class ModelExecutor:
                         embed_tokens=params.embed_tokens,
                         params=params.mtp_params,
                         config=self.config,
-                        positions=(next_mtp_position_arg - 1)[:, None],
+                        positions=pos_next_after_reject[:, None],
                     )
                     return jnp.argmax(rejected_logits[:, 0], axis=-1).astype(jnp.int32)
 
@@ -721,6 +731,14 @@ class ModelExecutor:
                         operand=None,
                     )
 
+                hybrid_after_current = HybridLayerState(
+                    conv_state=prefix_hybrid_state.conv_state[:, 0]
+                    if prefix_hybrid_state.conv_state is not None
+                    else None,
+                    recurrent_state=prefix_hybrid_state.recurrent_state[:, 0]
+                    if prefix_hybrid_state.recurrent_state is not None
+                    else None,
+                )
                 hybrid_after_draft = HybridLayerState(
                     conv_state=prefix_hybrid_state.conv_state[:, 1]
                     if prefix_hybrid_state.conv_state is not None
@@ -730,49 +748,42 @@ class ModelExecutor:
                     else updated_hybrid_state.recurrent_state,
                 )
 
-                def restore_rejected_slots(new_cache, old_cache, slots, slot_accept):
+                def restore_slots(new_cache, old_cache, slots, keep_new):
                     leading_shape = new_cache.shape[:-4] if new_cache.ndim == 5 else new_cache.shape[:-3]
                     flat_new = new_cache.reshape(leading_shape + (-1,) + new_cache.shape[-2:])
                     flat_old = old_cache.reshape(leading_shape + (-1,) + old_cache.shape[-2:])
                     new_values = flat_new[..., slots, :, :]
                     old_values = flat_old[..., slots, :, :]
-                    slot_mask = slot_accept.reshape((1,) * len(leading_shape) + (slot_accept.shape[0], 1, 1))
+                    slot_mask = keep_new.reshape((1,) * len(leading_shape) + (keep_new.shape[0], 1, 1))
                     selected_values = jnp.where(slot_mask, new_values, old_values)
                     flat_new = flat_new.at[..., slots, :, :].set(selected_values)
                     return flat_new.reshape(new_cache.shape)
 
-                conv_mask = accepted.reshape((accepted.shape[0],) + (1,) * (hybrid_after_draft.conv_state.ndim - 1))
-                recurrent_mask = accepted.reshape(
-                    (accepted.shape[0],) + (1,) * (hybrid_after_draft.recurrent_state.ndim - 1)
+                def select_row_state(old_state, after_current, after_draft):
+                    valid_mask = row_valid.reshape((row_valid.shape[0],) + (1,) * (old_state.ndim - 1))
+                    accept_mask = accepted.reshape((accepted.shape[0],) + (1,) * (old_state.ndim - 1))
+                    valid_selected = jnp.where(accept_mask, after_draft, after_current)
+                    return jnp.where(valid_mask, valid_selected, old_state)
+
+                selected_conv = select_row_state(
+                    conv_state,
+                    hybrid_after_current.conv_state,
+                    hybrid_after_draft.conv_state,
                 )
-                if batch_accept_policy == "rowwise":
-                    restore_slots = verify_metadata.slot_mapping[:, :2].reshape((-1,))
-                    restore_accept = jnp.repeat(accepted, 2)
-                    selected_conv = jnp.where(conv_mask, hybrid_after_draft.conv_state, conv_state)
-                    selected_recurrent = jnp.where(recurrent_mask, hybrid_after_draft.recurrent_state, recurrent_state)
-                else:
-                    hybrid_after_current = HybridLayerState(
-                        conv_state=prefix_hybrid_state.conv_state[:, 0]
-                        if prefix_hybrid_state.conv_state is not None
-                        else None,
-                        recurrent_state=prefix_hybrid_state.recurrent_state[:, 0]
-                        if prefix_hybrid_state.recurrent_state is not None
-                        else None,
-                    )
-                    restore_slots = verify_metadata.slot_mapping[:, 1]
-                    restore_accept = accepted
-                    selected_conv = jnp.where(
-                        conv_mask,
-                        hybrid_after_draft.conv_state,
-                        hybrid_after_current.conv_state,
-                    )
-                    selected_recurrent = jnp.where(
-                        recurrent_mask,
-                        hybrid_after_draft.recurrent_state,
-                        hybrid_after_current.recurrent_state,
-                    )
-                selected_k_cache = restore_rejected_slots(updated_kv_state.k_cache, k_cache, restore_slots, restore_accept)
-                selected_v_cache = restore_rejected_slots(updated_kv_state.v_cache, v_cache, restore_slots, restore_accept)
+                selected_recurrent = select_row_state(
+                    recurrent_state,
+                    hybrid_after_current.recurrent_state,
+                    hybrid_after_draft.recurrent_state,
+                )
+
+                # Slot 0 is the canonical current-token write for every active row.
+                # Rejected rows restore only the speculative draft slot. Inactive
+                # padded rows keep the verifier cache value to avoid duplicate dummy
+                # slot restores clobbering another active row's current-token write.
+                slot_draft = verify_metadata.slot_mapping[:, 1]
+                keep_draft_slot = accepted | (~row_valid)
+                selected_k_cache = restore_slots(updated_kv_state.k_cache, k_cache, slot_draft, keep_draft_slot)
+                selected_v_cache = restore_slots(updated_kv_state.v_cache, v_cache, slot_draft, keep_draft_slot)
                 committed_seq_lens = seq_lens + accepted.astype(jnp.int32)
                 return (
                     target_token,
@@ -1140,12 +1151,12 @@ class ModelExecutor:
                 output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
                 hidden0_norm = rms_norm(hidden0, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                 target_token = jnp.argmax(jnp.dot(hidden0_norm[:, 0], output_weight), axis=-1).astype(jnp.int32)
-                accepted = target_token == draft_token_arg
+                row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                row_active = (row_query_lens > 0) & (seq_ids >= 0)
+                accepted = (target_token == draft_token_arg) & row_active
                 if batch_accept_policy == "all_or_none":
-                    accepted = accepted & jnp.all(accepted)
+                    accepted = accepted & jnp.all(jnp.where(row_active, accepted, True))
 
-                second_tokens = target_token[:, None]
-                second_positions = positions + 1
                 second_query_lens = accepted.astype(jnp.int32)
                 second_query_start_loc = jnp.concatenate(
                     [
@@ -1153,16 +1164,24 @@ class ModelExecutor:
                         jnp.cumsum(second_query_lens),
                     ]
                 )
-                second_seq_lens = jnp.where(accepted, seq_lens + 1, seq_lens)
+                second_seq_lens = jnp.where(accepted, seq_lens + 1, jnp.zeros_like(seq_lens))
+                second_tokens = jnp.where(accepted[:, None], target_token[:, None], jnp.zeros_like(tokens))
+                second_positions = jnp.where(accepted[:, None], positions + 1, jnp.zeros_like(positions))
+                second_seq_ids = jnp.where(accepted, seq_ids, jnp.full_like(seq_ids, -1))
+                second_block_tables = jnp.where(
+                    accepted[:, None],
+                    block_tables,
+                    jnp.zeros_like(block_tables),
+                )
                 second_batch = ScheduledBatch(
                     tokens=second_tokens,
                     positions=second_positions,
-                    seq_ids=seq_ids,
+                    seq_ids=second_seq_ids,
                     query_start_loc=second_query_start_loc,
                     is_prefill=False,
                     num_prefill_tokens=0,
                     num_decode_tokens=jnp.sum(second_query_lens),
-                    block_tables=block_tables,
+                    block_tables=second_block_tables,
                     seq_lens=second_seq_lens,
                 )
                 second_metadata = self.backend.build_attention_metadata(
@@ -1203,7 +1222,7 @@ class ModelExecutor:
                     bonus_margin = bonus_top2[:, 0] - bonus_top2[:, 1]
                     accepted = accepted & (bonus_margin >= bonus_margin_threshold)
                     if batch_accept_policy == "all_or_none":
-                        accepted = accepted & jnp.all(accepted)
+                        accepted = accepted & jnp.all(jnp.where(row_active, accepted, True))
 
                 hidden1_norm = rms_norm(hidden1, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                 accept_mask = accepted[:, None, None]

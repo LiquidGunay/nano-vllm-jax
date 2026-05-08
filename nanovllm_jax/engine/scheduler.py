@@ -274,7 +274,7 @@ class Scheduler:
             query_start_loc=jnp.array(query_start_loc, dtype=jnp.int32),
             is_prefill=is_prefill,
             num_prefill_tokens=sum(query_lens) if is_prefill else 0,
-            num_decode_tokens=0 if is_prefill else len(seqs),
+            num_decode_tokens=0 if is_prefill else sum(query_lens),
             block_tables=jnp.array(block_tables, dtype=jnp.int32),
             seq_lens=jnp.array(seq_lens, dtype=jnp.int32),
             prefill_is_final=prefill_is_final if is_prefill else None,

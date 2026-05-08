@@ -87,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sweep-alignments", action="store_true")
     parser.add_argument("--exec-log-steps", action="store_true", help="Enable executor per-step logging")
     parser.add_argument("--step-profile", action="store_true", help="Collect per-step decode profiling")
+    parser.add_argument("--adaptive-margin", type=float, default=0.0,
+                        help="Margin for documented adaptive MTP gating decisions")
     parser.add_argument("--trace-steps", action="store_true",
                         help="Include per-step emitted token deltas in JSON output for correctness debugging")
     parser.add_argument("--hf-offline", action="store_true")
@@ -647,25 +649,52 @@ def run_hf_logits_check(
 
 def apply_correctness_gate(summary: dict, *, args: argparse.Namespace, hf_logits_check: dict) -> dict:
     mtp_exact = bool(summary.get("all_correct", False))
-    hf_ok = bool(hf_logits_check.get("ok", True))
+    hf_checked = bool(hf_logits_check.get("checked", False))
+    hf_ok = bool(hf_checked and hf_logits_check.get("ok", False))
     all_correct = bool(mtp_exact and hf_ok)
+    timed_results_valid = bool(all_correct and not args.correctness_only)
     summary["mtp_exact_token_match"] = mtp_exact
     summary["hf_logits_check"] = hf_logits_check
     summary["all_correct"] = all_correct
     summary["correctness"] = {
-        "hf_logits_checked": bool(hf_logits_check.get("checked", False)),
+        "hf_logits_checked": hf_checked,
         "hf_logits_ok": hf_ok,
+        "next_step_logit_sanity": hf_ok,
         "baseline_greedy_is_canonical": hf_ok,
         "mtp_exact_token_match": mtp_exact,
         "all_correct": all_correct,
     }
-    summary["throughput_valid"] = bool(all_correct and not args.correctness_only)
-    if not summary["throughput_valid"]:
+    summary["throughput_valid"] = timed_results_valid
+    summary["timed_results_valid"] = timed_results_valid
+    for row in summary.get("rows", []):
+        for variant in row.get("variants", []):
+            variant["next_step_logit_sanity"] = hf_ok
+            variant["exact_token_match"] = bool(variant.get("correct", False))
+            variant["timed_results_valid"] = bool(variant.get("correct", False) and hf_ok and not args.correctness_only)
+            variant["throughput_valid"] = variant["timed_results_valid"]
+            if "timed_results" in variant:
+                variant["timed_results"]["valid"] = variant["timed_results_valid"]
+                variant["timed_results"]["next_step_logit_sanity"] = hf_ok
+                variant["timed_results"]["exact_token_match"] = bool(variant.get("correct", False))
+    if not timed_results_valid:
         reason = "correctness_only" if args.correctness_only and all_correct else "correctness_failed"
         summary["throughput_suppressed_reason"] = reason
+        summary["timed_results_invalid_reason"] = reason
         if "throughput_summary" in summary:
             summary["raw_throughput_summary"] = summary["throughput_summary"]
             summary["throughput_summary"] = None
+        for row in summary.get("rows", []):
+            for variant in row.get("variants", []):
+                variant["throughput_valid"] = False
+                variant["timed_results_valid"] = False
+                variant["throughput_suppressed_reason"] = reason
+                variant["timed_results_invalid_reason"] = reason
+                if "timed_results" in variant:
+                    variant["raw_timed_results"] = variant["timed_results"]
+                    variant["timed_results"] = {
+                        "valid": False,
+                        "invalid_reason": reason,
+                    }
     return summary
 
 
@@ -816,6 +845,54 @@ def make_token_prompts_from_lengths(engine, lengths: list[int], seed_text: str |
     return prompts
 
 
+def _model_size_label(model: str) -> str:
+    lowered = model.lower()
+    for marker in ("27b", "14b", "7b", "4b", "2b", "1.5b", "0.8b"):
+        if marker in lowered:
+            return marker
+    return model.rsplit("/", 1)[-1]
+
+
+def _stats_key(args: argparse.Namespace, *, dtype: str, backend: str) -> dict:
+    batch_buckets = parse_buckets(getattr(args, "batch_size_buckets", "") or "")
+    batch_bucket = max(batch_buckets) if batch_buckets else max(1, int(getattr(args, "batch_prompts", 1)))
+    return {
+        "batch_bucket": int(batch_bucket),
+        "model_size": _model_size_label(str(args.model)),
+        "dtype": dtype,
+        "backend": backend,
+        "max_blocks_per_seq": getattr(args, "max_blocks_per_seq", None),
+    }
+
+
+def _adaptive_gating_decision(baseline: dict, speculative: dict, *, margin: float) -> dict:
+    baseline_ms = float(baseline.get("step_profile", {}).get("all_steps", {}).get("seconds_per_token", 0.0)) * 1000.0
+    speculative_ms = float(speculative.get("step_profile", {}).get("all_steps", {}).get("seconds_per_token", 0.0)) * 1000.0
+    stats = speculative.get("speculative", {})
+    accept_rate = float(stats.get("drafts_accepted", 0)) / max(1.0, float(stats.get("drafts_proposed", 0)))
+    predicted_speedup = (baseline_ms / max(1e-9, speculative_ms)) * (1.0 + accept_rate)
+    return {
+        "formula": "predicted_speedup = (baseline_ms / speculative_ms) * (1.0 + accept_rate); should_enable = predicted_speedup >= 1.0 + margin",
+        "baseline_ms": baseline_ms,
+        "speculative_ms": speculative_ms,
+        "accept_rate": accept_rate,
+        "margin": float(margin),
+        "predicted_speedup": predicted_speedup,
+        "should_enable": bool(predicted_speedup >= 1.0 + float(margin)),
+    }
+
+
+def _benchmark_modes_report() -> list[dict]:
+    return [
+        {"mode": "baseline", "status": "measured", "description": "No speculative decoding."},
+        {"mode": "all-or-none MTP", "status": "measured_by_current_mtp_row", "description": "Fused verifier result is only useful when the configured MTP path accepts as implemented by the runner."},
+        {"mode": "rowwise MTP", "status": "available_via_runner_env", "description": "K=1 commit-select path when NANO_VLLM_JAX_MTP_COMMIT_SELECT=1 is enabled."},
+        {"mode": "groupwise g=2", "status": "not_implemented_in_harness", "description": "Harness reports the required mode but does not yet split speculative batches into fixed groups of 2."},
+        {"mode": "groupwise g=4", "status": "not_implemented_in_harness", "description": "Harness reports the required mode but does not yet split speculative batches into fixed groups of 4."},
+        {"mode": "adaptive MTP gating", "status": "documented_and_reported", "description": "Reports the configured adaptive gating formula and decision from observed baseline/speculative timings."},
+    ]
+
+
 def _percentile_ms(values: list[float], p: float) -> float:
     """Return a percentile in milliseconds for a list of seconds values."""
     if not values:
@@ -850,6 +927,18 @@ def _percentile(values: list[float], p: float) -> float:
 def _summarize_branch(step_records: list[dict]) -> dict:
     count = len(step_records)
     if not count:
+        empty_phase_ms = {
+            "schedule_ms": 0.0,
+            "run_ms": 0.0,
+            "postprocess_ms": 0.0,
+            "release_ms": 0.0,
+        }
+        empty_rollup = {
+            "host_ms": 0.0,
+            "device_ms": 0.0,
+            "postprocess_ms": 0.0,
+            "release_ms": 0.0,
+        }
         return {
             "count": 0,
             "steps_seconds_total": 0.0,
@@ -865,18 +954,12 @@ def _summarize_branch(step_records: list[dict]) -> dict:
             "ms_per_token_p95": 0.0,
             "ms_per_decode_token_p50": 0.0,
             "ms_per_decode_token_p95": 0.0,
-            "phase_ms": {
-                "schedule_ms": 0.0,
-                "run_ms": 0.0,
-                "postprocess_ms": 0.0,
-                "release_ms": 0.0,
-            },
-            "phase_ms_avg_per_step": {
-                "schedule_ms": 0.0,
-                "run_ms": 0.0,
-                "postprocess_ms": 0.0,
-                "release_ms": 0.0,
-            },
+            "inter_token_latency_ms_p50": 0.0,
+            "inter_token_latency_ms_p95": 0.0,
+            "phase_ms": empty_phase_ms,
+            "phase_ms_avg_per_step": empty_phase_ms,
+            "host_device_postprocess_ms": empty_rollup,
+            "phase_ms_rollup": empty_rollup,
         }
 
     step_seconds = [r["seconds"] for r in step_records]
@@ -896,6 +979,14 @@ def _summarize_branch(step_records: list[dict]) -> dict:
         "postprocess_ms": sum(item.get("phase_ms_postprocess", 0.0) for item in step_records),
         "release_ms": sum(item.get("phase_ms_release", 0.0) for item in step_records),
     }
+    phase_rollup = {
+        "host_ms": phase_ms["schedule_ms"] + phase_ms["postprocess_ms"] + phase_ms["release_ms"],
+        "device_ms": phase_ms["run_ms"],
+        "postprocess_ms": phase_ms["postprocess_ms"],
+        "release_ms": phase_ms["release_ms"],
+    }
+    decode_latency_p50 = _percentile(decode_token_ms, 0.50)
+    decode_latency_p95 = _percentile(decode_token_ms, 0.95)
 
     return {
         "count": count,
@@ -910,8 +1001,10 @@ def _summarize_branch(step_records: list[dict]) -> dict:
         "ms_per_step_p95": _percentile_ms(step_seconds, 0.95),
         "ms_per_token_p50": _percentile(token_ms, 0.50),
         "ms_per_token_p95": _percentile(token_ms, 0.95),
-        "ms_per_decode_token_p50": _percentile(decode_token_ms, 0.50),
-        "ms_per_decode_token_p95": _percentile(decode_token_ms, 0.95),
+        "ms_per_decode_token_p50": decode_latency_p50,
+        "ms_per_decode_token_p95": decode_latency_p95,
+        "inter_token_latency_ms_p50": decode_latency_p50,
+        "inter_token_latency_ms_p95": decode_latency_p95,
         "phase_ms": phase_ms,
         "phase_ms_avg_per_step": {
             "schedule_ms": phase_ms["schedule_ms"] / count,
@@ -919,6 +1012,8 @@ def _summarize_branch(step_records: list[dict]) -> dict:
             "postprocess_ms": phase_ms["postprocess_ms"] / count,
             "release_ms": phase_ms["release_ms"] / count,
         },
+        "host_device_postprocess_ms": phase_rollup,
+        "phase_ms_rollup": phase_rollup,
     }
 
 
@@ -1162,9 +1257,21 @@ def run_generation_batch(
     fallback_summary = _summarize_branch(fallback_steps)
     prefill_summary = _summarize_branch(prefill_steps)
     decode_tokens = sum(abs(r["num_tokens"]) for r in decode_steps)
+    prefill_tokens = prefill_summary["tokens"]
     accepted_tokens = sum(abs(r["num_tokens"]) for r in accepted_steps)
     rejected_tokens = sum(abs(r["num_tokens"]) for r in rejected_steps)
     fallback_tokens = sum(abs(r["num_tokens"]) for r in fallback_steps)
+    e2e_tps = completion_total / elapsed if elapsed > 0 else 0.0
+    decode_tps = decode_tokens / max(1e-9, decode_seconds)
+    prefill_tps = prefill_tokens / max(1e-9, prefill_steps_seconds)
+    phase_ms_total = all_steps_summary["phase_ms"]
+    host_device_postprocess_ms = {
+        "host_ms": phase_ms_total["schedule_ms"] + phase_ms_total["postprocess_ms"] + phase_ms_total["release_ms"],
+        "device_ms": phase_ms_total["run_ms"],
+        "postprocess_ms": phase_ms_total["postprocess_ms"],
+        "release_ms": phase_ms_total["release_ms"],
+    }
+    speculative_counts = runner.get_speculative_stats()
 
     return {
         "texts": text_rows,
@@ -1174,17 +1281,45 @@ def run_generation_batch(
         "tokens": completion_total,
         "total_requests": len(prompts),
         "seconds": elapsed,
-        "tokens_per_second": completion_total / elapsed if elapsed > 0 else 0.0,
-        "decode_tokens_per_second": decode_tokens / max(1e-9, decode_seconds),
+        "tokens_per_second": e2e_tps,
+        "end_to_end_tokens_per_second": e2e_tps,
+        "decode_tokens_per_second": decode_tps,
+        "prefill_tokens_per_second": prefill_tps,
         "decode_tokens": decode_tokens,
+        "prefill_tokens": prefill_tokens,
+        "decode_seconds": decode_seconds,
         "accepted_tokens": accepted_tokens,
         "rejected_tokens": rejected_tokens,
         "fallback_tokens": fallback_tokens,
         "prefill_seconds": prefill_steps_seconds,
-        "speculative": runner.get_speculative_stats(),
+        "speculative": speculative_counts,
+        "speculative_counts": {
+            "drafts_proposed": speculative_counts.get("drafts_proposed", 0),
+            "drafts_accepted": speculative_counts.get("drafts_accepted", 0),
+            "drafts_rejected": speculative_counts.get("drafts_rejected", 0),
+            "bonus_tokens": speculative_counts.get("bonus_tokens", 0),
+            "fallback_steps": speculative_counts.get("fallback_steps", 0),
+            "accepted_decode_steps": len(accepted_steps),
+            "rejected_decode_steps": len(rejected_steps),
+            "fallback_decode_steps": len(fallback_steps),
+        },
         "return_step_records": return_step_records,
         "prefill_logits_by_request": prefill_logits_by_request,
         "step_record_count": len(step_records),
+        "host_device_postprocess_ms": host_device_postprocess_ms,
+        "phase_ms_total": phase_ms_total,
+        "accepted_inter_token_latency_ms": {
+            "p50": accepted_summary["inter_token_latency_ms_p50"],
+            "p95": accepted_summary["inter_token_latency_ms_p95"],
+        },
+        "rejected_inter_token_latency_ms": {
+            "p50": rejected_summary["inter_token_latency_ms_p50"],
+            "p95": rejected_summary["inter_token_latency_ms_p95"],
+        },
+        "fallback_inter_token_latency_ms": {
+            "p50": fallback_summary["inter_token_latency_ms_p50"],
+            "p95": fallback_summary["inter_token_latency_ms_p95"],
+        },
         "step_profile": {
             "steps": step_records if return_step_records else [],
             "all_steps": all_steps_summary,
@@ -1199,6 +1334,7 @@ def run_generation_batch(
                 "release_ms": all_steps_summary["phase_ms"]["release_ms"] / max(1, len(step_records)),
             },
             "phase_ms_total": all_steps_summary["phase_ms"],
+            "host_device_postprocess_ms": host_device_postprocess_ms,
             "mode_counts": {
                 "prefill_steps": len(prefill_steps),
                 "decode_steps": len(decode_steps),
@@ -1292,6 +1428,7 @@ def _run_shape_warmups(
             if target_batch <= 0:
                 continue
             prompts = make_token_prompts_from_lengths(engine, [prefill_len] * target_batch, seed_text=seed)
+            run_t0 = time.perf_counter()
             run_generation_batch(
                 engine=engine,
                 prompts=prompts,
@@ -1306,6 +1443,7 @@ def _run_shape_warmups(
                 return_step_records=False,
             )
             warmup_summary["runs"] += 1
+            warmup_summary["total_elapsed"] += time.perf_counter() - run_t0
 
     # Additional mixed-length warmup to force prefill chunked decode scheduling.
     mixed_prompts = make_token_prompts_from_lengths(
@@ -1314,6 +1452,7 @@ def _run_shape_warmups(
         seed_text=seed,
     )
     if len(mixed_prompts) > 1:
+        run_t0 = time.perf_counter()
         run_generation_batch(
             engine=engine,
             prompts=mixed_prompts,
@@ -1328,6 +1467,7 @@ def _run_shape_warmups(
             return_step_records=False,
         )
         warmup_summary["runs"] += 1
+        warmup_summary["total_elapsed"] += time.perf_counter() - run_t0
 
     return warmup_summary
 
@@ -1455,10 +1595,15 @@ def _build_variant_rows(
             "token_source": token_source,
             "position_offset": position_offset,
             "hidden_source": hidden_source,
+            "benchmark_mode": "all-or-none MTP",
             "mtp1": speculative,
             "baseline": baseline,
             "mtp1_runs": repeats,
             "mtp_tokens_per_second": speculative["tokens_per_second"],
+            "mtp_end_to_end_tps": speculative["end_to_end_tokens_per_second"],
+            "baseline_end_to_end_tps": baseline["end_to_end_tokens_per_second"],
+            "mtp_prefill_tps": speculative["prefill_tokens_per_second"],
+            "baseline_prefill_tps": baseline["prefill_tokens_per_second"],
             "mtp_decode_tps": speculative["decode_tokens_per_second"],
             "mtp_decode_latency_ms_per_token_p50": accepted_profile.get("ms_per_decode_token_p50", 0.0),
             "mtp_decode_latency_ms_per_token_p95": accepted_profile.get("ms_per_decode_token_p95", 0.0),
@@ -1467,6 +1612,12 @@ def _build_variant_rows(
             "mtp_fallback_decode_tokens_per_second": fallback_profile.get("decode_tokens_per_second", 0.0),
             "baseline_decode_tps": baseline["decode_tokens_per_second"],
             "decode_speedup": speculative["decode_tokens_per_second"] / max(1e-9, baseline["decode_tokens_per_second"]),
+            "end_to_end_speedup": baseline["seconds"] / max(1e-9, speculative["seconds"]),
+            "acceptance_rate": speculative["speculative"].get("drafts_accepted", 0) / max(1, speculative["speculative"].get("drafts_proposed", 0)),
+            "fallback_count": speculative["speculative_counts"].get("fallback_decode_steps", 0),
+            "host_time_ms": speculative["host_device_postprocess_ms"]["host_ms"],
+            "runner_device_time_ms": speculative["host_device_postprocess_ms"]["device_ms"],
+            "postprocess_time_ms": speculative["host_device_postprocess_ms"]["postprocess_ms"],
             "baseline_prefill_ms_per_token_p50": baseline_prefill_profile.get("ms_per_token_p50", 0.0),
             "mtp_prefill_ms_per_token_p50": prefill_profile.get("ms_per_token_p50", 0.0),
             "baseline_seconds": baseline["seconds"],
@@ -1477,6 +1628,8 @@ def _build_variant_rows(
             "correct": correct,
             "first_diff": first_diff,
             "throughput_valid": correct,
+            "timed_results_valid": correct,
+            "next_step_logit_sanity": "pending_global_hf_gate",
             "throughput_suppressed_reason": None if correct else "mtp_tokens_diverged",
             "accepted_tokens": speculative["accepted_tokens"],
             "rejected_tokens": speculative["rejected_tokens"],
@@ -1490,6 +1643,30 @@ def _build_variant_rows(
                 "rejected": rejected_profile,
                 "fallback": fallback_profile,
             },
+            "inter_token_latency_ms": {
+                "accepted": speculative["accepted_inter_token_latency_ms"],
+                "rejected": speculative["rejected_inter_token_latency_ms"],
+                "fallback": speculative["fallback_inter_token_latency_ms"],
+            },
+            "host_device_postprocess_ms": speculative["host_device_postprocess_ms"],
+            "timed_results": {
+                "valid": correct,
+                "prefill_tok_s": speculative["prefill_tokens_per_second"],
+                "decode_tok_s": speculative["decode_tokens_per_second"],
+                "end_to_end_tok_s": speculative["end_to_end_tokens_per_second"],
+                "decode_speedup": speculative["decode_tokens_per_second"] / max(1e-9, baseline["decode_tokens_per_second"]),
+                "end_to_end_speedup": baseline["seconds"] / max(1e-9, speculative["seconds"]),
+                "acceptance_rate": speculative["speculative"].get("drafts_accepted", 0) / max(1, speculative["speculative"].get("drafts_proposed", 0)),
+                "fallback_count": speculative["speculative_counts"].get("fallback_decode_steps", 0),
+                "host_time_ms": speculative["host_device_postprocess_ms"]["host_ms"],
+                "runner_device_time_ms": speculative["host_device_postprocess_ms"]["device_ms"],
+                "postprocess_time_ms": speculative["host_device_postprocess_ms"]["postprocess_ms"],
+            },
+            "adaptive_mtp_gating": _adaptive_gating_decision(
+                baseline,
+                speculative,
+                margin=float(getattr(args, "adaptive_margin", 0.0)),
+            ),
         }
         if output_samples is not None:
             row["outputs"] = output_samples
@@ -1604,10 +1781,17 @@ def main():
         "startup_seconds": 0.0,
         "shape_runs": 0,
         "shape_variant": "nospec",
+        "warmed_shape_phase": {
+            "enabled": bool(args.warmup),
+            "nospec": None,
+            "mtp": None,
+            "total_runs": 0,
+            "total_elapsed": 0.0,
+        },
     }
     if args.warmup:
         warmup_t0 = time.perf_counter()
-        _ = _run_shape_warmups(
+        nospec_warmup = _run_shape_warmups(
             engine=engine,
             prompt_lengths=batch_prompt_lengths,
             prefill_lengths=tuple(sorted(set([length for length in warmup_prefill_lengths]))),
@@ -1621,10 +1805,11 @@ def main():
             debug_spec=args.debug_spec,
             step_profile=False,
         )
+        warmup_summary["warmed_shape_phase"]["nospec"] = nospec_warmup
 
         if args.num_speculative_tokens > 0:
             first_mtp_variant = variants[0]
-            _ = _run_shape_warmups(
+            mtp_warmup = _run_shape_warmups(
                 engine=engine,
                 prompt_lengths=batch_prompt_lengths,
                 prefill_lengths=tuple(sorted(set([length for length in warmup_prefill_lengths]))),
@@ -1638,9 +1823,26 @@ def main():
                 debug_spec=args.debug_spec,
                 step_profile=False,
             )
+            warmup_summary["warmed_shape_phase"]["mtp"] = mtp_warmup
             warmup_summary["shape_variant"] = "nospec+mtp"
         warmup_summary["startup_seconds"] = time.perf_counter() - warmup_t0
-        warmup_summary["shape_runs"] = (batch_prompts if batch_prompts > 0 else 1)
+        warmup_summary["shape_runs"] = sum(
+            int(item.get("runs", 0))
+            for item in (
+                warmup_summary["warmed_shape_phase"]["nospec"],
+                warmup_summary["warmed_shape_phase"]["mtp"],
+            )
+            if item
+        )
+        warmup_summary["warmed_shape_phase"]["total_runs"] = warmup_summary["shape_runs"]
+        warmup_summary["warmed_shape_phase"]["total_elapsed"] = sum(
+            float(item.get("total_elapsed", 0.0))
+            for item in (
+                warmup_summary["warmed_shape_phase"]["nospec"],
+                warmup_summary["warmed_shape_phase"]["mtp"],
+            )
+            if item
+        )
 
     if use_batch:
         benchmark_start_t0 = time.perf_counter()
@@ -1691,6 +1893,11 @@ def main():
             "step_profile": args.step_profile,
             "load_seconds": load_seconds,
             "warmup": warmup_summary,
+            "warmed_shape_phase": warmup_summary["warmed_shape_phase"],
+            "benchmark_modes": _benchmark_modes_report(),
+            "adaptive_mtp_gating_formula": "predicted_speedup = (baseline_ms / speculative_ms) * (1.0 + accept_rate); should_enable = predicted_speedup >= 1.0 + margin",
+            "adaptive_margin": float(args.adaptive_margin),
+            "stats_key": _stats_key(args, dtype=dtype, backend=jax.default_backend()),
             "benchmark_seconds": benchmark_seconds,
             "all_correct": all(
                 variant["correct"] for variant in variant_rows
@@ -1785,6 +1992,31 @@ def main():
             ),
             "rows": rows,
             "warmup": warmup_summary,
+            "warmed_shape_phase": warmup_summary["warmed_shape_phase"],
+            "benchmark_modes": _benchmark_modes_report(),
+            "adaptive_mtp_gating_formula": "predicted_speedup = (baseline_ms / speculative_ms) * (1.0 + accept_rate); should_enable = predicted_speedup >= 1.0 + margin",
+            "adaptive_margin": float(args.adaptive_margin),
+            "stats_key": _stats_key(args, dtype=dtype, backend=jax.default_backend()),
+        }
+
+    primary_variant = None
+    for row in summary.get("rows", []):
+        variants_for_row = row.get("variants", [])
+        if variants_for_row:
+            primary_variant = variants_for_row[0]
+            break
+    if primary_variant is not None:
+        summary["required_metrics"] = {
+            "prefill_tok_s": primary_variant["mtp_prefill_tps"],
+            "decode_tok_s": primary_variant["mtp_decode_tps"],
+            "decode_speedup": primary_variant["decode_speedup"],
+            "end_to_end_speedup": primary_variant["end_to_end_speedup"],
+            "acceptance_rate": primary_variant["acceptance_rate"],
+            "fallback_count": primary_variant["fallback_count"],
+            "host_time_ms": primary_variant["host_time_ms"],
+            "runner_device_time_ms": primary_variant["runner_device_time_ms"],
+            "postprocess_time_ms": primary_variant["postprocess_time_ms"],
+            "stats_key": summary.get("stats_key"),
         }
 
     summary = apply_correctness_gate(summary, args=args, hf_logits_check=hf_logits_check)

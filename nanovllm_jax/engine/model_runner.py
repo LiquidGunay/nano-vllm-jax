@@ -1166,7 +1166,7 @@ class CanonicalModelRunner:
             query_start_loc=jnp.array(query_start_loc, dtype=jnp.int32),
             is_prefill=is_prefill,
             num_prefill_tokens=sum(query_lens) if is_prefill else 0,
-            num_decode_tokens=0 if is_prefill else len(seqs),
+            num_decode_tokens=0 if is_prefill else sum(query_lens),
             block_tables=jnp.array(block_tables, dtype=jnp.int32),
             seq_lens=jnp.array(seq_lens, dtype=jnp.int32),
         )
@@ -1251,20 +1251,53 @@ class CanonicalModelRunner:
             seq_lens=batch.seq_lens[idx : idx + 1],
         )
 
-    def _compact_decode_batch(self, batch: ScheduledBatch, rows: List[int]) -> ScheduledBatch:
+    def _masked_decode_batch(
+        self,
+        batch: ScheduledBatch,
+        rows: List[int],
+        *,
+        token_values: List[int] | None = None,
+        position_values: List[int] | None = None,
+        seq_len_values: List[int] | None = None,
+    ) -> ScheduledBatch:
         if not rows:
             raise ValueError("rows must not be empty")
+        if batch.is_prefill:
+            raise ValueError("masked decode batches require a decode batch")
+        batch_size = int(batch.tokens.shape[0])
         row_ids = jnp.array(rows, dtype=jnp.int32)
+        active = jnp.zeros((batch_size,), dtype=bool).at[row_ids].set(True)
+        tokens = jnp.zeros((batch_size, 1), dtype=jnp.int32)
+        positions = jnp.zeros((batch_size, 1), dtype=jnp.int32)
+        seq_lens = jnp.zeros((batch_size,), dtype=jnp.int32)
+        if token_values is None:
+            tokens = tokens.at[row_ids, 0].set(batch.tokens[row_ids, 0])
+        else:
+            tokens = tokens.at[row_ids, 0].set(jnp.array(token_values, dtype=jnp.int32))
+        if position_values is None:
+            positions = positions.at[row_ids, 0].set(batch.positions[row_ids, 0])
+        else:
+            positions = positions.at[row_ids, 0].set(jnp.array(position_values, dtype=jnp.int32))
+        if seq_len_values is None:
+            seq_lens = seq_lens.at[row_ids].set(batch.seq_lens[row_ids])
+        else:
+            seq_lens = seq_lens.at[row_ids].set(jnp.array(seq_len_values, dtype=jnp.int32))
+        query_lens = active.astype(jnp.int32)
         return ScheduledBatch(
-            tokens=batch.tokens[row_ids, :1],
-            positions=batch.positions[row_ids, :1],
-            seq_ids=batch.seq_ids[row_ids],
-            query_start_loc=jnp.arange(len(rows) + 1, dtype=jnp.int32),
+            tokens=tokens,
+            positions=positions,
+            seq_ids=jnp.where(active, batch.seq_ids, jnp.full_like(batch.seq_ids, -1)),
+            query_start_loc=jnp.concatenate(
+                [
+                    jnp.zeros((1,), dtype=jnp.int32),
+                    jnp.cumsum(query_lens),
+                ]
+            ),
             is_prefill=False,
             num_prefill_tokens=0,
             num_decode_tokens=len(rows),
-            block_tables=batch.block_tables[row_ids],
-            seq_lens=batch.seq_lens[row_ids],
+            block_tables=jnp.where(active[:, None], batch.block_tables, jnp.zeros_like(batch.block_tables)),
+            seq_lens=seq_lens,
         )
 
     def _batch_hybrid_state(self, batch: ScheduledBatch) -> HybridLayerState:
@@ -1295,8 +1328,9 @@ class CanonicalModelRunner:
             return
         valid_rows: List[int] = []
         slot_values: List[int] = []
+        query_lens = [int(x) for x in batch.query_lens.tolist()]
         for row, seq_id in enumerate([int(x) for x in batch.seq_ids.tolist()]):
-            if seq_id < 0:
+            if seq_id < 0 or (not batch.is_prefill and query_lens[row] <= 0):
                 continue
             valid_rows.append(row)
             slot_values.append(self._ensure_hybrid_slot(seq_id))
@@ -1592,21 +1626,37 @@ class CanonicalModelRunner:
             seed_hidden = self._hidden_for_mtp(last_hidden[:, None, :])[:, 0]
         else:
             last_logits = output.activations[: len(seqs), 0]
+        query_lens = [int(x) for x in batch.query_lens[: len(seqs)].tolist()]
+        active_rows = [
+            row
+            for row, query_len in enumerate(query_lens)
+            if query_len > 0 and int(batch.seq_ids[row]) >= 0
+        ]
         if batch.is_prefill:
             prefill_logits_by_seq = getattr(self, "_last_prefill_logits_by_seq", None)
             if prefill_logits_by_seq is None:
                 prefill_logits_by_seq = {}
                 self._last_prefill_logits_by_seq = prefill_logits_by_seq
             for row, seq in enumerate(seqs):
-                if row < len(prefill_final_flags) and prefill_final_flags[row]:
+                if row in active_rows and row < len(prefill_final_flags) and prefill_final_flags[row]:
                     prefill_logits_by_seq[int(seq.seq_id)] = last_logits[row]
 
-        temperatures = jnp.array([seq.temperature for seq in seqs], dtype=jnp.float32)
-        token_ids = self._sample_fn(last_logits, temperatures)
-        token_list = [int(token_id) for token_id in token_ids.tolist()]
+        token_by_row: dict[int, int] = {}
+        if active_rows:
+            active_idx = jnp.array(active_rows, dtype=jnp.int32)
+            temperatures = jnp.array([seqs[row].temperature for row in active_rows], dtype=jnp.float32)
+            token_ids = self._sample_fn(last_logits[active_idx], temperatures)
+            token_by_row = {
+                row: int(token_id)
+                for row, token_id in zip(active_rows, token_ids.tolist())
+            }
 
         outputs: List[int | List[int]] = []
-        for row, (seq, token_id) in enumerate(zip(seqs, token_list)):
+        for row, seq in enumerate(seqs):
+            if row not in token_by_row:
+                outputs.append([])
+                continue
+            token_id = token_by_row[row]
             if batch.is_prefill and not prefill_final_flags[row]:
                 outputs.append([])
                 continue
@@ -1700,16 +1750,13 @@ class CanonicalModelRunner:
             and all(seq.num_completion_tokens + 2 <= seq.max_tokens for seq in seqs)
             and all(int(length) == 1 for length in batch.query_lens[: len(seqs)].tolist())
         ):
-            lookahead_batch = ScheduledBatch(
-                tokens=token_ids[:, None].astype(jnp.int32),
-                positions=batch.positions[: len(seqs)] + 1,
-                seq_ids=batch.seq_ids[: len(seqs)],
-                query_start_loc=jnp.arange(len(seqs) + 1, dtype=jnp.int32),
-                is_prefill=False,
-                num_prefill_tokens=0,
-                num_decode_tokens=len(seqs),
-                block_tables=batch.block_tables[: len(seqs)],
-                seq_lens=batch.seq_lens[: len(seqs)] + 1,
+            lookahead_rows = list(range(len(seqs)))
+            lookahead_batch = self._masked_decode_batch(
+                batch,
+                lookahead_rows,
+                token_values=[int(token_id) for token_id in token_ids.tolist()],
+                position_values=[int(batch.positions[row, 0]) + 1 for row in lookahead_rows],
+                seq_len_values=[int(batch.seq_lens[row]) + 1 for row in lookahead_rows],
             )
             lookahead_hybrid = self._batch_hybrid_state(lookahead_batch)
             lookahead_output = self._step_fn(lookahead_batch)(
@@ -1722,7 +1769,7 @@ class CanonicalModelRunner:
             self.cache_storage = lookahead_output.cache_storage
             self._store_batch_hybrid_state(lookahead_batch, lookahead_output.hybrid_state)
             self._refresh_kv_snapshot(lookahead_batch, lookahead_output.hybrid_state)
-            lookahead_logits = lookahead_output.activations[:, 0]
+            lookahead_logits = lookahead_output.activations[: len(seqs), 0]
             bonus_token_ids = self._sample_fn(lookahead_logits, temperatures)
             bonus_tokens = [int(token_id) for token_id in bonus_token_ids.tolist()]
             return [[target_tokens[row], bonus_tokens[row]] for row in range(len(seqs))]
@@ -1809,16 +1856,12 @@ class CanonicalModelRunner:
 
         if accepted_rows:
             accepted_idx = jnp.array(accepted_rows, dtype=jnp.int32)
-            draft_batch = ScheduledBatch(
-                tokens=jnp.array(accepted_drafts, dtype=jnp.int32)[:, None],
-                positions=batch.positions[accepted_idx] + 1,
-                seq_ids=batch.seq_ids[accepted_idx],
-                query_start_loc=jnp.arange(len(accepted_rows) + 1, dtype=jnp.int32),
-                is_prefill=False,
-                num_prefill_tokens=0,
-                num_decode_tokens=len(accepted_rows),
-                block_tables=batch.block_tables[accepted_idx],
-                seq_lens=batch.seq_lens[accepted_idx] + 1,
+            draft_batch = self._masked_decode_batch(
+                batch,
+                accepted_rows,
+                token_values=accepted_drafts,
+                position_values=[int(batch.positions[row, 0]) + 1 for row in accepted_rows],
+                seq_len_values=[int(batch.seq_lens[row]) + 1 for row in accepted_rows],
             )
             draft_hybrid_state = self._batch_hybrid_state(draft_batch)
             draft_output = self._step_fn(draft_batch)(
@@ -1863,16 +1906,12 @@ class CanonicalModelRunner:
 
             if second_accept_rows:
                 second_idx = jnp.array(second_accept_rows, dtype=jnp.int32)
-                second_batch = ScheduledBatch(
-                    tokens=jnp.array(second_accept_drafts, dtype=jnp.int32)[:, None],
-                    positions=batch.positions[second_idx] + 2,
-                    seq_ids=batch.seq_ids[second_idx],
-                    query_start_loc=jnp.arange(len(second_accept_rows) + 1, dtype=jnp.int32),
-                    is_prefill=False,
-                    num_prefill_tokens=0,
-                    num_decode_tokens=len(second_accept_rows),
-                    block_tables=batch.block_tables[second_idx],
-                    seq_lens=batch.seq_lens[second_idx] + 2,
+                second_batch = self._masked_decode_batch(
+                    batch,
+                    second_accept_rows,
+                    token_values=second_accept_drafts,
+                    position_values=[int(batch.positions[row, 0]) + 2 for row in second_accept_rows],
+                    seq_len_values=[int(batch.seq_lens[row]) + 2 for row in second_accept_rows],
                 )
                 second_hybrid_state = self._batch_hybrid_state(second_batch)
                 second_output = self._step_fn(second_batch)(
@@ -2207,7 +2246,8 @@ class CanonicalModelRunner:
             "on",
             "True",
         }
-        partial_physical_batch = len(rows) < int(batch.tokens.shape[0])
+        physical_batch_size = int(batch.tokens.shape[0])
+        partial_physical_batch = rows != list(range(physical_batch_size))
         use_fused_step = (
             not use_debug
             and not force_scalar_mtp
@@ -2216,6 +2256,8 @@ class CanonicalModelRunner:
             and all(int(batch.query_lens[row]) == 1 for row in rows)
         )
         if not use_fused_step:
+            if int(batch.tokens.shape[0]) != 1 or rows != [0]:
+                return None
             for row in rows:
                 draft_value = self._mtp1_drafts.get(seqs[row].seq_id)
                 if isinstance(draft_value, list) and len(draft_value) > 1:
@@ -2241,6 +2283,12 @@ class CanonicalModelRunner:
             return None
         draft_token_chains = [chain[:draft_len] for chain in draft_chains]
         draft_tokens = [chain[0] for chain in draft_token_chains]
+        draft_token_chains_for_batch = [
+            [0 for _ in range(draft_len)]
+            for _ in range(physical_batch_size)
+        ]
+        for local_row, row in enumerate(rows):
+            draft_token_chains_for_batch[row] = draft_token_chains[local_row]
         verifier_draft_tokens = draft_tokens
         if os.environ.get("NANO_VLLM_JAX_MTP_FORCE_REJECT", "0") in {
             "1",
@@ -2250,16 +2298,15 @@ class CanonicalModelRunner:
             "True",
         }:
             verifier_draft_tokens = [-1 for _ in draft_tokens]
-        decode_batch = batch if partial_physical_batch else self._compact_decode_batch(batch, rows)
+        decode_batch = self._masked_decode_batch(batch, rows)
         hybrid_state = self._batch_hybrid_state(decode_batch)
         _ready(hybrid_state)
         t_profile = _mark("batch_hybrid_state", t_profile)
-        physical_batch_size = int(decode_batch.tokens.shape[0])
         verifier_draft_tokens_for_batch = [0 for _ in range(physical_batch_size)]
         next_mtp_positions_for_batch = [0 for _ in range(physical_batch_size)]
         for local_row, row in enumerate(rows):
-            verifier_draft_tokens_for_batch[row if partial_physical_batch else local_row] = verifier_draft_tokens[local_row]
-            next_mtp_positions_for_batch[row if partial_physical_batch else local_row] = (
+            verifier_draft_tokens_for_batch[row] = verifier_draft_tokens[local_row]
+            next_mtp_positions_for_batch[row] = (
                 mtp_seqs[local_row].num_tokens
                 + draft_len
                 + int(getattr(self, "mtp_position_offset", 0))
@@ -2312,6 +2359,7 @@ class CanonicalModelRunner:
         )
         use_mtp2_commit_select = (
             draft_len == 2
+            and not partial_physical_batch
             and hasattr(self.executor, "mtp2_commit_select_greedy_step_jit")
         )
         use_fast_all_accept = (
@@ -2380,7 +2428,7 @@ class CanonicalModelRunner:
                 decode_batch,
                 cache_storage=self.cache_storage,
                 hybrid_state=hybrid_state,
-                draft_tokens=jnp.array(draft_token_chains, dtype=jnp.int32),
+                draft_tokens=jnp.array(draft_token_chains_for_batch, dtype=jnp.int32),
                 next_mtp_position=next_mtp_positions,
                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
             )
@@ -2388,11 +2436,13 @@ class CanonicalModelRunner:
             t_profile = _mark("executor_mtp2_commit_select", t_profile)
             accepted_all = bool(jnp.all(output.accepted).item())
         else:
+            if partial_physical_batch:
+                return None
             output = self.executor.mtp_k_decode_greedy_step_jit(
                 decode_batch,
                 cache_storage=self.cache_storage,
                 hybrid_state=hybrid_state,
-                draft_tokens=jnp.array(draft_token_chains, dtype=jnp.int32),
+                draft_tokens=jnp.array(draft_token_chains_for_batch, dtype=jnp.int32),
                 next_mtp_position=next_mtp_positions,
                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
             )
@@ -2401,7 +2451,14 @@ class CanonicalModelRunner:
             accepted_all = bool(jnp.all(output.accepted).item())
         t_profile = _mark("host_result_transfer", t_profile)
 
-        accepted_all = bool(jnp.all(output.accepted).item())
+        if draft_len > 1:
+            accepted_all = all(
+                all(bool(value) for value in output.accepted.tolist()[row])
+                for row in rows
+            )
+        else:
+            output_acceptance_for_rows = [bool(x) for x in output.accepted.tolist()]
+            accepted_all = all(output_acceptance_for_rows[row] for row in rows)
         if (
             enable_rowwise_repair
             and (use_fast_all_accept or use_one_pass_k1)
@@ -2448,18 +2505,22 @@ class CanonicalModelRunner:
                     repair_rows.append(row)
 
             if repair_rows:
-                repair_seqs = [seqs[row] for row in repair_rows]
-                repair_batch = self._compact_decode_batch(batch, repair_rows)
+                repair_batch = self._masked_decode_batch(batch, repair_rows)
                 repair_outputs = self._run_main_and_sample(
-                    repair_seqs,
+                    seqs,
                     repair_batch,
                     seed_mtp1=self.mtp1_enabled,
                 )
-                for row, repair_output in zip(repair_rows, repair_outputs):
-                    outputs[row] = repair_output
+                for row in repair_rows:
+                    outputs[row] = repair_outputs[row]
             return outputs
 
-        if batch_accept_policy == "rowwise" and not enable_rowwise_repair and not accepted_all:
+        if (
+            batch_accept_policy == "rowwise"
+            and not enable_rowwise_repair
+            and not accepted_all
+            and not (use_one_pass_k1 or use_commit_select)
+        ):
             return None
 
         if not accepted_all and not (use_one_pass_k1 or use_commit_select) and draft_len == 1:
@@ -2606,19 +2667,20 @@ class CanonicalModelRunner:
         for local_row, row in enumerate(rows):
             seq = seqs[row]
             self._mtp1_drafts.pop(seq.seq_id, None)
+            idx = row
 
-            accepted = accepted_flags[local_row]
-            prefix_len = prefix_lengths[local_row]
+            accepted = accepted_flags[idx]
+            prefix_len = prefix_lengths[idx]
             if draft_len > 1 and prefix_len < draft_len:
                 stats["drafts_accepted"] += prefix_len
                 stats["drafts_rejected"] += 1
                 emitted_len = prefix_len + 1
                 if prefix_len == 0:
-                    outputs[row] = target_token_rows[local_row][0]
+                    outputs[row] = target_token_rows[idx][0]
                 else:
                     outputs[row] = (
                         draft_token_chains[local_row][:prefix_len]
-                        + [target_token_rows[local_row][prefix_len]]
+                        + [target_token_rows[idx][prefix_len]]
                     )
             elif accepted:
                 stats["drafts_accepted"] += draft_len
@@ -2628,11 +2690,11 @@ class CanonicalModelRunner:
                 else:
                     stats["bonus_tokens"] += 1
                     emitted_len = draft_len + 1
-                    outputs[row] = draft_token_chains[local_row] + [bonus_tokens[local_row]]
+                    outputs[row] = draft_token_chains[local_row] + [bonus_tokens[idx]]
             else:
                 stats["drafts_rejected"] += 1
                 emitted_len = 1
-                outputs[row] = target_tokens[local_row]
+                outputs[row] = target_tokens[idx]
 
             if (
                 self.mtp1_enabled
@@ -2640,7 +2702,7 @@ class CanonicalModelRunner:
                 and seq.num_completion_tokens + emitted_len < seq.max_tokens
                 and (prefix_len == 0 or seed_after_bonus)
             ):
-                next_chain = next_draft_chains[local_row]
+                next_chain = next_draft_chains[idx]
                 self._mtp1_drafts[seq.seq_id] = next_chain if len(next_chain) > 1 else next_chain[0]
                 stats["drafts_proposed"] += len(next_chain)
 
@@ -2877,14 +2939,14 @@ class CanonicalModelRunner:
                         outputs[row] = value
                     fallback_rows = [row for row in range(len(seqs)) if outputs[row] is None]
                     if fallback_rows:
-                        fallback_batch = self._compact_decode_batch(batch, fallback_rows)
+                        fallback_batch = self._masked_decode_batch(batch, fallback_rows)
                         fallback_outputs = self._run_main_and_sample(
-                            [seqs[row] for row in fallback_rows],
+                            seqs,
                             fallback_batch,
                             seed_mtp1=self.mtp1_enabled and seed_mtp1,
                         )
-                        for row, value in zip(fallback_rows, fallback_outputs):
-                            outputs[row] = value
+                        for row in fallback_rows:
+                            outputs[row] = fallback_outputs[row]
                     return [outputs[row] for row in range(len(seqs))]  # type: ignore[list-item]
             elif profile_mtp:
                 print(

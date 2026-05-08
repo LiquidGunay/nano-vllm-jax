@@ -36,6 +36,10 @@ class ScheduledBatch:
         return jnp.diff(self.query_start_loc).astype(jnp.int32)
 
     @property
+    def active_decode_rows(self) -> jnp.ndarray:
+        return (self.seq_ids >= 0) & (self.query_lens > 0)
+
+    @property
     def prefill_final_flags(self) -> list[bool]:
         if self.prefill_is_final is None:
             return [True] * self.batch_size
