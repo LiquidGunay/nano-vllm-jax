@@ -886,7 +886,7 @@ def _benchmark_modes_report() -> list[dict]:
     return [
         {"mode": "baseline", "status": "measured", "description": "No speculative decoding."},
         {"mode": "all-or-none MTP", "status": "measured_by_current_mtp_row", "description": "Fused verifier result is only useful when the configured MTP path accepts as implemented by the runner."},
-        {"mode": "rowwise MTP", "status": "available_via_runner_env", "description": "K=1 commit-select path when NANO_VLLM_JAX_MTP_COMMIT_SELECT=1 is enabled."},
+        {"mode": "rowwise MTP", "status": "available_via_runner_env", "description": "K=1 rowwise acceptance via NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY=rowwise on a fused verifier path."},
         {"mode": "groupwise g=2", "status": "not_implemented_in_harness", "description": "Harness reports the required mode but does not yet split speculative batches into fixed groups of 2."},
         {"mode": "groupwise g=4", "status": "not_implemented_in_harness", "description": "Harness reports the required mode but does not yet split speculative batches into fixed groups of 4."},
         {"mode": "adaptive MTP gating", "status": "documented_and_reported", "description": "Reports the configured adaptive gating formula and decision from observed baseline/speculative timings."},
