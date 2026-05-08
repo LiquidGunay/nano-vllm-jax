@@ -315,6 +315,13 @@ metrics after the correctness gate passed:
 - runner/device time: 4746.23 ms
 - postprocess time: 0.76 ms
 
+Additional warmed valid timed runs on the same pushed checkpoint:
+
+| batch | prompt lengths | exact match | acceptance | decode tok/s | decode speedup | end-to-end speedup |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 1 | `64` | pass | 42.70% | 62.77 | 0.801x | 0.902x |
+| 4 mixed | `32,64,96,128` | pass | 31.95% | 175.64 | 0.688x | 0.913x |
+
 The same continuous seeded setup failed with the fused two-token prefix verifier:
 B=1 diverged at generated token 101 and B=2 all-or-none also diverged. Treat
 those fused one-pass seeded numbers as invalid until slot-0 verifier logits are
