@@ -130,3 +130,130 @@ Archived reports show:
 - K=2 remains under validation.
 
 Historical raw reports are archived under `docs/archive/2026-05-pre-current-state/`.
+
+## TPU correctness checkpoint: 2026-05-08
+
+All commands below were run on the TPU VM with `--warmup`, `--correctness-only`,
+`--require-tpu`, exact token comparison, and HF next-step logit sanity enabled.
+Throughput fields are raw diagnostics only because correctness-only runs mark
+timed results invalid by design.
+
+### Prefix-safe forced reject, B2
+
+Configuration:
+
+```bash
+NANO_VLLM_JAX_MTP_FUSED_VERIFY=1 \
+NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED=1 \
+NANO_VLLM_JAX_MTP_PREFIX_SAFE=1 \
+NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY=rowwise \
+NANO_VLLM_JAX_MTP_FORCE_REJECT=1 \
+python benchmark_mtp1_engine.py \
+  --model Qwen/Qwen3.5-2B \
+  --max-tokens 32 \
+  --num-speculative-tokens 1 \
+  --compile-mtp-draft \
+  --batch-size-buckets 2 \
+  --batch-prompts 2 \
+  --prompt-lengths 32,64 \
+  --prefill-buckets 128 \
+  --warmup \
+  --correctness-only \
+  --check-hf-logits
+```
+
+Result summary:
+
+- Exact token match: true
+- HF logit sanity: true
+- First diff: null
+- Drafts proposed: 62
+- Drafts accepted: 0
+- Drafts rejected: 52
+- Accepted/rejected/fallback decode steps: 0 / 26 / 5
+- Raw decode TPS: 51.17
+- Raw decode speedup: 0.316x
+- Rejected inter-token latency p50/p95: 21.45 ms / 21.57 ms
+- Warmup: 6 shape runs, 29.91 s startup
+
+### Prefix-safe rowwise, B4 physical bucket with 3 active rows
+
+Configuration:
+
+```bash
+NANO_VLLM_JAX_MTP_FUSED_VERIFY=1 \
+NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED=1 \
+NANO_VLLM_JAX_MTP_PREFIX_SAFE=1 \
+NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY=rowwise \
+python benchmark_mtp1_engine.py \
+  --model Qwen/Qwen3.5-2B \
+  --max-tokens 32 \
+  --num-speculative-tokens 1 \
+  --compile-mtp-draft \
+  --max-num-seqs 4 \
+  --batch-size-buckets 4 \
+  --batch-prompts 3 \
+  --prompt-lengths 32,64,96 \
+  --prefill-buckets 128 \
+  --warmup \
+  --correctness-only \
+  --check-hf-logits
+```
+
+Result summary:
+
+- Exact token match: true
+- HF logit sanity: true
+- First diff: null
+- Drafts proposed: 49
+- Drafts accepted: 22
+- Drafts rejected: 8
+- Acceptance rate: 44.90%
+- Accepted/rejected/fallback decode steps: 10 / 0 / 14
+- Raw decode TPS: 96.30
+- Raw decode speedup: 0.536x
+- Accepted inter-token latency p50/p95: 12.02 ms / 15.08 ms
+- Fallback inter-token latency p50/p95: 8.91 ms / 9.71 ms
+- Warmup: 8 shape runs, 75.13 s startup
+
+### Prefix-safe rowwise, B2, 128 generated tokens/request
+
+Configuration:
+
+```bash
+NANO_VLLM_JAX_MTP_FUSED_VERIFY=1 \
+NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED=1 \
+NANO_VLLM_JAX_MTP_PREFIX_SAFE=1 \
+NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY=rowwise \
+python benchmark_mtp1_engine.py \
+  --model Qwen/Qwen3.5-2B \
+  --max-tokens 128 \
+  --num-speculative-tokens 1 \
+  --compile-mtp-draft \
+  --batch-size-buckets 2 \
+  --batch-prompts 2 \
+  --prompt-lengths 32,64 \
+  --prefill-buckets 128 \
+  --max-blocks-per-seq 24 \
+  --warmup \
+  --correctness-only \
+  --check-hf-logits
+```
+
+Result summary:
+
+- Exact token match: true
+- HF logit sanity: true
+- First diff: null
+- Completion tokens: 128 / 128 for both baseline and MTP
+- Drafts proposed: 146
+- Drafts accepted: 54
+- Drafts rejected: 23
+- Acceptance rate: 36.99%
+- Accepted/rejected/fallback decode steps: 36 / 3 / 63
+- Raw decode TPS: 83.05
+- Raw decode speedup: 0.543x
+- Accepted inter-token latency p50/p95: 13.10 ms / 15.25 ms
+- Rejected inter-token latency p50/p95: 22.92 ms / 22.97 ms
+- Fallback inter-token latency p50/p95: 10.36 ms / 10.69 ms
+- Warmup: 6 shape runs, 35.16 s startup
