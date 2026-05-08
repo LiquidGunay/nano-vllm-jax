@@ -257,3 +257,65 @@ Result summary:
 - Rejected inter-token latency p50/p95: 22.92 ms / 22.97 ms
 - Fallback inter-token latency p50/p95: 10.36 ms / 10.69 ms
 - Warmup: 6 shape runs, 35.16 s startup
+
+## Warmed TPU correctness checkpoint: seeded K=1 MTP
+
+Continuous seeded bonus drafts are valid only through the sequential
+commit-select verifier as of this checkpoint.
+
+Environment:
+
+```bash
+NANO_VLLM_JAX_MTP_FUSED_VERIFY=1
+NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED=1
+NANO_VLLM_JAX_MTP_PREFIX_SAFE=1
+NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY=rowwise
+NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS=1
+```
+
+Command shape:
+
+```bash
+python benchmark_mtp1_engine.py \
+  --model Qwen/Qwen3.5-2B \
+  --config-preset hf \
+  --prompt-suite expanded \
+  --max-tokens 128 \
+  --num-speculative-tokens 1 \
+  --compile-mtp-draft \
+  --dtype bfloat16 \
+  --backend tpu \
+  --jax-execution decode-jit \
+  --prefill-buckets 128 \
+  --num-kvcache-blocks 512 \
+  --max-blocks-per-seq 24 \
+  --require-tpu \
+  --warmup \
+  --correctness-only \
+  --check-hf-logits
+```
+
+Results:
+
+| batch | prompt lengths | exact match | HF sanity | acceptance | raw decode speedup |
+| --- | --- | --- | --- | ---: | ---: |
+| 1 | `64` | pass | pass | 42.70% | 0.865x |
+| 2 mixed | `32,64` | pass | pass | 44.32% | 0.777x |
+
+The same B=2 mixed run without `--correctness-only` produced valid timed
+metrics after the correctness gate passed:
+
+- prefill throughput: 36.73 tok/s
+- decode throughput: 115.93 tok/s
+- decode speedup versus baseline: 0.769x
+- end-to-end speedup versus baseline: 0.887x
+- acceptance rate: 44.32%
+- fallback count: 30
+- host time: 56.03 ms
+- runner/device time: 4746.23 ms
+- postprocess time: 0.76 ms
+
+The same continuous seeded setup failed with the fused two-token prefix verifier:
+B=1 diverged at generated token 101 and B=2 all-or-none also diverged. Treat
+those fused one-pass seeded numbers as invalid until slot-0 verifier logits are
+shown equivalent to a canonical one-token decode from the same state.

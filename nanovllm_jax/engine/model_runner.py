@@ -2328,6 +2328,15 @@ class CanonicalModelRunner:
             os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "0")
             in {"1", "true", "yes", "on", "True"}
         )
+        seed_after_bonus_enabled = (
+            os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0")
+            in {"1", "true", "yes", "on", "True"}
+        )
+        allow_seeded_one_pass_k1 = (
+            os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_SEEDED_ONE_PASS_K1", "0")
+            in {"1", "true", "yes", "on", "True"}
+        )
+        block_seeded_one_pass_k1 = seed_after_bonus_enabled and not allow_seeded_one_pass_k1
         enable_fast_all_accept = (
             (
                 allow_mixed_fused_k1
@@ -2348,6 +2357,7 @@ class CanonicalModelRunner:
             and not enable_fast_all_accept
             and (not force_commit_select or allow_mixed_fused_k1 or partial_physical_batch)
             and not disable_one_pass_k1
+            and not block_seeded_one_pass_k1
             and (enable_one_pass_k1 or allow_mixed_fused_k1 or partial_physical_batch)
             and hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
         )
@@ -2912,6 +2922,26 @@ class CanonicalModelRunner:
                 "on",
                 "True",
             }
+            seed_after_bonus_enabled = os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+            allow_seeded_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_SEEDED_ONE_PASS_K1", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+            one_pass_available_for_partial = (
+                hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
+                and os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1", "0")
+                not in {"1", "true", "yes", "on", "True"}
+                and (not seed_after_bonus_enabled or allow_seeded_one_pass_k1)
+            )
             homogeneous_full_batch = (
                 len(seqs) == batch.tokens.shape[0]
                 and len({seq.num_tokens for seq in seqs}) == 1
@@ -2919,9 +2949,10 @@ class CanonicalModelRunner:
             full_physical_batch = len(seqs) == batch.tokens.shape[0]
             partial_prefix_verifier = (
                 not full_physical_batch
-                and hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
-                and os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1", "0")
-                not in {"1", "true", "yes", "on", "True"}
+                and (
+                    one_pass_available_for_partial
+                    or hasattr(self.executor, "mtp1_commit_select_greedy_step_jit")
+                )
             )
             can_run_fused_batch = (
                 not force_reuse_fallback

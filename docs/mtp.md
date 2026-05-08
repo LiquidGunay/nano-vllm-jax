@@ -129,3 +129,37 @@ A K=2 implementation should pass these checks on TPU before speed conclusions:
 - first-token rejection continuation matches baseline,
 - second-token rejection continuation matches baseline,
 - mixed batch rows do not leak accepted or rejected state across rows.
+## Current K=1 correctness policy
+
+The continuous seeded path (`NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS=1`) must use
+the sequential commit-select verifier by default. Warmed TPU probes showed that
+the fused two-token prefix verifier can keep visible tokens matched for many
+steps and then diverge after a visibly correct accepted bonus, which means the
+next verifier can accept against a drifted or draft-contaminated state.
+
+The runner therefore blocks `mtp1_two_decode_greedy_step_jit` when seeded bonus
+drafts are enabled, unless `NANO_VLLM_JAX_MTP_ALLOW_SEEDED_ONE_PASS_K1=1` is set
+explicitly for experiments. The correctness path is
+`mtp1_commit_select_greedy_step_jit`: decode the current token first, compare it
+with the MTP draft, decode the accepted draft only for accepted rows, and select
+the committed KV/hybrid state on device.
+
+Validated TPU checkpoint:
+
+- `Qwen/Qwen3.5-2B`, bf16, warmed, decode-jit, B=1, 128 generated tokens:
+  exact MTP/baseline token match and HF logit sanity passed with continuous
+  seeded bonus drafts.
+- `Qwen/Qwen3.5-2B`, bf16, warmed, decode-jit, mixed B=2, prompt lengths
+  `32,64`, 128 generated tokens/request: exact MTP/baseline token match and HF
+  logit sanity passed with continuous seeded bonus drafts and rowwise acceptance.
+
+The fused one-pass K=1 verifier remains available only as an explicitly unsafe
+experiment for seeded bonus drafts. It needs a dedicated equivalence test that
+compares verifier slot-0 logits against a one-token baseline decode from the
+same state before it can be re-enabled for serving.
+
+Attempted fix that did not resolve the issue: switching the fused verifier's
+two-token block from cached-prefill metadata to decode metadata still reproduced
+the same seeded B=1 divergence at generated token 101. That points away from a
+simple attention metadata mode bug and toward prefix-state/logit equivalence
+drift in the fused path under consecutive accepted steps.
