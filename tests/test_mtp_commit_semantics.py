@@ -464,7 +464,7 @@ def test_k1_commit_reject_then_accept(monkeypatch):
 def test_k1_commit_block_boundary_defers_to_canonical_decode(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "1")
-    executor = _FakeExecutor([True], [10], [20], [30], [1], [8])
+    executor = _FakeExecutor([True], [10], [20], [30], [1], [8], [[0, 0]])
     runner = _FakeRunner(executor, {0: 10}, block_size=8)
 
     at_completed_block = [_seq(0, 8)]
