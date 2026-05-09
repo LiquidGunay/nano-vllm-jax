@@ -2691,9 +2691,16 @@ class CanonicalModelRunner:
                 idx = row
                 mismatch = (
                     target_tokens[idx] != parity_targets[idx]
-                    or bonus_tokens[idx] != parity_bonus[idx]
                     or accepted_flags[idx] != parity_accepted[idx]
-                    or next_draft_chains[idx][0] != parity_next[idx]
+                    or (
+                        accepted_flags[idx]
+                        and parity_accepted[idx]
+                        and bonus_tokens[idx] != parity_bonus[idx]
+                    )
+                    or (
+                        accepted_flags[idx] == parity_accepted[idx]
+                        and next_draft_chains[idx][0] != parity_next[idx]
+                    )
                 )
                 if mismatch:
                     seq = seqs[row]
