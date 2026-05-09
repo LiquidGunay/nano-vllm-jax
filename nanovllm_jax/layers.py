@@ -19,9 +19,11 @@ def rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndar
     Returns:
         Normalized output
     """
-    mean_sq = jnp.mean(x ** 2, axis=-1, keepdims=True)
-    x_norm = x / jnp.sqrt(mean_sq + eps)
-    return x_norm * (1.0 + weight)
+    input_dtype = x.dtype
+    x_f32 = x.astype(jnp.float32)
+    mean_sq = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
+    x_norm = x_f32 * lax.rsqrt(mean_sq + eps)
+    return x_norm.astype(input_dtype) * (1.0 + weight)
 
 
 def l2norm(x: jnp.ndarray, axis: int = -1, eps: float = 1e-6) -> jnp.ndarray:
@@ -35,8 +37,10 @@ def l2norm(x: jnp.ndarray, axis: int = -1, eps: float = 1e-6) -> jnp.ndarray:
     Returns:
         Normalized tensor
     """
-    norm = jnp.sqrt(jnp.sum(x ** 2, axis=axis, keepdims=True) + eps)
-    return x / norm
+    input_dtype = x.dtype
+    x_f32 = x.astype(jnp.float32)
+    norm = jnp.sqrt(jnp.sum(jnp.square(x_f32), axis=axis, keepdims=True) + eps)
+    return (x_f32 / norm).astype(input_dtype)
 
 
 def apply_rope(

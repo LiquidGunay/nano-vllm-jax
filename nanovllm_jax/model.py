@@ -1,5 +1,6 @@
 """Qwen 3.5 model implementation in pure JAX - matching HF exactly."""
 
+import os
 import jax
 import jax.numpy as jnp
 from jax import nn, lax
@@ -37,6 +38,27 @@ def _tokenwise_decode_dot(x: jnp.ndarray, weight: jnp.ndarray, *, force_width1: 
         out_t = jnp.dot(x[:, t : t + 1].reshape(batch, hidden), weight)
         outputs.append(out_t[:, None, :])
     return jnp.concatenate(outputs, axis=1)
+
+
+def _stable_rmsnorm_fp32(x: jnp.ndarray, weight: jnp.ndarray, eps: float) -> jnp.ndarray:
+    """Apply RMSNorm with an fp32 reduction and return the original dtype."""
+    x_dtype = x.dtype
+    x32 = x.astype(jnp.float32)
+    variance = jnp.mean(jnp.square(x32), axis=-1, keepdims=True)
+    y = x32 * lax.rsqrt(variance + eps)
+    y = y * weight.astype(jnp.float32)
+    return y.astype(x_dtype)
+
+
+def _force_width1_decode_math() -> bool:
+    """Opt-in diagnostic for width-1-shaped matmuls in multi-token decode."""
+    return os.environ.get("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH", "0") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "True",
+    }
 
 
 # Register ModelParams as a JAX pytree node for JIT compatibility
@@ -168,8 +190,8 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
     
     # Apply L2 norm if requested
     if use_qk_l2norm_in_kernel:
-        query = l2norm(query, axis=-1, eps=1e-6)
-        key = l2norm(key, axis=-1, eps=1e-6)
+        query = l2norm(query.astype(jnp.float32), axis=-1, eps=1e-6)
+        key = l2norm(key.astype(jnp.float32), axis=-1, eps=1e-6)
     
     # Convert to float32 for computation
     query = query.astype(jnp.float32)
@@ -529,7 +551,7 @@ def gated_deltanet_block(
     linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
     
     # === PROJECTIONS (same for both modes) ===
-    force_width1_dot = (not is_prefill) and seq_len > 1
+    force_width1_dot = (not is_prefill) and seq_len > 1 and _force_width1_decode_math()
     mixed_qkv = _tokenwise_decode_dot(x_cast, params["in_proj_qkv"], force_width1=force_width1_dot)
     z = _tokenwise_decode_dot(x_cast, params["in_proj_z"], force_width1=force_width1_dot).reshape(batch, seq_len, -1)
     a = _tokenwise_decode_dot(
@@ -869,10 +891,9 @@ def gated_deltanet_block(
     core_attn_out = core_attn_out.reshape(batch * seq_len, -1, config.linear_value_head_dim)  # [B*T, H, D]
     z = z.reshape(batch * seq_len, -1, config.linear_value_head_dim)  # [B*T, H, D]
     
-    # Apply gated RMSNorm per head (matching HF: compute in input dtype)
-    variance = (core_attn_out ** 2).mean(-1, keepdims=True)
-    core_attn_out = core_attn_out * jax.lax.rsqrt(variance + config.rms_norm_eps)
-    core_attn_out = params["norm_weight"] * core_attn_out
+    # Apply gated RMSNorm per head. HF-style RMSNorm computes the reduction in
+    # fp32, which also removes one source of width-dependent TPU bf16 drift.
+    core_attn_out = _stable_rmsnorm_fp32(core_attn_out, params["norm_weight"], config.rms_norm_eps)
     core_attn_out = core_attn_out * nn.silu(z)
     
     # Reshape back and project
@@ -880,7 +901,7 @@ def gated_deltanet_block(
     attn_out = _tokenwise_decode_dot(
         core_attn_out,
         params["out_proj"],
-        force_width1=(not is_prefill) and seq_len > 1,
+        force_width1=(not is_prefill) and seq_len > 1 and _force_width1_decode_math(),
     )
     
     if use_cached:
@@ -937,7 +958,7 @@ def full_attention_block(
         Using an explicit flatten+dot keeps row-wise projection numerically aligned
         between full-sequence and single-token calls across backends.
         """
-        if not is_prefill and seq_len > 1:
+        if not is_prefill and seq_len > 1 and _force_width1_decode_math():
             return _tokenwise_decode_dot(inp, weight, force_width1=True)
         out = jnp.dot(inp.reshape(-1, inp.shape[-1]), weight)
         return out.reshape(batch, seq_len, -1)
@@ -1137,7 +1158,7 @@ def full_attention_block(
     out = _tokenwise_decode_dot(
         out,
         params["o_proj"],
-        force_width1=(not is_prefill) and seq_len > 1,
+        force_width1=(not is_prefill) and seq_len > 1 and _force_width1_decode_math(),
     )
     
     if return_kv_prewrite:
@@ -1264,7 +1285,7 @@ def transformer_block(
     ffn_norm_out = x
 
     # MLP computation (stays in bfloat16)
-    force_width1_dot = (not is_prefill) and x.ndim == 3 and x.shape[1] > 1
+    force_width1_dot = (not is_prefill) and x.ndim == 3 and x.shape[1] > 1 and _force_width1_decode_math()
     gate = _tokenwise_decode_dot(x, params["gate_proj"], force_width1=force_width1_dot)
     up = _tokenwise_decode_dot(x, params["up_proj"], force_width1=force_width1_dot)
     x = get_activation(config.hidden_act)(gate) * up
@@ -1436,7 +1457,7 @@ def forward_step(
     logits = _tokenwise_decode_dot(
         x,
         output_weight,
-        force_width1=(not is_prefill) and seq_len > 1,
+        force_width1=(not is_prefill) and seq_len > 1 and _force_width1_decode_math(),
     )
     if return_hidden:
         hidden_result = (hidden_pre, logits) if return_hidden_with_logits else hidden_pre

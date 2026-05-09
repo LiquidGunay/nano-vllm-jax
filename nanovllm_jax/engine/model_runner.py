@@ -3009,11 +3009,13 @@ class CanonicalModelRunner:
                 emitted_len = 1
                 outputs[row] = target_tokens[idx]
 
+            emitted_bonus = accepted and not disable_bonus
+            can_seed_next_chain = prefix_len < draft_len or seed_after_bonus
             if (
                 self.mtp1_enabled
                 and seq.temperature == 0
                 and seq.num_completion_tokens + emitted_len < seq.max_tokens
-                and (prefix_len == 0 or seed_after_bonus)
+                and can_seed_next_chain
                 and (
                     max_seeded_chain <= 0
                     or self._mtp1_seeded_chain.get(seq.seq_id, 0) < max_seeded_chain
@@ -3021,8 +3023,12 @@ class CanonicalModelRunner:
             ):
                 next_chain = next_draft_chains[idx]
                 self._mtp1_drafts[seq.seq_id] = next_chain if len(next_chain) > 1 else next_chain[0]
+                seeded_increment = max(
+                    1,
+                    min(draft_len, emitted_len - (1 if emitted_bonus else 0)),
+                )
                 self._mtp1_seeded_chain[seq.seq_id] = (
-                    self._mtp1_seeded_chain.get(seq.seq_id, 0) + emitted_len
+                    self._mtp1_seeded_chain.get(seq.seq_id, 0) + seeded_increment
                 )
                 stats["drafts_proposed"] += len(next_chain)
             else:
