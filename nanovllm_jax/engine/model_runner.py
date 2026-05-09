@@ -2391,6 +2391,14 @@ class CanonicalModelRunner:
             in {"1", "true", "yes", "on", "True"}
             and hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
         )
+        parity_debug_one_pass = (
+            draft_len == 1
+            and use_one_pass_k1
+            and os.environ.get("NANO_VLLM_JAX_MTP_PARITY_DEBUG", "0")
+            in {"1", "true", "yes", "on", "True"}
+            and hasattr(self.executor, "mtp1_commit_select_greedy_step_jit")
+        )
+        parity_output = None
         if use_one_pass_k1:
             output = self.executor.mtp1_two_decode_greedy_step_jit(
                 decode_batch,
@@ -2402,6 +2410,17 @@ class CanonicalModelRunner:
             )
             _ready(output)
             t_profile = _mark("executor_mtp1_one_pass_prefix", t_profile)
+            if parity_debug_one_pass:
+                parity_output = self.executor.mtp1_commit_select_greedy_step_jit(
+                    decode_batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state=hybrid_state,
+                    draft_token=jnp.array(verifier_draft_tokens_for_batch, dtype=jnp.int32),
+                    next_mtp_position=next_mtp_positions,
+                    mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                )
+                _ready(parity_output)
+                t_profile = _mark("executor_mtp1_parity_commit_select", t_profile)
         elif use_commit_select:
             output = self.executor.mtp1_commit_select_greedy_step_jit(
                 decode_batch,
@@ -2663,6 +2682,41 @@ class CanonicalModelRunner:
             next_draft_chains = [[int(x)] for x in output.next_draft_token.tolist()]
         else:
             next_draft_chains = [[int(token) for token in chain] for chain in output.next_draft_token.tolist()]
+        if parity_output is not None:
+            parity_targets = [int(x) for x in parity_output.target_token.tolist()]
+            parity_bonus = [int(x) for x in parity_output.bonus_token.tolist()]
+            parity_accepted = [bool(x) for x in parity_output.accepted.tolist()]
+            parity_next = [int(x) for x in parity_output.next_draft_token.tolist()]
+            for local_row, row in enumerate(rows):
+                idx = row
+                mismatch = (
+                    target_tokens[idx] != parity_targets[idx]
+                    or bonus_tokens[idx] != parity_bonus[idx]
+                    or accepted_flags[idx] != parity_accepted[idx]
+                    or next_draft_chains[idx][0] != parity_next[idx]
+                )
+                if mismatch:
+                    seq = seqs[row]
+                    print(
+                        "[MTP_PARITY] one_pass_vs_commit_select "
+                        f"seq_id={seq.seq_id} row={row} "
+                        f"seq_tokens={seq.num_tokens} completion={seq.num_completion_tokens} "
+                        f"draft={draft_token_chains[local_row][0]} "
+                        f"target_one={target_tokens[idx]} target_commit={parity_targets[idx]} "
+                        f"bonus_one={bonus_tokens[idx]} bonus_commit={parity_bonus[idx]} "
+                        f"accepted_one={accepted_flags[idx]} accepted_commit={parity_accepted[idx]} "
+                        f"next_one={next_draft_chains[idx][0]} next_commit={parity_next[idx]}",
+                        flush=True,
+                    )
+                    if os.environ.get("NANO_VLLM_JAX_MTP_PARITY_STOP", "0") in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                        "True",
+                    }:
+                        raise RuntimeError("MTP one-pass parity mismatch")
+                    break
         t_profile = _mark("accepted_result_transfer", t_profile)
         outputs: dict[int, List[int] | int] = {}
         stats = self._speculative_stats()

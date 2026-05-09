@@ -63,9 +63,27 @@ simple prefill/decode metadata toggle.
 
 ## Required parity diagnostic
 
-Add a TPU-only diagnostic harness that pauses on accepted seeded K=1 steps and
-compares the fused one-pass verifier against sequential commit-select from the
-same pre-step state.
+The first diagnostic hook is implemented in the runner:
+
+```text
+NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1=1
+NANO_VLLM_JAX_MTP_PARITY_DEBUG=1
+```
+
+When unsafe one-pass K=1 is selected, the runner also executes
+`mtp1_commit_select_greedy_step_jit` from the same pre-step cache/hybrid state
+and prints the first target/bonus/acceptance/next-draft mismatch:
+
+```text
+[MTP_PARITY] one_pass_vs_commit_select ...
+```
+
+Use `NANO_VLLM_JAX_MTP_PARITY_STOP=1` to stop at the first mismatch. This is
+intentionally a diagnostic-only path and is not used for throughput.
+
+The next, deeper harness should pause on accepted seeded K=1 steps and compare
+the fused one-pass verifier against sequential commit-select from the same
+pre-step state.
 
 For each accepted row, compare:
 
