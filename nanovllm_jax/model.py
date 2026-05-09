@@ -21,6 +21,24 @@ class ModelParams:
     mtp_params: Optional['MTPParams'] = None  # MTP head parameters for speculative decoding
 
 
+def _tokenwise_decode_dot(x: jnp.ndarray, weight: jnp.ndarray, *, force_width1: bool = False) -> jnp.ndarray:
+    """Apply a tokenwise linear with width-1 matmul shapes for multi-token decode.
+
+    TPU bf16 matmuls can be shape dependent. For cached speculative decode, the
+    first token in a width-2 verifier must match a standalone width-1 decode
+    before any commit decision. Slicing the sequence dimension keeps the matmul
+    shape aligned with sequential decode while preserving one compiled graph.
+    """
+    if not force_width1 or x.ndim != 3 or x.shape[1] <= 1:
+        return jnp.dot(x, weight)
+    batch, seq_len, hidden = x.shape
+    outputs = []
+    for t in range(seq_len):
+        out_t = jnp.dot(x[:, t : t + 1].reshape(batch, hidden), weight)
+        outputs.append(out_t[:, None, :])
+    return jnp.concatenate(outputs, axis=1)
+
+
 # Register ModelParams as a JAX pytree node for JIT compatibility
 def _model_params_flatten(params: ModelParams):
     """Flatten ModelParams into children and auxiliary data."""
@@ -329,7 +347,7 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
 
 
 def jax_recurrent_gated_delta_rule(
-    query, key, value, g, beta, 
+    query, key, value, g, beta,
     initial_state=None,
     use_qk_l2norm_in_kernel=False,
     return_state_sequence: bool = False,
@@ -341,53 +359,96 @@ def jax_recurrent_gated_delta_rule(
     State shape: [B, H, k_head_dim, v_head_dim] (per-head state, matching HF)
     """
     initial_dtype = query.dtype
-    
-    # Apply L2 norm if requested
+
+    # Keep as [B, H, T, D]. For cached decode, normalize q/k in
+    # float32 before l2norm so width-2 recurrent scans match the width-1
+    # sequential decode path as closely as possible on TPU bf16.
+    query = query.astype(jnp.float32)
+    key = key.astype(jnp.float32)
     if use_qk_l2norm_in_kernel:
         query = l2norm(query, axis=-1, eps=1e-6)
         key = l2norm(key, axis=-1, eps=1e-6)
-    
-    # Keep as [B, H, T, D], convert to float32
-    query = query.astype(jnp.float32)
-    key = key.astype(jnp.float32)
     value = value.astype(jnp.float32)
     g = g.astype(jnp.float32)
     beta = beta.astype(jnp.float32)
-    
+
     batch, num_heads, time_dim, k_head_dim = query.shape
     v_head_dim = value.shape[-1]
-    
+
     # Scale query
     query = query * (1.0 / jnp.sqrt(k_head_dim))
-    
+
     # Initialize state: [B, H, K, V] (per-head state, matching HF)
     if initial_state is None:
         state = jnp.zeros((batch, num_heads, k_head_dim, v_head_dim), dtype=jnp.float32)
     else:
         state = initial_state.astype(jnp.float32)
-    
-    # Process each time step
+
+    def step_one(state, q_t, k_t, v_t, g_t_raw, beta_t):
+        g_t = jnp.exp(g_t_raw)  # [B, H]
+
+        # Reshape for broadcasting
+        g_t_exp = g_t[:, :, None, None]    # [B, H, 1, 1]
+        beta_t_exp = beta_t[:, :, None]    # [B, H, 1]
+        k_t_exp = k_t[:, :, :, None]       # [B, H, D, 1]
+
+        # Decay state: state * exp(g_t)
+        state = state * g_t_exp
+
+        # kv_mem = (state * k_t[..., None]).sum(-2)
+        kv_mem = jnp.einsum('bhkv,bhk->bhv', state, k_t)
+
+        # delta = (v_t - kv_mem) * beta_t
+        delta = (v_t - kv_mem) * beta_t_exp  # [B, H, V]
+
+        # state = state + k_t[..., None] * delta[..., None, :]
+        state = state + k_t_exp * delta[:, :, None, :]
+
+        # output_t = (state * q_t[..., None]).sum(-2)
+        out_t = jnp.einsum('bhkv,bhk->bhv', state, q_t)
+
+        return state, out_t
+
+    def step_index(state, t):
+        return step_one(
+            state,
+            query[:, :, t, :],
+            key[:, :, t, :],
+            value[:, :, t, :],
+            g[:, :, t],
+            beta[:, :, t],
+        )
+
+    if time_dim == 2:
+        # Cached K=1 verifier uses width-2 decode. Avoid a two-step scan so the
+        # first token is computed as the same explicit width-1 recurrence used by
+        # the sequential commit-select reference, then apply the second token.
+        state_0, out_0 = step_one(
+            state,
+            query[:, :, 0, :],
+            key[:, :, 0, :],
+            value[:, :, 0, :],
+            g[:, :, 0],
+            beta[:, :, 0],
+        )
+        state_1, out_1 = step_one(
+            state_0,
+            query[:, :, 1, :],
+            key[:, :, 1, :],
+            value[:, :, 1, :],
+            g[:, :, 1],
+            beta[:, :, 1],
+        )
+        output = jnp.stack([out_0, out_1], axis=2).astype(initial_dtype)
+        if return_state_sequence:
+            state_sequence = jnp.stack([state_0, state_1], axis=1)
+            return output, state_1, state_sequence
+        return output, state_1
+
     if return_state_sequence:
         def step_fn(carry, t):
-            state = carry  # [B, H, K, V]
-            
-            q_t = query[:, :, t, :]
-            k_t = key[:, :, t, :]
-            v_t = value[:, :, t, :]
-            g_t = jnp.exp(g[:, :, t])
-            beta_t = beta[:, :, t]
-            
-            g_t_exp = g_t[:, :, None, None]
-            beta_t_exp = beta_t[:, :, None]
-            k_t_exp = k_t[:, :, :, None]
-            
-            state = state * g_t_exp
-            kv_mem = jnp.einsum('bhkv,bhk->bhv', state, k_t)
-            delta = (v_t - kv_mem) * beta_t_exp
-            state = state + k_t_exp * delta[:, :, None, :]
-            out_t = jnp.einsum('bhkv,bhk->bhv', state, q_t)
-            
-            return state, (out_t, state)
+            next_state, out_t = step_index(carry, t)
+            return next_state, (out_t, next_state)
 
         final_state, (all_outputs, all_states) = lax.scan(step_fn, state, jnp.arange(time_dim))
         output = all_outputs.transpose(1, 2, 0, 3)
@@ -396,48 +457,15 @@ def jax_recurrent_gated_delta_rule(
         return output, final_state, state_sequence
 
     def step_fn(carry, t):
-        state = carry  # [B, H, K, V]
-        
-        # Get data for this time step: indexing dim 2 (T dimension)
-        q_t = query[:, :, t, :]      # [B, H, D]
-        k_t = key[:, :, t, :]        # [B, H, D]
-        v_t = value[:, :, t, :]      # [B, H, V]
-        g_t = jnp.exp(g[:, :, t])    # [B, H]
-        beta_t = beta[:, :, t]       # [B, H]
-        
-        # Reshape for broadcasting
-        g_t_exp = g_t[:, :, None, None]    # [B, H, 1, 1]
-        beta_t_exp = beta_t[:, :, None]    # [B, H, 1]
-        k_t_exp = k_t[:, :, :, None]       # [B, H, D, 1]
-        q_t_exp = q_t[:, :, :, None]       # [B, H, D, 1]
-        
-        # Decay state: state * exp(g_t)
-        state = state * g_t_exp
-        
-        # kv_mem = (state * k_t[..., None]).sum(-2)
-        # state: [B, H, K, V], k_t: [B, H, K]
-        # kv_mem: [B, H, V]
-        kv_mem = jnp.einsum('bhkv,bhk->bhv', state, k_t)
-        
-        # delta = (v_t - kv_mem) * beta_t
-        delta = (v_t - kv_mem) * beta_t_exp  # [B, H, V]
-        
-        # state = state + k_t[..., None] * delta[..., None, :]
-        state = state + k_t_exp * delta[:, :, None, :]
-        
-        # output_t = (state * q_t[..., None]).sum(-2)
-        out_t = jnp.einsum('bhkv,bhk->bhv', state, q_t)
-        
-        return state, out_t
-    
+        return step_index(carry, t)
+
     final_state, all_outputs = lax.scan(step_fn, state, jnp.arange(time_dim))
-    
+
     # all_outputs: [T, B, H, V] -> transpose to [B, H, T, V]
     output = all_outputs.transpose(1, 2, 0, 3)
-    
+
     output = output.astype(initial_dtype)
     return output, final_state
-
 
 
 def gated_deltanet_block(
@@ -501,10 +529,19 @@ def gated_deltanet_block(
     linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
     
     # === PROJECTIONS (same for both modes) ===
-    mixed_qkv = jnp.dot(x_cast, params["in_proj_qkv"])
-    z = jnp.dot(x_cast, params["in_proj_z"]).reshape(batch, seq_len, -1)
-    a = jnp.dot(x_cast, params["in_proj_a"]).reshape(batch, seq_len, config.linear_num_value_heads)
-    b = jnp.dot(x_cast, params["in_proj_b"]).reshape(batch, seq_len, config.linear_num_value_heads)
+    force_width1_dot = (not is_prefill) and seq_len > 1
+    mixed_qkv = _tokenwise_decode_dot(x_cast, params["in_proj_qkv"], force_width1=force_width1_dot)
+    z = _tokenwise_decode_dot(x_cast, params["in_proj_z"], force_width1=force_width1_dot).reshape(batch, seq_len, -1)
+    a = _tokenwise_decode_dot(
+        x_cast,
+        params["in_proj_a"],
+        force_width1=force_width1_dot,
+    ).reshape(batch, seq_len, config.linear_num_value_heads)
+    b = _tokenwise_decode_dot(
+        x_cast,
+        params["in_proj_b"],
+        force_width1=force_width1_dot,
+    ).reshape(batch, seq_len, config.linear_num_value_heads)
     
     if use_cached:
         # === DECODE MODE ===
@@ -516,12 +553,7 @@ def gated_deltanet_block(
         conv_weight = params["conv1d_weight"].reshape(conv_dim, config.linear_conv_kernel_size)
         conv_bias = params.get("conv1d_bias")
 
-        def conv_step(state, t):
-            mixed_qkv_t_step = lax.dynamic_slice(
-                mixed_qkv_t,
-                (0, 0, t),
-                (batch, conv_dim, 1),
-            )
+        def conv_step(state, mixed_qkv_t_step):
             conv_out_t, next_state = causal_conv1d_update(
                 mixed_qkv_t_step,
                 state,
@@ -531,23 +563,32 @@ def gated_deltanet_block(
             )
             return next_state, conv_out_t
 
-        if return_prefix_state:
-            def conv_step_with_state(state, t):
-                next_state, conv_out_t = conv_step(state, t)
-                return next_state, (conv_out_t, next_state)
-
-            new_layer_conv_state, (conv_out_steps, conv_state_steps) = lax.scan(
-                conv_step_with_state,
-                layer_conv_state,
-                jnp.arange(seq_len),
+        if seq_len > 1:
+            # Match sequential decode exactly: unroll static width-1 conv updates
+            # instead of scanning over a width-2 tensor. Each call sees [B, D, 1],
+            # the same shape used by the normal single-token decode path.
+            state = layer_conv_state
+            conv_out_parts = []
+            conv_state_parts = []
+            for t in range(seq_len):
+                state, conv_out_t = conv_step(state, mixed_qkv_t[:, :, t : t + 1])
+                conv_out_parts.append(conv_out_t)
+                if return_prefix_state:
+                    conv_state_parts.append(state)
+            new_layer_conv_state = state
+            conv_out_steps = jnp.stack(conv_out_parts, axis=0)
+            prefix_layer_conv_state = (
+                jnp.stack(conv_state_parts, axis=0).transpose(1, 0, 2, 3)
+                if return_prefix_state
+                else None
             )
-            prefix_layer_conv_state = conv_state_steps.transpose(1, 0, 2, 3)
+        elif return_prefix_state:
+            new_layer_conv_state, conv_out_t = conv_step(layer_conv_state, mixed_qkv_t[:, :, :1])
+            conv_out_steps = conv_out_t[None, ...]
+            prefix_layer_conv_state = new_layer_conv_state[:, None, :, :]
         else:
-            new_layer_conv_state, conv_out_steps = lax.scan(
-                conv_step,
-                layer_conv_state,
-                jnp.arange(seq_len),
-            )
+            new_layer_conv_state, conv_out_t = conv_step(layer_conv_state, mixed_qkv_t[:, :, :1])
+            conv_out_steps = conv_out_t[None, ...]
             prefix_layer_conv_state = None
         conv_out = conv_out_steps.transpose(1, 0, 2, 3).reshape(batch, seq_len, conv_dim)
         
@@ -578,6 +619,7 @@ def gated_deltanet_block(
         # linear_layer_idx computed above
         initial_recurrent = hybrid_state.recurrent_state[:, linear_layer_idx] if hybrid_state.recurrent_state is not None else None
 
+        use_recurrent_decode_scan = return_prefix_state or seq_len > 1
         if return_prefix_state:
             core_attn_out, new_recurrent_state_single, recurrent_state_steps = jax_recurrent_gated_delta_rule(
                 query,
@@ -587,9 +629,21 @@ def gated_deltanet_block(
                 beta,
                 initial_state=initial_recurrent,
                 use_qk_l2norm_in_kernel=True,
-                return_state_sequence=True,
+                return_state_sequence=return_prefix_state,
             )
             prefix_recurrent_state_single = recurrent_state_steps
+        elif use_recurrent_decode_scan:
+            core_attn_out, new_recurrent_state_single = jax_recurrent_gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                initial_state=initial_recurrent,
+                use_qk_l2norm_in_kernel=True,
+                return_state_sequence=False,
+            )
+            prefix_recurrent_state_single = None
         else:
             core_attn_out, new_recurrent_state_single = backend.gated_delta_decode(
                 query, key, value, g, beta,
@@ -816,7 +870,6 @@ def gated_deltanet_block(
     z = z.reshape(batch * seq_len, -1, config.linear_value_head_dim)  # [B*T, H, D]
     
     # Apply gated RMSNorm per head (matching HF: compute in input dtype)
-    input_dtype = core_attn_out.dtype
     variance = (core_attn_out ** 2).mean(-1, keepdims=True)
     core_attn_out = core_attn_out * jax.lax.rsqrt(variance + config.rms_norm_eps)
     core_attn_out = params["norm_weight"] * core_attn_out
@@ -824,7 +877,11 @@ def gated_deltanet_block(
     
     # Reshape back and project
     core_attn_out = core_attn_out.reshape(batch, seq_len, -1)
-    attn_out = jnp.dot(core_attn_out, params["out_proj"])
+    attn_out = _tokenwise_decode_dot(
+        core_attn_out,
+        params["out_proj"],
+        force_width1=(not is_prefill) and seq_len > 1,
+    )
     
     if use_cached:
         if return_prefix_state:
@@ -851,6 +908,7 @@ def full_attention_block(
     layer_idx: int = 0,
     attention_metadata: Optional[AttentionMetadata] = None,
     backend: Optional[InferenceBackend] = None,
+    return_kv_prewrite: bool = False,
 ):
     """Full attention block with optional KV cache support.
     
@@ -879,6 +937,8 @@ def full_attention_block(
         Using an explicit flatten+dot keeps row-wise projection numerically aligned
         between full-sequence and single-token calls across backends.
         """
+        if not is_prefill and seq_len > 1:
+            return _tokenwise_decode_dot(inp, weight, force_width1=True)
         out = jnp.dot(inp.reshape(-1, inp.shape[-1]), weight)
         return out.reshape(batch, seq_len, -1)
     
@@ -886,33 +946,86 @@ def full_attention_block(
     # q_proj: [hidden_size, hidden_size] -> output split into query and gate
     # query: [batch, seq_len, num_attention_heads * head_dim]
     # gate: [batch, seq_len, num_attention_heads * head_dim]
-    q_gate = _proj(x_cast, params["q_proj"])
     attn_out_dim = config.num_attention_heads * config.head_dim
+    force_width1_full_attn = False  # gated off: worsened parity; keep branch dormant for targeted experiments
+
+    if force_width1_full_attn:
+        query_parts = []
+        k_parts = []
+        v_parts = []
+        gate_parts = []
+        for t in range(seq_len):
+            x_t = x_cast[:, t : t + 1, :]
+            hidden_t = x_t.shape[-1]
+            q_gate_t = jnp.dot(x_t.reshape(batch, hidden_t), params["q_proj"])[:, None, :]
+            q_gate_t = q_gate_t.reshape(batch, 1, config.num_attention_heads, 2 * config.head_dim)
+            query_t, gate_t = jnp.split(q_gate_t, 2, axis=-1)
+            k_t = jnp.dot(x_t.reshape(batch, hidden_t), params["k_proj"])[:, None, :].reshape(
+                batch, 1, config.num_key_value_heads, config.head_dim
+            )
+            v_t = jnp.dot(x_t.reshape(batch, hidden_t), params["v_proj"])[:, None, :].reshape(
+                batch, 1, config.num_key_value_heads, config.head_dim
+            )
+
+            query_t = rms_norm(query_t, params["q_norm"], config.rms_norm_eps).transpose(0, 2, 1, 3)
+            k_t = rms_norm(k_t, params["k_norm"], config.rms_norm_eps).transpose(0, 2, 1, 3)
+            v_t = v_t.transpose(0, 2, 1, 3)
+            pos_t = positions[:, :, t : t + 1] if positions.ndim == 3 else positions[:, t : t + 1]
+            query_t = apply_rope(
+                query_t,
+                pos_t,
+                config.head_dim,
+                config.rope_theta,
+                config.partial_rotary_factor,
+                layout="BHTD",
+                mrope_section=config.mrope_section,
+            )
+            k_t = apply_rope(
+                k_t,
+                pos_t,
+                config.head_dim,
+                config.rope_theta,
+                config.partial_rotary_factor,
+                layout="BHTD",
+                mrope_section=config.mrope_section,
+            )
+            query_parts.append(query_t)
+            k_parts.append(k_t)
+            v_parts.append(v_t)
+            gate_parts.append(gate_t.reshape(batch, 1, -1))
+        query = jnp.concatenate(query_parts, axis=2)
+        k = jnp.concatenate(k_parts, axis=2)
+        v = jnp.concatenate(v_parts, axis=2)
+        gate = jnp.concatenate(gate_parts, axis=1)
+    else:
+        q_gate = _proj(x_cast, params["q_proj"])
+        q_gate_reshaped = q_gate.reshape(batch, seq_len, config.num_attention_heads, 2 * config.head_dim)
+        query, gate = jnp.split(q_gate_reshaped, 2, axis=-1)
+        gate = gate.reshape(batch, seq_len, -1)
+
+        k = _proj(x_cast, params["k_proj"]).reshape(
+            batch, seq_len, config.num_key_value_heads, config.head_dim
+        )
+        v = _proj(x_cast, params["v_proj"]).reshape(
+            batch, seq_len, config.num_key_value_heads, config.head_dim
+        )
+
+        # Apply RMSNorm BEFORE transpose (on head dimension, in [B, T, H, D] layout)
+        query = rms_norm(query, params["q_norm"], config.rms_norm_eps)
+        k = rms_norm(k, params["k_norm"], config.rms_norm_eps)
+
+        # Transpose to [B, H, T, D]
+        query = query.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        # Apply RoPE (now in [B, H, T, D] layout)
+        query = apply_rope(query, positions, config.head_dim, config.rope_theta, config.partial_rotary_factor, layout="BHTD", mrope_section=config.mrope_section)
+        k = apply_rope(k, positions, config.head_dim, config.rope_theta, config.partial_rotary_factor, layout="BHTD", mrope_section=config.mrope_section)
     
-    q_gate_reshaped = q_gate.reshape(batch, seq_len, config.num_attention_heads, 2 * config.head_dim)
-    query, gate = jnp.split(q_gate_reshaped, 2, axis=-1)
-    gate = gate.reshape(batch, seq_len, -1)
-    
-    k = _proj(x_cast, params["k_proj"]).reshape(
-        batch, seq_len, config.num_key_value_heads, config.head_dim
-    )
-    v = _proj(x_cast, params["v_proj"]).reshape(
-        batch, seq_len, config.num_key_value_heads, config.head_dim
-    )
-    
-    # Apply RMSNorm BEFORE transpose (on head dimension, in [B, T, H, D] layout)
-    query = rms_norm(query, params["q_norm"], config.rms_norm_eps)
-    k = rms_norm(k, params["k_norm"], config.rms_norm_eps)
-    
-    # Transpose to [B, H, T, D]
-    query = query.transpose(0, 2, 1, 3)
-    k = k.transpose(0, 2, 1, 3)
-    v = v.transpose(0, 2, 1, 3)
-    
-    # Apply RoPE (now in [B, H, T, D] layout)
-    query = apply_rope(query, positions, config.head_dim, config.rope_theta, config.partial_rotary_factor, layout="BHTD", mrope_section=config.mrope_section)
-    k = apply_rope(k, positions, config.head_dim, config.rope_theta, config.partial_rotary_factor, layout="BHTD", mrope_section=config.mrope_section)
-    
+    prewrite_k_cache_input = jnp.zeros((batch, seq_len, config.num_key_value_heads, config.head_dim), dtype=dtype)
+    prewrite_v_cache_input = jnp.zeros((batch, seq_len, config.num_key_value_heads, config.head_dim), dtype=dtype)
+
     num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
     
     if kv_cache_state is not None:
@@ -922,6 +1035,8 @@ def full_attention_block(
         # Transpose K, V back to [B, T, K, H] for cache storage
         k_cache_input = k.transpose(0, 2, 1, 3)  # [B, T, K, H]
         v_cache_input = v.transpose(0, 2, 1, 3)  # [B, T, K, H]
+        prewrite_k_cache_input = k_cache_input
+        prewrite_v_cache_input = v_cache_input
 
         metadata = attention_metadata
         if metadata is None:
@@ -945,16 +1060,58 @@ def full_attention_block(
         # Backend attention expects [batch, seq_len, num_heads, head_dim] (BTNH)
         query_btnh = query.transpose(0, 2, 1, 3)  # [batch, seq_len, num_heads, head_dim]
 
-        out = backend.attention(
-            layer_id=layer_idx,
-            query=query_btnh,
-            cache=cache_storage,
-            metadata=metadata,
-            block_size=config.block_size,
-            scale=1.0 / jnp.sqrt(config.head_dim),
-            num_key_value_groups=num_key_value_groups,
-            is_prefill=is_prefill,
-        )
+        if not is_prefill and seq_len > 1 and metadata.positions is not None:
+            query_lens = jnp.diff(metadata.query_start_loc).astype(jnp.int32)
+            step_outputs = []
+            for t in range(seq_len):
+                step_active = query_lens > t
+                step_positions = metadata.positions[:, t : t + 1]
+                step_query_lens = step_active.astype(jnp.int32)
+                step_query_start_loc = jnp.concatenate(
+                    [
+                        jnp.zeros((1,), dtype=jnp.int32),
+                        jnp.cumsum(step_query_lens),
+                    ]
+                )
+                step_seq_lens = jnp.where(
+                    step_active,
+                    step_positions[:, 0] + jnp.asarray(1, dtype=step_positions.dtype),
+                    jnp.zeros_like(metadata.seq_lens),
+                )
+                step_metadata = backend.build_attention_metadata(
+                    positions=step_positions,
+                    block_tables=metadata.block_tables,
+                    seq_lens=step_seq_lens,
+                    block_size=config.block_size,
+                    is_prefill=False,
+                    query_start_loc=step_query_start_loc,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=jnp.sum(step_query_lens),
+                )
+                step_outputs.append(
+                    backend.attention(
+                        layer_id=layer_idx,
+                        query=query_btnh[:, t : t + 1],
+                        cache=cache_storage,
+                        metadata=step_metadata,
+                        block_size=config.block_size,
+                        scale=1.0 / jnp.sqrt(config.head_dim),
+                        num_key_value_groups=num_key_value_groups,
+                        is_prefill=False,
+                    )
+                )
+            out = jnp.concatenate(step_outputs, axis=1)
+        else:
+            out = backend.attention(
+                layer_id=layer_idx,
+                query=query_btnh,
+                cache=cache_storage,
+                metadata=metadata,
+                block_size=config.block_size,
+                scale=1.0 / jnp.sqrt(config.head_dim),
+                num_key_value_groups=num_key_value_groups,
+                is_prefill=is_prefill,
+            )
         
         # Reshape out to [batch, seq_len, hidden_dim]
         # For prefill: out is [batch, seq_len, hidden_dim]
@@ -977,8 +1134,14 @@ def full_attention_block(
         out = jnp.einsum("bhts,bhsd->bhtd", attn, v).transpose(0, 2, 1, 3).reshape(batch, seq_len, -1)
     
     out = out * nn.sigmoid(gate)
-    out = jnp.dot(out, params["o_proj"])
+    out = _tokenwise_decode_dot(
+        out,
+        params["o_proj"],
+        force_width1=(not is_prefill) and seq_len > 1,
+    )
     
+    if return_kv_prewrite:
+        return out, kv_cache_state, prewrite_k_cache_input, prewrite_v_cache_input
     return out, kv_cache_state
 
 
@@ -996,51 +1159,68 @@ def transformer_block(
     is_prefill=True,
     backend: Optional[InferenceBackend] = None,
     return_prefix_hybrid: bool = False,
+    return_layer_hidden: bool = False,
+    return_kv_prewrite: bool = False,
+    return_layer_stages: bool = False,
 ):
-    """Matches HF Qwen3_5DecoderLayer - applies norms and residuals.
-    
-    Args:
-        x: Input tensor
-        params: Layer parameters
-        positions: Position IDs
-        mask: Causal mask
-        layer_idx: Layer index
-        config: Model config
-        kv_cache_state: Optional KV cache state
-        is_prefill: Whether this is prefill
-    
-    Returns:
-        tuple: (output, updated_kv_cache_state, updated_hybrid_state)
-    """
+    """Matches HF Qwen3_5DecoderLayer - applies norms and residuals."""
+    block_input = x
     residual = x
-    
+
     # Apply input_layernorm (both full attention and linear attention)
     # HF applies input_layernorm before both layer types
     x = rms_norm(x, params["input_norm"], config.rms_norm_eps)
-    
+    input_norm_out = x
+
     valid_token_mask = None
     if attention_metadata is not None:
         query_lens = jnp.diff(attention_metadata.query_start_loc).astype(jnp.int32)
         valid_token_mask = jnp.arange(x.shape[1], dtype=jnp.int32)[None, :] < query_lens[:, None]
 
     # Apply attention/linear_attn
+    layer_prewrite_k = jnp.zeros(
+        (x.shape[0], x.shape[1], config.num_key_value_heads, config.head_dim),
+        dtype=config.get_dtype(),
+    )
+    layer_prewrite_v = jnp.zeros(
+        (x.shape[0], x.shape[1], config.num_key_value_heads, config.head_dim),
+        dtype=config.get_dtype(),
+    )
     if config.layer_types[layer_idx] == "full_attention":
-        x, kv_cache_state = full_attention_block(
+        if return_kv_prewrite:
+            x, kv_cache_state, layer_prewrite_k, layer_prewrite_v = full_attention_block(
+                x,
+                params,
+                positions,
+                mask,
+                config,
+                kv_cache_state,
+                is_prefill,
+                layer_idx=layer_idx,
+                attention_metadata=attention_metadata,
+                backend=backend,
+                return_kv_prewrite=True,
+            )
+        else:
+            x, kv_cache_state = full_attention_block(
+                x,
+                params,
+                positions,
+                mask,
+                config,
+                kv_cache_state,
+                is_prefill,
+                layer_idx=layer_idx,
+                attention_metadata=attention_metadata,
+                backend=backend,
+            )
+    else:
+        result = gated_deltanet_block(
             x,
             params,
             positions,
-            mask,
             config,
-            kv_cache_state,
-            is_prefill,
-            layer_idx=layer_idx,
-            attention_metadata=attention_metadata,
-            backend=backend,
-        )
-    else:
-        # Linear attention with decode mode support
-        result = gated_deltanet_block(
-            x, params, positions, config, layer_idx,
+            layer_idx,
             is_prefill=is_prefill,
             hybrid_state=hybrid_state,
             valid_token_mask=valid_token_mask,
@@ -1071,25 +1251,50 @@ def transformer_block(
                 x, hybrid_state = result
         else:
             x = result
-    
+
+    attn_out = x
+
     # Add residual
     x = residual + x
-    
+    attn_residual_out = x
+
     # MLP path
     residual = x
     x = rms_norm(x, params["ffn_norm"], config.rms_norm_eps)
-    
+    ffn_norm_out = x
+
     # MLP computation (stays in bfloat16)
-    gate = jnp.dot(x, params["gate_proj"])
-    up = jnp.dot(x, params["up_proj"])
+    force_width1_dot = (not is_prefill) and x.ndim == 3 and x.shape[1] > 1
+    gate = _tokenwise_decode_dot(x, params["gate_proj"], force_width1=force_width1_dot)
+    up = _tokenwise_decode_dot(x, params["up_proj"], force_width1=force_width1_dot)
     x = get_activation(config.hidden_act)(gate) * up
-    x = jnp.dot(x, params["down_proj"])
-    
+    x = _tokenwise_decode_dot(x, params["down_proj"], force_width1=force_width1_dot)
+    mlp_out = x
+
     x = residual + x
-    
+    block_output = x
+
+    outputs = [x, kv_cache_state, hybrid_state]
     if return_prefix_hybrid:
-        return x, kv_cache_state, hybrid_state, prefix_hybrid_state
-    return x, kv_cache_state, hybrid_state
+        outputs.append(prefix_hybrid_state)
+    if return_kv_prewrite:
+        outputs.extend([layer_prewrite_k, layer_prewrite_v])
+    if return_layer_stages:
+        outputs.append(
+            jnp.stack(
+                [
+                    block_input,
+                    input_norm_out,
+                    attn_out,
+                    attn_residual_out,
+                    ffn_norm_out,
+                    mlp_out,
+                    block_output,
+                ],
+                axis=0,
+            )
+        )
+    return tuple(outputs)
 
 
 def forward_step(
@@ -1108,6 +1313,9 @@ def forward_step(
     logit_positions: Optional[jnp.ndarray] = None,
     backend: Optional[InferenceBackend] = None,
     return_prefix_hybrid: bool = False,
+    return_layer_hidden: bool = False,
+    return_kv_prewrite: bool = False,
+    return_layer_stages: bool = False,
 ):
     """Canonical forward step shared by cached and non-cached inference paths."""
     batch, seq_len = tokens.shape
@@ -1139,6 +1347,11 @@ def forward_step(
             else None,
         )
 
+    layer_hidden_states = [] if return_layer_hidden else None
+    kv_prewrite_k_states = [] if return_kv_prewrite else None
+    kv_prewrite_v_states = [] if return_kv_prewrite else None
+    layer_stage_states = [] if return_layer_stages else None
+
     for i, lp in enumerate(params.layers):
         block_result = transformer_block(
             x,
@@ -1154,16 +1367,58 @@ def forward_step(
             is_prefill=is_prefill,
             backend=backend,
             return_prefix_hybrid=return_prefix_hybrid,
+            return_kv_prewrite=return_kv_prewrite,
+            return_layer_stages=return_layer_stages,
         )
+        x, kv_cache_state, hybrid_state = block_result[:3]
+        offset = 3
         if return_prefix_hybrid:
-            x, kv_cache_state, hybrid_state, prefix_hybrid_state = block_result
-        else:
-            x, kv_cache_state, hybrid_state = block_result
+            prefix_hybrid_state = block_result[offset]
+            offset += 1
+        if return_kv_prewrite:
+            layer_prewrite_k = block_result[offset]
+            layer_prewrite_v = block_result[offset + 1]
+            offset += 2
+        if return_layer_stages:
+            layer_stage = block_result[offset]
+        if layer_hidden_states is not None:
+            layer_hidden_states.append(x)
+        if kv_prewrite_k_states is not None:
+            kv_prewrite_k_states.append(layer_prewrite_k)
+            kv_prewrite_v_states.append(layer_prewrite_v)
+        if layer_stage_states is not None:
+            layer_stage_states.append(layer_stage)
 
     hidden_pre = x
+    layer_hidden_result = (
+        jnp.stack(layer_hidden_states, axis=0)
+        if layer_hidden_states is not None
+        else None
+    )
+    kv_prewrite_k_result = (
+        jnp.stack(kv_prewrite_k_states, axis=0)
+        if kv_prewrite_k_states is not None
+        else None
+    )
+    kv_prewrite_v_result = (
+        jnp.stack(kv_prewrite_v_states, axis=0)
+        if kv_prewrite_v_states is not None
+        else None
+    )
+    layer_stage_result = (
+        jnp.stack(layer_stage_states, axis=0)
+        if layer_stage_states is not None
+        else None
+    )
     x = rms_norm(x, params.norm_weight, config.rms_norm_eps)
 
     if return_hidden and not return_hidden_with_logits:
+        if return_layer_hidden:
+            if return_prefix_hybrid:
+                return hidden_pre, kv_cache_state, hybrid_state, prefix_hybrid_state, layer_hidden_result
+            if return_kv_prewrite:
+                return hidden_pre, kv_cache_state, hybrid_state, layer_hidden_result, kv_prewrite_k_result, kv_prewrite_v_result, layer_stage_result
+            return hidden_pre, kv_cache_state, hybrid_state, layer_hidden_result
         if return_prefix_hybrid:
             return hidden_pre, kv_cache_state, hybrid_state, prefix_hybrid_state
         return hidden_pre, kv_cache_state, hybrid_state
@@ -1177,12 +1432,29 @@ def forward_step(
             gather_idx = gather_idx[:, None, None]
             gather_idx = jnp.broadcast_to(gather_idx, (batch, 1, x.shape[-1]))
             x = jnp.take_along_axis(x, gather_idx, axis=1)
-    logits = jnp.dot(x, params.lm_head) if params.lm_head is not None else jnp.dot(x, params.embed_tokens.T)
+    output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
+    logits = _tokenwise_decode_dot(
+        x,
+        output_weight,
+        force_width1=(not is_prefill) and seq_len > 1,
+    )
     if return_hidden:
         hidden_result = (hidden_pre, logits) if return_hidden_with_logits else hidden_pre
+        if return_layer_hidden:
+            if return_prefix_hybrid:
+                return hidden_result, kv_cache_state, hybrid_state, prefix_hybrid_state, layer_hidden_result
+            if return_kv_prewrite:
+                return hidden_result, kv_cache_state, hybrid_state, layer_hidden_result, kv_prewrite_k_result, kv_prewrite_v_result, layer_stage_result
+            return hidden_result, kv_cache_state, hybrid_state, layer_hidden_result
         if return_prefix_hybrid:
             return hidden_result, kv_cache_state, hybrid_state, prefix_hybrid_state
         return hidden_result, kv_cache_state, hybrid_state
+    if return_layer_hidden:
+        if return_prefix_hybrid:
+            return logits, kv_cache_state, hybrid_state, prefix_hybrid_state, layer_hidden_result
+        if return_kv_prewrite:
+            return logits, kv_cache_state, hybrid_state, layer_hidden_result, kv_prewrite_k_result, kv_prewrite_v_result, layer_stage_result
+        return logits, kv_cache_state, hybrid_state, layer_hidden_result
     if return_prefix_hybrid:
         return logits, kv_cache_state, hybrid_state, prefix_hybrid_state
     return logits, kv_cache_state, hybrid_state

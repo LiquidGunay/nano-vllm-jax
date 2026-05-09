@@ -94,6 +94,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-offline", action="store_true")
     parser.add_argument("--check-hf-logits", action="store_true",
                         help="Compare HF final-prefill logits against the JAX baseline model before trusting throughput")
+    parser.add_argument("--check-next-step-sanity", action="store_true",
+                        help="Run an extra max_tokens+1 baseline/MTP pass to verify the next token after the reported MTP boundary")
     parser.add_argument("--hf-device", choices=["auto", "cpu", "cuda"], default="cpu")
     parser.add_argument("--hf-topk", type=int, default=5)
     parser.add_argument("--hf-max-prompts", type=int, default=1)
@@ -650,8 +652,17 @@ def run_hf_logits_check(
 def apply_correctness_gate(summary: dict, *, args: argparse.Namespace, hf_logits_check: dict) -> dict:
     mtp_exact = bool(summary.get("all_correct", False))
     hf_checked = bool(hf_logits_check.get("checked", False))
-    hf_ok = bool(hf_checked and hf_logits_check.get("ok", False))
-    all_correct = bool(mtp_exact and hf_ok)
+    hf_ok = bool(hf_logits_check.get("ok", False))
+    next_step_checked = False
+    next_step_values = []
+    for row in summary.get("rows", []):
+        for variant in row.get("variants", []):
+            check = variant.get("next_step_sanity_check", {})
+            if bool(check.get("checked", False)):
+                next_step_checked = True
+                next_step_values.append(bool(check.get("ok", False)))
+    next_step_ok = bool(all(next_step_values)) if next_step_checked else hf_ok
+    all_correct = bool(mtp_exact and hf_ok and next_step_ok)
     timed_results_valid = bool(all_correct and not args.correctness_only)
     summary["mtp_exact_token_match"] = mtp_exact
     summary["hf_logits_check"] = hf_logits_check
@@ -659,7 +670,8 @@ def apply_correctness_gate(summary: dict, *, args: argparse.Namespace, hf_logits
     summary["correctness"] = {
         "hf_logits_checked": hf_checked,
         "hf_logits_ok": hf_ok,
-        "next_step_logit_sanity": hf_ok,
+        "next_step_logit_sanity_checked": next_step_checked,
+        "next_step_logit_sanity": next_step_ok,
         "baseline_greedy_is_canonical": hf_ok,
         "mtp_exact_token_match": mtp_exact,
         "all_correct": all_correct,
@@ -668,13 +680,24 @@ def apply_correctness_gate(summary: dict, *, args: argparse.Namespace, hf_logits
     summary["timed_results_valid"] = timed_results_valid
     for row in summary.get("rows", []):
         for variant in row.get("variants", []):
-            variant["next_step_logit_sanity"] = hf_ok
+            check = variant.get("next_step_sanity_check", {})
+            variant_next_ok = (
+                bool(check.get("ok", False))
+                if bool(check.get("checked", False))
+                else next_step_ok
+            )
+            variant["next_step_logit_sanity"] = variant_next_ok
             variant["exact_token_match"] = bool(variant.get("correct", False))
-            variant["timed_results_valid"] = bool(variant.get("correct", False) and hf_ok and not args.correctness_only)
+            variant["timed_results_valid"] = bool(
+                variant.get("correct", False)
+                and variant_next_ok
+                and hf_ok
+                and not args.correctness_only
+            )
             variant["throughput_valid"] = variant["timed_results_valid"]
             if "timed_results" in variant:
                 variant["timed_results"]["valid"] = variant["timed_results_valid"]
-                variant["timed_results"]["next_step_logit_sanity"] = hf_ok
+                variant["timed_results"]["next_step_logit_sanity"] = variant_next_ok
                 variant["timed_results"]["exact_token_match"] = bool(variant.get("correct", False))
     if not timed_results_valid:
         reason = "correctness_only" if args.correctness_only and all_correct else "correctness_failed"
@@ -866,19 +889,36 @@ def _stats_key(args: argparse.Namespace, *, dtype: str, backend: str) -> dict:
 
 
 def _adaptive_gating_decision(baseline: dict, speculative: dict, *, margin: float) -> dict:
-    baseline_ms = float(baseline.get("step_profile", {}).get("all_steps", {}).get("seconds_per_token", 0.0)) * 1000.0
-    speculative_ms = float(speculative.get("step_profile", {}).get("all_steps", {}).get("seconds_per_token", 0.0)) * 1000.0
+    baseline_decode_tps = float(baseline.get("decode_tokens_per_second", 0.0))
+    speculative_decode_tps = float(speculative.get("decode_tokens_per_second", 0.0))
+    measured_decode_speedup = speculative_decode_tps / max(1e-9, baseline_decode_tps)
+    baseline_decode_ms = 1000.0 / max(1e-9, baseline_decode_tps)
+    speculative_decode_ms = 1000.0 / max(1e-9, speculative_decode_tps)
+    baseline_step_ms = float(baseline.get("step_profile", {}).get("all_steps", {}).get("seconds_per_token", 0.0)) * 1000.0
+    speculative_step_ms = float(speculative.get("step_profile", {}).get("all_steps", {}).get("seconds_per_token", 0.0)) * 1000.0
     stats = speculative.get("speculative", {})
     accept_rate = float(stats.get("drafts_accepted", 0)) / max(1.0, float(stats.get("drafts_proposed", 0)))
-    predicted_speedup = (baseline_ms / max(1e-9, speculative_ms)) * (1.0 + accept_rate)
+    legacy_acceptance_formula = (
+        baseline_step_ms / max(1e-9, speculative_step_ms)
+    ) * (1.0 + accept_rate)
+    should_enable = measured_decode_speedup >= 1.0 + float(margin)
     return {
-        "formula": "predicted_speedup = (baseline_ms / speculative_ms) * (1.0 + accept_rate); should_enable = predicted_speedup >= 1.0 + margin",
-        "baseline_ms": baseline_ms,
-        "speculative_ms": speculative_ms,
+        "formula": "measured_decode_speedup = mtp_decode_tokens_per_second / baseline_decode_tokens_per_second; should_enable = measured_decode_speedup >= 1.0 + margin",
+        "timing_scope": "decode_tokens_per_second",
+        "baseline_decode_tokens_per_second": baseline_decode_tps,
+        "speculative_decode_tokens_per_second": speculative_decode_tps,
+        "baseline_decode_ms_per_token": baseline_decode_ms,
+        "speculative_decode_ms_per_token": speculative_decode_ms,
+        "baseline_step_ms_per_token": baseline_step_ms,
+        "speculative_step_ms_per_token": speculative_step_ms,
         "accept_rate": accept_rate,
         "margin": float(margin),
-        "predicted_speedup": predicted_speedup,
-        "should_enable": bool(predicted_speedup >= 1.0 + float(margin)),
+        "measured_decode_speedup": measured_decode_speedup,
+        "predicted_speedup": measured_decode_speedup,
+        "legacy_acceptance_formula_speedup": legacy_acceptance_formula,
+        "legacy_formula_note": "diagnostic only; it can overestimate exact commit-select by multiplying an already-emitted-token timing ratio by acceptance",
+        "should_enable": bool(should_enable),
+        "structural_limit": "Exact sequential commit-select K=1 needs at least one target-model forward for each emitted token plus MTP overhead; it should be enabled only when measured emitted-token throughput beats baseline by the configured margin.",
     }
 
 
@@ -886,10 +926,10 @@ def _benchmark_modes_report() -> list[dict]:
     return [
         {"mode": "baseline", "status": "measured", "description": "No speculative decoding."},
         {"mode": "all-or-none MTP", "status": "measured_by_current_mtp_row", "description": "Fused verifier result is only useful when the configured MTP path accepts as implemented by the runner."},
-        {"mode": "rowwise MTP", "status": "available_via_runner_env", "description": "K=1 rowwise acceptance via NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY=rowwise on a fused verifier path."},
+        {"mode": "rowwise MTP", "status": "default_for_exact_commit_select_serving", "description": "K=1 exact commit-select serving uses NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY=rowwise by default unless explicitly overridden."},
         {"mode": "groupwise g=2", "status": "not_implemented_in_harness", "description": "Harness reports the required mode but does not yet split speculative batches into fixed groups of 2."},
         {"mode": "groupwise g=4", "status": "not_implemented_in_harness", "description": "Harness reports the required mode but does not yet split speculative batches into fixed groups of 4."},
-        {"mode": "adaptive MTP gating", "status": "documented_and_reported", "description": "Reports the configured adaptive gating formula and decision from observed baseline/speculative timings."},
+        {"mode": "adaptive MTP gating", "status": "documented_and_reported", "description": "Reports measured decode-token throughput gating; exact commit-select enables only when observed decode speedup beats margin."},
     ]
 
 
@@ -1503,6 +1543,118 @@ def _run_benchmark_for_prompts(
     return runs[-1]
 
 
+def _should_check_next_step_sanity(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "check_next_step_sanity", False)
+        or getattr(args, "correctness_only", False)
+        or os.environ.get("NANO_VLLM_JAX_MTP_CHECK_NEXT_STEP_SANITY", "0")
+        in {"1", "true", "yes", "on", "True"}
+    )
+
+
+def _run_next_step_sanity_check(
+    engine: LLMEngine,
+    prompts: list[str | list[int]],
+    *,
+    args: argparse.Namespace,
+    mtp_position_offset: int,
+    mtp_token_source: str,
+    mtp_hidden_source: str,
+) -> dict:
+    """Compare baseline and MTP one token past the reported generation boundary.
+
+    This checks the actual public engine continuation path: if MTP emits exactly
+    ``args.max_tokens`` visible tokens but leaves cache/hybrid state or Python
+    length bookkeeping wrong, the extra token in this ``max_tokens + 1`` run
+    should diverge from the baseline.
+    """
+    if int(args.max_tokens) < 1:
+        return {
+            "checked": False,
+            "ok": True,
+            "reason": "max_tokens_less_than_one",
+        }
+
+    sanity_max_tokens = int(args.max_tokens) + 1
+    sanity_t0 = time.perf_counter()
+    baseline_t0 = time.perf_counter()
+    baseline_next = run_generation_batch(
+        engine=engine,
+        prompts=prompts,
+        mtp1=False,
+        max_tokens=sanity_max_tokens,
+        mtp_position_offset=0,
+        mtp_token_source=args.mtp_token_source,
+        mtp_hidden_source=args.mtp_hidden_source,
+        compile_mtp_draft=args.compile_mtp_draft,
+        debug_spec=args.debug_spec,
+        step_profile=False,
+        return_step_records=False,
+    )
+    baseline_sanity_seconds = time.perf_counter() - baseline_t0
+    mtp_t0 = time.perf_counter()
+    mtp_next = run_generation_batch(
+        engine=engine,
+        prompts=prompts,
+        mtp1=True,
+        max_tokens=sanity_max_tokens,
+        mtp_position_offset=mtp_position_offset,
+        mtp_token_source=mtp_token_source,
+        mtp_hidden_source=mtp_hidden_source,
+        compile_mtp_draft=args.compile_mtp_draft,
+        debug_spec=args.debug_spec,
+        step_profile=False,
+        return_step_records=False,
+    )
+    mtp_sanity_seconds = time.perf_counter() - mtp_t0
+    sanity_seconds = time.perf_counter() - sanity_t0
+    first_diff = _first_token_diff(
+        baseline_next["token_ids_by_request"],
+        mtp_next["token_ids_by_request"],
+    )
+    prompt_lengths = _prompt_lengths_for_inputs(engine, prompts)
+    block_size = int(getattr(engine.config, "block_size", 1) or 1)
+    boundary_rows = []
+    for request_index, prompt_len in enumerate(prompt_lengths):
+        baseline_tokens = baseline_next["token_ids_by_request"][request_index]
+        mtp_tokens = mtp_next["token_ids_by_request"][request_index]
+        visible_count = min(int(args.max_tokens), len(baseline_tokens), len(mtp_tokens))
+        next_input_position = int(prompt_len + max(0, visible_count - 1))
+        next_write_position = int(prompt_len + visible_count)
+        committed_seq_len = int(prompt_len + visible_count)
+        boundary_rows.append({
+            "request_index": int(request_index),
+            "prompt_tokens": int(prompt_len),
+            "visible_token_count": int(visible_count),
+            "baseline_visible_tail": [int(x) for x in baseline_tokens[:visible_count][-8:]],
+            "mtp_visible_tail": [int(x) for x in mtp_tokens[:visible_count][-8:]],
+            "next_input_token_baseline": int(baseline_tokens[visible_count - 1]) if visible_count > 0 else None,
+            "next_input_token_mtp": int(mtp_tokens[visible_count - 1]) if visible_count > 0 else None,
+            "next_token_baseline": int(baseline_tokens[visible_count]) if visible_count < len(baseline_tokens) else None,
+            "next_token_mtp": int(mtp_tokens[visible_count]) if visible_count < len(mtp_tokens) else None,
+            "committed_seq_len": committed_seq_len,
+            "next_input_position": next_input_position,
+            "next_input_block": int(next_input_position // block_size),
+            "next_input_slot": int(next_input_position % block_size),
+            "next_write_position": next_write_position,
+            "next_write_block": int(next_write_position // block_size),
+            "next_write_slot": int(next_write_position % block_size),
+        })
+
+    return {
+        "checked": True,
+        "ok": first_diff is None,
+        "max_tokens_checked": sanity_max_tokens,
+        "seconds": sanity_seconds,
+        "baseline_seconds": baseline_sanity_seconds,
+        "mtp_seconds": mtp_sanity_seconds,
+        "first_diff": first_diff,
+        "boundary": boundary_rows,
+        "baseline_speculative_counts": baseline_next.get("speculative_counts", {}),
+        "mtp_speculative_counts": mtp_next.get("speculative_counts", {}),
+    }
+
+
 def _prompt_lengths_for_inputs(engine: LLMEngine, prompts: list[str | list[int]]) -> list[int]:
     lengths: list[int] = []
     for prompt in prompts:
@@ -1584,6 +1736,17 @@ def _build_variant_rows(
             speculative["token_ids_by_request"],
         )
         correct = first_diff is None
+        next_step_check = {"checked": False, "ok": True}
+        if correct and _should_check_next_step_sanity(args):
+            next_step_check = _run_next_step_sanity_check(
+                engine,
+                prompts,
+                args=args,
+                mtp_position_offset=position_offset,
+                mtp_token_source=token_source,
+                mtp_hidden_source=hidden_source,
+            )
+        next_step_ok = bool(next_step_check.get("ok", True))
         output_samples = None
         if args.show_outputs:
             output_samples = {
@@ -1627,10 +1790,13 @@ def _build_variant_rows(
             "speedup": baseline["seconds"] / max(1e-9, speculative["seconds"]),
             "correct": correct,
             "first_diff": first_diff,
-            "throughput_valid": correct,
-            "timed_results_valid": correct,
-            "next_step_logit_sanity": "pending_global_hf_gate",
-            "throughput_suppressed_reason": None if correct else "mtp_tokens_diverged",
+            "throughput_valid": bool(correct and next_step_ok),
+            "timed_results_valid": bool(correct and next_step_ok),
+            "next_step_logit_sanity": bool(next_step_ok),
+            "next_step_sanity_check": next_step_check,
+            "throughput_suppressed_reason": None if correct and next_step_ok else (
+                "mtp_next_step_diverged" if correct else "mtp_tokens_diverged"
+            ),
             "accepted_tokens": speculative["accepted_tokens"],
             "rejected_tokens": speculative["rejected_tokens"],
             "fallback_tokens": speculative["fallback_tokens"],
@@ -1650,7 +1816,7 @@ def _build_variant_rows(
             },
             "host_device_postprocess_ms": speculative["host_device_postprocess_ms"],
             "timed_results": {
-                "valid": correct,
+                "valid": bool(correct and next_step_ok),
                 "prefill_tok_s": speculative["prefill_tokens_per_second"],
                 "decode_tok_s": speculative["decode_tokens_per_second"],
                 "end_to_end_tok_s": speculative["end_to_end_tokens_per_second"],
@@ -1682,6 +1848,16 @@ def main():
     if not args.hf_offline:
         os.environ.pop("HF_HUB_OFFLINE", None)
     os.environ["NANO_VLLM_JAX_EXEC_LOG_STEPS"] = "1" if args.exec_log_steps else "0"
+    exact_commit_select_serving = (
+        args.num_speculative_tokens > 0
+        and (
+            os.environ.get("NANO_VLLM_JAX_MTP_COMMIT_SELECT", "0") in {"1", "true", "yes", "on", "True"}
+            or os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1", "0") in {"1", "true", "yes", "on", "True"}
+            or os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0") not in {"1", "true", "yes", "on", "True"}
+        )
+    )
+    if exact_commit_select_serving and "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY" not in os.environ:
+        os.environ["NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY"] = "rowwise"
     if args.platform and args.platform != "auto":
         os.environ["JAX_PLATFORMS"] = args.platform
 
@@ -1895,7 +2071,8 @@ def main():
             "warmup": warmup_summary,
             "warmed_shape_phase": warmup_summary["warmed_shape_phase"],
             "benchmark_modes": _benchmark_modes_report(),
-            "adaptive_mtp_gating_formula": "predicted_speedup = (baseline_ms / speculative_ms) * (1.0 + accept_rate); should_enable = predicted_speedup >= 1.0 + margin",
+            "mtp_batch_accept_policy": os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
+            "adaptive_mtp_gating_formula": "measured_decode_speedup = mtp_decode_tokens_per_second / baseline_decode_tokens_per_second; should_enable = measured_decode_speedup >= 1.0 + margin",
             "adaptive_margin": float(args.adaptive_margin),
             "stats_key": _stats_key(args, dtype=dtype, backend=jax.default_backend()),
             "benchmark_seconds": benchmark_seconds,
@@ -1994,7 +2171,8 @@ def main():
             "warmup": warmup_summary,
             "warmed_shape_phase": warmup_summary["warmed_shape_phase"],
             "benchmark_modes": _benchmark_modes_report(),
-            "adaptive_mtp_gating_formula": "predicted_speedup = (baseline_ms / speculative_ms) * (1.0 + accept_rate); should_enable = predicted_speedup >= 1.0 + margin",
+            "mtp_batch_accept_policy": os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
+            "adaptive_mtp_gating_formula": "measured_decode_speedup = mtp_decode_tokens_per_second / baseline_decode_tokens_per_second; should_enable = measured_decode_speedup >= 1.0 + margin",
             "adaptive_margin": float(args.adaptive_margin),
             "stats_key": _stats_key(args, dtype=dtype, backend=jax.default_backend()),
         }

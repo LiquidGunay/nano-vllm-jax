@@ -38,6 +38,40 @@ class MTP1GreedyOutput:
     committed_seq_lens: object | None = None
 
 
+@dataclass
+class MTP1ParityDebugOutput:
+    slot0_logit_max_abs: object
+    slot1_logit_max_abs: object
+    slot0_hidden_max_abs: object
+    slot1_hidden_max_abs: object
+    current_k_slot_max_abs: object
+    draft_k_slot_max_abs: object
+    current_v_slot_max_abs: object
+    draft_v_slot_max_abs: object
+    conv_state_max_abs: object
+    recurrent_state_max_abs: object
+    fused_top5_slot0: object
+    seq_top5_slot0: object
+    fused_top5_slot1: object
+    seq_top5_slot1: object
+    fused_target_token: object
+    seq_target_token: object
+    fused_bonus_token: object
+    seq_bonus_token: object
+
+
+@dataclass
+class MTP1LayerwiseDriftDebugOutput:
+    hidden_max_abs: object
+    k_slot_max_abs: object
+    v_slot_max_abs: object
+    conv_state_max_abs: object
+    recurrent_state_max_abs: object
+    k_prewrite_max_abs: object
+    v_prewrite_max_abs: object
+    block_stage_max_abs: object
+
+
 class ModelExecutor:
     """Single canonical inference path for model execution."""
 
@@ -848,6 +882,605 @@ class ModelExecutor:
             committed_seq_lens=committed_seq_lens,
         )
 
+    def mtp1_layer_parity_debug_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state: HybridLayerState,
+        draft_token: jnp.ndarray,
+        next_mtp_position: jnp.ndarray,
+        mtp_hidden_final_normed: bool,
+    ) -> MTP1ParityDebugOutput:
+        """Debug-only K=1 parity probe for fused one-pass vs sequential decode.
+
+        This intentionally returns small metrics only. It does not donate input
+        cache buffers because it must run from the same pre-state that the
+        production one-pass call will use.
+        """
+        del next_mtp_position, mtp_hidden_final_normed
+        if hybrid_state.conv_state is None or hybrid_state.recurrent_state is None:
+            raise ValueError("mtp1_layer_parity_debug_jit requires initialized hybrid_state")
+        if batch.is_prefill or batch.tokens.shape[1] != 1:
+            raise ValueError("mtp1_layer_parity_debug_jit expects a decode batch")
+        self._validate_batch_contract(batch)
+
+        key = (
+            "mtp1-layer-parity-debug",
+            tuple(batch.tokens.shape),
+            tuple(batch.positions.shape),
+            tuple(batch.block_tables.shape),
+            os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "0"),
+        )
+        if key not in self._jit_cache:
+            one_pass_decode_mode = os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+
+            def _max_abs(left, right, row_mask):
+                diff = jnp.abs(left.astype(jnp.float32) - right.astype(jnp.float32))
+                mask = row_mask.reshape((row_mask.shape[0],) + (1,) * (diff.ndim - 1))
+                return jnp.max(jnp.where(mask, diff, jnp.zeros_like(diff)))
+
+            def _slot_max_abs(left, right, slots, row_mask):
+                leading_shape = left.shape[:-4] if left.ndim == 5 else left.shape[:-3]
+                flat_left = left.reshape(leading_shape + (-1,) + left.shape[-2:])
+                flat_right = right.reshape(leading_shape + (-1,) + right.shape[-2:])
+                left_values = flat_left[..., slots, :, :].astype(jnp.float32)
+                right_values = flat_right[..., slots, :, :].astype(jnp.float32)
+                diff = jnp.abs(left_values - right_values)
+                mask = row_mask.reshape((1,) * len(leading_shape) + (row_mask.shape[0], 1, 1))
+                return jnp.max(jnp.where(mask, diff, jnp.zeros_like(diff)))
+
+            def compiled(
+                params,
+                tokens,
+                positions,
+                seq_ids,
+                query_start_loc,
+                num_decode_tokens,
+                block_tables,
+                seq_lens,
+                k_cache,
+                v_cache,
+                conv_state,
+                recurrent_state,
+                draft_token_arg,
+            ):
+                row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                row_active = (row_query_lens > 0) & (seq_ids >= 0)
+
+                verify_tokens = jnp.concatenate([tokens, draft_token_arg[:, None]], axis=1)
+                verify_positions = jnp.concatenate([positions, positions + 1], axis=1)
+                verify_query_lens = row_query_lens * 2
+                verify_query_start_loc = jnp.concatenate(
+                    [
+                        jnp.zeros((1,), dtype=jnp.int32),
+                        jnp.cumsum(verify_query_lens),
+                    ]
+                )
+                verify_batch = ScheduledBatch(
+                    tokens=verify_tokens,
+                    positions=verify_positions,
+                    seq_ids=seq_ids,
+                    query_start_loc=verify_query_start_loc,
+                    is_prefill=not one_pass_decode_mode,
+                    num_prefill_tokens=0 if one_pass_decode_mode else jnp.sum(verify_query_lens),
+                    num_decode_tokens=jnp.sum(verify_query_lens) if one_pass_decode_mode else 0,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens + row_active.astype(jnp.int32),
+                )
+                verify_metadata = self.backend.build_attention_metadata(
+                    positions=verify_batch.positions,
+                    block_tables=verify_batch.block_tables,
+                    seq_lens=verify_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=not one_pass_decode_mode,
+                    query_start_loc=verify_batch.query_start_loc,
+                    num_prefill_tokens=verify_batch.num_prefill_tokens,
+                    num_decode_tokens=verify_batch.num_decode_tokens,
+                )
+                verify_kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=verify_batch.block_tables,
+                    kv_lens=verify_batch.seq_lens,
+                    slot_mapping=verify_metadata.slot_mapping,
+                )
+                (fused_hidden, fused_logits), fused_kv, fused_hybrid = model_forward_step(
+                    verify_batch.tokens,
+                    params,
+                    self.config,
+                    positions=verify_batch.positions,
+                    kv_cache_state=verify_kv_state,
+                    attention_metadata=verify_metadata,
+                    hybrid_state=HybridLayerState(conv_state, recurrent_state),
+                    is_prefill=not one_pass_decode_mode,
+                    return_hidden=True,
+                    return_hidden_with_logits=True,
+                    backend=self.backend,
+                )
+
+                first_batch = ScheduledBatch(
+                    tokens=tokens,
+                    positions=positions,
+                    seq_ids=seq_ids,
+                    query_start_loc=query_start_loc,
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=num_decode_tokens,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                )
+                first_metadata = self.backend.build_attention_metadata(
+                    positions=first_batch.positions,
+                    block_tables=first_batch.block_tables,
+                    seq_lens=first_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=False,
+                    query_start_loc=first_batch.query_start_loc,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=first_batch.num_decode_tokens,
+                )
+                first_kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=first_batch.block_tables,
+                    kv_lens=first_batch.seq_lens,
+                    slot_mapping=first_metadata.slot_mapping,
+                )
+                seq_hidden0, seq_kv0, seq_hybrid0 = model_forward_step(
+                    first_batch.tokens,
+                    params,
+                    self.config,
+                    positions=first_batch.positions,
+                    kv_cache_state=first_kv_state,
+                    attention_metadata=first_metadata,
+                    hybrid_state=HybridLayerState(conv_state, recurrent_state),
+                    is_prefill=False,
+                    return_hidden=True,
+                    backend=self.backend,
+                )
+                output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
+                seq_hidden0_norm = rms_norm(seq_hidden0, params.norm_weight, self.config.rms_norm_eps).astype(
+                    jnp.float32
+                )
+                seq_logits0 = jnp.dot(seq_hidden0_norm[:, 0], output_weight)
+
+                second_query_lens = row_active.astype(jnp.int32)
+                second_query_start_loc = jnp.concatenate(
+                    [
+                        jnp.zeros((1,), dtype=jnp.int32),
+                        jnp.cumsum(second_query_lens),
+                    ]
+                )
+                second_batch = ScheduledBatch(
+                    tokens=jnp.where(row_active[:, None], draft_token_arg[:, None], jnp.zeros_like(tokens)),
+                    positions=jnp.where(row_active[:, None], positions + 1, jnp.zeros_like(positions)),
+                    seq_ids=jnp.where(row_active, seq_ids, jnp.full_like(seq_ids, -1)),
+                    query_start_loc=second_query_start_loc,
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=jnp.sum(second_query_lens),
+                    block_tables=jnp.where(row_active[:, None], block_tables, jnp.zeros_like(block_tables)),
+                    seq_lens=jnp.where(row_active, seq_lens + 1, jnp.zeros_like(seq_lens)),
+                )
+                second_metadata = self.backend.build_attention_metadata(
+                    positions=second_batch.positions,
+                    block_tables=second_batch.block_tables,
+                    seq_lens=second_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=False,
+                    query_start_loc=second_batch.query_start_loc,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=second_batch.num_decode_tokens,
+                )
+                second_kv_state = KVCacheState(
+                    k_cache=seq_kv0.k_cache,
+                    v_cache=seq_kv0.v_cache,
+                    block_table=second_batch.block_tables,
+                    kv_lens=second_batch.seq_lens,
+                    slot_mapping=second_metadata.slot_mapping,
+                )
+                (seq_hidden1, seq_logits1), seq_kv1, seq_hybrid1 = model_forward_step(
+                    second_batch.tokens,
+                    params,
+                    self.config,
+                    positions=second_batch.positions,
+                    kv_cache_state=second_kv_state,
+                    attention_metadata=second_metadata,
+                    hybrid_state=seq_hybrid0,
+                    is_prefill=False,
+                    return_hidden=True,
+                    return_hidden_with_logits=True,
+                    backend=self.backend,
+                )
+
+                fused_top5_slot0 = jax.lax.top_k(fused_logits[:, 0].astype(jnp.float32), 5)[1].astype(jnp.int32)
+                seq_top5_slot0 = jax.lax.top_k(seq_logits0.astype(jnp.float32), 5)[1].astype(jnp.int32)
+                fused_top5_slot1 = jax.lax.top_k(fused_logits[:, 1].astype(jnp.float32), 5)[1].astype(jnp.int32)
+                seq_top5_slot1 = jax.lax.top_k(seq_logits1[:, 0].astype(jnp.float32), 5)[1].astype(jnp.int32)
+
+                current_slots = verify_metadata.slot_mapping[:, 0]
+                draft_slots = verify_metadata.slot_mapping[:, 1]
+                return (
+                    _max_abs(fused_logits[:, 0], seq_logits0, row_active),
+                    _max_abs(fused_logits[:, 1], seq_logits1[:, 0], row_active),
+                    _max_abs(fused_hidden[:, 0], seq_hidden0[:, 0], row_active),
+                    _max_abs(fused_hidden[:, 1], seq_hidden1[:, 0], row_active),
+                    _slot_max_abs(fused_kv.k_cache, seq_kv1.k_cache, current_slots, row_active),
+                    _slot_max_abs(fused_kv.k_cache, seq_kv1.k_cache, draft_slots, row_active),
+                    _slot_max_abs(fused_kv.v_cache, seq_kv1.v_cache, current_slots, row_active),
+                    _slot_max_abs(fused_kv.v_cache, seq_kv1.v_cache, draft_slots, row_active),
+                    _max_abs(fused_hybrid.conv_state, seq_hybrid1.conv_state, row_active),
+                    _max_abs(fused_hybrid.recurrent_state, seq_hybrid1.recurrent_state, row_active),
+                    fused_top5_slot0,
+                    seq_top5_slot0,
+                    fused_top5_slot1,
+                    seq_top5_slot1,
+                    jnp.argmax(fused_logits[:, 0], axis=-1).astype(jnp.int32),
+                    jnp.argmax(seq_logits0, axis=-1).astype(jnp.int32),
+                    jnp.argmax(fused_logits[:, 1], axis=-1).astype(jnp.int32),
+                    jnp.argmax(seq_logits1[:, 0], axis=-1).astype(jnp.int32),
+                )
+
+            self._jit_cache[key] = jax.jit(compiled)
+
+        outputs = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self.params,
+                batch.tokens,
+                batch.positions,
+                batch.seq_ids,
+                batch.query_start_loc,
+                jnp.asarray(batch.num_decode_tokens, dtype=jnp.int32),
+                batch.block_tables,
+                batch.seq_lens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state.conv_state,
+                hybrid_state.recurrent_state,
+                jnp.asarray(draft_token, dtype=jnp.int32),
+            ),
+            "mtp1_layer_parity_debug_jit",
+        )
+        return MTP1ParityDebugOutput(*outputs)
+
+    def mtp1_layerwise_drift_debug_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state: HybridLayerState,
+        draft_token: jnp.ndarray,
+    ) -> MTP1LayerwiseDriftDebugOutput:
+        """Debug-only per-layer drift probe for fused width-2 vs sequential width-1 decode."""
+        if hybrid_state.conv_state is None or hybrid_state.recurrent_state is None:
+            raise ValueError("mtp1_layerwise_drift_debug_jit requires initialized hybrid_state")
+        if batch.is_prefill or batch.tokens.shape[1] != 1:
+            raise ValueError("mtp1_layerwise_drift_debug_jit expects a decode batch")
+        self._validate_batch_contract(batch)
+
+        key = (
+            "mtp1-layerwise-drift-debug",
+            tuple(batch.tokens.shape),
+            tuple(batch.positions.shape),
+            tuple(batch.block_tables.shape),
+            os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "0"),
+        )
+        if key not in self._jit_cache:
+            one_pass_decode_mode = os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+            layer_types = tuple(self.config.layer_types)
+
+            def _layer_hidden_max_abs(fused_layers, seq_layers, row_mask):
+                diff = jnp.abs(fused_layers[:, :, 0, :].astype(jnp.float32) - seq_layers[:, :, 0, :].astype(jnp.float32))
+                mask = row_mask[None, :, None]
+                return jnp.max(jnp.where(mask, diff, jnp.zeros_like(diff)), axis=(1, 2))
+
+            def _kv_slot_layer_max_abs(left, right, slots, row_mask):
+                flat_left = left.reshape((left.shape[0], -1) + left.shape[-2:])
+                flat_right = right.reshape((right.shape[0], -1) + right.shape[-2:])
+                diff = jnp.abs(
+                    flat_left[:, slots, :, :].astype(jnp.float32)
+                    - flat_right[:, slots, :, :].astype(jnp.float32)
+                )
+                mask = row_mask[None, :, None, None]
+                return jnp.max(jnp.where(mask, diff, jnp.zeros_like(diff)), axis=(1, 2, 3))
+
+            def _hybrid_layer_max_abs(left, right, linear_idx, row_mask):
+                diff = jnp.abs(
+                    left[:, linear_idx].astype(jnp.float32)
+                    - right[:, linear_idx].astype(jnp.float32)
+                )
+                mask = row_mask.reshape((row_mask.shape[0],) + (1,) * (diff.ndim - 1))
+                return jnp.max(jnp.where(mask, diff, jnp.zeros_like(diff)))
+
+            def _prewrite_layer_max_abs(left, right, row_mask):
+                diff = jnp.abs(
+                    left[:, :, 0, :, :].astype(jnp.float32)
+                    - right[:, :, 0, :, :].astype(jnp.float32)
+                )
+                mask = row_mask[None, :, None, None]
+                return jnp.max(jnp.where(mask, diff, jnp.zeros_like(diff)), axis=(1, 2, 3))
+
+            def _block_stage_max_abs(fused_stages, seq_stages, row_mask):
+                # [L, S, B, T, D] -> [L, S] for slot0/current token.
+                diff = jnp.abs(
+                    fused_stages[:, :, :, 0, :].astype(jnp.float32)
+                    - seq_stages[:, :, :, 0, :].astype(jnp.float32)
+                )
+                mask = row_mask[None, None, :, None]
+                return jnp.max(jnp.where(mask, diff, jnp.zeros_like(diff)), axis=(2, 3))
+
+            def compiled(
+                params,
+                tokens,
+                positions,
+                seq_ids,
+                query_start_loc,
+                num_decode_tokens,
+                block_tables,
+                seq_lens,
+                k_cache,
+                v_cache,
+                conv_state,
+                recurrent_state,
+                draft_token_arg,
+            ):
+                row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                row_active = (row_query_lens > 0) & (seq_ids >= 0)
+
+                verify_tokens = jnp.concatenate([tokens, draft_token_arg[:, None]], axis=1)
+                verify_positions = jnp.concatenate([positions, positions + 1], axis=1)
+                verify_query_lens = row_query_lens * 2
+                verify_query_start_loc = jnp.concatenate(
+                    [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(verify_query_lens)]
+                )
+                verify_batch = ScheduledBatch(
+                    tokens=verify_tokens,
+                    positions=verify_positions,
+                    seq_ids=seq_ids,
+                    query_start_loc=verify_query_start_loc,
+                    is_prefill=not one_pass_decode_mode,
+                    num_prefill_tokens=0 if one_pass_decode_mode else jnp.sum(verify_query_lens),
+                    num_decode_tokens=jnp.sum(verify_query_lens) if one_pass_decode_mode else 0,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens + row_active.astype(jnp.int32),
+                )
+                verify_metadata = self.backend.build_attention_metadata(
+                    positions=verify_batch.positions,
+                    block_tables=verify_batch.block_tables,
+                    seq_lens=verify_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=not one_pass_decode_mode,
+                    query_start_loc=verify_batch.query_start_loc,
+                    num_prefill_tokens=verify_batch.num_prefill_tokens,
+                    num_decode_tokens=verify_batch.num_decode_tokens,
+                )
+                verify_kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=verify_batch.block_tables,
+                    kv_lens=verify_batch.seq_lens,
+                    slot_mapping=verify_metadata.slot_mapping,
+                )
+                (
+                    (_fused_hidden, _fused_logits),
+                    fused_kv,
+                    fused_hybrid,
+                    fused_layers,
+                    fused_prewrite_k,
+                    fused_prewrite_v,
+                    fused_stages,
+                ) = model_forward_step(
+                    verify_batch.tokens,
+                    params,
+                    self.config,
+                    positions=verify_batch.positions,
+                    kv_cache_state=verify_kv_state,
+                    attention_metadata=verify_metadata,
+                    hybrid_state=HybridLayerState(conv_state, recurrent_state),
+                    is_prefill=not one_pass_decode_mode,
+                    return_hidden=True,
+                    return_hidden_with_logits=True,
+                    return_layer_hidden=True,
+                    return_kv_prewrite=True,
+                    return_layer_stages=True,
+                    backend=self.backend,
+                )
+
+                first_batch = ScheduledBatch(
+                    tokens=tokens,
+                    positions=positions,
+                    seq_ids=seq_ids,
+                    query_start_loc=query_start_loc,
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=num_decode_tokens,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                )
+                first_metadata = self.backend.build_attention_metadata(
+                    positions=first_batch.positions,
+                    block_tables=first_batch.block_tables,
+                    seq_lens=first_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=False,
+                    query_start_loc=first_batch.query_start_loc,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=first_batch.num_decode_tokens,
+                )
+                first_kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=first_batch.block_tables,
+                    kv_lens=first_batch.seq_lens,
+                    slot_mapping=first_metadata.slot_mapping,
+                )
+                (
+                    _seq_hidden0,
+                    seq_kv0,
+                    seq_hybrid0,
+                    seq_layers0,
+                    seq_prewrite_k0,
+                    seq_prewrite_v0,
+                    seq_stages0,
+                ) = model_forward_step(
+                    first_batch.tokens,
+                    params,
+                    self.config,
+                    positions=first_batch.positions,
+                    kv_cache_state=first_kv_state,
+                    attention_metadata=first_metadata,
+                    hybrid_state=HybridLayerState(conv_state, recurrent_state),
+                    is_prefill=False,
+                    return_hidden=True,
+                    return_layer_hidden=True,
+                    return_kv_prewrite=True,
+                    return_layer_stages=True,
+                    backend=self.backend,
+                )
+
+                second_query_lens = row_active.astype(jnp.int32)
+                second_query_start_loc = jnp.concatenate(
+                    [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(second_query_lens)]
+                )
+                second_batch = ScheduledBatch(
+                    tokens=jnp.where(row_active[:, None], draft_token_arg[:, None], jnp.zeros_like(tokens)),
+                    positions=jnp.where(row_active[:, None], positions + 1, jnp.zeros_like(positions)),
+                    seq_ids=jnp.where(row_active, seq_ids, jnp.full_like(seq_ids, -1)),
+                    query_start_loc=second_query_start_loc,
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=jnp.sum(second_query_lens),
+                    block_tables=jnp.where(row_active[:, None], block_tables, jnp.zeros_like(block_tables)),
+                    seq_lens=jnp.where(row_active, seq_lens + 1, jnp.zeros_like(seq_lens)),
+                )
+                second_metadata = self.backend.build_attention_metadata(
+                    positions=second_batch.positions,
+                    block_tables=second_batch.block_tables,
+                    seq_lens=second_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=False,
+                    query_start_loc=second_batch.query_start_loc,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=second_batch.num_decode_tokens,
+                )
+                second_kv_state = KVCacheState(
+                    k_cache=seq_kv0.k_cache,
+                    v_cache=seq_kv0.v_cache,
+                    block_table=second_batch.block_tables,
+                    kv_lens=second_batch.seq_lens,
+                    slot_mapping=second_metadata.slot_mapping,
+                )
+                _seq_hidden1, seq_kv1, seq_hybrid1, _seq_layers1 = model_forward_step(
+                    second_batch.tokens,
+                    params,
+                    self.config,
+                    positions=second_batch.positions,
+                    kv_cache_state=second_kv_state,
+                    attention_metadata=second_metadata,
+                    hybrid_state=seq_hybrid0,
+                    is_prefill=False,
+                    return_hidden=True,
+                    return_layer_hidden=True,
+                    backend=self.backend,
+                )
+
+                hidden_max_abs = _layer_hidden_max_abs(fused_layers, seq_layers0, row_active)
+                current_slots = verify_metadata.slot_mapping[:, 0]
+                k_slot_all = _kv_slot_layer_max_abs(fused_kv.k_cache, seq_kv1.k_cache, current_slots, row_active)
+                v_slot_all = _kv_slot_layer_max_abs(fused_kv.v_cache, seq_kv1.v_cache, current_slots, row_active)
+
+                prewrite_k_all = _prewrite_layer_max_abs(fused_prewrite_k, seq_prewrite_k0, row_active)
+                prewrite_v_all = _prewrite_layer_max_abs(fused_prewrite_v, seq_prewrite_v0, row_active)
+                block_stage_all = _block_stage_max_abs(fused_stages, seq_stages0, row_active)
+
+                k_values = []
+                v_values = []
+                conv_values = []
+                recurrent_values = []
+                prewrite_k_values = []
+                prewrite_v_values = []
+                linear_idx = 0
+                for layer_idx, layer_type in enumerate(layer_types):
+                    if layer_type == "full_attention":
+                        k_values.append(k_slot_all[layer_idx])
+                        v_values.append(v_slot_all[layer_idx])
+                        conv_values.append(jnp.asarray(0.0, dtype=jnp.float32))
+                        recurrent_values.append(jnp.asarray(0.0, dtype=jnp.float32))
+                        prewrite_k_values.append(prewrite_k_all[layer_idx])
+                        prewrite_v_values.append(prewrite_v_all[layer_idx])
+                    else:
+                        k_values.append(jnp.asarray(0.0, dtype=jnp.float32))
+                        v_values.append(jnp.asarray(0.0, dtype=jnp.float32))
+                        prewrite_k_values.append(jnp.asarray(0.0, dtype=jnp.float32))
+                        prewrite_v_values.append(jnp.asarray(0.0, dtype=jnp.float32))
+                        conv_values.append(
+                            _hybrid_layer_max_abs(
+                                fused_hybrid.conv_state,
+                                seq_hybrid1.conv_state,
+                                linear_idx,
+                                row_active,
+                            )
+                        )
+                        recurrent_values.append(
+                            _hybrid_layer_max_abs(
+                                fused_hybrid.recurrent_state,
+                                seq_hybrid1.recurrent_state,
+                                linear_idx,
+                                row_active,
+                            )
+                        )
+                        linear_idx += 1
+
+                return (
+                    hidden_max_abs,
+                    jnp.stack(k_values),
+                    jnp.stack(v_values),
+                    jnp.stack(conv_values),
+                    jnp.stack(recurrent_values),
+                    jnp.stack(prewrite_k_values),
+                    jnp.stack(prewrite_v_values),
+                    block_stage_all,
+                )
+
+            self._jit_cache[key] = jax.jit(compiled)
+
+        outputs = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self.params,
+                batch.tokens,
+                batch.positions,
+                batch.seq_ids,
+                batch.query_start_loc,
+                jnp.asarray(batch.num_decode_tokens, dtype=jnp.int32),
+                batch.block_tables,
+                batch.seq_lens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state.conv_state,
+                hybrid_state.recurrent_state,
+                jnp.asarray(draft_token, dtype=jnp.int32),
+            ),
+            "mtp1_layerwise_drift_debug_jit",
+        )
+        return MTP1LayerwiseDriftDebugOutput(*outputs)
+
     def mtp1_two_decode_greedy_fast_step_jit(
         self,
         batch: ScheduledBatch,
@@ -1165,63 +1798,107 @@ class ModelExecutor:
                 if batch_accept_policy == "all_or_none":
                     accepted = accepted & jnp.all(jnp.where(row_active, accepted, True))
 
-                second_query_lens = accepted.astype(jnp.int32)
-                second_query_start_loc = jnp.concatenate(
-                    [
-                        jnp.zeros((1,), dtype=jnp.int32),
-                        jnp.cumsum(second_query_lens),
-                    ]
+                def run_second_decode(_):
+                    second_query_lens = accepted.astype(jnp.int32)
+                    second_query_start_loc = jnp.concatenate(
+                        [
+                            jnp.zeros((1,), dtype=jnp.int32),
+                            jnp.cumsum(second_query_lens),
+                        ]
+                    )
+                    second_seq_lens = jnp.where(accepted, seq_lens + 1, jnp.zeros_like(seq_lens))
+                    second_tokens = jnp.where(accepted[:, None], target_token[:, None], jnp.zeros_like(tokens))
+                    second_positions = jnp.where(accepted[:, None], positions + 1, jnp.zeros_like(positions))
+                    second_seq_ids = jnp.where(accepted, seq_ids, jnp.full_like(seq_ids, -1))
+                    second_block_tables = jnp.where(
+                        accepted[:, None],
+                        block_tables,
+                        jnp.zeros_like(block_tables),
+                    )
+                    second_batch = ScheduledBatch(
+                        tokens=second_tokens,
+                        positions=second_positions,
+                        seq_ids=second_seq_ids,
+                        query_start_loc=second_query_start_loc,
+                        is_prefill=False,
+                        num_prefill_tokens=0,
+                        num_decode_tokens=jnp.sum(second_query_lens),
+                        block_tables=second_block_tables,
+                        seq_lens=second_seq_lens,
+                    )
+                    second_metadata = self.backend.build_attention_metadata(
+                        positions=second_batch.positions,
+                        block_tables=second_batch.block_tables,
+                        seq_lens=second_batch.seq_lens,
+                        block_size=self.config.block_size,
+                        is_prefill=False,
+                        query_start_loc=second_batch.query_start_loc,
+                        num_prefill_tokens=0,
+                        num_decode_tokens=second_batch.num_decode_tokens,
+                    )
+                    second_kv_state = KVCacheState(
+                        k_cache=kv_after_current.k_cache,
+                        v_cache=kv_after_current.v_cache,
+                        block_table=second_batch.block_tables,
+                        kv_lens=second_batch.seq_lens,
+                        slot_mapping=second_metadata.slot_mapping,
+                    )
+                    (next_hidden, next_logits), next_kv, next_hybrid = model_forward_step(
+                        second_batch.tokens,
+                        params,
+                        self.config,
+                        positions=second_batch.positions,
+                        kv_cache_state=second_kv_state,
+                        attention_metadata=second_metadata,
+                        hybrid_state=hybrid_after_current,
+                        is_prefill=False,
+                        return_hidden=True,
+                        return_hidden_with_logits=True,
+                        last_logits_only=True,
+                        backend=self.backend,
+                    )
+                    return (
+                        next_hidden,
+                        next_logits,
+                        next_kv.k_cache,
+                        next_kv.v_cache,
+                        next_hybrid.conv_state,
+                        next_hybrid.recurrent_state,
+                        second_metadata.slot_mapping[:, 0],
+                    )
+
+                def skip_second_decode(_):
+                    return (
+                        jnp.zeros_like(hidden0),
+                        jnp.zeros(
+                            (tokens.shape[0], 1, output_weight.shape[1]),
+                            dtype=jnp.float32,
+                        ),
+                        kv_after_current.k_cache,
+                        kv_after_current.v_cache,
+                        hybrid_after_current.conv_state,
+                        hybrid_after_current.recurrent_state,
+                        jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
+                    )
+
+                second_decode_needed = jnp.any(accepted)
+                (
+                    hidden1,
+                    bonus_logits,
+                    draft_k_cache,
+                    draft_v_cache,
+                    draft_conv_state,
+                    draft_recurrent_state,
+                    draft_slots,
+                ) = jax.lax.cond(
+                    second_decode_needed,
+                    run_second_decode,
+                    skip_second_decode,
+                    operand=None,
                 )
-                second_seq_lens = jnp.where(accepted, seq_lens + 1, jnp.zeros_like(seq_lens))
-                second_tokens = jnp.where(accepted[:, None], target_token[:, None], jnp.zeros_like(tokens))
-                second_positions = jnp.where(accepted[:, None], positions + 1, jnp.zeros_like(positions))
-                second_seq_ids = jnp.where(accepted, seq_ids, jnp.full_like(seq_ids, -1))
-                second_block_tables = jnp.where(
-                    accepted[:, None],
-                    block_tables,
-                    jnp.zeros_like(block_tables),
-                )
-                second_batch = ScheduledBatch(
-                    tokens=second_tokens,
-                    positions=second_positions,
-                    seq_ids=second_seq_ids,
-                    query_start_loc=second_query_start_loc,
-                    is_prefill=False,
-                    num_prefill_tokens=0,
-                    num_decode_tokens=jnp.sum(second_query_lens),
-                    block_tables=second_block_tables,
-                    seq_lens=second_seq_lens,
-                )
-                second_metadata = self.backend.build_attention_metadata(
-                    positions=second_batch.positions,
-                    block_tables=second_batch.block_tables,
-                    seq_lens=second_batch.seq_lens,
-                    block_size=self.config.block_size,
-                    is_prefill=False,
-                    query_start_loc=second_batch.query_start_loc,
-                    num_prefill_tokens=0,
-                    num_decode_tokens=second_batch.num_decode_tokens,
-                )
-                second_kv_state = KVCacheState(
-                    k_cache=kv_after_current.k_cache,
-                    v_cache=kv_after_current.v_cache,
-                    block_table=second_batch.block_tables,
-                    kv_lens=second_batch.seq_lens,
-                    slot_mapping=second_metadata.slot_mapping,
-                )
-                (hidden1, bonus_logits), kv_after_draft, hybrid_after_draft = model_forward_step(
-                    second_batch.tokens,
-                    params,
-                    self.config,
-                    positions=second_batch.positions,
-                    kv_cache_state=second_kv_state,
-                    attention_metadata=second_metadata,
-                    hybrid_state=hybrid_after_current,
-                    is_prefill=False,
-                    return_hidden=True,
-                    return_hidden_with_logits=True,
-                    last_logits_only=True,
-                    backend=self.backend,
+                hybrid_after_draft = HybridLayerState(
+                    conv_state=draft_conv_state,
+                    recurrent_state=draft_recurrent_state,
                 )
 
                 bonus_token = jnp.argmax(bonus_logits[:, 0], axis=-1).astype(jnp.int32)
@@ -1255,18 +1932,28 @@ class ModelExecutor:
                 )
                 next_draft_token = jnp.argmax(next_draft_logits[:, 0], axis=-1).astype(jnp.int32)
 
-                selected_conv = jnp.where(
-                    _expand_row_mask(accepted, hybrid_after_draft.conv_state),
-                    hybrid_after_draft.conv_state,
-                    hybrid_after_current.conv_state,
-                )
-                selected_recurrent = jnp.where(
-                    _expand_row_mask(accepted, hybrid_after_draft.recurrent_state),
-                    hybrid_after_draft.recurrent_state,
-                    hybrid_after_current.recurrent_state,
-                )
-                draft_slots = second_metadata.slot_mapping[:, 0]
+                final_any_accepted = jnp.any(accepted)
 
+                def select_hybrid_after_draft(_):
+                    return (
+                        jnp.where(
+                            _expand_row_mask(accepted, hybrid_after_draft.conv_state),
+                            hybrid_after_draft.conv_state,
+                            hybrid_after_current.conv_state,
+                        ),
+                        jnp.where(
+                            _expand_row_mask(accepted, hybrid_after_draft.recurrent_state),
+                            hybrid_after_draft.recurrent_state,
+                            hybrid_after_current.recurrent_state,
+                        ),
+                    )
+
+                selected_conv, selected_recurrent = jax.lax.cond(
+                    final_any_accepted,
+                    select_hybrid_after_draft,
+                    lambda _: (hybrid_after_current.conv_state, hybrid_after_current.recurrent_state),
+                    operand=None,
+                )
                 def restore_rejected_draft_slots(new_cache, current_cache):
                     leading_shape = new_cache.shape[:-4] if new_cache.ndim == 5 else new_cache.shape[:-3]
                     flat_new = new_cache.reshape(leading_shape + (-1,) + new_cache.shape[-2:])
@@ -1278,8 +1965,15 @@ class ModelExecutor:
                     flat_new = flat_new.at[..., draft_slots, :, :].set(selected_values)
                     return flat_new.reshape(new_cache.shape)
 
-                selected_k_cache = restore_rejected_draft_slots(kv_after_draft.k_cache, kv_after_current.k_cache)
-                selected_v_cache = restore_rejected_draft_slots(kv_after_draft.v_cache, kv_after_current.v_cache)
+                selected_k_cache, selected_v_cache = jax.lax.cond(
+                    final_any_accepted,
+                    lambda _: (
+                        restore_rejected_draft_slots(draft_k_cache, kv_after_current.k_cache),
+                        restore_rejected_draft_slots(draft_v_cache, kv_after_current.v_cache),
+                    ),
+                    lambda _: (kv_after_current.k_cache, kv_after_current.v_cache),
+                    operand=None,
+                )
 
                 return (
                     target_token,
@@ -1362,8 +2056,10 @@ class ModelExecutor:
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
+            os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
         )
         if key not in self._jit_cache:
+            batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
 
             def _expand_row_mask(mask: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
                 return mask.reshape((mask.shape[0],) + (1,) * (target.ndim - 1))
@@ -1432,94 +2128,206 @@ class ModelExecutor:
                     backend=self.backend,
                 )
                 target0 = jnp.argmax(logits0[:, 0], axis=-1).astype(jnp.int32)
-                accepted0 = target0 == draft_tokens_arg[:, 0]
+                row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                row_active = (row_query_lens > 0) & (seq_ids >= 0)
+                accepted0 = (target0 == draft_tokens_arg[:, 0]) & row_active
+                if batch_accept_policy == "all_or_none":
+                    accepted0 = accepted0 & jnp.all(jnp.where(row_active, accepted0, True))
 
-                second_batch = ScheduledBatch(
-                    tokens=target0[:, None],
-                    positions=positions + 1,
-                    seq_ids=seq_ids,
-                    query_start_loc=query_start_loc,
-                    is_prefill=False,
-                    num_prefill_tokens=0,
-                    num_decode_tokens=num_decode_tokens,
-                    block_tables=block_tables,
-                    seq_lens=seq_lens + 1,
+                def run_second_decode(_):
+                    second_query_lens = accepted0.astype(jnp.int32)
+                    second_query_start_loc = jnp.concatenate(
+                        [
+                            jnp.zeros((1,), dtype=jnp.int32),
+                            jnp.cumsum(second_query_lens),
+                        ]
+                    )
+                    second_seq_lens = jnp.where(accepted0, seq_lens + 1, jnp.zeros_like(seq_lens))
+                    second_batch = ScheduledBatch(
+                        tokens=jnp.where(accepted0[:, None], target0[:, None], jnp.zeros_like(tokens)),
+                        positions=jnp.where(accepted0[:, None], positions + 1, jnp.zeros_like(positions)),
+                        seq_ids=jnp.where(accepted0, seq_ids, jnp.full_like(seq_ids, -1)),
+                        query_start_loc=second_query_start_loc,
+                        is_prefill=False,
+                        num_prefill_tokens=0,
+                        num_decode_tokens=jnp.sum(second_query_lens),
+                        block_tables=jnp.where(
+                            accepted0[:, None],
+                            block_tables,
+                            jnp.zeros_like(block_tables),
+                        ),
+                        seq_lens=second_seq_lens,
+                    )
+                    second_metadata = self.backend.build_attention_metadata(
+                        positions=second_batch.positions,
+                        block_tables=second_batch.block_tables,
+                        seq_lens=second_batch.seq_lens,
+                        block_size=self.config.block_size,
+                        is_prefill=False,
+                        query_start_loc=second_batch.query_start_loc,
+                        num_prefill_tokens=0,
+                        num_decode_tokens=second_batch.num_decode_tokens,
+                    )
+                    second_kv_state = KVCacheState(
+                        k_cache=kv_after_current.k_cache,
+                        v_cache=kv_after_current.v_cache,
+                        block_table=second_batch.block_tables,
+                        kv_lens=second_batch.seq_lens,
+                        slot_mapping=second_metadata.slot_mapping,
+                    )
+                    (next_hidden, next_logits), next_kv, next_hybrid = model_forward_step(
+                        second_batch.tokens,
+                        params,
+                        self.config,
+                        positions=second_batch.positions,
+                        kv_cache_state=second_kv_state,
+                        attention_metadata=second_metadata,
+                        hybrid_state=hybrid_after_current,
+                        is_prefill=False,
+                        return_hidden=True,
+                        return_hidden_with_logits=True,
+                        last_logits_only=True,
+                        backend=self.backend,
+                    )
+                    return (
+                        next_hidden,
+                        next_logits,
+                        next_kv.k_cache,
+                        next_kv.v_cache,
+                        next_hybrid.conv_state,
+                        next_hybrid.recurrent_state,
+                        second_metadata.slot_mapping[:, 0],
+                    )
+
+                def skip_second_decode(_):
+                    return (
+                        jnp.zeros_like(hidden0),
+                        jnp.zeros_like(logits0),
+                        kv_after_current.k_cache,
+                        kv_after_current.v_cache,
+                        hybrid_after_current.conv_state,
+                        hybrid_after_current.recurrent_state,
+                        jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
+                    )
+
+                (
+                    hidden1,
+                    logits1,
+                    token1_k_cache,
+                    token1_v_cache,
+                    token1_conv_state,
+                    token1_recurrent_state,
+                    token1_slots,
+                ) = jax.lax.cond(
+                    jnp.any(accepted0),
+                    run_second_decode,
+                    skip_second_decode,
+                    operand=None,
                 )
-                second_metadata = self.backend.build_attention_metadata(
-                    positions=second_batch.positions,
-                    block_tables=second_batch.block_tables,
-                    seq_lens=second_batch.seq_lens,
-                    block_size=self.config.block_size,
-                    is_prefill=False,
-                    query_start_loc=second_batch.query_start_loc,
-                    num_prefill_tokens=0,
-                    num_decode_tokens=second_batch.num_decode_tokens,
-                )
-                second_kv_state = KVCacheState(
-                    k_cache=kv_after_current.k_cache,
-                    v_cache=kv_after_current.v_cache,
-                    block_table=second_batch.block_tables,
-                    kv_lens=second_batch.seq_lens,
-                    slot_mapping=second_metadata.slot_mapping,
-                )
-                (hidden1, logits1), kv_after_token1, hybrid_after_token1 = model_forward_step(
-                    second_batch.tokens,
-                    params,
-                    self.config,
-                    positions=second_batch.positions,
-                    kv_cache_state=second_kv_state,
-                    attention_metadata=second_metadata,
-                    hybrid_state=hybrid_after_current,
-                    is_prefill=False,
-                    return_hidden=True,
-                    return_hidden_with_logits=True,
-                    last_logits_only=True,
-                    backend=self.backend,
+                kv_after_token1 = KVCacheStorage(token1_k_cache, token1_v_cache)
+                hybrid_after_token1 = HybridLayerState(
+                    conv_state=token1_conv_state,
+                    recurrent_state=token1_recurrent_state,
                 )
                 target1 = jnp.argmax(logits1[:, 0], axis=-1).astype(jnp.int32)
                 accepted1 = accepted0 & (target1 == draft_tokens_arg[:, 1])
+                if batch_accept_policy == "all_or_none":
+                    accepted1 = accepted1 & jnp.all(jnp.where(row_active, accepted1, True))
 
-                third_batch = ScheduledBatch(
-                    tokens=target1[:, None],
-                    positions=positions + 2,
-                    seq_ids=seq_ids,
-                    query_start_loc=query_start_loc,
-                    is_prefill=False,
-                    num_prefill_tokens=0,
-                    num_decode_tokens=num_decode_tokens,
-                    block_tables=block_tables,
-                    seq_lens=seq_lens + 2,
+                def run_third_decode(_):
+                    third_query_lens = accepted1.astype(jnp.int32)
+                    third_query_start_loc = jnp.concatenate(
+                        [
+                            jnp.zeros((1,), dtype=jnp.int32),
+                            jnp.cumsum(third_query_lens),
+                        ]
+                    )
+                    third_seq_lens = jnp.where(accepted1, seq_lens + 2, jnp.zeros_like(seq_lens))
+                    third_batch = ScheduledBatch(
+                        tokens=jnp.where(accepted1[:, None], target1[:, None], jnp.zeros_like(tokens)),
+                        positions=jnp.where(accepted1[:, None], positions + 2, jnp.zeros_like(positions)),
+                        seq_ids=jnp.where(accepted1, seq_ids, jnp.full_like(seq_ids, -1)),
+                        query_start_loc=third_query_start_loc,
+                        is_prefill=False,
+                        num_prefill_tokens=0,
+                        num_decode_tokens=jnp.sum(third_query_lens),
+                        block_tables=jnp.where(
+                            accepted1[:, None],
+                            block_tables,
+                            jnp.zeros_like(block_tables),
+                        ),
+                        seq_lens=third_seq_lens,
+                    )
+                    third_metadata = self.backend.build_attention_metadata(
+                        positions=third_batch.positions,
+                        block_tables=third_batch.block_tables,
+                        seq_lens=third_batch.seq_lens,
+                        block_size=self.config.block_size,
+                        is_prefill=False,
+                        query_start_loc=third_batch.query_start_loc,
+                        num_prefill_tokens=0,
+                        num_decode_tokens=third_batch.num_decode_tokens,
+                    )
+                    third_kv_state = KVCacheState(
+                        k_cache=kv_after_token1.k_cache,
+                        v_cache=kv_after_token1.v_cache,
+                        block_table=third_batch.block_tables,
+                        kv_lens=third_batch.seq_lens,
+                        slot_mapping=third_metadata.slot_mapping,
+                    )
+                    (next_hidden, next_logits), next_kv, next_hybrid = model_forward_step(
+                        third_batch.tokens,
+                        params,
+                        self.config,
+                        positions=third_batch.positions,
+                        kv_cache_state=third_kv_state,
+                        attention_metadata=third_metadata,
+                        hybrid_state=hybrid_after_token1,
+                        is_prefill=False,
+                        return_hidden=True,
+                        return_hidden_with_logits=True,
+                        last_logits_only=True,
+                        backend=self.backend,
+                    )
+                    return (
+                        next_hidden,
+                        next_logits,
+                        next_kv.k_cache,
+                        next_kv.v_cache,
+                        next_hybrid.conv_state,
+                        next_hybrid.recurrent_state,
+                        third_metadata.slot_mapping[:, 0],
+                    )
+
+                def skip_third_decode(_):
+                    return (
+                        jnp.zeros_like(hidden0),
+                        jnp.zeros_like(logits0),
+                        kv_after_token1.k_cache,
+                        kv_after_token1.v_cache,
+                        hybrid_after_token1.conv_state,
+                        hybrid_after_token1.recurrent_state,
+                        jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
+                    )
+
+                (
+                    hidden2,
+                    logits2,
+                    token2_k_cache,
+                    token2_v_cache,
+                    token2_conv_state,
+                    token2_recurrent_state,
+                    token2_slots,
+                ) = jax.lax.cond(
+                    jnp.any(accepted1),
+                    run_third_decode,
+                    skip_third_decode,
+                    operand=None,
                 )
-                third_metadata = self.backend.build_attention_metadata(
-                    positions=third_batch.positions,
-                    block_tables=third_batch.block_tables,
-                    seq_lens=third_batch.seq_lens,
-                    block_size=self.config.block_size,
-                    is_prefill=False,
-                    query_start_loc=third_batch.query_start_loc,
-                    num_prefill_tokens=0,
-                    num_decode_tokens=third_batch.num_decode_tokens,
-                )
-                third_kv_state = KVCacheState(
-                    k_cache=kv_after_token1.k_cache,
-                    v_cache=kv_after_token1.v_cache,
-                    block_table=third_batch.block_tables,
-                    kv_lens=third_batch.seq_lens,
-                    slot_mapping=third_metadata.slot_mapping,
-                )
-                (hidden2, logits2), kv_after_token2, hybrid_after_token2 = model_forward_step(
-                    third_batch.tokens,
-                    params,
-                    self.config,
-                    positions=third_batch.positions,
-                    kv_cache_state=third_kv_state,
-                    attention_metadata=third_metadata,
-                    hybrid_state=hybrid_after_token1,
-                    is_prefill=False,
-                    return_hidden=True,
-                    return_hidden_with_logits=True,
-                    last_logits_only=True,
-                    backend=self.backend,
+                kv_after_token2 = KVCacheStorage(token2_k_cache, token2_v_cache)
+                hybrid_after_token2 = HybridLayerState(
+                    conv_state=token2_conv_state,
+                    recurrent_state=token2_recurrent_state,
                 )
                 target2 = jnp.argmax(logits2[:, 0], axis=-1).astype(jnp.int32)
 
@@ -1567,43 +2375,8 @@ class ModelExecutor:
                     hybrid_after_token2.recurrent_state,
                 )
 
-                def restore_slot(new_cache, reference_cache, slots, keep_mask):
-                    leading_shape = new_cache.shape[:-4] if new_cache.ndim == 5 else new_cache.shape[:-3]
-                    flat_new = new_cache.reshape(leading_shape + (-1,) + new_cache.shape[-2:])
-                    flat_ref = reference_cache.reshape(leading_shape + (-1,) + reference_cache.shape[-2:])
-                    new_values = flat_new[..., slots, :, :]
-                    ref_values = flat_ref[..., slots, :, :]
-                    slot_mask = keep_mask.reshape((1,) * len(leading_shape) + (keep_mask.shape[0], 1, 1))
-                    selected_values = jnp.where(slot_mask, new_values, ref_values)
-                    flat_new = flat_new.at[..., slots, :, :].set(selected_values)
-                    return flat_new.reshape(new_cache.shape)
-
-                token1_slots = second_metadata.slot_mapping[:, 0]
-                token2_slots = third_metadata.slot_mapping[:, 0]
-                selected_k_cache = restore_slot(
-                    kv_after_token2.k_cache,
-                    kv_after_token1.k_cache,
-                    token2_slots,
-                    prefix_len >= 2,
-                )
-                selected_v_cache = restore_slot(
-                    kv_after_token2.v_cache,
-                    kv_after_token1.v_cache,
-                    token2_slots,
-                    prefix_len >= 2,
-                )
-                selected_k_cache = restore_slot(
-                    selected_k_cache,
-                    kv_after_current.k_cache,
-                    token1_slots,
-                    prefix_len >= 1,
-                )
-                selected_v_cache = restore_slot(
-                    selected_v_cache,
-                    kv_after_current.v_cache,
-                    token1_slots,
-                    prefix_len >= 1,
-                )
+                selected_k_cache = kv_after_token2.k_cache
+                selected_v_cache = kv_after_token2.v_cache
 
                 return (
                     jnp.stack([target0, target1], axis=1),

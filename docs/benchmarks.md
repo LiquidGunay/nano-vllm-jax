@@ -60,6 +60,129 @@ Interpretation invariant:
 decode_speedup is the primary MTP signal; end-to-end speedup can be dominated by prefill
 ```
 
+Adaptive MTP gating note:
+
+```text
+adaptive_mtp_gating.predicted_speedup is diagnostic only. Do not use it as an
+authoritative serving enable/disable criterion when it disagrees with measured
+decode_speedup from the same run. For exact commit-select K=1, prefer measured
+decode_speedup under valid correctness gates. Formulaic acceptance-based
+predicted speedup is only comparable when baseline and speculative milliseconds
+are measured with identical scope.
+```
+
+## Serving workload suite wrapper
+
+`benchmarks/benchmark_serving_workloads.py` orchestrates fixed serving-oriented
+workload definitions through `benchmark_mtp1_engine.py` and emits one combined
+JSON report plus one Markdown table. It keeps correctness gating in the existing
+engine harness: timed results are valid only when exact token match passes and
+the optional HF next-step logit sanity check passes. Invalid timing is preserved
+as raw timing by the engine report and surfaced with `valid=false` plus an
+invalid reason in the suite report.
+
+Fixed workload definitions:
+
+- `decode_steady_b1`: one active row, warmup, one normal prefill followed by steady decode.
+- `long_output_b1`: one active row with longer prompt and longer generated output.
+- `heterogeneous_b4`: four active rows with short, medium, and long prompt lengths in one batch.
+- `interleaved_prefill_decode_b4`: four rows, small prefill buckets, and mixed short/long prompts so short rows can decode while long rows continue chunked prefill.
+- `mixed_active_inactive_b4`: three active rows in fixed physical B4 buckets to cover inactive-row behavior.
+
+Optional MTP modes:
+
+- `baseline`: non-speculative target baseline with `--num-speculative-tokens 0`.
+- `commit_select`: safe sequential commit-select verifier reference, with no unsafe one-pass env. The standalone engine harness supports `--num-speculative-tokens 1` and `--num-speculative-tokens 2`; the serving-workload wrapper currently uses K=1 unless extended.
+- `compact_commit_select`: optional env-gated compact commit-select K=1 comparison mode using `NANO_VLLM_JAX_MTP_ENABLE_COMPACT_COMMIT_SELECT=1`; report separately from the safe full-physical-bucket `commit_select` reference.
+- `unsafe_one_pass_no_seed`: unsafe one-pass K=1 verifier with `NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1=1`, one-pass env enabled, and no seed-after-bonus.
+- `unsafe_one_pass_seeded_cap2`: unsafe one-pass K=1 verifier with seed-after-bonus enabled and `NANO_VLLM_JAX_MTP_MAX_SEEDED_CHAIN=2`.
+- `unsafe_one_pass_seeded_cap4`: unsafe one-pass K=1 verifier with seed-after-bonus enabled and `NANO_VLLM_JAX_MTP_MAX_SEEDED_CHAIN=4`.
+
+Unsafe one-pass validity policy:
+
+```text
+unsafe_one_pass_* speed fields are invalid unless exact-token match passes and next-step-logit sanity passes.
+```
+
+The suite wrapper enforces that policy by marking unsafe one-pass rows invalid
+unless `--check-hf-logits` was used and passed. Smoke or correctness-only runs
+may still preserve raw timing from the underlying engine report, but missing
+throughput cells in the Markdown report are rendered as `n/a (smoke)` instead of
+blank cells.
+
+Default correctness-valid benchmark matrix:
+
+- Workloads: `decode_steady_b1`, `heterogeneous_b4`, `long_output_b1`, `interleaved_prefill_decode_b4`.
+- Modes: `baseline`, `commit_select`, `compact_commit_select`.
+- Unsafe one-pass modes are opt-in diagnostics and should not be mixed into valid throughput summaries.
+
+Metrics normalized into the suite report:
+
+- `prefill_tok_s`
+- `decode_tok_s`
+- `end_to_end_tok_s`
+- `decode_speedup`
+- `end_to_end_speedup`
+- `acceptance_rate`
+- `fallback_count`
+- accepted, rejected, and fallback inter-token latency p50/p95
+- host, runner/device, and postprocess time
+- correctness flags
+- `first_diff` when invalid
+
+Bounded TPU smoke command:
+
+```bash
+gcloud compute tpus tpu-vm ssh nano-vllm-tpu-2404-run \
+  --project=project-b9551f07-5f68-491a-8a0 \
+  --zone=europe-west4-a \
+  --command='cd /tmp/nano-vllm-jax-validate-2e3fbad && \
+    /tmp/nvj-validate-venv-system/bin/python benchmarks/benchmark_serving_workloads.py \
+      --smoke \
+      --model Qwen/Qwen3.5-2B \
+      --backend tpu \
+      --output-json /tmp/serving_workloads_smoke.json \
+      --output-md /tmp/serving_workloads_smoke.md'
+```
+
+TPU-side dry-run command validation without model load or benchmark compute:
+
+```bash
+gcloud compute tpus tpu-vm ssh nano-vllm-tpu-2404-run \
+  --project=project-b9551f07-5f68-491a-8a0 \
+  --zone=europe-west4-a \
+  --command='cd /tmp/nano-vllm-jax-validate-2e3fbad && \
+    /tmp/nvj-validate-venv-system/bin/python benchmarks/benchmark_serving_workloads.py \
+      --dry-run \
+      --workload decode_steady_b1 \
+      --mode baseline \
+      --mode commit_select \
+      --mode compact_commit_select \
+      --output-json /tmp/serving_workloads_dry_run.json \
+      --output-md /tmp/serving_workloads_dry_run.md'
+```
+
+Bounded full-suite command:
+
+```bash
+gcloud compute tpus tpu-vm ssh nano-vllm-tpu-2404-run \
+  --project=project-b9551f07-5f68-491a-8a0 \
+  --zone=europe-west4-a \
+  --command='cd /tmp/nano-vllm-jax-validate-2e3fbad && \
+    /tmp/nvj-validate-venv-system/bin/python benchmarks/benchmark_serving_workloads.py \
+      --model Qwen/Qwen3.5-2B \
+      --backend tpu \
+      --workload decode_steady_b1 \
+      --workload heterogeneous_b4 \
+      --workload mixed_active_inactive_b4 \
+      --mode baseline \
+      --mode commit_select \
+      --mode compact_commit_select \
+      --check-hf-logits \
+      --output-json /tmp/serving_workloads.json \
+      --output-md /tmp/serving_workloads.md'
+```
+
 ## Exact command lines
 
 HF/JAX split comparison from historical docs:

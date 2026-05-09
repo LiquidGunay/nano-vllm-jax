@@ -1301,6 +1301,47 @@ class CanonicalModelRunner:
             seq_lens=seq_lens,
         )
 
+    def _compact_decode_batch(
+        self,
+        batch: ScheduledBatch,
+        rows: List[int],
+        *,
+        token_values: List[int] | None = None,
+        position_values: List[int] | None = None,
+        seq_len_values: List[int] | None = None,
+    ) -> ScheduledBatch:
+        if not rows:
+            raise ValueError("rows must not be empty")
+        if batch.is_prefill:
+            raise ValueError("compact decode batches require a decode batch")
+
+        row_ids = jnp.array(rows, dtype=jnp.int32)
+        if token_values is None:
+            tokens = batch.tokens[row_ids, :1]
+        else:
+            tokens = jnp.array(token_values, dtype=jnp.int32)[:, None]
+        if position_values is None:
+            positions = batch.positions[row_ids, :1]
+        else:
+            positions = jnp.array(position_values, dtype=jnp.int32)[:, None]
+        if seq_len_values is None:
+            seq_lens = batch.seq_lens[row_ids]
+        else:
+            seq_lens = jnp.array(seq_len_values, dtype=jnp.int32)
+
+        compact_size = len(rows)
+        return ScheduledBatch(
+            tokens=tokens,
+            positions=positions,
+            seq_ids=batch.seq_ids[row_ids],
+            query_start_loc=jnp.arange(compact_size + 1, dtype=jnp.int32),
+            is_prefill=False,
+            num_prefill_tokens=0,
+            num_decode_tokens=compact_size,
+            block_tables=batch.block_tables[row_ids],
+            seq_lens=seq_lens,
+        )
+
     def _batch_hybrid_state(self, batch: ScheduledBatch) -> HybridLayerState:
         slot_values = [self._ensure_hybrid_slot(int(seq_id)) for seq_id in batch.seq_ids.tolist()]
         slot_ids = jnp.array(slot_values, dtype=jnp.int32)
@@ -1675,6 +1716,7 @@ class CanonicalModelRunner:
         batch: ScheduledBatch,
         *,
         seed_mtp1: bool,
+        force_emit_bonus: bool = False,
     ) -> List[int | List[int]]:
         """Decode once with the target model and verify any stored MTP1 drafts.
 
@@ -1843,7 +1885,7 @@ class CanonicalModelRunner:
                     }
                 )
 
-        emit_bonus = os.environ.get("NANO_VLLM_JAX_MTP_EMIT_BONUS", "0") in {
+        emit_bonus = force_emit_bonus or os.environ.get("NANO_VLLM_JAX_MTP_EMIT_BONUS", "0") in {
             "1",
             "true",
             "yes",
@@ -1856,8 +1898,7 @@ class CanonicalModelRunner:
             accepted_rows = []
 
         if accepted_rows:
-            accepted_idx = jnp.array(accepted_rows, dtype=jnp.int32)
-            draft_batch = self._masked_decode_batch(
+            draft_batch = self._compact_decode_batch(
                 batch,
                 accepted_rows,
                 token_values=accepted_drafts,
@@ -1869,7 +1910,8 @@ class CanonicalModelRunner:
                 draft_batch,
                 cache_storage=self.cache_storage,
                 hybrid_state=draft_hybrid_state,
-                return_hidden=False,
+                return_hidden=bool(seed_mtp1),
+                return_hidden_with_logits=bool(seed_mtp1),
                 last_logits_only=True,
             )
             self.cache_storage = draft_output.cache_storage
@@ -1877,7 +1919,11 @@ class CanonicalModelRunner:
             self._refresh_kv_snapshot(draft_batch, draft_output.hybrid_state)
 
             bonus_hidden = None
-            bonus_logits = draft_output.activations[:, 0]
+            if seed_mtp1:
+                bonus_hidden, bonus_logits_all = draft_output.activations
+                bonus_logits = bonus_logits_all[:, 0]
+            else:
+                bonus_logits = draft_output.activations[:, 0]
             bonus_temperatures = jnp.array([seqs[row].temperature for row in accepted_rows], dtype=jnp.float32)
             bonus_token_ids = self._sample_fn(bonus_logits, bonus_temperatures)
             bonus_tokens = [int(token_id) for token_id in bonus_token_ids.tolist()]
@@ -1906,8 +1952,7 @@ class CanonicalModelRunner:
                     stats["bonus_tokens"] += 1
 
             if second_accept_rows:
-                second_idx = jnp.array(second_accept_rows, dtype=jnp.int32)
-                second_batch = self._masked_decode_batch(
+                second_batch = self._compact_decode_batch(
                     batch,
                     second_accept_rows,
                     token_values=second_accept_drafts,
@@ -1950,9 +1995,14 @@ class CanonicalModelRunner:
             if seed_mtp1 and first_only_rows:
                 if bonus_hidden is not None:
                     first_only_indices = jnp.array([accepted_rows.index(row) for row in first_only_rows], dtype=jnp.int32)
+                    bonus_seed_hidden = (
+                        self._hidden_for_mtp(bonus_hidden)[:, 0]
+                        if bonus_hidden.ndim == 3
+                        else self._hidden_for_mtp(bonus_hidden[:, None, :])[:, 0]
+                    )
                     self._seed_mtp1_drafts(
                         [seqs[row] for row in first_only_rows],
-                        self._hidden_for_mtp(bonus_hidden[:, None, :])[:, 0][first_only_indices],
+                        bonus_seed_hidden[first_only_indices],
                         [bonus_tokens[accepted_rows.index(row)] for row in first_only_rows],
                         positions=[
                             int(batch.positions[row, 0]) + 2
@@ -2401,8 +2451,44 @@ class CanonicalModelRunner:
             in {"1", "true", "yes", "on", "True"}
             and hasattr(self.executor, "mtp1_commit_select_greedy_step_jit")
         )
+        layer_parity_debug_one_pass = (
+            draft_len == 1
+            and use_one_pass_k1
+            and os.environ.get("NANO_VLLM_JAX_MTP_LAYER_PARITY_DEBUG", "0")
+            in {"1", "true", "yes", "on", "True"}
+            and hasattr(self.executor, "mtp1_layer_parity_debug_jit")
+        )
+        layerwise_drift_debug_one_pass = (
+            draft_len == 1
+            and use_one_pass_k1
+            and os.environ.get("NANO_VLLM_JAX_MTP_LAYERWISE_DRIFT_DEBUG", "0")
+            in {"1", "true", "yes", "on", "True"}
+            and hasattr(self.executor, "mtp1_layerwise_drift_debug_jit")
+        )
         parity_output = None
+        layer_parity_output = None
+        layerwise_drift_output = None
         if use_one_pass_k1:
+            if layerwise_drift_debug_one_pass:
+                layerwise_drift_output = self.executor.mtp1_layerwise_drift_debug_jit(
+                    decode_batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state=hybrid_state,
+                    draft_token=jnp.array(verifier_draft_tokens_for_batch, dtype=jnp.int32),
+                )
+                _ready(layerwise_drift_output)
+                t_profile = _mark("executor_mtp1_layerwise_drift_debug", t_profile)
+            if layer_parity_debug_one_pass:
+                layer_parity_output = self.executor.mtp1_layer_parity_debug_jit(
+                    decode_batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state=hybrid_state,
+                    draft_token=jnp.array(verifier_draft_tokens_for_batch, dtype=jnp.int32),
+                    next_mtp_position=next_mtp_positions,
+                    mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                )
+                _ready(layer_parity_output)
+                t_profile = _mark("executor_mtp1_layer_parity_debug", t_profile)
             output = self.executor.mtp1_two_decode_greedy_step_jit(
                 decode_batch,
                 cache_storage=self.cache_storage,
@@ -2556,7 +2642,7 @@ class CanonicalModelRunner:
             batch_accept_policy == "rowwise"
             and not enable_rowwise_repair
             and not accepted_all
-            and not (use_one_pass_k1 or use_commit_select)
+            and not (use_one_pass_k1 or use_commit_select or use_mtp2_commit_select)
         ):
             return None
 
@@ -2685,6 +2771,81 @@ class CanonicalModelRunner:
             next_draft_chains = [[int(x)] for x in output.next_draft_token.tolist()]
         else:
             next_draft_chains = [[int(token) for token in chain] for chain in output.next_draft_token.tolist()]
+        if layerwise_drift_output is not None:
+            threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_LAYERWISE_DRIFT_THRESHOLD", "0.1"))
+            hidden_vals = [float(x) for x in layerwise_drift_output.hidden_max_abs.tolist()]
+            k_vals = [float(x) for x in layerwise_drift_output.k_slot_max_abs.tolist()]
+            v_vals = [float(x) for x in layerwise_drift_output.v_slot_max_abs.tolist()]
+            conv_vals = [float(x) for x in layerwise_drift_output.conv_state_max_abs.tolist()]
+            rec_vals = [float(x) for x in layerwise_drift_output.recurrent_state_max_abs.tolist()]
+            pre_k_vals = [float(x) for x in layerwise_drift_output.k_prewrite_max_abs.tolist()]
+            pre_v_vals = [float(x) for x in layerwise_drift_output.v_prewrite_max_abs.tolist()]
+            stage_vals = [
+                [float(v) for v in row]
+                for row in layerwise_drift_output.block_stage_max_abs.tolist()
+            ]
+            stage_names = ["entry", "in_norm", "attn", "attn_resid", "ffn_norm", "mlp", "out"]
+            layer_rows = []
+            first_idx = None
+            for layer_idx, layer_type in enumerate(self.config.layer_types):
+                score = max(
+                    hidden_vals[layer_idx],
+                    k_vals[layer_idx],
+                    v_vals[layer_idx],
+                    conv_vals[layer_idx],
+                    rec_vals[layer_idx],
+                    pre_k_vals[layer_idx],
+                    pre_v_vals[layer_idx],
+                    max(stage_vals[layer_idx]),
+                )
+                if first_idx is None and score > threshold:
+                    first_idx = layer_idx
+                limit_idx = 3 if first_idx is None else first_idx + 1
+                if layer_idx <= limit_idx:
+                    layer_rows.append(
+                        f"{layer_idx}:{layer_type}:h={hidden_vals[layer_idx]:.6g},"
+                        f"k={k_vals[layer_idx]:.6g},v={v_vals[layer_idx]:.6g},"
+                        f"pre_k={pre_k_vals[layer_idx]:.6g},pre_v={pre_v_vals[layer_idx]:.6g},"
+                        f"conv={conv_vals[layer_idx]:.6g},rec={rec_vals[layer_idx]:.6g},"
+                        f"stages="
+                        f"{','.join(f'{name}={stage_vals[layer_idx][idx]:.6g}' for idx, name in enumerate(stage_names))}"
+                    )
+            if first_idx is None:
+                first_layer = "none"
+                first_type = "none"
+            else:
+                first_layer = str(first_idx)
+                first_type = self.config.layer_types[first_idx]
+            print(
+                "[MTP_LAYERWISE_DRIFT] fused_one_pass_vs_seq "
+                f"threshold={threshold:.6g} "
+                f"first_layer={first_layer} first_type={first_type} "
+                f"layers={';'.join(layer_rows)}",
+                flush=True,
+            )
+        if layer_parity_output is not None:
+            print(
+                "[MTP_LAYER_PARITY] fused_one_pass_vs_seq "
+                f"slot0_logit_max_abs={float(layer_parity_output.slot0_logit_max_abs.item()):.6g} "
+                f"slot1_logit_max_abs={float(layer_parity_output.slot1_logit_max_abs.item()):.6g} "
+                f"slot0_hidden_max_abs={float(layer_parity_output.slot0_hidden_max_abs.item()):.6g} "
+                f"slot1_hidden_max_abs={float(layer_parity_output.slot1_hidden_max_abs.item()):.6g} "
+                f"current_k_slot_max_abs={float(layer_parity_output.current_k_slot_max_abs.item()):.6g} "
+                f"draft_k_slot_max_abs={float(layer_parity_output.draft_k_slot_max_abs.item()):.6g} "
+                f"current_v_slot_max_abs={float(layer_parity_output.current_v_slot_max_abs.item()):.6g} "
+                f"draft_v_slot_max_abs={float(layer_parity_output.draft_v_slot_max_abs.item()):.6g} "
+                f"conv_state_max_abs={float(layer_parity_output.conv_state_max_abs.item()):.6g} "
+                f"recurrent_state_max_abs={float(layer_parity_output.recurrent_state_max_abs.item()):.6g} "
+                f"fused_target={layer_parity_output.fused_target_token.tolist()} "
+                f"seq_target={layer_parity_output.seq_target_token.tolist()} "
+                f"fused_bonus={layer_parity_output.fused_bonus_token.tolist()} "
+                f"seq_bonus={layer_parity_output.seq_bonus_token.tolist()} "
+                f"fused_top5_slot0={layer_parity_output.fused_top5_slot0.tolist()} "
+                f"seq_top5_slot0={layer_parity_output.seq_top5_slot0.tolist()} "
+                f"fused_top5_slot1={layer_parity_output.fused_top5_slot1.tolist()} "
+                f"seq_top5_slot1={layer_parity_output.seq_top5_slot1.tolist()}",
+                flush=True,
+            )
         if parity_output is not None:
             parity_targets = [int(x) for x in parity_output.target_token.tolist()]
             parity_bonus = [int(x) for x in parity_output.bonus_token.tolist()]
@@ -2983,6 +3144,31 @@ class CanonicalModelRunner:
             batch = self._build_scheduled_batch(seqs, is_prefill=is_prefill)
 
         seed_mtp1 = True
+        force_commit_select = os.environ.get("NANO_VLLM_JAX_MTP_COMMIT_SELECT", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }
+        disable_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }
+        allow_unsafe_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }
+        exact_commit_select_available = (
+            hasattr(self.executor, "mtp1_commit_select_greedy_step_jit")
+            and (force_commit_select or disable_one_pass_k1 or not allow_unsafe_one_pass_k1)
+        )
         if batch.is_prefill:
             prefill_final_flags = [
                 bool(flag) for flag in (batch.prefill_final_flags[: len(seqs)] if len(batch.prefill_final_flags) >= len(seqs) else batch.prefill_final_flags)
@@ -2999,7 +3185,7 @@ class CanonicalModelRunner:
                 len(seqs) == batch.tokens.shape[0]
                 and len({seq.num_tokens for seq in seqs}) == 1
             )
-            if not (allow_mixed_fused_prefill or homogeneous_full_prefill):
+            if not (allow_mixed_fused_prefill or homogeneous_full_prefill or exact_commit_select_available):
                 seed_mtp1 = False
             if os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_PREFILL_SEED", "0") in {
                 "1",
@@ -3066,6 +3252,7 @@ class CanonicalModelRunner:
                 "on",
                 "True",
             }
+            batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
             force_reuse_fallback = os.environ.get("NANO_VLLM_JAX_MTP_FORCE_REUSE_FALLBACK", "0") in {
                 "1",
                 "true",
@@ -3106,6 +3293,7 @@ class CanonicalModelRunner:
                 and len({seq.num_tokens for seq in seqs}) == 1
             )
             full_physical_batch = len(seqs) == batch.tokens.shape[0]
+            allow_exact_commit_select_mixed = exact_commit_select_available
             partial_prefix_verifier = (
                 not full_physical_batch
                 and (
@@ -3113,13 +3301,36 @@ class CanonicalModelRunner:
                     or hasattr(self.executor, "mtp1_commit_select_greedy_step_jit")
                 )
             )
+            allow_partial_commit_select = (
+                not allow_exact_commit_select_mixed
+                or os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_PARTIAL_COMMIT_SELECT", "0")
+                in {"1", "true", "yes", "on", "True"}
+            )
+            allow_verifier_for_batch_shape = full_physical_batch or (
+                partial_prefix_verifier and allow_partial_commit_select
+            )
+            compact_commit_select = (
+                allow_exact_commit_select_mixed
+                and batch_accept_policy == "rowwise"
+                and len(seqs) > 1
+                and allow_verifier_for_batch_shape
+                and os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_COMPACT_COMMIT_SELECT", "0")
+                in {"1", "true", "yes", "on", "True"}
+            )
+            if compact_commit_select:
+                return self._run_main_and_sample_with_mtp1_reuse(
+                    seqs,
+                    batch,
+                    seed_mtp1=self.mtp1_enabled and seed_mtp1,
+                    force_emit_bonus=True,
+                )
             can_run_fused_batch = (
                 not force_reuse_fallback
                 and
                 fused_rows
                 and fused_rows == list(range(len(seqs)))
-                and (full_physical_batch or partial_prefix_verifier)
-                and (allow_mixed_fused or homogeneous_full_batch)
+                and allow_verifier_for_batch_shape
+                and (allow_mixed_fused or homogeneous_full_batch or allow_exact_commit_select_mixed)
             )
             if can_run_fused_batch:
                 fused_outputs = self._run_mtp1_batched(seqs, batch, fused_rows)
@@ -3163,8 +3374,8 @@ class CanonicalModelRunner:
                 batch,
                 seed_mtp1=self.mtp1_enabled
                 and seed_mtp1
-                and (full_physical_batch or partial_prefix_verifier)
-                and (allow_mixed_fused or homogeneous_full_batch),
+                and allow_verifier_for_batch_shape
+                and (allow_mixed_fused or homogeneous_full_batch or allow_exact_commit_select_mixed),
             )
 
         return self._run_main_and_sample(seqs, batch, seed_mtp1=self.mtp1_enabled and seed_mtp1)

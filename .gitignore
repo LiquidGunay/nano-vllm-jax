@@ -58,6 +58,10 @@ checkpoints/
 logs/
 *.log
 
+# Local tooling / generated benchmark artifacts
+node_modules/
+tpu_profile*.json
+
 # OS
 .DS_Store
 Thumbs.db
