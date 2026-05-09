@@ -28,10 +28,16 @@ Any MTP head, selection, host, or scheduler overhead pushes it below 1.0x.
 
 ## Fused one-pass failure
 
-The seeded fused one-pass path is unsafe today:
+The fused one-pass path is unsafe today and is blocked by default. It can only
+be enabled for experiments with:
 
 ```text
-NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS=1
+NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1=1
+```
+
+Seeded experiments additionally require:
+
+```text
 NANO_VLLM_JAX_MTP_ALLOW_SEEDED_ONE_PASS_K1=1
 ```
 
@@ -40,6 +46,8 @@ Observed warmed TPU failures:
 - B=1 diverged at generated token 101: baseline token `871`, MTP token `11`
 - mixed B=2 diverged at generated token 79 for request 1: baseline token
   `7359`, MTP token `68146`
+- B=1 without post-bonus seeding diverged at generated token 37: baseline token
+  `22513`, MTP token `73982`
 
 The B=1 trace matched visible tokens through token 100, then the next accepted
 step emitted the wrong first token. That means either:

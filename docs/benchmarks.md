@@ -323,6 +323,7 @@ Additional warmed valid timed runs on the same pushed checkpoint:
 | 4 mixed | `32,64,96,128` | pass | 31.95% | 175.64 | 0.688x | 0.913x |
 
 The same continuous seeded setup failed with the fused two-token prefix verifier:
-B=1 diverged at generated token 101 and B=2 all-or-none also diverged. Treat
-those fused one-pass seeded numbers as invalid until slot-0 verifier logits are
+B=1 diverged at generated token 101 and B=2 all-or-none also diverged. A warmed
+B=1 control without post-bonus seeding also diverged at generated token 37.
+Treat all fused one-pass numbers as invalid until slot-0 verifier logits are
 shown equivalent to a canonical one-token decode from the same state.

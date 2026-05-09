@@ -2324,6 +2324,10 @@ class CanonicalModelRunner:
             os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_ONE_PASS_K1", "0")
             in {"1", "true", "yes", "on", "True"}
         )
+        allow_unsafe_one_pass_k1 = (
+            os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0")
+            in {"1", "true", "yes", "on", "True"}
+        )
         allow_mixed_fused_k1 = (
             os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "0")
             in {"1", "true", "yes", "on", "True"}
@@ -2358,6 +2362,7 @@ class CanonicalModelRunner:
             and (not force_commit_select or allow_mixed_fused_k1 or partial_physical_batch)
             and not disable_one_pass_k1
             and not block_seeded_one_pass_k1
+            and allow_unsafe_one_pass_k1
             and (enable_one_pass_k1 or allow_mixed_fused_k1 or partial_physical_batch)
             and hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
         )
@@ -2936,10 +2941,18 @@ class CanonicalModelRunner:
                 "on",
                 "True",
             }
+            allow_unsafe_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
             one_pass_available_for_partial = (
                 hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
                 and os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1", "0")
                 not in {"1", "true", "yes", "on", "True"}
+                and allow_unsafe_one_pass_k1
                 and (not seed_after_bonus_enabled or allow_seeded_one_pass_k1)
             )
             homogeneous_full_batch = (

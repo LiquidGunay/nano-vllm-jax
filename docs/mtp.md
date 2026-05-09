@@ -137,9 +137,11 @@ the fused two-token prefix verifier can keep visible tokens matched for many
 steps and then diverge after a visibly correct accepted bonus, which means the
 next verifier can accept against a drifted or draft-contaminated state.
 
-The runner therefore blocks `mtp1_two_decode_greedy_step_jit` when seeded bonus
-drafts are enabled, unless `NANO_VLLM_JAX_MTP_ALLOW_SEEDED_ONE_PASS_K1=1` is set
-explicitly for experiments. The correctness path is
+The runner therefore blocks `mtp1_two_decode_greedy_step_jit` by default, unless
+`NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1=1` is set explicitly for parity and
+performance experiments. For seeded bonus experiments, the additional
+`NANO_VLLM_JAX_MTP_ALLOW_SEEDED_ONE_PASS_K1=1` opt-in is also required. The
+correctness path is
 `mtp1_commit_select_greedy_step_jit`: decode the current token first, compare it
 with the MTP draft, decode the accepted draft only for accepted rows, and select
 the committed KV/hybrid state on device.
@@ -163,3 +165,8 @@ two-token block from cached-prefill metadata to decode metadata still reproduced
 the same seeded B=1 divergence at generated token 101. That points away from a
 simple attention metadata mode bug and toward prefix-state/logit equivalence
 drift in the fused path under consecutive accepted steps.
+
+Additional control: warmed B=1 without post-bonus seeding still diverged with
+the fused one-pass verifier at generated token 37 (`22513` baseline versus
+`73982` MTP). That makes the fused verifier unsafe as a default even outside the
+continuous seeded path.

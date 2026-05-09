@@ -266,6 +266,7 @@ def _run_case(
 
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "1")
     monkeypatch.delenv("NANO_VLLM_JAX_MTP_ENABLE_FAST_ALL_ACCEPT", raising=False)
     monkeypatch.delenv("NANO_VLLM_JAX_MTP_COMMIT_SELECT", raising=False)
     monkeypatch.delenv("NANO_VLLM_JAX_MTP_ENABLE_ROWWISE_REPAIR", raising=False)
