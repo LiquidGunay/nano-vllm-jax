@@ -593,10 +593,18 @@ class ModelExecutor:
             bool(mtp_hidden_final_normed),
             float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0")),
             os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
+            os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "0"),
         )
         if key not in self._jit_cache:
             bonus_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0"))
             batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
+            one_pass_decode_mode = os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
 
             def compiled(
                 params,
@@ -630,9 +638,9 @@ class ModelExecutor:
                     positions=verify_positions,
                     seq_ids=seq_ids,
                     query_start_loc=verify_query_start_loc,
-                    is_prefill=True,
-                    num_prefill_tokens=jnp.sum(verify_query_lens),
-                    num_decode_tokens=0,
+                    is_prefill=not one_pass_decode_mode,
+                    num_prefill_tokens=0 if one_pass_decode_mode else jnp.sum(verify_query_lens),
+                    num_decode_tokens=jnp.sum(verify_query_lens) if one_pass_decode_mode else 0,
                     block_tables=block_tables,
                     seq_lens=seq_lens + row_valid.astype(jnp.int32),
                 )
@@ -641,7 +649,7 @@ class ModelExecutor:
                     block_tables=verify_batch.block_tables,
                     seq_lens=verify_batch.seq_lens,
                     block_size=self.config.block_size,
-                    is_prefill=True,
+                    is_prefill=not one_pass_decode_mode,
                     query_start_loc=verify_batch.query_start_loc,
                     num_prefill_tokens=verify_batch.num_prefill_tokens,
                     num_decode_tokens=verify_batch.num_decode_tokens,
@@ -661,7 +669,7 @@ class ModelExecutor:
                     kv_cache_state=verify_kv_state,
                     attention_metadata=verify_metadata,
                     hybrid_state=HybridLayerState(conv_state, recurrent_state),
-                    is_prefill=True,
+                    is_prefill=not one_pass_decode_mode,
                     return_hidden=True,
                     return_hidden_with_logits=True,
                     return_prefix_hybrid=True,

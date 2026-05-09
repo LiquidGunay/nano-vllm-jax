@@ -99,6 +99,26 @@ Use `NANO_VLLM_JAX_MTP_PARITY_STOP_STATE=1` to stop on the first state mismatch.
 Use `NANO_VLLM_JAX_MTP_PARITY_STATE_THRESHOLD=<float>` to ignore small numeric
 differences.
 
+The first state-parity run stopped immediately with:
+
+```text
+k_slot_max_abs=0.0625
+v_slot_max_abs=0.09375
+conv_max_abs=0.25
+recurrent_max_abs=0.01116
+```
+
+That implicates the fused verifier's cached-prefill prefix path, especially the
+convolution state, rather than only next-draft sampling. There is now an
+experimental switch to force one-pass verifier internals through decode-mode
+metadata and Gated DeltaNet scan semantics:
+
+```text
+NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE=1
+```
+
+This switch is diagnostic only until it passes exact-token parity.
+
 The next, deeper harness should pause on accepted seeded K=1 steps and compare
 the fused one-pass verifier against sequential commit-select from the same
 pre-step state.
