@@ -970,6 +970,7 @@ class CanonicalModelRunner:
         self._mtp1_token_jit = None
         self._hidden_token_jit = None
         self._mtp1_drafts: Dict[int, int] = {}
+        self._mtp1_seeded_chain: Dict[int, int] = {}
         self._mtp1_draft_debug: Dict[int, Dict[str, Any]] = {}
         self._mtp1_debug_events: List[Dict[str, Any]] = []
         self.reset_speculative_stats()
@@ -2033,6 +2034,7 @@ class CanonicalModelRunner:
             seq = seqs[row]
             draft_chain = draft_chain_list[local_row]
             self._mtp1_drafts[seq.seq_id] = draft_chain if len(draft_chain) > 1 else draft_chain[0]
+            self._mtp1_seeded_chain[seq.seq_id] = 0
             if getattr(self, "mtp_debug", False):
                 draft_token = draft_chain[0]
                 draft_vector = draft_logits[local_row, 0]
@@ -2082,6 +2084,7 @@ class CanonicalModelRunner:
                 positions=position_input,
             )[0])
         self._mtp1_drafts[seq.seq_id] = draft_token
+        self._mtp1_seeded_chain[seq.seq_id] = 0
         if getattr(self, "mtp_debug", False):
             draft_debug, _ = self._mtp1_debug_state()
             draft_debug[seq.seq_id] = {
@@ -2804,6 +2807,9 @@ class CanonicalModelRunner:
             "on",
             "True",
         }
+        if not hasattr(self, "_mtp1_seeded_chain"):
+            self._mtp1_seeded_chain = {}
+        max_seeded_chain = int(os.environ.get("NANO_VLLM_JAX_MTP_MAX_SEEDED_CHAIN", "0") or "0")
         disable_bonus = (
             draft_len == 1
             and os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_BONUS", "0")
@@ -2847,10 +2853,19 @@ class CanonicalModelRunner:
                 and seq.temperature == 0
                 and seq.num_completion_tokens + emitted_len < seq.max_tokens
                 and (prefix_len == 0 or seed_after_bonus)
+                and (
+                    max_seeded_chain <= 0
+                    or self._mtp1_seeded_chain.get(seq.seq_id, 0) < max_seeded_chain
+                )
             ):
                 next_chain = next_draft_chains[idx]
                 self._mtp1_drafts[seq.seq_id] = next_chain if len(next_chain) > 1 else next_chain[0]
+                self._mtp1_seeded_chain[seq.seq_id] = (
+                    self._mtp1_seeded_chain.get(seq.seq_id, 0) + emitted_len
+                )
                 stats["drafts_proposed"] += len(next_chain)
+            else:
+                self._mtp1_seeded_chain.pop(seq.seq_id, None)
 
         return outputs
 

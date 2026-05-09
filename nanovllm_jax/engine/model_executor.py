@@ -805,7 +805,7 @@ class ModelExecutor:
                     committed_seq_lens,
                 )
 
-            self._jit_cache[key] = jax.jit(compiled)
+            self._jit_cache[key] = jax.jit(compiled, donate_argnums=(8, 9))
 
         (
             target_token,
