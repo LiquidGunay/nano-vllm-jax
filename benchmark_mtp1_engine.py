@@ -1072,6 +1072,8 @@ def reset_engine_runtime(engine: LLMEngine):
         engine.config.block_size,
     )
     scheduler.last_num_generated_tokens = 0
+    if hasattr(scheduler, "reset_mtp_admission"):
+        scheduler.reset_mtp_admission()
     Sequence.counter = count()
 
     runner = engine.model_runner

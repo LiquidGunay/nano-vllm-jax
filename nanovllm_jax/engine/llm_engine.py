@@ -138,6 +138,7 @@ class LLMEngine:
 
         # Run model
         token_ids = self.model_runner.run(seqs, batch=scheduled_batch)
+        self.scheduler.update_mtp_admission(self.model_runner.get_speculative_stats())
 
         # Post-process
         prefill_chunk_lengths: list[int] | None = None

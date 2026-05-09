@@ -46,6 +46,11 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.block_table: List[int] = []
+        # Scheduler-owned speculative decoding admission. The model runner
+        # treats this as a per-step permission bit and must fall back to
+        # baseline decode when it is false.
+        self.mtp_admitted = True
+        self.mtp_admission_reason = "default"
         
         if sampling_params is None:
             sampling_params = SamplingParams()

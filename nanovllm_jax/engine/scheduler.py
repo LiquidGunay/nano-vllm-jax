@@ -1,5 +1,6 @@
 """Scheduler for continuous batching."""
 
+import os
 from collections import deque
 from typing import Deque, List, Tuple
 
@@ -34,6 +35,16 @@ class Scheduler:
             else max(64, self.max_num_batched_tokens if self.max_num_batched_tokens > 0 else 64)
         )
         self.decode_lookahead_tokens = max(1, 1 + int(getattr(config, "num_speculative_tokens", 0) or 0))
+        self.num_speculative_tokens = max(0, int(getattr(config, "num_speculative_tokens", 0) or 0))
+        self.mtp_min_accept_rate = float(os.environ.get("NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE", "0") or "0")
+        self.mtp_min_accept_samples = int(os.environ.get("NANO_VLLM_JAX_MTP_MIN_ACCEPT_SAMPLES", "8") or "8")
+        self.mtp_scheduler_gate_enabled = self.num_speculative_tokens > 0 and self.mtp_min_accept_rate > 0
+        self.mtp_observed_accepted = 0
+        self.mtp_observed_rejected = 0
+        self.mtp_stats_seen_accepted = 0
+        self.mtp_stats_seen_rejected = 0
+        self.mtp_admission_enabled = True
+        self.mtp_admission_reason = "enabled"
         self.max_blocks_per_seq = getattr(config, "max_blocks_per_seq", None)
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, 
@@ -44,6 +55,15 @@ class Scheduler:
         
         self.waiting: Deque[Sequence] = deque()
         self.running: Deque[Sequence] = deque()
+
+    def reset_mtp_admission(self) -> None:
+        """Reset adaptive speculative admission counters."""
+        self.mtp_observed_accepted = 0
+        self.mtp_observed_rejected = 0
+        self.mtp_stats_seen_accepted = 0
+        self.mtp_stats_seen_rejected = 0
+        self.mtp_admission_enabled = True
+        self.mtp_admission_reason = "enabled"
 
     def is_finished(self) -> bool:
         """Check if all sequences are done."""
@@ -122,6 +142,9 @@ class Scheduler:
                 if not self.enable_prefix_cache_execution:
                     seq.num_cached_tokens = 0
             seq.status = SequenceStatus.RUNNING
+            mtp_admitted = self.should_admit_mtp(seq)
+            seq.mtp_admitted = mtp_admitted
+            seq.mtp_admission_reason = self.mtp_admission_reason if mtp_admitted else "scheduler_gate"
 
             num_seqs += 1
             chunk_len = min(chunk_len, remaining_tokens)
@@ -155,8 +178,11 @@ class Scheduler:
                 continue
             
             # Ensure we can append
+            mtp_admitted = self.should_admit_mtp(seq)
+            seq.mtp_admitted = mtp_admitted
+            seq.mtp_admission_reason = self.mtp_admission_reason if mtp_admitted else "scheduler_gate"
             lookahead_tokens = min(
-                self.decode_lookahead_tokens,
+                1 + (self.num_speculative_tokens if mtp_admitted else 0),
                 max(1, seq.max_tokens - seq.num_completion_tokens),
             )
             while not self.block_manager.can_append_slots(seq, lookahead_tokens):
@@ -286,6 +312,51 @@ class Scheduler:
             if size <= bucket:
                 return bucket
         raise ValueError(f"{name} size {size} exceeds configured buckets {buckets}")
+
+    def should_admit_mtp(self, seq: Sequence) -> bool:
+        """Return whether this decode row may attempt speculative decoding."""
+        if not self.mtp_scheduler_gate_enabled:
+            self.mtp_admission_reason = "disabled"
+            return True
+        if seq.temperature != 0:
+            self.mtp_admission_reason = "temperature"
+            return False
+        remaining = seq.max_tokens - seq.num_completion_tokens
+        if remaining <= 1:
+            self.mtp_admission_reason = "remaining_tokens"
+            return False
+        self.mtp_admission_reason = "enabled" if self.mtp_admission_enabled else "low_acceptance"
+        return self.mtp_admission_enabled
+
+    def update_mtp_admission(self, speculative_stats: dict) -> None:
+        """Update scheduler-level speculative admission from cumulative stats.
+
+        The runner owns correctness and exact accept/reject accounting. The
+        scheduler consumes only cumulative counters and decides whether future
+        decode rows should reserve lookahead slots and enter the verifier.
+        """
+        if not self.mtp_scheduler_gate_enabled:
+            return
+        accepted = int(speculative_stats.get("drafts_accepted", 0) or 0)
+        rejected = int(speculative_stats.get("drafts_rejected", 0) or 0)
+        delta_accepted = max(0, accepted - self.mtp_stats_seen_accepted)
+        delta_rejected = max(0, rejected - self.mtp_stats_seen_rejected)
+        self.mtp_stats_seen_accepted = accepted
+        self.mtp_stats_seen_rejected = rejected
+        if delta_accepted == 0 and delta_rejected == 0:
+            return
+
+        self.mtp_observed_accepted += delta_accepted
+        self.mtp_observed_rejected += delta_rejected
+        verified = self.mtp_observed_accepted + self.mtp_observed_rejected
+        if verified < self.mtp_min_accept_samples:
+            self.mtp_admission_enabled = True
+            self.mtp_admission_reason = "warming"
+            return
+
+        accept_rate = self.mtp_observed_accepted / max(1, verified)
+        self.mtp_admission_enabled = accept_rate >= self.mtp_min_accept_rate
+        self.mtp_admission_reason = "enabled" if self.mtp_admission_enabled else "low_acceptance"
 
     def preempt(self, seq: Sequence):
         """Preempt a sequence (move back to waiting)."""

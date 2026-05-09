@@ -1022,6 +1022,10 @@ class CanonicalModelRunner:
             return False
         return (accepted / max(1, verified)) < min_accept_rate
 
+    @staticmethod
+    def _seq_mtp_admitted(seq: Sequence) -> bool:
+        return bool(getattr(seq, "mtp_admitted", True))
+
     def _record_draft_position_acceptance(self, accepted_matrix: List[List[bool]]):
         if not accepted_matrix:
             return
@@ -2104,7 +2108,12 @@ class CanonicalModelRunner:
             if getattr(self, "mtp_token_source", "generated") == "current":
                 confirmed_token_id = seq.last_token
                 position = seq.num_tokens - 1
-            if not self.mtp1_enabled or seq.temperature != 0 or adaptive_gated():
+            if (
+                not self.mtp1_enabled
+                or seq.temperature != 0
+                or not self._seq_mtp_admitted(seq)
+                or adaptive_gated()
+            ):
                 self._mtp1_drafts.pop(seq.seq_id, None)
                 self._mtp1_debug_state()[0].pop(seq.seq_id, None)
                 continue
@@ -2191,7 +2200,12 @@ class CanonicalModelRunner:
         position: int,
     ):
         adaptive_gated = getattr(self, "_mtp_adaptive_gated", lambda: False)
-        if not self.mtp1_enabled or seq.temperature != 0 or adaptive_gated():
+        if (
+            not self.mtp1_enabled
+            or seq.temperature != 0
+            or not self._seq_mtp_admitted(seq)
+            or adaptive_gated()
+        ):
             self._mtp1_drafts.pop(seq.seq_id, None)
             self._mtp1_debug_state()[0].pop(seq.seq_id, None)
             return
@@ -2256,7 +2270,11 @@ class CanonicalModelRunner:
                 self._speculative_stats()["fallback_steps"] += 1
             return False
         seq = seqs[0]
-        if seq.temperature != 0 or seq.seq_id not in self._mtp1_drafts:
+        if (
+            seq.temperature != 0
+            or not self._seq_mtp_admitted(seq)
+            or seq.seq_id not in self._mtp1_drafts
+        ):
             self._speculative_stats()["fallback_steps"] += 1
             return False
         if seq.num_completion_tokens + 2 > seq.max_tokens:
@@ -2280,7 +2298,11 @@ class CanonicalModelRunner:
                 self._speculative_stats()["fallback_steps"] += 1
             return False
 
-        if seq.temperature != 0 or seq.seq_id not in self._mtp1_drafts:
+        if (
+            seq.temperature != 0
+            or not self._seq_mtp_admitted(seq)
+            or seq.seq_id not in self._mtp1_drafts
+        ):
             self._speculative_stats()["fallback_steps"] += 1
             return False
 
@@ -2355,6 +2377,12 @@ class CanonicalModelRunner:
     ) -> dict[int, List[int] | int] | None:
         if not rows:
             return {}
+        for row in rows:
+            if not bool(getattr(seqs[row], "mtp_admitted", True)):
+                seq = seqs[row]
+                self._mtp1_drafts.pop(seq.seq_id, None)
+                self._mtp1_seeded_chain.pop(seq.seq_id, None)
+                return None
         if getattr(self, "_mtp_adaptive_gated", lambda: False)():
             for row in rows:
                 seq = seqs[row]
@@ -3336,7 +3364,10 @@ class CanonicalModelRunner:
             }:
                 seed_mtp1 = False
 
-        if self.mtp1_enabled and not batch.is_prefill:
+        admitted_mtp_rows = [
+            row for row, seq in enumerate(seqs) if self._seq_mtp_admitted(seq)
+        ]
+        if self.mtp1_enabled and not batch.is_prefill and admitted_mtp_rows:
             fused_rows: List[int] = []
             profile_mtp = os.environ.get("NANO_VLLM_JAX_PROFILE_MTP_RUN", "0") in {
                 "1",
@@ -3358,6 +3389,7 @@ class CanonicalModelRunner:
                 can_fuse = (
                     draft_value is not None
                     and draft_len > 0
+                    and self._seq_mtp_admitted(seq)
                     and seq.temperature == 0
                     and seq.num_completion_tokens + draft_len + 1 <= seq.max_tokens
                     and int(batch.query_lens[row]) == 1
@@ -3371,6 +3403,8 @@ class CanonicalModelRunner:
                         reason = "missing_draft"
                     elif draft_len <= 0:
                         reason = "empty_draft"
+                    elif not self._seq_mtp_admitted(seq):
+                        reason = "scheduler_gate"
                     elif seq.temperature != 0:
                         reason = "temperature"
                     elif seq.num_completion_tokens + draft_len + 1 > seq.max_tokens:
@@ -3518,7 +3552,11 @@ class CanonicalModelRunner:
                 and (allow_mixed_fused or homogeneous_full_batch or allow_exact_commit_select_mixed),
             )
 
-        return self._run_main_and_sample(seqs, batch, seed_mtp1=self.mtp1_enabled and seed_mtp1)
+        return self._run_main_and_sample(
+            seqs,
+            batch,
+            seed_mtp1=self.mtp1_enabled and seed_mtp1 and bool(admitted_mtp_rows),
+        )
 
     def forward(
         self,

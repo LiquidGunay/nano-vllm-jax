@@ -125,6 +125,10 @@ next-step sanity checks.
 | manual counting prompt, 32 decode tokens | 1 | min accept 0.6, samples 4 | 64.39 | 71.09 | 1.104x | 72.2% | 3 | yes |
 | manual counting prompt, 32 decode tokens | 1 | min accept 0.6, samples 2 | 61.49 | 54.18 | 0.881x | 50.0% | 28 | yes |
 | manual counting prompt, 64 decode tokens | 2 | min accept 0.6, samples 4 | 64.51 | 60.27 | 0.934x | 51.6% | 7 | yes |
+| synthetic, scheduler gate + baseline bypass | 1 | min accept 0.6, samples 4 | 63.06 | 60.91 | 0.966x | 50.0% | 22 | yes |
+| manual counting, scheduler gate + baseline bypass | 1 | min accept 0.6, samples 4 | 64.05 | 71.09 | 1.110x | 72.2% | 3 | yes |
+| synthetic, scheduler gate + baseline bypass | 1 | min accept 0.6, samples 3 | 60.30 | 58.63 | 0.972x | 50.0% | 22 | yes |
+| manual counting, scheduler gate + baseline bypass | 1 | min accept 0.6, samples 3 | 62.89 | 69.94 | 1.112x | 72.2% | 3 | yes |
 
 The useful setting from this sweep is K=1 with a conservative acceptance gate
 around four verified drafts. It preserves a real speedup on the high-acceptance
@@ -141,3 +145,23 @@ or low-confidence requests, the scheduler should either delay MTP until a prompt
 class has prior acceptance statistics or disable it immediately after the first
 few rejected drafts. For high-acceptance greedy streams, K=1 one-pass MTP is the
 only path currently showing TPU decode speedup.
+
+## Scheduler-owned admission update
+
+The MTP gate now lives in the scheduler instead of only inside
+`ModelRunner`. When `NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE` is set, the scheduler:
+
+- tracks cumulative accepted/rejected draft deltas reported by the runner,
+- marks each sequence with `mtp_admitted` before prefill/decode execution,
+- allocates speculative lookahead slots only for admitted rows,
+- suppresses prefill draft seeding when the gate is closed,
+- lets the runner bypass all MTP orchestration for fully gated decode batches.
+
+This matches the vLLM-style policy direction: speculative decoding is scheduled
+only when current acceptance evidence says it should help. The current policy is
+still acceptance-only, not latency-EWMA-based, so it cannot fully guarantee
+non-regression. The next step is to add per-bucket latency accounting so the
+gate uses measured emitted-token throughput rather than acceptance alone.
+
+Benchmark reset now also clears scheduler MTP admission state. Warmup runs
+should compile shapes, not train the adaptive gate for the measured run.
