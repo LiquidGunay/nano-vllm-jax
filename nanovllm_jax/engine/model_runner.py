@@ -1009,6 +1009,19 @@ class CanonicalModelRunner:
             self.reset_speculative_stats()
         return self.speculative_stats
 
+    def _mtp_adaptive_gated(self) -> bool:
+        min_accept_rate = float(os.environ.get("NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE", "0") or "0")
+        if min_accept_rate <= 0:
+            return False
+        min_samples = int(os.environ.get("NANO_VLLM_JAX_MTP_MIN_ACCEPT_SAMPLES", "8") or "8")
+        stats = self._speculative_stats()
+        accepted = int(stats.get("drafts_accepted", 0))
+        rejected = int(stats.get("drafts_rejected", 0))
+        verified = accepted + rejected
+        if verified < min_samples:
+            return False
+        return (accepted / max(1, verified)) < min_accept_rate
+
     def _record_draft_position_acceptance(self, accepted_matrix: List[List[bool]]):
         if not accepted_matrix:
             return
@@ -1587,6 +1600,54 @@ class CanonicalModelRunner:
             return self._mtp1_chain_jit[draft_len](hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
         return forward(hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
 
+    def _mtp1_draft_chain_with_margin(
+        self,
+        hidden_state: jnp.ndarray,
+        token_ids: jnp.ndarray,
+        positions: jnp.ndarray,
+        draft_len: int,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        def forward(hidden_arg, token_arg, position_arg, embed_tokens_arg, mtp_params_tree):
+            mtp_params = self._mtp1_params_from_tree(mtp_params_tree)
+            current_hidden = hidden_arg
+            current_token = token_arg
+            current_position = position_arg
+            drafts = []
+            first_margin = None
+            for idx in range(draft_len):
+                logits, current_hidden = mtp_forward(
+                    hidden_state=current_hidden,
+                    next_token_ids=current_token,
+                    embed_tokens=embed_tokens_arg,
+                    params=mtp_params,
+                    config=self.config,
+                    positions=current_position,
+                )
+                if idx == 0:
+                    top2, _ = jax.lax.top_k(logits[:, 0].astype(jnp.float32), 2)
+                    first_margin = top2[:, 0] - top2[:, 1]
+                current_token = jnp.argmax(logits[:, 0], axis=-1).astype(jnp.int32)[:, None]
+                drafts.append(current_token[:, 0])
+                current_position = current_position + 1
+            if first_margin is None:
+                first_margin = jnp.zeros((hidden_arg.shape[0],), dtype=jnp.float32)
+            return jnp.stack(drafts, axis=1), first_margin
+
+        mtp_params_tree = self._mtp1_params_tree()
+        if getattr(self, "execution", "eager") in {"decode-jit", "jit"}:
+            if not hasattr(self, "_mtp1_chain_margin_jit"):
+                self._mtp1_chain_margin_jit = {}
+            if draft_len not in self._mtp1_chain_margin_jit:
+                self._mtp1_chain_margin_jit[draft_len] = jax.jit(forward)
+            return self._mtp1_chain_margin_jit[draft_len](
+                hidden_state,
+                token_ids,
+                positions,
+                self.params.embed_tokens,
+                mtp_params_tree,
+            )
+        return forward(hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
+
     def _greedy_tokens_from_hidden(self, hidden: jnp.ndarray) -> jnp.ndarray:
         from nanovllm_jax.layers import rms_norm
 
@@ -2036,13 +2097,14 @@ class CanonicalModelRunner:
         seed_rows: List[int] = []
         token_values: List[int] = []
         position_values: List[int] = []
+        adaptive_gated = getattr(self, "_mtp_adaptive_gated", lambda: False)
         for row, seq in enumerate(seqs):
             confirmed_token_id = confirmed_token_ids[row]
             position = int(positions[row]) if positions is not None else seq.num_tokens
             if getattr(self, "mtp_token_source", "generated") == "current":
                 confirmed_token_id = seq.last_token
                 position = seq.num_tokens - 1
-            if not self.mtp1_enabled or seq.temperature != 0:
+            if not self.mtp1_enabled or seq.temperature != 0 or adaptive_gated():
                 self._mtp1_drafts.pop(seq.seq_id, None)
                 self._mtp1_debug_state()[0].pop(seq.seq_id, None)
                 continue
@@ -2062,6 +2124,8 @@ class CanonicalModelRunner:
         token_input = jnp.array(token_values, dtype=jnp.int32)[:, None]
         position_input = jnp.array(position_values, dtype=jnp.int32)[:, None]
         draft_len = max(1, int(getattr(self, "num_speculative_tokens", 1) or 1))
+        draft_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_DRAFT_MARGIN", "0") or "0")
+        draft_margin_values = None
         if getattr(self, "mtp_debug", False):
             draft_logits = self._mtp1_logits(
                 hidden_state=hidden_input,
@@ -2070,6 +2134,18 @@ class CanonicalModelRunner:
             )
             draft_tokens = jnp.argmax(draft_logits[:, 0], axis=-1).astype(jnp.int32)
             draft_chains = draft_tokens[:, None]
+            if draft_margin_threshold > 0:
+                draft_top2, _ = jax.lax.top_k(draft_logits[:, 0].astype(jnp.float32), 2)
+                draft_margin_values = [float(value) for value in (draft_top2[:, 0] - draft_top2[:, 1]).tolist()]
+        elif draft_margin_threshold > 0:
+            draft_logits = None
+            draft_chains, draft_margins = self._mtp1_draft_chain_with_margin(
+                hidden_state=hidden_input,
+                token_ids=token_input,
+                positions=position_input,
+                draft_len=draft_len,
+            )
+            draft_margin_values = [float(value) for value in draft_margins.tolist()]
         else:
             draft_logits = None
             draft_chains = self._mtp1_draft_chain(
@@ -2082,6 +2158,13 @@ class CanonicalModelRunner:
         draft_chain_list = [[int(token) for token in chain] for chain in draft_chains.tolist()]
         for local_row, row in enumerate(seed_rows):
             seq = seqs[row]
+            if (
+                draft_margin_values is not None
+                and draft_margin_values[local_row] < draft_margin_threshold
+            ):
+                self._mtp1_drafts.pop(seq.seq_id, None)
+                self._mtp1_seeded_chain.pop(seq.seq_id, None)
+                continue
             draft_chain = draft_chain_list[local_row]
             self._mtp1_drafts[seq.seq_id] = draft_chain if len(draft_chain) > 1 else draft_chain[0]
             self._mtp1_seeded_chain[seq.seq_id] = 0
@@ -2107,7 +2190,8 @@ class CanonicalModelRunner:
         confirmed_token_id: int,
         position: int,
     ):
-        if not self.mtp1_enabled or seq.temperature != 0:
+        adaptive_gated = getattr(self, "_mtp_adaptive_gated", lambda: False)
+        if not self.mtp1_enabled or seq.temperature != 0 or adaptive_gated():
             self._mtp1_drafts.pop(seq.seq_id, None)
             self._mtp1_debug_state()[0].pop(seq.seq_id, None)
             return
@@ -2119,6 +2203,8 @@ class CanonicalModelRunner:
         hidden_input = hidden[None, None, :]
         token_input = jnp.array([[confirmed_token_id]], dtype=jnp.int32)
         position_input = jnp.array([[position + int(getattr(self, "mtp_position_offset", 0))]], dtype=jnp.int32)
+        draft_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_DRAFT_MARGIN", "0") or "0")
+        draft_margin = None
         if getattr(self, "mtp_debug", False):
             draft_logits = self._mtp1_logits(
                 hidden_state=hidden_input,
@@ -2127,12 +2213,28 @@ class CanonicalModelRunner:
             )
             draft_vector = draft_logits[0, 0]
             draft_token = int(jnp.argmax(draft_vector))
+            if draft_margin_threshold > 0:
+                top2, _ = jax.lax.top_k(draft_vector.astype(jnp.float32), 2)
+                draft_margin = float(top2[0] - top2[1])
+        elif draft_margin_threshold > 0:
+            draft_chain, draft_margins = self._mtp1_draft_chain_with_margin(
+                hidden_state=hidden_input,
+                token_ids=token_input,
+                positions=position_input,
+                draft_len=1,
+            )
+            draft_token = int(draft_chain[0, 0])
+            draft_margin = float(draft_margins[0])
         else:
             draft_token = int(self._mtp1_draft_token(
                 hidden_state=hidden_input,
                 token_ids=token_input,
                 positions=position_input,
             )[0])
+        if draft_margin is not None and draft_margin < draft_margin_threshold:
+            self._mtp1_drafts.pop(seq.seq_id, None)
+            self._mtp1_seeded_chain.pop(seq.seq_id, None)
+            return
         self._mtp1_drafts[seq.seq_id] = draft_token
         self._mtp1_seeded_chain[seq.seq_id] = 0
         if getattr(self, "mtp_debug", False):
@@ -2253,11 +2355,24 @@ class CanonicalModelRunner:
     ) -> dict[int, List[int] | int] | None:
         if not rows:
             return {}
+        if getattr(self, "_mtp_adaptive_gated", lambda: False)():
+            for row in rows:
+                seq = seqs[row]
+                self._mtp1_drafts.pop(seq.seq_id, None)
+                self._mtp1_seeded_chain.pop(seq.seq_id, None)
+            return None
         # K=1 MTP may run one target-model token ahead of the canonical
         # decode stream. Avoid doing that on the same step that starts from a
         # just-completed KV block; the ordinary decode path will process the
         # boundary token, refresh block metadata, and MTP can resume next step.
-        if any(seqs[row].num_tokens % self.block_size == 0 for row in rows):
+        relax_start_boundary = (
+            os.environ.get("NANO_VLLM_JAX_MTP_RELAX_START_BOUNDARY", "0")
+            in {"1", "true", "yes", "on", "True"}
+        )
+        if (
+            not relax_start_boundary
+            and any(seqs[row].num_tokens % self.block_size == 0 for row in rows)
+        ):
             return None
         if os.environ.get("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "0") not in {
             "1",
@@ -2332,7 +2447,14 @@ class CanonicalModelRunner:
         draft_len = min(draft_len, max(1, int(getattr(self, "num_speculative_tokens", 1) or 1)))
         if draft_len < 1:
             return {}
-        if any((seqs[row].num_tokens + draft_len + 1) % self.block_size == 0 for row in rows):
+        relax_start_boundary = (
+            os.environ.get("NANO_VLLM_JAX_MTP_RELAX_START_BOUNDARY", "0")
+            in {"1", "true", "yes", "on", "True"}
+        )
+        if (
+            not relax_start_boundary
+            and any((seqs[row].num_tokens + draft_len + 1) % self.block_size == 0 for row in rows)
+        ):
             return None
         draft_token_chains = [chain[:draft_len] for chain in draft_chains]
         draft_tokens = [chain[0] for chain in draft_token_chains]
@@ -2374,7 +2496,7 @@ class CanonicalModelRunner:
             in {"1", "true", "yes", "on", "True"}
         )
         enable_one_pass_k1 = (
-            os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_ONE_PASS_K1", "0")
+            os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_ONE_PASS_K1", "1")
             in {"1", "true", "yes", "on", "True"}
         )
         allow_unsafe_one_pass_k1 = (
@@ -2620,6 +2742,7 @@ class CanonicalModelRunner:
                         self.mtp1_enabled
                         and seq.temperature == 0
                         and seq.num_completion_tokens + emitted_len < seq.max_tokens
+                        and not getattr(self, "_mtp_adaptive_gated", lambda: False)()
                     ):
                         self._mtp1_drafts[seq.seq_id] = next_draft_values[idx]
                         stats["drafts_proposed"] += 1
@@ -2714,7 +2837,12 @@ class CanonicalModelRunner:
                     stats["bonus_tokens"] += 1
                     emitted_len = draft_len + 1
                     outputs[row] = draft_token_chains[local_row] + [bonus_values[local_row]]
-                    if self.mtp1_enabled and seq.temperature == 0 and seq.num_completion_tokens + emitted_len < seq.max_tokens:
+                    if (
+                        self.mtp1_enabled
+                        and seq.temperature == 0
+                        and seq.num_completion_tokens + emitted_len < seq.max_tokens
+                        and not getattr(self, "_mtp_adaptive_gated", lambda: False)()
+                    ):
                         next_chain = next_draft_values[local_row]
                         self._mtp1_drafts[seq.seq_id] = next_chain if len(next_chain) > 1 else next_chain[0]
                         stats["drafts_proposed"] += len(next_chain)
@@ -3016,6 +3144,7 @@ class CanonicalModelRunner:
                 and seq.temperature == 0
                 and seq.num_completion_tokens + emitted_len < seq.max_tokens
                 and can_seed_next_chain
+                and not getattr(self, "_mtp_adaptive_gated", lambda: False)()
                 and (
                     max_seeded_chain <= 0
                     or self._mtp1_seeded_chain.get(seq.seq_id, 0) < max_seeded_chain
@@ -3112,7 +3241,12 @@ class CanonicalModelRunner:
 
         if use_fused_step:
             bonus_token = int(output.bonus_token[0].item())
-            if self.mtp1_enabled and seq.temperature == 0 and seq.num_completion_tokens + 1 < seq.max_tokens:
+            if (
+                self.mtp1_enabled
+                and seq.temperature == 0
+                and seq.num_completion_tokens + 1 < seq.max_tokens
+                and not getattr(self, "_mtp_adaptive_gated", lambda: False)()
+            ):
                 self._mtp1_drafts[seq.seq_id] = int(output.next_draft_token[0].item())
                 self._speculative_stats()["drafts_proposed"] += 1
             else:

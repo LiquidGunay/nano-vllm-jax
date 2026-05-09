@@ -73,11 +73,14 @@ NANO_VLLM_JAX_MTP_ALLOW_SEEDED_ONE_PASS_K1=1
 | workload | batch | K | seed-after-bonus | baseline decode tok/s | MTP decode tok/s | decode speedup | acceptance | fallback decode steps |
 |---|---:|---:|---|---:|---:|---:|---:|---:|
 | synthetic red-repeat | 1 | 1 | yes | 62.50 | 57.72 | 0.924x | 47.6% | 5 |
+| synthetic red-repeat, confirmed decode-mode defaults | 1 | 1 | yes | 61.84 | 61.93 | 1.001x | 47.6% | 5 |
 | synthetic red-repeat | 1 | 2 | no | 64.32 | 58.46 | 0.909x | 59.1% | 10 |
 | easy numbers | 1 | 1 | yes | 59.85 | 69.62 | 1.163x | 75.0% | 9 |
+| easy numbers, fast-all-accept variant | 1 | 1 | yes | 64.44 | 67.46 | 1.047x | 75.0% | 9 |
 | easy numbers | 1 | 2 | no | 63.88 | 60.24 | 0.943x | 83.3% | 18 |
 | easy numbers | 1 | 2 | yes, after K=2 carry patch | 64.32 | 60.73 | 0.944x | 51.6% | 8 |
 | easy numbers | 4 | 1 | yes | 196.05 | 182.00 | 0.928x | 70.3% | 7 |
+| easy numbers, fast-all-accept variant | 4 | 1 | yes | 200.34 | 173.45 | 0.866x | 70.3% | 11 |
 
 Easy numbers prompt:
 
@@ -94,15 +97,47 @@ Generated continuation for the speedup row:
 ## Current interpretation
 
 - A correctness-clean MTP speedup exists on the 4B model for a high-acceptance B=1 workload: `1.163x` decode speedup with K=1 seed-after-bonus.
+- A marginal correctness-clean MTP speedup also exists on the synthetic B=1 smoke workload when the actual decode-mode one-pass verifier is selected: `1.001x`.
 - The speedup is not robust yet:
-  - Synthetic B=1 remains below baseline even with fewer fallback steps.
+  - Synthetic B=1 is only barely above baseline and is likely within run-to-run variance.
   - B=4 remains below baseline because baseline decode batching is already much more efficient.
   - K=2 has high acceptance on the easy prompt without seed-after-bonus, but too many fallback/single-token transitions.
 - The next bottleneck is draft-chain continuity and verifier overhead, not TPU availability or basic correctness.
 
 ## Next work items
 
-1. Make K=1 one-pass decode-mode the explicit benchmark/serving fast-path when unsafe one-pass is selected.
+1. Keep K=1 one-pass decode-mode as the explicit benchmark/serving fast-path when unsafe one-pass is selected.
 2. Rework K=2 next-draft generation so full accepts keep a high-quality chain without reducing acceptance.
 3. Add a traced step-mode label to benchmark JSON so fallback, rejected, K=1, and K=2 steps are distinguishable without inferring from token counts.
 4. Add adaptive gating by workload/bucket using measured decode speedup, not legacy acceptance-only formulas.
+
+## Adaptive gating update on v6e-1
+
+All runs below used the existing spot `v6e-1` TPU VM, real
+`Qwen/Qwen3.5-4B` weights, BF16, JIT execution, warmup enabled, KV caching, and
+next-step sanity checks.
+
+| workload | K | gate | baseline decode tok/s | MTP decode tok/s | decode speedup | acceptance | fallback decode steps | correct |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| synthetic, 64-token prompt, 32 decode tokens | 1 | min accept 0.6, samples 8 | 63.79 | 54.69 | 0.857x | 41.7% | 17 | yes |
+| synthetic, 64-token prompt, 32 decode tokens | 1 | min accept 0.6, samples 4 | 63.62 | 56.35 | 0.886x | 50.0% | 22 | yes |
+| synthetic, 64-token prompt, 32 decode tokens | 1 | min accept 0.6, samples 2 | 64.41 | 57.39 | 0.891x | 50.0% | 28 | yes |
+| manual counting prompt, 32 decode tokens | 1 | min accept 0.6, samples 4 | 64.39 | 71.09 | 1.104x | 72.2% | 3 | yes |
+| manual counting prompt, 32 decode tokens | 1 | min accept 0.6, samples 2 | 61.49 | 54.18 | 0.881x | 50.0% | 28 | yes |
+| manual counting prompt, 64 decode tokens | 2 | min accept 0.6, samples 4 | 64.51 | 60.27 | 0.934x | 51.6% | 7 | yes |
+
+The useful setting from this sweep is K=1 with a conservative acceptance gate
+around four verified drafts. It preserves a real speedup on the high-acceptance
+counting prompt while limiting speculative attempts on synthetic prompts. It
+does not make low-acceptance short generations faster than baseline, because the
+first few failed speculative steps still dominate a 32-token decode.
+
+K=2 remains correctness-clean but non-winning on this setup. The accepted-token
+multiplier is not high enough to pay for the wider verifier and additional
+commit bookkeeping.
+
+Current serving implication: MTP should stay adaptive and per bucket. For short
+or low-confidence requests, the scheduler should either delay MTP until a prompt
+class has prior acceptance statistics or disable it immediately after the first
+few rejected drafts. For high-acceptance greedy streams, K=1 one-pass MTP is the
+only path currently showing TPU decode speedup.

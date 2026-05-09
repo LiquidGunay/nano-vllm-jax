@@ -627,12 +627,12 @@ class ModelExecutor:
             bool(mtp_hidden_final_normed),
             float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0")),
             os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
-            os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "0"),
+            os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "1"),
         )
         if key not in self._jit_cache:
             bonus_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0"))
             batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
-            one_pass_decode_mode = os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "0") in {
+            one_pass_decode_mode = os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "1") in {
                 "1",
                 "true",
                 "yes",
@@ -910,10 +910,10 @@ class ModelExecutor:
             tuple(batch.tokens.shape),
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
-            os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "0"),
+            os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "1"),
         )
         if key not in self._jit_cache:
-            one_pass_decode_mode = os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "0") in {
+            one_pass_decode_mode = os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "1") in {
                 "1",
                 "true",
                 "yes",
@@ -1172,10 +1172,10 @@ class ModelExecutor:
             tuple(batch.tokens.shape),
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
-            os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "0"),
+            os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "1"),
         )
         if key not in self._jit_cache:
-            one_pass_decode_mode = os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "0") in {
+            one_pass_decode_mode = os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "1") in {
                 "1",
                 "true",
                 "yes",
