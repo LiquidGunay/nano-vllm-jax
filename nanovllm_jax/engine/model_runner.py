@@ -2687,6 +2687,76 @@ class CanonicalModelRunner:
             parity_bonus = [int(x) for x in parity_output.bonus_token.tolist()]
             parity_accepted = [bool(x) for x in parity_output.accepted.tolist()]
             parity_next = [int(x) for x in parity_output.next_draft_token.tolist()]
+            state_threshold = float(
+                os.environ.get("NANO_VLLM_JAX_MTP_PARITY_STATE_THRESHOLD", "0")
+            )
+
+            def _state_max_abs(left, right) -> float:
+                if left is None or right is None:
+                    return 0.0
+                return float(
+                    jnp.max(
+                        jnp.abs(left.astype(jnp.float32) - right.astype(jnp.float32))
+                    ).item()
+                )
+
+            def _slot_max_abs(left, right, slots) -> float:
+                leading_shape = left.shape[:-4] if left.ndim == 5 else left.shape[:-3]
+                flat_left = left.reshape(leading_shape + (-1,) + left.shape[-2:])
+                flat_right = right.reshape(leading_shape + (-1,) + right.shape[-2:])
+                left_values = flat_left[..., slots, :, :].astype(jnp.float32)
+                right_values = flat_right[..., slots, :, :].astype(jnp.float32)
+                return float(jnp.max(jnp.abs(left_values - right_values)).item())
+
+            slot_current = compute_slot_mapping(
+                positions=decode_batch.positions,
+                block_table=decode_batch.block_tables,
+                block_size=self.config.block_size,
+                is_prefill=False,
+            )[:, 0]
+            slot_draft = compute_slot_mapping(
+                positions=decode_batch.positions + 1,
+                block_table=decode_batch.block_tables,
+                block_size=self.config.block_size,
+                is_prefill=False,
+            )[:, 0]
+            parity_slots = jnp.stack([slot_current, slot_draft], axis=1).reshape(-1)
+            k_slot_diff = _slot_max_abs(
+                output.cache_storage.k_cache,
+                parity_output.cache_storage.k_cache,
+                parity_slots,
+            )
+            v_slot_diff = _slot_max_abs(
+                output.cache_storage.v_cache,
+                parity_output.cache_storage.v_cache,
+                parity_slots,
+            )
+            conv_diff = _state_max_abs(
+                output.hybrid_state.conv_state,
+                parity_output.hybrid_state.conv_state,
+            )
+            recurrent_diff = _state_max_abs(
+                output.hybrid_state.recurrent_state,
+                parity_output.hybrid_state.recurrent_state,
+            )
+            state_diff = max(k_slot_diff, v_slot_diff, conv_diff, recurrent_diff)
+            if state_diff > state_threshold:
+                print(
+                    "[MTP_PARITY_STATE] one_pass_vs_commit_select "
+                    f"k_slot_max_abs={k_slot_diff:.6g} "
+                    f"v_slot_max_abs={v_slot_diff:.6g} "
+                    f"conv_max_abs={conv_diff:.6g} "
+                    f"recurrent_max_abs={recurrent_diff:.6g}",
+                    flush=True,
+                )
+                if os.environ.get("NANO_VLLM_JAX_MTP_PARITY_STOP_STATE", "0") in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                    "True",
+                }:
+                    raise RuntimeError("MTP one-pass parity state mismatch")
             for local_row, row in enumerate(rows):
                 idx = row
                 mismatch = (

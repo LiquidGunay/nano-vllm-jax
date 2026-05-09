@@ -81,6 +81,24 @@ and prints the first target/bonus/acceptance/next-draft mismatch:
 Use `NANO_VLLM_JAX_MTP_PARITY_STOP=1` to stop at the first mismatch. This is
 intentionally a diagnostic-only path and is not used for throughput.
 
+The same hook also reports state drift between the fused and commit-select
+outputs:
+
+```text
+[MTP_PARITY_STATE] one_pass_vs_commit_select ...
+```
+
+It compares:
+
+- current and draft KV slots in `k_cache`
+- current and draft KV slots in `v_cache`
+- full selected convolution state
+- full selected recurrent state
+
+Use `NANO_VLLM_JAX_MTP_PARITY_STOP_STATE=1` to stop on the first state mismatch.
+Use `NANO_VLLM_JAX_MTP_PARITY_STATE_THRESHOLD=<float>` to ignore small numeric
+differences.
+
 The next, deeper harness should pause on accepted seeded K=1 steps and compare
 the fused one-pass verifier against sequential commit-select from the same
 pre-step state.
