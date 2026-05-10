@@ -270,6 +270,71 @@ def test_scheduler_pads_scheduled_batch_to_static_buckets():
     assert batch.num_prefill_tokens == 4
 
 
+def test_mtp_admission_gate_tracks_logical_decode_rows(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE", "0")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_ACCEPT_SAMPLES", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_SPEEDUP", "1.0")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_LATENCY_MIN_STEPS", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_LATENCY_ALPHA", "1.0")
+    config = _tiny_full_attention_config()
+    config.num_speculative_tokens = 1
+    config.batch_size_buckets = (4,)
+    scheduler = Scheduler(config)
+
+    assert scheduler.mtp_scheduler_gate_enabled
+
+    batch_active_2 = ScheduledBatch(
+        tokens=jnp.zeros((4, 1), dtype=jnp.int32),
+        positions=jnp.zeros((4, 1), dtype=jnp.int32),
+        seq_ids=jnp.array([0, 1, -1, -1], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 2, 2, 2], dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=2,
+        block_tables=jnp.zeros((4, 2), dtype=jnp.int32),
+        seq_lens=jnp.array([3, 3, 0, 0], dtype=jnp.int32),
+    )
+
+    scheduler.update_mtp_admission(
+        {},
+        is_decode=True,
+        elapsed_seconds=0.02,
+        emitted_tokens=2,
+        batch=batch_active_2,
+    )
+    scheduler.update_mtp_admission(
+        {"drafts_accepted": 1, "drafts_rejected": 0},
+        is_decode=True,
+        elapsed_seconds=0.06,
+        emitted_tokens=2,
+        batch=batch_active_2,
+    )
+
+    seq = Sequence([1, 2, 3], SamplingParams(temperature=0.0, max_tokens=4), seq_id=99)
+    assert not scheduler.should_admit_mtp(
+        seq,
+        for_decode=True,
+        batch_size_bucket=4,
+        active_decode_rows=2,
+    )
+    assert scheduler.mtp_admission_reason == "low_throughput"
+
+    assert scheduler.should_admit_mtp(
+        seq,
+        for_decode=True,
+        batch_size_bucket=4,
+        active_decode_rows=4,
+    )
+    assert scheduler.mtp_admission_reason == "warming"
+
+    report = scheduler.get_mtp_admission_report()
+    buckets = {bucket["key"]["active_decode_rows"]: bucket for bucket in report["buckets"]}
+    assert buckets[2]["key"]["physical_batch_size"] == 4
+    assert buckets[2]["admission_reason"] == "low_throughput"
+    assert buckets[2]["measured_speedup"] == pytest.approx(1 / 3)
+    assert buckets[4]["admission_reason"] == "warming"
+
+
 def test_scheduler_rejects_requests_exceeding_static_capacity():
     config = _tiny_full_attention_config()
     config.max_blocks_per_seq = 2

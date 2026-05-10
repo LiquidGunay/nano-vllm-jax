@@ -39,18 +39,21 @@ class Scheduler:
         self.num_speculative_tokens = max(0, int(getattr(config, "num_speculative_tokens", 0) or 0))
         self.mtp_min_accept_rate = float(os.environ.get("NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE", "0") or "0")
         self.mtp_min_accept_samples = int(os.environ.get("NANO_VLLM_JAX_MTP_MIN_ACCEPT_SAMPLES", "8") or "8")
-        self.mtp_scheduler_gate_enabled = self.num_speculative_tokens > 0 and self.mtp_min_accept_rate > 0
+        self.mtp_min_speedup = float(os.environ.get("NANO_VLLM_JAX_MTP_MIN_SPEEDUP", "1.0") or "1.0")
+        self.mtp_scheduler_gate_enabled = (
+            self.num_speculative_tokens > 0
+            and (self.mtp_min_accept_rate > 0 or self.mtp_min_speedup > 0)
+        )
         self.mtp_dtype = str(config.get_dtype())
         self.mtp_backend = str(getattr(config, "backend", "unknown"))
-        self.mtp_bucket_stats: dict[tuple[int, str, str, int | None, int], dict[str, object]] = {}
-        self.mtp_active_bucket_key: tuple[int, str, str, int | None, int] | None = None
+        self.mtp_bucket_stats: dict[tuple[int, int, str, str, int | None, int], dict[str, object]] = {}
+        self.mtp_active_bucket_key: tuple[int, int, str, str, int | None, int] | None = None
         self.mtp_observed_accepted = 0
         self.mtp_observed_rejected = 0
         self.mtp_stats_seen_accepted = 0
         self.mtp_stats_seen_rejected = 0
         self.mtp_admission_enabled = True
         self.mtp_admission_reason = "enabled"
-        self.mtp_min_speedup = float(os.environ.get("NANO_VLLM_JAX_MTP_MIN_SPEEDUP", "1.0") or "1.0")
         self.mtp_latency_alpha = float(os.environ.get("NANO_VLLM_JAX_MTP_LATENCY_ALPHA", "0.2") or "0.2")
         self.mtp_latency_min_steps = int(os.environ.get("NANO_VLLM_JAX_MTP_LATENCY_MIN_STEPS", "2") or "2")
         self.mtp_baseline_ms_per_token: float | None = None
@@ -167,6 +170,7 @@ class Scheduler:
             mtp_admitted = self.should_admit_mtp(
                 seq,
                 batch_size_bucket=self._select_batch_size_bucket(num_seqs + 1),
+                active_decode_rows=0,
             )
             seq.mtp_admitted = mtp_admitted
             seq.mtp_admission_reason = self.mtp_admission_reason if mtp_admitted else "scheduler_gate"
@@ -207,6 +211,7 @@ class Scheduler:
                 seq,
                 for_decode=True,
                 batch_size_bucket=self._select_batch_size_bucket(num_seqs + 1),
+                active_decode_rows=num_seqs + 1,
             )
             seq.mtp_admitted = mtp_admitted
             seq.mtp_admission_reason = self.mtp_admission_reason if mtp_admitted else "scheduler_gate"
@@ -351,9 +356,11 @@ class Scheduler:
         self,
         *,
         batch_size_bucket: int,
-    ) -> tuple[int, str, str, int | None, int]:
+        active_decode_rows: int,
+    ) -> tuple[int, int, str, str, int | None, int]:
         return (
             int(batch_size_bucket),
+            int(active_decode_rows),
             self.mtp_dtype,
             self.mtp_backend,
             self.max_blocks_per_seq,
@@ -375,7 +382,7 @@ class Scheduler:
 
     def _get_mtp_bucket_stats(
         self,
-        key: tuple[int, str, str, int | None, int],
+        key: tuple[int, int, str, str, int | None, int],
     ) -> dict[str, object]:
         stats = self.mtp_bucket_stats.get(key)
         if stats is None:
@@ -385,7 +392,7 @@ class Scheduler:
 
     def _sync_legacy_mtp_fields(
         self,
-        key: tuple[int, str, str, int | None, int],
+        key: tuple[int, int, str, str, int | None, int],
         stats: dict[str, object],
     ) -> None:
         self.mtp_active_bucket_key = key
@@ -404,6 +411,7 @@ class Scheduler:
         *,
         for_decode: bool = False,
         batch_size_bucket: int | None = None,
+        active_decode_rows: int | None = None,
     ) -> bool:
         """Return whether this decode row may attempt speculative decoding."""
         if self.num_speculative_tokens <= 0:
@@ -441,7 +449,12 @@ class Scheduler:
             return True
         if batch_size_bucket is None:
             batch_size_bucket = 1
-        key = self._mtp_bucket_key(batch_size_bucket=batch_size_bucket)
+        if active_decode_rows is None:
+            active_decode_rows = batch_size_bucket if for_decode else 0
+        key = self._mtp_bucket_key(
+            batch_size_bucket=batch_size_bucket,
+            active_decode_rows=active_decode_rows,
+        )
         bucket_stats = self._get_mtp_bucket_stats(key)
         self._update_mtp_admission_decision(bucket_stats)
         self._sync_legacy_mtp_fields(key, bucket_stats)
@@ -466,9 +479,14 @@ class Scheduler:
             return
         if batch is None:
             batch_size_bucket = 1
+            active_decode_rows = 1 if is_decode else 0
         else:
             batch_size_bucket = int(batch.tokens.shape[0])
-        key = self._mtp_bucket_key(batch_size_bucket=batch_size_bucket)
+            active_decode_rows = int(batch.num_decode_tokens) if is_decode else 0
+        key = self._mtp_bucket_key(
+            batch_size_bucket=batch_size_bucket,
+            active_decode_rows=active_decode_rows,
+        )
         bucket_stats = self._get_mtp_bucket_stats(key)
         accepted = int(speculative_stats.get("drafts_accepted", 0) or 0)
         rejected = int(speculative_stats.get("drafts_rejected", 0) or 0)
@@ -547,7 +565,7 @@ class Scheduler:
         """Return JSON-friendly per-bucket MTP admission stats."""
         buckets = []
         for key, stats in self.mtp_bucket_stats.items():
-            batch_size, dtype, backend, max_blocks_per_seq, num_speculative_tokens = key
+            batch_size, active_decode_rows, dtype, backend, max_blocks_per_seq, num_speculative_tokens = key
             verified = int(stats["observed_accepted"]) + int(stats["observed_rejected"])
             accept_rate = int(stats["observed_accepted"]) / verified if verified else 0.0
             baseline_ms = stats["baseline_ms_per_token"]
@@ -559,6 +577,7 @@ class Scheduler:
                 {
                     "key": {
                         "physical_batch_size": batch_size,
+                        "active_decode_rows": active_decode_rows,
                         "dtype": dtype,
                         "backend": backend,
                         "max_blocks_per_seq": max_blocks_per_seq,
@@ -585,13 +604,14 @@ class Scheduler:
 
     @staticmethod
     def _bucket_key_to_report(
-        key: tuple[int, str, str, int | None, int] | None,
+        key: tuple[int, int, str, str, int | None, int] | None,
     ) -> dict[str, object] | None:
         if key is None:
             return None
-        batch_size, dtype, backend, max_blocks_per_seq, num_speculative_tokens = key
+        batch_size, active_decode_rows, dtype, backend, max_blocks_per_seq, num_speculative_tokens = key
         return {
             "physical_batch_size": batch_size,
+            "active_decode_rows": active_decode_rows,
             "dtype": dtype,
             "backend": backend,
             "max_blocks_per_seq": max_blocks_per_seq,

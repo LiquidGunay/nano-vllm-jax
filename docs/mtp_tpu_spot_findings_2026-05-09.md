@@ -365,3 +365,44 @@ Current direction:
   implementation. The next speed work needs to reduce accepted-step cost itself:
   narrower packed verifier shapes, cheaper LM-head/top-k path, or a specialized
   target+MTP fused decode kernel.
+
+### Targeted do-no-harm fix
+
+The mixed benchmark exposed an admission-accounting bug: scheduler latency stats
+were keyed only by physical JIT bucket. That can compare unlike shapes, for
+example a physical B=4 speculative step with four active decode rows against a
+fallback/baseline step with fewer active rows. The report can then claim a
+positive scheduler speedup even while emitted-token throughput is below baseline.
+
+The admission key now includes logical active decode rows:
+
+```text
+(physical_batch_size, active_decode_rows, dtype, backend, max_blocks_per_seq, num_speculative_tokens)
+```
+
+The speed gate is also enabled when `NANO_VLLM_JAX_MTP_MIN_SPEEDUP > 0`, even if
+`NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE=0`. Previously setting accept-rate gating to
+zero unintentionally disabled throughput gating too.
+
+This does not make the current K=1 verifier faster. It implements the vLLM-style
+"do no harm" design principle for this engine: gather warmup stats per comparable
+shape, then stop admitting MTP for a shape when measured emitted-token latency is
+worse than baseline.
+
+Validation on v6e-1 after the scheduler fix, using the same mixed/interleaved
+B=4 Qwen/Qwen3.5-4B workload:
+
+| metric | value |
+|---|---:|
+| exact token match | yes |
+| next-step sanity | yes |
+| baseline decode tok/s | 106.45 |
+| MTP decode tok/s | 67.48 |
+| decode speedup | 0.634x |
+| acceptance | 41.67% |
+| final scheduler reason | `low_throughput` |
+| scheduler measured speedup | 0.964x |
+
+The important change is not the raw MTP speed. The important change is that the
+gate now correctly identifies this comparable active-row shape as slower and
+stops admitting MTP for it instead of reporting a misleading positive speedup.
