@@ -396,6 +396,56 @@ def test_k1_commit_b4_with_inactive_padded_rows(monkeypatch):
     assert runner.stored[-1][0].seq_lens.tolist() == [6, 0, 0, 9]
 
 
+def test_k1_forced_reject_probe_row_is_logical_one_token(monkeypatch):
+    seq_lens = [5, 6, 7]
+    accepted = [True, False, True]
+    target = [10, 101, 12]
+    bonus = [20, 201, 22]
+    next_draft = [30, 301, 32]
+    committed_seq_lens = [6, 6, 8]
+    executor = _FakeExecutor(
+        accepted=accepted,
+        target=target,
+        bonus=bonus,
+        next_draft=next_draft,
+        state_marker=[901, 910, 921],
+        committed_seq_lens=committed_seq_lens,
+        kv_slots=[
+            [1000, 1001],
+            [1010, 2011],
+            [1020, 1021],
+        ],
+    )
+    runner = _FakeRunner(executor, {0: 10, 2: 12}, block_size=16)
+    seqs = [_seq(i, seq_lens[i]) for i in range(3)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "1")
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_ENABLE_FAST_ALL_ACCEPT", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_COMMIT_SELECT", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_ENABLE_ROWWISE_REPAIR", raising=False)
+
+    outputs = ModelRunner._run_mtp1_batched(
+        runner,
+        seqs,
+        _batch(seq_lens),
+        [0, 1, 2],
+        forced_reject_rows={1},
+    )
+
+    assert outputs == {0: [10, 20], 1: 101, 2: [12, 22]}
+    assert runner.executor.calls[-1]["draft_token"] == [10, -1, 12]
+    assert runner.stats == {
+        "drafts_proposed": 1,
+        "drafts_accepted": 2,
+        "drafts_rejected": 0,
+        "bonus_tokens": 2,
+    }
+    assert runner._mtp1_drafts == {1: 301}
+    assert runner.stored[-1][0].seq_lens.tolist() == committed_seq_lens
+
+
 def test_k1_commit_consecutive_reject(monkeypatch):
     runner, first_outputs = _run_case(monkeypatch, accepted=[False], target=[111], next_draft=[211], block_size=16)
     assert first_outputs == {0: 111}

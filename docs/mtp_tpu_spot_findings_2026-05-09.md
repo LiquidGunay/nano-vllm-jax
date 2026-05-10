@@ -263,6 +263,13 @@ be `{0, 1, 2}` per row. The executor now treats forced-reject probe rows
 This is the correct layout invariant for mixed serving: physical shape is static
 for JIT, while logical work and cache ownership are row-local.
 
+The same K=1 logical-length rule is now applied to the regular one-pass verifier
+and the fast two-token verifier path. A regression test covers forced-reject
+probe rows explicitly: the verifier sees a physical draft lane with token `-1`,
+the row emits only the target token, the forced rejection is not counted as a
+failed proposed draft, and the row still receives a next draft for the following
+step.
+
 Benchmark outcome: this layout fix is correctness-clean but not a standalone
 speedup. The interleaved B=4 workload stayed below baseline within run variance.
 An attempted conditional-logits version that skipped second-position vocab logits

@@ -1539,7 +1539,8 @@ class ModelExecutor:
                 verify_positions = jnp.concatenate([positions, positions + 1], axis=1)
                 row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
                 row_valid = row_query_lens > 0
-                verify_query_lens = row_query_lens * 2
+                row_has_draft = row_valid & (draft_token_arg >= 0)
+                verify_query_lens = row_query_lens + row_has_draft.astype(jnp.int32)
                 verify_query_start_loc = jnp.concatenate(
                     [
                         jnp.zeros((1,), dtype=jnp.int32),
@@ -1555,7 +1556,7 @@ class ModelExecutor:
                     num_prefill_tokens=0,
                     num_decode_tokens=jnp.sum(verify_query_lens),
                     block_tables=block_tables,
-                    seq_lens=seq_lens + row_valid.astype(jnp.int32),
+                    seq_lens=seq_lens + row_has_draft.astype(jnp.int32),
                 )
                 verify_metadata = self.backend.build_attention_metadata(
                     positions=verify_batch.positions,
@@ -1592,7 +1593,7 @@ class ModelExecutor:
                 token_ids = jnp.argmax(verify_logits[:, :2], axis=-1).astype(jnp.int32)
                 target_token = token_ids[:, 0]
                 bonus_token = token_ids[:, 1]
-                accepted = (target_token == draft_token_arg) & row_valid
+                accepted = (target_token == draft_token_arg) & row_has_draft
                 if batch_accept_policy == "all_or_none":
                     accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
                 if bonus_margin_threshold > 0:
