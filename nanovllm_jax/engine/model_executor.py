@@ -1585,14 +1585,28 @@ class ModelExecutor:
                     accepted = accepted & (bonus_margin >= bonus_margin_threshold)
                     if batch_accept_policy == "all_or_none":
                         accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
-                mtp_hidden = hidden_norm[:, 1:2, :] if mtp_hidden_final_normed else hidden[:, 1:2, :]
+                pos_current = verify_positions[:, 0]
+                pos_next_after_reject = pos_current + jnp.asarray(1, dtype=pos_current.dtype)
+                pos_next_after_accept = pos_current + jnp.asarray(2, dtype=pos_current.dtype)
+                hidden_for_mtp = hidden_norm if mtp_hidden_final_normed else hidden
+                selected_mtp_hidden = jnp.where(
+                    accepted[:, None, None],
+                    hidden_for_mtp[:, 1:2, :],
+                    hidden_for_mtp[:, 0:1, :],
+                )
+                selected_mtp_token = jnp.where(accepted, bonus_token, target_token)
+                selected_mtp_position = jnp.where(
+                    accepted,
+                    pos_next_after_accept,
+                    pos_next_after_reject,
+                )
                 mtp_logits, _ = mtp_forward(
-                    hidden_state=mtp_hidden,
-                    next_token_ids=bonus_token[:, None],
+                    hidden_state=selected_mtp_hidden,
+                    next_token_ids=selected_mtp_token[:, None],
                     embed_tokens=params.embed_tokens,
                     params=params.mtp_params,
                     config=self.config,
-                    positions=next_mtp_position_arg[:, None],
+                    positions=selected_mtp_position[:, None],
                 )
                 next_draft_token = jnp.argmax(mtp_logits[:, 0], axis=-1).astype(jnp.int32)
                 output_accepted = jnp.where(row_valid, accepted, True)

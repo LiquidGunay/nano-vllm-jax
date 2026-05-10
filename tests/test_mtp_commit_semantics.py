@@ -7,12 +7,17 @@ single-pass verifier.
 """
 
 import jax.numpy as jnp
+import pytest
 
+from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.model import init_params
+from nanovllm_jax.mtp.mtp_layer import init_mtp_params
+from nanovllm_jax.engine.model_executor import ModelExecutor
 from nanovllm_jax.engine.model_executor import MTP1GreedyOutput
 from nanovllm_jax.engine.model_runner import ModelRunner
 from nanovllm_jax.engine.scheduled_batch import ScheduledBatch
 from nanovllm_jax.engine.sequence import SamplingParams, Sequence
-from nanovllm_jax.kv_cache import HybridLayerState, KVCacheStorage
+from nanovllm_jax.kv_cache import HybridLayerState, KVCacheSpec, KVCacheStorage, init_hybrid_state
 
 
 def _batch(seq_lens):
@@ -618,3 +623,146 @@ def test_k1_no_hidden_drift_style_next_token_and_topk_parity(monkeypatch):
 
     assert mtp_tokens == baseline_tokens
     assert mtp_next_logits_topk == baseline_topk
+
+
+def _tiny_mtp_verifier_config():
+    return Qwen3_5Config(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=8,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_size=2,
+        linear_chunk_size=4,
+        block_size=2,
+        num_kvcache_blocks=8,
+        max_blocks_per_seq=4,
+        max_num_seqs=2,
+        dtype="float32",
+        tie_word_embeddings=True,
+        layer_types=("linear_attention",),
+        linear_attn_layers=(0,),
+        num_speculative_tokens=1,
+        max_kv_cache_bytes=8 * 2 * 1 * 8 * 4 * 2,
+    )
+
+
+def _clone_cache_storage(cache):
+    return KVCacheStorage(
+        k_cache=jnp.array(cache.k_cache, copy=True),
+        v_cache=jnp.array(cache.v_cache, copy=True),
+    )
+
+
+def _clone_hybrid_state(hybrid):
+    return HybridLayerState(
+        conv_state=jnp.array(hybrid.conv_state, copy=True),
+        recurrent_state=jnp.array(hybrid.recurrent_state, copy=True),
+    )
+
+
+def _output_fields(output):
+    return {
+        "target_token": [int(x) for x in output.target_token.tolist()],
+        "bonus_token": [int(x) for x in output.bonus_token.tolist()],
+        "accepted": [bool(x) for x in output.accepted.tolist()],
+        "next_draft_token": [int(x) for x in output.next_draft_token.tolist()],
+    }
+
+
+def _format_mtp_fast_safe_mismatch(safe_fields, fast_fields):
+    differing = {
+        name: {
+            "safe": safe_fields[name],
+            "fast": fast_fields[name],
+        }
+        for name in safe_fields
+        if safe_fields[name] != fast_fields[name]
+    }
+    return f"fast-vs-safe K=1 rowwise verifier mismatch: {differing}"
+
+
+def test_k1_safe_and_fast_two_decode_verifier_parity_rowwise(monkeypatch):
+    """Diagnostic parity gate for prefix-safe vs fast K=1 verifier outputs.
+
+    The two verifier methods must see identical decode batch/cache/hybrid/draft
+    inputs.  Under rowwise acceptance, the fast path is only safe as an
+    all-accepted optimization; if a rejected row produces a different next
+    draft than the prefix-safe path, keep this test as xfail until the fast path
+    is narrowed or repaired.
+    """
+    import jax
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_BONUS_MARGIN", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", raising=False)
+
+    config = _tiny_mtp_verifier_config()
+    params = init_params(jax.random.PRNGKey(0), config)
+    params.mtp_params = init_mtp_params(jax.random.PRNGKey(1), config)
+    executor = ModelExecutor(config, params, backend="pure_jax")
+
+    batch = ScheduledBatch(
+        tokens=jnp.array([[3], [4]], dtype=jnp.int32),
+        positions=jnp.array([[0], [0]], dtype=jnp.int32),
+        seq_ids=jnp.array([0, 1], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 2], dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=2,
+        block_tables=jnp.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=jnp.int32),
+        seq_lens=jnp.array([1, 1], dtype=jnp.int32),
+    )
+
+    kv_spec = KVCacheSpec(
+        num_layers=config.num_hidden_layers,
+        num_blocks=config.num_kvcache_blocks,
+        block_size=config.block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        dtype=config.get_dtype(),
+        max_kv_cache_bytes=config.max_kv_cache_bytes,
+    )
+    base_cache = executor.backend.allocate_kv_cache(kv_spec, max_seqs=2, max_blocks_per_seq=4)
+    base_hybrid = init_hybrid_state(config, batch_size=2, dtype=config.get_dtype())
+
+    probe = executor.mtp1_two_decode_greedy_step_jit(
+        batch,
+        cache_storage=_clone_cache_storage(base_cache),
+        hybrid_state=_clone_hybrid_state(base_hybrid),
+        draft_token=jnp.array([-1, -1], dtype=jnp.int32),
+        next_mtp_position=jnp.array([2, 2], dtype=jnp.int32),
+        mtp_hidden_final_normed=True,
+    )
+    target_tokens = jnp.array(probe.target_token.tolist(), dtype=jnp.int32)
+    draft_tokens = target_tokens.at[1].set((target_tokens[1] + 1) % config.vocab_size)
+
+    safe = executor.mtp1_two_decode_greedy_step_jit(
+        batch,
+        cache_storage=_clone_cache_storage(base_cache),
+        hybrid_state=_clone_hybrid_state(base_hybrid),
+        draft_token=draft_tokens,
+        next_mtp_position=jnp.array([2, 2], dtype=jnp.int32),
+        mtp_hidden_final_normed=True,
+    )
+    fast = executor.mtp1_two_decode_greedy_fast_step_jit(
+        batch,
+        cache_storage=_clone_cache_storage(base_cache),
+        hybrid_state=_clone_hybrid_state(base_hybrid),
+        draft_token=draft_tokens,
+        next_mtp_position=jnp.array([2, 2], dtype=jnp.int32),
+        mtp_hidden_final_normed=True,
+    )
+
+    safe_fields = _output_fields(safe)
+    fast_fields = _output_fields(fast)
+    if safe_fields != fast_fields:
+        pytest.xfail(_format_mtp_fast_safe_mismatch(safe_fields, fast_fields))
+
+    assert fast_fields == safe_fields

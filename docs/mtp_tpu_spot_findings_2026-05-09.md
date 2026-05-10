@@ -440,3 +440,27 @@ Next concrete work items:
 2. Fix fast-path acceptance parity. Candidate areas: verifier `seq_lens`, MTP draft-token source, position for seeded drafts, and hidden normalization parity when `return_prefix_hybrid=False`.
 3. After parity, use optimistic rowwise repair: fast verifier commits accepted rows, compact one-token repair runs only for rejected rows.
 4. Keep measured adaptive gating enabled for serving so speculative decoding is disabled when observed emitted-token throughput is below baseline.
+
+## 2026-05-10 fast-path parity follow-up
+
+Added `test_k1_safe_and_fast_two_decode_verifier_parity_rowwise` to compare safe prefix K=1 and fast K=1 on identical decode/cache/hybrid/draft inputs.
+
+TPU validation:
+
+- Before the fix, the diagnostic xfailed only on `next_draft_token`: safe `[21, 27]`, fast `[21, 28]`. `target_token`, `bonus_token`, and `accepted` already matched.
+- Patched fast K=1 to seed next drafts from the same row-selected accepted/rejected prefix as the safe path.
+- `python3 -m pytest tests/test_mtp_commit_semantics.py -q` on TPU: 15 passed.
+
+Additional TPU benchmark results:
+
+| workload | mode | exact | baseline decode tok/s | MTP decode tok/s | decode speedup | acceptance | note |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| mixed B=4, lengths 16/17/31/32, outputs 4/8/3/7 | fast K=1 rowwise repair after parity fix | yes | 103.69 | 55.06 | 0.531x | 41.67% | accepted rows commit, rejected rows repair/fallback; repair dominates |
+| homogeneous B=4, prompt length 16, output length 24 | safe rowwise K=1 | yes | 203.14 | 149.98 | 0.738x | 66.04% | even with all rows active and higher acceptance, exact K=1 remains slower |
+
+Updated conclusion:
+
+- Fast-path parity is now correct for the exposed scalar outputs, but optimistic rowwise repair is not faster at the observed acceptance rates.
+- Safe rowwise K=1 is currently the best exact K=1 path, but it still cannot beat baseline on these TPU measurements.
+- The throughput gate should keep MTP disabled by default unless a bucket proves measured emitted-token throughput above baseline.
+- A real speedup likely needs either K=2 with a verified accepted path, a cheaper verifier that avoids target-model work proportional to emitted tokens, or lower-level kernel fusion that makes width-2/width-3 verifier cost substantially less than sequential baseline decode.
