@@ -406,3 +406,37 @@ B=4 Qwen/Qwen3.5-4B workload:
 The important change is not the raw MTP speed. The important change is that the
 gate now correctly identifies this comparable active-row shape as slower and
 stops admitting MTP for it instead of reporting a misleading positive speedup.
+
+## 2026-05-10 targeted speed pass
+
+Changes tested on TPU VM `nano-vllm-jax-spot-v6e2-1527`:
+
+- Safe rowwise K=1 now seeds the next MTP draft with a single row-selected MTP-head call instead of running accepted and rejected MTP branches separately.
+- Full-attention cached decode no longer loops over width-2 verifier tokens. It now calls paged decode attention once for `query_len > 1`; `paged_attention_decode` already masks keys by `key_position <= query_position`, so token 0 cannot see token 1.
+
+Focused correctness:
+
+- `python3 -m py_compile nanovllm_jax/model.py nanovllm_jax/engine/model_executor.py` passed on TPU.
+- `python3 -m pytest tests/test_mtp_commit_semantics.py -q` passed on TPU: 14 passed.
+
+Mixed B=4 workload, Qwen/Qwen3.5-4B bf16 TPU, prompt lengths 16/17/31/32, output lengths 4/8/3/7, arrivals 0/0/2/4, warmup enabled:
+
+| mode | exact | baseline decode tok/s | MTP decode tok/s | decode speedup | acceptance | note |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| safe rowwise K=1, fused q2 attention + single MTP seed | yes | 104.52 | 66.83 | 0.639x | 41.67% | accepted step device time remains about 40.6 ms, fallback about 19.6 ms |
+| fast all-accept K=1, all-or-none | yes | 106.16 | 98.29 | 0.926x | 0.00% | no accepted mixed-batch steps; mostly fallback overhead |
+| fast K=1 with rowwise repair enabled | yes | 105.26 | 98.28 | 0.934x | 0.00% | fast path did not reproduce safe-path acceptance on this workload |
+| K=2 attempt through current harness | yes | 109.09 | 101.35 | 0.929x | 0.00% | current harness/path fell back; not a useful K=2 accepted-path measurement |
+
+Current diagnosis:
+
+- The extra MTP-head branch and the old per-token full-attention loop were not the dominant bottlenecks.
+- Safe rowwise K=1 still pays roughly a two-token target-model verifier to emit `1 + acceptance_rate` tokens. With 41.67% acceptance, that cannot beat a one-token baseline unless the width-2 verifier is far cheaper than two baseline decode positions.
+- The existing fast verifier is near baseline when it falls back, but its acceptance semantics are not matching the safe path. Fix fast-path parity before using it as the hot serving path.
+
+Next concrete work items:
+
+1. Add a direct fast-vs-safe verifier parity test for the same decode batch and draft tokens: target token, bonus token, accepted flags, next draft token, and next-step sanity after commit.
+2. Fix fast-path acceptance parity. Candidate areas: verifier `seq_lens`, MTP draft-token source, position for seeded drafts, and hidden normalization parity when `return_prefix_hybrid=False`.
+3. After parity, use optimistic rowwise repair: fast verifier commits accepted rows, compact one-token repair runs only for rejected rows.
+4. Keep measured adaptive gating enabled for serving so speculative decoding is disabled when observed emitted-token throughput is below baseline.

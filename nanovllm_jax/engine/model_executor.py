@@ -729,50 +729,31 @@ class ModelExecutor:
                 pos_next_after_reject = pos_current + jnp.asarray(1, dtype=pos_current.dtype)
                 pos_next_after_accept = pos_current + jnp.asarray(2, dtype=pos_current.dtype)
 
-                def accepted_next_draft():
-                    mtp_hidden = hidden_norm[:, 1:2, :] if mtp_hidden_final_normed else hidden[:, 1:2, :]
-                    mtp_logits, _ = mtp_forward(
-                        hidden_state=mtp_hidden,
-                        next_token_ids=bonus_token[:, None],
-                        embed_tokens=params.embed_tokens,
-                        params=params.mtp_params,
-                        config=self.config,
-                        positions=pos_next_after_accept[:, None],
-                    )
-                    return jnp.argmax(mtp_logits[:, 0], axis=-1).astype(jnp.int32)
-
-                def rejected_next_draft():
-                    rejected_hidden = hidden_norm[:, 0:1, :] if mtp_hidden_final_normed else hidden[:, 0:1, :]
-                    rejected_logits, _ = mtp_forward(
-                        hidden_state=rejected_hidden,
-                        next_token_ids=target_token[:, None],
-                        embed_tokens=params.embed_tokens,
-                        params=params.mtp_params,
-                        config=self.config,
-                        positions=pos_next_after_reject[:, None],
-                    )
-                    return jnp.argmax(rejected_logits[:, 0], axis=-1).astype(jnp.int32)
-
-                def mixed_next_draft():
-                    accepted_draft = accepted_next_draft()
-                    rejected_draft = rejected_next_draft()
-                    return jnp.where(accepted, accepted_draft, rejected_draft)
-
-                accepted_all_valid = jnp.all(jnp.where(row_valid, accepted, True))
-                if batch_accept_policy == "all_or_none":
-                    next_draft_token = jax.lax.cond(
-                        accepted_all_valid,
-                        lambda _: accepted_next_draft(),
-                        lambda _: rejected_next_draft(),
-                        operand=None,
-                    )
-                else:
-                    next_draft_token = jax.lax.cond(
-                        accepted_all_valid,
-                        lambda _: accepted_next_draft(),
-                        lambda _: mixed_next_draft(),
-                        operand=None,
-                    )
+                # Select the next MTP seed per row before running the MTP head.
+                # The previous rowwise implementation ran one full MTP forward
+                # for accepted rows and another for rejected rows, then selected
+                # between their logits. Mixed B>1 batches paid both costs.
+                hidden_for_mtp = hidden_norm if mtp_hidden_final_normed else hidden
+                selected_mtp_hidden = jnp.where(
+                    accepted[:, None, None],
+                    hidden_for_mtp[:, 1:2, :],
+                    hidden_for_mtp[:, 0:1, :],
+                )
+                selected_mtp_token = jnp.where(accepted, bonus_token, target_token)
+                selected_mtp_position = jnp.where(
+                    accepted,
+                    pos_next_after_accept,
+                    pos_next_after_reject,
+                )
+                next_mtp_logits, _ = mtp_forward(
+                    hidden_state=selected_mtp_hidden,
+                    next_token_ids=selected_mtp_token[:, None],
+                    embed_tokens=params.embed_tokens,
+                    params=params.mtp_params,
+                    config=self.config,
+                    positions=selected_mtp_position[:, None],
+                )
+                next_draft_token = jnp.argmax(next_mtp_logits[:, 0], axis=-1).astype(jnp.int32)
 
                 hybrid_after_current = HybridLayerState(
                     conv_state=prefix_hybrid_state.conv_state[:, 0]

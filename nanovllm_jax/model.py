@@ -1081,58 +1081,16 @@ def full_attention_block(
         # Backend attention expects [batch, seq_len, num_heads, head_dim] (BTNH)
         query_btnh = query.transpose(0, 2, 1, 3)  # [batch, seq_len, num_heads, head_dim]
 
-        if not is_prefill and seq_len > 1 and metadata.positions is not None:
-            query_lens = jnp.diff(metadata.query_start_loc).astype(jnp.int32)
-            step_outputs = []
-            for t in range(seq_len):
-                step_active = query_lens > t
-                step_positions = metadata.positions[:, t : t + 1]
-                step_query_lens = step_active.astype(jnp.int32)
-                step_query_start_loc = jnp.concatenate(
-                    [
-                        jnp.zeros((1,), dtype=jnp.int32),
-                        jnp.cumsum(step_query_lens),
-                    ]
-                )
-                step_seq_lens = jnp.where(
-                    step_active,
-                    step_positions[:, 0] + jnp.asarray(1, dtype=step_positions.dtype),
-                    jnp.zeros_like(metadata.seq_lens),
-                )
-                step_metadata = backend.build_attention_metadata(
-                    positions=step_positions,
-                    block_tables=metadata.block_tables,
-                    seq_lens=step_seq_lens,
-                    block_size=config.block_size,
-                    is_prefill=False,
-                    query_start_loc=step_query_start_loc,
-                    num_prefill_tokens=0,
-                    num_decode_tokens=jnp.sum(step_query_lens),
-                )
-                step_outputs.append(
-                    backend.attention(
-                        layer_id=layer_idx,
-                        query=query_btnh[:, t : t + 1],
-                        cache=cache_storage,
-                        metadata=step_metadata,
-                        block_size=config.block_size,
-                        scale=1.0 / jnp.sqrt(config.head_dim),
-                        num_key_value_groups=num_key_value_groups,
-                        is_prefill=False,
-                    )
-                )
-            out = jnp.concatenate(step_outputs, axis=1)
-        else:
-            out = backend.attention(
-                layer_id=layer_idx,
-                query=query_btnh,
-                cache=cache_storage,
-                metadata=metadata,
-                block_size=config.block_size,
-                scale=1.0 / jnp.sqrt(config.head_dim),
-                num_key_value_groups=num_key_value_groups,
-                is_prefill=is_prefill,
-            )
+        out = backend.attention(
+            layer_id=layer_idx,
+            query=query_btnh,
+            cache=cache_storage,
+            metadata=metadata,
+            block_size=config.block_size,
+            scale=1.0 / jnp.sqrt(config.head_dim),
+            num_key_value_groups=num_key_value_groups,
+            is_prefill=is_prefill,
+        )
         
         # Reshape out to [batch, seq_len, hidden_dim]
         # For prefill: out is [batch, seq_len, hidden_dim]
