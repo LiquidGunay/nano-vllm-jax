@@ -955,7 +955,7 @@ def _adaptive_gating_decision(baseline: dict, speculative: dict, *, margin: floa
         "legacy_acceptance_formula_speedup": legacy_acceptance_formula,
         "legacy_formula_note": "diagnostic only; it can overestimate exact commit-select by multiplying an already-emitted-token timing ratio by acceptance",
         "should_enable": bool(should_enable),
-        "structural_limit": "Exact sequential commit-select K=1 needs at least one target-model forward for each emitted token plus MTP overhead; it should be enabled only when measured emitted-token throughput beats baseline by the configured margin.",
+        "structural_limit": "Exact speculative verification must be enabled only when measured emitted-token throughput beats baseline by the configured margin; acceptance-only formulas can overestimate speedup.",
     }
 
 
@@ -1123,7 +1123,35 @@ def _summarize_branch(step_records: list[dict]) -> dict:
     }
 
 
-def reset_engine_runtime(engine: LLMEngine):
+def _snapshot_mtp_admission(scheduler) -> dict | None:
+    if not hasattr(scheduler, "mtp_bucket_stats"):
+        return None
+    from copy import deepcopy
+
+    return {
+        "mtp_bucket_stats": deepcopy(scheduler.mtp_bucket_stats),
+        "mtp_active_bucket_key": getattr(scheduler, "mtp_active_bucket_key", None),
+        "mtp_observed_accepted": getattr(scheduler, "mtp_observed_accepted", 0),
+        "mtp_observed_rejected": getattr(scheduler, "mtp_observed_rejected", 0),
+        "mtp_stats_seen_accepted": getattr(scheduler, "mtp_stats_seen_accepted", 0),
+        "mtp_stats_seen_rejected": getattr(scheduler, "mtp_stats_seen_rejected", 0),
+        "mtp_admission_enabled": getattr(scheduler, "mtp_admission_enabled", True),
+        "mtp_admission_reason": getattr(scheduler, "mtp_admission_reason", "enabled"),
+        "mtp_baseline_ms_per_token": getattr(scheduler, "mtp_baseline_ms_per_token", None),
+        "mtp_spec_ms_per_token": getattr(scheduler, "mtp_spec_ms_per_token", None),
+        "mtp_baseline_latency_steps": getattr(scheduler, "mtp_baseline_latency_steps", 0),
+        "mtp_spec_latency_steps": getattr(scheduler, "mtp_spec_latency_steps", 0),
+    }
+
+
+def _restore_mtp_admission(scheduler, snapshot: dict | None) -> None:
+    if snapshot is None:
+        return
+    for key, value in snapshot.items():
+        setattr(scheduler, key, value)
+
+
+def reset_engine_runtime(engine: LLMEngine, *, reset_mtp_admission: bool = True):
     """Reset per-request runtime state while preserving loaded weights/JIT cache."""
     from itertools import count
 
@@ -1138,7 +1166,7 @@ def reset_engine_runtime(engine: LLMEngine):
         engine.config.block_size,
     )
     scheduler.last_num_generated_tokens = 0
-    if hasattr(scheduler, "reset_mtp_admission"):
+    if reset_mtp_admission and hasattr(scheduler, "reset_mtp_admission"):
         scheduler.reset_mtp_admission()
     Sequence.counter = count()
 
@@ -1172,8 +1200,9 @@ def run_generation_batch(
     return_prefill_logits: bool = False,
     output_lengths: list[int] | None = None,
     arrival_steps: list[int] | None = None,
+    reset_mtp_admission: bool = True,
 ):
-    reset_engine_runtime(engine)
+    reset_engine_runtime(engine, reset_mtp_admission=reset_mtp_admission)
     runner = engine.model_runner
     runner.mtp1_enabled = bool(mtp1 and runner.mtp_enabled and runner.num_speculative_tokens > 0)
     runner.mtp_position_offset = mtp_position_offset
@@ -1656,6 +1685,7 @@ def _run_benchmark_for_prompts(
     mtp_token_source: str = "generated",
     mtp_hidden_source: str = "final_normed",
     step_profile: bool = False,
+    reset_mtp_admission: bool = True,
 ):
     runs = []
     for _ in range(repeats):
@@ -1683,6 +1713,7 @@ def _run_benchmark_for_prompts(
                 0,
                 minimum=0,
             ),
+            reset_mtp_admission=reset_mtp_admission,
         )
         runs.append(run)
     return runs[-1]
@@ -1862,10 +1893,12 @@ def _build_variant_rows(
         mtp_hidden_source=args.mtp_hidden_source,
         step_profile=step_profile,
     )
+    baseline_mtp_admission = _snapshot_mtp_admission(engine.scheduler)
 
     variant_rows = []
     for token_source, position_offset, hidden_source in variants:
         if warmup:
+            _restore_mtp_admission(engine.scheduler, baseline_mtp_admission)
             _run_benchmark_for_prompts(
                 engine,
                 prompts,
@@ -1876,7 +1909,9 @@ def _build_variant_rows(
                 mtp_token_source=token_source,
                 mtp_hidden_source=hidden_source,
                 step_profile=False,
+                reset_mtp_admission=False,
             )
+        _restore_mtp_admission(engine.scheduler, baseline_mtp_admission)
         speculative = _run_benchmark_for_prompts(
             engine,
             prompts,
@@ -1887,6 +1922,7 @@ def _build_variant_rows(
             mtp_token_source=token_source,
             mtp_hidden_source=hidden_source,
             step_profile=step_profile,
+            reset_mtp_admission=False,
         )
 
         speculative_profile = speculative["step_profile"]
@@ -1918,12 +1954,22 @@ def _build_variant_rows(
                 "baseline": baseline["texts"],
                 "mtp": speculative["texts"],
             }
+        accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
+        speculative_k = max(1, int(getattr(args, "num_speculative_tokens", 1) or 1))
+        benchmark_mode = f"K={speculative_k} {accept_policy} MTP"
+        if (
+            speculative_k > 1
+            and speculative["speculative_counts"].get("fallback_decode_steps", 0) > 0
+            and speculative["speculative"].get("drafts_accepted", 0) == 0
+            and speculative["speculative"].get("drafts_rejected", 0) == 0
+        ):
+            benchmark_mode = f"K={speculative_k} MTP fallback/no verifier accepts"
 
         row = {
             "token_source": token_source,
             "position_offset": position_offset,
             "hidden_source": hidden_source,
-            "benchmark_mode": "all-or-none MTP",
+            "benchmark_mode": benchmark_mode,
             "mtp1": speculative,
             "baseline": baseline,
             "mtp1_runs": repeats,

@@ -464,3 +464,55 @@ Updated conclusion:
 - Safe rowwise K=1 is currently the best exact K=1 path, but it still cannot beat baseline on these TPU measurements.
 - The throughput gate should keep MTP disabled by default unless a bucket proves measured emitted-token throughput above baseline.
 - A real speedup likely needs either K=2 with a verified accepted path, a cheaper verifier that avoids target-model work proportional to emitted tokens, or lower-level kernel fusion that makes width-2/width-3 verifier cost substantially less than sequential baseline decode.
+
+## 2026-05-10 K=2 compact verifier and gating follow-up
+
+Patch summary:
+
+- K=2 `mtp2_commit_select` is now allowed for compacted partial physical batches. Previously K=2 required `rows == range(physical_batch_size)`, so mixed/underfilled buckets silently returned `None` and fell back to ordinary decode.
+- K>1 acceptance indexing now uses `verifier_index_for_local`, so compact verifier output rows are not indexed with original physical row ids.
+- `benchmark_mtp1_engine.py` now labels rows as `K=<n> <policy> MTP` instead of always saying `all-or-none MTP`.
+- The benchmark harness snapshots baseline MTP-admission stats, runs MTP warmup under the same preserved admission state, restores the baseline snapshot, then times the speculative run. This exposes the intended "do no harm" gate against a real baseline instead of comparing speculative steps only against fallback steps from the same speculative run.
+
+Focused TPU validation:
+
+- `python3 -m py_compile nanovllm_jax/engine/model_runner.py benchmark_mtp1_engine.py tests/test_mtp_commit_semantics.py` passed on the TPU VM.
+- `python3 -m pytest tests/test_mtp_commit_semantics.py -q` passed on the TPU VM: 16 passed.
+- New test: `test_k2_commit_select_compacts_partial_physical_rows` verifies rows `[0, 2]` from a three-row physical batch use compact `mtp2_commit_select` and commit rowwise accepted/rejected outputs without scalar fallback.
+
+Verifier-mode evidence from the mixed/interleaved K=2 TPU run:
+
+| verifier mode | count |
+| --- | ---: |
+| `mtp2_commit_select`, full B=4 | 11 |
+| `mtp2_commit_select`, compact rows `[1,2,3]` | 3 |
+| `mtp2_commit_select`, compact rows `[2,3]` | 3 |
+| `mtp2_commit_select`, compact rows `[3]` | 3 |
+
+K=2 benchmark results after the compact verifier patch, Qwen/Qwen3.5-4B bf16 on v6e-1:
+
+| workload | exact | next-step sanity | baseline decode tok/s | K=2 MTP decode tok/s | decode speedup | acceptance | fallback steps | note |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| homogeneous B=4, prompt 16, output 24 | yes | yes | 207.74 | 166.64 | 0.802x | 68.75% | 5 | real `mtp2_commit_select`; accepted steps p50 4.68 ms/token, fallback p50 9.29 ms/token |
+| mixed B=4, prompts 16/17/31/32, outputs 12 each, arrivals 0/0/2/4 | yes | yes | 174.46 | 100.01 | 0.573x | 36.11% | 5 | compact K=2 works, but low acceptance and underfilled rows dominate |
+| homogeneous B=4, prompt 16, output 96 | yes | yes | 220.71 | 154.67 | 0.701x | 46.34% | 27 | longer decode did not amortize; acceptance fell |
+
+Gating-specific benchmark after preserving baseline admission stats:
+
+| workload | exact | baseline decode tok/s | measured MTP decode tok/s | B=4 gate decision | B=4 measured speedup |
+| --- | --- | ---: | ---: | --- | ---: |
+| homogeneous B=4, prompt 16, output 24 | yes | 216.40 | 101.98 | `low_throughput`, disabled | 0.318x |
+
+Interpretation:
+
+- The silent K=2 fallback bug is fixed: K=2 now enters `mtp2_commit_select` for both full and compact verifier batches.
+- Correctness is still intact for the tested K=2 workloads: exact token match and next-step sanity both pass.
+- K=2 still does not produce a throughput win in this pure-JAX runner. The accepted-path p50 can be near baseline on the short full-B=4 run, but aggregate throughput loses to rejected/fallback steps and underfilled active-row buckets.
+- The scheduler gate can now see the B=4 K=2 bucket as `low_throughput` when the benchmark preserves baseline stats, but the top-level report is still misleading for mixed/finished workloads because it reflects the last active bucket, not necessarily the main B=4 bucket. Use per-bucket admission data for decisions.
+
+Next bottlenecks:
+
+1. Fallback under MTP is much slower than the clean no-spec baseline, especially for underfilled buckets. The fallback path should avoid stale draft bookkeeping and run the exact same hot baseline decode path when a bucket is gated off.
+2. Baseline admission stats need to be seeded for every active-row bucket used by serving, not just full B=4. Otherwise B=3/B=2/B=1 buckets remain in `warming` and can keep admitting speculative decode after B=4 is gated.
+3. The benchmark should report the active bucket used for the primary timed result and should not surface the last-bucket legacy scheduler fields as if they represented the whole workload.
+4. Real speedup likely requires improving accepted-path device time or increasing accepted tokens per verifier without raising fallback cost. K=2 correctness is now unblocked, so the next speed work should target fallback parity and per-bucket gate coverage before trying wider K.

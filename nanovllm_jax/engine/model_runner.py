@@ -2499,13 +2499,22 @@ class CanonicalModelRunner:
             return None
         draft_token_chains = [chain[:draft_len] for chain in draft_chains]
         draft_tokens = [chain[0] for chain in draft_token_chains]
+        compact_verifier_enabled = (
+            os.environ.get("NANO_VLLM_JAX_MTP_COMPACT_VERIFIER", "1")
+            in {"1", "true", "yes", "on", "True"}
+        )
         use_compact_verifier = (
-            draft_len == 1
-            and partial_physical_batch
+            partial_physical_batch
             and not use_debug
             and not debug_verifier_enabled
-            and os.environ.get("NANO_VLLM_JAX_MTP_COMPACT_VERIFIER", "1")
-            in {"1", "true", "yes", "on", "True"}
+            and compact_verifier_enabled
+            and (
+                draft_len == 1
+                or (
+                    draft_len == 2
+                    and hasattr(self.executor, "mtp2_commit_select_greedy_step_jit")
+                )
+            )
         )
         decode_batch = (
             self._compact_decode_batch(batch, rows)
@@ -2605,9 +2614,10 @@ class CanonicalModelRunner:
             and not enable_fast_all_accept
             and hasattr(self.executor, "mtp1_commit_select_greedy_step_jit")
         )
+        verifier_full_physical_batch = (not partial_physical_batch) or use_compact_verifier
         use_mtp2_commit_select = (
             draft_len == 2
-            and not partial_physical_batch
+            and verifier_full_physical_batch
             and hasattr(self.executor, "mtp2_commit_select_greedy_step_jit")
         )
         use_fast_all_accept = (
@@ -2645,6 +2655,32 @@ class CanonicalModelRunner:
             in {"1", "true", "yes", "on", "True"}
             and hasattr(self.executor, "mtp1_layerwise_drift_debug_jit")
         )
+        if profile_mtp:
+            if use_one_pass_k1:
+                verifier_mode = "mtp1_one_pass_prefix"
+            elif use_commit_select:
+                verifier_mode = "mtp1_commit_select"
+            elif use_fast_all_accept:
+                verifier_mode = "mtp1_two_decode_fast"
+            elif draft_len == 1 and use_prefix_two_decode:
+                verifier_mode = "mtp1_two_decode"
+            elif use_mtp2_commit_select:
+                verifier_mode = "mtp2_commit_select"
+            elif draft_len == 1:
+                verifier_mode = "fallback_k1_no_verifier"
+            elif partial_physical_batch and not use_compact_verifier:
+                verifier_mode = "fallback_k_gt1_partial_physical"
+            else:
+                verifier_mode = "mtp_k_decode"
+            print(
+                "[MTP_RUN] verifier "
+                f"mode={verifier_mode} draft_len={draft_len} "
+                f"rows={rows} physical_batch={physical_batch_size} "
+                f"verifier_batch={verifier_physical_batch_size} "
+                f"partial_physical={partial_physical_batch} "
+                f"compact={use_compact_verifier}",
+                flush=True,
+            )
         parity_output = None
         layer_parity_output = None
         layerwise_drift_output = None
@@ -2755,9 +2791,15 @@ class CanonicalModelRunner:
         t_profile = _mark("host_result_transfer", t_profile)
 
         if draft_len > 1:
+            output_acceptance_matrix = output.accepted.tolist()
             accepted_all = all(
-                all(bool(value) for value in output.accepted.tolist()[row])
-                for row in rows
+                all(
+                    bool(value)
+                    for value in output_acceptance_matrix[
+                        verifier_index_for_local[local_row]
+                    ]
+                )
+                for local_row, _row in enumerate(rows)
             )
         else:
             output_acceptance_for_rows = [bool(x) for x in output.accepted.tolist()]

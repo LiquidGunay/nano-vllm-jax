@@ -73,6 +73,13 @@ class _FakeExecutor:
     def mtp1_commit_select_greedy_step_jit(self, *args, **kwargs):
         raise AssertionError("one-pass K=1 path should be selected in these tests")
 
+    @staticmethod
+    def _row_values(values, row, width):
+        value = values[row]
+        if isinstance(value, (list, tuple)):
+            return [int(token) for token in value]
+        return [int(value) for _ in range(width)]
+
     def mtp1_two_decode_greedy_step_jit(
         self,
         batch,
@@ -113,15 +120,77 @@ class _FakeExecutor:
             ),
         )
 
+    def mtp2_commit_select_greedy_step_jit(
+        self,
+        batch,
+        *,
+        cache_storage,
+        hybrid_state,
+        draft_tokens,
+        next_mtp_position,
+        mtp_hidden_final_normed,
+    ):
+        self.calls.append(
+            {
+                "method": "mtp2_commit_select",
+                "batch_size": int(batch.tokens.shape[0]),
+                "draft_tokens": [
+                    [int(token) for token in row]
+                    for row in draft_tokens.tolist()
+                ],
+                "next_mtp_position": [int(x) for x in next_mtp_position.tolist()],
+            }
+        )
+        if int(batch.tokens.shape[0]) == len(self.accepted):
+            output_rows = list(range(len(self.accepted)))
+        else:
+            output_rows = [int(seq_id) for seq_id in batch.seq_ids.tolist()]
+        marker = jnp.array([self.state_marker[row] for row in output_rows], dtype=jnp.float32).reshape(
+            (-1, 1, 1, 1)
+        )
+        width = int(draft_tokens.shape[1])
+        return MTP1GreedyOutput(
+            target_token=jnp.array(
+                [self._row_values(self.target, row, width) for row in output_rows],
+                dtype=jnp.int32,
+            ),
+            bonus_token=jnp.array([self.bonus[row] for row in output_rows], dtype=jnp.int32),
+            next_draft_token=jnp.array(
+                [self._row_values(self.next_draft, row, width) for row in output_rows],
+                dtype=jnp.int32,
+            ),
+            accepted=jnp.array(
+                [self._row_values(self.accepted, row, width) for row in output_rows],
+                dtype=jnp.bool_,
+            ),
+            cache_storage=KVCacheStorage(
+                k_cache=jnp.array(self.kv_slots, dtype=jnp.float32),
+                v_cache=jnp.array(self.kv_slots, dtype=jnp.float32) + 100,
+            ),
+            hybrid_state=HybridLayerState(conv_state=marker, recurrent_state=marker + 1000),
+            committed_seq_lens=jnp.array(
+                [self.committed_seq_lens[row] for row in output_rows],
+                dtype=jnp.int32,
+            ),
+        )
+
 
 class _FakeRunner:
-    def __init__(self, executor, drafts, *, block_size=8, mtp1_enabled=True):
+    def __init__(
+        self,
+        executor,
+        drafts,
+        *,
+        block_size=8,
+        mtp1_enabled=True,
+        num_speculative_tokens=1,
+    ):
         self.executor = executor
         self._mtp1_drafts = dict(drafts)
         self.block_size = block_size
         self.execution = "jit"
         self.mtp_debug = False
-        self.num_speculative_tokens = 1
+        self.num_speculative_tokens = num_speculative_tokens
         self.mtp_position_offset = 0
         self.mtp_hidden_source = "final_normed"
         self.mtp1_enabled = mtp1_enabled
@@ -137,6 +206,7 @@ class _FakeRunner:
         }
         self.stored = []
         self.snapshots = []
+        self.draft_position_acceptance = []
 
     def _compact_decode_batch(self, batch, rows):
         row_idx = jnp.array(rows, dtype=jnp.int32)
@@ -211,6 +281,9 @@ class _FakeRunner:
 
     def _record_kv_snapshot(self, batch, hybrid_state=None):
         self.snapshots.append((batch, hybrid_state))
+
+    def _record_draft_position_acceptance(self, accepted_matrix):
+        self.draft_position_acceptance.append(accepted_matrix)
 
     def _speculative_stats(self):
         return self.stats
@@ -408,6 +481,67 @@ def test_k1_commit_b4_with_inactive_padded_rows(monkeypatch):
         [1030.0, 1031.0],
     ]
     assert runner.stored[-1][0].seq_lens.tolist() == [6, 9]
+
+
+def test_k2_commit_select_compacts_partial_physical_rows(monkeypatch):
+    seq_lens = [5, 6, 7]
+    executor = _FakeExecutor(
+        accepted=[
+            [True, True],
+            [False, False],
+            [False, True],
+        ],
+        target=[
+            [10, 11],
+            [101, 102],
+            [102, 103],
+        ],
+        bonus=[20, 21, 22],
+        next_draft=[
+            [30, 31],
+            [301, 302],
+            [32, 33],
+        ],
+        state_marker=[902, 910, 920],
+        committed_seq_lens=[7, 6, 7],
+        kv_slots=[
+            [1000, 1001, 1002],
+            [1010, 1011, 1012],
+            [1020, 2021, 2022],
+        ],
+    )
+    runner = _FakeRunner(
+        executor,
+        {0: [10, 11], 2: [12, 13]},
+        block_size=16,
+        num_speculative_tokens=2,
+    )
+    seqs = [_seq(i, seq_lens[i]) for i in range(3)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_COMPACT_VERIFIER", raising=False)
+
+    outputs = ModelRunner._run_mtp1_batched(
+        runner,
+        seqs,
+        _batch(seq_lens),
+        [0, 2],
+    )
+
+    assert outputs == {0: [10, 11, 20], 2: 102}
+    assert runner.executor.calls[-1]["method"] == "mtp2_commit_select"
+    assert runner.executor.calls[-1]["batch_size"] == 2
+    assert runner.executor.calls[-1]["draft_tokens"] == [[10, 11], [12, 13]]
+    assert runner.stats == {
+        "drafts_proposed": 2,
+        "drafts_accepted": 2,
+        "drafts_rejected": 1,
+        "bonus_tokens": 1,
+    }
+    assert runner._mtp1_drafts == {2: [32, 33]}
+    assert runner.stored[-1][0].seq_lens.tolist() == [7, 7]
 
 
 def test_k1_forced_reject_probe_row_is_logical_one_token(monkeypatch):
