@@ -295,3 +295,73 @@ baseline cost. A robust B>1 MTP speedup needs real kernel/logit-path work:
   `[B, 2]` width, drives expensive layer work,
 - keep per-bucket adaptive gating so low-acceptance B>1 traffic quickly falls
   back to baseline.
+
+## 2026-05-10 mixed verifier cleanup and compact K=1 results
+
+The K=1 logical-layout invariant is now applied consistently across:
+
+- regular one-pass verifier,
+- fast two-token verifier,
+- layer parity debug verifier,
+- layerwise drift debug verifier,
+- exact commit-select acceptance masking.
+
+Rows with no real draft use `draft_token < 0` and have logical verifier length
+`1`, not `2`. Under `all_or_none`, those no-draft rows no longer poison the
+acceptance decision for rows that did have real drafts.
+
+The runner now also has an enabled-by-default compact K=1 verifier path for
+partial candidate sets. If only some physical rows have real drafts, the verifier
+can run on a compact decode batch containing only those rows. Forced-reject probe
+rows are disabled by default because ordinary fallback decode already seeds their
+next draft without paying width-2 verifier work.
+
+TPU focused tests:
+
+```text
+python3 -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py tests/test_mtp_commit_semantics.py
+python3 -m pytest tests/test_mtp_commit_semantics.py -q
+14 passed in 6.14s
+```
+
+Warmup-enabled v6e-1 mixed/interleaved B=4, Qwen/Qwen3.5-4B, BF16, exact token
+match and next-step sanity both true:
+
+| variant | baseline decode tok/s | MTP decode tok/s | speedup | acceptance | accepted/rejected/fallback steps |
+|---|---:|---:|---:|---:|---|
+| logical-length one-pass before compact | 105.55 | 53.65 | 0.508x | 36.36% | 3 / 2 / 3 |
+| compact K=1 verifier, probes disabled | 101.07 | 59.56 | 0.589x | 36.36% | 3 / 2 / 3 |
+
+Compact partial verification helped but did not get B=4 above baseline. It also
+increased warmup time on this harness because extra compact shapes compile; a
+production server should bucket and warm compact candidate counts explicitly.
+
+Warmup-enabled homogeneous synthetic B=4, Qwen/Qwen3.5-4B, BF16:
+
+| variant | baseline decode tok/s | MTP decode tok/s | speedup | acceptance | accepted/rejected/fallback steps |
+|---|---:|---:|---:|---:|---|
+| compact default, seed after bonus | 215.35 | 122.62 | 0.569x | 52.63% | 7 / 6 / 2 |
+| seed after bonus disabled | 211.48 | 80.62 | 0.381x | 45.16% | 8 / 5 / 2 |
+| draft margin 2.0 | 208.55 | 90.63 | 0.435x | 51.43% | 9 / 4 / 2 |
+
+Interpretation:
+
+- Compacting partial candidate rows is a real improvement for heterogeneous
+  serving, but it only helps rows that would otherwise be padded no-draft lanes.
+- For full B=4, accepted MTP steps are still not cheaper than baseline per
+  emitted token on this pure-JAX path. Synthetic accepted-step p50 inter-token
+  latency was around `5.04ms`, while baseline decode was around `4.64ms/token`.
+- Rejected verifier steps dominate losses. Synthetic rejected-step p50 latency
+  was around `22.83ms/token`.
+- Draft-margin gating at `2.0` did not improve this workload. It reduced some
+  rejected steps but hurt total device time and emitted-token throughput.
+
+Current direction:
+
+- Keep compact K=1 verification for correctness and mixed-serving shape hygiene.
+- Keep adaptive admission as the default protection against low-acceptance B>1
+  traffic.
+- Do not expect B=4 K=1 speedup from scheduler changes alone on this pure-JAX
+  implementation. The next speed work needs to reduce accepted-step cost itself:
+  narrower packed verifier shapes, cheaper LM-head/top-k path, or a specialized
+  target+MTP fused decode kernel.

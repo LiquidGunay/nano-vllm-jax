@@ -85,18 +85,27 @@ class _FakeExecutor:
                 "next_mtp_position": [int(x) for x in next_mtp_position.tolist()],
             }
         )
-        marker = jnp.array(self.state_marker, dtype=jnp.float32).reshape((-1, 1, 1, 1))
+        if int(batch.tokens.shape[0]) == len(self.accepted):
+            output_rows = list(range(len(self.accepted)))
+        else:
+            output_rows = [int(seq_id) for seq_id in batch.seq_ids.tolist()]
+        marker = jnp.array([self.state_marker[row] for row in output_rows], dtype=jnp.float32).reshape(
+            (-1, 1, 1, 1)
+        )
         return MTP1GreedyOutput(
-            target_token=jnp.array(self.target, dtype=jnp.int32),
-            bonus_token=jnp.array(self.bonus, dtype=jnp.int32),
-            next_draft_token=jnp.array(self.next_draft, dtype=jnp.int32),
-            accepted=jnp.array(self.accepted, dtype=jnp.bool_),
+            target_token=jnp.array([self.target[row] for row in output_rows], dtype=jnp.int32),
+            bonus_token=jnp.array([self.bonus[row] for row in output_rows], dtype=jnp.int32),
+            next_draft_token=jnp.array([self.next_draft[row] for row in output_rows], dtype=jnp.int32),
+            accepted=jnp.array([self.accepted[row] for row in output_rows], dtype=jnp.bool_),
             cache_storage=KVCacheStorage(
                 k_cache=jnp.array(self.kv_slots, dtype=jnp.float32),
                 v_cache=jnp.array(self.kv_slots, dtype=jnp.float32) + 100,
             ),
             hybrid_state=HybridLayerState(conv_state=marker, recurrent_state=marker + 1000),
-            committed_seq_lens=jnp.array(self.committed_seq_lens, dtype=jnp.int32),
+            committed_seq_lens=jnp.array(
+                [self.committed_seq_lens[row] for row in output_rows],
+                dtype=jnp.int32,
+            ),
         )
 
 
@@ -361,7 +370,7 @@ def test_k1_commit_ignores_inactive_padded_rows(monkeypatch):
     )
 
     assert outputs == {0: [10, 200], 2: [12, 202]}
-    assert runner.executor.calls[-1]["draft_token"] == [10, 0, 12]
+    assert runner.executor.calls[-1]["draft_token"] == [10, 12]
     assert runner.stats["drafts_accepted"] == 2
     assert runner.stats["drafts_rejected"] == 0
     assert runner.cache_storage.k_cache.tolist() == [
@@ -369,7 +378,7 @@ def test_k1_commit_ignores_inactive_padded_rows(monkeypatch):
         [801.0, 802.0],
         [1020.0, 1021.0],
     ]
-    assert runner.stored[-1][1].conv_state.reshape(-1).tolist() == [901.0, 801.0, 921.0]
+    assert runner.stored[-1][1].conv_state.reshape(-1).tolist() == [901.0, 921.0]
     assert runner._mtp1_drafts == {}
 
 
@@ -386,14 +395,14 @@ def test_k1_commit_b4_with_inactive_padded_rows(monkeypatch):
     )
 
     assert outputs == {0: [10, 20], 3: [13, 23]}
-    assert runner.executor.calls[-1]["draft_token"] == [10, 0, 0, 13]
+    assert runner.executor.calls[-1]["draft_token"] == [10, 13]
     assert runner.cache_storage.k_cache.tolist() == [
         [1000.0, 1001.0],
         [801.0, 802.0],
         [802.0, 803.0],
         [1030.0, 1031.0],
     ]
-    assert runner.stored[-1][0].seq_lens.tolist() == [6, 0, 0, 9]
+    assert runner.stored[-1][0].seq_lens.tolist() == [6, 9]
 
 
 def test_k1_forced_reject_probe_row_is_logical_one_token(monkeypatch):

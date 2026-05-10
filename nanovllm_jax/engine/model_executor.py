@@ -955,10 +955,11 @@ class ModelExecutor:
             ):
                 row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
                 row_active = (row_query_lens > 0) & (seq_ids >= 0)
+                row_has_draft = row_active & (draft_token_arg >= 0)
 
                 verify_tokens = jnp.concatenate([tokens, draft_token_arg[:, None]], axis=1)
                 verify_positions = jnp.concatenate([positions, positions + 1], axis=1)
-                verify_query_lens = row_query_lens * 2
+                verify_query_lens = row_query_lens + row_has_draft.astype(jnp.int32)
                 verify_query_start_loc = jnp.concatenate(
                     [
                         jnp.zeros((1,), dtype=jnp.int32),
@@ -974,7 +975,7 @@ class ModelExecutor:
                     num_prefill_tokens=0 if one_pass_decode_mode else jnp.sum(verify_query_lens),
                     num_decode_tokens=jnp.sum(verify_query_lens) if one_pass_decode_mode else 0,
                     block_tables=block_tables,
-                    seq_lens=seq_lens + row_active.astype(jnp.int32),
+                    seq_lens=seq_lens + row_has_draft.astype(jnp.int32),
                 )
                 verify_metadata = self.backend.build_attention_metadata(
                     positions=verify_batch.positions,
@@ -1053,7 +1054,7 @@ class ModelExecutor:
                 )
                 seq_logits0 = jnp.dot(seq_hidden0_norm[:, 0], output_weight)
 
-                second_query_lens = row_active.astype(jnp.int32)
+                second_query_lens = row_has_draft.astype(jnp.int32)
                 second_query_start_loc = jnp.concatenate(
                     [
                         jnp.zeros((1,), dtype=jnp.int32),
@@ -1061,15 +1062,15 @@ class ModelExecutor:
                     ]
                 )
                 second_batch = ScheduledBatch(
-                    tokens=jnp.where(row_active[:, None], draft_token_arg[:, None], jnp.zeros_like(tokens)),
-                    positions=jnp.where(row_active[:, None], positions + 1, jnp.zeros_like(positions)),
-                    seq_ids=jnp.where(row_active, seq_ids, jnp.full_like(seq_ids, -1)),
+                    tokens=jnp.where(row_has_draft[:, None], draft_token_arg[:, None], jnp.zeros_like(tokens)),
+                    positions=jnp.where(row_has_draft[:, None], positions + 1, jnp.zeros_like(positions)),
+                    seq_ids=jnp.where(row_has_draft, seq_ids, jnp.full_like(seq_ids, -1)),
                     query_start_loc=second_query_start_loc,
                     is_prefill=False,
                     num_prefill_tokens=0,
                     num_decode_tokens=jnp.sum(second_query_lens),
-                    block_tables=jnp.where(row_active[:, None], block_tables, jnp.zeros_like(block_tables)),
-                    seq_lens=jnp.where(row_active, seq_lens + 1, jnp.zeros_like(seq_lens)),
+                    block_tables=jnp.where(row_has_draft[:, None], block_tables, jnp.zeros_like(block_tables)),
+                    seq_lens=jnp.where(row_has_draft, seq_lens + 1, jnp.zeros_like(seq_lens)),
                 )
                 second_metadata = self.backend.build_attention_metadata(
                     positions=second_batch.positions,
@@ -1111,13 +1112,13 @@ class ModelExecutor:
                 draft_slots = verify_metadata.slot_mapping[:, 1]
                 return (
                     _max_abs(fused_logits[:, 0], seq_logits0, row_active),
-                    _max_abs(fused_logits[:, 1], seq_logits1[:, 0], row_active),
+                    _max_abs(fused_logits[:, 1], seq_logits1[:, 0], row_has_draft),
                     _max_abs(fused_hidden[:, 0], seq_hidden0[:, 0], row_active),
-                    _max_abs(fused_hidden[:, 1], seq_hidden1[:, 0], row_active),
+                    _max_abs(fused_hidden[:, 1], seq_hidden1[:, 0], row_has_draft),
                     _slot_max_abs(fused_kv.k_cache, seq_kv1.k_cache, current_slots, row_active),
-                    _slot_max_abs(fused_kv.k_cache, seq_kv1.k_cache, draft_slots, row_active),
+                    _slot_max_abs(fused_kv.k_cache, seq_kv1.k_cache, draft_slots, row_has_draft),
                     _slot_max_abs(fused_kv.v_cache, seq_kv1.v_cache, current_slots, row_active),
-                    _slot_max_abs(fused_kv.v_cache, seq_kv1.v_cache, draft_slots, row_active),
+                    _slot_max_abs(fused_kv.v_cache, seq_kv1.v_cache, draft_slots, row_has_draft),
                     _max_abs(fused_hybrid.conv_state, seq_hybrid1.conv_state, row_active),
                     _max_abs(fused_hybrid.recurrent_state, seq_hybrid1.recurrent_state, row_active),
                     fused_top5_slot0,
@@ -1243,10 +1244,11 @@ class ModelExecutor:
             ):
                 row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
                 row_active = (row_query_lens > 0) & (seq_ids >= 0)
+                row_has_draft = row_active & (draft_token_arg >= 0)
 
                 verify_tokens = jnp.concatenate([tokens, draft_token_arg[:, None]], axis=1)
                 verify_positions = jnp.concatenate([positions, positions + 1], axis=1)
-                verify_query_lens = row_query_lens * 2
+                verify_query_lens = row_query_lens + row_has_draft.astype(jnp.int32)
                 verify_query_start_loc = jnp.concatenate(
                     [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(verify_query_lens)]
                 )
@@ -1259,7 +1261,7 @@ class ModelExecutor:
                     num_prefill_tokens=0 if one_pass_decode_mode else jnp.sum(verify_query_lens),
                     num_decode_tokens=jnp.sum(verify_query_lens) if one_pass_decode_mode else 0,
                     block_tables=block_tables,
-                    seq_lens=seq_lens + row_active.astype(jnp.int32),
+                    seq_lens=seq_lens + row_has_draft.astype(jnp.int32),
                 )
                 verify_metadata = self.backend.build_attention_metadata(
                     positions=verify_batch.positions,
@@ -1355,20 +1357,20 @@ class ModelExecutor:
                     backend=self.backend,
                 )
 
-                second_query_lens = row_active.astype(jnp.int32)
+                second_query_lens = row_has_draft.astype(jnp.int32)
                 second_query_start_loc = jnp.concatenate(
                     [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(second_query_lens)]
                 )
                 second_batch = ScheduledBatch(
-                    tokens=jnp.where(row_active[:, None], draft_token_arg[:, None], jnp.zeros_like(tokens)),
-                    positions=jnp.where(row_active[:, None], positions + 1, jnp.zeros_like(positions)),
-                    seq_ids=jnp.where(row_active, seq_ids, jnp.full_like(seq_ids, -1)),
+                    tokens=jnp.where(row_has_draft[:, None], draft_token_arg[:, None], jnp.zeros_like(tokens)),
+                    positions=jnp.where(row_has_draft[:, None], positions + 1, jnp.zeros_like(positions)),
+                    seq_ids=jnp.where(row_has_draft, seq_ids, jnp.full_like(seq_ids, -1)),
                     query_start_loc=second_query_start_loc,
                     is_prefill=False,
                     num_prefill_tokens=0,
                     num_decode_tokens=jnp.sum(second_query_lens),
-                    block_tables=jnp.where(row_active[:, None], block_tables, jnp.zeros_like(block_tables)),
-                    seq_lens=jnp.where(row_active, seq_lens + 1, jnp.zeros_like(seq_lens)),
+                    block_tables=jnp.where(row_has_draft[:, None], block_tables, jnp.zeros_like(block_tables)),
+                    seq_lens=jnp.where(row_has_draft, seq_lens + 1, jnp.zeros_like(seq_lens)),
                 )
                 second_metadata = self.backend.build_attention_metadata(
                     positions=second_batch.positions,
@@ -1797,9 +1799,10 @@ class ModelExecutor:
                 target_token = jnp.argmax(jnp.dot(hidden0_norm[:, 0], output_weight), axis=-1).astype(jnp.int32)
                 row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
                 row_active = (row_query_lens > 0) & (seq_ids >= 0)
-                accepted = (target_token == draft_token_arg) & row_active
+                row_has_draft = row_active & (draft_token_arg >= 0)
+                accepted = (target_token == draft_token_arg) & row_has_draft
                 if batch_accept_policy == "all_or_none":
-                    accepted = accepted & jnp.all(jnp.where(row_active, accepted, True))
+                    accepted = accepted & jnp.all(jnp.where(row_has_draft, accepted, True))
 
                 def run_second_decode(_):
                     second_query_lens = accepted.astype(jnp.int32)

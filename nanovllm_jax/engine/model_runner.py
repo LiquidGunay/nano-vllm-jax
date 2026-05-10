@@ -2446,6 +2446,14 @@ class CanonicalModelRunner:
         }
         physical_batch_size = int(batch.tokens.shape[0])
         partial_physical_batch = rows != list(range(physical_batch_size))
+        debug_verifier_enabled = any(
+            os.environ.get(name, "0") in {"1", "true", "yes", "on", "True"}
+            for name in (
+                "NANO_VLLM_JAX_MTP_PARITY_DEBUG",
+                "NANO_VLLM_JAX_MTP_LAYER_PARITY_DEBUG",
+                "NANO_VLLM_JAX_MTP_LAYERWISE_DRIFT_DEBUG",
+            )
+        )
         use_fused_step = (
             not use_debug
             and not force_scalar_mtp
@@ -2491,12 +2499,29 @@ class CanonicalModelRunner:
             return None
         draft_token_chains = [chain[:draft_len] for chain in draft_chains]
         draft_tokens = [chain[0] for chain in draft_token_chains]
+        use_compact_verifier = (
+            draft_len == 1
+            and partial_physical_batch
+            and not use_debug
+            and not debug_verifier_enabled
+            and os.environ.get("NANO_VLLM_JAX_MTP_COMPACT_VERIFIER", "1")
+            in {"1", "true", "yes", "on", "True"}
+        )
+        decode_batch = (
+            self._compact_decode_batch(batch, rows)
+            if use_compact_verifier
+            else self._masked_decode_batch(batch, rows)
+        )
+        verifier_physical_batch_size = int(decode_batch.tokens.shape[0])
+        verifier_index_for_local = (
+            list(range(len(rows))) if use_compact_verifier else list(rows)
+        )
         draft_token_chains_for_batch = [
             [0 for _ in range(draft_len)]
-            for _ in range(physical_batch_size)
+            for _ in range(verifier_physical_batch_size)
         ]
         for local_row, row in enumerate(rows):
-            draft_token_chains_for_batch[row] = draft_token_chains[local_row]
+            draft_token_chains_for_batch[verifier_index_for_local[local_row]] = draft_token_chains[local_row]
         verifier_draft_tokens = draft_tokens
         if os.environ.get("NANO_VLLM_JAX_MTP_FORCE_REJECT", "0") in {
             "1",
@@ -2506,15 +2531,15 @@ class CanonicalModelRunner:
             "True",
         }:
             verifier_draft_tokens = [-1 for _ in draft_tokens]
-        decode_batch = self._masked_decode_batch(batch, rows)
         hybrid_state = self._batch_hybrid_state(decode_batch)
         _ready(hybrid_state)
         t_profile = _mark("batch_hybrid_state", t_profile)
-        verifier_draft_tokens_for_batch = [0 for _ in range(physical_batch_size)]
-        next_mtp_positions_for_batch = [0 for _ in range(physical_batch_size)]
+        verifier_draft_tokens_for_batch = [0 for _ in range(verifier_physical_batch_size)]
+        next_mtp_positions_for_batch = [0 for _ in range(verifier_physical_batch_size)]
         for local_row, row in enumerate(rows):
-            verifier_draft_tokens_for_batch[row] = verifier_draft_tokens[local_row]
-            next_mtp_positions_for_batch[row] = (
+            verifier_idx = verifier_index_for_local[local_row]
+            verifier_draft_tokens_for_batch[verifier_idx] = verifier_draft_tokens[local_row]
+            next_mtp_positions_for_batch[verifier_idx] = (
                 mtp_seqs[local_row].num_tokens
                 + draft_len
                 + int(getattr(self, "mtp_position_offset", 0))
@@ -2736,7 +2761,10 @@ class CanonicalModelRunner:
             )
         else:
             output_acceptance_for_rows = [bool(x) for x in output.accepted.tolist()]
-            accepted_all = all(output_acceptance_for_rows[row] for row in rows)
+            accepted_all = all(
+                output_acceptance_for_rows[verifier_index_for_local[local_row]]
+                for local_row, _row in enumerate(rows)
+            )
         if (
             enable_rowwise_repair
             and (use_fast_all_accept or use_one_pass_k1)
@@ -2745,7 +2773,7 @@ class CanonicalModelRunner:
         ):
             output_acceptance = [bool(x) for x in output.accepted.tolist()]
             accepted_flags_local = [
-                output_acceptance[row if partial_physical_batch else local_row]
+                output_acceptance[verifier_index_for_local[local_row]]
                 for local_row, row in enumerate(rows)
             ]
             if not any(accepted_flags_local):
@@ -2766,7 +2794,7 @@ class CanonicalModelRunner:
                 seq = seqs[row]
                 self._mtp1_drafts.pop(seq.seq_id, None)
                 if accepted_flags_local[local_row]:
-                    idx = row if partial_physical_batch else local_row
+                    idx = verifier_index_for_local[local_row]
                     stats["drafts_accepted"] += 1
                     stats["bonus_tokens"] += 1
                     emitted_len = 2
@@ -3083,7 +3111,7 @@ class CanonicalModelRunner:
                 }:
                     raise RuntimeError("MTP one-pass parity state mismatch")
             for local_row, row in enumerate(rows):
-                idx = row
+                idx = verifier_index_for_local[local_row]
                 mismatch = (
                     target_tokens[idx] != parity_targets[idx]
                     or accepted_flags[idx] != parity_accepted[idx]
@@ -3141,7 +3169,7 @@ class CanonicalModelRunner:
         for local_row, row in enumerate(rows):
             seq = seqs[row]
             self._mtp1_drafts.pop(seq.seq_id, None)
-            idx = row
+            idx = verifier_index_for_local[local_row]
             forced_reject_probe = row in forced_reject_rows
 
             accepted = accepted_flags[idx]
@@ -3524,7 +3552,9 @@ class CanonicalModelRunner:
                 and (not force_commit_select or allow_mixed_fused or not full_physical_batch)
             )
             allow_forced_reject_probes = (
-                batch_accept_policy == "rowwise"
+                os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_FORCED_REJECT_PROBES", "0")
+                in {"1", "true", "yes", "on", "True"}
+                and batch_accept_policy == "rowwise"
                 and one_pass_expected
                 and not enable_rowwise_repair
             )
