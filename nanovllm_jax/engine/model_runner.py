@@ -1010,17 +1010,10 @@ class CanonicalModelRunner:
         return self.speculative_stats
 
     def _mtp_adaptive_gated(self) -> bool:
-        min_accept_rate = float(os.environ.get("NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE", "0") or "0")
-        if min_accept_rate <= 0:
-            return False
-        min_samples = int(os.environ.get("NANO_VLLM_JAX_MTP_MIN_ACCEPT_SAMPLES", "8") or "8")
-        stats = self._speculative_stats()
-        accepted = int(stats.get("drafts_accepted", 0))
-        rejected = int(stats.get("drafts_rejected", 0))
-        verified = accepted + rejected
-        if verified < min_samples:
-            return False
-        return (accepted / max(1, verified)) < min_accept_rate
+        # Adaptive MTP admission is scheduler-owned so it can be keyed by the
+        # active physical bucket. Keep this legacy runner hook inert; rows that
+        # are gated by the scheduler arrive with ``seq.mtp_admitted = False``.
+        return False
 
     @staticmethod
     def _seq_mtp_admitted(seq: Sequence) -> bool:
@@ -2381,9 +2374,11 @@ class CanonicalModelRunner:
         seqs: List[Sequence],
         batch: ScheduledBatch,
         rows: List[int],
+        forced_reject_rows: set[int] | None = None,
     ) -> dict[int, List[int] | int] | None:
         if not rows:
             return {}
+        forced_reject_rows = set(forced_reject_rows or ())
         for row in rows:
             if not bool(getattr(seqs[row], "mtp_admitted", True)):
                 seq = seqs[row]
@@ -2472,7 +2467,10 @@ class CanonicalModelRunner:
 
         mtp_seqs = [seqs[row] for row in rows]
         draft_chains: List[List[int]] = []
-        for seq in mtp_seqs:
+        for row, seq in zip(rows, mtp_seqs):
+            if row in forced_reject_rows:
+                draft_chains.append([-1])
+                continue
             draft_value = self._mtp1_drafts[seq.seq_id]
             if isinstance(draft_value, list):
                 draft_chains.append([int(token) for token in draft_value])
@@ -3144,12 +3142,14 @@ class CanonicalModelRunner:
             seq = seqs[row]
             self._mtp1_drafts.pop(seq.seq_id, None)
             idx = row
+            forced_reject_probe = row in forced_reject_rows
 
             accepted = accepted_flags[idx]
             prefix_len = prefix_lengths[idx]
             if draft_len > 1 and prefix_len < draft_len:
-                stats["drafts_accepted"] += prefix_len
-                stats["drafts_rejected"] += 1
+                if not forced_reject_probe:
+                    stats["drafts_accepted"] += prefix_len
+                    stats["drafts_rejected"] += 1
                 emitted_len = prefix_len + 1
                 if prefix_len == 0:
                     outputs[row] = target_token_rows[idx][0]
@@ -3168,7 +3168,8 @@ class CanonicalModelRunner:
                     emitted_len = draft_len + 1
                     outputs[row] = draft_token_chains[local_row] + [bonus_tokens[idx]]
             else:
-                stats["drafts_rejected"] += 1
+                if not forced_reject_probe:
+                    stats["drafts_rejected"] += 1
                 emitted_len = 1
                 outputs[row] = target_tokens[idx]
 
@@ -3348,20 +3349,13 @@ class CanonicalModelRunner:
             prefill_final_flags = [
                 bool(flag) for flag in (batch.prefill_final_flags[: len(seqs)] if len(batch.prefill_final_flags) >= len(seqs) else batch.prefill_final_flags)
             ]
-            seed_mtp1 = all(prefill_final_flags)
-            allow_mixed_fused_prefill = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "0") in {
-                "1",
-                "true",
-                "yes",
-                "on",
-                "True",
-            }
-            homogeneous_full_prefill = (
-                len(seqs) == batch.tokens.shape[0]
-                and len({seq.num_tokens for seq in seqs}) == 1
-            )
-            if not (allow_mixed_fused_prefill or homogeneous_full_prefill or exact_commit_select_available):
-                seed_mtp1 = False
+            # Draft seeding after prefill is read-only with respect to target
+            # KV/hybrid state and is already row-gated in _run_main_and_sample:
+            # non-final prompt chunks emit no token and are skipped.  Do not tie
+            # this to verifier shape policy; bucket-padded or heterogeneous
+            # final prefill rows still need initial drafts for the following
+            # decode step to exercise scheduler-owned MTP admission.
+            seed_mtp1 = any(prefill_final_flags)
             if os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_PREFILL_SEED", "0") in {
                 "1",
                 "true",
@@ -3382,6 +3376,7 @@ class CanonicalModelRunner:
                 self._clear_mtp1_drafts_for_rows(seqs, non_admitted_rows)
         if self.mtp1_enabled and not batch.is_prefill and admitted_mtp_rows:
             fused_rows: List[int] = []
+            probe_candidate_rows: List[int] = []
             profile_mtp = os.environ.get("NANO_VLLM_JAX_PROFILE_MTP_RUN", "0") in {
                 "1",
                 "true",
@@ -3397,8 +3392,9 @@ class CanonicalModelRunner:
                 # MTP can emit all accepted drafts plus one bonus token. Require
                 # block-table capacity for the post-emit logical length, not
                 # just the verifier-written draft positions.
-                required_blocks = (seq.num_tokens + draft_len + 1 + self.block_size - 1) // self.block_size
-                unsafe_bonus_boundary = (seq.num_tokens + draft_len + 1) % self.block_size == 0
+                verifier_width = max(1, draft_len)
+                required_blocks = (seq.num_tokens + verifier_width + 1 + self.block_size - 1) // self.block_size
+                unsafe_bonus_boundary = (seq.num_tokens + verifier_width + 1) % self.block_size == 0
                 can_fuse = (
                     draft_value is not None
                     and draft_len > 0
@@ -3411,6 +3407,17 @@ class CanonicalModelRunner:
                 )
                 if can_fuse:
                     fused_rows.append(row)
+                elif (
+                    draft_value is None
+                    and self.num_speculative_tokens == 1
+                    and self._seq_mtp_admitted(seq)
+                    and seq.temperature == 0
+                    and seq.num_completion_tokens + 1 <= seq.max_tokens
+                    and int(batch.query_lens[row]) == 1
+                    and len(seq.block_table) >= required_blocks
+                    and not unsafe_bonus_boundary
+                ):
+                    probe_candidate_rows.append(row)
                 elif profile_mtp:
                     if draft_value is None:
                         reason = "missing_draft"
@@ -3441,6 +3448,13 @@ class CanonicalModelRunner:
             }
             batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
             force_reuse_fallback = os.environ.get("NANO_VLLM_JAX_MTP_FORCE_REUSE_FALLBACK", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+            enable_rowwise_repair = os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_ROWWISE_REPAIR", "0") in {
                 "1",
                 "true",
                 "yes",
@@ -3496,6 +3510,30 @@ class CanonicalModelRunner:
             allow_verifier_for_batch_shape = full_physical_batch or (
                 partial_prefix_verifier and allow_partial_commit_select
             )
+            can_seed_for_decode_shape = (
+                allow_verifier_for_batch_shape
+                and (
+                    allow_mixed_fused
+                    or allow_exact_commit_select_mixed
+                    or homogeneous_full_batch
+                    or one_pass_available_for_partial
+                )
+            )
+            one_pass_expected = (
+                one_pass_available_for_partial
+                and (not force_commit_select or allow_mixed_fused or not full_physical_batch)
+            )
+            allow_forced_reject_probes = (
+                batch_accept_policy == "rowwise"
+                and one_pass_expected
+                and not enable_rowwise_repair
+            )
+            probe_rows = probe_candidate_rows if allow_forced_reject_probes and fused_rows else []
+            verifier_row_set = set(fused_rows) | set(probe_rows)
+            verifier_rows = [
+                row for row in range(len(seqs))
+                if row in verifier_row_set
+            ]
             compact_commit_select = (
                 allow_exact_commit_select_mixed
                 and batch_accept_policy == "rowwise"
@@ -3516,17 +3554,15 @@ class CanonicalModelRunner:
                 and
                 fused_rows
                 and allow_verifier_for_batch_shape
-                and (
-                    allow_mixed_fused
-                    or allow_exact_commit_select_mixed
-                    or (
-                        homogeneous_full_batch
-                        and fused_rows == list(range(len(seqs)))
-                    )
-                )
+                and can_seed_for_decode_shape
             )
             if can_run_fused_batch:
-                fused_outputs = self._run_mtp1_batched(seqs, batch, fused_rows)
+                fused_outputs = self._run_mtp1_batched(
+                    seqs,
+                    batch,
+                    verifier_rows,
+                    forced_reject_rows=set(probe_rows),
+                )
                 if fused_outputs is not None:
                     outputs: List[int | List[int] | None] = [None] * len(seqs)
                     for row, value in fused_outputs.items():
@@ -3562,13 +3598,15 @@ class CanonicalModelRunner:
                     seed_mtp1=self.mtp1_enabled and seed_mtp1,
                 )
 
+            if not can_seed_for_decode_shape:
+                self._clear_mtp1_drafts_for_rows(seqs, admitted_mtp_rows)
+
             return self._run_main_and_sample(
                 seqs,
                 batch,
                 seed_mtp1=self.mtp1_enabled
                 and seed_mtp1
-                and allow_verifier_for_batch_shape
-                and (allow_mixed_fused or homogeneous_full_batch or allow_exact_commit_select_mixed),
+                and can_seed_for_decode_shape,
             )
 
         return self._run_main_and_sample(

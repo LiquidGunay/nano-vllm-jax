@@ -334,6 +334,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--require-tpu", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--check-hf-logits", action="store_true")
+    parser.add_argument("--check-next-step-sanity", action="store_true")
     parser.add_argument("--hf-offline", action="store_true")
     parser.add_argument("--hf-device", default="cpu")
     parser.add_argument("--hf-max-prompts", type=int, default=1)
@@ -775,6 +776,8 @@ def build_command(
                 str(args.hf_max_prompts),
             ]
         )
+    if args.check_next_step_sanity:
+        command.append("--check-next-step-sanity")
     if args.hf_offline:
         command.append("--hf-offline")
     if args.correctness_only:
@@ -973,6 +976,7 @@ def main() -> int:
         "warmup": args.warmup,
         "require_tpu": args.require_tpu,
         "check_hf_logits": args.check_hf_logits,
+        "check_next_step_sanity": args.check_next_step_sanity,
         "correctness_only": args.correctness_only,
         "smoke": args.smoke,
         "dry_run": args.dry_run,

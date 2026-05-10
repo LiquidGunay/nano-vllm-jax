@@ -40,6 +40,10 @@ class Scheduler:
         self.mtp_min_accept_rate = float(os.environ.get("NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE", "0") or "0")
         self.mtp_min_accept_samples = int(os.environ.get("NANO_VLLM_JAX_MTP_MIN_ACCEPT_SAMPLES", "8") or "8")
         self.mtp_scheduler_gate_enabled = self.num_speculative_tokens > 0 and self.mtp_min_accept_rate > 0
+        self.mtp_dtype = str(config.get_dtype())
+        self.mtp_backend = str(getattr(config, "backend", "unknown"))
+        self.mtp_bucket_stats: dict[tuple[int, str, str, int | None, int], dict[str, object]] = {}
+        self.mtp_active_bucket_key: tuple[int, str, str, int | None, int] | None = None
         self.mtp_observed_accepted = 0
         self.mtp_observed_rejected = 0
         self.mtp_stats_seen_accepted = 0
@@ -64,8 +68,14 @@ class Scheduler:
         self.waiting: Deque[Sequence] = deque()
         self.running: Deque[Sequence] = deque()
 
+    def set_mtp_backend(self, backend: object) -> None:
+        """Set backend identity used in scheduler-side MTP bucket keys."""
+        self.mtp_backend = type(backend).__name__ if not isinstance(backend, str) else backend
+
     def reset_mtp_admission(self) -> None:
         """Reset adaptive speculative admission counters."""
+        self.mtp_bucket_stats = {}
+        self.mtp_active_bucket_key = None
         self.mtp_observed_accepted = 0
         self.mtp_observed_rejected = 0
         self.mtp_stats_seen_accepted = 0
@@ -154,7 +164,10 @@ class Scheduler:
                 if not self.enable_prefix_cache_execution:
                     seq.num_cached_tokens = 0
             seq.status = SequenceStatus.RUNNING
-            mtp_admitted = self.should_admit_mtp(seq)
+            mtp_admitted = self.should_admit_mtp(
+                seq,
+                batch_size_bucket=self._select_batch_size_bucket(num_seqs + 1),
+            )
             seq.mtp_admitted = mtp_admitted
             seq.mtp_admission_reason = self.mtp_admission_reason if mtp_admitted else "scheduler_gate"
 
@@ -190,7 +203,11 @@ class Scheduler:
                 continue
             
             # Ensure we can append
-            mtp_admitted = self.should_admit_mtp(seq, for_decode=True)
+            mtp_admitted = self.should_admit_mtp(
+                seq,
+                for_decode=True,
+                batch_size_bucket=self._select_batch_size_bucket(num_seqs + 1),
+            )
             seq.mtp_admitted = mtp_admitted
             seq.mtp_admission_reason = self.mtp_admission_reason if mtp_admitted else "scheduler_gate"
             lookahead_tokens = min(
@@ -325,7 +342,69 @@ class Scheduler:
                 return bucket
         raise ValueError(f"{name} size {size} exceeds configured buckets {buckets}")
 
-    def should_admit_mtp(self, seq: Sequence, *, for_decode: bool = False) -> bool:
+    def _select_batch_size_bucket(self, size: int) -> int:
+        if self.batch_size_buckets:
+            return self._select_bucket(size, self.batch_size_buckets, "batch")
+        return size
+
+    def _mtp_bucket_key(
+        self,
+        *,
+        batch_size_bucket: int,
+    ) -> tuple[int, str, str, int | None, int]:
+        return (
+            int(batch_size_bucket),
+            self.mtp_dtype,
+            self.mtp_backend,
+            self.max_blocks_per_seq,
+            self.num_speculative_tokens,
+        )
+
+    @staticmethod
+    def _new_mtp_bucket_stats() -> dict[str, object]:
+        return {
+            "observed_accepted": 0,
+            "observed_rejected": 0,
+            "admission_enabled": True,
+            "admission_reason": "enabled",
+            "baseline_ms_per_token": None,
+            "spec_ms_per_token": None,
+            "baseline_latency_steps": 0,
+            "spec_latency_steps": 0,
+        }
+
+    def _get_mtp_bucket_stats(
+        self,
+        key: tuple[int, str, str, int | None, int],
+    ) -> dict[str, object]:
+        stats = self.mtp_bucket_stats.get(key)
+        if stats is None:
+            stats = self._new_mtp_bucket_stats()
+            self.mtp_bucket_stats[key] = stats
+        return stats
+
+    def _sync_legacy_mtp_fields(
+        self,
+        key: tuple[int, str, str, int | None, int],
+        stats: dict[str, object],
+    ) -> None:
+        self.mtp_active_bucket_key = key
+        self.mtp_observed_accepted = int(stats["observed_accepted"])
+        self.mtp_observed_rejected = int(stats["observed_rejected"])
+        self.mtp_admission_enabled = bool(stats["admission_enabled"])
+        self.mtp_admission_reason = str(stats["admission_reason"])
+        self.mtp_baseline_ms_per_token = stats["baseline_ms_per_token"]  # type: ignore[assignment]
+        self.mtp_spec_ms_per_token = stats["spec_ms_per_token"]  # type: ignore[assignment]
+        self.mtp_baseline_latency_steps = int(stats["baseline_latency_steps"])
+        self.mtp_spec_latency_steps = int(stats["spec_latency_steps"])
+
+    def should_admit_mtp(
+        self,
+        seq: Sequence,
+        *,
+        for_decode: bool = False,
+        batch_size_bucket: int | None = None,
+    ) -> bool:
         """Return whether this decode row may attempt speculative decoding."""
         if self.num_speculative_tokens <= 0:
             self.mtp_admission_reason = "disabled"
@@ -360,8 +439,13 @@ class Scheduler:
         if not self.mtp_scheduler_gate_enabled:
             self.mtp_admission_reason = "enabled"
             return True
-        self.mtp_admission_reason = "enabled" if self.mtp_admission_enabled else "low_acceptance"
-        return self.mtp_admission_enabled
+        if batch_size_bucket is None:
+            batch_size_bucket = 1
+        key = self._mtp_bucket_key(batch_size_bucket=batch_size_bucket)
+        bucket_stats = self._get_mtp_bucket_stats(key)
+        self._update_mtp_admission_decision(bucket_stats)
+        self._sync_legacy_mtp_fields(key, bucket_stats)
+        return bool(bucket_stats["admission_enabled"])
 
     def update_mtp_admission(
         self,
@@ -370,6 +454,7 @@ class Scheduler:
         is_decode: bool = False,
         elapsed_seconds: float | None = None,
         emitted_tokens: int = 0,
+        batch: ScheduledBatch | None = None,
     ) -> None:
         """Update scheduler-level speculative admission from cumulative stats.
 
@@ -379,6 +464,12 @@ class Scheduler:
         """
         if not self.mtp_scheduler_gate_enabled:
             return
+        if batch is None:
+            batch_size_bucket = 1
+        else:
+            batch_size_bucket = int(batch.tokens.shape[0])
+        key = self._mtp_bucket_key(batch_size_bucket=batch_size_bucket)
+        bucket_stats = self._get_mtp_bucket_stats(key)
         accepted = int(speculative_stats.get("drafts_accepted", 0) or 0)
         rejected = int(speculative_stats.get("drafts_rejected", 0) or 0)
         delta_accepted = max(0, accepted - self.mtp_stats_seen_accepted)
@@ -390,26 +481,28 @@ class Scheduler:
         if is_decode and elapsed_seconds is not None and emitted_tokens > 0:
             ms_per_token = (elapsed_seconds * 1000.0) / emitted_tokens
             if attempted_spec:
-                self.mtp_spec_ms_per_token = self._ewma(
-                    self.mtp_spec_ms_per_token,
+                bucket_stats["spec_ms_per_token"] = self._ewma(
+                    bucket_stats["spec_ms_per_token"],  # type: ignore[arg-type]
                     ms_per_token,
                     self.mtp_latency_alpha,
                 )
-                self.mtp_spec_latency_steps += 1
+                bucket_stats["spec_latency_steps"] = int(bucket_stats["spec_latency_steps"]) + 1
             else:
-                self.mtp_baseline_ms_per_token = self._ewma(
-                    self.mtp_baseline_ms_per_token,
+                bucket_stats["baseline_ms_per_token"] = self._ewma(
+                    bucket_stats["baseline_ms_per_token"],  # type: ignore[arg-type]
                     ms_per_token,
                     self.mtp_latency_alpha,
                 )
-                self.mtp_baseline_latency_steps += 1
+                bucket_stats["baseline_latency_steps"] = int(bucket_stats["baseline_latency_steps"]) + 1
         if delta_accepted == 0 and delta_rejected == 0:
-            self._update_mtp_admission_decision()
+            self._update_mtp_admission_decision(bucket_stats)
+            self._sync_legacy_mtp_fields(key, bucket_stats)
             return
 
-        self.mtp_observed_accepted += delta_accepted
-        self.mtp_observed_rejected += delta_rejected
-        self._update_mtp_admission_decision()
+        bucket_stats["observed_accepted"] = int(bucket_stats["observed_accepted"]) + delta_accepted
+        bucket_stats["observed_rejected"] = int(bucket_stats["observed_rejected"]) + delta_rejected
+        self._update_mtp_admission_decision(bucket_stats)
+        self._sync_legacy_mtp_fields(key, bucket_stats)
 
     @staticmethod
     def _ewma(current: float | None, value: float, alpha: float) -> float:
@@ -417,38 +510,93 @@ class Scheduler:
             return value
         return (1.0 - alpha) * current + alpha * value
 
-    def _update_mtp_admission_decision(self) -> None:
-        verified = self.mtp_observed_accepted + self.mtp_observed_rejected
+    def _update_mtp_admission_decision(self, stats: dict[str, object]) -> None:
+        verified = int(stats["observed_accepted"]) + int(stats["observed_rejected"])
         acceptance_ok = True
         if verified < self.mtp_min_accept_samples:
             acceptance_ok = True
         else:
-            accept_rate = self.mtp_observed_accepted / max(1, verified)
+            accept_rate = int(stats["observed_accepted"]) / max(1, verified)
             acceptance_ok = accept_rate >= self.mtp_min_accept_rate
 
         latency_ok = True
         if (
-            self.mtp_baseline_latency_steps >= self.mtp_latency_min_steps
-            and self.mtp_spec_latency_steps >= self.mtp_latency_min_steps
-            and self.mtp_baseline_ms_per_token is not None
-            and self.mtp_spec_ms_per_token is not None
+            int(stats["baseline_latency_steps"]) >= self.mtp_latency_min_steps
+            and int(stats["spec_latency_steps"]) >= self.mtp_latency_min_steps
+            and stats["baseline_ms_per_token"] is not None
+            and stats["spec_ms_per_token"] is not None
         ):
-            measured_speedup = self.mtp_baseline_ms_per_token / max(
+            measured_speedup = float(stats["baseline_ms_per_token"]) / max(
                 1e-9,
-                self.mtp_spec_ms_per_token,
+                float(stats["spec_ms_per_token"]),
             )
             latency_ok = measured_speedup >= self.mtp_min_speedup
 
-        self.mtp_admission_enabled = acceptance_ok and latency_ok
+        stats["admission_enabled"] = acceptance_ok and latency_ok
         if not acceptance_ok:
-            self.mtp_admission_reason = "low_acceptance"
+            stats["admission_reason"] = "low_acceptance"
         elif not latency_ok:
-            self.mtp_admission_reason = "low_throughput"
+            stats["admission_reason"] = "low_throughput"
         elif verified < self.mtp_min_accept_samples:
-            self.mtp_admission_enabled = True
-            self.mtp_admission_reason = "warming"
+            stats["admission_enabled"] = True
+            stats["admission_reason"] = "warming"
         else:
-            self.mtp_admission_reason = "enabled"
+            stats["admission_reason"] = "enabled"
+
+    def get_mtp_admission_report(self) -> dict[str, object]:
+        """Return JSON-friendly per-bucket MTP admission stats."""
+        buckets = []
+        for key, stats in self.mtp_bucket_stats.items():
+            batch_size, dtype, backend, max_blocks_per_seq, num_speculative_tokens = key
+            verified = int(stats["observed_accepted"]) + int(stats["observed_rejected"])
+            accept_rate = int(stats["observed_accepted"]) / verified if verified else 0.0
+            baseline_ms = stats["baseline_ms_per_token"]
+            spec_ms = stats["spec_ms_per_token"]
+            measured_speedup = None
+            if baseline_ms is not None and spec_ms is not None:
+                measured_speedup = float(baseline_ms) / max(1e-9, float(spec_ms))
+            buckets.append(
+                {
+                    "key": {
+                        "physical_batch_size": batch_size,
+                        "dtype": dtype,
+                        "backend": backend,
+                        "max_blocks_per_seq": max_blocks_per_seq,
+                        "num_speculative_tokens": num_speculative_tokens,
+                    },
+                    "admission_enabled": bool(stats["admission_enabled"]),
+                    "admission_reason": str(stats["admission_reason"]),
+                    "observed_accepted": int(stats["observed_accepted"]),
+                    "observed_rejected": int(stats["observed_rejected"]),
+                    "acceptance_rate": accept_rate,
+                    "baseline_ms_per_token": baseline_ms,
+                    "spec_ms_per_token": spec_ms,
+                    "baseline_latency_steps": int(stats["baseline_latency_steps"]),
+                    "spec_latency_steps": int(stats["spec_latency_steps"]),
+                    "measured_speedup": measured_speedup,
+                    "active": key == self.mtp_active_bucket_key,
+                }
+            )
+        return {
+            "enabled": bool(self.mtp_scheduler_gate_enabled),
+            "active_bucket": self._bucket_key_to_report(self.mtp_active_bucket_key),
+            "buckets": buckets,
+        }
+
+    @staticmethod
+    def _bucket_key_to_report(
+        key: tuple[int, str, str, int | None, int] | None,
+    ) -> dict[str, object] | None:
+        if key is None:
+            return None
+        batch_size, dtype, backend, max_blocks_per_seq, num_speculative_tokens = key
+        return {
+            "physical_batch_size": batch_size,
+            "dtype": dtype,
+            "backend": backend,
+            "max_blocks_per_seq": max_blocks_per_seq,
+            "num_speculative_tokens": num_speculative_tokens,
+        }
 
     def preempt(self, seq: Sequence):
         """Preempt a sequence (move back to waiting)."""

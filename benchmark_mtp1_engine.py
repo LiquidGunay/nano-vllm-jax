@@ -965,6 +965,9 @@ def _scheduler_mtp_admission_report(scheduler) -> dict:
     measured_speedup = None
     if baseline_ms is not None and spec_ms is not None:
         measured_speedup = float(baseline_ms) / max(1e-9, float(spec_ms))
+    per_bucket = None
+    if hasattr(scheduler, "get_mtp_admission_report"):
+        per_bucket = scheduler.get_mtp_admission_report()
     return {
         "enabled": bool(getattr(scheduler, "mtp_admission_enabled", True)),
         "reason": getattr(scheduler, "mtp_admission_reason", None),
@@ -981,6 +984,7 @@ def _scheduler_mtp_admission_report(scheduler) -> dict:
         "baseline_latency_steps": int(getattr(scheduler, "mtp_baseline_latency_steps", 0)),
         "spec_latency_steps": int(getattr(scheduler, "mtp_spec_latency_steps", 0)),
         "measured_scheduler_speedup": measured_speedup,
+        "per_bucket": per_bucket,
     }
 
 

@@ -187,3 +187,53 @@ Remaining gap: the latency gate needs bucket keys such as `(batch_size_bucket,
 model_size, dtype, max_blocks_per_seq, num_speculative_tokens)`. A single global
 EWMA can mix B=1 and larger batch behavior, which is exactly where vLLM-style
 serving systems need separate admission decisions.
+
+## Per-bucket gate and mixed-serving update
+
+Follow-up date: 2026-05-10.
+
+The scheduler now owns MTP admission per physical bucket. The bucket key is:
+
+```text
+(physical_batch_size, dtype, backend, max_blocks_per_seq, num_speculative_tokens)
+```
+
+The runner's legacy acceptance-only gate is inert; rows arrive with
+`seq.mtp_admitted` already set by the scheduler. Benchmark JSON now includes the
+legacy active-bucket fields plus the scheduler's per-bucket report.
+
+Mixed final prefill rows now seed K=1 drafts even when the physical bucket is
+padded or heterogeneous. This fixed the earlier `drafts_proposed = 0` mixed
+arrival smoke: the same workload now exercises the verifier path and remains
+correct.
+
+Latest TPU spot numbers on `Qwen/Qwen3.5-4B`, BF16, JIT, real weights, warmup
+enabled, KV caching, and next-step sanity enabled:
+
+| workload | batch | baseline decode tok/s | MTP decode tok/s | decode speedup | acceptance | fallback decode steps | correct |
+|---|---:|---:|---:|---:|---:|---:|---|
+| manual counting prompt, 32 decode tokens | 1 | 64.48 | 72.84 | 1.130x | 61.1% | 7 | yes |
+| mixed arrivals, prompt lengths 16/17/31/32 | 4 | 104.33 | 52.41 | 0.502x | 36.4% | 3 | yes |
+| interleaved prefill/decode, prompt lengths 32/448/48/512 | 4 | 95.25 | 89.66 | 0.941x | 0.0% | 61 | yes |
+
+The manual counting prompt still proves that K=1 MTP can produce a real decode
+speedup on TPU when acceptance and measured latency are favorable:
+
+```text
+prompt: Continue the sequence exactly: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+baseline:  11, 12, 13, 14, 15, 16, 17, 18,
+mtp:       11, 12, 13, 14, 15, 16, 17, 18,
+```
+
+The mixed B=4 workload remains slower because accepted speculative steps still
+cost about `17 ms/token`, rejected steps cost about `35 ms/token`, and baseline
+decode is about `10-12 ms/token` on these shapes. The next optimization target is
+the verifier/commit path itself, not correctness.
+
+Forced-reject probe rows were added for K=1 rowwise one-pass decode. A row with
+no stored draft can ride along in an existing verifier batch with draft token
+`-1`, forcing rejection while committing the target-token state and producing a
+next draft. This reduces split verifier-plus-fallback overhead for mixed batches;
+on the interleaved B=4 workload the always-on MTP path improved from the earlier
+`68.90 tok/s` to `89.66 tok/s`, but it still does not beat the `95.25 tok/s`
+baseline when acceptance is `0%`.

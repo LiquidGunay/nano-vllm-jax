@@ -89,6 +89,7 @@ class LLMEngine:
         # Initialize components
         self.scheduler = Scheduler(self.config)
         self.model_runner = ModelRunner(self.config, self.params, backend=backend)
+        self.scheduler.set_mtp_backend(self.model_runner.backend)
         
         # Register cleanup
         atexit.register(self.exit)
@@ -149,6 +150,7 @@ class LLMEngine:
             is_decode=not scheduled_batch.is_prefill,
             elapsed_seconds=runner_elapsed,
             emitted_tokens=emitted_tokens,
+            batch=scheduled_batch,
         )
 
         # Post-process
@@ -178,6 +180,10 @@ class LLMEngine:
     def is_finished(self) -> bool:
         """Check if all requests are complete."""
         return self.scheduler.is_finished()
+
+    def get_mtp_admission_report(self) -> dict[str, object]:
+        """Return JSON-friendly per-bucket MTP admission stats."""
+        return self.scheduler.get_mtp_admission_report()
 
     def generate(
         self,
