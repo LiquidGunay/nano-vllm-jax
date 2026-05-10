@@ -1334,6 +1334,7 @@ def run_generation_batch(
         last_completion_lens: dict[int, int] = {}
         accepted_steps: list[dict] = []
         rejected_steps: list[dict] = []
+        mixed_accept_reject_steps: list[dict] = []
         fallback_steps: list[dict] = []
         prefill_steps: list[dict] = []
 
@@ -1382,7 +1383,10 @@ def run_generation_batch(
                 delta_fallback_gated = post.get("fallback_gated_no_spec_steps", 0) - pre.get("fallback_gated_no_spec_steps", 0)
                 delta_fallback_seeded = post.get("fallback_seeded_main_steps", 0) - pre.get("fallback_seeded_main_steps", 0)
                 delta_fallback_partial_rows = post.get("fallback_partial_rows", 0) - pre.get("fallback_partial_rows", 0)
-                if delta_accepted > 0:
+                if delta_accepted > 0 and delta_rejected > 0:
+                    branch = "mtp_mixed_accept_reject"
+                    mixed_accept_reject_steps.append(step_record)
+                elif delta_accepted > 0:
                     branch = "mtp_accepted"
                     accepted_steps.append(step_record)
                 elif delta_rejected > 0:
@@ -1464,6 +1468,7 @@ def run_generation_batch(
     all_steps_summary = _summarize_branch(step_records)
     accepted_summary = _summarize_branch(accepted_steps)
     rejected_summary = _summarize_branch(rejected_steps)
+    mixed_accept_reject_summary = _summarize_branch(mixed_accept_reject_steps)
     fallback_summary = _summarize_branch(fallback_steps)
     prefill_summary = _summarize_branch(prefill_steps)
     decode_tokens = sum(abs(r["num_tokens"]) for r in decode_steps)
@@ -1535,11 +1540,16 @@ def run_generation_batch(
             "p50": fallback_summary["inter_token_latency_ms_p50"],
             "p95": fallback_summary["inter_token_latency_ms_p95"],
         },
+        "mixed_accept_reject_inter_token_latency_ms": {
+            "p50": mixed_accept_reject_summary["inter_token_latency_ms_p50"],
+            "p95": mixed_accept_reject_summary["inter_token_latency_ms_p95"],
+        },
         "step_profile": {
             "steps": step_records if return_step_records else [],
             "all_steps": all_steps_summary,
             "accepted": accepted_summary,
             "rejected": rejected_summary,
+            "mixed_accept_reject": mixed_accept_reject_summary,
             "fallback": fallback_summary,
             "prefill": prefill_summary,
             "phase_ms_avg_per_step": {
@@ -1555,6 +1565,7 @@ def run_generation_batch(
                 "decode_steps": len(decode_steps),
                 "accepted_decode_steps": len(accepted_steps),
                 "rejected_decode_steps": len(rejected_steps),
+                "mixed_accept_reject_decode_steps": len(mixed_accept_reject_steps),
                 "fallback_decode_steps": len(fallback_steps),
             },
         },
@@ -1941,6 +1952,7 @@ def _build_variant_rows(
         speculative_profile = speculative["step_profile"]
         accepted_profile = speculative_profile.get("accepted", {})
         rejected_profile = speculative_profile.get("rejected", {})
+        mixed_accept_reject_profile = speculative_profile.get("mixed_accept_reject", {})
         fallback_profile = speculative_profile.get("fallback", {})
         prefill_profile = speculative_profile.get("prefill", {})
         baseline_profile = baseline["step_profile"]
@@ -1996,6 +2008,8 @@ def _build_variant_rows(
             "mtp_decode_latency_ms_per_token_p95": accepted_profile.get("ms_per_decode_token_p95", 0.0),
             "mtp_rejected_decode_tokens_per_second": rejected_profile.get("decode_tokens_per_second", 0.0),
             "mtp_rejected_latency_ms_per_token_p50": rejected_profile.get("ms_per_decode_token_p50", 0.0),
+            "mtp_mixed_accept_reject_decode_tokens_per_second": mixed_accept_reject_profile.get("decode_tokens_per_second", 0.0),
+            "mtp_mixed_accept_reject_latency_ms_per_token_p50": mixed_accept_reject_profile.get("ms_per_decode_token_p50", 0.0),
             "mtp_fallback_decode_tokens_per_second": fallback_profile.get("decode_tokens_per_second", 0.0),
             "baseline_decode_tps": baseline["decode_tokens_per_second"],
             "decode_speedup": speculative["decode_tokens_per_second"] / max(1e-9, baseline["decode_tokens_per_second"]),
@@ -2004,6 +2018,7 @@ def _build_variant_rows(
             "fallback_count": speculative["speculative_counts"].get("fallback_decode_steps", 0),
             "accepted_step_count": speculative["speculative_counts"].get("accepted_decode_steps", 0),
             "rejected_step_count": speculative["speculative_counts"].get("rejected_decode_steps", 0),
+            "mixed_accept_reject_step_count": speculative["speculative_counts"].get("mixed_accept_reject_decode_steps", 0),
             "fallback_step_count": speculative["speculative_counts"].get("fallback_decode_steps", 0),
             "host_time_ms": speculative["host_device_postprocess_ms"]["host_ms"],
             "runner_device_time_ms": speculative["host_device_postprocess_ms"]["device_ms"],
@@ -2035,11 +2050,13 @@ def _build_variant_rows(
             "decode": {
                 "accepted": accepted_profile,
                 "rejected": rejected_profile,
+                "mixed_accept_reject": mixed_accept_reject_profile,
                 "fallback": fallback_profile,
             },
             "inter_token_latency_ms": {
                 "accepted": speculative["accepted_inter_token_latency_ms"],
                 "rejected": speculative["rejected_inter_token_latency_ms"],
+                "mixed_accept_reject": speculative["mixed_accept_reject_inter_token_latency_ms"],
                 "fallback": speculative["fallback_inter_token_latency_ms"],
             },
             "host_device_postprocess_ms": speculative["host_device_postprocess_ms"],
@@ -2054,6 +2071,7 @@ def _build_variant_rows(
                 "fallback_count": speculative["speculative_counts"].get("fallback_decode_steps", 0),
                 "accepted_step_count": speculative["speculative_counts"].get("accepted_decode_steps", 0),
                 "rejected_step_count": speculative["speculative_counts"].get("rejected_decode_steps", 0),
+                "mixed_accept_reject_step_count": speculative["speculative_counts"].get("mixed_accept_reject_decode_steps", 0),
                 "fallback_step_count": speculative["speculative_counts"].get("fallback_decode_steps", 0),
                 "scheduler_admission_reason": speculative["scheduler_mtp_admission"].get("reason"),
                 "scheduler_baseline_ewma_ms_per_token": speculative["scheduler_mtp_admission"].get("baseline_ewma_ms_per_token"),
@@ -2447,6 +2465,7 @@ def main():
             "fallback_count": primary_variant["fallback_count"],
             "accepted_step_count": primary_variant["accepted_step_count"],
             "rejected_step_count": primary_variant["rejected_step_count"],
+            "mixed_accept_reject_step_count": primary_variant["mixed_accept_reject_step_count"],
             "fallback_step_count": primary_variant["fallback_step_count"],
             "end_to_end_tok_s": primary_variant["mtp_end_to_end_tps"],
             "scheduler_admission_reason": primary_variant.get("scheduler_mtp_admission", {}).get("reason"),

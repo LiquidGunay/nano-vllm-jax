@@ -134,24 +134,16 @@ class LLMEngine:
             - outputs: List of (seq_id, completion_tokens) for finished sequences
             - num_tokens: Number of tokens processed (positive for prefill, negative for decode)
         """
+        step_t = perf_counter()
         # Schedule sequences
         seqs, scheduled_batch = self.scheduler.schedule()
 
         # Run model
-        runner_t = perf_counter()
         token_ids = self.model_runner.run(seqs, batch=scheduled_batch)
-        runner_elapsed = perf_counter() - runner_t
         emitted_tokens = 0
         if not scheduled_batch.is_prefill:
             for token_id in token_ids:
                 emitted_tokens += len(token_id) if isinstance(token_id, list) else 1
-        self.scheduler.update_mtp_admission(
-            self.model_runner.get_speculative_stats(),
-            is_decode=not scheduled_batch.is_prefill,
-            elapsed_seconds=runner_elapsed,
-            emitted_tokens=emitted_tokens,
-            batch=scheduled_batch,
-        )
 
         # Post-process
         prefill_chunk_lengths: list[int] | None = None
@@ -161,6 +153,14 @@ class LLMEngine:
         finished_seq_ids = [seq.seq_id for seq, is_finished in zip(seqs, finished_flags) if is_finished]
         if finished_seq_ids:
             self.model_runner.release(finished_seq_ids)
+        step_elapsed = perf_counter() - step_t
+        self.scheduler.update_mtp_admission(
+            self.model_runner.get_speculative_stats(),
+            is_decode=not scheduled_batch.is_prefill,
+            elapsed_seconds=step_elapsed,
+            emitted_tokens=emitted_tokens,
+            batch=scheduled_batch,
+        )
         
         # Collect outputs
         outputs = [

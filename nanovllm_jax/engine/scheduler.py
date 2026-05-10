@@ -405,6 +405,68 @@ class Scheduler:
         self.mtp_baseline_latency_steps = int(stats["baseline_latency_steps"])
         self.mtp_spec_latency_steps = int(stats["spec_latency_steps"])
 
+    def _mtp_physical_bucket_block_reason(
+        self,
+        key: tuple[int, int, str, str, int | None, int],
+    ) -> str | None:
+        """Return why this K=1 active-row bucket is blocked by its physical bucket.
+
+        Admission stats are tracked per active row count so mixed/underfilled
+        serving can be diagnosed. For serving, however, a full physical bucket
+        that is already measured as slower with K=1 MTP should also disable
+        speculative decode for smaller active-row siblings in the same compiled
+        shape. Otherwise tail batches can stay in ``warming`` and keep taking
+        the slow repair path after the main B bucket has proven unprofitable.
+        """
+        batch_size, active_rows, dtype, backend, max_blocks_per_seq, num_speculative_tokens = key
+        if num_speculative_tokens != 1:
+            return None
+        if os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNDERFILLED_AFTER_PHYSICAL_LOW_THROUGHPUT", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }:
+            return None
+
+        for sibling_key, sibling_stats in self.mtp_bucket_stats.items():
+            (
+                sibling_batch_size,
+                sibling_active_rows,
+                sibling_dtype,
+                sibling_backend,
+                sibling_max_blocks,
+                sibling_num_speculative,
+            ) = sibling_key
+            same_physical_bucket = (
+                sibling_batch_size == batch_size
+                and sibling_dtype == dtype
+                and sibling_backend == backend
+                and sibling_max_blocks == max_blocks_per_seq
+                and sibling_num_speculative == num_speculative_tokens
+            )
+            if not same_physical_bucket:
+                continue
+            if sibling_active_rows < active_rows:
+                continue
+            if str(sibling_stats.get("admission_reason")) == "low_throughput":
+                return "physical_low_throughput"
+        return None
+
+    def _apply_mtp_physical_bucket_gate(
+        self,
+        key: tuple[int, int, str, str, int | None, int],
+        stats: dict[str, object],
+    ) -> None:
+        reason = self._mtp_physical_bucket_block_reason(key)
+        if reason is None:
+            return
+        if str(stats.get("admission_reason")) == "low_throughput":
+            return
+        stats["admission_enabled"] = False
+        stats["admission_reason"] = reason
+
     def should_admit_mtp(
         self,
         seq: Sequence,
@@ -457,6 +519,7 @@ class Scheduler:
         )
         bucket_stats = self._get_mtp_bucket_stats(key)
         self._update_mtp_admission_decision(bucket_stats)
+        self._apply_mtp_physical_bucket_gate(key, bucket_stats)
         self._sync_legacy_mtp_fields(key, bucket_stats)
         return bool(bucket_stats["admission_enabled"])
 
@@ -514,12 +577,14 @@ class Scheduler:
                 bucket_stats["baseline_latency_steps"] = int(bucket_stats["baseline_latency_steps"]) + 1
         if delta_accepted == 0 and delta_rejected == 0:
             self._update_mtp_admission_decision(bucket_stats)
+            self._apply_mtp_physical_bucket_gate(key, bucket_stats)
             self._sync_legacy_mtp_fields(key, bucket_stats)
             return
 
         bucket_stats["observed_accepted"] = int(bucket_stats["observed_accepted"]) + delta_accepted
         bucket_stats["observed_rejected"] = int(bucket_stats["observed_rejected"]) + delta_rejected
         self._update_mtp_admission_decision(bucket_stats)
+        self._apply_mtp_physical_bucket_gate(key, bucket_stats)
         self._sync_legacy_mtp_fields(key, bucket_stats)
 
     @staticmethod
@@ -573,6 +638,7 @@ class Scheduler:
             measured_speedup = None
             if baseline_ms is not None and spec_ms is not None:
                 measured_speedup = float(baseline_ms) / max(1e-9, float(spec_ms))
+            physical_bucket_reason = self._mtp_physical_bucket_block_reason(key)
             buckets.append(
                 {
                     "key": {
@@ -585,6 +651,8 @@ class Scheduler:
                     },
                     "admission_enabled": bool(stats["admission_enabled"]),
                     "admission_reason": str(stats["admission_reason"]),
+                    "physical_bucket_admission_enabled": physical_bucket_reason is None,
+                    "physical_bucket_reason": physical_bucket_reason or "enabled",
                     "observed_accepted": int(stats["observed_accepted"]),
                     "observed_rejected": int(stats["observed_rejected"]),
                     "acceptance_rate": accept_rate,

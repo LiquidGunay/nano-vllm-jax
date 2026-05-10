@@ -2629,6 +2629,9 @@ class CanonicalModelRunner:
             and not use_commit_select
             and enable_fast_all_accept
         )
+        enable_rowwise_repair = enable_rowwise_repair or (
+            batch_accept_policy == "rowwise" and use_fast_all_accept
+        )
         use_prefix_two_decode = (
             draft_len == 1
             and not use_one_pass_k1
@@ -2822,7 +2825,18 @@ class CanonicalModelRunner:
                 for local_row, row in enumerate(rows)
             ]
             if not any(accepted_flags_local):
-                return None
+                stats = self._speculative_stats()
+                for row in rows:
+                    seq = seqs[row]
+                    self._mtp1_drafts.pop(seq.seq_id, None)
+                    stats["drafts_rejected"] += 1
+                repair_batch = self._masked_decode_batch(batch, rows)
+                repair_outputs = self._run_main_and_sample(
+                    seqs,
+                    repair_batch,
+                    seed_mtp1=False,
+                )
+                return {row: repair_outputs[row] for row in rows}
 
             committed_batch = replace(decode_batch, seq_lens=output.committed_seq_lens)
             self.cache_storage = output.cache_storage
@@ -2861,7 +2875,7 @@ class CanonicalModelRunner:
                 repair_outputs = self._run_main_and_sample(
                     seqs,
                     repair_batch,
-                    seed_mtp1=self.mtp1_enabled,
+                    seed_mtp1=False,
                 )
                 for row in repair_rows:
                     outputs[row] = repair_outputs[row]
@@ -3618,12 +3632,16 @@ class CanonicalModelRunner:
                 in {"1", "true", "yes", "on", "True"}
             )
             if compact_commit_select:
-                return self._run_main_and_sample_with_mtp1_reuse(
-                    seqs,
-                    batch,
-                    seed_mtp1=self.mtp1_enabled and seed_mtp1,
-                    force_emit_bonus=True,
-                )
+                legacy_compact_reuse = os.environ.get(
+                    "NANO_VLLM_JAX_MTP_ENABLE_LEGACY_COMPACT_REUSE", "0"
+                ) in {"1", "true", "yes", "on", "True"}
+                if legacy_compact_reuse:
+                    return self._run_main_and_sample_with_mtp1_reuse(
+                        seqs,
+                        batch,
+                        seed_mtp1=self.mtp1_enabled and seed_mtp1,
+                        force_emit_bonus=True,
+                    )
             can_run_fused_batch = (
                 not force_reuse_fallback
                 and

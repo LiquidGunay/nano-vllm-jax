@@ -551,3 +551,90 @@ Interpretation:
 - The patch improves observability and prevents one avoidable seeded partial fallback path, but it does not produce a speedup.
 - The main remaining issue is structural: rowwise speculative decode desynchronizes rows and the current scheduler/benchmark then spends many steps in non-ideal fallback or underfilled buckets.
 - For serving, the next design fix is not another MTP head tweak. It is better bucket/backfill policy plus per-active-row baseline seeding, so when a bucket is gated off it stays on a known-fast no-spec path and the report does not confuse B=4 results with B=1/B=2 tail buckets.
+
+## 2026-05-10 K=1 mixed/homogeneous follow-up
+
+The K=1 path has the same scheduler/fallback blockers as K=2, but the root is easier to see:
+
+- Fast K=1 accepted steps can beat baseline when all rows accept.
+- Aggregate K=1 still loses because rejected/all-rejected repair and underfilled tail buckets dominate the run.
+- The legacy top-level scheduler fields are misleading; per-bucket admission is the source of truth.
+
+Patch summary:
+
+- Moved scheduler MTP-admission timing in `LLMEngine.step` from runner-only elapsed time to full engine-step elapsed time after postprocess/release. This aligns scheduler gating with benchmark decode throughput scope.
+- Made `batch_accept_policy=rowwise` imply rowwise repair for the fast K=1 verifier.
+- Fixed the all-rejected fast K=1 rowwise case: it now records draft rejections and repairs through baseline instead of returning `None` as an unclassified fallback.
+- Rejected K=1 repair rows now use `seed_mtp1=False`; accepted rows already get next drafts from verifier output, and rejected repair should stay as close to clean baseline as possible.
+
+TPU validation:
+
+- `python3 -m py_compile nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/llm_engine.py` passed on TPU.
+- `python3 -m pytest tests/test_mtp_commit_semantics.py -q` passed on TPU: 16 passed.
+
+K=1 homogeneous B=4, Qwen/Qwen3.5-4B bf16, prompt length 16, output length 24:
+
+| path | exact | next-step sanity | baseline decode tok/s | K=1 decode tok/s | speedup | acceptance | note |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| fast K=1, after-bonus seeding, before all-reject repair accounting | yes | yes | 216.39 | 152.78 | 0.706x | 50.00% | accepted steps alone reached 249.66 tok/s |
+| prefix-safe K=1, after-bonus seeding | yes | yes | 208.93 | 32.93 | 0.158x | 53.33% | correctness path is too expensive for throughput |
+| fast K=1 rowwise repair, all-reject accounting + unseeded repair | yes | yes | 216.75 | 98.41 | 0.454x | 56.76% | B=4 gate correctly becomes `low_throughput` |
+
+K=1 mixed/interleaved B=4, prompts 16/17/31/32, outputs 12 each, arrivals 0/0/2/4:
+
+| path | exact | next-step sanity | baseline decode tok/s | K=1 decode tok/s | speedup | acceptance | note |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| fast K=1 rowwise repair, all-reject accounting + unseeded repair | yes | yes | 166.04 | 81.32 | 0.490x | 42.86% | compact/mixed correctness holds, but repair and underfilled buckets dominate |
+
+Per-bucket K=1 gate evidence after the repair/accounting patch:
+
+| workload | bucket | decision | measured speedup |
+| --- | --- | --- | ---: |
+| homogeneous B=4 | active rows 4 | `low_throughput` | 0.408x |
+| mixed B=4 | active rows 4 | `low_throughput` | 0.0196x |
+
+Current K=1 conclusion:
+
+- K=1 correctness is not the blocker for these tested paths; exact token match and next-step sanity pass.
+- Fast K=1 can produce faster accepted steps than baseline, but not enough accepted steps survive once rowwise repair, all-rejected batches, and underfilled tail buckets are included.
+- Prefix-safe K=1 is far too slow for serving throughput in the current pure-JAX implementation.
+- The next K=1 serving fix is scheduler policy: do not let underfilled buckets remain indefinitely in `warming`, and backfill/pack rows so the fast accepted path runs on full physical buckets whenever possible.
+
+## 2026-05-10 K=1 mixed-row unblock patch
+
+Patch summary:
+
+- Benchmark step classification now separates `mtp_mixed_accept_reject` from pure `mtp_accepted` and pure `mtp_rejected` decode steps. This matters for K=1 rowwise serving because mixed rows are where accepted rows can be fast while rejected rows still pay repair cost.
+- The optional `NANO_VLLM_JAX_MTP_ENABLE_COMPACT_COMMIT_SELECT=1` path no longer forces K=1 into `_run_main_and_sample_with_mtp1_reuse`, which is the old two-decode/reuse path. That slow path is now only available through `NANO_VLLM_JAX_MTP_ENABLE_LEGACY_COMPACT_REUSE=1`.
+- This keeps K=1 focused on the one-pass verifier/commit path for mixed and homogeneous batches, while preserving a legacy escape hatch for comparison.
+
+Remaining K=1 blockers:
+
+- Rejected-row repair is still the dominant cost when a physical bucket has mixed accept/reject outcomes.
+- Underfilled/tail buckets can still dilute throughput and admission stats. The serving fix should keep fixed physical shapes, use zero-length inactive rows, and backfill active requests so fast K=1 accepted work runs on full buckets whenever possible.
+- The top-level legacy scheduler fields can still be misleading when B=1/B=2/B=3 tail buckets have no speculative samples. Per-bucket admission stats are still the source of truth.
+
+Follow-up scheduler patch:
+
+- K=1 admission now has a physical-bucket gate: if a larger active-row sibling in the same compiled physical bucket reports `low_throughput`, smaller underfilled siblings are forced to `physical_low_throughput` instead of remaining in `warming`.
+- This preserves logical/physical separation. The executor still sees fixed physical buckets with zero-length inactive rows; the scheduler only changes whether rows reserve/look ahead for K=1 MTP.
+- `get_mtp_admission_report()` now reports `physical_bucket_admission_enabled` and `physical_bucket_reason` per active-row bucket.
+- Override for experiments: `NANO_VLLM_JAX_MTP_ALLOW_UNDERFILLED_AFTER_PHYSICAL_LOW_THROUGHPUT=1`.
+
+TPU validation after this patch:
+
+- `python3 -m py_compile benchmark_mtp1_engine.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/llm_engine.py nanovllm_jax/engine/scheduler.py` passed on TPU.
+- `python3 -m pytest tests/test_mtp_commit_semantics.py -q` passed on TPU: 16 passed.
+
+Warm K=1 no-worse gate check on Qwen/Qwen3.5-0.8B bf16, v6e-1:
+
+| workload | exact | next-step sanity | baseline decode tok/s | served K=1 decode tok/s | decode speedup | scheduler reason |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| homogeneous B=4, prompt 16, output 16 | yes | yes | 361.51 | 360.51 | 0.997x | `low_throughput` |
+| mixed/interleaved B=4, prompts 16/17/31/32, outputs 12, arrivals 0/0/2/4 | yes | yes | 283.92 | 278.37 | 0.980x | `physical_low_throughput` |
+
+Interpretation:
+
+- Warmup can now identify unprofitable K=1 MTP and the timed serving path falls back close to baseline rather than serving the slow speculative path.
+- In the mixed run, the B=4 physical bucket measured `low_throughput`; B=1/B=2/B=3 sibling buckets were reported as `physical_low_throughput`, so underfilled tails did not keep trying K=1 MTP.
+- A forced mixed trace with `NANO_VLLM_JAX_MTP_MIN_SPEEDUP=0` confirmed the benchmark classifier: exact match and next-step sanity passed, and step counts were `accepted=1`, `rejected=2`, `mixed_accept_reject=2`, `fallback=2`.
