@@ -1521,6 +1521,7 @@ def run_generation_batch(
             "fallback_steps": speculative_counts.get("fallback_steps", 0),
             "accepted_decode_steps": len(accepted_steps),
             "rejected_decode_steps": len(rejected_steps),
+            "mixed_accept_reject_decode_steps": len(mixed_accept_reject_steps),
             "fallback_decode_steps": len(fallback_steps),
         },
         "return_step_records": return_step_records,

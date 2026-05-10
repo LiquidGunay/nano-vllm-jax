@@ -638,3 +638,40 @@ Interpretation:
 - Warmup can now identify unprofitable K=1 MTP and the timed serving path falls back close to baseline rather than serving the slow speculative path.
 - In the mixed run, the B=4 physical bucket measured `low_throughput`; B=1/B=2/B=3 sibling buckets were reported as `physical_low_throughput`, so underfilled tails did not keep trying K=1 MTP.
 - A forced mixed trace with `NANO_VLLM_JAX_MTP_MIN_SPEEDUP=0` confirmed the benchmark classifier: exact match and next-step sanity passed, and step counts were `accepted=1`, `rejected=2`, `mixed_accept_reject=2`, `fallback=2`.
+
+## 2026-05-10 K=1 commit-select routing follow-up
+
+Patch summary:
+
+- `NANO_VLLM_JAX_MTP_COMMIT_SELECT=1` now takes precedence over the unsafe one-pass and fast-all-accept K=1 routes.
+- Before this patch, the profile showed `NANO_VLLM_JAX_MTP_COMMIT_SELECT=1` still entering `mtp1_two_decode_fast`.
+- After this patch, the profile shows `verifier mode=mtp1_commit_select`.
+- Benchmark summaries now include `mixed_accept_reject_decode_steps` in `speculative_counts`, so `required_metrics.mixed_accept_reject_step_count` matches `step_profile.mode_counts`.
+
+Forced homogeneous K=1, Qwen/Qwen3.5-0.8B bf16, v6e-1, B=4, prompt 16, output 16:
+
+| route | exact | next-step sanity | baseline decode tok/s | K=1 decode tok/s | speedup | acceptance | accepted p50 ms/tok | rejected p50 ms/tok |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fast all-accept route | yes | yes | 352.77 | 263.49 | 0.747x | 62.50% | 2.33 | 8.85 |
+| explicit commit-select route | yes | yes | 351.23 | 294.31 | 0.838x | 55.56% | 2.84 | 5.14 |
+
+Interpretation:
+
+- Explicit commit-select is now correctly routed and materially reduces rejected-step latency.
+- It still does not beat baseline for this 0.8B workload because accepted commit-select steps are only near baseline throughput, while rejected and tail fallback steps remain slower.
+- The fast route has profitable accepted steps but very expensive rejected steps. The commit-select route has cheaper rejected steps but gives up the fast route's accepted-step advantage.
+- For K=1 on 0.8B, a real speedup requires either much higher acceptance than the tested workloads provide or a fused verifier that both keeps the fast accepted path and commits rejected rows without baseline repair.
+
+Longer homogeneous K=1 commit-select, B=4, prompt 16, output 64:
+
+| exact | next-step sanity | baseline decode tok/s | K=1 decode tok/s | speedup | acceptance |
+| --- | --- | ---: | ---: | ---: | ---: |
+| yes | yes | 382.54 | 282.81 | 0.739x | 47.37% |
+
+Easy repetitive manual prompt, fast route, B=4, output 32:
+
+| exact | next-step sanity | baseline decode tok/s | K=1 decode tok/s | speedup | acceptance | mixed steps |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| yes | yes | 369.89 | 128.53 | 0.347x | 55.56% | 8 |
+
+The repetitive prompt did not produce the expected high-acceptance regime; it created many mixed/partial rows and was a poor K=1 workload.

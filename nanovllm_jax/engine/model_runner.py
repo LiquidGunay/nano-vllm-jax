@@ -2592,6 +2592,7 @@ class CanonicalModelRunner:
                 or os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_FAST_ALL_ACCEPT", "0")
                 in {"1", "true", "yes", "on", "True"}
             )
+            and not force_commit_select
             and os.environ.get("NANO_VLLM_JAX_MTP_PREFIX_SAFE", "0")
             not in {"1", "true", "yes", "on", "True"}
             and hasattr(self.executor, "mtp1_two_decode_greedy_fast_step_jit")
@@ -2604,7 +2605,7 @@ class CanonicalModelRunner:
         use_one_pass_k1 = (
             draft_len == 1
             and not enable_fast_all_accept
-            and (not force_commit_select or allow_mixed_fused_k1 or partial_physical_batch)
+            and not force_commit_select
             and not disable_one_pass_k1
             and not block_seeded_one_pass_k1
             and allow_unsafe_one_pass_k1
