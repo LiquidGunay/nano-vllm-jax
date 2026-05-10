@@ -137,8 +137,19 @@ class LLMEngine:
         seqs, scheduled_batch = self.scheduler.schedule()
 
         # Run model
+        runner_t = perf_counter()
         token_ids = self.model_runner.run(seqs, batch=scheduled_batch)
-        self.scheduler.update_mtp_admission(self.model_runner.get_speculative_stats())
+        runner_elapsed = perf_counter() - runner_t
+        emitted_tokens = 0
+        if not scheduled_batch.is_prefill:
+            for token_id in token_ids:
+                emitted_tokens += len(token_id) if isinstance(token_id, list) else 1
+        self.scheduler.update_mtp_admission(
+            self.model_runner.get_speculative_stats(),
+            is_decode=not scheduled_batch.is_prefill,
+            elapsed_seconds=runner_elapsed,
+            emitted_tokens=emitted_tokens,
+        )
 
         # Post-process
         prefill_chunk_lengths: list[int] | None = None

@@ -129,6 +129,8 @@ next-step sanity checks.
 | manual counting, scheduler gate + baseline bypass | 1 | min accept 0.6, samples 4 | 64.05 | 71.09 | 1.110x | 72.2% | 3 | yes |
 | synthetic, scheduler gate + baseline bypass | 1 | min accept 0.6, samples 3 | 60.30 | 58.63 | 0.972x | 50.0% | 22 | yes |
 | manual counting, scheduler gate + baseline bypass | 1 | min accept 0.6, samples 3 | 62.89 | 69.94 | 1.112x | 72.2% | 3 | yes |
+| synthetic, scheduler gate + latency EWMA | 1 | min accept 0.6, samples 3, min speedup 1.0 | 62.56 | 62.28 | 0.996x | 50.0% | 22 | yes |
+| manual counting, scheduler gate + latency EWMA | 1 | min accept 0.6, samples 3, min speedup 1.0 | 61.09 | 67.52 | 1.105x | 72.2% | 3 | yes |
 
 The useful setting from this sweep is K=1 with a conservative acceptance gate
 around four verified drafts. It preserves a real speedup on the high-acceptance
@@ -165,3 +167,23 @@ gate uses measured emitted-token throughput rather than acceptance alone.
 
 Benchmark reset now also clears scheduler MTP admission state. Warmup runs
 should compile shapes, not train the adaptive gate for the measured run.
+
+## Latency EWMA admission update
+
+The scheduler gate now also tracks measured decode latency per emitted token:
+
+- speculative decode EWMA is updated when a step verifies at least one draft,
+- baseline decode EWMA is updated when a decode step emits tokens without a
+  speculative verifier attempt,
+- MTP is admitted only if both acceptance and measured speedup gates pass once
+  enough samples exist.
+
+The first implementation is global, not yet per-bucket. It still moves the
+behavior closer to vLLM's practical policy: low-acceptance synthetic decode is
+now within run-to-run noise of baseline (`0.996x`), while the high-acceptance
+counting prompt keeps a correctness-clean decode speedup (`1.105x`).
+
+Remaining gap: the latency gate needs bucket keys such as `(batch_size_bucket,
+model_size, dtype, max_blocks_per_seq, num_speculative_tokens)`. A single global
+EWMA can mix B=1 and larger batch behavior, which is exactly where vLLM-style
+serving systems need separate admission decisions.

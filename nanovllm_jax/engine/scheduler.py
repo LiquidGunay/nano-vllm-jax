@@ -45,6 +45,13 @@ class Scheduler:
         self.mtp_stats_seen_rejected = 0
         self.mtp_admission_enabled = True
         self.mtp_admission_reason = "enabled"
+        self.mtp_min_speedup = float(os.environ.get("NANO_VLLM_JAX_MTP_MIN_SPEEDUP", "1.0") or "1.0")
+        self.mtp_latency_alpha = float(os.environ.get("NANO_VLLM_JAX_MTP_LATENCY_ALPHA", "0.2") or "0.2")
+        self.mtp_latency_min_steps = int(os.environ.get("NANO_VLLM_JAX_MTP_LATENCY_MIN_STEPS", "2") or "2")
+        self.mtp_baseline_ms_per_token: float | None = None
+        self.mtp_spec_ms_per_token: float | None = None
+        self.mtp_baseline_latency_steps = 0
+        self.mtp_spec_latency_steps = 0
         self.max_blocks_per_seq = getattr(config, "max_blocks_per_seq", None)
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, 
@@ -64,6 +71,10 @@ class Scheduler:
         self.mtp_stats_seen_rejected = 0
         self.mtp_admission_enabled = True
         self.mtp_admission_reason = "enabled"
+        self.mtp_baseline_ms_per_token = None
+        self.mtp_spec_ms_per_token = None
+        self.mtp_baseline_latency_steps = 0
+        self.mtp_spec_latency_steps = 0
 
     def is_finished(self) -> bool:
         """Check if all sequences are done."""
@@ -328,7 +339,14 @@ class Scheduler:
         self.mtp_admission_reason = "enabled" if self.mtp_admission_enabled else "low_acceptance"
         return self.mtp_admission_enabled
 
-    def update_mtp_admission(self, speculative_stats: dict) -> None:
+    def update_mtp_admission(
+        self,
+        speculative_stats: dict,
+        *,
+        is_decode: bool = False,
+        elapsed_seconds: float | None = None,
+        emitted_tokens: int = 0,
+    ) -> None:
         """Update scheduler-level speculative admission from cumulative stats.
 
         The runner owns correctness and exact accept/reject accounting. The
@@ -343,20 +361,70 @@ class Scheduler:
         delta_rejected = max(0, rejected - self.mtp_stats_seen_rejected)
         self.mtp_stats_seen_accepted = accepted
         self.mtp_stats_seen_rejected = rejected
+        attempted_spec = (delta_accepted + delta_rejected) > 0
+
+        if is_decode and elapsed_seconds is not None and emitted_tokens > 0:
+            ms_per_token = (elapsed_seconds * 1000.0) / emitted_tokens
+            if attempted_spec:
+                self.mtp_spec_ms_per_token = self._ewma(
+                    self.mtp_spec_ms_per_token,
+                    ms_per_token,
+                    self.mtp_latency_alpha,
+                )
+                self.mtp_spec_latency_steps += 1
+            else:
+                self.mtp_baseline_ms_per_token = self._ewma(
+                    self.mtp_baseline_ms_per_token,
+                    ms_per_token,
+                    self.mtp_latency_alpha,
+                )
+                self.mtp_baseline_latency_steps += 1
         if delta_accepted == 0 and delta_rejected == 0:
+            self._update_mtp_admission_decision()
             return
 
         self.mtp_observed_accepted += delta_accepted
         self.mtp_observed_rejected += delta_rejected
+        self._update_mtp_admission_decision()
+
+    @staticmethod
+    def _ewma(current: float | None, value: float, alpha: float) -> float:
+        if current is None:
+            return value
+        return (1.0 - alpha) * current + alpha * value
+
+    def _update_mtp_admission_decision(self) -> None:
         verified = self.mtp_observed_accepted + self.mtp_observed_rejected
+        acceptance_ok = True
         if verified < self.mtp_min_accept_samples:
+            acceptance_ok = True
+        else:
+            accept_rate = self.mtp_observed_accepted / max(1, verified)
+            acceptance_ok = accept_rate >= self.mtp_min_accept_rate
+
+        latency_ok = True
+        if (
+            self.mtp_baseline_latency_steps >= self.mtp_latency_min_steps
+            and self.mtp_spec_latency_steps >= self.mtp_latency_min_steps
+            and self.mtp_baseline_ms_per_token is not None
+            and self.mtp_spec_ms_per_token is not None
+        ):
+            measured_speedup = self.mtp_baseline_ms_per_token / max(
+                1e-9,
+                self.mtp_spec_ms_per_token,
+            )
+            latency_ok = measured_speedup >= self.mtp_min_speedup
+
+        self.mtp_admission_enabled = acceptance_ok and latency_ok
+        if not acceptance_ok:
+            self.mtp_admission_reason = "low_acceptance"
+        elif not latency_ok:
+            self.mtp_admission_reason = "low_throughput"
+        elif verified < self.mtp_min_accept_samples:
             self.mtp_admission_enabled = True
             self.mtp_admission_reason = "warming"
-            return
-
-        accept_rate = self.mtp_observed_accepted / max(1, verified)
-        self.mtp_admission_enabled = accept_rate >= self.mtp_min_accept_rate
-        self.mtp_admission_reason = "enabled" if self.mtp_admission_enabled else "low_acceptance"
+        else:
+            self.mtp_admission_reason = "enabled"
 
     def preempt(self, seq: Sequence):
         """Preempt a sequence (move back to waiting)."""
