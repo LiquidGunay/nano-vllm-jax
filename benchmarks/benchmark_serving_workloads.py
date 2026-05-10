@@ -30,6 +30,8 @@ class Workload:
     batch_size_buckets: tuple[int, ...]
     prefill_buckets: tuple[int, ...]
     num_kvcache_blocks: int
+    output_lengths: tuple[int, ...] = ()
+    arrival_steps: tuple[int, ...] = ()
     max_blocks_per_seq: int | None = None
     prompt_suite: str = "real"
 
@@ -85,12 +87,14 @@ WORKLOADS: dict[str, Workload] = {
     "interleaved_prefill_decode_b4": Workload(
         name="interleaved_prefill_decode_b4",
         description=(
-            "Four rows with small prefill buckets and mixed long/short prompts so shorter rows can decode "
-            "while longer rows continue chunked prefill."
+            "Four rows with staggered arrivals, small prefill buckets, and mixed long/short prompts so "
+            "later prefills are scheduled while earlier rows are decoding."
         ),
         batch_prompts=4,
         prompt_lengths=(32, 448, 48, 512),
         max_tokens=64,
+        output_lengths=(48, 16, 64, 24),
+        arrival_steps=(0, 0, 3, 6),
         max_num_seqs=4,
         batch_size_buckets=(4,),
         prefill_buckets=(64, 128),
@@ -109,6 +113,24 @@ WORKLOADS: dict[str, Workload] = {
         prefill_buckets=(128, 256),
         num_kvcache_blocks=512,
         max_blocks_per_seq=48,
+        prompt_suite="expanded",
+    ),
+    "heterogeneous_lengths_b16_partial": Workload(
+        name="heterogeneous_lengths_b16_partial",
+        description=(
+            "Nine active rows in a physical B16 bucket with boundary prompt lengths "
+            "1,15,16,17,31,32,127,128,129 and heterogeneous output lengths."
+        ),
+        batch_prompts=9,
+        prompt_lengths=(1, 15, 16, 17, 31, 32, 127, 128, 129),
+        max_tokens=33,
+        output_lengths=(1, 2, 4, 8, 16, 32, 7, 15, 31),
+        arrival_steps=(0, 0, 0, 2, 2, 4, 4, 6, 8),
+        max_num_seqs=16,
+        batch_size_buckets=(1, 4, 8, 16),
+        prefill_buckets=(16, 32, 128, 256),
+        num_kvcache_blocks=1024,
+        max_blocks_per_seq=32,
         prompt_suite="expanded",
     ),
 }
@@ -187,6 +209,38 @@ MODES: dict[str, Mode] = {
         },
         unsafe_one_pass=True,
     ),
+    "always_on_mtp": Mode(
+        name="always_on_mtp",
+        description="Safe K=1 commit-select MTP with scheduler adaptive admission disabled, so MTP is always admitted.",
+        num_speculative_tokens=1,
+        compile_mtp_draft=True,
+        env={
+            **COMMON_MTP_ENV,
+            "NANO_VLLM_JAX_MTP_COMMIT_SELECT": "1",
+            "NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1": "1",
+            "NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE": "0",
+            "NANO_VLLM_JAX_MTP_MIN_SPEEDUP": "0",
+        },
+    ),
+    "adaptive_mtp": Mode(
+        name="adaptive_mtp",
+        description=(
+            "Safe K=1 commit-select MTP with scheduler adaptive admission enabled from measured "
+            "acceptance and EWMA latency stats."
+        ),
+        num_speculative_tokens=1,
+        compile_mtp_draft=True,
+        env={
+            **COMMON_MTP_ENV,
+            "NANO_VLLM_JAX_MTP_COMMIT_SELECT": "1",
+            "NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1": "1",
+            "NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE": "0.01",
+            "NANO_VLLM_JAX_MTP_MIN_ACCEPT_SAMPLES": "8",
+            "NANO_VLLM_JAX_MTP_MIN_SPEEDUP": "1.0",
+            "NANO_VLLM_JAX_MTP_LATENCY_MIN_STEPS": "2",
+            "NANO_VLLM_JAX_MTP_LATENCY_ALPHA": "0.2",
+        },
+    ),
     "commit_select": Mode(
         name="commit_select",
         description="Safe sequential commit-select K=1 verifier reference; no unsafe one-pass env.",
@@ -220,6 +274,7 @@ MODES: dict[str, Mode] = {
 DEFAULT_WORKLOADS = (
     "decode_steady_b1",
     "heterogeneous_b4",
+    "heterogeneous_lengths_b16_partial",
     "long_output_b1",
     "interleaved_prefill_decode_b4",
 )
@@ -227,8 +282,8 @@ DEFAULT_WORKLOADS = (
 
 DEFAULT_MODES = (
     "baseline",
-    "commit_select",
-    "compact_commit_select",
+    "always_on_mtp",
+    "adaptive_mtp",
 )
 
 
@@ -240,6 +295,13 @@ METRIC_KEYS = [
     "end_to_end_speedup",
     "acceptance_rate",
     "fallback_count",
+    "accepted_step_count",
+    "rejected_step_count",
+    "fallback_step_count",
+    "scheduler_admission_reason",
+    "scheduler_baseline_ewma_ms_per_token",
+    "scheduler_spec_ewma_ms_per_token",
+    "measured_scheduler_speedup",
     "accepted_itl_p50_ms",
     "accepted_itl_p95_ms",
     "rejected_itl_p50_ms",
@@ -332,6 +394,22 @@ def primary_result(data: dict[str, Any]) -> dict[str, Any]:
                 return variant
         if isinstance(variants[0], dict):
             return variants[0]
+    rows = data.get("rows")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_variants = row.get("variants")
+            if not isinstance(row_variants, list) or not row_variants:
+                continue
+            for variant in row_variants:
+                if isinstance(variant, dict) and "timed_results" in variant:
+                    return variant
+            if isinstance(row_variants[0], dict):
+                return row_variants[0]
+    required = data.get("required_metrics")
+    if isinstance(required, dict) and required:
+        return required
     return data
 
 
@@ -480,6 +558,61 @@ def normalize_metrics(data: dict[str, Any]) -> dict[str, Any]:
                 ("speculative_counts", "fallback_decode_steps"),
             ],
         ),
+        "accepted_step_count": first_number(
+            merged,
+            [
+                ("timed_results", "accepted_step_count"),
+                ("accepted_step_count",),
+                ("speculative_counts", "accepted_decode_steps"),
+                ("step_mode_counts", "accepted_decode_steps"),
+            ],
+        ),
+        "rejected_step_count": first_number(
+            merged,
+            [
+                ("timed_results", "rejected_step_count"),
+                ("rejected_step_count",),
+                ("speculative_counts", "rejected_decode_steps"),
+                ("step_mode_counts", "rejected_decode_steps"),
+            ],
+        ),
+        "fallback_step_count": first_number(
+            merged,
+            [
+                ("timed_results", "fallback_step_count"),
+                ("fallback_step_count",),
+                ("speculative_counts", "fallback_decode_steps"),
+                ("step_mode_counts", "fallback_decode_steps"),
+            ],
+        ),
+        "scheduler_admission_reason": first_present(
+            merged,
+            [
+                ("timed_results", "scheduler_admission_reason"),
+                ("scheduler_mtp_admission", "reason"),
+            ],
+        ),
+        "scheduler_baseline_ewma_ms_per_token": first_number(
+            merged,
+            [
+                ("timed_results", "scheduler_baseline_ewma_ms_per_token"),
+                ("scheduler_mtp_admission", "baseline_ewma_ms_per_token"),
+            ],
+        ),
+        "scheduler_spec_ewma_ms_per_token": first_number(
+            merged,
+            [
+                ("timed_results", "scheduler_spec_ewma_ms_per_token"),
+                ("scheduler_mtp_admission", "spec_ewma_ms_per_token"),
+            ],
+        ),
+        "measured_scheduler_speedup": first_number(
+            merged,
+            [
+                ("timed_results", "measured_scheduler_speedup"),
+                ("scheduler_mtp_admission", "measured_scheduler_speedup"),
+            ],
+        ),
         "accepted_itl_p50_ms": first_number(
             merged,
             [
@@ -611,6 +744,10 @@ def build_command(
         csv_ints(workload.prompt_lengths),
         "--prompt-suite",
         workload.prompt_suite,
+        "--output-lengths",
+        csv_ints(workload.output_lengths),
+        "--arrival-steps",
+        csv_ints(workload.arrival_steps),
         "--prefill-buckets",
         csv_ints(workload.prefill_buckets),
         "--num-kvcache-blocks",
@@ -673,8 +810,8 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
             "",
             "## Results",
             "",
-            "| workload | mode | TPU | valid | exact | next-step | HF | prefill tok/s | decode tok/s | e2e tok/s | decode speedup | measured enable | predicted diag | predicted disagrees | e2e speedup | acceptance | drafts p/a/r | fallback | acc p50/p95 ms | rej p50/p95 ms | fb p50/p95 ms | host ms | device ms | post ms | first_diff |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+            "| workload | mode | TPU | valid | exact | next-step | HF | prefill tok/s | decode tok/s | e2e tok/s | decode speedup | measured enable | scheduler reason | scheduler speedup | scheduler EWMA base/spec ms | predicted diag | predicted disagrees | e2e speedup | acceptance | drafts p/a/r | step a/r/f | fallback | acc p50/p95 ms | rej p50/p95 ms | fb p50/p95 ms | host ms | device ms | post ms | first_diff |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
     for run in report["runs"]:
@@ -695,11 +832,15 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
                     show(metrics.get("end_to_end_tok_s")),
                     show(metrics.get("decode_speedup")),
                     format_value(metrics.get("serving_enable_by_measured_decode")),
+                    format_value(metrics.get("scheduler_admission_reason")),
+                    show(metrics.get("measured_scheduler_speedup")),
+                    f"{show(metrics.get('scheduler_baseline_ewma_ms_per_token'))}/{show(metrics.get('scheduler_spec_ewma_ms_per_token'))}",
                     show(metrics.get("adaptive_predicted_speedup_diagnostic")),
                     format_value(metrics.get("adaptive_predicted_disagrees_with_measured")),
                     show(metrics.get("end_to_end_speedup")),
                     show(metrics.get("acceptance_rate")),
                     f"{show(metrics.get('drafts_proposed'))}/{show(metrics.get('drafts_accepted'))}/{show(metrics.get('drafts_rejected'))}",
+                    f"{show(metrics.get('accepted_step_count'))}/{show(metrics.get('rejected_step_count'))}/{show(metrics.get('fallback_step_count'))}",
                     show(metrics.get("fallback_count")),
                     f"{show(metrics.get('accepted_itl_p50_ms'))}/{show(metrics.get('accepted_itl_p95_ms'))}",
                     f"{show(metrics.get('rejected_itl_p50_ms'))}/{show(metrics.get('rejected_itl_p95_ms'))}",
@@ -777,7 +918,7 @@ def run_one(args: argparse.Namespace, workload: Workload, mode: Mode, run_dir: P
             )
     else:
         metrics["unsafe_one_pass"] = False
-    if mode.name == "commit_select":
+    if mode.name in {"commit_select", "always_on_mtp", "adaptive_mtp"}:
         measured_decode_speedup = metrics.get("decode_speedup")
         metrics["serving_enable_by_measured_decode"] = (
             bool(metrics.get("valid"))
@@ -842,6 +983,8 @@ def main() -> int:
                 "batch_prompts": workload.batch_prompts,
                 "prompt_lengths": workload.prompt_lengths,
                 "max_tokens": args.max_tokens_override if args.max_tokens_override is not None else workload.max_tokens,
+                "output_lengths": workload.output_lengths,
+                "arrival_steps": workload.arrival_steps,
                 "max_num_seqs": workload.max_num_seqs,
                 "batch_size_buckets": workload.batch_size_buckets,
                 "prefill_buckets": workload.prefill_buckets,

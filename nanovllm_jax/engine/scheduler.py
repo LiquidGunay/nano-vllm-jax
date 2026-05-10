@@ -26,6 +26,7 @@ class Scheduler:
         self.max_num_seqs = getattr(config, 'max_num_seqs', 16)
         self.max_num_batched_tokens = getattr(config, 'max_num_batched_tokens', 2048)
         self.eos = getattr(config, 'eos', None)
+        self.block_size = config.block_size
         self.enable_prefix_cache_execution = not getattr(config, "linear_attn_layers", ())
         self.prefill_buckets = tuple(getattr(config, "prefill_buckets", ()))
         self.batch_size_buckets = tuple(getattr(config, "batch_size_buckets", ()))
@@ -189,7 +190,7 @@ class Scheduler:
                 continue
             
             # Ensure we can append
-            mtp_admitted = self.should_admit_mtp(seq)
+            mtp_admitted = self.should_admit_mtp(seq, for_decode=True)
             seq.mtp_admitted = mtp_admitted
             seq.mtp_admission_reason = self.mtp_admission_reason if mtp_admitted else "scheduler_gate"
             lookahead_tokens = min(
@@ -324,11 +325,11 @@ class Scheduler:
                 return bucket
         raise ValueError(f"{name} size {size} exceeds configured buckets {buckets}")
 
-    def should_admit_mtp(self, seq: Sequence) -> bool:
+    def should_admit_mtp(self, seq: Sequence, *, for_decode: bool = False) -> bool:
         """Return whether this decode row may attempt speculative decoding."""
-        if not self.mtp_scheduler_gate_enabled:
+        if self.num_speculative_tokens <= 0:
             self.mtp_admission_reason = "disabled"
-            return True
+            return False
         if seq.temperature != 0:
             self.mtp_admission_reason = "temperature"
             return False
@@ -336,6 +337,29 @@ class Scheduler:
         if remaining <= 1:
             self.mtp_admission_reason = "remaining_tokens"
             return False
+        relax_start_boundary = (
+            os.environ.get("NANO_VLLM_JAX_MTP_RELAX_START_BOUNDARY", "0")
+            in {"1", "true", "yes", "on", "True"}
+        )
+        if (
+            for_decode
+            and self.num_speculative_tokens == 1
+            and not relax_start_boundary
+            and seq.num_tokens % self.block_size == 0
+        ):
+            self.mtp_admission_reason = "start_boundary"
+            return False
+        if (
+            for_decode
+            and self.num_speculative_tokens == 1
+            and not relax_start_boundary
+            and (seq.num_tokens + 2) % self.block_size == 0
+        ):
+            self.mtp_admission_reason = "bonus_boundary"
+            return False
+        if not self.mtp_scheduler_gate_enabled:
+            self.mtp_admission_reason = "enabled"
+            return True
         self.mtp_admission_reason = "enabled" if self.mtp_admission_enabled else "low_acceptance"
         return self.mtp_admission_enabled
 

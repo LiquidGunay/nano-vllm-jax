@@ -1,36 +1,44 @@
 # Roadmap
 
-The near-term roadmap is correctness first, then speed. MTP work should stay constrained to K=1 or K=2 until the target-model equivalence story is fully validated.
+This roadmap is grouped by work type. It is not a production-readiness claim.
 
-## Priority 1: preserve canonical target decode
+## Correctness
 
-- Keep `ModelExecutor` as the canonical execution boundary.
-- Keep verifier logits sourced from canonical target logits.
-- Avoid hidden-derived verifier logits except for diagnostics.
-- Preserve exact token parity against non-speculative baseline before measuring speed.
+- Keep `tests/test_mtp_commit_semantics.py` passing on TPU.
+- Preserve K=1 accept/reject commit invariants across block boundaries and inactive rows.
+- Keep target logits sourced from the canonical executor forward-step contract.
+- Add coverage for per-bucket MTP admission behavior once EWMA is bucketed.
+- Keep K=2 correctness tests, but do not promote K=2 to serving policy without speed evidence.
 
-## Priority 2: validate K=2
+## Serving
 
-- Prove multi-token verifier decode equals sequential one-token target decode for logits and committed cache state.
-- Test full accept, first-token reject, second-token reject, and mixed-row batches.
-- Confirm full-attention decode masking and linear-attention recurrent state are position-causal for query length greater than one.
-- Keep K=2 disabled or experimental until TPU validation passes.
+- Keep current serving policy at K=1 one-pass MTP only.
+- Keep MTP admission scheduler-owned.
+- Gate on acceptance and measured decode-latency EWMA.
+- Replace global latency EWMA with per-bucket EWMA.
+- Document all serving flags with exact default behavior.
 
-## Priority 3: repair partial acceptance
+## Benchmarks
 
-- Prefer discard-and-repair from canonical state for rejected rows until rowwise commit selection is proven.
-- If rowwise acceptance is reintroduced, make KV and hybrid state selection explicit per accepted prefix.
-- Do not let rejected verifier writes become logically reachable.
+- Preserve latest TPU v6e-1 Qwen/Qwen3.5-4B BF16 findings.
+- Add repeatable benchmark recipes for low-acceptance and high-acceptance prompts.
+- Validate mixed/heterogeneous benchmark recipes on TPU once the v6e-1 VM is reachable again.
+- Add vLLM TPU baseline/speculative comparison for Qwen 0.8B, or document exact blockers if unsupported.
+- Report decode tokens/sec separately from prefill and compile time.
+- Keep correctness checks mandatory for any speed claim.
+- Add compact per-bucket reporting once per-bucket EWMA exists.
 
-## Priority 4: improve speed after correctness
+## Optimization
 
-- Reduce fallback rate before optimizing microseconds.
-- Use larger prefill buckets in benchmark configurations where capacity allows.
-- Minimize host synchronization in token materialization and acceptance accounting.
-- Explore groupwise acceptance only after rowwise state correctness is solved.
+- Reduce host synchronization in token materialization and MTP accounting.
+- Improve bucket-specific admission decisions.
+- Investigate K=1 overhead in rejected and fallback steps.
+- Treat K=2 as optimization research only until it beats K=1/baseline in valid benchmarks.
+- Avoid dedicated TPU-kernel claims; current accelerator path is JAX/XLA on TPU.
 
-## Non-goals for this cleanup
+## Cleanup
 
-- No source-code edits.
-- No local benchmark or test runs.
-- No changes to executor, runner, tests, or benchmark scripts.
+- Keep canonical docs in `docs/architecture.md`, `docs/kv_cache.md`, `docs/mtp.md`, `docs/scheduler.md`, `docs/benchmarks.md`, and this file.
+- Keep `docs/mtp_tpu_spot_findings_2026-05-09.md` accessible as the latest detailed findings record.
+- Archive obsolete debug/status markdown under `docs/archive/2026-05-pre-latency-gate/`.
+- Avoid duplicating full benchmark logs in canonical docs.

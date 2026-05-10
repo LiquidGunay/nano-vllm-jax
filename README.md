@@ -2,18 +2,31 @@
 
 A compact vLLM-style JAX runtime for Qwen3.5-family checkpoints, with paged KV cache, hybrid linear/full attention, scheduler-driven batching, and experimental MTP speculative decoding.
 
-This repository is a correctness-focused research/prototype codebase. Heavy validation and benchmark work should run on the TPU VM, not locally.
+This is a correctness-focused research/prototype codebase. Current TPU execution is a pure JAX/XLA backend running on TPU, not a dedicated TPU kernel backend.
 
-## Current documentation
+## Current validated state
 
+- Hardware: TPU v6e-1.
+- Model: `Qwen/Qwen3.5-4B`, BF16, real weights.
+- Execution: JIT on TPU.
+- MTP policy: K=1 one-pass only, scheduler-owned admission, acceptance plus measured decode-latency EWMA gates.
+- Correctness: `tests/test_mtp_commit_semantics.py` passes `13/13` on TPU.
+- Remaining gap: latency EWMA is global, not per bucket.
+
+K=2 is correctness-clean in focused testing but slower in observed benchmarks, so it is experimental and non-serving.
+
+## Documentation
+
+- [Documentation index](docs/README.md)
 - [Architecture](docs/architecture.md)
-- [KV cache and hybrid state](docs/kv_cache.md)
+- [KV cache](docs/kv_cache.md)
 - [MTP speculative decoding](docs/mtp.md)
 - [Scheduler](docs/scheduler.md)
 - [Benchmarks](docs/benchmarks.md)
 - [Roadmap](docs/roadmap.md)
+- [Latest TPU findings](docs/mtp_tpu_spot_findings_2026-05-09.md)
 
-Archived historical MTP, benchmark, and stale status notes live in [docs/archive/2026-05-pre-current-state](docs/archive/2026-05-pre-current-state/).
+Historical and obsolete notes are archived under [docs/archive/2026-05-pre-latency-gate](docs/archive/2026-05-pre-latency-gate/).
 
 ## Runtime path
 
@@ -21,7 +34,7 @@ Archived historical MTP, benchmark, and stale status notes live in [docs/archive
 LLMEngine -> Scheduler -> ModelRunner -> ModelExecutor -> Backend -> model.forward_step
 ```
 
-`ModelExecutor` is the canonical execution path. `ModelRunner` owns runtime/session state and compatibility helpers around the executor.
+`ModelExecutor` is the canonical execution boundary. The scheduler owns runnable work, block allocation, and MTP admission.
 
 ## Quick start
 
@@ -40,10 +53,3 @@ config = Qwen3_5Config.qwen3_5_0_8b()
 params = load_weights_from_hf("Qwen/Qwen3.5-0.8B", config)
 runner = ModelRunner(config, params)
 ```
-
-## Notes
-
-- MTP is experimental and limited to K=1 or K=2 work.
-- K=1 safe mode is the correctness baseline; speed remains workload-dependent.
-- K=2 needs TPU validation before being treated as correct.
-- Do not treat archived status reports as current state without rerunning the TPU correctness gates.

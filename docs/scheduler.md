@@ -1,98 +1,96 @@
 # Scheduler
 
-The scheduler converts queued `Sequence` objects into fixed-shape `ScheduledBatch` objects and maintains Python-side block allocation metadata.
+The scheduler is the Python-side owner of runnable work, block allocation, preemption, and MTP admission.
+
+## Responsibilities
+
+The scheduler owns:
+
+- waiting and running queues,
+- prompt prefill chunking,
+- decode bucket selection,
+- active/inactive row masks,
+- block allocation and block-table updates,
+- preemption when cache capacity is insufficient,
+- postprocess after executor output,
+- MTP admission and lookahead reservation.
+
+The scheduler does not own model logits or target-model verification correctness.
 
 ## Prefill chunks
 
-Prompt prefill can be chunked by token budget or configured prefill buckets.
+Prefill may split a prompt into chunks. Each chunk must have:
 
-Prefill chunk fields:
+- logical positions for the prompt slice,
+- allocated blocks for every written position,
+- valid attention metadata for all visible prefix tokens,
+- postprocess that advances prompt progress exactly by the chunk length.
 
-- `tokens`: prompt tokens for this chunk,
-- `positions`: absolute prompt positions,
-- `query_lens`: number of active tokens per row,
-- `query_start_loc`: flattened query offsets,
-- `seq_lens`: logical sequence length after this chunk,
-- `prefill_is_final`: whether this chunk finishes the prompt.
-
-Prefill invariant:
-
-```text
-non-final prefill chunks update cache only and emit no generated token
-```
-
-Final prefill chunks may emit the first generated token from target logits.
+Prefill chunks should not run speculative decode. MTP starts only once a sequence is in decode state.
 
 ## Decode buckets
 
-Decode batches usually have one active token per sequence. With speculative decoding, the scheduler reserves lookahead capacity:
+Decode batches are bucketed to static shapes for JIT reuse. A bucket can contain active and inactive rows.
 
-```text
-reserved slots = 1 current token + K draft tokens
-```
+Active rows:
 
-Decode bucket invariant:
+- have a sequence assigned,
+- have at least one scheduled decode position,
+- may be eligible for MTP lookahead.
 
-```text
-block capacity must cover the largest position the executor may write, not only the token Python will append first
-```
+Inactive rows:
 
-For K=2, a verifier can write current token plus two draft-token positions.
+- are shape padding,
+- have zero logical scheduled tokens,
+- must not change sequence state,
+- must not expose logits or cache writes as real work.
 
-## Zero-length rows
+## Zero-length inactive rows
 
-Fixed-shape batches may contain inactive rows or rows with zero query length. These rows are useful for stable compilation shapes but must be masked throughout metadata and KV writes.
+Zero-length inactive rows are required for static bucket shapes. They must remain inert through:
 
-Zero-row invariant:
+- batch materialization,
+- attention metadata,
+- executor output,
+- scheduler postprocess,
+- MTP accept/reject accounting.
 
-```text
-zero-length rows must not write KV, advance hybrid state, emit tokens, or affect active rows
-```
-
-If a batch uses padded rows, `query_start_loc` and valid masks are the source of truth for which columns are active.
+A common failure mode is treating padded row output as a real token. Masks must prevent that.
 
 ## Preemption
 
-When KV capacity is insufficient, the scheduler can preempt running sequences by deallocating their blocks and moving them back to waiting.
+If cache capacity is insufficient, the scheduler may preempt lower-priority running sequences and free their blocks.
 
 Preemption invariant:
 
 ```text
-a preempted sequence must not retain device cache state as if it were still resident
+A scheduled batch must never reference a physical block that was not allocated for that sequence at scheduling time.
 ```
 
-After preemption, prompt/cache reconstruction must proceed through normal scheduling rather than reusing stale physical slots.
+After preemption, sequence-visible logical state and block-manager state must agree before the sequence is rescheduled.
 
-## Postprocess
+## MTP admission and lookahead
 
-Postprocess appends emitted tokens and updates block metadata.
+For K=1, an admitted row needs capacity for the target token and one lookahead/bonus position. The scheduler must reserve this before execution.
 
-For a single emitted token:
+Admission is controlled by serving policy:
+
+- K=1 only,
+- scheduler-owned admission,
+- acceptance gate,
+- measured decode-latency EWMA gate,
+- pure JAX/XLA TPU execution expectations.
+
+Current limitation:
 
 ```text
-append token; it has not yet been processed as an input token
+Latency EWMA is global; per-bucket admission is still pending.
 ```
 
-For multiple emitted tokens:
+Postprocess commits:
 
-```text
-append each token
-for every emitted token except the last, commit_processed_token
-```
+- reject: target token only,
+- accept: target token plus bonus token,
+- inactive: no state change.
 
-This matches speculative semantics: accepted drafts have been processed by the verifier, while the final bonus token has not.
-
-## Scheduler/executor boundary
-
-Scheduler guarantees before executor execution:
-
-- every active row has valid tokens and positions,
-- block tables include every slot the executor may write,
-- query lengths and token counts agree,
-- decode rows are fully prefetched through prompt tokens.
-
-Executor guarantees after execution:
-
-- cache storage reflects the model step it ran,
-- hybrid state reflects the same accepted/processed prefix,
-- logits/hidden outputs correspond to the scheduled tokens.
+Postprocess must update sequence length, block metadata, draft carry, and accounting consistently with the committed prefix.

@@ -1,115 +1,75 @@
-# KV Cache and Hybrid State
+# KV Cache
 
-This document describes cache invariants rather than historical implementation status.
+This document records the canonical KV-cache invariants for prefill, decode, and MTP lookahead.
+
+## Objects
+
+Full-attention KV state has three logical parts:
+
+- device KV arrays, indexed by physical block and offset,
+- per-sequence block tables, mapping logical blocks to physical blocks,
+- slot mappings, mapping scheduled token positions to physical write slots.
+
+Linear-attention layers do not use the paged full-attention cache. They carry recurrent/convolution state in `HybridLayerState` and must advance with the same accepted prefix as the full-attention cache.
 
 ## Block table
 
-Each sequence has a block table:
+A sequence is divided into fixed-size logical blocks. The block table stores the physical block id for each logical block.
 
 ```text
-logical block index -> physical block id
+logical_position -> logical_block = position // block_size
+logical_position -> block_offset  = position % block_size
+block_table[row, logical_block] -> physical_block
+physical_slot = physical_block * block_size + block_offset
 ```
 
-If `block_size = 16`, logical token positions map to logical blocks as:
+Scheduler invariant:
 
 ```text
-positions 0..15   -> logical block 0
-positions 16..31  -> logical block 1
-positions 32..47  -> logical block 2
-```
-
-Block-table invariant:
-
-```text
-a token position may be scheduled only if its logical block has a physical block id
+All logical blocks that may be written by the next scheduled step, including MTP lookahead, are allocated before the executor runs.
 ```
 
 ## Slot mapping
 
-`slot_mapping` maps each scheduled token position to a flat physical KV slot:
+`slot_mapping` is the executor-facing list of physical slots to write for scheduled tokens. It is not equivalent to logical position when paging is active.
 
-```text
-physical_slot = physical_block_id * block_size + (position % block_size)
-```
+Valid slot mappings must satisfy:
 
-Example with `block_size = 16` and block table `[7, 3]`:
-
-```text
-position 0   -> block 7, offset 0  -> slot 112
-position 15  -> block 7, offset 15 -> slot 127
-position 16  -> block 3, offset 0  -> slot 48
-position 17  -> block 3, offset 1  -> slot 49
-```
-
-Slot invariant:
-
-```text
-sequential target decode and any fused verifier must write identical logical positions to identical physical slots
-```
+- active rows map each scheduled token to an allocated physical slot,
+- inactive padded rows do not expose writable slots as real tokens,
+- prefill chunks map every prompt token in the chunk,
+- decode maps the next target token position,
+- MTP lookahead maps the additional draft/bonus positions that may be committed.
 
 ## Valid masks
 
-Scheduled batches can be padded or contain fixed-shape rows. KV writes must use a valid-token mask derived from query lengths so inactive or padded positions do not overwrite real cache entries.
+Masks are part of correctness, not only performance.
 
-Valid-mask invariant:
+- Active-row masks decide which rows participate in logits, sampling, and commit updates.
+- Attention masks decide which historical positions are visible to each query position.
+- Slot/write masks prevent inactive padded rows and rejected lookahead tokens from becoming logically reachable.
 
-```text
-only positions with local index < query_len(row) may write KV
-```
+Inactive rows in a bucket may have zero scheduled tokens. They must preserve previous sequence, KV, and hybrid state.
 
-For rows with query length zero, all token columns are invalid and must be masked out.
+## Block boundary behavior
 
-## Block boundary examples
+Decode and MTP can cross a block boundary. When the current target token or lookahead token lands at offset `0` of a new logical block, the scheduler must allocate that block before execution.
 
-Normal decode at a boundary:
+For K=1 MTP, a row may need capacity for:
 
-```text
-before decode: len(seq) = 16, block table has block 0 full
-scheduled token position = 15 as current last_token if already appended
-next emitted token will make len(seq) = 17
-block manager must allocate block 1 before position 16 can be written
-```
+- the target token at `current_length`,
+- the draft/bonus token at `current_length + 1` when admitted.
 
-Speculative K=2 near a boundary with `block_size = 16`:
+A reject commits only the target token. An accept commits the target token plus the bonus token. Rejected lookahead writes must not become reachable through logical length, masks, or future block-table interpretation.
 
-```text
-current last_token position = 14
-verifier tokens = [position 14, position 15, position 16]
-required blocks include positions 15 and 16
-position 16 requires the next physical block before verifier execution
-```
+## Commit invariant
 
-Postprocess after full K=2 accept emits:
+After scheduler postprocess:
 
 ```text
-[draft_1, draft_2, bonus]
+visible tokens == tokens committed by the target-model semantics
+logical length == old length + committed token count
+reachable KV/hybrid state == state for that committed prefix
 ```
 
-The verifier has processed through `draft_2`; the bonus is emitted but not yet in KV. `commit_processed_token` is needed for accepted drafts that complete a block.
-
-## Rejected speculative writes
-
-Rejected verifier writes may exist physically, but they must remain logically unreachable.
-
-Safety invariant:
-
-```text
-a rejected draft slot must be restored, overwritten, or masked by logical length before any later attention can read it
-```
-
-For correctness-first work, prefer discarding speculative state and repairing from canonical target decode over relying on stale future slots being harmless.
-
-## Hybrid state
-
-Full-attention KV cache is not the only state. Linear-attention layers also maintain:
-
-- convolution state,
-- recurrent Gated DeltaNet state.
-
-Hybrid-state invariant:
-
-```text
-committed hybrid state must correspond to the same accepted token prefix as committed KV state
-```
-
-A multi-token decode is equivalent to sequential decode only if linear-attention state updates scan in token order and the selected final state matches the accepted prefix.
+This invariant is required even when an executor call produced extra padded rows or speculative lookahead writes.

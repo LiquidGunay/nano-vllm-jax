@@ -1026,6 +1026,13 @@ class CanonicalModelRunner:
     def _seq_mtp_admitted(seq: Sequence) -> bool:
         return bool(getattr(seq, "mtp_admitted", True))
 
+    def _clear_mtp1_drafts_for_rows(self, seqs: List[Sequence], rows: List[int]) -> None:
+        for row in rows:
+            seq = seqs[row]
+            self._mtp1_drafts.pop(seq.seq_id, None)
+            self._mtp1_seeded_chain.pop(seq.seq_id, None)
+            self._mtp1_debug_state()[0].pop(seq.seq_id, None)
+
     def _record_draft_position_acceptance(self, accepted_matrix: List[List[bool]]):
         if not accepted_matrix:
             return
@@ -3367,6 +3374,12 @@ class CanonicalModelRunner:
         admitted_mtp_rows = [
             row for row, seq in enumerate(seqs) if self._seq_mtp_admitted(seq)
         ]
+        if self.mtp1_enabled and not batch.is_prefill:
+            non_admitted_rows = [
+                row for row, seq in enumerate(seqs) if not self._seq_mtp_admitted(seq)
+            ]
+            if non_admitted_rows:
+                self._clear_mtp1_drafts_for_rows(seqs, non_admitted_rows)
         if self.mtp1_enabled and not batch.is_prefill and admitted_mtp_rows:
             fused_rows: List[int] = []
             profile_mtp = os.environ.get("NANO_VLLM_JAX_PROFILE_MTP_RUN", "0") in {
@@ -3502,9 +3515,15 @@ class CanonicalModelRunner:
                 not force_reuse_fallback
                 and
                 fused_rows
-                and fused_rows == list(range(len(seqs)))
                 and allow_verifier_for_batch_shape
-                and (allow_mixed_fused or homogeneous_full_batch or allow_exact_commit_select_mixed)
+                and (
+                    allow_mixed_fused
+                    or allow_exact_commit_select_mixed
+                    or (
+                        homogeneous_full_batch
+                        and fused_rows == list(range(len(seqs)))
+                    )
+                )
             )
             if can_run_fused_batch:
                 fused_outputs = self._run_mtp1_batched(seqs, batch, fused_rows)

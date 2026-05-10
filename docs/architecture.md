@@ -1,94 +1,102 @@
 # Architecture
 
-This document records stable runtime invariants. It intentionally avoids one-off benchmark claims and dated status conclusions.
+This document describes the canonical runtime flow and ownership boundaries. It intentionally avoids dated benchmark conclusions.
 
-## Engine loop
-
-The serving loop is organized as:
+## Canonical flow
 
 ```text
 LLMEngine -> Scheduler -> ModelRunner -> ModelExecutor -> Backend -> model.forward_step
 ```
 
-Core invariant:
+One scheduled batch produces one executor call and one scheduler postprocess decision for every scheduled sequence row.
 
-```text
-one scheduled batch produces one postprocess decision for every scheduled sequence
-```
+## Engine loop
 
-The engine is responsible for request lifecycle. It repeatedly asks the scheduler for runnable work, calls the runner, and lets scheduler postprocess append emitted tokens and update block metadata.
+`LLMEngine` owns request lifecycle:
 
-## Scheduler
+- accept requests and create `Sequence` objects,
+- ask the scheduler for the next runnable batch,
+- call the runner,
+- return generated tokens,
+- finish or abort completed requests.
 
-The scheduler owns Python-side logical state:
+The engine should not duplicate scheduler decisions or model verification logic.
 
-- waiting and running queues,
-- prompt chunk selection,
-- decode row selection,
-- block-table allocation and preemption,
-- conversion from `Sequence` objects to `ScheduledBatch`.
+## Scheduler boundary
+
+The scheduler owns Python-side serving state:
+
+- waiting/running queues,
+- prefill chunk selection,
+- decode bucket row selection,
+- block allocation and preemption,
+- inactive-row padding,
+- MTP admission and lookahead reservation.
 
 Scheduler invariant:
 
 ```text
-all physical KV slots that a model step may write must be allocated before the executor runs
+Every physical KV slot that a model step may write is allocated before execution.
 ```
 
-The scheduler does not decide logits, draft acceptance, or target-model correctness. It only decides which logical positions are executable.
+For MTP, admission is scheduler-owned. The scheduler decides whether a row may run speculative decode, based on acceptance and measured decode-latency EWMA gates. The current EWMA is global, not per bucket.
 
-## Executor
+## Runner boundary
 
-`ModelExecutor` is the canonical model execution boundary. It builds attention metadata, creates the `KVCacheState` view, calls `model.forward_step`, and returns updated cache and hybrid state.
+`ModelRunner` owns runtime/session state around execution:
+
+- JIT entrypoint selection,
+- bucketed batch materialization,
+- persistent cache and hybrid-state handles,
+- MTP draft state passed between scheduler steps,
+- compatibility glue around the executor.
+
+The runner may package data for efficient JAX calls, but it should not become a second source of scheduling truth.
+
+## Executor boundary
+
+`ModelExecutor` is the canonical model execution boundary. It builds attention metadata, creates the `KVCacheState` view, calls `model.forward_step`, and returns updated full-attention KV and hybrid linear-attention state.
 
 Executor invariant:
 
 ```text
-all target logits used for sampling or verification must come from the canonical forward-step contract
+Target logits used for sampling or verification come from the canonical forward-step contract.
 ```
 
-Verifier paths may request hidden states for MTP seeding, but target token decisions should use canonical logits, not independently reconstructed logits unless the reconstruction is explicitly being tested as equivalent.
+Verifier paths may request hidden states for MTP seeding, but target token decisions must not depend on independently reconstructed logits unless that path is explicitly being tested as equivalent.
 
 ## Backend boundary
 
-The backend boundary owns operations that depend on cache layout or accelerator implementation:
+The backend owns cache-layout and accelerator-specific operations:
 
 - KV cache allocation,
+- slot mapping,
 - attention metadata construction,
 - KV writes,
-- full-attention prefill/decode attention,
+- full-attention prefill/decode kernels expressed in JAX/XLA,
 - linear-attention recurrent decode helpers.
+
+Current TPU execution is a pure JAX/XLA backend running on TPU. It is not a dedicated TPU kernel backend.
 
 Backend invariant:
 
 ```text
-decode attention with query length greater than one must be absolute-position causal
+Decode attention with query length greater than one must be absolute-position causal.
 ```
 
-For speculative verification, a decode query can contain multiple tokens. The backend must ensure token at absolute position `p` can attend only to keys with position `<= p`.
-
-## Model forward contract
-
-`model.forward_step` returns either logits, hidden states, or `(hidden, logits)` depending on flags.
-
-Important invariant:
-
-```text
-return_hidden=True and return_hidden_with_logits=True returns ((hidden, logits), kv_state, hybrid_state)
-```
-
-Callers must destructure this exactly. Misdestructuring can cause verifier code to use hidden tuples where arrays are expected or to reference undefined logits.
+For speculative verification, a decode query may contain multiple logical positions. A token at absolute position `p` may attend only to keys with position `<= p`.
 
 ## State ownership
 
-Runtime state is split across four layers:
+Runtime state is split across layers:
 
 - `Sequence` owns emitted token ids and logical length.
 - `BlockManager` owns physical block ids and prefix-cache metadata.
 - `KVCacheStorage` owns full-attention device KV arrays.
-- `HybridLayerState` owns linear-attention recurrent and convolution state.
+- `HybridLayerState` owns linear-attention recurrent/convolution state.
 
 Global invariant:
 
 ```text
-logical sequence length, block-table capacity, KV writes, and hybrid state must advance by the same accepted prefix
+Logical length, block-table capacity, KV writes, and hybrid state advance by the same committed prefix.
 ```

@@ -69,6 +69,22 @@ def parse_args() -> argparse.Namespace:
                         help="Run one batched benchmark with this many prompts")
     parser.add_argument("--prompt-lengths", default="",
                         help="Comma-separated prompt lengths for batched mode")
+    parser.add_argument(
+        "--output-lengths",
+        default="",
+        help=(
+            "Comma-separated per-request generation lengths. Values repeat or truncate "
+            "to --batch-prompts; defaults to --max-tokens for every request."
+        ),
+    )
+    parser.add_argument(
+        "--arrival-steps",
+        default="",
+        help=(
+            "Comma-separated per-request scheduler-step arrival offsets. Use nondecreasing "
+            "values such as 0,0,2,4 to interleave later prefills with active decodes."
+        ),
+    )
     parser.add_argument("--prompt-length-min", type=int, default=32)
     parser.add_argument("--prompt-length-max", type=int, default=192)
     parser.add_argument("--warmup", action="store_true", help="Enable compile/timing warmup passes")
@@ -132,6 +148,27 @@ def parse_prompt_lengths(value: str) -> tuple[int, ...]:
     if not value:
         return ()
     return tuple(int(part) for part in value.split(",") if part.strip())
+
+
+def parse_int_tuple(value: str) -> tuple[int, ...]:
+    if not value:
+        return ()
+    return tuple(int(part) for part in value.split(",") if part.strip())
+
+
+def expand_ints(values: tuple[int, ...], count: int, default: int, *, minimum: int = 0) -> list[int]:
+    if count <= 0:
+        return []
+    if not values:
+        return [max(minimum, int(default)) for _ in range(count)]
+    expanded = list(values)
+    if len(expanded) < count:
+        repeats = count // len(expanded)
+        tail = count % len(expanded)
+        expanded = expanded * repeats + expanded[:tail]
+    elif len(expanded) > count:
+        expanded = expanded[:count]
+    return [max(minimum, int(value)) for value in expanded]
 
 
 def prompt_suite(name: str) -> list[str]:
@@ -922,6 +959,31 @@ def _adaptive_gating_decision(baseline: dict, speculative: dict, *, margin: floa
     }
 
 
+def _scheduler_mtp_admission_report(scheduler) -> dict:
+    baseline_ms = getattr(scheduler, "mtp_baseline_ms_per_token", None)
+    spec_ms = getattr(scheduler, "mtp_spec_ms_per_token", None)
+    measured_speedup = None
+    if baseline_ms is not None and spec_ms is not None:
+        measured_speedup = float(baseline_ms) / max(1e-9, float(spec_ms))
+    return {
+        "enabled": bool(getattr(scheduler, "mtp_admission_enabled", True)),
+        "reason": getattr(scheduler, "mtp_admission_reason", None),
+        "gate_enabled": bool(getattr(scheduler, "mtp_scheduler_gate_enabled", False)),
+        "min_accept_rate": float(getattr(scheduler, "mtp_min_accept_rate", 0.0)),
+        "min_accept_samples": int(getattr(scheduler, "mtp_min_accept_samples", 0)),
+        "min_speedup": float(getattr(scheduler, "mtp_min_speedup", 1.0)),
+        "latency_alpha": float(getattr(scheduler, "mtp_latency_alpha", 0.0)),
+        "latency_min_steps": int(getattr(scheduler, "mtp_latency_min_steps", 0)),
+        "observed_accepted": int(getattr(scheduler, "mtp_observed_accepted", 0)),
+        "observed_rejected": int(getattr(scheduler, "mtp_observed_rejected", 0)),
+        "baseline_ewma_ms_per_token": None if baseline_ms is None else float(baseline_ms),
+        "spec_ewma_ms_per_token": None if spec_ms is None else float(spec_ms),
+        "baseline_latency_steps": int(getattr(scheduler, "mtp_baseline_latency_steps", 0)),
+        "spec_latency_steps": int(getattr(scheduler, "mtp_spec_latency_steps", 0)),
+        "measured_scheduler_speedup": measured_speedup,
+    }
+
+
 def _benchmark_modes_report() -> list[dict]:
     return [
         {"mode": "baseline", "status": "measured", "description": "No speculative decoding."},
@@ -1104,6 +1166,8 @@ def run_generation_batch(
     step_profile: bool = False,
     return_step_records: bool = True,
     return_prefill_logits: bool = False,
+    output_lengths: list[int] | None = None,
+    arrival_steps: list[int] | None = None,
 ):
     reset_engine_runtime(engine)
     runner = engine.model_runner
@@ -1117,9 +1181,20 @@ def run_generation_batch(
     runner._last_prefill_logits_by_seq = {}
     runner.reset_speculative_stats()
 
-    sampling = SamplingParams(temperature=0.0, max_tokens=max_tokens, ignore_eos=True)
     if not prompts:
         raise ValueError("prompts list must not be empty")
+    per_request_output_lengths = expand_ints(
+        tuple(output_lengths or ()),
+        len(prompts),
+        int(max_tokens),
+        minimum=1,
+    )
+    per_request_arrival_steps = expand_ints(
+        tuple(arrival_steps or ()),
+        len(prompts),
+        0,
+        minimum=0,
+    )
 
     scheduler = engine.scheduler
     phase_deltas = {
@@ -1185,8 +1260,40 @@ def run_generation_batch(
         return trace_outputs
 
     try:
-        for prompt in prompts:
-            engine.add_request(prompt, sampling)
+        pending_requests = [
+            {
+                "index": index,
+                "prompt": prompt,
+                "max_tokens": per_request_output_lengths[index],
+                "arrival_step": per_request_arrival_steps[index],
+            }
+            for index, prompt in enumerate(prompts)
+        ]
+        step_index = 0
+
+        def _add_due_requests(current_step: int) -> list[dict]:
+            nonlocal pending_requests
+            due = [
+                item
+                for item in pending_requests
+                if int(item["arrival_step"]) <= int(current_step)
+            ]
+            if not due:
+                return []
+            due_indices = {int(item["index"]) for item in due}
+            pending_requests = [
+                item for item in pending_requests if int(item["index"]) not in due_indices
+            ]
+            for item in due:
+                sampling = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=int(item["max_tokens"]),
+                    ignore_eos=True,
+                )
+                engine.add_request(item["prompt"], sampling)
+            return due
+
+        _add_due_requests(step_index)
 
         step_records = []
         elapsed = 0.0
@@ -1197,7 +1304,12 @@ def run_generation_batch(
         fallback_steps: list[dict] = []
         prefill_steps: list[dict] = []
 
-        while not engine.is_finished():
+        while pending_requests or not engine.is_finished():
+            if engine.is_finished() and pending_requests:
+                step_index = min(int(item["arrival_step"]) for item in pending_requests)
+            arrivals = _add_due_requests(step_index)
+            if engine.is_finished():
+                continue
             pre = runner.get_speculative_stats()
             t0 = time.perf_counter()
             _outputs, num_tokens = engine.step()
@@ -1220,6 +1332,15 @@ def run_generation_batch(
                 "phase_ms_run": run_ms,
                 "phase_ms_postprocess": postprocess_ms,
                 "phase_ms_release": release_ms,
+                "scheduler_step_index": step_index,
+                "arrivals": [
+                    {
+                        "request_index": int(item["index"]),
+                        "arrival_step": int(item["arrival_step"]),
+                        "max_tokens": int(item["max_tokens"]),
+                    }
+                    for item in arrivals
+                ],
             }
 
             if num_tokens < 0:
@@ -1264,6 +1385,7 @@ def run_generation_batch(
 
             for seq_id, completion in _outputs:
                 completion_by_seq[int(seq_id)] = list(completion)
+            step_index += 1
     finally:
         scheduler.schedule = orig_schedule
         runner.run = orig_run
@@ -1314,6 +1436,7 @@ def run_generation_batch(
         "release_ms": phase_ms_total["release_ms"],
     }
     speculative_counts = runner.get_speculative_stats()
+    scheduler_admission = _scheduler_mtp_admission_report(scheduler)
 
     return {
         "texts": text_rows,
@@ -1322,6 +1445,9 @@ def run_generation_batch(
         "completion_tokens_by_request": completion_counts,
         "tokens": completion_total,
         "total_requests": len(prompts),
+        "output_lengths_by_request": per_request_output_lengths,
+        "arrival_steps_by_request": per_request_arrival_steps,
+        "interleaved_arrivals": any(step > 0 for step in per_request_arrival_steps),
         "seconds": elapsed,
         "tokens_per_second": e2e_tps,
         "end_to_end_tokens_per_second": e2e_tps,
@@ -1335,6 +1461,7 @@ def run_generation_batch(
         "fallback_tokens": fallback_tokens,
         "prefill_seconds": prefill_steps_seconds,
         "speculative": speculative_counts,
+        "scheduler_mtp_admission": scheduler_admission,
         "speculative_counts": {
             "drafts_proposed": speculative_counts.get("drafts_proposed", 0),
             "drafts_accepted": speculative_counts.get("drafts_accepted", 0),
@@ -1540,6 +1667,18 @@ def _run_benchmark_for_prompts(
             debug_spec=args.debug_spec,
             step_profile=step_profile,
             return_step_records=bool(getattr(args, "trace_steps", False)),
+            output_lengths=expand_ints(
+                parse_int_tuple(getattr(args, "output_lengths", "") or ""),
+                len(prompts),
+                int(args.max_tokens),
+                minimum=1,
+            ),
+            arrival_steps=expand_ints(
+                parse_int_tuple(getattr(args, "arrival_steps", "") or ""),
+                len(prompts),
+                0,
+                minimum=0,
+            ),
         )
         runs.append(run)
     return runs[-1]
@@ -1578,6 +1717,21 @@ def _run_next_step_sanity_check(
         }
 
     sanity_max_tokens = int(args.max_tokens) + 1
+    sanity_output_lengths = [
+        int(value) + 1
+        for value in expand_ints(
+            parse_int_tuple(getattr(args, "output_lengths", "") or ""),
+            len(prompts),
+            int(args.max_tokens),
+            minimum=1,
+        )
+    ]
+    sanity_arrival_steps = expand_ints(
+        parse_int_tuple(getattr(args, "arrival_steps", "") or ""),
+        len(prompts),
+        0,
+        minimum=0,
+    )
     sanity_t0 = time.perf_counter()
     baseline_t0 = time.perf_counter()
     baseline_next = run_generation_batch(
@@ -1592,6 +1746,8 @@ def _run_next_step_sanity_check(
         debug_spec=args.debug_spec,
         step_profile=False,
         return_step_records=False,
+        output_lengths=sanity_output_lengths,
+        arrival_steps=sanity_arrival_steps,
     )
     baseline_sanity_seconds = time.perf_counter() - baseline_t0
     mtp_t0 = time.perf_counter()
@@ -1607,6 +1763,8 @@ def _run_next_step_sanity_check(
         debug_spec=args.debug_spec,
         step_profile=False,
         return_step_records=False,
+        output_lengths=sanity_output_lengths,
+        arrival_steps=sanity_arrival_steps,
     )
     mtp_sanity_seconds = time.perf_counter() - mtp_t0
     sanity_seconds = time.perf_counter() - sanity_t0
@@ -1620,7 +1778,7 @@ def _run_next_step_sanity_check(
     for request_index, prompt_len in enumerate(prompt_lengths):
         baseline_tokens = baseline_next["token_ids_by_request"][request_index]
         mtp_tokens = mtp_next["token_ids_by_request"][request_index]
-        visible_count = min(int(args.max_tokens), len(baseline_tokens), len(mtp_tokens))
+        visible_count = min(int(sanity_output_lengths[request_index]) - 1, len(baseline_tokens), len(mtp_tokens))
         next_input_position = int(prompt_len + max(0, visible_count - 1))
         next_write_position = int(prompt_len + visible_count)
         committed_seq_len = int(prompt_len + visible_count)
@@ -1654,6 +1812,7 @@ def _run_next_step_sanity_check(
         "boundary": boundary_rows,
         "baseline_speculative_counts": baseline_next.get("speculative_counts", {}),
         "mtp_speculative_counts": mtp_next.get("speculative_counts", {}),
+        "mtp_scheduler_mtp_admission": mtp_next.get("scheduler_mtp_admission", {}),
     }
 
 
@@ -1780,6 +1939,9 @@ def _build_variant_rows(
             "end_to_end_speedup": baseline["seconds"] / max(1e-9, speculative["seconds"]),
             "acceptance_rate": speculative["speculative"].get("drafts_accepted", 0) / max(1, speculative["speculative"].get("drafts_proposed", 0)),
             "fallback_count": speculative["speculative_counts"].get("fallback_decode_steps", 0),
+            "accepted_step_count": speculative["speculative_counts"].get("accepted_decode_steps", 0),
+            "rejected_step_count": speculative["speculative_counts"].get("rejected_decode_steps", 0),
+            "fallback_step_count": speculative["speculative_counts"].get("fallback_decode_steps", 0),
             "host_time_ms": speculative["host_device_postprocess_ms"]["host_ms"],
             "runner_device_time_ms": speculative["host_device_postprocess_ms"]["device_ms"],
             "postprocess_time_ms": speculative["host_device_postprocess_ms"]["postprocess_ms"],
@@ -1805,6 +1967,7 @@ def _build_variant_rows(
             "decode_tokens": speculative["decode_tokens"],
             "prefill_tokens": speculative["step_profile"]["prefill"]["tokens"],
             "step_mode_counts": speculative["step_profile"]["mode_counts"],
+            "scheduler_mtp_admission": speculative["scheduler_mtp_admission"],
             "speculative": speculative["speculative"],
             "decode": {
                 "accepted": accepted_profile,
@@ -1826,6 +1989,13 @@ def _build_variant_rows(
                 "end_to_end_speedup": baseline["seconds"] / max(1e-9, speculative["seconds"]),
                 "acceptance_rate": speculative["speculative"].get("drafts_accepted", 0) / max(1, speculative["speculative"].get("drafts_proposed", 0)),
                 "fallback_count": speculative["speculative_counts"].get("fallback_decode_steps", 0),
+                "accepted_step_count": speculative["speculative_counts"].get("accepted_decode_steps", 0),
+                "rejected_step_count": speculative["speculative_counts"].get("rejected_decode_steps", 0),
+                "fallback_step_count": speculative["speculative_counts"].get("fallback_decode_steps", 0),
+                "scheduler_admission_reason": speculative["scheduler_mtp_admission"].get("reason"),
+                "scheduler_baseline_ewma_ms_per_token": speculative["scheduler_mtp_admission"].get("baseline_ewma_ms_per_token"),
+                "scheduler_spec_ewma_ms_per_token": speculative["scheduler_mtp_admission"].get("spec_ewma_ms_per_token"),
+                "measured_scheduler_speedup": speculative["scheduler_mtp_admission"].get("measured_scheduler_speedup"),
                 "host_time_ms": speculative["host_device_postprocess_ms"]["host_ms"],
                 "runner_device_time_ms": speculative["host_device_postprocess_ms"]["device_ms"],
                 "postprocess_time_ms": speculative["host_device_postprocess_ms"]["postprocess_ms"],
@@ -1874,6 +2044,8 @@ def main():
     dtype = choose_dtype(args.dtype, jax.default_backend())
     batch_prompts = max(1, int(args.batch_prompts))
     requested_prompt_lengths = parse_prompt_lengths(args.prompt_lengths)
+    requested_output_lengths = parse_int_tuple(args.output_lengths)
+    requested_arrival_steps = parse_int_tuple(args.arrival_steps)
     use_batch = batch_prompts > 1 or bool(requested_prompt_lengths)
     if use_batch:
         batch_size_buckets = tuple(sorted(set(batch_size_buckets + (batch_prompts,))))
@@ -1953,6 +2125,18 @@ def main():
     runner = engine.model_runner
     max_prefill_len = max(batch_prompt_lengths) if batch_prompt_lengths else args.prompt_length_min
     max_batch = len(benchmark_prompts)
+    benchmark_output_lengths = expand_ints(
+        requested_output_lengths,
+        len(benchmark_prompts),
+        int(args.max_tokens),
+        minimum=1,
+    )
+    benchmark_arrival_steps = expand_ints(
+        requested_arrival_steps,
+        len(benchmark_prompts),
+        0,
+        minimum=0,
+    )
     runner.warmup_compilation(max_prefill_len=max_prefill_len, max_batch=max_batch)
 
     warmup_summary = {
@@ -2072,6 +2256,7 @@ def main():
             "load_seconds": load_seconds,
             "warmup": warmup_summary,
             "warmed_shape_phase": warmup_summary["warmed_shape_phase"],
+            "warmup_resets_mtp_admission": hasattr(engine.scheduler, "reset_mtp_admission"),
             "benchmark_modes": _benchmark_modes_report(),
             "mtp_batch_accept_policy": os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
             "adaptive_mtp_gating_formula": "measured_decode_speedup = mtp_decode_tokens_per_second / baseline_decode_tokens_per_second; should_enable = measured_decode_speedup >= 1.0 + margin",
@@ -2082,6 +2267,9 @@ def main():
                 variant["correct"] for variant in variant_rows
             ),
             "batch_prompts": batch_prompts,
+            "output_lengths": benchmark_output_lengths,
+            "arrival_steps": benchmark_arrival_steps,
+            "interleaved_arrivals": any(step > 0 for step in benchmark_arrival_steps),
             "rows": rows,
             "acceptance_rate_mean": (
                 sum(
@@ -2172,6 +2360,7 @@ def main():
             "rows": rows,
             "warmup": warmup_summary,
             "warmed_shape_phase": warmup_summary["warmed_shape_phase"],
+            "warmup_resets_mtp_admission": hasattr(engine.scheduler, "reset_mtp_admission"),
             "benchmark_modes": _benchmark_modes_report(),
             "mtp_batch_accept_policy": os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
             "adaptive_mtp_gating_formula": "measured_decode_speedup = mtp_decode_tokens_per_second / baseline_decode_tokens_per_second; should_enable = measured_decode_speedup >= 1.0 + margin",
@@ -2193,6 +2382,14 @@ def main():
             "end_to_end_speedup": primary_variant["end_to_end_speedup"],
             "acceptance_rate": primary_variant["acceptance_rate"],
             "fallback_count": primary_variant["fallback_count"],
+            "accepted_step_count": primary_variant["accepted_step_count"],
+            "rejected_step_count": primary_variant["rejected_step_count"],
+            "fallback_step_count": primary_variant["fallback_step_count"],
+            "end_to_end_tok_s": primary_variant["mtp_end_to_end_tps"],
+            "scheduler_admission_reason": primary_variant.get("scheduler_mtp_admission", {}).get("reason"),
+            "scheduler_baseline_ewma_ms_per_token": primary_variant.get("scheduler_mtp_admission", {}).get("baseline_ewma_ms_per_token"),
+            "scheduler_spec_ewma_ms_per_token": primary_variant.get("scheduler_mtp_admission", {}).get("spec_ewma_ms_per_token"),
+            "measured_scheduler_speedup": primary_variant.get("scheduler_mtp_admission", {}).get("measured_scheduler_speedup"),
             "host_time_ms": primary_variant["host_time_ms"],
             "runner_device_time_ms": primary_variant["runner_device_time_ms"],
             "postprocess_time_ms": primary_variant["postprocess_time_ms"],
