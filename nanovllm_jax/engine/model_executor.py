@@ -660,7 +660,8 @@ class ModelExecutor:
                 verify_positions = jnp.concatenate([positions, positions + 1], axis=1)
                 row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
                 row_valid = row_query_lens > 0
-                verify_query_lens = row_query_lens * 2
+                row_has_draft = row_valid & (draft_token_arg >= 0)
+                verify_query_lens = row_query_lens + row_has_draft.astype(jnp.int32)
                 verify_query_start_loc = jnp.concatenate(
                     [
                         jnp.zeros((1,), dtype=jnp.int32),
@@ -676,7 +677,7 @@ class ModelExecutor:
                     num_prefill_tokens=0 if one_pass_decode_mode else jnp.sum(verify_query_lens),
                     num_decode_tokens=jnp.sum(verify_query_lens) if one_pass_decode_mode else 0,
                     block_tables=block_tables,
-                    seq_lens=seq_lens + row_valid.astype(jnp.int32),
+                    seq_lens=seq_lens + row_has_draft.astype(jnp.int32),
                 )
                 verify_metadata = self.backend.build_attention_metadata(
                     positions=verify_batch.positions,
@@ -714,7 +715,7 @@ class ModelExecutor:
                 token_ids = jnp.argmax(verify_logits[:, :2], axis=-1).astype(jnp.int32)
                 target_token = token_ids[:, 0]
                 bonus_token = token_ids[:, 1]
-                accepted = (target_token == draft_token_arg) & row_valid
+                accepted = (target_token == draft_token_arg) & row_has_draft
                 if batch_accept_policy == "all_or_none":
                     accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
                 if bonus_margin_threshold > 0:
@@ -819,11 +820,12 @@ class ModelExecutor:
                 )
 
                 # Slot 0 is the canonical current-token write for every active row.
-                # Rejected rows restore only the speculative draft slot. Inactive
-                # padded rows keep the verifier cache value to avoid duplicate dummy
-                # slot restores clobbering another active row's current-token write.
+                # Rejected rows with a real draft restore only the speculative
+                # draft slot. Inactive padded rows and no-draft probe rows keep
+                # the verifier cache value to avoid duplicate dummy slot restores
+                # clobbering another active row's current-token write.
                 slot_draft = verify_metadata.slot_mapping[:, 1]
-                keep_draft_slot = accepted | (~row_valid)
+                keep_draft_slot = accepted | (~row_valid) | (~row_has_draft)
                 selected_k_cache = restore_slots(updated_kv_state.k_cache, k_cache, slot_draft, keep_draft_slot)
                 selected_v_cache = restore_slots(updated_kv_state.v_cache, v_cache, slot_draft, keep_draft_slot)
                 committed_seq_lens = seq_lens + accepted.astype(jnp.int32)

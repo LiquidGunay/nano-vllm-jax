@@ -237,3 +237,54 @@ next draft. This reduces split verifier-plus-fallback overhead for mixed batches
 on the interleaved B=4 workload the always-on MTP path improved from the earlier
 `68.90 tok/s` to `89.66 tok/s`, but it still does not beat the `95.25 tok/s`
 baseline when acceptance is `0%`.
+
+## Mixed B>1 layout analysis
+
+Follow-up date: 2026-05-10.
+
+The mixed/heterogeneous serving problem is not that logical rows have different
+lengths. The scheduler already keeps a fixed physical bucket and expresses
+logical work through row masks, `query_start_loc`, `seq_lens`, and block tables.
+The problem is that K=1 MTP has different logical work per row:
+
+- inactive padded row: 0 target tokens,
+- baseline/probe row without a stored draft: 1 target token,
+- MTP row with a stored draft: 2 target tokens, current plus draft.
+
+The physical JAX shape can remain `[B, 2]`, but the logical verifier length must
+be `{0, 1, 2}` per row. The executor now treats forced-reject probe rows
+(`draft_token < 0`) as logical length 1:
+
+- `verify_query_lens = row_query_lens + row_has_draft`,
+- verifier `seq_lens` advance only for rows with a real draft lane,
+- rows without a real draft cannot accept,
+- dummy draft slots are not restored over potentially shared inactive slots.
+
+This is the correct layout invariant for mixed serving: physical shape is static
+for JIT, while logical work and cache ownership are row-local.
+
+Benchmark outcome: this layout fix is correctness-clean but not a standalone
+speedup. The interleaved B=4 workload stayed below baseline within run variance.
+An attempted conditional-logits version that skipped second-position vocab logits
+on all-reject verifier steps also did not help; XLA control-flow overhead and the
+small number of speculative steps outweighed any savings, so it was not kept.
+
+Exact commit-select was also tested as an alternative logical layout: first
+decode every row, then run the second target decode only for accepted rows. It is
+semantically attractive but too slow on v6e-1 for this engine:
+
+| workload | path | baseline decode tok/s | MTP decode tok/s | speedup | acceptance | correct |
+|---|---|---:|---:|---:|---:|---|
+| interleaved B=4, low acceptance | commit-select | 99.07 | 89.64 | 0.905x | 0.0% | yes |
+| counting B=4, high acceptance | commit-select | 213.99 | 81.28 | 0.380x | 60.6% reported, 80.0% bucket | yes |
+
+Conclusion: for B>1, the one-pass verifier is still the best current path, but
+its two-token target-model cost is too close to or above 2x the one-token
+baseline cost. A robust B>1 MTP speedup needs real kernel/logit-path work:
+
+- avoid full second-position LM-head work for rows that cannot accept without
+  adding expensive dynamic control flow,
+- specialize a packed verifier kernel where logical token count, not rectangular
+  `[B, 2]` width, drives expensive layer work,
+- keep per-bucket adaptive gating so low-acceptance B>1 traffic quickly falls
+  back to baseline.
