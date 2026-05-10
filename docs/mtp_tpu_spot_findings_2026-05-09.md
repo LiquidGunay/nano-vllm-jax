@@ -516,3 +516,38 @@ Next bottlenecks:
 2. Baseline admission stats need to be seeded for every active-row bucket used by serving, not just full B=4. Otherwise B=3/B=2/B=1 buckets remain in `warming` and can keep admitting speculative decode after B=4 is gated.
 3. The benchmark should report the active bucket used for the primary timed result and should not surface the last-bucket legacy scheduler fields as if they represented the whole workload.
 4. Real speedup likely requires improving accepted-path device time or increasing accepted tokens per verifier without raising fallback cost. K=2 correctness is now unblocked, so the next speed work should target fallback parity and per-bucket gate coverage before trying wider K.
+
+## 2026-05-10 fallback classification follow-up
+
+Patch summary:
+
+- Added speculative counters for `fallback_gated_no_spec_steps`, `fallback_seeded_main_steps`, and `fallback_partial_rows`.
+- Partial rows left unresolved after a fused verifier now run `_run_main_and_sample(..., seed_mtp1=False)` so they take the baseline-safe path instead of paying hidden-return/MTP-seeding cost.
+- Benchmark step records now label no-accept/no-reject decode steps as `fallback_seeded_main`, `fallback_gated_no_spec`, `fallback_partial_rows`, or generic `fallback`.
+
+TPU validation:
+
+- `python3 -m py_compile nanovllm_jax/engine/model_runner.py benchmark_mtp1_engine.py` passed on TPU.
+- `python3 -m pytest tests/test_mtp_commit_semantics.py -q` passed on TPU: 16 passed.
+
+Short homogeneous B=4 K=2 run after this patch:
+
+| metric | value |
+| --- | ---: |
+| exact token match | yes |
+| next-step sanity | yes |
+| baseline decode tok/s | 218.06 |
+| K=2 MTP decode tok/s | 98.89 |
+| decode speedup | 0.453x |
+| acceptance | 66.00% |
+| B=4 gate decision | `low_throughput` |
+| B=4 measured scheduler speedup | 0.325x |
+| `fallback_gated_no_spec_steps` | 18 |
+| `fallback_seeded_main_steps` | 5 |
+| `fallback_partial_rows` | 7 |
+
+Interpretation:
+
+- The patch improves observability and prevents one avoidable seeded partial fallback path, but it does not produce a speedup.
+- The main remaining issue is structural: rowwise speculative decode desynchronizes rows and the current scheduler/benchmark then spends many steps in non-ideal fallback or underfilled buckets.
+- For serving, the next design fix is not another MTP head tweak. It is better bucket/backfill policy plus per-active-row baseline seeding, so when a bucket is gated off it stays on a known-fast no-spec path and the report does not confuse B=4 results with B=1/B=2 tail buckets.

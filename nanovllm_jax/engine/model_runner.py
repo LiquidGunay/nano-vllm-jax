@@ -984,6 +984,9 @@ class CanonicalModelRunner:
             "drafts_rejected": 0,
             "bonus_tokens": 0,
             "fallback_steps": 0,
+            "fallback_gated_no_spec_steps": 0,
+            "fallback_seeded_main_steps": 0,
+            "fallback_partial_rows": 0,
             "draft_position_proposed": [],
             "draft_position_accepted": [],
         }
@@ -3641,11 +3644,14 @@ class CanonicalModelRunner:
                         outputs[row] = value
                     fallback_rows = [row for row in range(len(seqs)) if outputs[row] is None]
                     if fallback_rows:
+                        stats = self._speculative_stats()
+                        stats["fallback_partial_rows"] += len(fallback_rows)
+                        stats["fallback_gated_no_spec_steps"] += 1
                         fallback_batch = self._masked_decode_batch(batch, fallback_rows)
                         fallback_outputs = self._run_main_and_sample(
                             seqs,
                             fallback_batch,
-                            seed_mtp1=self.mtp1_enabled and seed_mtp1,
+                            seed_mtp1=False,
                         )
                         for row in fallback_rows:
                             outputs[row] = fallback_outputs[row]
@@ -3673,14 +3679,24 @@ class CanonicalModelRunner:
             if not can_seed_for_decode_shape:
                 self._clear_mtp1_drafts_for_rows(seqs, admitted_mtp_rows)
 
+            main_seed_mtp1 = (
+                self.mtp1_enabled
+                and seed_mtp1
+                and can_seed_for_decode_shape
+            )
+            stats = self._speculative_stats()
+            if main_seed_mtp1:
+                stats["fallback_seeded_main_steps"] += 1
+            elif self.mtp1_enabled and not batch.is_prefill:
+                stats["fallback_gated_no_spec_steps"] += 1
             return self._run_main_and_sample(
                 seqs,
                 batch,
-                seed_mtp1=self.mtp1_enabled
-                and seed_mtp1
-                and can_seed_for_decode_shape,
+                seed_mtp1=main_seed_mtp1,
             )
 
+        if self.mtp1_enabled and not batch.is_prefill and not admitted_mtp_rows:
+            self._speculative_stats()["fallback_gated_no_spec_steps"] += 1
         return self._run_main_and_sample(
             seqs,
             batch,

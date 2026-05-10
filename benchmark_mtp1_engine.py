@@ -1379,6 +1379,9 @@ def run_generation_batch(
             if num_tokens < 0:
                 delta_accepted = post["drafts_accepted"] - pre["drafts_accepted"]
                 delta_rejected = post["drafts_rejected"] - pre["drafts_rejected"]
+                delta_fallback_gated = post.get("fallback_gated_no_spec_steps", 0) - pre.get("fallback_gated_no_spec_steps", 0)
+                delta_fallback_seeded = post.get("fallback_seeded_main_steps", 0) - pre.get("fallback_seeded_main_steps", 0)
+                delta_fallback_partial_rows = post.get("fallback_partial_rows", 0) - pre.get("fallback_partial_rows", 0)
                 if delta_accepted > 0:
                     branch = "mtp_accepted"
                     accepted_steps.append(step_record)
@@ -1386,13 +1389,23 @@ def run_generation_batch(
                     branch = "mtp_rejected"
                     rejected_steps.append(step_record)
                 else:
-                    branch = "fallback"
+                    if delta_fallback_seeded > 0:
+                        branch = "fallback_seeded_main"
+                    elif delta_fallback_gated > 0:
+                        branch = "fallback_gated_no_spec"
+                    elif delta_fallback_partial_rows > 0:
+                        branch = "fallback_partial_rows"
+                    else:
+                        branch = "fallback"
                     fallback_steps.append(step_record)
                 step_record["mtp_branch"] = branch
                 step_record["drafts_accepted_delta"] = delta_accepted
                 step_record["drafts_rejected_delta"] = delta_rejected
                 step_record["drafts_proposed_delta"] = post["drafts_proposed"] - pre["drafts_proposed"]
                 step_record["bonus_tokens_delta"] = post["bonus_tokens"] - pre["bonus_tokens"]
+                step_record["fallback_gated_no_spec_delta"] = delta_fallback_gated
+                step_record["fallback_seeded_main_delta"] = delta_fallback_seeded
+                step_record["fallback_partial_rows_delta"] = delta_fallback_partial_rows
             else:
                 step_record["mtp_branch"] = "prefill"
                 prefill_steps.append(step_record)
