@@ -27,6 +27,11 @@ Every result below passed exact token match and next-step sanity for its own sam
 | `measured_gate_0p8b_b4` | 0.8B B=4 | Scheduler speed gate at `min_speedup=1.0` | 369.94 | 370.66 | 1.002x | 0.0% | 0.00 | 0.00 | 2.59 |
 | `safe_forced_0p8b_b16` | 0.8B B=16 | Current exact forced K=1 at larger batch | 822.18 | 546.17 | 0.664x | 57.1% | 1.17 | 2.29 | 3.21 |
 | `safe_forced_4b_b4` | 4B B=4 | Current exact forced K=1 at larger model | 211.09 | 169.39 | 0.802x | 62.5% | 4.68 | 9.04 | 8.56 |
+| `native_width2_4b_b4` | 4B B=4 | Larger model with native width-2 verifier math | 210.25 | 188.35 | 0.896x | 62.5% | 4.06 | 7.53 | n/a |
+| `native_width2_4b_b1_manual` | 4B B=1 | Small-batch manual prompt, native width-2 | 70.91 | 70.67 | 0.997x | 62.5% | 11.43 | 21.80 | n/a |
+| `safe_width1_4b_b1_synthetic` | 4B B=1 | High-acceptance synthetic prompt, safe width-1 | 69.91 | 79.17 | 1.132x | 87.5% | 12.35 | 0.00 | n/a |
+| `native_width2_4b_b1_synthetic` | 4B B=1 | High-acceptance synthetic prompt, native width-2 | 70.58 | 84.67 | 1.200x | 87.5% | 11.50 | 0.00 | n/a |
+| `safe_width1_4b_b1_synthetic_gate` | 4B B=1 | Same synthetic prompt with default measured gate | 68.82 | 77.85 | 1.131x | 87.5% | n/a | 0.00 | n/a |
 
 ## Per-change interpretation
 
@@ -145,6 +150,53 @@ Result: exact but still slower, `0.802x`.
 
 The larger model improves the ratio compared with 0.8B B=4, but not enough. Accepted-step p50 is still around baseline per emitted token, and rejected/fallback paths are still roughly 2x baseline.
 
+### 4B native width-2 verifier math
+
+Result: exact at B=4 and closer to baseline, `0.896x`, but still not a speedup.
+
+Native width-2 verifier math reduces accepted and rejected latency:
+
+```text
+safe 4B B=4 accepted p50 = 4.68 ms/tok
+native 4B B=4 accepted p50 = 4.06 ms/tok
+safe 4B B=4 rejected p50 = 9.04 ms/tok
+native 4B B=4 rejected p50 = 7.53 ms/tok
+```
+
+This is not robust as a global default. The same native width-2 mode still fails exact token matching at 0.8B B=16. It can be considered only for narrow shapes where same-shape parity is proven.
+
+### First valid speedup: high-acceptance 4B B=1
+
+Result: exact K=1 MTP speedup exists when acceptance is high enough.
+
+The synthetic B=1 4B prompt suite produced `87.5%` acceptance and no rejected steps. Results:
+
+```text
+safe width-1:   69.91 -> 79.17 tok/s, 1.132x
+native width-2: 70.58 -> 84.67 tok/s, 1.200x
+```
+
+The default measured gate also preserved the speedup on this case:
+
+```text
+baseline decode = 68.82 tok/s
+gated MTP decode = 77.85 tok/s
+decode speedup = 1.131x
+scheduler measured speedup = 1.229x
+accepted decode steps = 7
+rejected decode steps = 0
+fallback decode steps = 1
+```
+
+Manual and real B=1 4B prompts stayed near parity but did not cross it:
+
+```text
+manual: 0.997x at 62.5% acceptance
+real:   0.991x at 62.5% acceptance
+```
+
+This changes the conclusion: K=1 speedup is achievable, but only for high-acceptance small-batch workloads with the current executor. For ordinary prompts around `62.5%` acceptance, the rejected/fallback overhead still erases the gain.
+
 ## Break-even calculation
 
 For K=1, using emitted-token latency:
@@ -185,7 +237,7 @@ The 4B threshold is slightly better but still too tight for real serving because
 
 ## Conclusion
 
-The controlled experiments do not show a forced K=1 MTP speedup with the current exact implementation.
+The controlled experiments show a valid K=1 MTP speedup only in high-acceptance small-batch 4B workloads.
 
 The viable next implementation target is narrow:
 
@@ -200,6 +252,6 @@ The current blockers are:
 - rejected/fallback rows are around 2x baseline latency,
 - native width-2 math helps only slightly and is not robust across batch shapes,
 - larger batch sizes improve baseline more than MTP,
-- larger model size helps the ratio but does not make forced K=1 profitable.
+- larger model size helps the ratio, and becomes profitable only when acceptance is high enough.
 
 The current default measured gate is the correct serving behavior until the executor has a cheaper exact verifier path.
