@@ -19,6 +19,8 @@ Every result below passed exact token match and next-step sanity for its own sam
 | Experiment | Model / shape | Change tested | Baseline decode tok/s | MTP decode tok/s | Speedup | Acceptance | Accepted p50 ms/tok | Rejected p50 ms/tok | Fallback p50 ms/tok |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|
 | `safe_forced_0p8b_b4` | 0.8B B=4 | Current exact forced K=1 path | 362.36 | 275.08 | 0.759x | 62.5% | 2.78 | 5.43 | 5.67 |
+| `afterdraft_final_0p8b_b4` | 0.8B B=4 | Accepted rows use final verifier state, not token-1 prefix state | 336.49 | 261.69 | 0.778x | 62.5% | 2.87 | 5.66 | 6.20 |
+| `prefix_first_only_0p8b_b4` | 0.8B B=4 | Temporary experiment: materialize token-0 prefix state only | 354.29 | 138.04 | 0.390x | 62.5% | 2.99 | 5.84 | 6.10 |
 | `native_width2_0p8b_b4` | 0.8B B=4 | Disable width-1 decode math | 351.42 | 279.96 | 0.797x | 62.5% | 2.69 | 5.28 | 5.78 |
 | `fast_all_accept_0p8b_b4` | 0.8B B=4 | Cheap fast verifier, repair rejected rows | 362.08 | 239.71 | 0.662x | 62.5% | 2.75 | 9.69 | 5.63 |
 | `commit_select_0p8b_b4` | 0.8B B=4 | Explicit commit-select verifier | 362.40 | 273.63 | 0.755x | 62.5% | 2.81 | 5.19 | 5.81 |
@@ -53,6 +55,34 @@ absolute speedup change = +0.038x
 ```
 
 This is not a safe serving default. Earlier B=16 tests showed native width-2 decode math can diverge from the same-shape baseline; width-1 decode math is still required for robust exactness across larger physical batch shapes.
+
+### Accepted rows use final verifier state
+
+Result: exact and roughly neutral, `0.778x` in this run.
+
+This change removes the need to read token-1 prefix hybrid state for accepted rows. Accepted rows can use `updated_hybrid_state`, the final state after the two-token verifier. Rejected rows still need token-0 prefix state.
+
+This is retained because it simplifies the invariant:
+
+```text
+accepted row: final verifier state
+rejected row: token-0 prefix verifier state
+```
+
+The measured speed is within run-to-run noise of the safe forced path and does not solve the speedup problem by itself.
+
+### Token-0-only prefix materialization
+
+Result: exact but much slower, `0.390x`; not retained.
+
+The experiment tried to materialize only token-0 prefix state and broadcast it through the prefix-state shape because accepted rows no longer need token-1 prefix state. XLA produced a much worse graph:
+
+```text
+safe forced MTP decode = 275.08 tok/s
+prefix-first-only MTP decode = 138.04 tok/s
+```
+
+This rules out the naive "return less prefix state by broadcasting token 0" implementation. A useful implementation would need a separate verifier return type or kernel path, not shape-compatible dummy prefix state.
 
 ### Fast all-accept verifier
 
@@ -173,4 +203,3 @@ The current blockers are:
 - larger model size helps the ratio but does not make forced K=1 profitable.
 
 The current default measured gate is the correct serving behavior until the executor has a cheaper exact verifier path.
-

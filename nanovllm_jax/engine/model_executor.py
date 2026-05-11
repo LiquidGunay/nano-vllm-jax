@@ -775,12 +775,8 @@ class ModelExecutor:
                     else None,
                 )
                 hybrid_after_draft = HybridLayerState(
-                    conv_state=prefix_hybrid_state.conv_state[:, 1]
-                    if prefix_hybrid_state.conv_state is not None
-                    else updated_hybrid_state.conv_state,
-                    recurrent_state=prefix_hybrid_state.recurrent_state[:, 1]
-                    if prefix_hybrid_state.recurrent_state is not None
-                    else updated_hybrid_state.recurrent_state,
+                    conv_state=updated_hybrid_state.conv_state,
+                    recurrent_state=updated_hybrid_state.recurrent_state,
                 )
 
                 def restore_slots(new_cache, old_cache, slots, keep_new):
