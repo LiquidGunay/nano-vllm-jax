@@ -745,15 +745,26 @@ class ModelExecutor:
                     pos_next_after_accept,
                     pos_next_after_reject,
                 )
-                next_mtp_logits, _ = mtp_forward(
-                    hidden_state=selected_mtp_hidden,
-                    next_token_ids=selected_mtp_token[:, None],
-                    embed_tokens=params.embed_tokens,
-                    params=params.mtp_params,
-                    config=self.config,
-                    positions=selected_mtp_position[:, None],
+                def run_next_mtp(_):
+                    next_mtp_logits, _ = mtp_forward(
+                        hidden_state=selected_mtp_hidden,
+                        next_token_ids=selected_mtp_token[:, None],
+                        embed_tokens=params.embed_tokens,
+                        params=params.mtp_params,
+                        config=self.config,
+                        positions=selected_mtp_position[:, None],
+                    )
+                    return jnp.argmax(next_mtp_logits[:, 0], axis=-1).astype(jnp.int32)
+
+                def skip_next_mtp(_):
+                    return jnp.full_like(target_token, -1)
+
+                next_draft_token = jax.lax.cond(
+                    jnp.any(accepted),
+                    run_next_mtp,
+                    skip_next_mtp,
+                    operand=None,
                 )
-                next_draft_token = jnp.argmax(next_mtp_logits[:, 0], axis=-1).astype(jnp.int32)
 
                 hybrid_after_current = HybridLayerState(
                     conv_state=prefix_hybrid_state.conv_state[:, 0]
@@ -1600,15 +1611,26 @@ class ModelExecutor:
                     pos_next_after_accept,
                     pos_next_after_reject,
                 )
-                mtp_logits, _ = mtp_forward(
-                    hidden_state=selected_mtp_hidden,
-                    next_token_ids=selected_mtp_token[:, None],
-                    embed_tokens=params.embed_tokens,
-                    params=params.mtp_params,
-                    config=self.config,
-                    positions=selected_mtp_position[:, None],
+                def run_next_mtp(_):
+                    mtp_logits, _ = mtp_forward(
+                        hidden_state=selected_mtp_hidden,
+                        next_token_ids=selected_mtp_token[:, None],
+                        embed_tokens=params.embed_tokens,
+                        params=params.mtp_params,
+                        config=self.config,
+                        positions=selected_mtp_position[:, None],
+                    )
+                    return jnp.argmax(mtp_logits[:, 0], axis=-1).astype(jnp.int32)
+
+                def skip_next_mtp(_):
+                    return jnp.full_like(target_token, -1)
+
+                next_draft_token = jax.lax.cond(
+                    jnp.any(accepted),
+                    run_next_mtp,
+                    skip_next_mtp,
+                    operand=None,
                 )
-                next_draft_token = jnp.argmax(mtp_logits[:, 0], axis=-1).astype(jnp.int32)
                 output_accepted = jnp.where(row_valid, accepted, True)
                 verify_slots = verify_metadata.slot_mapping[:, :2].reshape((-1,))
                 slot_accept = jnp.repeat(accepted, 2)

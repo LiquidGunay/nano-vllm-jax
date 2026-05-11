@@ -2827,7 +2827,7 @@ class CanonicalModelRunner:
             ]
             commit_rejected_directly = (
                 use_one_pass_k1
-                and os.environ.get("NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED", "1")
+                and os.environ.get("NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED", "0")
                 in {"1", "true", "yes", "on", "True"}
             )
 
@@ -3259,7 +3259,14 @@ class CanonicalModelRunner:
                 outputs[row] = target_tokens[idx]
 
             emitted_bonus = accepted and not disable_bonus
-            can_seed_next_chain = prefix_len < draft_len or seed_after_bonus
+            if draft_len == 1:
+                # The rejected-row next-draft invariant is not proven for K=1:
+                # direct rejected commit is correct only when the following
+                # step falls back to a normal decode. Seeding the verifier's
+                # rejected-row next_draft_token causes visible token drift.
+                can_seed_next_chain = accepted and seed_after_bonus
+            else:
+                can_seed_next_chain = prefix_len < draft_len or seed_after_bonus
             if (
                 self.mtp1_enabled
                 and seq.temperature == 0
@@ -3608,7 +3615,7 @@ class CanonicalModelRunner:
                 one_pass_available_for_partial
                 and (not force_commit_select or allow_mixed_fused or not full_physical_batch)
             )
-            k1_commit_rejected_enabled = os.environ.get("NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED", "1") in {
+            k1_commit_rejected_enabled = os.environ.get("NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED", "0") in {
                 "1",
                 "true",
                 "yes",

@@ -421,7 +421,7 @@ def test_k1_commit_accept_reject_and_mixed_rows(monkeypatch):
         [[700, 701, 702], [701, 702, 703], [702, 703, 704]],
     )
     assert runner.stats == {
-        "drafts_proposed": 1,
+        "drafts_proposed": 0,
         "drafts_accepted": 2,
         "drafts_rejected": 1,
         "bonus_tokens": 2,
@@ -434,7 +434,7 @@ def test_k1_commit_accept_reject_and_mixed_rows(monkeypatch):
         [1010.0, 2011.0],
         [1020.0, 1021.0],
     ]
-    assert runner._mtp1_drafts == {1: 301}
+    assert runner._mtp1_drafts == {}
 
 
 def test_k1_commit_ignores_inactive_padded_rows(monkeypatch):
@@ -585,19 +585,19 @@ def test_k1_forced_reject_probe_row_is_logical_one_token(monkeypatch):
     assert outputs == {0: [10, 20], 1: 101, 2: [12, 22]}
     assert runner.executor.calls[-1]["draft_token"] == [10, -1, 12]
     assert runner.stats == {
-        "drafts_proposed": 1,
+        "drafts_proposed": 0,
         "drafts_accepted": 2,
         "drafts_rejected": 0,
         "bonus_tokens": 2,
     }
-    assert runner._mtp1_drafts == {1: 301}
+    assert runner._mtp1_drafts == {}
     assert runner.stored[-1][0].seq_lens.tolist() == committed_seq_lens
 
 
 def test_k1_commit_consecutive_reject(monkeypatch):
     runner, first_outputs = _run_case(monkeypatch, accepted=[False], target=[111], next_draft=[211], block_size=16)
     assert first_outputs == {0: 111}
-    assert runner._mtp1_drafts == {0: 211}
+    assert runner._mtp1_drafts == {}
 
     runner, second_outputs = _run_case(
         monkeypatch,
@@ -608,7 +608,7 @@ def test_k1_commit_consecutive_reject(monkeypatch):
         block_size=16,
     )
     assert second_outputs == {0: 112}
-    assert runner._mtp1_drafts == {0: 212}
+    assert runner._mtp1_drafts == {}
     assert runner.stats["drafts_rejected"] == 1
 
 
@@ -633,7 +633,7 @@ def test_k1_commit_accept_then_reject(monkeypatch):
         block_size=16,
     )
     assert rejected_outputs == {0: 31}
-    assert runner._mtp1_drafts == {0: 32}
+    assert runner._mtp1_drafts == {}
 
 
 def test_k1_commit_reject_then_accept(monkeypatch):
@@ -645,7 +645,7 @@ def test_k1_commit_reject_then_accept(monkeypatch):
         block_size=16,
     )
     assert rejected_outputs == {0: 40}
-    assert runner._mtp1_drafts == {0: 50}
+    assert runner._mtp1_drafts == {}
 
     runner, accepted_outputs = _run_case(
         monkeypatch,

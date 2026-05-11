@@ -6,6 +6,7 @@ This roadmap is grouped by work type. It is not a production-readiness claim.
 
 - Keep `tests/test_mtp_commit_semantics.py` passing on TPU.
 - Preserve K=1 accept/reject commit invariants across block boundaries and inactive rows.
+- Preserve the K=1 rejected-row no-reseed invariant until rejected-row next-draft state is formally proven.
 - Keep target logits sourced from the canonical executor forward-step contract.
 - Add coverage for per-bucket MTP admission behavior once EWMA is bucketed.
 - Keep K=2 correctness tests, but do not promote K=2 to serving policy without speed evidence.
@@ -33,6 +34,7 @@ This roadmap is grouped by work type. It is not a production-readiness claim.
 - Reduce host synchronization in token materialization and MTP accounting.
 - Improve bucket-specific admission decisions.
 - Investigate K=1 overhead in rejected and fallback steps.
+- Implement a safe fast K=1 verifier that can commit rejected rows from after-current-token state without full repair decode.
 - Treat K=2 as optimization research only until it beats K=1/baseline in valid benchmarks.
 - Avoid dedicated TPU-kernel claims; current accelerator path is JAX/XLA on TPU.
 

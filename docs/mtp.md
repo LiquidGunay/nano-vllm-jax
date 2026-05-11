@@ -6,12 +6,12 @@ Do not describe the current MTP path as production-ready.
 
 ## Current validated state
 
-Validated on 2026-05-09/2026-05-10 repo state:
+Validated on 2026-05-09 through 2026-05-11 repo state:
 
 - hardware: TPU v6e-1,
-- model: `Qwen/Qwen3.5-4B`, BF16, real weights,
+- models: `Qwen/Qwen3.5-0.8B` and `Qwen/Qwen3.5-4B`, BF16, real weights,
 - execution: JIT on the pure JAX/XLA TPU backend,
-- correctness test: `tests/test_mtp_commit_semantics.py` passed `13/13` on TPU,
+- correctness test: `tests/test_mtp_commit_semantics.py` passed `16/16` on TPU,
 - serving policy: K=1, scheduler-owned admission, latency EWMA gate.
 
 Remaining serving gap:
@@ -66,6 +66,28 @@ The scheduler owns whether MTP is admitted for a row. Admission should consider:
 - bucket and shape eligibility.
 
 Current implementation gates with acceptance and measured latency, but the latency EWMA is still global. Per-bucket EWMA remains pending.
+
+## 2026-05-11 K=1 speed status
+
+The corrected K=1 path is exact but does not yet beat baseline when MTP is forced on.
+
+Validated TPU v6e-1 results, `Qwen/Qwen3.5-0.8B`, BF16, real weights, JIT, warmed shapes:
+
+- homogeneous B=4, prompt length 16, output length 16: exact token match passed, next-step sanity passed, baseline decode `347.84-364.65 tok/s`, forced K=1 decode `271.43-282.93 tok/s`, speedup `0.776-0.780x`, acceptance `62.5%`.
+- mixed/interleaved B=4, prompt lengths `16,17,31,32`, arrivals `0,0,2,4`, output length 12: exact token match passed, next-step sanity passed, baseline decode `238.71 tok/s`, forced K=1 decode `141.88 tok/s`, speedup `0.594x`, acceptance `38.9%`.
+- measured-speed gate with `NANO_VLLM_JAX_MTP_MIN_SPEEDUP=1.0`: exact token match passed and decode throughput was effectively parity, `362.76 tok/s` baseline vs `362.72 tok/s` gated K=1, because admission disabled speculative decode after measured throughput was below threshold.
+
+Current blocker:
+
+```text
+Accepted K=1 steps can be slightly faster per emitted token than baseline.
+Rejected and fallback K=1 steps are much slower per emitted token, so forced MTP
+needs a high acceptance rate to break even.
+```
+
+Do not seed a follow-up K=1 draft after a rejected row unless the rejected-row next-draft state invariant is proven. The current safe policy commits the target token and leaves no draft behind for rejected K=1 rows.
+
+The next implementation target is a safe fast verifier that preserves the cheap accepted path while exposing an after-current-token state for rejected rows. Without that prefix state, fast rejected rows must either be repaired or left uncommitted, which removes the expected K=1 speedup.
 
 ## Current K=2 status
 
