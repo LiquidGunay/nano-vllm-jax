@@ -675,3 +675,58 @@ Easy repetitive manual prompt, fast route, B=4, output 32:
 | yes | yes | 369.89 | 128.53 | 0.347x | 55.56% | 8 |
 
 The repetitive prompt did not produce the expected high-acceptance regime; it created many mixed/partial rows and was a poor K=1 workload.
+
+## 2026-05-11 K=1 threshold analysis and 4B measurements
+
+Patch summary:
+
+- Added `mixed_accept_reject_decode_steps` to the benchmark `speculative_counts` object so top-level required metrics match branch-mode summaries.
+- Kept forced-reject probes conservative. They are not enabled by the fast route by default because a mixed/interleaved test with fast repair plus probes failed exact token matching.
+- Removed the experimental fast-route plus commit-select repair serving path from the safe default path. It was correctness-sensitive for mixed rows and did not beat pure commit-select on homogeneous B=4.
+- Direct rejected-row commit remains available for the one-pass K=1 verifier path, guarded by `NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED=1`.
+
+Acceptance-threshold formula for K=1:
+
+```text
+B = baseline ms per emitted token
+A = accepted-step ms per emitted token
+R = rejected-step ms per emitted token
+p = accepted-step probability
+
+K=1 average ms/token = (2*p*A + (1-p)*R) / (1+p)
+
+Break-even threshold:
+p > (R - B) / (R + B - 2*A)
+```
+
+This uses emitted-token-normalized branch latency. Accepted K=1 steps emit two tokens per active row; rejected K=1 steps emit one token per active row.
+
+0.8B measured thresholds, homogeneous B=4, prompt 16, output 16:
+
+| route/model | baseline B | accepted A | rejected R | break-even acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| 0.8B fast route | 2.835 ms/tok | 2.326 ms/tok | 8.849 ms/tok | 85.5% |
+| 0.8B commit-select route | 2.847 ms/tok | 2.837 ms/tok | 5.144 ms/tok | 99.1% |
+| 0.8B ideal hybrid, fast accepted + commit rejected | 2.835 ms/tok | 2.326 ms/tok | 5.144 ms/tok | 69.4% |
+
+4B measured thresholds, homogeneous B=4, prompt 16, output 16:
+
+| route/model | baseline B | accepted A | rejected R | break-even acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| 4B fast route | 4.746 ms/tok | 3.874 ms/tok | 14.325 ms/tok | 84.6% |
+| 4B commit-select route | 4.698 ms/tok | 5.863 ms/tok | 9.099 ms/tok | impossible, threshold >100% |
+| 4B ideal hybrid, fast accepted + commit rejected | 4.746 ms/tok | 3.874 ms/tok | 9.099 ms/tok | 71.4% |
+
+4B TPU benchmark results:
+
+| route | exact | next-step sanity | baseline decode tok/s | K=1 decode tok/s | speedup | acceptance | accepted p50 ms/tok | rejected p50 ms/tok |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4B fast route | yes | yes | 210.72 | 163.82 | 0.777x | 62.50% | 3.87 | 14.33 |
+| 4B commit-select route | yes | yes | 212.86 | 154.47 | 0.726x | 55.56% | 5.86 | 9.10 |
+
+Interpretation:
+
+- We expected the threshold to fall on larger models only if the accepted verifier overhead and rejected repair overhead grew more slowly than baseline decode.
+- That is not what this pure-JAX implementation shows on 4B. The fast route keeps a similar accepted-step advantage versus baseline, but rejected work remains very expensive.
+- The practical threshold therefore stays roughly the same for the fast route: mid-80% acceptance on both 0.8B and 4B.
+- The route that can realistically beat baseline is still the ideal hybrid: keep fast accepted-step latency while committing rejected rows at commit-select-like cost without a second baseline repair decode.

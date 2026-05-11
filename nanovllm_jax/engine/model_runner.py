@@ -2825,19 +2825,11 @@ class CanonicalModelRunner:
                 output_acceptance[verifier_index_for_local[local_row]]
                 for local_row, row in enumerate(rows)
             ]
-            if not any(accepted_flags_local):
-                stats = self._speculative_stats()
-                for row in rows:
-                    seq = seqs[row]
-                    self._mtp1_drafts.pop(seq.seq_id, None)
-                    stats["drafts_rejected"] += 1
-                repair_batch = self._masked_decode_batch(batch, rows)
-                repair_outputs = self._run_main_and_sample(
-                    seqs,
-                    repair_batch,
-                    seed_mtp1=False,
-                )
-                return {row: repair_outputs[row] for row in rows}
+            commit_rejected_directly = (
+                use_one_pass_k1
+                and os.environ.get("NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED", "1")
+                in {"1", "true", "yes", "on", "True"}
+            )
 
             committed_batch = replace(decode_batch, seq_lens=output.committed_seq_lens)
             self.cache_storage = output.cache_storage
@@ -2845,6 +2837,7 @@ class CanonicalModelRunner:
             _ready(self._hybrid_state_table)
             self._record_kv_snapshot(committed_batch, output.hybrid_state)
 
+            target_values = [int(value) for value in output.target_token.tolist()]
             bonus_values = [int(value) for value in output.bonus_token.tolist()]
             next_draft_values = [int(value) for value in output.next_draft_token.tolist()]
             outputs: dict[int, List[int] | int] = {}
@@ -2869,7 +2862,11 @@ class CanonicalModelRunner:
                         stats["drafts_proposed"] += 1
                 else:
                     stats["drafts_rejected"] += 1
-                    repair_rows.append(row)
+                    if commit_rejected_directly:
+                        idx = verifier_index_for_local[local_row]
+                        outputs[row] = target_values[idx]
+                    else:
+                        repair_rows.append(row)
 
             if repair_rows:
                 repair_batch = self._masked_decode_batch(batch, repair_rows)
@@ -3611,12 +3608,26 @@ class CanonicalModelRunner:
                 one_pass_available_for_partial
                 and (not force_commit_select or allow_mixed_fused or not full_physical_batch)
             )
+            k1_commit_rejected_enabled = os.environ.get("NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED", "1") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+            allow_unsafe_forced_reject_probes = os.environ.get(
+                "NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_FORCED_REJECT_PROBES", "0"
+            ) in {"1", "true", "yes", "on", "True"}
+            can_commit_forced_reject_rows = force_commit_select or (
+                allow_unsafe_forced_reject_probes
+                and one_pass_expected
+                and k1_commit_rejected_enabled
+            )
             allow_forced_reject_probes = (
                 os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_FORCED_REJECT_PROBES", "0")
                 in {"1", "true", "yes", "on", "True"}
                 and batch_accept_policy == "rowwise"
-                and one_pass_expected
-                and not enable_rowwise_repair
+                and can_commit_forced_reject_rows
             )
             probe_rows = probe_candidate_rows if allow_forced_reject_probes and fused_rows else []
             verifier_row_set = set(fused_rows) | set(probe_rows)
