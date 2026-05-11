@@ -73,7 +73,8 @@ The corrected K=1 path is exact but does not yet beat baseline when MTP is force
 
 Validated TPU v6e-1 results, `Qwen/Qwen3.5-0.8B`, BF16, real weights, JIT, warmed shapes:
 
-- homogeneous B=4, prompt length 16, output length 16: exact token match passed, next-step sanity passed, baseline decode `347.84-364.65 tok/s`, forced K=1 decode `271.43-282.93 tok/s`, speedup `0.776-0.780x`, acceptance `62.5%`.
+- homogeneous B=4, prompt length 16, output length 16: exact token match passed, next-step sanity passed, baseline decode `353.57 tok/s`, forced K=1 decode `265.27 tok/s`, speedup `0.750x`, acceptance `62.5%`.
+- homogeneous B=16, prompt length 16, output length 16: exact token match passed, next-step sanity passed, baseline decode `772.84 tok/s`, forced K=1 decode `510.14 tok/s`, speedup `0.660x`, acceptance `57.1%`.
 - mixed/interleaved B=4, prompt lengths `16,17,31,32`, arrivals `0,0,2,4`, output length 12: exact token match passed, next-step sanity passed, baseline decode `238.71 tok/s`, forced K=1 decode `141.88 tok/s`, speedup `0.594x`, acceptance `38.9%`.
 - measured-speed gate with `NANO_VLLM_JAX_MTP_MIN_SPEEDUP=1.0`: exact token match passed and decode throughput was effectively parity, `362.76 tok/s` baseline vs `362.72 tok/s` gated K=1, because admission disabled speculative decode after measured throughput was below threshold.
 
@@ -88,6 +89,13 @@ needs a high acceptance rate to break even.
 Do not seed a follow-up K=1 draft after a rejected row unless the rejected-row next-draft state invariant is proven. The current safe policy commits the target token and leaves no draft behind for rejected K=1 rows.
 
 The next implementation target is a safe fast verifier that preserves the cheap accepted path while exposing an after-current-token state for rejected rows. Without that prefix state, fast rejected rows must either be repaired or left uncommitted, which removes the expected K=1 speedup.
+
+Batch-shape correctness note:
+
+- B=16 homogeneous forced K=1 diverged from the B=16 baseline when width-2 decode matmuls used their native shape.
+- Setting `NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH=1` restored exact token match and next-step sanity at B=16.
+- This is now the default for multi-token decode. It preserves the canonical width-1 baseline contract but raises the forced-MTP speedup threshold.
+- Hybrid prefix-cache execution is disabled, so allocation must also avoid sharing content-addressed full blocks. Otherwise repeated prompts in the same prefill wave can write duplicate rows into one physical KV block. The scheduler now passes `use_prefix_cache=False` to allocation when prefix-cache execution is disabled; blocks still keep local hashes for decode append bookkeeping, but they are not inserted into the shared prefix-cache map.
 
 ## Current K=2 status
 

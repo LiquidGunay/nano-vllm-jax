@@ -51,8 +51,14 @@ def _stable_rmsnorm_fp32(x: jnp.ndarray, weight: jnp.ndarray, eps: float) -> jnp
 
 
 def _force_width1_decode_math() -> bool:
-    """Opt-in diagnostic for width-1-shaped matmuls in multi-token decode."""
-    return os.environ.get("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH", "0") in {
+    """Use width-1-shaped matmuls in multi-token decode by default.
+
+    K=1 MTP verifies a width-2 decode block but must match the canonical
+    width-1 baseline token for every physical batch shape. TPU BF16 matmuls are
+    shape-sensitive enough that the width-2 verifier can diverge at larger
+    batches unless tokenwise projections use the width-1 decode shape.
+    """
+    return os.environ.get("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH", "1") in {
         "1",
         "true",
         "yes",

@@ -157,13 +157,19 @@ class Scheduler:
             
             # Check constraints
             if from_waiting:
-                if not self.block_manager.can_allocate(seq):
+                if not self.block_manager.can_allocate(
+                    seq,
+                    use_prefix_cache=self.enable_prefix_cache_execution,
+                ):
                     self.waiting.appendleft(seq)
                     break
             
             # Allocate and schedule
             if from_waiting:
-                self.block_manager.allocate(seq)
+                self.block_manager.allocate(
+                    seq,
+                    use_prefix_cache=self.enable_prefix_cache_execution,
+                )
                 if not self.enable_prefix_cache_execution:
                     seq.num_cached_tokens = 0
             seq.status = SequenceStatus.RUNNING

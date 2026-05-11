@@ -78,16 +78,22 @@ class BlockManager:
         end = (block_idx + 1) * self.block_size
         return seq.token_ids[start:end]
 
-    def can_allocate(self, seq: Sequence) -> bool:
+    def can_allocate(self, seq: Sequence, *, use_prefix_cache: bool = True) -> bool:
         """Check if we can allocate blocks for sequence."""
-        return len(self.free_block_ids) >= self._num_required_blocks(seq)
+        return len(self.free_block_ids) >= self._num_required_blocks(
+            seq,
+            use_prefix_cache=use_prefix_cache,
+        )
 
-    def _num_required_blocks(self, seq: Sequence) -> int:
+    def _num_required_blocks(self, seq: Sequence, *, use_prefix_cache: bool = True) -> int:
         """Count physical free blocks needed for allocation.
 
         Full-block prefix-cache hits that are already in use do not consume a
         free block; cache misses and request-local partial blocks do.
         """
+        if not use_prefix_cache:
+            return self._num_blocks(seq)
+
         h = -1
         required = 0
         for i in range(self._num_blocks(seq)):
@@ -103,7 +109,7 @@ class BlockManager:
                 required += 1
         return required
 
-    def allocate(self, seq: Sequence):
+    def allocate(self, seq: Sequence, *, use_prefix_cache: bool = True):
         """Allocate blocks for a sequence.
         
         Implements prefix caching:
@@ -122,13 +128,17 @@ class BlockManager:
             # Compute hash only for full blocks
             if len(token_ids) == self.block_size:
                 h = self.compute_hash(token_ids, h)
-                block_id = self.hash_to_block_id.get(h, -1)
-                
-                # Check if we have a cache hit
-                if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+
+                if not use_prefix_cache:
                     cache_miss = True
                 else:
-                    cache_miss = False
+                    block_id = self.hash_to_block_id.get(h, -1)
+
+                    # Check if we have a cache hit
+                    if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                        cache_miss = True
+                    else:
+                        cache_miss = False
             else:
                 cache_miss = True
             
@@ -151,7 +161,8 @@ class BlockManager:
             # request-local and must not overwrite the prefix-cache hash map.
             if len(token_ids) == self.block_size and h != -1:
                 block.update(h, token_ids)
-                self.hash_to_block_id[h] = block_id
+                if use_prefix_cache:
+                    self.hash_to_block_id[h] = block_id
             
             seq.block_table.append(block_id)
 

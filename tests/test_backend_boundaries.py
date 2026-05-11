@@ -1509,6 +1509,33 @@ def test_prefix_cache_allocation_allows_used_full_block_hit_without_free_blocks(
     assert block_manager.blocks[0].ref_count == 2
 
 
+def test_no_prefix_cache_allocation_keeps_repeated_prompts_on_unique_blocks():
+    block_manager = BlockManager(num_blocks=4, block_size=2)
+    seq_a = Sequence([1, 2], SamplingParams(temperature=0.0), seq_id=1)
+    seq_b = Sequence([1, 2], SamplingParams(temperature=0.0), seq_id=2)
+
+    block_manager.allocate(seq_a, use_prefix_cache=False)
+    block_manager.allocate(seq_b, use_prefix_cache=False)
+
+    assert seq_a.block_table != seq_b.block_table
+    assert block_manager.blocks[seq_a.block_table[0]].ref_count == 1
+    assert block_manager.blocks[seq_b.block_table[0]].ref_count == 1
+    assert block_manager.blocks[seq_a.block_table[0]].hash != -1
+    assert block_manager.blocks[seq_b.block_table[0]].hash != -1
+    assert block_manager.hash_to_block_id == {}
+
+
+def test_no_prefix_cache_allocation_requires_free_blocks_for_repeated_prompts():
+    block_manager = BlockManager(num_blocks=1, block_size=2)
+    seq_a = Sequence([1, 2], SamplingParams(temperature=0.0), seq_id=1)
+    seq_b = Sequence([1, 2], SamplingParams(temperature=0.0), seq_id=2)
+
+    block_manager.allocate(seq_a, use_prefix_cache=False)
+
+    assert len(block_manager.free_block_ids) == 0
+    assert not block_manager.can_allocate(seq_b, use_prefix_cache=False)
+
+
 def test_server_generate_accepts_batched_prompts(monkeypatch):
     import server
 
