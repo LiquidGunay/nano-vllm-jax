@@ -75,6 +75,7 @@ Validated TPU v6e-1 results, `Qwen/Qwen3.5-0.8B`, BF16, real weights, JIT, warme
 
 - homogeneous B=4, prompt length 16, output length 16: exact token match passed, next-step sanity passed, baseline decode `353.57 tok/s`, forced K=1 decode `265.27 tok/s`, speedup `0.750x`, acceptance `62.5%`.
 - homogeneous B=16, prompt length 16, output length 16: exact token match passed, next-step sanity passed, baseline decode `772.84 tok/s`, forced K=1 decode `510.14 tok/s`, speedup `0.660x`, acceptance `57.1%`.
+- homogeneous B=4, `Qwen/Qwen3.5-4B`, prompt length 16, output length 16: exact token match passed, next-step sanity passed, baseline decode `209.33 tok/s`, forced K=1 decode `161.44 tok/s`, speedup `0.771x`, acceptance `62.5%`.
 - mixed/interleaved B=4, prompt lengths `16,17,31,32`, arrivals `0,0,2,4`, output length 12: exact token match passed, next-step sanity passed, baseline decode `238.71 tok/s`, forced K=1 decode `141.88 tok/s`, speedup `0.594x`, acceptance `38.9%`.
 - measured-speed gate with `NANO_VLLM_JAX_MTP_MIN_SPEEDUP=1.0`: exact token match passed and decode throughput was effectively parity, `362.76 tok/s` baseline vs `362.72 tok/s` gated K=1, because admission disabled speculative decode after measured throughput was below threshold.
 
@@ -89,6 +90,11 @@ needs a high acceptance rate to break even.
 Do not seed a follow-up K=1 draft after a rejected row unless the rejected-row next-draft state invariant is proven. The current safe policy commits the target token and leaves no draft behind for rejected K=1 rows.
 
 The next implementation target is a safe fast verifier that preserves the cheap accepted path while exposing an after-current-token state for rejected rows. Without that prefix state, fast rejected rows must either be repaired or left uncommitted, which removes the expected K=1 speedup.
+
+Break-even direction:
+
+- With the current safe path, increasing from 0.8B to 4B does not materially lower the threshold. The 4B accepted-step per-token latency is approximately baseline latency, while rejected rows remain about 2x baseline latency.
+- Therefore the current 4B forced-K=1 break-even acceptance threshold is effectively at or above 100%. A larger model alone is not enough; the accepted verifier path must become cheaper than two baseline decode steps and rejected/fallback rows must be gated or repaired cheaply.
 
 Batch-shape correctness note:
 
