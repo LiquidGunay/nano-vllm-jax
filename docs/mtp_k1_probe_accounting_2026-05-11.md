@@ -461,3 +461,12 @@ This is the clearest current split:
 - fastest path: closer to speedup but invalid;
 - B>1 mixed correctness can be made valid by avoiding unsafe next-draft
   propagation, but K=1 verifier cost remains too high.
+
+Seed-after-bonus was also tested on the exact commit-select path:
+
+| Case | Path | Seed after bonus | Exact | Decode speedup | Acceptance |
+|---|---|---:|---:|---:|---:|
+| 4B B=1 real, 32 tokens | commit-select | true | true | `0.799` | `0.375` |
+
+This reduced acceptance and speed relative to the safer no-reseed default, so it
+should not be enabled as a default policy.
