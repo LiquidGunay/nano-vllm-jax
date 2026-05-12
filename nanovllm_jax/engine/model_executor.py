@@ -659,7 +659,7 @@ class ModelExecutor:
                 verify_tokens = jnp.concatenate([tokens, draft_token_arg[:, None]], axis=1)
                 verify_positions = jnp.concatenate([positions, positions + 1], axis=1)
                 row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
-                row_valid = row_query_lens > 0
+                row_valid = (row_query_lens > 0) & (seq_ids >= 0)
                 row_has_draft = row_valid & (draft_token_arg >= 0)
                 verify_query_lens = row_query_lens + row_has_draft.astype(jnp.int32)
                 verify_query_start_loc = jnp.concatenate(
@@ -717,13 +717,13 @@ class ModelExecutor:
                 bonus_token = token_ids[:, 1]
                 accepted = (target_token == draft_token_arg) & row_has_draft
                 if batch_accept_policy == "all_or_none":
-                    accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
+                    accepted = accepted & jnp.all(jnp.where(row_has_draft, accepted, True))
                 if bonus_margin_threshold > 0:
                     bonus_top2, _ = jax.lax.top_k(verify_logits[:, 1].astype(jnp.float32), 2)
                     bonus_margin = bonus_top2[:, 0] - bonus_top2[:, 1]
                     accepted = accepted & (bonus_margin >= bonus_margin_threshold)
                     if batch_accept_policy == "all_or_none":
-                        accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
+                        accepted = accepted & jnp.all(jnp.where(row_has_draft, accepted, True))
 
                 pos_current = verify_positions[:, 0]
                 pos_next_after_reject = pos_current + jnp.asarray(1, dtype=pos_current.dtype)

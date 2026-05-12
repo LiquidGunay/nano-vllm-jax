@@ -343,3 +343,85 @@ Concrete current blocker:
    mathematically impossible until verifier cost is reduced below `2x`.
 4. For 4B B=1, speedup is plausible after correctness because the one-pass
    cost ratio is about `1.68x`, requiring acceptance above roughly `0.68`.
+
+### Controlled fixes attempted - 2026-05-12
+
+Two additional narrow fixes were tested on TPU.
+
+#### 1. Width-1 decode RMSNorm for multi-token one-pass
+
+Layerwise drift showed the first one-pass-vs-sequential difference at layer 0:
+
+```text
+first_layer=0 first_type=linear_attention
+stages=entry=0,in_norm=0.03125,...
+```
+
+This means the input token entering layer 0 is identical, but the width-2
+one-pass RMSNorm and the width-1 sequential RMSNorm are not bit-equivalent on
+TPU BF16. The model now has `_decode_width1_rms_norm`, used only for
+multi-token cached decode, so one-pass can run per-token RMSNorm with the same
+`[B, 1, ...]` shape as baseline decode.
+
+Focused validation:
+
+```text
+17 passed
+```
+
+4B B=1 real-prompt control after this patch:
+
+| Metric | Value |
+|---|---:|
+| exact token match | `false` |
+| throughput valid | `false` |
+| acceptance rate | `0.500` |
+| decode tok/s | `59.85` |
+| decode speedup | `0.917` |
+| end-to-end speedup | `0.909` |
+| runner/device time | `272.50 ms` |
+
+This improved one-pass throughput substantially but did not fix exact token
+parity.
+
+#### 2. One-pass all-or-none gating over rows with drafts
+
+The one-pass verifier used active rows for all-or-none acceptance gating, while
+commit-select used rows that actually had draft tokens. That can change commit
+decisions in partial/probe batches. One-pass now matches commit-select:
+
+```text
+all_or_none_accept = all(where(row_has_draft, accepted, true))
+```
+
+Focused validation:
+
+```text
+17 passed
+```
+
+4B B=1 real-prompt control after both patches:
+
+| Metric | Value |
+|---|---:|
+| exact token match | `false` |
+| throughput valid | `false` |
+| acceptance rate | `0.500` |
+| decode tok/s | `60.58` |
+| decode speedup | `0.916` |
+| end-to-end speedup | `0.908` |
+| runner/device time | `269.30 ms` |
+
+Some individual short runs were close to parity in speed (`~0.999x` decode),
+but correctness still failed. The remaining blocker is therefore not just
+row-gating. It is still one-pass state/logit drift from width-2 execution.
+
+Updated concrete reason speedup is blocked:
+
+1. The near-fast path is now close to baseline speed for 4B B=1, but invalid.
+2. The exact path is still commit-select, which costs too much to beat baseline
+   at the observed acceptance rates.
+3. Width-2 one-pass still differs from width-1 sequential execution at layer 0
+   despite width-1 matmul and RMSNorm attempts, so the remaining work is to
+   either make width-2 state installation exactly match sequential decode or
+   design a verifier that avoids installing width-2-derived target state.

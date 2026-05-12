@@ -50,6 +50,28 @@ def _stable_rmsnorm_fp32(x: jnp.ndarray, weight: jnp.ndarray, eps: float) -> jnp
     return y.astype(x_dtype)
 
 
+def _decode_width1_rms_norm(
+    x: jnp.ndarray,
+    weight: jnp.ndarray,
+    eps: float,
+    *,
+    force_width1: bool = False,
+) -> jnp.ndarray:
+    """Apply RMSNorm with width-1 sequence shapes for multi-token decode.
+
+    The K=1 one-pass verifier evaluates a two-token decode block, but its first
+    token must match the canonical single-token decode path exactly enough for
+    greedy parity. TPU BF16 reductions can be shape-dependent even when each
+    token is independent along the normalized dimension, so run the same
+    `[B, 1, ...]` RMSNorm shape used by baseline decode and concatenate the
+    token results inside the compiled graph.
+    """
+    if not force_width1 or x.ndim < 3 or x.shape[1] <= 1:
+        return rms_norm(x, weight, eps)
+    parts = [rms_norm(x[:, t : t + 1, ...], weight, eps) for t in range(x.shape[1])]
+    return jnp.concatenate(parts, axis=1)
+
+
 def _force_width1_decode_math() -> bool:
     """Use width-1-shaped matmuls in multi-token decode by default.
 
@@ -1081,8 +1103,19 @@ def full_attention_block(
         )
 
         # Apply RMSNorm BEFORE transpose (on head dimension, in [B, T, H, D] layout)
-        query = rms_norm(query, params["q_norm"], config.rms_norm_eps)
-        k = rms_norm(k, params["k_norm"], config.rms_norm_eps)
+        force_width1_norm = (not is_prefill) and seq_len > 1 and _force_width1_decode_math()
+        query = _decode_width1_rms_norm(
+            query,
+            params["q_norm"],
+            config.rms_norm_eps,
+            force_width1=force_width1_norm,
+        )
+        k = _decode_width1_rms_norm(
+            k,
+            params["k_norm"],
+            config.rms_norm_eps,
+            force_width1=force_width1_norm,
+        )
 
         # Transpose to [B, H, T, D]
         query = query.transpose(0, 2, 1, 3)
@@ -1198,7 +1231,13 @@ def transformer_block(
 
     # Apply input_layernorm (both full attention and linear attention)
     # HF applies input_layernorm before both layer types
-    x = rms_norm(x, params["input_norm"], config.rms_norm_eps)
+    force_width1_norm = (not is_prefill) and x.ndim == 3 and x.shape[1] > 1 and _force_width1_decode_math()
+    x = _decode_width1_rms_norm(
+        x,
+        params["input_norm"],
+        config.rms_norm_eps,
+        force_width1=force_width1_norm,
+    )
     input_norm_out = x
 
     valid_token_mask = None
@@ -1307,7 +1346,12 @@ def transformer_block(
 
     # MLP path
     residual = x
-    x = rms_norm(x, params["ffn_norm"], config.rms_norm_eps)
+    x = _decode_width1_rms_norm(
+        x,
+        params["ffn_norm"],
+        config.rms_norm_eps,
+        force_width1=force_width1_norm,
+    )
     ffn_norm_out = x
 
     # MLP computation (stays in bfloat16)
