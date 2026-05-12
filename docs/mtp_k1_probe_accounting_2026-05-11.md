@@ -425,3 +425,39 @@ Updated concrete reason speedup is blocked:
    despite width-1 matmul and RMSNorm attempts, so the remaining work is to
    either make width-2 state installation exactly match sequential decode or
    design a verifier that avoids installing width-2-derived target state.
+
+#### 3. Skip unused next-draft computation/seeding by default
+
+The serving default does not seed another K=1 draft after an accepted bonus
+unless `NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS=1`. The verifier was still computing
+`next_draft_token`, and the one-pass rowwise repair path was still storing it
+for accepted rows. That was both wasted work and an unsafe way to propagate
+one-pass hidden-state drift.
+
+Changes:
+
+- one-pass K=1 skips `mtp_forward` for `next_draft_token` unless seed-after-bonus is enabled;
+- commit-select K=1 does the same;
+- one-pass rowwise repair no longer stores next drafts after bonus by default;
+- tests now assert the safer no-reseed default.
+
+Focused validation:
+
+```text
+16 passed, 1 xfailed
+```
+
+TPU controls:
+
+| Case | Path | Exact | Valid throughput | Decode speedup | Acceptance | Notes |
+|---|---|---:|---:|---:|---:|---|
+| 4B B=1 real | one-pass | false | false | `0.934` | `0.500` | Faster, still invalid |
+| 4B B=1 real | commit-select | true | true | `0.853` | `0.500` | Exact, still below baseline |
+| 4B B=4 manual | one-pass rowwise | true | true | `0.567` | `0.500` | Mixed-row correctness fixed for this case, but slow |
+
+This is the clearest current split:
+
+- exact path: valid but no speedup;
+- fastest path: closer to speedup but invalid;
+- B>1 mixed correctness can be made valid by avoiding unsafe next-draft
+  propagation, but K=1 verifier cost remains too high.

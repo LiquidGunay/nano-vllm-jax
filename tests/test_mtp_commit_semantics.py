@@ -421,7 +421,7 @@ def test_k1_commit_accept_reject_and_mixed_rows(monkeypatch):
         [[700, 701, 702], [701, 702, 703], [702, 703, 704]],
     )
     assert runner.stats == {
-        "drafts_proposed": 2,
+        "drafts_proposed": 0,
         "drafts_accepted": 2,
         "drafts_rejected": 1,
         "bonus_tokens": 2,
@@ -434,7 +434,7 @@ def test_k1_commit_accept_reject_and_mixed_rows(monkeypatch):
         [1010.0, 2011.0],
         [1020.0, 1021.0],
     ]
-    assert runner._mtp1_drafts == {0: 300, 2: 302}
+    assert runner._mtp1_drafts == {}
 
 
 def test_k1_commit_ignores_inactive_padded_rows(monkeypatch):
@@ -585,12 +585,12 @@ def test_k1_forced_reject_probe_row_is_logical_one_token(monkeypatch):
     assert outputs == {0: [10, 20], 1: 101, 2: [12, 22]}
     assert runner.executor.calls[-1]["draft_token"] == [10, -1, 12]
     assert runner.stats == {
-        "drafts_proposed": 2,
+        "drafts_proposed": 0,
         "drafts_accepted": 2,
         "drafts_rejected": 0,
         "bonus_tokens": 2,
     }
-    assert runner._mtp1_drafts == {0: 30, 2: 32}
+    assert runner._mtp1_drafts == {}
     assert runner.stored[-1][0].seq_lens.tolist() == committed_seq_lens
 
 

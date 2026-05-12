@@ -2851,6 +2851,13 @@ class CanonicalModelRunner:
             outputs: dict[int, List[int] | int] = {}
             repair_rows: List[int] = []
             stats = self._speculative_stats()
+            seed_after_bonus = os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
             for local_row, row in enumerate(rows):
                 seq = seqs[row]
                 self._mtp1_drafts.pop(seq.seq_id, None)
@@ -2864,6 +2871,7 @@ class CanonicalModelRunner:
                         self.mtp1_enabled
                         and seq.temperature == 0
                         and seq.num_completion_tokens + emitted_len < seq.max_tokens
+                        and seed_after_bonus
                         and not getattr(self, "_mtp_adaptive_gated", lambda: False)()
                     ):
                         self._mtp1_drafts[seq.seq_id] = next_draft_values[idx]

@@ -628,11 +628,19 @@ class ModelExecutor:
             float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0")),
             os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
             os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "1"),
+            os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0"),
         )
         if key not in self._jit_cache:
             bonus_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0"))
             batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
             one_pass_decode_mode = os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "1") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+            compute_next_draft = os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0") in {
                 "1",
                 "true",
                 "yes",
@@ -759,12 +767,15 @@ class ModelExecutor:
                 def skip_next_mtp(_):
                     return jnp.full_like(target_token, -1)
 
-                next_draft_token = jax.lax.cond(
-                    jnp.any(accepted),
-                    run_next_mtp,
-                    skip_next_mtp,
-                    operand=None,
-                )
+                if compute_next_draft:
+                    next_draft_token = jax.lax.cond(
+                        jnp.any(accepted),
+                        run_next_mtp,
+                        skip_next_mtp,
+                        operand=None,
+                    )
+                else:
+                    next_draft_token = skip_next_mtp(None)
 
                 hybrid_after_current = HybridLayerState(
                     conv_state=first_prefix_hybrid_state.conv_state
@@ -1504,10 +1515,18 @@ class ModelExecutor:
             bool(mtp_hidden_final_normed),
             float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0")),
             os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
+            os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0"),
         )
         if key not in self._jit_cache:
             bonus_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0"))
             batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
+            compute_next_draft = os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
 
             def compiled(
                 params,
@@ -1742,10 +1761,18 @@ class ModelExecutor:
             bool(mtp_hidden_final_normed),
             float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0")),
             os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
+            os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0"),
         )
         if key not in self._jit_cache:
             bonus_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0"))
             batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
+            compute_next_draft = os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
 
             def _expand_row_mask(mask: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
                 return mask.reshape((mask.shape[0],) + (1,) * (target.ndim - 1))
@@ -1941,15 +1968,18 @@ class ModelExecutor:
                     next_mtp_position_arg,
                     next_mtp_position_arg - 1,
                 )
-                next_draft_logits, _ = mtp_forward(
-                    hidden_state=selected_hidden,
-                    next_token_ids=selected_next_token[:, None],
-                    embed_tokens=params.embed_tokens,
-                    params=params.mtp_params,
-                    config=self.config,
-                    positions=selected_mtp_position[:, None],
-                )
-                next_draft_token = jnp.argmax(next_draft_logits[:, 0], axis=-1).astype(jnp.int32)
+                if compute_next_draft:
+                    next_draft_logits, _ = mtp_forward(
+                        hidden_state=selected_hidden,
+                        next_token_ids=selected_next_token[:, None],
+                        embed_tokens=params.embed_tokens,
+                        params=params.mtp_params,
+                        config=self.config,
+                        positions=selected_mtp_position[:, None],
+                    )
+                    next_draft_token = jnp.argmax(next_draft_logits[:, 0], axis=-1).astype(jnp.int32)
+                else:
+                    next_draft_token = jnp.full_like(target_token, -1)
 
                 final_any_accepted = jnp.any(accepted)
 
