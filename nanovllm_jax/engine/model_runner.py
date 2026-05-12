@@ -2407,7 +2407,7 @@ class CanonicalModelRunner:
             and any(seqs[row].num_tokens % self.block_size == 0 for row in rows)
         ):
             return None
-        if os.environ.get("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "0") not in {
+        if os.environ.get("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1") not in {
             "1",
             "true",
             "yes",
@@ -2570,7 +2570,7 @@ class CanonicalModelRunner:
             in {"1", "true", "yes", "on", "True"}
         )
         allow_unsafe_one_pass_k1 = (
-            os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0")
+            os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "1")
             in {"1", "true", "yes", "on", "True"}
         )
         allow_mixed_fused_k1 = (
@@ -2599,7 +2599,7 @@ class CanonicalModelRunner:
         )
         batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
         enable_rowwise_repair = (
-            os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_ROWWISE_REPAIR", "0")
+            os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_ROWWISE_REPAIR", "1")
             in {"1", "true", "yes", "on", "True"}
         )
         use_one_pass_k1 = (
@@ -2712,6 +2712,25 @@ class CanonicalModelRunner:
                 )
                 _ready(layer_parity_output)
                 t_profile = _mark("executor_mtp1_layer_parity_debug", t_profile)
+            if parity_debug_one_pass:
+                # Run the commit-select parity reference before the one-pass
+                # verifier call. Both executors donate KV cache buffers, so the
+                # parity reference must consume an explicit copy and leave the
+                # live cache available for the production one-pass call.
+                parity_cache_storage = KVCacheStorage(
+                    self.cache_storage.k_cache.copy(),
+                    self.cache_storage.v_cache.copy(),
+                )
+                parity_output = self.executor.mtp1_commit_select_greedy_step_jit(
+                    decode_batch,
+                    cache_storage=parity_cache_storage,
+                    hybrid_state=hybrid_state,
+                    draft_token=jnp.array(verifier_draft_tokens_for_batch, dtype=jnp.int32),
+                    next_mtp_position=next_mtp_positions,
+                    mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                )
+                _ready(parity_output)
+                t_profile = _mark("executor_mtp1_parity_commit_select", t_profile)
             output = self.executor.mtp1_two_decode_greedy_step_jit(
                 decode_batch,
                 cache_storage=self.cache_storage,
@@ -2722,17 +2741,6 @@ class CanonicalModelRunner:
             )
             _ready(output)
             t_profile = _mark("executor_mtp1_one_pass_prefix", t_profile)
-            if parity_debug_one_pass:
-                parity_output = self.executor.mtp1_commit_select_greedy_step_jit(
-                    decode_batch,
-                    cache_storage=self.cache_storage,
-                    hybrid_state=hybrid_state,
-                    draft_token=jnp.array(verifier_draft_tokens_for_batch, dtype=jnp.int32),
-                    next_mtp_position=next_mtp_positions,
-                    mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
-                )
-                _ready(parity_output)
-                t_profile = _mark("executor_mtp1_parity_commit_select", t_profile)
         elif use_commit_select:
             output = self.executor.mtp1_commit_select_greedy_step_jit(
                 decode_batch,
@@ -2827,7 +2835,7 @@ class CanonicalModelRunner:
             ]
             commit_rejected_directly = (
                 use_one_pass_k1
-                and os.environ.get("NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED", "0")
+                and os.environ.get("NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED", "1")
                 in {"1", "true", "yes", "on", "True"}
             )
 
@@ -2861,7 +2869,8 @@ class CanonicalModelRunner:
                         self._mtp1_drafts[seq.seq_id] = next_draft_values[idx]
                         stats["drafts_proposed"] += 1
                 else:
-                    stats["drafts_rejected"] += 1
+                    if row not in forced_reject_rows:
+                        stats["drafts_rejected"] += 1
                     if commit_rejected_directly:
                         idx = verifier_index_for_local[local_row]
                         outputs[row] = target_values[idx]
@@ -3426,7 +3435,7 @@ class CanonicalModelRunner:
             "on",
             "True",
         }
-        allow_unsafe_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0") in {
+        allow_unsafe_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "1") in {
             "1",
             "true",
             "yes",
@@ -3546,7 +3555,7 @@ class CanonicalModelRunner:
                 "on",
                 "True",
             }
-            enable_rowwise_repair = os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_ROWWISE_REPAIR", "0") in {
+            enable_rowwise_repair = os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_ROWWISE_REPAIR", "1") in {
                 "1",
                 "true",
                 "yes",
@@ -3567,7 +3576,7 @@ class CanonicalModelRunner:
                 "on",
                 "True",
             }
-            allow_unsafe_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0") in {
+            allow_unsafe_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "1") in {
                 "1",
                 "true",
                 "yes",
@@ -3615,7 +3624,7 @@ class CanonicalModelRunner:
                 one_pass_available_for_partial
                 and (not force_commit_select or allow_mixed_fused or not full_physical_batch)
             )
-            k1_commit_rejected_enabled = os.environ.get("NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED", "0") in {
+            k1_commit_rejected_enabled = os.environ.get("NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED", "1") in {
                 "1",
                 "true",
                 "yes",

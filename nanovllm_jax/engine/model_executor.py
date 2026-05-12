@@ -696,7 +696,7 @@ class ModelExecutor:
                     kv_lens=verify_batch.seq_lens,
                     slot_mapping=verify_metadata.slot_mapping,
                 )
-                (hidden, verify_logits), updated_kv_state, updated_hybrid_state, prefix_hybrid_state = model_forward_step(
+                (hidden, verify_logits), updated_kv_state, updated_hybrid_state, first_prefix_hybrid_state = model_forward_step(
                     verify_batch.tokens,
                     params,
                     self.config,
@@ -707,7 +707,7 @@ class ModelExecutor:
                     is_prefill=not one_pass_decode_mode,
                     return_hidden=True,
                     return_hidden_with_logits=True,
-                    return_prefix_hybrid=True,
+                    return_first_prefix_hybrid=True,
                     backend=self.backend,
                 )
 
@@ -767,11 +767,11 @@ class ModelExecutor:
                 )
 
                 hybrid_after_current = HybridLayerState(
-                    conv_state=prefix_hybrid_state.conv_state[:, 0]
-                    if prefix_hybrid_state.conv_state is not None
+                    conv_state=first_prefix_hybrid_state.conv_state
+                    if first_prefix_hybrid_state.conv_state is not None
                     else None,
-                    recurrent_state=prefix_hybrid_state.recurrent_state[:, 0]
-                    if prefix_hybrid_state.recurrent_state is not None
+                    recurrent_state=first_prefix_hybrid_state.recurrent_state
+                    if first_prefix_hybrid_state.recurrent_state is not None
                     else None,
                 )
                 hybrid_after_draft = HybridLayerState(

@@ -325,14 +325,14 @@ def test_mtp_admission_gate_tracks_logical_decode_rows(monkeypatch):
         batch_size_bucket=4,
         active_decode_rows=4,
     )
-    assert scheduler.mtp_admission_reason == "warming"
+    assert scheduler.mtp_admission_reason == "probing_mtp"
 
     report = scheduler.get_mtp_admission_report()
     buckets = {bucket["key"]["active_decode_rows"]: bucket for bucket in report["buckets"]}
     assert buckets[2]["key"]["physical_batch_size"] == 4
     assert buckets[2]["admission_reason"] == "low_throughput"
     assert buckets[2]["measured_speedup"] == pytest.approx(1 / 3)
-    assert buckets[4]["admission_reason"] == "warming"
+    assert buckets[4]["admission_reason"] == "probing_mtp"
 
 
 def test_scheduler_rejects_requests_exceeding_static_capacity():

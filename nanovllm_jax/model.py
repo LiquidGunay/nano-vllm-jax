@@ -379,6 +379,7 @@ def jax_recurrent_gated_delta_rule(
     initial_state=None,
     use_qk_l2norm_in_kernel=False,
     return_state_sequence: bool = False,
+    return_first_state: bool = False,
 ):
     """
     JAX implementation of recurrent gated delta rule (matching HF torch_recurrent_gated_delta_rule).
@@ -471,6 +472,8 @@ def jax_recurrent_gated_delta_rule(
         if return_state_sequence:
             state_sequence = jnp.stack([state_0, state_1], axis=1)
             return output, state_1, state_sequence
+        if return_first_state:
+            return output, state_1, state_0
         return output, state_1
 
     if return_state_sequence:
@@ -483,6 +486,17 @@ def jax_recurrent_gated_delta_rule(
         state_sequence = all_states.transpose(1, 0, 2, 3, 4)
         output = output.astype(initial_dtype)
         return output, final_state, state_sequence
+
+    if return_first_state:
+        def step_fn(carry, t):
+            next_state, out_t = step_index(carry, t)
+            return next_state, (out_t, next_state)
+
+        final_state, (all_outputs, all_states) = lax.scan(step_fn, state, jnp.arange(time_dim))
+        output = all_outputs.transpose(1, 2, 0, 3)
+        first_state = all_states[0]
+        output = output.astype(initial_dtype)
+        return output, final_state, first_state
 
     def step_fn(carry, t):
         return step_index(carry, t)
@@ -507,6 +521,7 @@ def gated_deltanet_block(
     valid_token_mask: Optional[jnp.ndarray] = None,
     backend: Optional[InferenceBackend] = None,
     return_prefix_state: bool = False,
+    return_first_prefix_state: bool = False,
 ):
     """Gated DeltaNet block with decode mode support.
     
@@ -601,19 +616,24 @@ def gated_deltanet_block(
             for t in range(seq_len):
                 state, conv_out_t = conv_step(state, mixed_qkv_t[:, :, t : t + 1])
                 conv_out_parts.append(conv_out_t)
-                if return_prefix_state:
+                if return_prefix_state or (return_first_prefix_state and t == 0):
                     conv_state_parts.append(state)
             new_layer_conv_state = state
             conv_out_steps = jnp.stack(conv_out_parts, axis=0)
-            prefix_layer_conv_state = (
-                jnp.stack(conv_state_parts, axis=0).transpose(1, 0, 2, 3)
-                if return_prefix_state
-                else None
-            )
-        elif return_prefix_state:
+            if return_prefix_state:
+                prefix_layer_conv_state = jnp.stack(conv_state_parts, axis=0).transpose(1, 0, 2, 3)
+            elif return_first_prefix_state:
+                prefix_layer_conv_state = conv_state_parts[0] if conv_state_parts else state
+            else:
+                prefix_layer_conv_state = None
+        elif return_prefix_state or return_first_prefix_state:
             new_layer_conv_state, conv_out_t = conv_step(layer_conv_state, mixed_qkv_t[:, :, :1])
             conv_out_steps = conv_out_t[None, ...]
-            prefix_layer_conv_state = new_layer_conv_state[:, None, :, :]
+            prefix_layer_conv_state = (
+                new_layer_conv_state[:, None, :, :]
+                if return_prefix_state
+                else new_layer_conv_state
+            )
         else:
             new_layer_conv_state, conv_out_t = conv_step(layer_conv_state, mixed_qkv_t[:, :, :1])
             conv_out_steps = conv_out_t[None, ...]
@@ -660,6 +680,17 @@ def gated_deltanet_block(
                 return_state_sequence=return_prefix_state,
             )
             prefix_recurrent_state_single = recurrent_state_steps
+        elif return_first_prefix_state:
+            core_attn_out, new_recurrent_state_single, prefix_recurrent_state_single = jax_recurrent_gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                initial_state=initial_recurrent,
+                use_qk_l2norm_in_kernel=True,
+                return_first_state=True,
+            )
         elif use_recurrent_decode_scan:
             core_attn_out, new_recurrent_state_single = jax_recurrent_gated_delta_rule(
                 query,
@@ -695,6 +726,18 @@ def gated_deltanet_block(
                     new_recurrent_state_single,
                     initial_recurrent,
                 )
+                if return_first_prefix_state and prefix_recurrent_state_single is not None:
+                    prefix_recurrent_state_single = jnp.where(
+                        recurrent_keep,
+                        prefix_recurrent_state_single,
+                        initial_recurrent,
+                    )
+            if return_first_prefix_state and prefix_layer_conv_state is not None:
+                prefix_layer_conv_state = jnp.where(
+                    conv_keep,
+                    prefix_layer_conv_state,
+                    layer_conv_state,
+                )
 
         # Update cache with new recurrent state and conv state for this layer
         if hybrid_state.recurrent_state is not None:
@@ -714,7 +757,7 @@ def gated_deltanet_block(
                 conv_state=prefix_layer_conv_state,
                 recurrent_state=prefix_recurrent_state_single,
             )
-            if return_prefix_state
+            if return_prefix_state or return_first_prefix_state
             else None
         )
         
@@ -1144,6 +1187,7 @@ def transformer_block(
     is_prefill=True,
     backend: Optional[InferenceBackend] = None,
     return_prefix_hybrid: bool = False,
+    return_first_prefix_hybrid: bool = False,
     return_layer_hidden: bool = False,
     return_kv_prewrite: bool = False,
     return_layer_stages: bool = False,
@@ -1211,27 +1255,45 @@ def transformer_block(
             valid_token_mask=valid_token_mask,
             backend=backend,
             return_prefix_state=return_prefix_hybrid,
+            return_first_prefix_state=return_first_prefix_hybrid,
         )
         if isinstance(result, tuple):
-            if return_prefix_hybrid and len(result) == 3:
+            if (return_prefix_hybrid or return_first_prefix_hybrid) and len(result) == 3:
                 x, hybrid_state, prefix_layer_state = result
                 if prefix_hybrid_state is not None and prefix_layer_state is not None:
                     linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
-                    prefix_hybrid_state = replace(
-                        prefix_hybrid_state,
-                        conv_state=prefix_hybrid_state.conv_state.at[:, :, linear_layer_idx].set(
-                            prefix_layer_state.conv_state
+                    if return_prefix_hybrid:
+                        prefix_hybrid_state = replace(
+                            prefix_hybrid_state,
+                            conv_state=prefix_hybrid_state.conv_state.at[:, :, linear_layer_idx].set(
+                                prefix_layer_state.conv_state
+                            )
+                            if prefix_hybrid_state.conv_state is not None
+                            and prefix_layer_state.conv_state is not None
+                            else prefix_hybrid_state.conv_state,
+                            recurrent_state=prefix_hybrid_state.recurrent_state.at[:, :, linear_layer_idx].set(
+                                prefix_layer_state.recurrent_state
+                            )
+                            if prefix_hybrid_state.recurrent_state is not None
+                            and prefix_layer_state.recurrent_state is not None
+                            else prefix_hybrid_state.recurrent_state,
                         )
-                        if prefix_hybrid_state.conv_state is not None
-                        and prefix_layer_state.conv_state is not None
-                        else prefix_hybrid_state.conv_state,
-                        recurrent_state=prefix_hybrid_state.recurrent_state.at[:, :, linear_layer_idx].set(
-                            prefix_layer_state.recurrent_state
+                    else:
+                        prefix_hybrid_state = replace(
+                            prefix_hybrid_state,
+                            conv_state=prefix_hybrid_state.conv_state.at[:, linear_layer_idx].set(
+                                prefix_layer_state.conv_state
+                            )
+                            if prefix_hybrid_state.conv_state is not None
+                            and prefix_layer_state.conv_state is not None
+                            else prefix_hybrid_state.conv_state,
+                            recurrent_state=prefix_hybrid_state.recurrent_state.at[:, linear_layer_idx].set(
+                                prefix_layer_state.recurrent_state
+                            )
+                            if prefix_hybrid_state.recurrent_state is not None
+                            and prefix_layer_state.recurrent_state is not None
+                            else prefix_hybrid_state.recurrent_state,
                         )
-                        if prefix_hybrid_state.recurrent_state is not None
-                        and prefix_layer_state.recurrent_state is not None
-                        else prefix_hybrid_state.recurrent_state,
-                    )
             else:
                 x, hybrid_state = result
         else:
@@ -1260,7 +1322,7 @@ def transformer_block(
     block_output = x
 
     outputs = [x, kv_cache_state, hybrid_state]
-    if return_prefix_hybrid:
+    if return_prefix_hybrid or return_first_prefix_hybrid:
         outputs.append(prefix_hybrid_state)
     if return_kv_prewrite:
         outputs.extend([layer_prewrite_k, layer_prewrite_v])
@@ -1298,6 +1360,7 @@ def forward_step(
     logit_positions: Optional[jnp.ndarray] = None,
     backend: Optional[InferenceBackend] = None,
     return_prefix_hybrid: bool = False,
+    return_first_prefix_hybrid: bool = False,
     return_layer_hidden: bool = False,
     return_kv_prewrite: bool = False,
     return_layer_stages: bool = False,
@@ -1331,6 +1394,11 @@ def forward_step(
             if hybrid_state.recurrent_state is not None
             else None,
         )
+    if return_first_prefix_hybrid and hybrid_state is not None:
+        prefix_hybrid_state = HybridLayerState(
+            conv_state=hybrid_state.conv_state,
+            recurrent_state=hybrid_state.recurrent_state,
+        )
 
     layer_hidden_states = [] if return_layer_hidden else None
     kv_prewrite_k_states = [] if return_kv_prewrite else None
@@ -1352,12 +1420,13 @@ def forward_step(
             is_prefill=is_prefill,
             backend=backend,
             return_prefix_hybrid=return_prefix_hybrid,
+            return_first_prefix_hybrid=return_first_prefix_hybrid,
             return_kv_prewrite=return_kv_prewrite,
             return_layer_stages=return_layer_stages,
         )
         x, kv_cache_state, hybrid_state = block_result[:3]
         offset = 3
-        if return_prefix_hybrid:
+        if return_prefix_hybrid or return_first_prefix_hybrid:
             prefix_hybrid_state = block_result[offset]
             offset += 1
         if return_kv_prewrite:
@@ -1399,12 +1468,12 @@ def forward_step(
 
     if return_hidden and not return_hidden_with_logits:
         if return_layer_hidden:
-            if return_prefix_hybrid:
+            if return_prefix_hybrid or return_first_prefix_hybrid:
                 return hidden_pre, kv_cache_state, hybrid_state, prefix_hybrid_state, layer_hidden_result
             if return_kv_prewrite:
                 return hidden_pre, kv_cache_state, hybrid_state, layer_hidden_result, kv_prewrite_k_result, kv_prewrite_v_result, layer_stage_result
             return hidden_pre, kv_cache_state, hybrid_state, layer_hidden_result
-        if return_prefix_hybrid:
+        if return_prefix_hybrid or return_first_prefix_hybrid:
             return hidden_pre, kv_cache_state, hybrid_state, prefix_hybrid_state
         return hidden_pre, kv_cache_state, hybrid_state
 
@@ -1426,21 +1495,21 @@ def forward_step(
     if return_hidden:
         hidden_result = (hidden_pre, logits) if return_hidden_with_logits else hidden_pre
         if return_layer_hidden:
-            if return_prefix_hybrid:
+            if return_prefix_hybrid or return_first_prefix_hybrid:
                 return hidden_result, kv_cache_state, hybrid_state, prefix_hybrid_state, layer_hidden_result
             if return_kv_prewrite:
                 return hidden_result, kv_cache_state, hybrid_state, layer_hidden_result, kv_prewrite_k_result, kv_prewrite_v_result, layer_stage_result
             return hidden_result, kv_cache_state, hybrid_state, layer_hidden_result
-        if return_prefix_hybrid:
+        if return_prefix_hybrid or return_first_prefix_hybrid:
             return hidden_result, kv_cache_state, hybrid_state, prefix_hybrid_state
         return hidden_result, kv_cache_state, hybrid_state
     if return_layer_hidden:
-        if return_prefix_hybrid:
+        if return_prefix_hybrid or return_first_prefix_hybrid:
             return logits, kv_cache_state, hybrid_state, prefix_hybrid_state, layer_hidden_result
         if return_kv_prewrite:
             return logits, kv_cache_state, hybrid_state, layer_hidden_result, kv_prewrite_k_result, kv_prewrite_v_result, layer_stage_result
         return logits, kv_cache_state, hybrid_state, layer_hidden_result
-    if return_prefix_hybrid:
+    if return_prefix_hybrid or return_first_prefix_hybrid:
         return logits, kv_cache_state, hybrid_state, prefix_hybrid_state
     return logits, kv_cache_state, hybrid_state
 

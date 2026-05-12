@@ -37,9 +37,22 @@ class Scheduler:
         )
         self.decode_lookahead_tokens = max(1, 1 + int(getattr(config, "num_speculative_tokens", 0) or 0))
         self.num_speculative_tokens = max(0, int(getattr(config, "num_speculative_tokens", 0) or 0))
-        self.mtp_min_accept_rate = float(os.environ.get("NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE", "0") or "0")
+        self.mtp_min_accept_rate = float(
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE",
+                os.environ.get("NANO_VLLM_JAX_MTP_CONFIDENCE_MIN_ACCEPT_RATE", "0.75"),
+            )
+            or "0.75"
+        )
         self.mtp_min_accept_samples = int(os.environ.get("NANO_VLLM_JAX_MTP_MIN_ACCEPT_SAMPLES", "8") or "8")
         self.mtp_min_speedup = float(os.environ.get("NANO_VLLM_JAX_MTP_MIN_SPEEDUP", "1.0") or "1.0")
+        self.mtp_probe_steps = int(
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_PROBE_STEPS",
+                os.environ.get("NANO_VLLM_JAX_MTP_LATENCY_MIN_STEPS", "2"),
+            )
+            or "2"
+        )
         self.mtp_scheduler_gate_enabled = (
             self.num_speculative_tokens > 0
             and (self.mtp_min_accept_rate > 0 or self.mtp_min_speedup > 0)
@@ -52,6 +65,9 @@ class Scheduler:
         self.mtp_observed_rejected = 0
         self.mtp_stats_seen_accepted = 0
         self.mtp_stats_seen_rejected = 0
+        self.mtp_stats_seen_proposed = 0
+        self.mtp_stats_seen_seeded_main_steps = 0
+        self.mtp_stats_seen_partial_rows = 0
         self.mtp_admission_enabled = True
         self.mtp_admission_reason = "enabled"
         self.mtp_latency_alpha = float(os.environ.get("NANO_VLLM_JAX_MTP_LATENCY_ALPHA", "0.2") or "0.2")
@@ -83,6 +99,9 @@ class Scheduler:
         self.mtp_observed_rejected = 0
         self.mtp_stats_seen_accepted = 0
         self.mtp_stats_seen_rejected = 0
+        self.mtp_stats_seen_proposed = 0
+        self.mtp_stats_seen_seeded_main_steps = 0
+        self.mtp_stats_seen_partial_rows = 0
         self.mtp_admission_enabled = True
         self.mtp_admission_reason = "enabled"
         self.mtp_baseline_ms_per_token = None
@@ -378,6 +397,9 @@ class Scheduler:
         return {
             "observed_accepted": 0,
             "observed_rejected": 0,
+            "observed_proposed": 0,
+            "observed_seeded_main_steps": 0,
+            "observed_partial_rows": 0,
             "admission_enabled": True,
             "admission_reason": "enabled",
             "baseline_ms_per_token": None,
@@ -559,15 +581,25 @@ class Scheduler:
         bucket_stats = self._get_mtp_bucket_stats(key)
         accepted = int(speculative_stats.get("drafts_accepted", 0) or 0)
         rejected = int(speculative_stats.get("drafts_rejected", 0) or 0)
+        proposed = int(speculative_stats.get("drafts_proposed", 0) or 0)
+        seeded_main_steps = int(speculative_stats.get("fallback_seeded_main_steps", 0) or 0)
+        partial_rows = int(speculative_stats.get("fallback_partial_rows", 0) or 0)
         delta_accepted = max(0, accepted - self.mtp_stats_seen_accepted)
         delta_rejected = max(0, rejected - self.mtp_stats_seen_rejected)
+        delta_proposed = max(0, proposed - self.mtp_stats_seen_proposed)
+        delta_seeded_main_steps = max(0, seeded_main_steps - self.mtp_stats_seen_seeded_main_steps)
+        delta_partial_rows = max(0, partial_rows - self.mtp_stats_seen_partial_rows)
         self.mtp_stats_seen_accepted = accepted
         self.mtp_stats_seen_rejected = rejected
+        self.mtp_stats_seen_proposed = proposed
+        self.mtp_stats_seen_seeded_main_steps = seeded_main_steps
+        self.mtp_stats_seen_partial_rows = partial_rows
         attempted_spec = (delta_accepted + delta_rejected) > 0
+        speculative_overhead = attempted_spec or delta_proposed > 0 or delta_seeded_main_steps > 0 or delta_partial_rows > 0
 
         if is_decode and elapsed_seconds is not None and emitted_tokens > 0:
             ms_per_token = (elapsed_seconds * 1000.0) / emitted_tokens
-            if attempted_spec:
+            if speculative_overhead:
                 bucket_stats["spec_ms_per_token"] = self._ewma(
                     bucket_stats["spec_ms_per_token"],  # type: ignore[arg-type]
                     ms_per_token,
@@ -581,7 +613,7 @@ class Scheduler:
                     self.mtp_latency_alpha,
                 )
                 bucket_stats["baseline_latency_steps"] = int(bucket_stats["baseline_latency_steps"]) + 1
-        if delta_accepted == 0 and delta_rejected == 0:
+        if delta_accepted == 0 and delta_rejected == 0 and delta_proposed == 0 and delta_seeded_main_steps == 0 and delta_partial_rows == 0:
             self._update_mtp_admission_decision(bucket_stats)
             self._apply_mtp_physical_bucket_gate(key, bucket_stats)
             self._sync_legacy_mtp_fields(key, bucket_stats)
@@ -589,6 +621,9 @@ class Scheduler:
 
         bucket_stats["observed_accepted"] = int(bucket_stats["observed_accepted"]) + delta_accepted
         bucket_stats["observed_rejected"] = int(bucket_stats["observed_rejected"]) + delta_rejected
+        bucket_stats["observed_proposed"] = int(bucket_stats["observed_proposed"]) + delta_proposed
+        bucket_stats["observed_seeded_main_steps"] = int(bucket_stats["observed_seeded_main_steps"]) + delta_seeded_main_steps
+        bucket_stats["observed_partial_rows"] = int(bucket_stats["observed_partial_rows"]) + delta_partial_rows
         self._update_mtp_admission_decision(bucket_stats)
         self._apply_mtp_physical_bucket_gate(key, bucket_stats)
         self._sync_legacy_mtp_fields(key, bucket_stats)
@@ -601,35 +636,46 @@ class Scheduler:
 
     def _update_mtp_admission_decision(self, stats: dict[str, object]) -> None:
         verified = int(stats["observed_accepted"]) + int(stats["observed_rejected"])
-        acceptance_ok = True
-        if verified < self.mtp_min_accept_samples:
-            acceptance_ok = True
-        else:
-            accept_rate = int(stats["observed_accepted"]) / max(1, verified)
-            acceptance_ok = accept_rate >= self.mtp_min_accept_rate
-
+        spec_steps = int(stats["spec_latency_steps"])
+        baseline_steps = int(stats["baseline_latency_steps"])
+        accept_rate = int(stats["observed_accepted"]) / max(1, verified) if verified else 0.0
+        probing = spec_steps < self.mtp_probe_steps
+        acceptance_ready = verified >= self.mtp_min_accept_samples
+        acceptance_ok = (not acceptance_ready) or accept_rate >= self.mtp_min_accept_rate
         latency_ok = True
-        if (
-            int(stats["baseline_latency_steps"]) >= self.mtp_latency_min_steps
-            and int(stats["spec_latency_steps"]) >= self.mtp_latency_min_steps
+        latency_ready = (
+            baseline_steps >= self.mtp_latency_min_steps
+            and spec_steps >= max(self.mtp_latency_min_steps, self.mtp_probe_steps)
             and stats["baseline_ms_per_token"] is not None
             and stats["spec_ms_per_token"] is not None
-        ):
+        )
+        if latency_ready:
             measured_speedup = float(stats["baseline_ms_per_token"]) / max(
                 1e-9,
                 float(stats["spec_ms_per_token"]),
             )
             latency_ok = measured_speedup >= self.mtp_min_speedup
 
-        stats["admission_enabled"] = acceptance_ok and latency_ok
-        if not acceptance_ok:
+        stats["probe_complete"] = not probing
+        stats["acceptance_ready"] = acceptance_ready
+        stats["latency_ready"] = latency_ready
+        if probing:
+            stats["admission_enabled"] = True
+            stats["admission_reason"] = "probing_mtp"
+        elif not acceptance_ready:
+            stats["admission_enabled"] = True
+            stats["admission_reason"] = "warming_acceptance"
+        elif not acceptance_ok:
+            stats["admission_enabled"] = False
             stats["admission_reason"] = "low_acceptance"
         elif not latency_ok:
+            stats["admission_enabled"] = False
             stats["admission_reason"] = "low_throughput"
-        elif verified < self.mtp_min_accept_samples:
+        elif not latency_ready and self.mtp_min_speedup > 0:
             stats["admission_enabled"] = True
-            stats["admission_reason"] = "warming"
+            stats["admission_reason"] = "waiting_baseline_probe"
         else:
+            stats["admission_enabled"] = True
             stats["admission_reason"] = "enabled"
 
     def get_mtp_admission_report(self) -> dict[str, object]:
@@ -661,11 +707,19 @@ class Scheduler:
                     "physical_bucket_reason": physical_bucket_reason or "enabled",
                     "observed_accepted": int(stats["observed_accepted"]),
                     "observed_rejected": int(stats["observed_rejected"]),
+                    "observed_proposed": int(stats.get("observed_proposed", 0)),
+                    "observed_seeded_main_steps": int(stats.get("observed_seeded_main_steps", 0)),
+                    "observed_partial_rows": int(stats.get("observed_partial_rows", 0)),
                     "acceptance_rate": accept_rate,
+                    "confidence_min_accept_rate": self.mtp_min_accept_rate,
+                    "acceptance_ready": bool(stats.get("acceptance_ready", verified >= self.mtp_min_accept_samples)),
+                    "probe_steps_required": self.mtp_probe_steps,
+                    "probe_complete": bool(stats.get("probe_complete", int(stats["spec_latency_steps"]) >= self.mtp_probe_steps)),
                     "baseline_ms_per_token": baseline_ms,
                     "spec_ms_per_token": spec_ms,
                     "baseline_latency_steps": int(stats["baseline_latency_steps"]),
                     "spec_latency_steps": int(stats["spec_latency_steps"]),
+                    "latency_ready": bool(stats.get("latency_ready", False)),
                     "measured_speedup": measured_speedup,
                     "active": key == self.mtp_active_bucket_key,
                 }
@@ -673,6 +727,8 @@ class Scheduler:
         return {
             "enabled": bool(self.mtp_scheduler_gate_enabled),
             "active_bucket": self._bucket_key_to_report(self.mtp_active_bucket_key),
+            "confidence_min_accept_rate": self.mtp_min_accept_rate,
+            "probe_steps": self.mtp_probe_steps,
             "buckets": buckets,
         }
 

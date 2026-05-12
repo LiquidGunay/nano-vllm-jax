@@ -242,6 +242,76 @@ def _first_token_diff(
     return None
 
 
+def _divergence_context(
+    first_diff: dict | None,
+    baseline: dict,
+    speculative: dict,
+    *,
+    history_window: int = 8,
+) -> dict | None:
+    if first_diff is None:
+        return None
+    request_index = int(first_diff.get("request_index", 0) or 0)
+    token_index = int(first_diff.get("token_index", 0) or 0)
+    baseline_rows = baseline.get("token_ids_by_request", [])
+    mtp_rows = speculative.get("token_ids_by_request", [])
+    baseline_tokens = baseline_rows[request_index] if request_index < len(baseline_rows) else []
+    mtp_tokens = mtp_rows[request_index] if request_index < len(mtp_rows) else []
+
+    def token_window(tokens: list[int]) -> dict:
+        start = max(0, token_index - history_window)
+        end = min(len(tokens), token_index + history_window + 1)
+        return {
+            "start": start,
+            "end": end,
+            "tokens": [int(x) for x in tokens[start:end]],
+        }
+
+    steps = speculative.get("step_profile", {}).get("steps", [])
+    step_at_diff = None
+    prior_decode_steps = []
+    for step in steps:
+        if bool(step.get("prefill", False)):
+            continue
+        seq_outputs = [
+            item for item in step.get("outputs", [])
+            if int(item.get("seq_id", -1)) == request_index
+        ]
+        if not seq_outputs:
+            continue
+        completion_len = max(int(item.get("completion_len", 0)) for item in seq_outputs)
+        compact = {
+            "scheduler_step_index": int(step.get("scheduler_step_index", -1)),
+            "mtp_branch": step.get("mtp_branch"),
+            "num_tokens": int(step.get("num_tokens", 0)),
+            "seconds": float(step.get("seconds", 0.0)),
+            "phase_ms_run": float(step.get("phase_ms_run", 0.0)),
+            "drafts_accepted_delta": int(step.get("drafts_accepted_delta", 0)),
+            "drafts_rejected_delta": int(step.get("drafts_rejected_delta", 0)),
+            "drafts_proposed_delta": int(step.get("drafts_proposed_delta", 0)),
+            "bonus_tokens_delta": int(step.get("bonus_tokens_delta", 0)),
+            "fallback_gated_no_spec_delta": int(step.get("fallback_gated_no_spec_delta", 0)),
+            "fallback_seeded_main_delta": int(step.get("fallback_seeded_main_delta", 0)),
+            "outputs": seq_outputs,
+        }
+        prior_decode_steps.append(compact)
+        if completion_len > token_index and step_at_diff is None:
+            step_at_diff = compact
+            break
+
+    return {
+        "first_diff": first_diff,
+        "request_index": request_index,
+        "token_index": token_index,
+        "baseline_window": token_window(baseline_tokens),
+        "mtp_window": token_window(mtp_tokens),
+        "mtp_step_at_or_after_diff": step_at_diff,
+        "mtp_branch_history": prior_decode_steps[-history_window:],
+        "speculative_counts": speculative.get("speculative", {}),
+        "scheduler_mtp_admission": speculative.get("scheduler_mtp_admission", {}),
+    }
+
+
 def _torch_dtype(dtype: str):
     import torch
 
@@ -975,6 +1045,8 @@ def _scheduler_mtp_admission_report(scheduler) -> dict:
         "min_accept_rate": float(getattr(scheduler, "mtp_min_accept_rate", 0.0)),
         "min_accept_samples": int(getattr(scheduler, "mtp_min_accept_samples", 0)),
         "min_speedup": float(getattr(scheduler, "mtp_min_speedup", 1.0)),
+        "confidence_min_accept_rate": float(getattr(scheduler, "mtp_min_accept_rate", 0.0)),
+        "probe_steps": int(getattr(scheduler, "mtp_probe_steps", 0)),
         "latency_alpha": float(getattr(scheduler, "mtp_latency_alpha", 0.0)),
         "latency_min_steps": int(getattr(scheduler, "mtp_latency_min_steps", 0)),
         "observed_accepted": int(getattr(scheduler, "mtp_observed_accepted", 0)),
@@ -1135,6 +1207,9 @@ def _snapshot_mtp_admission(scheduler) -> dict | None:
         "mtp_observed_rejected": getattr(scheduler, "mtp_observed_rejected", 0),
         "mtp_stats_seen_accepted": getattr(scheduler, "mtp_stats_seen_accepted", 0),
         "mtp_stats_seen_rejected": getattr(scheduler, "mtp_stats_seen_rejected", 0),
+        "mtp_stats_seen_proposed": getattr(scheduler, "mtp_stats_seen_proposed", 0),
+        "mtp_stats_seen_seeded_main_steps": getattr(scheduler, "mtp_stats_seen_seeded_main_steps", 0),
+        "mtp_stats_seen_partial_rows": getattr(scheduler, "mtp_stats_seen_partial_rows", 0),
         "mtp_admission_enabled": getattr(scheduler, "mtp_admission_enabled", True),
         "mtp_admission_reason": getattr(scheduler, "mtp_admission_reason", "enabled"),
         "mtp_baseline_ms_per_token": getattr(scheduler, "mtp_baseline_ms_per_token", None),
@@ -1963,6 +2038,7 @@ def _build_variant_rows(
             speculative["token_ids_by_request"],
         )
         correct = first_diff is None
+        divergence_context = _divergence_context(first_diff, baseline, speculative)
         next_step_check = {"checked": False, "ok": True}
         if correct and _should_check_next_step_sanity(args):
             next_step_check = _run_next_step_sanity_check(
@@ -2033,6 +2109,7 @@ def _build_variant_rows(
             "speedup": baseline["seconds"] / max(1e-9, speculative["seconds"]),
             "correct": correct,
             "first_diff": first_diff,
+            "divergence_context": divergence_context,
             "throughput_valid": bool(correct and next_step_ok),
             "timed_results_valid": bool(correct and next_step_ok),
             "next_step_logit_sanity": bool(next_step_ok),
