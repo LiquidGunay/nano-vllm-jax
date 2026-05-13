@@ -966,6 +966,18 @@ class CanonicalModelRunner:
         self.mtp_enabled = hasattr(params, "mtp_params") and params.mtp_params is not None
         self.num_speculative_tokens = int(getattr(config, "num_speculative_tokens", 0) or 0)
         self.mtp1_enabled = self.mtp_enabled and self.num_speculative_tokens > 0
+        compile_mtp_draft_default = os.environ.get("NANO_VLLM_JAX_MTP_COMPILE_DRAFT", "1") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }
+        self.mtp_compile_draft = bool(
+            self.mtp1_enabled
+            and self.execution in {"decode-jit", "jit"}
+            and compile_mtp_draft_default
+        )
         self._mtp1_forward_jit = None
         self._mtp1_token_jit = None
         self._hidden_token_jit = None

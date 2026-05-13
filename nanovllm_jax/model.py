@@ -66,9 +66,32 @@ def _decode_width1_rms_norm(
     `[B, 1, ...]` RMSNorm shape used by baseline decode and concatenate the
     token results inside the compiled graph.
     """
+    stable_decode_norm = os.environ.get("NANO_VLLM_JAX_STABLE_DECODE_RMSNORM", "0") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "True",
+    }
     if not force_width1 or x.ndim < 3 or x.shape[1] <= 1:
-        return rms_norm(x, weight, eps)
-    parts = [rms_norm(x[:, t : t + 1, ...], weight, eps) for t in range(x.shape[1])]
+        return _stable_rmsnorm_fp32(x, weight, eps) if stable_decode_norm and force_width1 else rms_norm(x, weight, eps)
+    norm_fn = _stable_rmsnorm_fp32 if stable_decode_norm else rms_norm
+    if os.environ.get("NANO_VLLM_JAX_SCAN_WIDTH1_RMSNORM", "0") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "True",
+    }:
+        x_time_major = jnp.swapaxes(x, 0, 1)
+
+        def scan_norm(_, x_t):
+            y_t = norm_fn(x_t[:, None, ...], weight, eps)
+            return None, y_t[:, 0, ...]
+
+        _, y_time_major = lax.scan(scan_norm, None, x_time_major)
+        return jnp.swapaxes(y_time_major, 0, 1)
+    parts = [norm_fn(x[:, t : t + 1, ...], weight, eps) for t in range(x.shape[1])]
     return jnp.concatenate(parts, axis=1)
 
 
@@ -1070,7 +1093,12 @@ def full_attention_block(
     # query: [batch, seq_len, num_attention_heads * head_dim]
     # gate: [batch, seq_len, num_attention_heads * head_dim]
     attn_out_dim = config.num_attention_heads * config.head_dim
-    force_width1_full_attn = False  # gated off: worsened parity; keep branch dormant for targeted experiments
+    force_width1_full_attn = (
+        (not is_prefill)
+        and seq_len > 1
+        and os.environ.get("NANO_VLLM_JAX_FORCE_WIDTH1_FULL_ATTN", "0")
+        in {"1", "true", "yes", "on", "True"}
+    )
 
     if force_width1_full_attn:
         query_parts = []
@@ -1134,7 +1162,7 @@ def full_attention_block(
         )
 
         # Apply RMSNorm BEFORE transpose (on head dimension, in [B, T, H, D] layout)
-        force_width1_norm = (not is_prefill) and seq_len > 1 and _force_width1_decode_math()
+        force_width1_norm = (not is_prefill) and _force_width1_decode_math()
         query = _decode_width1_rms_norm(
             query,
             params["q_norm"],
@@ -1262,7 +1290,7 @@ def transformer_block(
 
     # Apply input_layernorm (both full attention and linear attention)
     # HF applies input_layernorm before both layer types
-    force_width1_norm = (not is_prefill) and x.ndim == 3 and x.shape[1] > 1 and _force_width1_decode_math()
+    force_width1_norm = (not is_prefill) and x.ndim == 3 and _force_width1_decode_math()
     x = _decode_width1_rms_norm(
         x,
         params["input_norm"],

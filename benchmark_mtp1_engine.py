@@ -95,7 +95,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--require-tpu", action="store_true")
-    parser.add_argument("--compile-mtp-draft", action="store_true")
+    parser.add_argument(
+        "--compile-mtp-draft",
+        dest="compile_mtp_draft",
+        action="store_true",
+        default=None,
+        help=(
+            "Force compiled MTP draft seeding. By default JIT runners compile "
+            "the draft path unless NANO_VLLM_JAX_MTP_COMPILE_DRAFT=0."
+        ),
+    )
+    parser.add_argument(
+        "--no-compile-mtp-draft",
+        dest="compile_mtp_draft",
+        action="store_false",
+        help="Force uncompiled MTP draft seeding for diagnostics.",
+    )
     parser.add_argument("--debug-spec", action="store_true")
     parser.add_argument("--mtp-position-offset", type=int, default=0)
     parser.add_argument("--mtp-token-source", choices=["generated", "current"], default="generated")
@@ -1268,7 +1283,7 @@ def run_generation_batch(
     mtp_position_offset: int = 0,
     mtp_token_source: str = "generated",
     mtp_hidden_source: str = "final_normed",
-    compile_mtp_draft: bool = False,
+    compile_mtp_draft: bool | None = None,
     debug_spec: bool = False,
     step_profile: bool = False,
     return_step_records: bool = True,
@@ -1283,7 +1298,8 @@ def run_generation_batch(
     runner.mtp_position_offset = mtp_position_offset
     runner.mtp_token_source = mtp_token_source
     runner.mtp_hidden_source = mtp_hidden_source
-    runner.mtp_compile_draft = compile_mtp_draft
+    if compile_mtp_draft is not None:
+        runner.mtp_compile_draft = bool(compile_mtp_draft)
     runner.mtp_debug = debug_spec
     runner._mtp1_drafts.clear()
     runner._last_prefill_logits_by_seq = {}
@@ -1657,7 +1673,7 @@ def run_generation(
     mtp_position_offset: int = 0,
     mtp_token_source: str = "generated",
     mtp_hidden_source: str = "final_normed",
-    compile_mtp_draft: bool = False,
+    compile_mtp_draft: bool | None = None,
     debug_spec: bool = False,
     step_profile: bool = False,
 ):
@@ -1700,7 +1716,7 @@ def _run_shape_warmups(
     mtp_position_offset: int = 0,
     mtp_token_source: str = "generated",
     mtp_hidden_source: str = "final_normed",
-    compile_mtp_draft: bool = False,
+    compile_mtp_draft: bool | None = None,
     debug_spec: bool = False,
     step_profile: bool = False,
 ) -> dict[str, float]:
@@ -2409,7 +2425,8 @@ def main():
             "jax_execution": args.jax_execution,
             "max_tokens": args.max_tokens,
             "repeats": args.repeats,
-            "compile_mtp_draft": args.compile_mtp_draft,
+            "compile_mtp_draft": bool(getattr(engine.model_runner, "mtp_compile_draft", False)),
+            "compile_mtp_draft_cli": args.compile_mtp_draft,
             "debug_spec": args.debug_spec,
             "step_profile": args.step_profile,
             "load_seconds": load_seconds,
@@ -2496,7 +2513,8 @@ def main():
             "jax_execution": args.jax_execution,
             "max_tokens": args.max_tokens,
             "repeats": args.repeats,
-            "compile_mtp_draft": args.compile_mtp_draft,
+            "compile_mtp_draft": bool(getattr(engine.model_runner, "mtp_compile_draft", False)),
+            "compile_mtp_draft_cli": args.compile_mtp_draft,
             "debug_spec": args.debug_spec,
             "step_profile": args.step_profile,
             "load_seconds": load_seconds,

@@ -492,3 +492,102 @@ first, then target hidden-state cost and commit overhead. Correctness still
 depends on the active verifier mode: the exact commit-select path remains the
 reference, while one-pass width-2 execution must still be validated against
 baseline before being trusted for speed claims.
+
+#### 5. Draft-seed compilation default and rejected-path controls
+
+Follow-up TPU controls showed that K=1 commit-select with forced rejection is
+still slower than baseline even when it is exact:
+
+| Case | Path | Forced reject | Exact | Decode speedup | Acceptance | Notes |
+|---|---|---:|---:|---:|---:|---|
+| 4B B=1 real | commit-select | true | true | `0.749` | `0.000` | Rejected verifier path is exact but too slow |
+| 4B B=1 real | one-pass | true | false | `0.789` | `0.000` | Width-2 lane-0/after-current state is not canonical |
+
+This isolates two issues:
+
+- one-pass width-2 is not safe even for all-reject K=1, so it cannot be used as
+  a correctness-preserving reject fast path yet;
+- the exact reject path pays target verifier cost plus MTP draft-seeding cost,
+  and benchmark runs that report `compile_mtp_draft=false` can accidentally
+  measure the uncompiled MTP head path.
+
+The runner now defaults to compiled MTP draft seeding whenever MTP is enabled
+and execution is `decode-jit` or `jit`. Set
+`NANO_VLLM_JAX_MTP_COMPILE_DRAFT=0` or benchmark with
+`--no-compile-mtp-draft` only for diagnostics. The benchmark `--compile-mtp-draft`
+flag is now an explicit override rather than an implicit requirement for the
+fast path.
+
+An fp32 decode RMSNorm diagnostic flag was also tested:
+
+```text
+NANO_VLLM_JAX_STABLE_DECODE_RMSNORM=1
+```
+
+It reduced both speed and acceptance in the 4B B=1 one-pass control, so it is
+kept default-off. This points away from RMSNorm precision as the primary
+one-pass drift cause and back toward the width-2 verifier state/install path.
+
+#### 6. Updated width-2 verifier diagnostics
+
+After making compiled draft seeding the JIT default, a warmed 4B B=1
+commit-select control without `--compile-mtp-draft` reported the effective
+default correctly:
+
+| Metric | Value |
+|---|---:|
+| `compile_mtp_draft` | `true` |
+| `compile_mtp_draft_cli` | `null` |
+| exact token match | `true` |
+| decode speedup | `0.839x` |
+| acceptance | `0.500` |
+| accepted inter-token p50 | `15.92 ms/token` |
+| rejected inter-token p50 | `24.63 ms/token` |
+| seeded fallback p50 | `20.61 ms/token` |
+
+This did not materially improve throughput. The exact accepted path still emits
+two tokens in about the same time as two baseline decodes, while reject and
+seeded-fallback paths remain slower than baseline.
+
+The next set of one-pass diagnostics isolated the correctness blocker further:
+
+| Diagnostic | Result |
+|---|---|
+| `NANO_VLLM_JAX_FORCE_WIDTH1_FULL_ATTN=1` | one-pass forced-reject still incorrect |
+| current layerwise drift | first difference remains layer 0 `linear_attention`, `entry=0`, `in_norm>0` |
+| `NANO_VLLM_JAX_SCAN_WIDTH1_RMSNORM=1` | no change; same layer-0 `in_norm` drift |
+| stable decode RMSNorm applied to both width-1 and width-2 decode | one-pass exact for the short diagnostic, but acceptance collapsed to `0.0` |
+
+Representative current layerwise line:
+
+```text
+[MTP_LAYERWISE_DRIFT] fused_one_pass_vs_seq threshold=0 first_layer=0 first_type=linear_attention layers=0:linear_attention:h=0.0078125,k=0,v=0,pre_k=0,pre_v=0,conv=0.125,rec=0.0127265,stages=entry=0,in_norm=0.03125,...
+```
+
+The stable decode RMSNorm run, without layerwise debug, was exact but not useful
+for speed:
+
+| Metric | Value |
+|---|---:|
+| exact token match | `true` |
+| decode speedup | `0.764x` |
+| acceptance | `0.000` |
+| rejected p50 | `20.40 ms` |
+| seeded fallback p50 | `19.21 ms` |
+
+Current concrete blocker:
+
+1. Normal BF16 decode preserves some MTP agreement, but width-2 one-pass drifts
+   immediately at layer-0 RMSNorm even when token inputs are identical.
+2. Stable fp32 decode RMSNorm can remove the observed width-2 drift, but it
+   changes the target/MTP numerical contract enough that K=1 drafts stop being
+   accepted on the tested 4B real prompt.
+3. Exact commit-select remains the correctness reference, but for K=1 it cannot
+   beat baseline unless accepted steps are materially cheaper than two baseline
+   decodes or the acceptance rate is high enough to overcome reject/fallback
+   overhead. The current 4B B=1 exact accepted latency is not cheaper per emitted
+   token than baseline.
+4. The next speed path is therefore either a numerically canonical width-2
+   decode kernel/RMSNorm lowering that preserves normal-model MTP agreement, or
+   a different target verifier contract that avoids shape-sensitive width-2
+   state while costing less than two sequential target decodes.
