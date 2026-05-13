@@ -470,3 +470,25 @@ Seed-after-bonus was also tested on the exact commit-select path:
 
 This reduced acceptance and speed relative to the safer no-reseed default, so it
 should not be enabled as a default policy.
+
+#### 4. Token-only verifier LM-head and dirty rejected slots
+
+The next K=1 implementation pass keeps the same scheduler-owned admission and
+rectangular physical-bucket contract, but narrows the verifier output path:
+
+- `lm_head_token_ids_and_topk` computes exact greedy target ids and optional
+  top-k margin data inside the JIT, instead of returning full
+  `[B, 2, vocab]` verifier logits to the host.
+- The one-pass K=1 verifier now calls the target model with
+  `return_hidden=True` only, then runs the LM-head reduction on device.
+- The exact commit-select verifier also avoids returning full bonus logits from
+  its second target decode.
+- Rejected draft KV slots are no longer restored in the serving verifier path;
+  they are treated as dirty but uncommitted because `committed_seq_lens` remains
+  at the current-token prefix and the next decode overwrites the same slot.
+
+This targets the current priority order: reduce verifier LM-head/output cost
+first, then target hidden-state cost and commit overhead. Correctness still
+depends on the active verifier mode: the exact commit-select path remains the
+reference, while one-pass width-2 execution must still be validated against
+baseline before being trusted for speed claims.

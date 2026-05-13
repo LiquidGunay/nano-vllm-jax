@@ -15,7 +15,7 @@ from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.engine.scheduled_batch import ScheduledBatch
 from nanovllm_jax.kv_cache import AttentionMetadata, HybridLayerState, KVCacheState, KVCacheStorage
 from nanovllm_jax.layers import rms_norm
-from nanovllm_jax.model import ModelParams, forward_step as model_forward_step
+from nanovllm_jax.model import ModelParams, forward_step as model_forward_step, lm_head_token_ids_and_topk
 from nanovllm_jax.mtp.mtp_layer import mtp_forward
 
 
@@ -704,7 +704,7 @@ class ModelExecutor:
                     kv_lens=verify_batch.seq_lens,
                     slot_mapping=verify_metadata.slot_mapping,
                 )
-                (hidden, verify_logits), updated_kv_state, updated_hybrid_state, first_prefix_hybrid_state = model_forward_step(
+                hidden, updated_kv_state, updated_hybrid_state, first_prefix_hybrid_state = model_forward_step(
                     verify_batch.tokens,
                     params,
                     self.config,
@@ -714,20 +714,26 @@ class ModelExecutor:
                     hybrid_state=HybridLayerState(conv_state, recurrent_state),
                     is_prefill=not one_pass_decode_mode,
                     return_hidden=True,
-                    return_hidden_with_logits=True,
                     return_first_prefix_hybrid=True,
                     backend=self.backend,
                 )
 
                 hidden_norm = rms_norm(hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
-                token_ids = jnp.argmax(verify_logits[:, :2], axis=-1).astype(jnp.int32)
+                token_ids, bonus_topk_values, _ = lm_head_token_ids_and_topk(
+                    hidden_norm,
+                    params,
+                    self.config,
+                    hidden_is_normed=True,
+                    is_prefill=not one_pass_decode_mode,
+                    top_k=2 if bonus_margin_threshold > 0 else 0,
+                )
                 target_token = token_ids[:, 0]
                 bonus_token = token_ids[:, 1]
                 accepted = (target_token == draft_token_arg) & row_has_draft
                 if batch_accept_policy == "all_or_none":
                     accepted = accepted & jnp.all(jnp.where(row_has_draft, accepted, True))
                 if bonus_margin_threshold > 0:
-                    bonus_top2, _ = jax.lax.top_k(verify_logits[:, 1].astype(jnp.float32), 2)
+                    bonus_top2 = bonus_topk_values[:, 1]
                     bonus_margin = bonus_top2[:, 0] - bonus_top2[:, 1]
                     accepted = accepted & (bonus_margin >= bonus_margin_threshold)
                     if batch_accept_policy == "all_or_none":
@@ -818,15 +824,12 @@ class ModelExecutor:
                     hybrid_after_draft.recurrent_state,
                 )
 
-                # Slot 0 is the canonical current-token write for every active row.
-                # Rejected rows with a real draft restore only the speculative
-                # draft slot. Inactive padded rows and no-draft probe rows keep
-                # the verifier cache value to avoid duplicate dummy slot restores
-                # clobbering another active row's current-token write.
-                slot_draft = verify_metadata.slot_mapping[:, 1]
-                keep_draft_slot = accepted | (~row_valid) | (~row_has_draft)
-                selected_k_cache = restore_slots(updated_kv_state.k_cache, k_cache, slot_draft, keep_draft_slot)
-                selected_v_cache = restore_slots(updated_kv_state.v_cache, v_cache, slot_draft, keep_draft_slot)
+                # Slot 0 is the canonical current-token write for every active
+                # row. Rejected draft slots are allowed to remain dirty: they
+                # are not logically committed because committed_seq_lens does
+                # not advance, and the next decode overwrites the same slot.
+                selected_k_cache = updated_kv_state.k_cache
+                selected_v_cache = updated_kv_state.v_cache
                 committed_seq_lens = seq_lens + accepted.astype(jnp.int32)
                 return (
                     target_token,
@@ -1834,9 +1837,15 @@ class ModelExecutor:
                     backend=self.backend,
                 )
 
-                output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
                 hidden0_norm = rms_norm(hidden0, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
-                target_token = jnp.argmax(jnp.dot(hidden0_norm[:, 0], output_weight), axis=-1).astype(jnp.int32)
+                target_ids, _, _ = lm_head_token_ids_and_topk(
+                    hidden0_norm,
+                    params,
+                    self.config,
+                    hidden_is_normed=True,
+                    is_prefill=False,
+                )
+                target_token = target_ids[:, 0]
                 row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
                 row_active = (row_query_lens > 0) & (seq_ids >= 0)
                 row_has_draft = row_active & (draft_token_arg >= 0)
@@ -1889,7 +1898,7 @@ class ModelExecutor:
                         kv_lens=second_batch.seq_lens,
                         slot_mapping=second_metadata.slot_mapping,
                     )
-                    (next_hidden, next_logits), next_kv, next_hybrid = model_forward_step(
+                    next_hidden, next_kv, next_hybrid = model_forward_step(
                         second_batch.tokens,
                         params,
                         self.config,
@@ -1899,43 +1908,32 @@ class ModelExecutor:
                         hybrid_state=hybrid_after_current,
                         is_prefill=False,
                         return_hidden=True,
-                        return_hidden_with_logits=True,
-                        last_logits_only=True,
                         backend=self.backend,
                     )
                     return (
                         next_hidden,
-                        next_logits,
                         next_kv.k_cache,
                         next_kv.v_cache,
                         next_hybrid.conv_state,
                         next_hybrid.recurrent_state,
-                        second_metadata.slot_mapping[:, 0],
                     )
 
                 def skip_second_decode(_):
                     return (
                         jnp.zeros_like(hidden0),
-                        jnp.zeros(
-                            (tokens.shape[0], 1, output_weight.shape[1]),
-                            dtype=jnp.float32,
-                        ),
                         kv_after_current.k_cache,
                         kv_after_current.v_cache,
                         hybrid_after_current.conv_state,
                         hybrid_after_current.recurrent_state,
-                        jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
                     )
 
                 second_decode_needed = jnp.any(accepted)
                 (
                     hidden1,
-                    bonus_logits,
                     draft_k_cache,
                     draft_v_cache,
                     draft_conv_state,
                     draft_recurrent_state,
-                    draft_slots,
                 ) = jax.lax.cond(
                     second_decode_needed,
                     run_second_decode,
@@ -1947,15 +1945,23 @@ class ModelExecutor:
                     recurrent_state=draft_recurrent_state,
                 )
 
-                bonus_token = jnp.argmax(bonus_logits[:, 0], axis=-1).astype(jnp.int32)
+                hidden1_norm = rms_norm(hidden1, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                bonus_ids, bonus_topk_values, _ = lm_head_token_ids_and_topk(
+                    hidden1_norm,
+                    params,
+                    self.config,
+                    hidden_is_normed=True,
+                    is_prefill=False,
+                    top_k=2 if bonus_margin_threshold > 0 else 0,
+                )
+                bonus_token = bonus_ids[:, 0]
                 if bonus_margin_threshold > 0:
-                    bonus_top2, _ = jax.lax.top_k(bonus_logits[:, 0].astype(jnp.float32), 2)
+                    bonus_top2 = bonus_topk_values[:, 0]
                     bonus_margin = bonus_top2[:, 0] - bonus_top2[:, 1]
                     accepted = accepted & (bonus_margin >= bonus_margin_threshold)
                     if batch_accept_policy == "all_or_none":
                         accepted = accepted & jnp.all(jnp.where(row_active, accepted, True))
 
-                hidden1_norm = rms_norm(hidden1, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                 accept_mask = accepted[:, None, None]
                 selected_hidden = jnp.where(
                     accept_mask,
@@ -2003,26 +2009,10 @@ class ModelExecutor:
                     lambda _: (hybrid_after_current.conv_state, hybrid_after_current.recurrent_state),
                     operand=None,
                 )
-                def restore_rejected_draft_slots(new_cache, current_cache):
-                    leading_shape = new_cache.shape[:-4] if new_cache.ndim == 5 else new_cache.shape[:-3]
-                    flat_new = new_cache.reshape(leading_shape + (-1,) + new_cache.shape[-2:])
-                    flat_current = current_cache.reshape(leading_shape + (-1,) + current_cache.shape[-2:])
-                    new_values = flat_new[..., draft_slots, :, :]
-                    current_values = flat_current[..., draft_slots, :, :]
-                    slot_mask = accepted.reshape((1,) * len(leading_shape) + (accepted.shape[0], 1, 1))
-                    selected_values = jnp.where(slot_mask, new_values, current_values)
-                    flat_new = flat_new.at[..., draft_slots, :, :].set(selected_values)
-                    return flat_new.reshape(new_cache.shape)
-
-                selected_k_cache, selected_v_cache = jax.lax.cond(
-                    final_any_accepted,
-                    lambda _: (
-                        restore_rejected_draft_slots(draft_k_cache, kv_after_current.k_cache),
-                        restore_rejected_draft_slots(draft_v_cache, kv_after_current.v_cache),
-                    ),
-                    lambda _: (kv_after_current.k_cache, kv_after_current.v_cache),
-                    operand=None,
-                )
+                # Rejected draft slots are dirty but uncommitted because the
+                # committed length stays at the current-token prefix.
+                selected_k_cache = draft_k_cache
+                selected_v_cache = draft_v_cache
 
                 return (
                     target_token,

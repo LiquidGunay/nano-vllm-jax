@@ -89,6 +89,37 @@ def _force_width1_decode_math() -> bool:
     }
 
 
+def lm_head_token_ids_and_topk(
+    hidden: jnp.ndarray,
+    params: ModelParams,
+    config,
+    *,
+    hidden_is_normed: bool = False,
+    is_prefill: bool = True,
+    top_k: int = 0,
+):
+    """Return greedy LM-head token ids and optional top-k values on device.
+
+    Speculative verification needs exact target token ids and sometimes a
+    top-2 margin, but returning full `[B, width, vocab]` logits from the JIT
+    bloats the verifier path. Keep the dense LM-head computation inside the
+    compiled graph and return only small verifier products.
+    """
+    hidden_norm = hidden if hidden_is_normed else rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
+    hidden_norm = hidden_norm.astype(jnp.float32)
+    output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
+    logits = _tokenwise_decode_dot(
+        hidden_norm,
+        output_weight,
+        force_width1=(not is_prefill) and hidden_norm.ndim == 3 and hidden_norm.shape[1] > 1 and _force_width1_decode_math(),
+    )
+    token_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+    if top_k > 0:
+        top_values, top_indices = jax.lax.top_k(logits.astype(jnp.float32), top_k)
+        return token_ids, top_values, top_indices.astype(jnp.int32)
+    return token_ids, None, None
+
+
 # Register ModelParams as a JAX pytree node for JIT compatibility
 def _model_params_flatten(params: ModelParams):
     """Flatten ModelParams into children and auxiliary data."""
