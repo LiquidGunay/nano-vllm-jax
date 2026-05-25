@@ -323,6 +323,19 @@ def test_model_runner_hybrid_state_uses_full_table_fast_path():
     assert runner._hybrid_state_table is new_state
 
 
+def test_model_runner_hybrid_state_prefers_physical_row_slots_for_new_sequences():
+    runner = _hybrid_state_runner_with_two_slots()
+    runner._hybrid_slots = {}
+    runner._free_hybrid_slots = [0, 1]
+    batch = _hybrid_state_batch([8, 9], [1, 1])
+
+    batched_state = runner._batch_hybrid_state(batch)
+
+    assert batched_state is runner._hybrid_state_table
+    assert runner._hybrid_slots == {8: 0, 9: 1}
+    assert batch.hybrid_slot_ids_host == (0, 1)
+
+
 def test_model_runner_hybrid_state_does_not_replace_full_table_with_inactive_rows():
     runner = _hybrid_state_runner_with_two_slots()
     original_state = runner._hybrid_state_table

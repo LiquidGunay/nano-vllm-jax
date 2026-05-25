@@ -1233,7 +1233,7 @@ class CanonicalModelRunner:
             else None,
         )
 
-    def _ensure_hybrid_slot(self, seq_id: int) -> int:
+    def _ensure_hybrid_slot(self, seq_id: int, preferred_slot: int | None = None) -> int:
         if seq_id < 0:
             return -1
         slot = self._hybrid_slots.get(seq_id)
@@ -1241,7 +1241,14 @@ class CanonicalModelRunner:
             return slot
         if not self._free_hybrid_slots:
             raise RuntimeError("No free hybrid-state slots; max_num_seqs is exhausted")
-        if seq_id < self._max_hybrid_slots and seq_id in self._free_hybrid_slots:
+        if (
+            preferred_slot is not None
+            and 0 <= preferred_slot < self._max_hybrid_slots
+            and preferred_slot in self._free_hybrid_slots
+        ):
+            slot = preferred_slot
+            self._free_hybrid_slots.remove(slot)
+        elif seq_id < self._max_hybrid_slots and seq_id in self._free_hybrid_slots:
             slot = seq_id
             self._free_hybrid_slots.remove(slot)
         else:
@@ -1386,7 +1393,10 @@ class CanonicalModelRunner:
             if batch.seq_ids_host is not None
             else [int(seq_id) for seq_id in batch.seq_ids.tolist()]
         )
-        slot_values = [self._ensure_hybrid_slot(int(seq_id)) for seq_id in seq_ids]
+        slot_values = [
+            self._ensure_hybrid_slot(int(seq_id), preferred_slot=row)
+            for row, seq_id in enumerate(seq_ids)
+        ]
         batch.hybrid_slot_ids_host = tuple(slot_values)
         if (
             self._hybrid_state_table.conv_state is not None
@@ -1811,11 +1821,18 @@ class CanonicalModelRunner:
             seed_hidden = self._hidden_for_mtp(last_hidden[:, None, :])[:, 0]
         else:
             last_logits = output.activations[: len(seqs), 0]
-        query_lens = [int(x) for x in batch.query_lens[: len(seqs)].tolist()]
+        if batch.query_lens_host is not None:
+            query_lens = [int(x) for x in batch.query_lens_host[: len(seqs)]]
+        else:
+            query_lens = [int(x) for x in batch.query_lens[: len(seqs)].tolist()]
+        if batch.seq_ids_host is not None:
+            seq_ids_host = [int(x) for x in batch.seq_ids_host[: len(seqs)]]
+        else:
+            seq_ids_host = [int(batch.seq_ids[row]) for row in range(len(seqs))]
         active_rows = [
             row
             for row, query_len in enumerate(query_lens)
-            if query_len > 0 and int(batch.seq_ids[row]) >= 0
+            if query_len > 0 and seq_ids_host[row] >= 0
         ]
         if batch.is_prefill and last_logits is not None:
             prefill_logits_by_seq = getattr(self, "_last_prefill_logits_by_seq", None)
@@ -1829,7 +1846,10 @@ class CanonicalModelRunner:
         token_by_row: dict[int, int] = {}
         if active_rows:
             if use_greedy_token_fastpath:
-                token_ids = token_ids_all[jnp.array(active_rows, dtype=jnp.int32)]
+                if active_rows == list(range(len(seqs))):
+                    token_ids = token_ids_all
+                else:
+                    token_ids = token_ids_all[jnp.array(active_rows, dtype=jnp.int32)]
             else:
                 active_idx = jnp.array(active_rows, dtype=jnp.int32)
                 temperatures = jnp.array([seqs[row].temperature for row in active_rows], dtype=jnp.float32)
