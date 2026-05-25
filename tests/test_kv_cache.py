@@ -173,6 +173,50 @@ def test_linear_attention_chunked_vs_recurrent(seq_len):
     print("  ✓ PASS: Chunked and recurrent match (MSE < 1e-6)")
 
 
+def test_linear_attention_multichunk_matches_recurrent(monkeypatch):
+    """The multi-chunk GDN prefill path must preserve recurrent parity."""
+    monkeypatch.setenv("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1")
+    key = jax.random.PRNGKey(123)
+    keys = jax.random.split(key, 5)
+    batch_size = 1
+    num_heads = 2
+    seq_len = 16
+    k_dim = 8
+    v_dim = 8
+    chunk_size = 4
+    query = jax.random.normal(keys[0], (batch_size, num_heads, seq_len, k_dim), dtype=jnp.float32)
+    key = jax.random.normal(keys[1], (batch_size, num_heads, seq_len, k_dim), dtype=jnp.float32)
+    value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, v_dim), dtype=jnp.float32)
+    g = jax.random.normal(keys[3], (batch_size, num_heads, seq_len), dtype=jnp.float32) * 0.1
+    beta = jax.random.uniform(keys[4], (batch_size, num_heads, seq_len), dtype=jnp.float32)
+
+    chunked_output, _ = jax_chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        chunk_size=chunk_size,
+        use_qk_l2norm_in_kernel=True,
+    )
+    state = jnp.zeros((batch_size, num_heads, k_dim, v_dim), dtype=jnp.float32)
+    recurrent_outputs = []
+    for t in range(seq_len):
+        out_t, state = jax_recurrent_gated_delta_rule(
+            query[:, :, t : t + 1],
+            key[:, :, t : t + 1],
+            value[:, :, t : t + 1],
+            g[:, :, t : t + 1],
+            beta[:, :, t : t + 1],
+            initial_state=state,
+            use_qk_l2norm_in_kernel=True,
+        )
+        recurrent_outputs.append(out_t)
+    recurrent_output = jnp.concatenate(recurrent_outputs, axis=2)
+
+    np.testing.assert_allclose(np.array(chunked_output), np.array(recurrent_output), rtol=1e-5, atol=1e-5)
+
+
 def test_linear_attention_state_persistence():
     """Test that linear attention state persists correctly across decode steps."""
     print("\n=== Testing Linear Attention State Persistence ===")

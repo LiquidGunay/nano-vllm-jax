@@ -340,3 +340,66 @@ Decision:
 
 - Do not keep the full-active decode KV write specialization. Removing the sentinel-concat source branch did not translate into a better lowered plan on this profile.
 - The failed result is still useful: the dominant pure-JAX decode cost is not this padding mask construction. Continue below this level with decode attention/GDN lowering or broader compiled-step fusion evidence.
+
+## Entry 012 - Rejected Hidden-Select Token Fast Path
+
+- run id: `20260525-193100-1877871-jax_hetero8_64_512x32_hidden_select_fastpath`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_hidden_select_fastpath.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-193100-1877871-jax_hetero8_64_512x32_hidden_select_fastpath`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-193100-1877871-jax_hetero8_64_512x32_hidden_select_fastpath/plugins/profile/2026_05_25_19_31_50/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-193100-1877871-jax_hetero8_64_512x32_hidden_select_fastpath/plugins/profile/2026_05_25_19_31_50/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: `forward_step` could return only selected hidden positions for the greedy token-id JIT path, avoiding an outer hidden gather and skipping final RMSNorm when only pre-norm hidden was requested.
+- status: rejected and reverted from the working tree.
+- correctness: full generated-token match against Entry 001 for all 8 rows; focused CUDA tests passed before the revert.
+- JAX timing: `127.98 tok/s`, TTFT p50 `1223.68 ms`, ITL p50 `25.04 ms`, ITL p95 `31.43 ms`
+- delta vs Entry 009: `0.948x` total tok/s, so the change regressed throughput.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 009 ms | Entry 012 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1896.26 | 2000.33 | regressed |
+| `_run_main_and_sample` | 1769.72 | 1836.75 | regressed |
+| `forward_step_token_ids_jit` | 1359.84 | 1442.22 | compiled step regressed |
+| `PjRtCApiLoadedExecutable::Execute` | 1330.04 | 1405.97 | compiled execution increased |
+| `jit_compiled:XLA GPU module` | 1167.33 | 1188.99 | lowered module slower |
+| `MemcpyD2D` | 673.14 | 653.10 | copy bucket fell, but not enough to pay for slower execution |
+| `while` | 1087.00 | 1086.71 | GDN prefill bottleneck unchanged |
+
+Decision:
+
+- Do not keep hidden-position selection in `forward_step`. XLA did not turn the smaller source-level return into a better compiled plan for this workload.
+- The result reinforces that the remaining large target is not last-hidden gathering or final RMSNorm in the token fast path; it is Gated DeltaNet prefill and lower-level compiled decode work.
+
+## Entry 013 - Fixed Chunked Gated DeltaNet Prefill
+
+- run id: `20260525-194440-1884283-jax_hetero8_64_512x32_chunked_gdn_prefill_default`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_chunked_gdn_prefill_default.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-194440-1884283-jax_hetero8_64_512x32_chunked_gdn_prefill_default`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-194440-1884283-jax_hetero8_64_512x32_chunked_gdn_prefill_default/plugins/profile/2026_05_25_19_45_04/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-194440-1884283-jax_hetero8_64_512x32_chunked_gdn_prefill_default/plugins/profile/2026_05_25_19_45_04/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Beauvoir identified Gated DeltaNet prefill as the top model-side bottleneck. Entry 009 spent about `1087 ms` in 18 recurrent `while` ranges, one per linear-attention layer.
+- change: fixed the multi-chunk GDN prefill state correction to use `exp(cumsum(g))` instead of per-token `exp(g)`, then made chunked cached prefill the default. `NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL=0` remains as the recurrent fallback.
+- correctness: full generated-token match against Entry 001 for all 8 rows; focused CUDA tests cover multi-chunk GDN parity and bucketed cached prefill state.
+- JAX timing: `180.44 tok/s`, TTFT p50 `739.45 ms`, ITL p50 `21.77 ms`, ITL p95 `23.58 ms`
+- delta vs Entry 009: `1.337x` total tok/s, TTFT p50 `0.607x`, ITL p50 essentially unchanged.
+- gap vs vLLM Entry 001 comparison: JAX is now `0.209x` of vLLM total tokens/sec on this shape.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 009 ms | Entry 013 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1896.26 | 1418.76 | end-to-end improvement |
+| `_run_main_and_sample` | 1769.72 | 1287.47 | improved mainly from prefill |
+| `forward_step_token_ids_jit` | 1359.84 | 427.58 | large compiled-step reduction |
+| `_profile_jit_call` | 1240.42 | 310.19 | compiled execution much lower |
+| `PjRtCApiLoadedExecutable::Execute` | 1330.04 | 402.94 | major reduction |
+| `jit_compiled:XLA GPU module` | 1167.33 | 237.87 | major reduction |
+| `while` | 1087.00 over 18 calls | 152.27 over 36 calls | recurrent prefill scans replaced by chunked work |
+| `MemcpyD2D` | 673.14 | 36.41 | large copy-bucket drop |
+| `np.asarray(jax.Array)` / `tolist` | 283.25 / 249.33 | 728.50 / 696.31 | host token materialization is now the biggest visible non-model overhead |
+
+Decision:
+
+- Keep the chunked cached GDN prefill fix as the default. It is correctness-clean on the real-weight hetero8 reference and directly attacks the largest model-side prefill bottleneck.
+- The next profile-backed target should be post-model host/token materialization (`np.asarray`, `tolist`) and then decode kernels. Scheduler changes remain lower priority unless they reduce that new host overhead without harming the paged/ragged contract.

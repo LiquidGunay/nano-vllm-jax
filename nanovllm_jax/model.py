@@ -112,6 +112,17 @@ def _force_width1_decode_math() -> bool:
     }
 
 
+def _enable_chunked_gdn_prefill() -> bool:
+    """Use the chunked cached-prefill GDN path; set env to 0 for fallback."""
+    return os.environ.get("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "True",
+    }
+
+
 def lm_head_token_ids_and_topk(
     hidden: jnp.ndarray,
     params: ModelParams,
@@ -266,7 +277,7 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
     Input shapes: [B, H, T, D] for query/key/value, [B, H, T] for g/beta
     Output shape: [B, H, T, D]
     """
-    if query.shape[2] > chunk_size:
+    if query.shape[2] > chunk_size and not _enable_chunked_gdn_prefill():
         # The multi-chunk JAX chunk kernel still has measurable drift from the
         # HF/PyTorch chunked reference. Use the recurrent reference path for
         # correctness; the chunk kernel can be restored behind parity tests.
@@ -398,8 +409,8 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
     # result: [B, H, n, cs, V]
     value_transformed = jnp.einsum('bhnct,bhntv->bhncv', attn, v_beta_chunks)
     
-    # k_cumdecay = attn @ (k_beta * exp(g))
-    k_cumdecay = jnp.einsum('bhnct,bhntv->bhncv', attn, k_beta_chunks * jnp.exp(g_chunks)[..., None])
+    # Initial-state correction uses decay from the start of each chunk.
+    k_cumdecay = jnp.einsum('bhnct,bhntv->bhncv', attn, k_beta_chunks * jnp.exp(g_cumsum)[..., None])
     
     # Initialize state [B, H, K, V]
     if initial_state is None:
@@ -662,10 +673,13 @@ def gated_deltanet_block(
         and hybrid_state.conv_state is not None
         and hybrid_state.recurrent_state is not None
     )
-    # The chunked Gated DeltaNet prefill path currently diverges from the
-    # recurrent/HF path for long bucketed prefill. Keep cached prefill on the
-    # recurrent path until the chunk kernel is fixed.
-    use_recurrent_prefill = use_cached_prefill
+    use_recurrent_prefill = (
+        use_cached_prefill
+        and (
+            seq_len <= int(getattr(config, "linear_recurrent_prefill_threshold", 8))
+            or not _enable_chunked_gdn_prefill()
+        )
+    )
     linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
     
     # === PROJECTIONS (same for both modes) ===
