@@ -1154,3 +1154,42 @@ Decision:
 - Reject and revert broadcast/reshape GDN head repeat. It preserved exact correctness but did not reduce the `wrapped_concatenate` bucket and made compiled execution materially worse.
 - Do not spend more time on equivalent source spellings for this bucket. If GDN decode becomes the next target, use a real lowered backend kernel around the recurrent/conv state update rather than another `repeat` expression rewrite.
 - Continue from Entry 033 as the accepted baseline. The next high-upside model-side target remains an optional fused compact prefill projection kernel or a true lowered greedy top-1 LM-head path.
+
+## Entry 035 - Rejected Packed MLP Gate/Up on Autotuned Baseline
+
+- run id: `20260525-234057-1991214-jax_hetero8_64_512x32_packed_mlp_gate_up`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_packed_mlp_gate_up.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-234057-1991214-jax_hetero8_64_512x32_packed_mlp_gate_up`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-234057-1991214-jax_hetero8_64_512x32_packed_mlp_gate_up/plugins/profile/2026_05_25_23_43_25/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-234057-1991214-jax_hetero8_64_512x32_packed_mlp_gate_up/plugins/profile/2026_05_25_23_43_25/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Harvey found Entry 018 had already rejected the same source-level idea before the XLA autotune change. The current run intentionally rechecked it against Entry 033 because autotune changed the GEMM lowering; the result reconfirmed the rejection.
+- change tested: a temporary `NANO_VLLM_JAX_PACKED_MLP_GATE_UP=1` path materialized a per-layer `gate_up_proj = concat(gate_proj, up_proj)`, used one dot, split gate/up activations, and then kept the same `silu(gate) * up` and `down_proj` math. The source change was reverted after profiling.
+- correctness: targeted CUDA helper check passed, and the full hetero8 run had exact generated-token match for all 8 rows against the Entry 033 reference.
+- JAX timing: `289.40 tok/s`, TTFT p50 `344.05 ms`, ITL p50 `15.86 ms`, ITL p95 `24.30 ms`.
+- delta vs Entry 033 default: `0.815x` total tok/s, TTFT p50 `1.089x`, ITL p50 `1.233x`, ITL p95 `1.763x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 033 ms | Entry 035 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 720.52 | 884.60 | major regression |
+| `_run_main_and_sample` | 598.60 | 665.63 | runner hot path slower |
+| `forward_step_token_ids_jit` | 175.81 | 265.22 | compiled token-id step much slower |
+| `PjRtCApiLoadedExecutable::Execute` | 191.91 over 252 calls | 298.32 over 252 calls | same dispatch count, much heavier execution |
+| `jit_compiled:XLA GPU module` | 147.90 | 209.07 | widened MLP lowering regressed |
+| `command_buffer::execute` | 92.22 over 1575 calls | 114.51 over 1575 calls | command-buffer time increased |
+| `PjitFunction(convert_element_type)` | 77.18 | 196.59 | extra packed parameter leaves increased host/JAX conversion overhead |
+| `DevicePut` | 10.85 | 45.47 | parameter/metadata traffic increased |
+| `gemm_fusion_dot_234` | 31.89 | 0.00 | bucket renamed to `gemm_fusion_dot_210`, not eliminated |
+| `gemm_fusion_dot_210` | 0.00 | 31.85 | LM-head-equivalent bucket unchanged |
+| `gemm_fusion_dot_286` | 25.05 | 0.00 | bucket renamed after packing |
+| `gemm_fusion_dot_6` | 0.00 | 24.57 | narrow/MLP bucket reassigned, not improved |
+| `wrapped_concatenate` | 36.49 | 36.45 | unchanged |
+| `MemcpyD2D` | 24.62 | 27.23 | copy bucket worsened |
+| `cutlass_80_tensorop_s1688gemm_128x128_16x5_nn_align4` | 52.39 | 52.49 | compact prefill GEMM bucket unchanged |
+
+Decision:
+
+- Reject and revert packed MLP gate/up again, now with evidence on the accepted autotuned baseline. The packed path preserved correctness but made compiled execution, command-buffer time, host conversion, and ITL much worse.
+- Do not revisit source-level packed MLP projection unless the parameter representation changes fundamentally. Any future MLP work should be a real lowered compact projection kernel or a fused MLP kernel that avoids adding large parameter leaves and does not depend on XLA discovering the right split.
+- Continue from Entry 033 as the accepted implementation baseline.
