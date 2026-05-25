@@ -84,6 +84,8 @@ class ModelExecutor:
     ):
         self.config = config
         self.params = params
+        params_leaves, self._params_treedef = jax.tree_util.tree_flatten(self.params)
+        self._params_leaves = tuple(params_leaves)
         self.backend = select_backend(backend) if isinstance(backend, str) else backend
         self._jit_cache = {}
         self._jit_metrics: dict[tuple, dict] = {}
@@ -380,7 +382,7 @@ class ModelExecutor:
             is_prefill = bool(batch.is_prefill)
 
             def compiled(
-                params,
+                params_leaves,
                 tokens,
                 positions,
                 seq_ids,
@@ -394,6 +396,7 @@ class ModelExecutor:
                 conv_state,
                 recurrent_state,
             ):
+                params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
                 step_batch = ScheduledBatch(
                     tokens=tokens,
                     positions=positions,
@@ -454,7 +457,7 @@ class ModelExecutor:
             key,
             self._jit_cache[key],
             (
-                self.params,
+                self._params_leaves,
                 batch.tokens,
                 batch.positions,
                 batch.seq_ids,
@@ -507,7 +510,7 @@ class ModelExecutor:
             is_prefill = bool(batch.is_prefill)
 
             def compiled(
-                params,
+                params_leaves,
                 tokens,
                 positions,
                 seq_ids,
@@ -521,6 +524,7 @@ class ModelExecutor:
                 conv_state,
                 recurrent_state,
             ):
+                params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
                 step_batch = ScheduledBatch(
                     tokens=tokens,
                     positions=positions,
@@ -593,7 +597,7 @@ class ModelExecutor:
             key,
             self._jit_cache[key],
             (
-                self.params,
+                self._params_leaves,
                 batch.tokens,
                 batch.positions,
                 batch.seq_ids,

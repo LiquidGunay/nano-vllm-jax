@@ -468,3 +468,95 @@ Decision:
 
 - Keep snapshot-only updates for the normal greedy path with the refresh fallback env var. On the post-Entry013 codebase it is correctness-clean and improves throughput, unlike the earlier pre-GDN Entry 007 experiment.
 - The next high-confidence profile target is token readback/materialization (`output.activations[:len(seqs)]`, `tolist`, and related `np.asarray` ranges). After that, revisit decode kernels with HLO/kernel evidence rather than wider Python/JAX metadata tensors.
+
+## Entry 016 - Cached JIT Parameter Leaves
+
+- run id: `20260525-201252-1895342-jax_hetero8_64_512x32_cached_param_leaves`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_cached_param_leaves.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-201252-1895342-jax_hetero8_64_512x32_cached_param_leaves`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-201252-1895342-jax_hetero8_64_512x32_cached_param_leaves/plugins/profile/2026_05_25_20_13_14/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-201252-1895342-jax_hetero8_64_512x32_cached_param_leaves/plugins/profile/2026_05_25_20_13_14/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Erdos confirmed that `tolist`/`np.asarray(jax.Array)` is primarily an asynchronous GPU synchronization label, not a D2H copy bottleneck. The audit found about `813 ms` attributed there in Entry 015, but only about `0.04 ms` total D2H stream time; the next model-side targets are MLP gate/up projection structure, padded prefill dense work, greedy LM-head top-1 lowering, and narrow lowered decode kernels.
+- change: `ModelExecutor` now flattens `ModelParams` once at initialization and passes cached leaves to the main JIT functions, unflattening inside the compiled function. This avoids sorting every layer dictionary in `_model_params_flatten` before each profiled JIT call.
+- correctness: full generated-token match against Entry 001 for all 8 rows; focused CUDA backend-boundary and GDN tests passed.
+- JAX timing: `201.86 tok/s`, TTFT p50 `735.16 ms`, ITL p50 `16.86 ms`, ITL p95 `18.66 ms`
+- delta vs Entry 015: `1.028x` total tok/s
+- gap vs vLLM Entry 001 comparison: JAX is now `0.234x` of vLLM total tokens/sec on this shape.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 015 ms | Entry 016 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1304.10 | 1268.21 | end-to-end improvement |
+| `_run_main_and_sample` | 1182.58 | 1144.02 | main runner hot path |
+| `forward_step_token_ids_jit` | 322.73 | 281.10 | lower Python/JAX wrapper overhead around the same model step |
+| `_profile_jit_call` | 300.88 | 259.02 | reduced caller-side overhead |
+| `_model_params_flatten` | 36.00 | 0.00 | repeated layer-dict sorting removed |
+| `PjRtCApiLoadedExecutable::Execute` | 310.72 | 294.75 | fewer small executions around argument conversion |
+| `jit_compiled:XLA GPU module` | 234.70 | 230.60 | model GPU work mostly unchanged |
+| `np.asarray(jax.Array)` / `tolist` | 813.40 / 813.72 | 816.99 / 817.34 | still mainly synchronizes on prior GPU work |
+
+Decision:
+
+- Keep cached parameter leaves. It is correctness-clean, improves the target hetero8 workload, and removes a real repeated Python-side cost without changing model math or the ragged/paged layout.
+- Do not chase `tolist` directly until there is evidence of actual D2H copy cost. The next model-side experiment should target either padded prefill dense work or an optional lowered greedy top-1/attention/GDN kernel.
+
+## Entry 017 - Rejected Hybrid-State Donation
+
+- run id: `20260525-201511-1896115-jax_hetero8_64_512x32_cached_param_leaves_donate_hybrid`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_cached_param_leaves_donate_hybrid.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-201511-1896115-jax_hetero8_64_512x32_cached_param_leaves_donate_hybrid`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-201511-1896115-jax_hetero8_64_512x32_cached_param_leaves_donate_hybrid/plugins/profile/2026_05_25_20_16_01/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-201511-1896115-jax_hetero8_64_512x32_cached_param_leaves_donate_hybrid/plugins/profile/2026_05_25_20_16_01/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: main JIT paths donated hybrid `conv_state` and `recurrent_state` buffers in addition to KV cache buffers.
+- status: rejected and reverted from the working tree.
+- correctness: full generated-token match against Entry 001 for all 8 rows; focused CUDA tests passed before the revert.
+- JAX timing: `195.31 tok/s`, TTFT p50 `747.97 ms`, ITL p50 `17.82 ms`, ITL p95 `19.72 ms`
+- delta vs Entry 016: `0.968x` total tok/s, so the change regressed the target workload.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 016 ms | Entry 017 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1268.21 | 1310.71 | regressed |
+| `_run_main_and_sample` | 1144.02 | 1178.42 | regressed |
+| `forward_step_token_ids_jit` | 281.10 | 280.54 | compiled call body roughly unchanged |
+| `jit_compiled:XLA GPU module` | 230.60 | 222.15 | lower module bucket did not improve end-to-end |
+| `np.asarray(jax.Array)` / `tolist` | 816.99 / 817.34 | 848.89 / 849.22 | longer synchronization after the step |
+| `schedule` / `build_scheduled_batch` | 224.47 / 108.12 | 239.11 / 114.97 | noisy/regressed host scheduling buckets |
+
+Decision:
+
+- Do not donate hybrid state in the main path. It did not reduce end-to-end time and may constrain buffer reuse or scheduling in a way that increases synchronization delay.
+- If donation is revisited, gate it behind a backend-specific experiment and inspect buffer-assignment/HLO evidence first.
+
+## Entry 018 - Rejected Packed MLP Gate/Up Projection
+
+- run id: `20260525-201857-1897035-jax_hetero8_64_512x32_cached_leaves_packed_mlp`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_cached_leaves_packed_mlp.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-201857-1897035-jax_hetero8_64_512x32_cached_leaves_packed_mlp`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-201857-1897035-jax_hetero8_64_512x32_cached_leaves_packed_mlp/plugins/profile/2026_05_25_20_19_49/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-201857-1897035-jax_hetero8_64_512x32_cached_leaves_packed_mlp/plugins/profile/2026_05_25_20_19_49/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: executor setup packed each layer's `gate_proj` and `up_proj` into one `gate_up_proj`, and the MLP path did a single dot followed by a split.
+- status: rejected and reverted from the working tree.
+- correctness: full generated-token match against Entry 001 for all 8 rows; focused CUDA tests passed before the revert.
+- JAX timing: `184.33 tok/s`, TTFT p50 `849.79 ms`, ITL p50 `17.27 ms`, ITL p95 `18.19 ms`
+- delta vs Entry 016: `0.913x` total tok/s, a clear regression from worse prefill.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 016 ms | Entry 018 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1268.21 | 1388.82 | regressed |
+| `_run_main_and_sample` | 1144.02 | 1260.36 | regressed |
+| `forward_step_token_ids_jit` | 281.10 | 321.32 | compiled step regressed |
+| `PjRtCApiLoadedExecutable::Execute` | 294.75 | 333.24 | execution increased |
+| `jit_compiled:XLA GPU module` | 230.60 | 265.06 | lowered module slower |
+| `gemm_fusion_dot_6` | 127.32 over 48 calls | 117.77 over 768 calls | packing changed the lowered GEMM/fusion structure unfavorably |
+| `while` | 152.16 | 174.79 | GDN-related prefill work regressed |
+| `command_buffer::execute` | 178.13 | 203.20 | more GPU command-buffer time |
+
+Decision:
+
+- Do not keep source-level packed MLP gate/up projection. Although it removes an obvious pair of source dots, XLA lowered it into a slower plan for the target workload.
+- If the MLP path is optimized later, do it with HLO-guided lowering or a dedicated optional kernel, not by widening the source-level dense projection.
