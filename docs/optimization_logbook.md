@@ -1118,3 +1118,39 @@ Decision:
 - Accept XLA GPU autotune level 4 as the repo default for GPU benchmark/server entry points. It is a configuration fix rather than a model-code optimization, but it unlocks a large measured improvement while preserving exact correctness.
 - Preserve explicit `XLA_FLAGS` when users set them. This keeps debugging and reproduction control intact, while making the default GPU path match the fastest verified setting.
 - Continue model-side speed work from this stronger baseline. The next candidate should be an opt-in Ampere-compatible fused compact prefill projection kernel; the remaining pure-JAX projection variants have either been accepted already or rejected with profile evidence.
+
+## Entry 034 - Rejected Broadcast GDN Head Repeat
+
+- run id: `20260525-233212-1987844-jax_hetero8_64_512x32_gdn_broadcast_head_repeat`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_broadcast_head_repeat.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-233212-1987844-jax_hetero8_64_512x32_gdn_broadcast_head_repeat`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-233212-1987844-jax_hetero8_64_512x32_gdn_broadcast_head_repeat/plugins/profile/2026_05_25_23_34_08/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-233212-1987844-jax_hetero8_64_512x32_gdn_broadcast_head_repeat/plugins/profile/2026_05_25_23_34_08/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Harvey reviewed Entry 033 and ranked the remaining model-side targets as an Ampere-compatible fused compact prefill projection kernel, a real streaming/top-1 LM-head kernel, then a lowered Gated DeltaNet decode kernel. The audit also called out `wrapped_concatenate` at `36.45 ms` as a decode-side GDN symptom worth reducing only if the source change actually moved that bucket.
+- change tested: a temporary `NANO_VLLM_JAX_BROADCAST_GDN_HEAD_REPEAT=1` path replaced GDN query/key `jnp.repeat(..., axis=2)` with `broadcast_to` plus reshape before recurrent GDN prefill/decode. This tried to remove the visible repeat/concatenate lowering without changing the logical head order. The source change was reverted after profiling.
+- correctness: exact generated-token match for all 8 rows against the Entry 033 hetero8 reference.
+- JAX timing: `345.16 tok/s`, TTFT p50 `324.90 ms`, ITL p50 `13.48 ms`, ITL p95 `14.02 ms`.
+- delta vs Entry 033 default: `0.971x` total tok/s, TTFT p50 `1.029x`, ITL p50 `1.049x`, ITL p95 `1.017x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 033 ms | Entry 034 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 720.52 | 741.69 | end-to-end regression |
+| `_run_main_and_sample` | 598.60 | 613.74 | runner hot path slower |
+| `forward_step_token_ids_jit` | 175.81 | 195.09 | compiled token-id step regressed |
+| `PjRtCApiLoadedExecutable::Execute` | 191.91 over 252 calls | 211.24 over 252 calls | same dispatch count, heavier execution |
+| `jit_compiled:XLA GPU module` | 147.90 | 159.66 | compiled GPU work increased |
+| `command_buffer::execute` | 92.22 over 1575 calls | 94.22 over 1575 calls | command-buffer time increased |
+| `wrapped_concatenate` | 36.49 over 576 calls | 36.48 over 576 calls | target bucket unchanged |
+| `gemm_fusion_dot_234` | 31.89 | 31.87 | LM-head unchanged |
+| `gemm_fusion_dot_286` | 25.05 | 25.61 | narrow decode GEMM slightly worse |
+| `gemm_fusion_dot_285` | 23.45 | 23.12 | small improvement did not offset regressions |
+| `MemcpyD2D` | 24.62 | 24.62 | unchanged |
+| `cutlass_80_tensorop_s1688gemm_128x128_16x5_nn_align4` | 52.39 | 52.47 | compact prefill GEMM bucket unchanged |
+
+Decision:
+
+- Reject and revert broadcast/reshape GDN head repeat. It preserved exact correctness but did not reduce the `wrapped_concatenate` bucket and made compiled execution materially worse.
+- Do not spend more time on equivalent source spellings for this bucket. If GDN decode becomes the next target, use a real lowered backend kernel around the recurrent/conv state update rather than another `repeat` expression rewrite.
+- Continue from Entry 033 as the accepted baseline. The next high-upside model-side target remains an optional fused compact prefill projection kernel or a true lowered greedy top-1 LM-head path.
