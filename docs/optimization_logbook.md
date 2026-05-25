@@ -1007,3 +1007,41 @@ Decision:
 - Reject and revert compact attention output projections. The target bucket was mostly renamed, while compiled execution time increased substantially and decode-step latency regressed.
 - Do not extend plain source-level row compaction to every remaining projection by default. The accepted compact input/MLP paths are useful, but this result shows that later-stage output projections can make XLA's compiled plan worse even when exact correctness holds.
 - Continue from Entry 029 as the accepted implementation baseline. Next work should focus on optional lower-level kernels for the compact projection paths, paged attention prefill, or decode LM-head/narrow-GEMM work with kernel-level evidence.
+
+## Entry 031 - Rejected lax.ragged_dot Compact Projections
+
+- run id: `20260525-224444-1959951-jax_hetero8_64_512x32_compact_lax_ragged_dot`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_compact_lax_ragged_dot.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-224444-1959951-jax_hetero8_64_512x32_compact_lax_ragged_dot`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-224444-1959951-jax_hetero8_64_512x32_compact_lax_ragged_dot/plugins/profile/2026_05_25_22_45_24/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-224444-1959951-jax_hetero8_64_512x32_compact_lax_ragged_dot/plugins/profile/2026_05_25_22_45_24/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Huygens ranked optional lower-level compact projection kernels as the next best direction after Entry 029, ahead of decode LM-head and paged prefill attention. It identified the compact projection buckets (`gemm_fusion_dot_182`, `gemm_fusion_dot_181`) as larger than decode LM-head or narrow decode GEMMs, but warned that replacing only the dot may leave gather/scatter as the limiter and that the installed Pallas path must be checked carefully.
+- Pallas feasibility: the installed `jax.experimental.pallas.ops.gpu.ragged_dot_mgpu.ragged_dot` is a Mosaic GPU WGMMA kernel. A tiny CUDA check on this A10G failed during lowering with `nvvm.wgmma.fence.aligned` unsupported on `sm_86`, so that path is not usable on this machine. No Cutlass/CuteDSL package is installed in the current environment.
+- change tested: a temporary `NANO_VLLM_JAX_COMPACT_PREFILL_LAX_RAGGED_DOT=1` path replaced compact-row `jnp.dot` calls inside `_compact_prefill_dot_if_enabled` and `_compact_prefill_mlp` with single-group `jax.lax.ragged_dot`. The source change was reverted after profiling.
+- correctness: focused CUDA guardrails passed with the flag enabled (`11 passed`), and the full hetero8 run had exact generated-token matches for all 8 rows against Entry 001.
+- JAX timing: `245.89 tok/s`, TTFT p50 `553.58 ms`, ITL p50 `15.69 ms`, ITL p95 `16.51 ms`.
+- delta vs Entry 029 repeat: `0.998x` total tok/s, TTFT p50 `0.982x`, ITL p50 `1.028x`, ITL p95 `1.049x`; lower TTFT did not compensate for decode latency and compiled execution regressions.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 029 repeat ms | Entry 031 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1039.52 | 1041.11 | slight end-to-end regression |
+| `_run_main_and_sample` | 907.94 | 913.45 | runner hot path slower |
+| `forward_step_token_ids_jit` | 224.15 | 237.39 | compiled token-id step slower |
+| `PjRtCApiLoadedExecutable::Execute` | 240.53 over 252 calls | 252.67 over 252 calls | same dispatch count, heavier execution |
+| `jit_compiled:XLA GPU module` | 196.07 | 204.15 | compiled GPU work increased |
+| `command_buffer::execute` | 144.17 over 1575 calls | 146.99 over 1575 calls | command-buffer time slightly worse |
+| `gemm_fusion_dot_182` | 110.73 over 24 calls | 0.00 | bucket renamed rather than removed |
+| `gemm_fusion_dot_434` | 0.00 | 110.71 over 24 calls | reassigned compact MLP bucket |
+| `gemm_fusion_dot_181` | 97.20 over 18 calls | 0.00 | bucket renamed rather than removed |
+| `gemm_fusion_dot_433` | 0.00 | 97.21 over 18 calls | reassigned compact GDN/full-attention bucket |
+| `gemm_fusion_dot_234` | 45.68 | 47.16 | materialized LM-head decode bucket slightly worse |
+| `gemm_fusion_dot_286` | 43.79 | 43.73 | narrow decode GEMM bucket unchanged |
+| `MemcpyD2D` | 24.37 | 24.58 | copy bucket unchanged |
+
+Decision:
+
+- Reject and revert the `lax.ragged_dot` compact projection path. It preserved correctness but did not change the underlying compact GEMM cost materially and made compiled execution and ITL worse.
+- On this A10G target, the installed Mosaic GPU `ragged_dot_mgpu` WGMMA path is not viable because it requires instructions unsupported on `sm_86`. A useful lower-level compact projection kernel would need an Ampere-compatible implementation, likely Triton or another CUDA path, and probably needs to fuse gather/dot/scatter to beat the current XLA plan.
+- Continue from Entry 029 as the accepted implementation baseline. The next practical work should either prototype an Ampere-compatible custom kernel outside Pallas WGMMA, or switch to decode LM-head/narrow-GEMM work with kernel-level evidence.
