@@ -156,6 +156,17 @@ def _enable_compact_prefill_gdn_z() -> bool:
     }
 
 
+def _enable_compact_prefill_full_attn_proj() -> bool:
+    """Compact true prefill tokens for full-attention Q/K/V projections."""
+    return os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ", "0") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "True",
+    }
+
+
 def _compact_prefill_dot_if_enabled(
     x: jnp.ndarray,
     weight: jnp.ndarray,
@@ -1233,6 +1244,16 @@ def full_attention_block(
     # Cast to target dtype (bfloat16 for CPU/CUDA, float16 for Metal)
     dtype = config.get_dtype()
     x_cast = x.astype(dtype)
+    valid_token_mask = None
+    compact_prefill_tokens = None
+    if is_prefill and attention_metadata is not None:
+        query_lens = jnp.diff(attention_metadata.query_start_loc).astype(jnp.int32)
+        valid_token_mask = jnp.arange(seq_len, dtype=jnp.int32)[None, :] < query_lens[:, None]
+        compact_prefill_tokens = (
+            int(attention_metadata.num_prefill_tokens)
+            if isinstance(attention_metadata.num_prefill_tokens, int)
+            else None
+        )
 
     def _proj(inp: jnp.ndarray, weight: jnp.ndarray) -> jnp.ndarray:
         """Project a [B, T, D] tensor with a linear matrix [D, O].
@@ -1242,6 +1263,14 @@ def full_attention_block(
         """
         if not is_prefill and seq_len > 1 and _force_width1_decode_math():
             return _tokenwise_decode_dot(inp, weight, force_width1=True)
+        if is_prefill:
+            return _compact_prefill_dot_if_enabled(
+                inp,
+                weight,
+                valid_token_mask,
+                compact_prefill_tokens,
+                enabled=_enable_compact_prefill_full_attn_proj(),
+            )
         out = jnp.dot(inp.reshape(-1, inp.shape[-1]), weight)
         return out.reshape(batch, seq_len, -1)
     
