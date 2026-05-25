@@ -336,6 +336,28 @@ def test_model_runner_hybrid_state_prefers_physical_row_slots_for_new_sequences(
     assert batch.hybrid_slot_ids_host == (0, 1)
 
 
+def test_model_runner_hybrid_state_zeroes_reused_slot_on_allocation_not_release():
+    runner = _hybrid_state_runner_with_two_slots()
+    runner.hybrid_states = {0: object()}
+    runner._mtp1_drafts = {0: 123}
+    zeroed_slots: list[int] = []
+    runner._zero_hybrid_slot = lambda slot: zeroed_slots.append(slot)
+
+    runner.release([0])
+
+    assert zeroed_slots == []
+    assert runner._hybrid_slots == {1: 1}
+    assert runner._free_hybrid_slots == [0]
+    assert runner.hybrid_states == {}
+    assert runner._mtp1_drafts == {}
+
+    slot = runner._ensure_hybrid_slot(8, preferred_slot=0)
+
+    assert slot == 0
+    assert zeroed_slots == [0]
+    assert runner._hybrid_slots == {1: 1, 8: 0}
+
+
 def test_model_runner_hybrid_state_does_not_replace_full_table_with_inactive_rows():
     runner = _hybrid_state_runner_with_two_slots()
     original_state = runner._hybrid_state_table

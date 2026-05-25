@@ -1136,7 +1136,6 @@ class CanonicalModelRunner:
             self.hybrid_states.pop(seq_id, None)
             slot = self._hybrid_slots.pop(seq_id, None)
             if slot is not None:
-                self._zero_hybrid_slot(slot)
                 self._free_hybrid_slots.append(slot)
             self._mtp1_drafts.pop(seq_id, None)
 

@@ -188,3 +188,94 @@ Decision:
 - Do not keep the width-1 recurrent source rewrite. It reduced the D2D copy bucket slightly but increased compiled execution time enough to hurt end-to-end throughput.
 - Revisit Gated DeltaNet only with HLO/kernel evidence or an optional lowered backend path. The pure JAX source-level bypass is not a win on this GPU profile.
 - Next better target: cache metadata/snapshot work (`compute_slot_mapping`, `_refresh_kv_snapshot`) or paged decode attention key-slot reuse across full-attention layers.
+
+## Entry 007 - Rejected Legacy Snapshot-Only Update
+
+- run id: `20260525-185217-1863257-jax_hetero8_64_512x32_record_snapshot`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_record_snapshot.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-185217-1863257-jax_hetero8_64_512x32_record_snapshot`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-185217-1863257-jax_hetero8_64_512x32_record_snapshot/plugins/profile/2026_05_25_18_52_43/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-185217-1863257-jax_hetero8_64_512x32_record_snapshot/plugins/profile/2026_05_25_18_52_43/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: normal non-MTP `_run_main_and_sample` used `_record_kv_snapshot` instead of `_refresh_kv_snapshot`, keeping `cache_storage`, block tables, sequence lengths, and hybrid state current while preserving the previous legacy `kv_state.slot_mapping`.
+- status: rejected and reverted from the working tree.
+- correctness: full generated-token match against Entry 001 for all 8 rows; focused GPU tests covering MTP baseline/reference paths passed.
+- JAX timing: `130.54 tok/s`, TTFT p50 `1217.85 ms`, ITL p50 `22.04 ms`, ITL p95 `26.54 ms`
+- delta vs Entry 005: `0.987x` total tok/s, so the change was slightly slower end to end.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 005 ms | Entry 007 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1936.15 | 1961.13 | slight regression |
+| `_run_main_and_sample` | 1764.35 | 1777.85 | slight regression |
+| `forward_step_token_ids_jit` | 1357.39 | 1372.65 | slight regression |
+| `_refresh_kv_snapshot` | 117.32 | 0.00 | removed as intended |
+| `_record_kv_snapshot` | 0.00 | 0.58 | cheap replacement |
+| `compute_slot_mapping` | 115.90 | 0.00 | removed from snapshot path |
+| `__getitem__`/`rewriting_take` cluster | about 112 ms | about 25 ms | improved |
+| `MemcpyD2D` | 679.62 | 680.63 | unchanged |
+
+Decision:
+
+- Do not keep this as the default. The trace-local cleanup did not translate to throughput, and it weakens the legacy introspection guarantee that `kv_state.slot_mapping` describes the latest step.
+- The experiment is useful evidence: Python/JAX snapshot metadata is no longer the main bottleneck after Entry 005. The larger target remains compiled execution and per-layer cache movement.
+
+## Entry 008 - Rejected Decode Slot-Mapping Reuse
+
+- run id: `20260525-185804-1865547-jax_hetero8_64_512x32_decode_slot_reuse`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_decode_slot_reuse.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-185804-1865547-jax_hetero8_64_512x32_decode_slot_reuse`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-185804-1865547-jax_hetero8_64_512x32_decode_slot_reuse/plugins/profile/2026_05_25_18_58_43/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-185804-1865547-jax_hetero8_64_512x32_decode_slot_reuse/plugins/profile/2026_05_25_18_58_43/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: `AttentionMetadata` carried a decode-wide `[batch, max_kv_len]` key-slot map computed once in `build_attention_metadata`, and `paged_attention_decode` reused it across full-attention layers.
+- status: rejected and reverted from the working tree.
+- correctness: full generated-token match against Entry 001 for all 8 rows; focused GPU tests for decode attention metadata, long decode, physical cache capacity independence, and JIT-vs-eager cached decode passed.
+- JAX timing: `123.19 tok/s`, TTFT p50 `1232.17 ms`, ITL p50 `23.60 ms`, ITL p95 `53.24 ms`
+- delta vs Entry 005: `0.932x` total tok/s, a clear regression.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 005 ms | Entry 008 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1936.15 | 2078.08 | regressed |
+| `_run_main_and_sample` | 1764.35 | 1895.85 | regressed |
+| `forward_step_token_ids_jit` | 1357.39 | 1418.70 | regressed |
+| `_refresh_kv_snapshot` | 117.32 | 363.93 | precomputing the wide decode map made metadata much heavier |
+| `__getitem__`/`rewriting_take` cluster | about 112 ms | about 292 ms | regressed |
+| `PjRtCApiLoadedExecutable::Execute` | 1344.00 | 1543.03 | compiled execution regressed |
+| `MemcpyD2D` | 679.62 | 663.71 | small copy-bucket improvement did not pay for metadata/compile cost |
+
+Decision:
+
+- Do not keep decode-wide slot reuse in pure JAX metadata. It increases snapshot/metadata and compiled execution costs more than it saves inside per-layer attention.
+- If revisiting paged decode attention, do it as a narrower lowered kernel or as direct per-layer gather/attention fusion, not by materializing a wider metadata tensor in Python/JAX.
+
+## Entry 009 - Lazy Hybrid Slot Zeroing
+
+- run id: `20260525-190314-1866930-jax_hetero8_64_512x32_release_lazy_zero`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_release_lazy_zero.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-190314-1866930-jax_hetero8_64_512x32_release_lazy_zero`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-190314-1866930-jax_hetero8_64_512x32_release_lazy_zero/plugins/profile/2026_05_25_19_03_38/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-190314-1866930-jax_hetero8_64_512x32_release_lazy_zero/plugins/profile/2026_05_25_19_03_38/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change: `ModelRunner.release` no longer zeros the freed hybrid slot. The next `_ensure_hybrid_slot` allocation still zeroes the slot before reuse, preserving isolation while avoiding redundant end-of-request device updates.
+- correctness: full generated-token match against Entry 001 for all 8 rows; focused GPU hybrid-state tests passed.
+- JAX timing: `135.00 tok/s`, TTFT p50 `1217.15 ms`, ITL p50 `21.71 ms`, ITL p95 `23.43 ms`
+- delta vs Entry 005: `1.021x` total tok/s
+- gap vs vLLM Entry 001 comparison: JAX is now `0.156x` of vLLM total tokens/sec on this shape.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 005 ms | Entry 009 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1936.15 | 1896.26 | end-to-end improvement |
+| `_run_main_and_sample` | 1764.35 | 1769.72 | essentially unchanged; line number shifted in trace |
+| `forward_step_token_ids_jit` | 1357.39 | 1359.84 | unchanged |
+| `release` | 41.74 | 0.01 | release no longer launches slot-zero updates |
+| `_zero_hybrid_slot` | 81.91 over 16 calls | 0.00 in measured trace | redundant release-time zeroes removed; allocation-time zeroing remains for reuse |
+| `__getitem__`/`rewriting_take` cluster | about 112 ms | about 99 ms | slight reduction from fewer release-time updates |
+| `MemcpyD2D` | 679.62 | 673.14 | slight reduction |
+
+Decision:
+
+- Keep lazy release zeroing. It is correctness-clean, removes redundant end-of-request device work, and gives a small but measurable throughput win.
+- The next meaningful speed work should move below Python runner bookkeeping: inspect compiled full-attention/GDN HLO and consider optional lowered decode attention or GDN kernels rather than wider metadata precomputation.
