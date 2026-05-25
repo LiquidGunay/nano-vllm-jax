@@ -1232,12 +1232,12 @@ class CanonicalModelRunner:
             else None,
         )
 
-    def _ensure_hybrid_slot(self, seq_id: int, preferred_slot: int | None = None) -> int:
+    def _assign_hybrid_slot(self, seq_id: int, preferred_slot: int | None = None) -> tuple[int, bool]:
         if seq_id < 0:
-            return -1
+            return -1, False
         slot = self._hybrid_slots.get(seq_id)
         if slot is not None:
-            return slot
+            return slot, False
         if not self._free_hybrid_slots:
             raise RuntimeError("No free hybrid-state slots; max_num_seqs is exhausted")
         if (
@@ -1252,8 +1252,13 @@ class CanonicalModelRunner:
             self._free_hybrid_slots.remove(slot)
         else:
             slot = self._free_hybrid_slots.pop()
-        self._zero_hybrid_slot(slot)
         self._hybrid_slots[seq_id] = slot
+        return slot, True
+
+    def _ensure_hybrid_slot(self, seq_id: int, preferred_slot: int | None = None) -> int:
+        slot, allocated = self._assign_hybrid_slot(seq_id, preferred_slot=preferred_slot)
+        if allocated:
+            self._zero_hybrid_slot(slot)
         return slot
 
     def _get_hybrid_state(self, seq_id: int) -> HybridLayerState:
@@ -1392,21 +1397,24 @@ class CanonicalModelRunner:
             if batch.seq_ids_host is not None
             else [int(seq_id) for seq_id in batch.seq_ids.tolist()]
         )
-        slot_values = [
-            self._ensure_hybrid_slot(int(seq_id), preferred_slot=row)
+        slot_allocations = [
+            self._assign_hybrid_slot(int(seq_id), preferred_slot=row)
             for row, seq_id in enumerate(seq_ids)
         ]
+        slot_values = [slot for slot, _ in slot_allocations]
+        newly_allocated = [allocated for _, allocated in slot_allocations]
         batch.hybrid_slot_ids_host = tuple(slot_values)
         if (
             self._hybrid_state_table.conv_state is not None
             and self._hybrid_state_table.recurrent_state is not None
             and len(slot_values) == self._hybrid_state_table.conv_state.shape[0]
             and slot_values == list(range(len(slot_values)))
+            and not any(newly_allocated)
         ):
             return self._hybrid_state_table
         slot_ids = jnp.array(slot_values, dtype=jnp.int32)
         safe_slot_ids = jnp.maximum(slot_ids, 0)
-        valid = slot_ids >= 0
+        valid = (slot_ids >= 0) & jnp.logical_not(jnp.array(newly_allocated, dtype=bool))
         conv_state = None
         recurrent_state = None
         if self._hybrid_state_table.conv_state is not None:

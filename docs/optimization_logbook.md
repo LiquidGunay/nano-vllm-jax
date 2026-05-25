@@ -593,3 +593,37 @@ Decision:
 
 - Keep the static metadata argument cleanup. It is correctness-clean, improves the target workload, and does not alter model math, ragged query metadata, or the paged-attention layout.
 - This is probably the last worthwhile pure executor-wrapper cleanup for the main greedy path. Next speed work should move back to model-side GPU work: padded prefill dense computation, lowered greedy top-1, or narrow optional kernels for decode attention/GDN.
+
+## Entry 020 - Deferred Batched Hybrid Slot Zeroing
+
+- run id: `20260525-203339-1901859-jax_hetero8_64_512x32_deferred_hybrid_zero`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_deferred_hybrid_zero.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-203339-1901859-jax_hetero8_64_512x32_deferred_hybrid_zero`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-203339-1901859-jax_hetero8_64_512x32_deferred_hybrid_zero/plugins/profile/2026_05_25_20_34_01/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-203339-1901859-jax_hetero8_64_512x32_deferred_hybrid_zero/plugins/profile/2026_05_25_20_34_01/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Dalton confirmed that the dominant remaining target is padded prefill dense work: this shape has `2304` true prompt tokens but `4096` rectangular token slots, so `43.75%` of prefill token positions are padding. The next large model-side targets are padded prefill shape-changing, lowered greedy top-1 LM head, and narrow decode kernels. D2H token copy remains negligible at about `0.046 ms` total in Entry 016.
+- change: batched serving allocation now assigns new hybrid slots without first writing zeros into the persistent hybrid-state table. `_batch_hybrid_state` feeds zero rows for newly assigned slots, then `_store_batch_hybrid_state` writes the real post-step state once. Direct `_ensure_hybrid_slot` callers still zero on allocation.
+- correctness: full generated-token match against Entry 001 for all 8 rows; focused CUDA hybrid-state, backend-boundary, and GDN tests passed.
+- JAX timing: `210.37 tok/s`, TTFT p50 `709.96 ms`, ITL p50 `16.10 ms`, ITL p95 `17.05 ms`
+- delta vs Entry 019: `1.029x` total tok/s
+- gap vs vLLM Entry 001 comparison: JAX is now `0.243x` of vLLM total tokens/sec on this shape.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 019 ms | Entry 020 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1251.80 | 1216.92 | end-to-end improvement |
+| `_run_main_and_sample` | 1124.22 | 1094.88 | main runner hot path |
+| `_batch_hybrid_state` | 38.60 | 8.04 | pre-step table zero writes removed |
+| `_ensure_hybrid_slot` / `_zero_hybrid_slot` | 37.47 / 37.28 | 0.00 / 0.00 | hot batched path no longer calls them |
+| `_assign_hybrid_slot` | 0.00 | 0.17 | host-only replacement bookkeeping |
+| `_store_batch_hybrid_state` | 0.72 | 0.72 | unchanged post-step state write |
+| `forward_step_token_ids_jit` | 263.63 | 260.71 | model step essentially unchanged |
+| `PjRtCApiLoadedExecutable::Execute` | 293.02 over 352 calls | 275.65 over 252 calls | fewer zeroing-related executions |
+| `MemcpyD2D` | 31.84 | 21.89 | fewer device-side state update copies |
+| `jit_compiled:XLA GPU module` | 232.50 | 232.15 | model GPU work unchanged, as expected |
+
+Decision:
+
+- Keep deferred batched hybrid zeroing. It is correctness-clean and removes a real prefill-side device update while preserving zero-state semantics for newly assigned sequences.
+- Dalton's audit should drive the next major optimization: stop doing dense prefill work on padded token positions without reverting to the rejected scheduling split. The likely next prototype is a model-side shape-changing/ragged prefill path or narrow lowered kernels, not more host-wrapper cleanup.

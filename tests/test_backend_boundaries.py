@@ -333,9 +333,11 @@ def test_model_runner_hybrid_state_prefers_physical_row_slots_for_new_sequences(
 
     batched_state = runner._batch_hybrid_state(batch)
 
-    assert batched_state is runner._hybrid_state_table
+    assert batched_state is not runner._hybrid_state_table
     assert runner._hybrid_slots == {8: 0, 9: 1}
     assert batch.hybrid_slot_ids_host == (0, 1)
+    np.testing.assert_array_equal(np.array(batched_state.conv_state), np.zeros((2, 1, 3, 4), dtype=np.float32))
+    np.testing.assert_array_equal(np.array(batched_state.recurrent_state), np.zeros((2, 1, 1, 2, 3), dtype=np.float32))
 
 
 def test_model_runner_hybrid_state_zeroes_reused_slot_on_allocation_not_release():
