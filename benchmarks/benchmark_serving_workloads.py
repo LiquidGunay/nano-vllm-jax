@@ -321,6 +321,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="Qwen/Qwen3.5-2B")
     parser.add_argument("--config-preset", default="auto")
     parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--weight-dtype", choices=["float16", "bfloat16", "float32", "auto"], default="auto")
     parser.add_argument("--backend", default="auto")
     parser.add_argument("--jax-execution", default="jit")
     parser.add_argument("--max-kv-cache-mb", type=int, default=2048)
@@ -338,6 +339,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-offline", action="store_true")
     parser.add_argument("--hf-device", default="cpu")
     parser.add_argument("--hf-max-prompts", type=int, default=1)
+    parser.add_argument("--hf-logits-cache", default="")
+    parser.add_argument("--hf-logits-cache-mode", choices=["auto", "read", "refresh"], default="auto")
     parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument("--step-profile", action="store_true")
     parser.add_argument("--show-outputs", action="store_true")
@@ -727,6 +730,8 @@ def build_command(
         args.config_preset,
         "--dtype",
         args.dtype,
+        "--weight-dtype",
+        args.weight_dtype,
         "--backend",
         args.backend,
         "--jax-execution",
@@ -776,6 +781,10 @@ def build_command(
                 str(args.hf_max_prompts),
             ]
         )
+        if args.hf_logits_cache:
+            command.extend(["--hf-logits-cache", args.hf_logits_cache])
+        if args.hf_logits_cache_mode != "auto":
+            command.extend(["--hf-logits-cache-mode", args.hf_logits_cache_mode])
     if args.check_next_step_sanity:
         command.append("--check-next-step-sanity")
     if args.hf_offline:
@@ -971,12 +980,15 @@ def main() -> int:
         "model": args.model,
         "config_preset": args.config_preset,
         "dtype": args.dtype,
+        "weight_dtype": args.weight_dtype,
         "backend": args.backend,
         "jax_execution": args.jax_execution,
         "warmup": args.warmup,
         "require_tpu": args.require_tpu,
         "check_hf_logits": args.check_hf_logits,
         "check_next_step_sanity": args.check_next_step_sanity,
+        "hf_logits_cache": args.hf_logits_cache,
+        "hf_logits_cache_mode": args.hf_logits_cache_mode,
         "correctness_only": args.correctness_only,
         "smoke": args.smoke,
         "dry_run": args.dry_run,

@@ -1,0 +1,1868 @@
+{
+  "model": "Qwen/Qwen3.5-0.8B",
+  "dtype": "float32",
+  "weight_dtype": "bfloat16",
+  "resolved_dtype": "float32",
+  "resolved_weight_dtype": "bfloat16",
+  "serving_fastpath_flags": {
+    "greedy_token_fastpath": true,
+    "materialize_tied_lm_head": true,
+    "compact_prefill_in_proj_qkv": true,
+    "compact_prefill_gdn_z": true,
+    "compact_prefill_full_attn_proj": true,
+    "compact_prefill_mlp": true
+  },
+  "jax_backend": "gpu",
+  "jax_execution": "jit",
+  "max_tokens": 1,
+  "repeats": 1,
+  "compile_mtp_draft": false,
+  "compile_mtp_draft_cli": null,
+  "debug_spec": false,
+  "step_profile": false,
+  "load_seconds": 7.892719933995977,
+  "warmup": {
+    "startup_seconds": 4.940725528053008,
+    "shape_runs": 1,
+    "shape_variant": "nospec",
+    "warmed_shape_phase": {
+      "enabled": true,
+      "nospec": {
+        "variant": "nospec",
+        "runs": 1,
+        "total_elapsed": 4.940345849958248
+      },
+      "mtp": null,
+      "total_runs": 1,
+      "total_elapsed": 4.940345849958248
+    }
+  },
+  "warmed_shape_phase": {
+    "enabled": true,
+    "nospec": {
+      "variant": "nospec",
+      "runs": 1,
+      "total_elapsed": 4.940345849958248
+    },
+    "mtp": null,
+    "total_runs": 1,
+    "total_elapsed": 4.940345849958248
+  },
+  "warmup_resets_mtp_admission": true,
+  "benchmark_modes": [
+    {
+      "mode": "baseline",
+      "status": "measured",
+      "description": "No speculative decoding."
+    },
+    {
+      "mode": "all-or-none MTP",
+      "status": "measured_by_current_mtp_row",
+      "description": "Fused verifier result is only useful when the configured MTP path accepts as implemented by the runner."
+    },
+    {
+      "mode": "rowwise MTP",
+      "status": "default_for_exact_commit_select_serving",
+      "description": "K=1 exact commit-select serving uses NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY=rowwise by default unless explicitly overridden."
+    },
+    {
+      "mode": "groupwise g=2",
+      "status": "not_implemented_in_harness",
+      "description": "Harness reports the required mode but does not yet split speculative batches into fixed groups of 2."
+    },
+    {
+      "mode": "groupwise g=4",
+      "status": "not_implemented_in_harness",
+      "description": "Harness reports the required mode but does not yet split speculative batches into fixed groups of 4."
+    },
+    {
+      "mode": "adaptive MTP gating",
+      "status": "documented_and_reported",
+      "description": "Reports measured decode-token throughput gating; exact commit-select enables only when observed decode speedup beats margin."
+    }
+  ],
+  "mtp_batch_accept_policy": "all_or_none",
+  "adaptive_mtp_gating_formula": "measured_decode_speedup = mtp_decode_tokens_per_second / baseline_decode_tokens_per_second; should_enable = measured_decode_speedup >= 1.0 + margin",
+  "adaptive_margin": 0.0,
+  "stats_key": {
+    "batch_bucket": 1,
+    "model_size": "0.8b",
+    "dtype": "float32",
+    "backend": "gpu",
+    "max_blocks_per_seq": 24
+  },
+  "benchmark_seconds": 35.973510873969644,
+  "all_correct": true,
+  "batch_prompts": 1,
+  "output_lengths": [
+    1
+  ],
+  "arrival_steps": [
+    0
+  ],
+  "interleaved_arrivals": false,
+  "rows": [
+    {
+      "prompt_count": 1,
+      "prompt_lengths": [
+        64
+      ],
+      "mode": "parallel_batch",
+      "baseline": {
+        "texts": [
+          "."
+        ],
+        "token_ids": [
+          13
+        ],
+        "token_ids_by_request": [
+          [
+            13
+          ]
+        ],
+        "completion_tokens_by_request": [
+          1
+        ],
+        "tokens": 1,
+        "total_requests": 1,
+        "output_lengths_by_request": [
+          1
+        ],
+        "arrival_steps_by_request": [
+          0
+        ],
+        "interleaved_arrivals": false,
+        "seconds": 0.03424139693379402,
+        "tokens_per_second": 29.204415986109062,
+        "end_to_end_tokens_per_second": 29.204415986109062,
+        "decode_tokens_per_second": 0.0,
+        "prefill_tokens_per_second": 1869.08262311098,
+        "decode_tokens": 0,
+        "prefill_tokens": 64,
+        "decode_seconds": 0,
+        "accepted_tokens": 0,
+        "rejected_tokens": 0,
+        "fallback_tokens": 0,
+        "prefill_seconds": 0.03424139693379402,
+        "speculative": {
+          "enabled": false,
+          "drafts_proposed": 0,
+          "drafts_accepted": 0,
+          "drafts_rejected": 0,
+          "bonus_tokens": 0,
+          "fallback_steps": 0,
+          "fallback_gated_no_spec_steps": 0,
+          "fallback_seeded_main_steps": 0,
+          "fallback_partial_rows": 0,
+          "draft_position_proposed": [],
+          "draft_position_accepted": [],
+          "acceptance_rate": 0.0,
+          "debug_events": []
+        },
+        "scheduler_mtp_admission": {
+          "enabled": true,
+          "reason": "disabled",
+          "gate_enabled": false,
+          "min_accept_rate": 0.75,
+          "min_accept_samples": 8,
+          "min_speedup": 1.0,
+          "confidence_min_accept_rate": 0.75,
+          "probe_steps": 2,
+          "latency_alpha": 0.2,
+          "latency_min_steps": 2,
+          "observed_accepted": 0,
+          "observed_rejected": 0,
+          "baseline_ewma_ms_per_token": null,
+          "spec_ewma_ms_per_token": null,
+          "baseline_latency_steps": 0,
+          "spec_latency_steps": 0,
+          "measured_scheduler_speedup": null,
+          "per_bucket": {
+            "enabled": false,
+            "active_bucket": null,
+            "confidence_min_accept_rate": 0.75,
+            "probe_steps": 2,
+            "buckets": []
+          }
+        },
+        "speculative_counts": {
+          "drafts_proposed": 0,
+          "drafts_accepted": 0,
+          "drafts_rejected": 0,
+          "bonus_tokens": 0,
+          "fallback_steps": 0,
+          "accepted_decode_steps": 0,
+          "rejected_decode_steps": 0,
+          "mixed_accept_reject_decode_steps": 0,
+          "fallback_decode_steps": 0
+        },
+        "return_step_records": false,
+        "prefill_logits_by_request": [],
+        "step_record_count": 1,
+        "host_device_postprocess_ms": {
+          "host_ms": 0.0,
+          "device_ms": 0.0,
+          "postprocess_ms": 0.0,
+          "release_ms": 0.0
+        },
+        "phase_ms_total": {
+          "schedule_ms": 0.0,
+          "run_ms": 0.0,
+          "postprocess_ms": 0.0,
+          "release_ms": 0.0
+        },
+        "accepted_inter_token_latency_ms": {
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "rejected_inter_token_latency_ms": {
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "fallback_inter_token_latency_ms": {
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "mixed_accept_reject_inter_token_latency_ms": {
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "step_profile": {
+          "steps": [],
+          "all_steps": {
+            "count": 1,
+            "steps_seconds_total": 0.03424139693379402,
+            "tokens": 64,
+            "decode_tokens": 0,
+            "decode_seconds": 0,
+            "seconds_per_step": 0.03424139693379402,
+            "seconds_per_token": 0.0005350218270905316,
+            "decode_tokens_per_second": 0.0,
+            "ms_per_step_p50": 34.24139693379402,
+            "ms_per_step_p95": 34.24139693379402,
+            "ms_per_token_p50": 0.5350218270905316,
+            "ms_per_token_p95": 0.5350218270905316,
+            "ms_per_decode_token_p50": 0.0,
+            "ms_per_decode_token_p95": 0.0,
+            "inter_token_latency_ms_p50": 0.0,
+            "inter_token_latency_ms_p95": 0.0,
+            "phase_ms": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_avg_per_step": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "host_device_postprocess_ms": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_rollup": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            }
+          },
+          "accepted": {
+            "count": 0,
+            "steps_seconds_total": 0.0,
+            "tokens": 0,
+            "decode_tokens": 0,
+            "decode_seconds": 0.0,
+            "seconds_per_step": 0.0,
+            "seconds_per_token": 0.0,
+            "decode_tokens_per_second": 0.0,
+            "ms_per_step_p50": 0.0,
+            "ms_per_step_p95": 0.0,
+            "ms_per_token_p50": 0.0,
+            "ms_per_token_p95": 0.0,
+            "ms_per_decode_token_p50": 0.0,
+            "ms_per_decode_token_p95": 0.0,
+            "inter_token_latency_ms_p50": 0.0,
+            "inter_token_latency_ms_p95": 0.0,
+            "phase_ms": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_avg_per_step": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "host_device_postprocess_ms": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_rollup": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            }
+          },
+          "rejected": {
+            "count": 0,
+            "steps_seconds_total": 0.0,
+            "tokens": 0,
+            "decode_tokens": 0,
+            "decode_seconds": 0.0,
+            "seconds_per_step": 0.0,
+            "seconds_per_token": 0.0,
+            "decode_tokens_per_second": 0.0,
+            "ms_per_step_p50": 0.0,
+            "ms_per_step_p95": 0.0,
+            "ms_per_token_p50": 0.0,
+            "ms_per_token_p95": 0.0,
+            "ms_per_decode_token_p50": 0.0,
+            "ms_per_decode_token_p95": 0.0,
+            "inter_token_latency_ms_p50": 0.0,
+            "inter_token_latency_ms_p95": 0.0,
+            "phase_ms": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_avg_per_step": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "host_device_postprocess_ms": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_rollup": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            }
+          },
+          "mixed_accept_reject": {
+            "count": 0,
+            "steps_seconds_total": 0.0,
+            "tokens": 0,
+            "decode_tokens": 0,
+            "decode_seconds": 0.0,
+            "seconds_per_step": 0.0,
+            "seconds_per_token": 0.0,
+            "decode_tokens_per_second": 0.0,
+            "ms_per_step_p50": 0.0,
+            "ms_per_step_p95": 0.0,
+            "ms_per_token_p50": 0.0,
+            "ms_per_token_p95": 0.0,
+            "ms_per_decode_token_p50": 0.0,
+            "ms_per_decode_token_p95": 0.0,
+            "inter_token_latency_ms_p50": 0.0,
+            "inter_token_latency_ms_p95": 0.0,
+            "phase_ms": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_avg_per_step": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "host_device_postprocess_ms": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_rollup": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            }
+          },
+          "fallback": {
+            "count": 0,
+            "steps_seconds_total": 0.0,
+            "tokens": 0,
+            "decode_tokens": 0,
+            "decode_seconds": 0.0,
+            "seconds_per_step": 0.0,
+            "seconds_per_token": 0.0,
+            "decode_tokens_per_second": 0.0,
+            "ms_per_step_p50": 0.0,
+            "ms_per_step_p95": 0.0,
+            "ms_per_token_p50": 0.0,
+            "ms_per_token_p95": 0.0,
+            "ms_per_decode_token_p50": 0.0,
+            "ms_per_decode_token_p95": 0.0,
+            "inter_token_latency_ms_p50": 0.0,
+            "inter_token_latency_ms_p95": 0.0,
+            "phase_ms": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_avg_per_step": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "host_device_postprocess_ms": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_rollup": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            }
+          },
+          "prefill": {
+            "count": 1,
+            "steps_seconds_total": 0.03424139693379402,
+            "tokens": 64,
+            "decode_tokens": 0,
+            "decode_seconds": 0,
+            "seconds_per_step": 0.03424139693379402,
+            "seconds_per_token": 0.0005350218270905316,
+            "decode_tokens_per_second": 0.0,
+            "ms_per_step_p50": 34.24139693379402,
+            "ms_per_step_p95": 34.24139693379402,
+            "ms_per_token_p50": 0.5350218270905316,
+            "ms_per_token_p95": 0.5350218270905316,
+            "ms_per_decode_token_p50": 0.0,
+            "ms_per_decode_token_p95": 0.0,
+            "inter_token_latency_ms_p50": 0.0,
+            "inter_token_latency_ms_p95": 0.0,
+            "phase_ms": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_avg_per_step": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "host_device_postprocess_ms": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_rollup": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            }
+          },
+          "phase_ms_avg_per_step": {
+            "schedule_ms": 0.0,
+            "run_ms": 0.0,
+            "postprocess_ms": 0.0,
+            "release_ms": 0.0
+          },
+          "phase_ms_total": {
+            "schedule_ms": 0.0,
+            "run_ms": 0.0,
+            "postprocess_ms": 0.0,
+            "release_ms": 0.0
+          },
+          "host_device_postprocess_ms": {
+            "host_ms": 0.0,
+            "device_ms": 0.0,
+            "postprocess_ms": 0.0,
+            "release_ms": 0.0
+          },
+          "mode_counts": {
+            "prefill_steps": 1,
+            "decode_steps": 0,
+            "accepted_decode_steps": 0,
+            "rejected_decode_steps": 0,
+            "mixed_accept_reject_decode_steps": 0,
+            "fallback_decode_steps": 0
+          }
+        }
+      },
+      "variants": [
+        {
+          "token_source": "generated",
+          "position_offset": 0,
+          "hidden_source": "final_normed",
+          "benchmark_mode": "K=1 all_or_none MTP",
+          "mtp1": {
+            "texts": [
+              "."
+            ],
+            "token_ids": [
+              13
+            ],
+            "token_ids_by_request": [
+              [
+                13
+              ]
+            ],
+            "completion_tokens_by_request": [
+              1
+            ],
+            "tokens": 1,
+            "total_requests": 1,
+            "output_lengths_by_request": [
+              1
+            ],
+            "arrival_steps_by_request": [
+              0
+            ],
+            "interleaved_arrivals": false,
+            "seconds": 0.03399791195988655,
+            "tokens_per_second": 29.413571079891017,
+            "end_to_end_tokens_per_second": 29.413571079891017,
+            "decode_tokens_per_second": 0.0,
+            "prefill_tokens_per_second": 1882.4685491130251,
+            "decode_tokens": 0,
+            "prefill_tokens": 64,
+            "decode_seconds": 0,
+            "accepted_tokens": 0,
+            "rejected_tokens": 0,
+            "fallback_tokens": 0,
+            "prefill_seconds": 0.03399791195988655,
+            "speculative": {
+              "enabled": false,
+              "drafts_proposed": 0,
+              "drafts_accepted": 0,
+              "drafts_rejected": 0,
+              "bonus_tokens": 0,
+              "fallback_steps": 0,
+              "fallback_gated_no_spec_steps": 0,
+              "fallback_seeded_main_steps": 0,
+              "fallback_partial_rows": 0,
+              "draft_position_proposed": [],
+              "draft_position_accepted": [],
+              "acceptance_rate": 0.0,
+              "debug_events": []
+            },
+            "scheduler_mtp_admission": {
+              "enabled": true,
+              "reason": "disabled",
+              "gate_enabled": false,
+              "min_accept_rate": 0.75,
+              "min_accept_samples": 8,
+              "min_speedup": 1.0,
+              "confidence_min_accept_rate": 0.75,
+              "probe_steps": 2,
+              "latency_alpha": 0.2,
+              "latency_min_steps": 2,
+              "observed_accepted": 0,
+              "observed_rejected": 0,
+              "baseline_ewma_ms_per_token": null,
+              "spec_ewma_ms_per_token": null,
+              "baseline_latency_steps": 0,
+              "spec_latency_steps": 0,
+              "measured_scheduler_speedup": null,
+              "per_bucket": {
+                "enabled": false,
+                "active_bucket": null,
+                "confidence_min_accept_rate": 0.75,
+                "probe_steps": 2,
+                "buckets": []
+              }
+            },
+            "speculative_counts": {
+              "drafts_proposed": 0,
+              "drafts_accepted": 0,
+              "drafts_rejected": 0,
+              "bonus_tokens": 0,
+              "fallback_steps": 0,
+              "accepted_decode_steps": 0,
+              "rejected_decode_steps": 0,
+              "mixed_accept_reject_decode_steps": 0,
+              "fallback_decode_steps": 0
+            },
+            "return_step_records": false,
+            "prefill_logits_by_request": [],
+            "step_record_count": 1,
+            "host_device_postprocess_ms": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_total": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "accepted_inter_token_latency_ms": {
+              "p50": 0.0,
+              "p95": 0.0
+            },
+            "rejected_inter_token_latency_ms": {
+              "p50": 0.0,
+              "p95": 0.0
+            },
+            "fallback_inter_token_latency_ms": {
+              "p50": 0.0,
+              "p95": 0.0
+            },
+            "mixed_accept_reject_inter_token_latency_ms": {
+              "p50": 0.0,
+              "p95": 0.0
+            },
+            "step_profile": {
+              "steps": [],
+              "all_steps": {
+                "count": 1,
+                "steps_seconds_total": 0.03399791195988655,
+                "tokens": 64,
+                "decode_tokens": 0,
+                "decode_seconds": 0,
+                "seconds_per_step": 0.03399791195988655,
+                "seconds_per_token": 0.0005312173743732274,
+                "decode_tokens_per_second": 0.0,
+                "ms_per_step_p50": 33.99791195988655,
+                "ms_per_step_p95": 33.99791195988655,
+                "ms_per_token_p50": 0.5312173743732274,
+                "ms_per_token_p95": 0.5312173743732274,
+                "ms_per_decode_token_p50": 0.0,
+                "ms_per_decode_token_p95": 0.0,
+                "inter_token_latency_ms_p50": 0.0,
+                "inter_token_latency_ms_p95": 0.0,
+                "phase_ms": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_avg_per_step": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "host_device_postprocess_ms": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_rollup": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                }
+              },
+              "accepted": {
+                "count": 0,
+                "steps_seconds_total": 0.0,
+                "tokens": 0,
+                "decode_tokens": 0,
+                "decode_seconds": 0.0,
+                "seconds_per_step": 0.0,
+                "seconds_per_token": 0.0,
+                "decode_tokens_per_second": 0.0,
+                "ms_per_step_p50": 0.0,
+                "ms_per_step_p95": 0.0,
+                "ms_per_token_p50": 0.0,
+                "ms_per_token_p95": 0.0,
+                "ms_per_decode_token_p50": 0.0,
+                "ms_per_decode_token_p95": 0.0,
+                "inter_token_latency_ms_p50": 0.0,
+                "inter_token_latency_ms_p95": 0.0,
+                "phase_ms": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_avg_per_step": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "host_device_postprocess_ms": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_rollup": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                }
+              },
+              "rejected": {
+                "count": 0,
+                "steps_seconds_total": 0.0,
+                "tokens": 0,
+                "decode_tokens": 0,
+                "decode_seconds": 0.0,
+                "seconds_per_step": 0.0,
+                "seconds_per_token": 0.0,
+                "decode_tokens_per_second": 0.0,
+                "ms_per_step_p50": 0.0,
+                "ms_per_step_p95": 0.0,
+                "ms_per_token_p50": 0.0,
+                "ms_per_token_p95": 0.0,
+                "ms_per_decode_token_p50": 0.0,
+                "ms_per_decode_token_p95": 0.0,
+                "inter_token_latency_ms_p50": 0.0,
+                "inter_token_latency_ms_p95": 0.0,
+                "phase_ms": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_avg_per_step": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "host_device_postprocess_ms": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_rollup": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                }
+              },
+              "mixed_accept_reject": {
+                "count": 0,
+                "steps_seconds_total": 0.0,
+                "tokens": 0,
+                "decode_tokens": 0,
+                "decode_seconds": 0.0,
+                "seconds_per_step": 0.0,
+                "seconds_per_token": 0.0,
+                "decode_tokens_per_second": 0.0,
+                "ms_per_step_p50": 0.0,
+                "ms_per_step_p95": 0.0,
+                "ms_per_token_p50": 0.0,
+                "ms_per_token_p95": 0.0,
+                "ms_per_decode_token_p50": 0.0,
+                "ms_per_decode_token_p95": 0.0,
+                "inter_token_latency_ms_p50": 0.0,
+                "inter_token_latency_ms_p95": 0.0,
+                "phase_ms": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_avg_per_step": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "host_device_postprocess_ms": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_rollup": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                }
+              },
+              "fallback": {
+                "count": 0,
+                "steps_seconds_total": 0.0,
+                "tokens": 0,
+                "decode_tokens": 0,
+                "decode_seconds": 0.0,
+                "seconds_per_step": 0.0,
+                "seconds_per_token": 0.0,
+                "decode_tokens_per_second": 0.0,
+                "ms_per_step_p50": 0.0,
+                "ms_per_step_p95": 0.0,
+                "ms_per_token_p50": 0.0,
+                "ms_per_token_p95": 0.0,
+                "ms_per_decode_token_p50": 0.0,
+                "ms_per_decode_token_p95": 0.0,
+                "inter_token_latency_ms_p50": 0.0,
+                "inter_token_latency_ms_p95": 0.0,
+                "phase_ms": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_avg_per_step": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "host_device_postprocess_ms": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_rollup": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                }
+              },
+              "prefill": {
+                "count": 1,
+                "steps_seconds_total": 0.03399791195988655,
+                "tokens": 64,
+                "decode_tokens": 0,
+                "decode_seconds": 0,
+                "seconds_per_step": 0.03399791195988655,
+                "seconds_per_token": 0.0005312173743732274,
+                "decode_tokens_per_second": 0.0,
+                "ms_per_step_p50": 33.99791195988655,
+                "ms_per_step_p95": 33.99791195988655,
+                "ms_per_token_p50": 0.5312173743732274,
+                "ms_per_token_p95": 0.5312173743732274,
+                "ms_per_decode_token_p50": 0.0,
+                "ms_per_decode_token_p95": 0.0,
+                "inter_token_latency_ms_p50": 0.0,
+                "inter_token_latency_ms_p95": 0.0,
+                "phase_ms": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_avg_per_step": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "host_device_postprocess_ms": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_rollup": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                }
+              },
+              "phase_ms_avg_per_step": {
+                "schedule_ms": 0.0,
+                "run_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "phase_ms_total": {
+                "schedule_ms": 0.0,
+                "run_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "host_device_postprocess_ms": {
+                "host_ms": 0.0,
+                "device_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "mode_counts": {
+                "prefill_steps": 1,
+                "decode_steps": 0,
+                "accepted_decode_steps": 0,
+                "rejected_decode_steps": 0,
+                "mixed_accept_reject_decode_steps": 0,
+                "fallback_decode_steps": 0
+              }
+            }
+          },
+          "baseline": {
+            "texts": [
+              "."
+            ],
+            "token_ids": [
+              13
+            ],
+            "token_ids_by_request": [
+              [
+                13
+              ]
+            ],
+            "completion_tokens_by_request": [
+              1
+            ],
+            "tokens": 1,
+            "total_requests": 1,
+            "output_lengths_by_request": [
+              1
+            ],
+            "arrival_steps_by_request": [
+              0
+            ],
+            "interleaved_arrivals": false,
+            "seconds": 0.03424139693379402,
+            "tokens_per_second": 29.204415986109062,
+            "end_to_end_tokens_per_second": 29.204415986109062,
+            "decode_tokens_per_second": 0.0,
+            "prefill_tokens_per_second": 1869.08262311098,
+            "decode_tokens": 0,
+            "prefill_tokens": 64,
+            "decode_seconds": 0,
+            "accepted_tokens": 0,
+            "rejected_tokens": 0,
+            "fallback_tokens": 0,
+            "prefill_seconds": 0.03424139693379402,
+            "speculative": {
+              "enabled": false,
+              "drafts_proposed": 0,
+              "drafts_accepted": 0,
+              "drafts_rejected": 0,
+              "bonus_tokens": 0,
+              "fallback_steps": 0,
+              "fallback_gated_no_spec_steps": 0,
+              "fallback_seeded_main_steps": 0,
+              "fallback_partial_rows": 0,
+              "draft_position_proposed": [],
+              "draft_position_accepted": [],
+              "acceptance_rate": 0.0,
+              "debug_events": []
+            },
+            "scheduler_mtp_admission": {
+              "enabled": true,
+              "reason": "disabled",
+              "gate_enabled": false,
+              "min_accept_rate": 0.75,
+              "min_accept_samples": 8,
+              "min_speedup": 1.0,
+              "confidence_min_accept_rate": 0.75,
+              "probe_steps": 2,
+              "latency_alpha": 0.2,
+              "latency_min_steps": 2,
+              "observed_accepted": 0,
+              "observed_rejected": 0,
+              "baseline_ewma_ms_per_token": null,
+              "spec_ewma_ms_per_token": null,
+              "baseline_latency_steps": 0,
+              "spec_latency_steps": 0,
+              "measured_scheduler_speedup": null,
+              "per_bucket": {
+                "enabled": false,
+                "active_bucket": null,
+                "confidence_min_accept_rate": 0.75,
+                "probe_steps": 2,
+                "buckets": []
+              }
+            },
+            "speculative_counts": {
+              "drafts_proposed": 0,
+              "drafts_accepted": 0,
+              "drafts_rejected": 0,
+              "bonus_tokens": 0,
+              "fallback_steps": 0,
+              "accepted_decode_steps": 0,
+              "rejected_decode_steps": 0,
+              "mixed_accept_reject_decode_steps": 0,
+              "fallback_decode_steps": 0
+            },
+            "return_step_records": false,
+            "prefill_logits_by_request": [],
+            "step_record_count": 1,
+            "host_device_postprocess_ms": {
+              "host_ms": 0.0,
+              "device_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "phase_ms_total": {
+              "schedule_ms": 0.0,
+              "run_ms": 0.0,
+              "postprocess_ms": 0.0,
+              "release_ms": 0.0
+            },
+            "accepted_inter_token_latency_ms": {
+              "p50": 0.0,
+              "p95": 0.0
+            },
+            "rejected_inter_token_latency_ms": {
+              "p50": 0.0,
+              "p95": 0.0
+            },
+            "fallback_inter_token_latency_ms": {
+              "p50": 0.0,
+              "p95": 0.0
+            },
+            "mixed_accept_reject_inter_token_latency_ms": {
+              "p50": 0.0,
+              "p95": 0.0
+            },
+            "step_profile": {
+              "steps": [],
+              "all_steps": {
+                "count": 1,
+                "steps_seconds_total": 0.03424139693379402,
+                "tokens": 64,
+                "decode_tokens": 0,
+                "decode_seconds": 0,
+                "seconds_per_step": 0.03424139693379402,
+                "seconds_per_token": 0.0005350218270905316,
+                "decode_tokens_per_second": 0.0,
+                "ms_per_step_p50": 34.24139693379402,
+                "ms_per_step_p95": 34.24139693379402,
+                "ms_per_token_p50": 0.5350218270905316,
+                "ms_per_token_p95": 0.5350218270905316,
+                "ms_per_decode_token_p50": 0.0,
+                "ms_per_decode_token_p95": 0.0,
+                "inter_token_latency_ms_p50": 0.0,
+                "inter_token_latency_ms_p95": 0.0,
+                "phase_ms": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_avg_per_step": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "host_device_postprocess_ms": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_rollup": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                }
+              },
+              "accepted": {
+                "count": 0,
+                "steps_seconds_total": 0.0,
+                "tokens": 0,
+                "decode_tokens": 0,
+                "decode_seconds": 0.0,
+                "seconds_per_step": 0.0,
+                "seconds_per_token": 0.0,
+                "decode_tokens_per_second": 0.0,
+                "ms_per_step_p50": 0.0,
+                "ms_per_step_p95": 0.0,
+                "ms_per_token_p50": 0.0,
+                "ms_per_token_p95": 0.0,
+                "ms_per_decode_token_p50": 0.0,
+                "ms_per_decode_token_p95": 0.0,
+                "inter_token_latency_ms_p50": 0.0,
+                "inter_token_latency_ms_p95": 0.0,
+                "phase_ms": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_avg_per_step": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "host_device_postprocess_ms": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_rollup": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                }
+              },
+              "rejected": {
+                "count": 0,
+                "steps_seconds_total": 0.0,
+                "tokens": 0,
+                "decode_tokens": 0,
+                "decode_seconds": 0.0,
+                "seconds_per_step": 0.0,
+                "seconds_per_token": 0.0,
+                "decode_tokens_per_second": 0.0,
+                "ms_per_step_p50": 0.0,
+                "ms_per_step_p95": 0.0,
+                "ms_per_token_p50": 0.0,
+                "ms_per_token_p95": 0.0,
+                "ms_per_decode_token_p50": 0.0,
+                "ms_per_decode_token_p95": 0.0,
+                "inter_token_latency_ms_p50": 0.0,
+                "inter_token_latency_ms_p95": 0.0,
+                "phase_ms": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_avg_per_step": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "host_device_postprocess_ms": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_rollup": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                }
+              },
+              "mixed_accept_reject": {
+                "count": 0,
+                "steps_seconds_total": 0.0,
+                "tokens": 0,
+                "decode_tokens": 0,
+                "decode_seconds": 0.0,
+                "seconds_per_step": 0.0,
+                "seconds_per_token": 0.0,
+                "decode_tokens_per_second": 0.0,
+                "ms_per_step_p50": 0.0,
+                "ms_per_step_p95": 0.0,
+                "ms_per_token_p50": 0.0,
+                "ms_per_token_p95": 0.0,
+                "ms_per_decode_token_p50": 0.0,
+                "ms_per_decode_token_p95": 0.0,
+                "inter_token_latency_ms_p50": 0.0,
+                "inter_token_latency_ms_p95": 0.0,
+                "phase_ms": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_avg_per_step": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "host_device_postprocess_ms": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_rollup": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                }
+              },
+              "fallback": {
+                "count": 0,
+                "steps_seconds_total": 0.0,
+                "tokens": 0,
+                "decode_tokens": 0,
+                "decode_seconds": 0.0,
+                "seconds_per_step": 0.0,
+                "seconds_per_token": 0.0,
+                "decode_tokens_per_second": 0.0,
+                "ms_per_step_p50": 0.0,
+                "ms_per_step_p95": 0.0,
+                "ms_per_token_p50": 0.0,
+                "ms_per_token_p95": 0.0,
+                "ms_per_decode_token_p50": 0.0,
+                "ms_per_decode_token_p95": 0.0,
+                "inter_token_latency_ms_p50": 0.0,
+                "inter_token_latency_ms_p95": 0.0,
+                "phase_ms": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_avg_per_step": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "host_device_postprocess_ms": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_rollup": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                }
+              },
+              "prefill": {
+                "count": 1,
+                "steps_seconds_total": 0.03424139693379402,
+                "tokens": 64,
+                "decode_tokens": 0,
+                "decode_seconds": 0,
+                "seconds_per_step": 0.03424139693379402,
+                "seconds_per_token": 0.0005350218270905316,
+                "decode_tokens_per_second": 0.0,
+                "ms_per_step_p50": 34.24139693379402,
+                "ms_per_step_p95": 34.24139693379402,
+                "ms_per_token_p50": 0.5350218270905316,
+                "ms_per_token_p95": 0.5350218270905316,
+                "ms_per_decode_token_p50": 0.0,
+                "ms_per_decode_token_p95": 0.0,
+                "inter_token_latency_ms_p50": 0.0,
+                "inter_token_latency_ms_p95": 0.0,
+                "phase_ms": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_avg_per_step": {
+                  "schedule_ms": 0.0,
+                  "run_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "host_device_postprocess_ms": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                },
+                "phase_ms_rollup": {
+                  "host_ms": 0.0,
+                  "device_ms": 0.0,
+                  "postprocess_ms": 0.0,
+                  "release_ms": 0.0
+                }
+              },
+              "phase_ms_avg_per_step": {
+                "schedule_ms": 0.0,
+                "run_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "phase_ms_total": {
+                "schedule_ms": 0.0,
+                "run_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "host_device_postprocess_ms": {
+                "host_ms": 0.0,
+                "device_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "mode_counts": {
+                "prefill_steps": 1,
+                "decode_steps": 0,
+                "accepted_decode_steps": 0,
+                "rejected_decode_steps": 0,
+                "mixed_accept_reject_decode_steps": 0,
+                "fallback_decode_steps": 0
+              }
+            }
+          },
+          "mtp1_runs": 1,
+          "mtp_tokens_per_second": 29.413571079891017,
+          "mtp_end_to_end_tps": 29.413571079891017,
+          "baseline_end_to_end_tps": 29.204415986109062,
+          "mtp_prefill_tps": 1882.4685491130251,
+          "baseline_prefill_tps": 1869.08262311098,
+          "mtp_decode_tps": 0.0,
+          "mtp_decode_latency_ms_per_token_p50": 0.0,
+          "mtp_decode_latency_ms_per_token_p95": 0.0,
+          "mtp_rejected_decode_tokens_per_second": 0.0,
+          "mtp_rejected_latency_ms_per_token_p50": 0.0,
+          "mtp_mixed_accept_reject_decode_tokens_per_second": 0.0,
+          "mtp_mixed_accept_reject_latency_ms_per_token_p50": 0.0,
+          "mtp_fallback_decode_tokens_per_second": 0.0,
+          "baseline_decode_tps": 0.0,
+          "decode_speedup": 0.0,
+          "end_to_end_speedup": 1.0071617625869127,
+          "acceptance_rate": 0.0,
+          "fallback_count": 0,
+          "accepted_step_count": 0,
+          "rejected_step_count": 0,
+          "mixed_accept_reject_step_count": 0,
+          "fallback_step_count": 0,
+          "host_time_ms": 0.0,
+          "runner_device_time_ms": 0.0,
+          "postprocess_time_ms": 0.0,
+          "baseline_prefill_ms_per_token_p50": 0.5350218270905316,
+          "mtp_prefill_ms_per_token_p50": 0.5312173743732274,
+          "baseline_seconds": 0.03424139693379402,
+          "mtp_seconds": 0.03399791195988655,
+          "baseline_prefill_seconds": 0.03424139693379402,
+          "mtp_prefill_seconds": 0.03399791195988655,
+          "speedup": 1.0071617625869127,
+          "correct": true,
+          "first_diff": null,
+          "divergence_context": null,
+          "throughput_valid": false,
+          "timed_results_valid": false,
+          "next_step_logit_sanity": true,
+          "next_step_sanity_check": {
+            "checked": true,
+            "ok": true,
+            "max_tokens_checked": 2,
+            "seconds": 20.729171740007587,
+            "baseline_seconds": 20.67443512706086,
+            "mtp_seconds": 0.054735752986744046,
+            "first_diff": null,
+            "boundary": [
+              {
+                "request_index": 0,
+                "prompt_tokens": 64,
+                "visible_token_count": 1,
+                "baseline_visible_tail": [
+                  13
+                ],
+                "mtp_visible_tail": [
+                  13
+                ],
+                "next_input_token_baseline": 13,
+                "next_input_token_mtp": 13,
+                "next_token_baseline": 271,
+                "next_token_mtp": 271,
+                "committed_seq_len": 65,
+                "next_input_position": 64,
+                "next_input_block": 4,
+                "next_input_slot": 0,
+                "next_write_position": 65,
+                "next_write_block": 4,
+                "next_write_slot": 1
+              }
+            ],
+            "baseline_speculative_counts": {
+              "drafts_proposed": 0,
+              "drafts_accepted": 0,
+              "drafts_rejected": 0,
+              "bonus_tokens": 0,
+              "fallback_steps": 0,
+              "accepted_decode_steps": 0,
+              "rejected_decode_steps": 0,
+              "mixed_accept_reject_decode_steps": 0,
+              "fallback_decode_steps": 1
+            },
+            "mtp_speculative_counts": {
+              "drafts_proposed": 0,
+              "drafts_accepted": 0,
+              "drafts_rejected": 0,
+              "bonus_tokens": 0,
+              "fallback_steps": 0,
+              "accepted_decode_steps": 0,
+              "rejected_decode_steps": 0,
+              "mixed_accept_reject_decode_steps": 0,
+              "fallback_decode_steps": 1
+            },
+            "mtp_scheduler_mtp_admission": {
+              "enabled": true,
+              "reason": "disabled",
+              "gate_enabled": false,
+              "min_accept_rate": 0.75,
+              "min_accept_samples": 8,
+              "min_speedup": 1.0,
+              "confidence_min_accept_rate": 0.75,
+              "probe_steps": 2,
+              "latency_alpha": 0.2,
+              "latency_min_steps": 2,
+              "observed_accepted": 0,
+              "observed_rejected": 0,
+              "baseline_ewma_ms_per_token": null,
+              "spec_ewma_ms_per_token": null,
+              "baseline_latency_steps": 0,
+              "spec_latency_steps": 0,
+              "measured_scheduler_speedup": null,
+              "per_bucket": {
+                "enabled": false,
+                "active_bucket": null,
+                "confidence_min_accept_rate": 0.75,
+                "probe_steps": 2,
+                "buckets": []
+              }
+            }
+          },
+          "throughput_suppressed_reason": "correctness_only",
+          "accepted_tokens": 0,
+          "rejected_tokens": 0,
+          "fallback_tokens": 0,
+          "decode_tokens": 0,
+          "prefill_tokens": 64,
+          "step_mode_counts": {
+            "prefill_steps": 1,
+            "decode_steps": 0,
+            "accepted_decode_steps": 0,
+            "rejected_decode_steps": 0,
+            "mixed_accept_reject_decode_steps": 0,
+            "fallback_decode_steps": 0
+          },
+          "scheduler_mtp_admission": {
+            "enabled": true,
+            "reason": "disabled",
+            "gate_enabled": false,
+            "min_accept_rate": 0.75,
+            "min_accept_samples": 8,
+            "min_speedup": 1.0,
+            "confidence_min_accept_rate": 0.75,
+            "probe_steps": 2,
+            "latency_alpha": 0.2,
+            "latency_min_steps": 2,
+            "observed_accepted": 0,
+            "observed_rejected": 0,
+            "baseline_ewma_ms_per_token": null,
+            "spec_ewma_ms_per_token": null,
+            "baseline_latency_steps": 0,
+            "spec_latency_steps": 0,
+            "measured_scheduler_speedup": null,
+            "per_bucket": {
+              "enabled": false,
+              "active_bucket": null,
+              "confidence_min_accept_rate": 0.75,
+              "probe_steps": 2,
+              "buckets": []
+            }
+          },
+          "speculative": {
+            "enabled": false,
+            "drafts_proposed": 0,
+            "drafts_accepted": 0,
+            "drafts_rejected": 0,
+            "bonus_tokens": 0,
+            "fallback_steps": 0,
+            "fallback_gated_no_spec_steps": 0,
+            "fallback_seeded_main_steps": 0,
+            "fallback_partial_rows": 0,
+            "draft_position_proposed": [],
+            "draft_position_accepted": [],
+            "acceptance_rate": 0.0,
+            "debug_events": []
+          },
+          "decode": {
+            "accepted": {
+              "count": 0,
+              "steps_seconds_total": 0.0,
+              "tokens": 0,
+              "decode_tokens": 0,
+              "decode_seconds": 0.0,
+              "seconds_per_step": 0.0,
+              "seconds_per_token": 0.0,
+              "decode_tokens_per_second": 0.0,
+              "ms_per_step_p50": 0.0,
+              "ms_per_step_p95": 0.0,
+              "ms_per_token_p50": 0.0,
+              "ms_per_token_p95": 0.0,
+              "ms_per_decode_token_p50": 0.0,
+              "ms_per_decode_token_p95": 0.0,
+              "inter_token_latency_ms_p50": 0.0,
+              "inter_token_latency_ms_p95": 0.0,
+              "phase_ms": {
+                "schedule_ms": 0.0,
+                "run_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "phase_ms_avg_per_step": {
+                "schedule_ms": 0.0,
+                "run_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "host_device_postprocess_ms": {
+                "host_ms": 0.0,
+                "device_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "phase_ms_rollup": {
+                "host_ms": 0.0,
+                "device_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              }
+            },
+            "rejected": {
+              "count": 0,
+              "steps_seconds_total": 0.0,
+              "tokens": 0,
+              "decode_tokens": 0,
+              "decode_seconds": 0.0,
+              "seconds_per_step": 0.0,
+              "seconds_per_token": 0.0,
+              "decode_tokens_per_second": 0.0,
+              "ms_per_step_p50": 0.0,
+              "ms_per_step_p95": 0.0,
+              "ms_per_token_p50": 0.0,
+              "ms_per_token_p95": 0.0,
+              "ms_per_decode_token_p50": 0.0,
+              "ms_per_decode_token_p95": 0.0,
+              "inter_token_latency_ms_p50": 0.0,
+              "inter_token_latency_ms_p95": 0.0,
+              "phase_ms": {
+                "schedule_ms": 0.0,
+                "run_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "phase_ms_avg_per_step": {
+                "schedule_ms": 0.0,
+                "run_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "host_device_postprocess_ms": {
+                "host_ms": 0.0,
+                "device_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "phase_ms_rollup": {
+                "host_ms": 0.0,
+                "device_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              }
+            },
+            "mixed_accept_reject": {
+              "count": 0,
+              "steps_seconds_total": 0.0,
+              "tokens": 0,
+              "decode_tokens": 0,
+              "decode_seconds": 0.0,
+              "seconds_per_step": 0.0,
+              "seconds_per_token": 0.0,
+              "decode_tokens_per_second": 0.0,
+              "ms_per_step_p50": 0.0,
+              "ms_per_step_p95": 0.0,
+              "ms_per_token_p50": 0.0,
+              "ms_per_token_p95": 0.0,
+              "ms_per_decode_token_p50": 0.0,
+              "ms_per_decode_token_p95": 0.0,
+              "inter_token_latency_ms_p50": 0.0,
+              "inter_token_latency_ms_p95": 0.0,
+              "phase_ms": {
+                "schedule_ms": 0.0,
+                "run_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "phase_ms_avg_per_step": {
+                "schedule_ms": 0.0,
+                "run_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "host_device_postprocess_ms": {
+                "host_ms": 0.0,
+                "device_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "phase_ms_rollup": {
+                "host_ms": 0.0,
+                "device_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              }
+            },
+            "fallback": {
+              "count": 0,
+              "steps_seconds_total": 0.0,
+              "tokens": 0,
+              "decode_tokens": 0,
+              "decode_seconds": 0.0,
+              "seconds_per_step": 0.0,
+              "seconds_per_token": 0.0,
+              "decode_tokens_per_second": 0.0,
+              "ms_per_step_p50": 0.0,
+              "ms_per_step_p95": 0.0,
+              "ms_per_token_p50": 0.0,
+              "ms_per_token_p95": 0.0,
+              "ms_per_decode_token_p50": 0.0,
+              "ms_per_decode_token_p95": 0.0,
+              "inter_token_latency_ms_p50": 0.0,
+              "inter_token_latency_ms_p95": 0.0,
+              "phase_ms": {
+                "schedule_ms": 0.0,
+                "run_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "phase_ms_avg_per_step": {
+                "schedule_ms": 0.0,
+                "run_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "host_device_postprocess_ms": {
+                "host_ms": 0.0,
+                "device_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              },
+              "phase_ms_rollup": {
+                "host_ms": 0.0,
+                "device_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "release_ms": 0.0
+              }
+            }
+          },
+          "inter_token_latency_ms": {
+            "accepted": {
+              "p50": 0.0,
+              "p95": 0.0
+            },
+            "rejected": {
+              "p50": 0.0,
+              "p95": 0.0
+            },
+            "mixed_accept_reject": {
+              "p50": 0.0,
+              "p95": 0.0
+            },
+            "fallback": {
+              "p50": 0.0,
+              "p95": 0.0
+            }
+          },
+          "host_device_postprocess_ms": {
+            "host_ms": 0.0,
+            "device_ms": 0.0,
+            "postprocess_ms": 0.0,
+            "release_ms": 0.0
+          },
+          "timed_results": {
+            "valid": false,
+            "invalid_reason": "correctness_only"
+          },
+          "adaptive_mtp_gating": {
+            "formula": "measured_decode_speedup = mtp_decode_tokens_per_second / baseline_decode_tokens_per_second; should_enable = measured_decode_speedup >= 1.0 + margin",
+            "timing_scope": "decode_tokens_per_second",
+            "baseline_decode_tokens_per_second": 0.0,
+            "speculative_decode_tokens_per_second": 0.0,
+            "baseline_decode_ms_per_token": 999999999999.9999,
+            "speculative_decode_ms_per_token": 999999999999.9999,
+            "baseline_step_ms_per_token": 0.5350218270905316,
+            "speculative_step_ms_per_token": 0.5312173743732274,
+            "accept_rate": 0.0,
+            "margin": 0.0,
+            "measured_decode_speedup": 0.0,
+            "predicted_speedup": 0.0,
+            "legacy_acceptance_formula_speedup": 1.0071617625869127,
+            "legacy_formula_note": "diagnostic only; it can overestimate exact commit-select by multiplying an already-emitted-token timing ratio by acceptance",
+            "should_enable": false,
+            "structural_limit": "Exact speculative verification must be enabled only when measured emitted-token throughput beats baseline by the configured margin; acceptance-only formulas can overestimate speedup."
+          },
+          "exact_token_match": true,
+          "timed_results_invalid_reason": "correctness_only",
+          "raw_timed_results": {
+            "valid": false,
+            "prefill_tok_s": 1882.4685491130251,
+            "decode_tok_s": 0.0,
+            "end_to_end_tok_s": 29.413571079891017,
+            "decode_speedup": 0.0,
+            "end_to_end_speedup": 1.0071617625869127,
+            "acceptance_rate": 0.0,
+            "fallback_count": 0,
+            "accepted_step_count": 0,
+            "rejected_step_count": 0,
+            "mixed_accept_reject_step_count": 0,
+            "fallback_step_count": 0,
+            "scheduler_admission_reason": "disabled",
+            "scheduler_baseline_ewma_ms_per_token": null,
+            "scheduler_spec_ewma_ms_per_token": null,
+            "measured_scheduler_speedup": null,
+            "host_time_ms": 0.0,
+            "runner_device_time_ms": 0.0,
+            "postprocess_time_ms": 0.0,
+            "next_step_logit_sanity": true,
+            "exact_token_match": true
+          }
+        }
+      ],
+      "total_elapsed_seconds": 0.03424139693379402,
+      "throughput_tokens_per_second": 29.204415986109062,
+      "decode_tokens_per_second": 0.0,
+      "prefill_tokens_per_second": 1869.08262311098,
+      "prefill_decode_split": {
+        "prefill_tokens": 64,
+        "decode_tokens": 0,
+        "prefill_fraction": 1.0,
+        "decode_fraction": 0.0
+      }
+    }
+  ],
+  "acceptance_rate_mean": 0.0,
+  "decode_tps_no_spec_mean": 0.0,
+  "decode_tps_mtp_mean": 0.0,
+  "decode_speedup_mean": 0.0,
+  "throughput_summary": null,
+  "required_metrics": {
+    "prefill_tok_s": 1882.4685491130251,
+    "decode_tok_s": 0.0,
+    "decode_speedup": 0.0,
+    "end_to_end_speedup": 1.0071617625869127,
+    "acceptance_rate": 0.0,
+    "fallback_count": 0,
+    "accepted_step_count": 0,
+    "rejected_step_count": 0,
+    "mixed_accept_reject_step_count": 0,
+    "fallback_step_count": 0,
+    "end_to_end_tok_s": 29.413571079891017,
+    "scheduler_admission_reason": "disabled",
+    "scheduler_baseline_ewma_ms_per_token": null,
+    "scheduler_spec_ewma_ms_per_token": null,
+    "measured_scheduler_speedup": null,
+    "host_time_ms": 0.0,
+    "runner_device_time_ms": 0.0,
+    "postprocess_time_ms": 0.0,
+    "stats_key": {
+      "batch_bucket": 1,
+      "model_size": "0.8b",
+      "dtype": "float32",
+      "backend": "gpu",
+      "max_blocks_per_seq": 24
+    }
+  },
+  "mtp_exact_token_match": true,
+  "hf_logits_check": {
+    "checked": true,
+    "ok": true,
+    "device": "cache",
+    "dtype": "float32",
+    "activation_dtype": "float32",
+    "weight_dtype": "bfloat16",
+    "topk": 5,
+    "mse_threshold": 0.0001,
+    "mse_threshold_source": "dtype_default",
+    "checks": [
+      {
+        "prompt_index": 0,
+        "prompt_tokens": 64,
+        "mse": 4.411989266372984e-06,
+        "max_abs": 0.010146737098693848,
+        "hf_topk": [
+          13,
+          3937,
+          1135,
+          271,
+          1149
+        ],
+        "baseline_topk": [
+          13,
+          3937,
+          1135,
+          271,
+          1149
+        ],
+        "top1_match": true,
+        "topk_match": true,
+        "topk_overlap": 5,
+        "baseline_first_token": 13,
+        "baseline_first_token_match": true,
+        "ok": true,
+        "cache_key": "a6224c8f129be19249aabe7f3f5beec48f454c670e3d61ab01396eb109df4c3b"
+      }
+    ],
+    "cache": {
+      "path": "results/qwen08_hf_logits_serving_workloads.npz",
+      "mode": "read",
+      "hits": 1,
+      "misses": 0,
+      "written": false,
+      "entries": 1,
+      "load_warning": null
+    }
+  },
+  "correctness": {
+    "hf_logits_checked": true,
+    "hf_logits_ok": true,
+    "next_step_logit_sanity_checked": true,
+    "next_step_logit_sanity": true,
+    "baseline_greedy_is_canonical": true,
+    "mtp_exact_token_match": true,
+    "all_correct": true
+  },
+  "throughput_valid": false,
+  "timed_results_valid": false,
+  "throughput_suppressed_reason": "correctness_only",
+  "timed_results_invalid_reason": "correctness_only",
+  "raw_throughput_summary": {
+    "parallel_batch_tps": 29.204415986109062,
+    "decode_tps": 0.0,
+    "prefill_tps": 1869.08262311098,
+    "prefill_decode_balance": {
+      "prefill_tokens": 64,
+      "decode_tokens": 0,
+      "prefill_fraction": 1.0,
+      "decode_fraction": 0.0
+    },
+    "num_prefill_steps": 1,
+    "num_decode_steps": 0
+  },
+  "run": {
+    "run_id": "20260525-231020-1979278-benchmark_mtp1_engine",
+    "run_label": "benchmark_mtp1_engine",
+    "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl",
+    "profile_path": "/mountpoint/.exp/profiles/20260525-231020-1979278-benchmark_mtp1_engine",
+    "profile_enabled": false,
+    "profile_started": false,
+    "profile_error": null,
+    "issues": []
+  }
+}

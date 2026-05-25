@@ -31,6 +31,21 @@ from nanovllm_jax.engine.llm_engine import LLMEngine
 from nanovllm_jax.engine.sequence import SamplingParams
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0") in {"1", "true", "yes", "on", "True"}
+
+
+def _serving_fastpath_flags() -> dict[str, bool]:
+    return {
+        "greedy_token_fastpath": _env_flag("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH"),
+        "materialize_tied_lm_head": _env_flag("NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD"),
+        "compact_prefill_in_proj_qkv": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV"),
+        "compact_prefill_gdn_z": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z"),
+        "compact_prefill_full_attn_proj": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ"),
+        "compact_prefill_mlp": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_MLP"),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
@@ -509,11 +524,17 @@ def run_hf_logits_check(
             return [int(token) for token in engine._tokenize(prompt)]
         return [int(token) for token in prompt]
 
+    hf_weight_dtype = str(getattr(args, "weight_dtype", "auto") or "auto")
+    if hf_weight_dtype == "auto":
+        hf_weight_dtype = dtype
+
     def _cache_key(token_ids: list[int]) -> str:
         digest = hashlib.sha256()
         digest.update(str(args.model).encode("utf-8"))
         digest.update(b"\0")
         digest.update(str(dtype).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(hf_weight_dtype).encode("utf-8"))
         digest.update(b"\0")
         digest.update(np.asarray(token_ids, dtype=np.int32).tobytes())
         return digest.hexdigest()
@@ -542,10 +563,18 @@ def run_hf_logits_check(
         try:
             loaded = np.load(cache_path, allow_pickle=False)
             metadata = _json.loads(str(loaded["metadata"].tolist()))
-            if metadata.get("model") != args.model or metadata.get("dtype") != dtype:
+            metadata_dtype = metadata.get("activation_dtype", metadata.get("dtype"))
+            metadata_weight_dtype = metadata.get("weight_dtype", metadata.get("dtype"))
+            if (
+                metadata.get("model") != args.model
+                or metadata_dtype != dtype
+                or metadata_weight_dtype != hf_weight_dtype
+            ):
                 cache_error = (
-                    f"cache metadata mismatch: expected model={args.model} dtype={dtype}, "
-                    f"found model={metadata.get('model')} dtype={metadata.get('dtype')}"
+                    "cache metadata mismatch: "
+                    f"expected model={args.model} activation_dtype={dtype} weight_dtype={hf_weight_dtype}, "
+                    f"found model={metadata.get('model')} activation_dtype={metadata_dtype} "
+                    f"weight_dtype={metadata_weight_dtype}"
                 )
             else:
                 for entry in metadata.get("entries", []):
@@ -619,10 +648,12 @@ def run_hf_logits_check(
         try:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 args.model,
-                torch_dtype=_torch_dtype(dtype),
+                torch_dtype=_torch_dtype(hf_weight_dtype),
                 trust_remote_code=True,
                 local_files_only=bool(args.hf_offline),
             )
+            if dtype == "float32":
+                hf_model.float()
             hf_model.eval()
             hf_model.to(device)
             for record in missing_records:
@@ -666,6 +697,8 @@ def run_hf_logits_check(
                 "version": 1,
                 "model": args.model,
                 "dtype": dtype,
+                "activation_dtype": dtype,
+                "weight_dtype": hf_weight_dtype,
                 "entries": entries,
             }
             np.savez_compressed(
@@ -773,6 +806,8 @@ def run_hf_logits_check(
         "ok": bool(ok),
         "device": device,
         "dtype": dtype,
+        "activation_dtype": dtype,
+        "weight_dtype": hf_weight_dtype,
         "topk": args.hf_topk,
         "mse_threshold": mse_threshold,
         "mse_threshold_source": "cli" if args.hf_logits_mse_threshold is not None else "dtype_default",
@@ -2445,6 +2480,7 @@ def _main_impl(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "weight_dtype": args.weight_dtype,
             "resolved_dtype": dtype,
             "resolved_weight_dtype": weight_dtype,
+            "serving_fastpath_flags": _serving_fastpath_flags(),
             "jax_backend": jax.default_backend(),
             "jax_execution": args.jax_execution,
             "max_tokens": args.max_tokens,
@@ -2535,6 +2571,7 @@ def _main_impl(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "weight_dtype": args.weight_dtype,
             "resolved_dtype": dtype,
             "resolved_weight_dtype": weight_dtype,
+            "serving_fastpath_flags": _serving_fastpath_flags(),
             "jax_backend": jax.default_backend(),
             "jax_execution": args.jax_execution,
             "max_tokens": args.max_tokens,

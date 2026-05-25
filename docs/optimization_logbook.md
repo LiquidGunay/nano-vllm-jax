@@ -1045,3 +1045,39 @@ Decision:
 - Reject and revert the `lax.ragged_dot` compact projection path. It preserved correctness but did not change the underlying compact GEMM cost materially and made compiled execution and ITL worse.
 - On this A10G target, the installed Mosaic GPU `ragged_dot_mgpu` WGMMA path is not viable because it requires instructions unsupported on `sm_86`. A useful lower-level compact projection kernel would need an Ampere-compatible implementation, likely Triton or another CUDA path, and probably needs to fuse gather/dot/scatter to beat the current XLA plan.
 - Continue from Entry 029 as the accepted implementation baseline. The next practical work should either prototype an Ampere-compatible custom kernel outside Pallas WGMMA, or switch to decode LM-head/narrow-GEMM work with kernel-level evidence.
+
+## Entry 032 - Rejected Exact `max_blocks_per_seq=34` KV Window
+
+- run id: `20260525-225535-1976931-jax_hetero8_64_512x32_max_blocks_34`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_max_blocks_34.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-225535-1976931-jax_hetero8_64_512x32_max_blocks_34`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-225535-1976931-jax_hetero8_64_512x32_max_blocks_34/plugins/profile/2026_05_25_22_56_35/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-225535-1976931-jax_hetero8_64_512x32_max_blocks_34/plugins/profile/2026_05_25_22_56_35/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Noether recommended testing the exact static paged-attention window for this workload before lower-level kernel work. The target shape needs at most `512 + 32 = 544` tokens, so `--max-blocks-per-seq 34` shrinks the static KV window from `40 * 16 = 640` to `34 * 16 = 544` without changing model math.
+- change tested: benchmark-only setting change from Entry 029's `--max-blocks-per-seq 40` to `--max-blocks-per-seq 34`, with all accepted Entry 029 opt-in fast paths enabled.
+- correctness: exact generated-token match for all 8 rows against the hetero8 reference.
+- JAX timing: `246.76 tok/s`, TTFT p50 `553.52 ms`, ITL p50 `15.37 ms`, ITL p95 `16.86 ms`.
+- delta vs Entry 029 repeat: `1.002x` total tok/s, TTFT p50 `0.982x`, ITL p50 `1.007x`, ITL p95 `1.071x`. It missed the acceptance target of `>= 248.7 tok/s` and regressed ITL.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 029 repeat ms | Entry 032 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1039.52 | 1037.45 | slightly lower end-to-end wall attribution |
+| `_run_main_and_sample` | 907.94 | 910.26 | runner hot path slightly worse |
+| `forward_step_token_ids_jit` | 224.15 | 244.39 | compiled token-id step regressed |
+| `PjRtCApiLoadedExecutable::Execute` | 240.53 over 252 calls | 258.98 over 252 calls | same dispatch count, heavier execution |
+| `jit_compiled:XLA GPU module` | 196.07 | 208.89 | compiled GPU work increased |
+| `command_buffer::execute` | 144.17 over 1575 calls | 147.55 over 1575 calls | command-buffer time increased |
+| `np.asarray(jax.Array)` | 668.35 | 650.70 | host readback improved but not enough |
+| `gemm_fusion_dot_182` | 110.73 over 24 calls | 110.75 over 24 calls | compact MLP bucket unchanged |
+| `gemm_fusion_dot_181` | 97.20 over 18 calls | 97.20 over 18 calls | compact GDN/full-attn bucket unchanged |
+| `gemm_fusion_dot_234` | 45.68 | 45.70 | materialized LM-head decode bucket unchanged |
+| `gemm_fusion_dot_286` | 43.79 | 43.67 | narrow decode GEMM bucket unchanged |
+| `MemcpyD2D` | 24.37 | 24.59 | copy bucket unchanged |
+
+Decision:
+
+- Reject adopting the exact `34`-block window as the target hetero8 setting. The lower TTFT and host readback do not compensate for worse compiled execution and ITL.
+- Keep Entry 029's `--max-blocks-per-seq 40` as the current benchmark baseline for this workload. Revisit block-table width only as part of a broader shape-bucketing/server policy experiment, not as the next model-side optimization.
+- The next meaningful model-side win still likely needs an Ampere-compatible fused compact projection path or a decode LM-head/top-1 kernel with stronger HLO/kernel evidence.

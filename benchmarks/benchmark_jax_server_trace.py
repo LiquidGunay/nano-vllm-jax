@@ -67,6 +67,10 @@ def _parse_ints(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part.strip()]
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0") in {"1", "true", "yes", "on", "True"}
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -197,12 +201,14 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "output_len": args.output_len,
             "output_lengths": output_lengths or None,
             "prompt_suite": args.prompt_suite,
-            "greedy_token_fastpath": os.environ.get("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH", "0") in {
-                "1",
-                "true",
-                "yes",
-                "on",
-                "True",
+            "greedy_token_fastpath": _env_flag("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH"),
+            "serving_fastpath_flags": {
+                "greedy_token_fastpath": _env_flag("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH"),
+                "materialize_tied_lm_head": _env_flag("NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD"),
+                "compact_prefill_in_proj_qkv": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV"),
+                "compact_prefill_gdn_z": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z"),
+                "compact_prefill_full_attn_proj": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ"),
+                "compact_prefill_mlp": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_MLP"),
             },
         },
         "performance": _timing_metrics(trace["events"], elapsed, total_tokens),
