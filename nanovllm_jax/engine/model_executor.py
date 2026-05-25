@@ -385,10 +385,7 @@ class ModelExecutor:
                 params_leaves,
                 tokens,
                 positions,
-                seq_ids,
                 query_start_loc,
-                num_prefill_tokens,
-                num_decode_tokens,
                 block_tables,
                 seq_lens,
                 k_cache,
@@ -397,14 +394,15 @@ class ModelExecutor:
                 recurrent_state,
             ):
                 params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
+                num_query_tokens = query_start_loc[-1].astype(jnp.int32)
                 step_batch = ScheduledBatch(
                     tokens=tokens,
                     positions=positions,
-                    seq_ids=seq_ids,
+                    seq_ids=jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
                     query_start_loc=query_start_loc,
                     is_prefill=is_prefill,
-                    num_prefill_tokens=num_prefill_tokens,
-                    num_decode_tokens=num_decode_tokens,
+                    num_prefill_tokens=num_query_tokens if is_prefill else 0,
+                    num_decode_tokens=0 if is_prefill else num_query_tokens,
                     block_tables=block_tables,
                     seq_lens=seq_lens,
                 )
@@ -450,7 +448,7 @@ class ModelExecutor:
 
             self._jit_cache[key] = jax.jit(
                 compiled,
-                donate_argnums=(9, 10),
+                donate_argnums=(6, 7),
             )
 
         activations, k_cache, v_cache, conv_state, recurrent_state = self._profile_jit_call(
@@ -460,10 +458,7 @@ class ModelExecutor:
                 self._params_leaves,
                 batch.tokens,
                 batch.positions,
-                batch.seq_ids,
                 batch.query_start_loc,
-                jnp.asarray(batch.num_prefill_tokens, dtype=jnp.int32),
-                jnp.asarray(batch.num_decode_tokens, dtype=jnp.int32),
                 batch.block_tables,
                 batch.seq_lens,
                 cache_storage.k_cache,
@@ -513,10 +508,7 @@ class ModelExecutor:
                 params_leaves,
                 tokens,
                 positions,
-                seq_ids,
                 query_start_loc,
-                num_prefill_tokens,
-                num_decode_tokens,
                 block_tables,
                 seq_lens,
                 k_cache,
@@ -525,14 +517,15 @@ class ModelExecutor:
                 recurrent_state,
             ):
                 params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
+                num_query_tokens = query_start_loc[-1].astype(jnp.int32)
                 step_batch = ScheduledBatch(
                     tokens=tokens,
                     positions=positions,
-                    seq_ids=seq_ids,
+                    seq_ids=jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
                     query_start_loc=query_start_loc,
                     is_prefill=is_prefill,
-                    num_prefill_tokens=num_prefill_tokens,
-                    num_decode_tokens=num_decode_tokens,
+                    num_prefill_tokens=num_query_tokens if is_prefill else 0,
+                    num_decode_tokens=0 if is_prefill else num_query_tokens,
                     block_tables=block_tables,
                     seq_lens=seq_lens,
                 )
@@ -590,7 +583,7 @@ class ModelExecutor:
 
             self._jit_cache[key] = jax.jit(
                 compiled,
-                donate_argnums=(9, 10),
+                donate_argnums=(6, 7),
             )
 
         token_ids, k_cache, v_cache, conv_state, recurrent_state = self._profile_jit_call(
@@ -600,10 +593,7 @@ class ModelExecutor:
                 self._params_leaves,
                 batch.tokens,
                 batch.positions,
-                batch.seq_ids,
                 batch.query_start_loc,
-                jnp.asarray(batch.num_prefill_tokens, dtype=jnp.int32),
-                jnp.asarray(batch.num_decode_tokens, dtype=jnp.int32),
                 batch.block_tables,
                 batch.seq_lens,
                 cache_storage.k_cache,
