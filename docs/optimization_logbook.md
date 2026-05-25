@@ -970,3 +970,40 @@ Decision:
 - Accept compact full-attention prefill projections as a small opt-in improvement. It preserves exact greedy correctness, keeps the same dispatch count, and slightly improves the target hetero8 repeat without touching scheduling or decode semantics.
 - Keep this default-off with the other compact prefill flags. The improvement is modest, and the trace bucket names shift enough that this should be treated as workload-specific until broader prompt/MTP profiles are run.
 - Source-level row compaction has now covered the obvious padded prefill projections. Next work should move to optional lowered kernels for compact MLP/GDN projection paths, paged prefill attention kernels, or a deeper decode LM-head/narrow-GEMM plan with stronger HLO/kernel evidence.
+
+## Entry 030 - Rejected Compact Attention Output Projections
+
+- run id: `20260525-223325-1953992-jax_hetero8_64_512x32_compact_attn_out_proj`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_compact_attn_out_proj.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-223325-1953992-jax_hetero8_64_512x32_compact_attn_out_proj`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-223325-1953992-jax_hetero8_64_512x32_compact_attn_out_proj/plugins/profile/2026_05_25_22_34_06/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-223325-1953992-jax_hetero8_64_512x32_compact_attn_out_proj/plugins/profile/2026_05_25_22_34_06/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Euler was launched to audit the broader post-Entry029 bottleneck direction but did not complete before shutdown. Carver reviewed the Entry029/Entry030 evidence and confirmed rejection: exact correctness was not enough to offset the `-2.9%` throughput regression, worse ITL, and much heavier `PjRt Execute` / `forward_step_token_ids_jit` ranges.
+- change tested: a temporary `NANO_VLLM_JAX_COMPACT_PREFILL_ATTN_OUT_PROJ=1` path compacted valid prefill rows for GDN `out_proj` and full-attention `o_proj`, then scattered the projected output back to the rectangular layout. The source change was reverted after profiling.
+- correctness: focused CUDA guardrails passed with the flag enabled (`11 passed`), and the full hetero8 run had exact generated-token matches for all 8 rows against Entry 001.
+- JAX timing: `239.07 tok/s`, TTFT p50 `552.36 ms`, ITL p50 `16.81 ms`, ITL p95 `18.55 ms`.
+- delta vs Entry 029 repeat: `0.971x` total tok/s, TTFT p50 `0.980x`, ITL p50 `1.102x`, ITL p95 `1.178x`; despite a lower TTFT, decode latency and overall throughput regressed clearly.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 029 repeat ms | Entry 030 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1039.52 | 1070.81 | end-to-end regression |
+| `_run_main_and_sample` | 907.94 | 919.20 | runner hot path slower |
+| `forward_step_token_ids_jit` | 224.15 | 258.43 | compiled token-id step much slower |
+| `PjRtCApiLoadedExecutable::Execute` | 240.53 over 252 calls | 276.41 over 252 calls | same dispatch count, much heavier execution |
+| `jit_compiled:XLA GPU module` | 196.07 | 216.17 | compiled GPU work increased |
+| `command_buffer::execute` | 144.17 over 1575 calls | 146.54 over 1575 calls | command-buffer time slightly worse |
+| `gemm_fusion_dot_182` | 110.73 over 24 calls | 0.00 | bucket renamed rather than eliminated |
+| `gemm_fusion_dot_158` | 0.00 | 110.72 over 24 calls | reassigned compact MLP/attention output bucket |
+| `gemm_fusion_dot_181` | 97.20 over 18 calls | 0.00 | bucket renamed rather than eliminated |
+| `gemm_fusion_dot_157` | 0.00 | 97.18 over 18 calls | reassigned compact GDN/full-attention bucket |
+| `gemm_fusion_dot_234` | 45.68 | 45.72 | materialized LM-head decode bucket unchanged |
+| `gemm_fusion_dot_286` | 43.79 | 43.71 | narrow decode GEMM bucket unchanged |
+| `MemcpyD2D` | 24.37 | 25.42 | copy bucket slightly worse |
+
+Decision:
+
+- Reject and revert compact attention output projections. The target bucket was mostly renamed, while compiled execution time increased substantially and decode-step latency regressed.
+- Do not extend plain source-level row compaction to every remaining projection by default. The accepted compact input/MLP paths are useful, but this result shows that later-stage output projections can make XLA's compiled plan worse even when exact correctness holds.
+- Continue from Entry 029 as the accepted implementation baseline. Next work should focus on optional lower-level kernels for the compact projection paths, paged attention prefill, or decode LM-head/narrow-GEMM work with kernel-level evidence.
