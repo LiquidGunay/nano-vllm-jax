@@ -1,5 +1,7 @@
 # K=1 MTP probe/accounting update - 2026-05-11
 
+Historical TPU note. Current GPU defaults keep unsafe one-pass K=1 verifier paths opt-in only through `NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1=1`.
+
 ## Scope
 
 Implemented and tested the five requested items:

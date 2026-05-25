@@ -10,6 +10,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+jax.config.update("jax_default_matmul_precision", "highest")
+
 from nanovllm_jax.backends import PureJAXBackend, select_backend
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.engine.block_manager import BlockManager
@@ -382,9 +384,11 @@ def test_scheduler_chunks_prefill_by_max_batched_tokens_budget():
     )
 
     finished = scheduler.postprocess(second_batch_seqs, [99], prefill_chunk_lengths=[1])
-    assert finished == [False]
-    assert second_batch_seqs[0].num_cached_tokens == 4
+    assert finished == [True]
     assert second_batch_seqs[0].completion_token_ids == [99]
+    assert second_batch_seqs[0].status == SequenceStatus.FINISHED
+    assert second_batch_seqs[0].num_cached_tokens == 0
+    assert second_batch_seqs[0].block_table == []
 
 
 def test_scheduler_rejects_single_prompt_larger_than_prefill_budget():
@@ -961,7 +965,14 @@ def test_model_runner_warmup_uses_requested_prefill_len_without_buckets():
 
         def forward_step_jit(self, batch, **kwargs):
             self.calls.append((tuple(batch.tokens.shape), batch.is_prefill))
-            return type("Output", (), {"activations": Ready()})()
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                },
+            )()
 
     runner.executor = FakeExecutor()
     runner._sample_fn = lambda logits, temperatures: Ready()
@@ -1253,7 +1264,11 @@ def test_model_runner_mtp1_rejection_matches_single_step_main_decode_reference()
                 logits = logits.at[0, 0, token].set(10.0)
                 cache = "decode-cache"
                 hybrid = "decode-hybrid"
-                activations = logits
+                if kwargs.get("return_hidden_with_logits"):
+                    hidden = jnp.zeros((1, 1, config.hidden_size), dtype=jnp.float32)
+                    activations = (hidden, logits)
+                else:
+                    activations = logits
             else:
                 cache = "verify-cache"
                 hybrid = "verify-hybrid"
@@ -1462,9 +1477,9 @@ def test_executor_mtp1_greedy_step_jit_matches_separate_path():
         mtp_hidden_final_normed=True,
     )
 
-    assert int(fused.target_token) == int(expected_tokens[0, 0])
-    assert int(fused.bonus_token) == int(expected_tokens[0, 1])
-    assert int(fused.next_draft_token) == int(expected_next_draft)
+    assert int(fused.target_token[0]) == int(expected_tokens[0, 0])
+    assert int(fused.bonus_token[0]) == int(expected_tokens[0, 1])
+    assert int(fused.next_draft_token[0]) == int(expected_next_draft)
     assert bool(fused.accepted)
     np.testing.assert_allclose(
         np.array(fused.cache_storage.k_cache),

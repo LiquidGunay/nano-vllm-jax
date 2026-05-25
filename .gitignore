@@ -57,6 +57,7 @@ checkpoints/
 # Logs
 logs/
 *.log
+*.pid
 
 # Local tooling / generated benchmark artifacts
 node_modules/

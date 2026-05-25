@@ -2,6 +2,8 @@
 
 This document describes the canonical runtime flow and ownership boundaries. It intentionally avoids dated benchmark conclusions.
 
+Current GPU work uses CUDA/JAX with BF16 checkpoint values and FP32 activation math. TPU-specific backend wording in older sections is historical context, not current GPU serving guidance.
+
 ## Canonical flow
 
 ```text
@@ -76,7 +78,7 @@ The backend owns cache-layout and accelerator-specific operations:
 - full-attention prefill/decode kernels expressed in JAX/XLA,
 - linear-attention recurrent decode helpers.
 
-Current TPU execution is a pure JAX/XLA backend running on TPU. It is not a dedicated TPU kernel backend.
+Historical TPU execution used a pure JAX/XLA backend running on TPU. Current GPU execution uses the JAX CUDA backend; it is not a dedicated custom CUDA kernel backend yet.
 
 Backend invariant:
 

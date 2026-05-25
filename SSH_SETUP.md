@@ -1,54 +1,46 @@
-# SSH Key Setup Instructions
+# Directory-Scoped SSH Setup
 
-## Your Project-Specific SSH Key
+The previous `~/.ssh/nano_vllm_jax` instructions are stale for this workspace. Keep repository authentication scoped under `/mountpoint/.exp/.ssh` so this forked workspace does not depend on or mutate global SSH state.
 
-Public key (copy this):
+## Expected layout
+
+```text
+/mountpoint/.exp/.ssh/
+  nano_vllm_jax
+  nano_vllm_jax.pub
+  known_hosts
 ```
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEsGPm6+uLKRlOJ2yqxfHptKN1ykMTE/jVxUg2ZoUIpx nano-vllm-jax
-```
 
-## What I've Done
-
-✓ Generated SSH key: `~/.ssh/nano_vllm_jax` (private) and `~/.ssh/nano_vllm_jax.pub` (public)
-✓ Configured this git repo to use the key: `git config --local core.sshCommand "ssh -i ~/.ssh/nano_vllm_jax"`
-✓ No passphrase (for convenience, but you can add one if desired)
-
-## What You Need To Do
-
-### Step 1: Add SSH Key to GitHub
-
-1. Copy the public key above (the line starting with `ssh-ed25519`)
-2. Go to GitHub: https://github.com/settings/keys
-3. Click "New SSH key"
-4. Title: "nano-vllm-jax" (or any name you prefer)
-5. Key type: "Authentication Key"
-6. Paste the public key
-7. Click "Add SSH key"
-
-### Step 2: Test Connection (Optional)
+## Create or reuse the key
 
 ```bash
-ssh -i ~/.ssh/nano_vllm_jax -T git@github.com
+mkdir -p /mountpoint/.exp/.ssh
+chmod 700 /mountpoint/.exp/.ssh
+ssh-keygen -t ed25519 -C nano-vllm-jax -f /mountpoint/.exp/.ssh/nano_vllm_jax
+chmod 600 /mountpoint/.exp/.ssh/nano_vllm_jax
+chmod 644 /mountpoint/.exp/.ssh/nano_vllm_jax.pub
 ```
 
-You should see: "Hi username! You've successfully authenticated..."
+Add the public key from `/mountpoint/.exp/.ssh/nano_vllm_jax.pub` to GitHub as an authentication key.
 
-### Step 3: Tell Me When Done
+## Scope Git to this directory
 
-Once you've added the key to GitHub, I'll:
-1. Create the GitHub repository
-2. Add remote origin
-3. Make initial commit
-4. Push to GitHub
+Configure only this repository to use the workspace key and workspace-scoped `known_hosts` file:
 
-## Security Note
+```bash
+git config --local core.sshCommand "ssh -F /dev/null -i /mountpoint/.exp/.ssh/nano_vllm_jax -o IdentitiesOnly=yes -o UserKnownHostsFile=/mountpoint/.exp/.ssh/known_hosts"
+```
 
-- This SSH key is ONLY for this project (isolated)
-- It won't affect your other git repositories
-- Private key is in `~/.ssh/nano_vllm_jax` (never share this!)
-- Public key is in `~/.ssh/nano_vllm_jax.pub` (safe to share)
+If the remote is HTTPS and SSH pushes are required, switch only this repository:
 
-## Files Location
+```bash
+git remote set-url origin git@github.com:LiquidGunay/nano-vllm-jax.git
+```
 
-- Private key: `~/.ssh/nano_vllm_jax`
-- Public key: `~/.ssh/nano_vllm_jax.pub`
+Test with:
+
+```bash
+ssh -F /dev/null -i /mountpoint/.exp/.ssh/nano_vllm_jax -o IdentitiesOnly=yes -o UserKnownHostsFile=/mountpoint/.exp/.ssh/known_hosts -T git@github.com
+```
+
+Do not put this repository's private key in `~/.ssh`, and do not configure global Git SSH settings for this workspace.

@@ -61,7 +61,8 @@ def load_models_with_mtp(model_name="Qwen/Qwen3.5-0.8B"):
             model_name,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-        ).to(hf_device)
+        )
+        hf_model.float().to(hf_device)
     except ValueError as exc:
         if "not recognized" in str(exc).lower() or "model_type" in str(exc).lower():
             pytest.skip(
@@ -76,7 +77,9 @@ def load_models_with_mtp(model_name="Qwen/Qwen3.5-0.8B"):
     # Load JAX model with MTP
     print("  Loading JAX model with MTP...")
     config = Qwen3_5Config.qwen3_5_0_8b()
+    config.dtype = "bfloat16"
     params = load_weights_from_hf(model_name, config, load_mtp=True)
+    config.dtype = "float32"
     
     # Check if MTP params are loaded
     if hasattr(params, 'mtp_params') and params.mtp_params is not None:

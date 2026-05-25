@@ -30,6 +30,8 @@ from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.load_weights import load_weights_from_hf
 from nanovllm_jax.model import forward
  
+jax.config.update("jax_default_matmul_precision", "highest")
+
 MODEL_NAME = os.getenv("HF_PARITY_MODEL", "Qwen/Qwen3.5-0.8B")
 
 
@@ -61,7 +63,8 @@ def load_models(model_name: str = MODEL_NAME):
             model_name,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-        ).to(hf_device)
+        )
+        hf_model.float().to(hf_device)
     except ValueError as exc:
         # Newer/older transformers versions gate Qwen3.5 support differently.
         msg = str(exc).lower()
@@ -82,7 +85,9 @@ def load_models(model_name: str = MODEL_NAME):
     # Load JAX model with HF weights
     print("  Loading JAX model...")
     config = Qwen3_5Config.qwen3_5_0_8b()
+    config.dtype = "bfloat16"
     params = load_weights_from_hf(model_name, config)
+    config.dtype = "float32"
     
     print("  ✓ Models loaded")
     return hf_model, tokenizer, config, params, hf_device
@@ -172,7 +177,7 @@ def test_logits_parity(
         print(f"  Top 5 match: {'✓' if top5_match else '✗'}")
 
         assert top5_match, f"Top 5 tokens do not match for prompt {i}"
-        assert mse < 1e-4, f"MSE {mse:.2e} >= 1e-4 for prompt {i}"
+        assert mse < 1e-8, f"MSE {mse:.2e} >= 1e-8 for prompt {i}"
         num_tests += 1
     
     avg_mse = total_mse / num_tests if num_tests > 0 else 0.0

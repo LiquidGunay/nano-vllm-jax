@@ -266,6 +266,21 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
     Input shapes: [B, H, T, D] for query/key/value, [B, H, T] for g/beta
     Output shape: [B, H, T, D]
     """
+    if query.shape[2] > chunk_size:
+        # The multi-chunk JAX chunk kernel still has measurable drift from the
+        # HF/PyTorch chunked reference. Use the recurrent reference path for
+        # correctness; the chunk kernel can be restored behind parity tests.
+        output, final_state = jax_recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_state=initial_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        return output, final_state if output_final_state else None
+
     import jax
     
     initial_dtype = query.dtype
@@ -439,8 +454,14 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
     
     final_state, core_attn_out_chunks = lax.scan(process_chunk, state, jnp.arange(n_chunks))
     
-    # Reshape output back to [B, H, T, V]
-    core_attn_out = core_attn_out_chunks.reshape(batch_size, num_heads, -1, v_head_dim)
+    # lax.scan returns [n_chunks, B, H, chunk, V]; HF keeps chunk as the
+    # third dimension [B, H, n_chunks, chunk, V] before flattening time.
+    core_attn_out = core_attn_out_chunks.transpose(1, 2, 0, 3, 4).reshape(
+        batch_size,
+        num_heads,
+        -1,
+        v_head_dim,
+    )
     core_attn_out = core_attn_out[:, :, :seq_len]  # Remove padding
     
     if not output_final_state:

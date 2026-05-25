@@ -23,7 +23,10 @@ def rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndar
     x_f32 = x.astype(jnp.float32)
     mean_sq = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
     x_norm = x_f32 * lax.rsqrt(mean_sq + eps)
-    return x_norm.astype(input_dtype) * (1.0 + weight)
+    # HF computes the shifted standard RMSNorm weight in FP32:
+    # output = norm(x.float()) * (1.0 + weight.float()), then type_as(x).
+    output = x_norm * (1.0 + weight.astype(jnp.float32))
+    return output.astype(input_dtype)
 
 
 def l2norm(x: jnp.ndarray, axis: int = -1, eps: float = 1e-6) -> jnp.ndarray:

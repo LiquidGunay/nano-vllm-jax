@@ -1,5 +1,7 @@
 # MTP TPU Spot Findings - 2026-05-09
 
+Historical note: this file records TPU-era experiments and should not be used as current GPU serving guidance. For current CUDA GPU correctness and benchmark posture, use `docs/gpu_correctness_guardrails.md`, `docs/benchmarks.md`, and `docs/mtp.md`.
+
 ## TPU spot status
 
 - Working spot TPU VM: `nano-vllm-jax-spot-v6e2-1527`

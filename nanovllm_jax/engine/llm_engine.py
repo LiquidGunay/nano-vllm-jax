@@ -4,6 +4,7 @@ import atexit
 from time import perf_counter
 from typing import List, Dict, Optional, Union
 from tqdm.auto import tqdm
+from dataclasses import replace
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.kv_cache import KVCacheSpec, cap_num_kv_cache_blocks
@@ -49,9 +50,11 @@ class LLMEngine:
             **kwargs: Additional config parameters
         """
         # Create config
+        weight_dtype = kwargs.pop("weight_dtype", None)
         config_fields = {f.name for f in Qwen3_5Config.__dataclass_fields__.values()}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         self.config = Qwen3_5Config(**config_kwargs)
+        self.weight_dtype = weight_dtype or self.config.dtype
         kv_spec = KVCacheSpec(
             num_layers=self.config.num_hidden_layers,
             num_blocks=self.config.num_kvcache_blocks,
@@ -79,9 +82,10 @@ class LLMEngine:
         
         # Initialize model parameters - load from HF (no silent fallback)
         print(f"Loading pretrained weights from {model_path}...")
+        load_config = replace(self.config, dtype=self.weight_dtype)
         self.params = load_weights_from_hf_streaming(
             model_path,
-            self.config,
+            load_config,
             load_mtp=self.config.num_speculative_tokens > 0,
         )
         print("✓ Using pretrained weights")
@@ -102,7 +106,7 @@ class LLMEngine:
         self, 
         prompt: Union[str, List[int]], 
         sampling_params: SamplingParams,
-    ):
+    ) -> Sequence:
         """Add a generation request.
         
         Args:
@@ -125,6 +129,7 @@ class LLMEngine:
         # Create sequence
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq
 
     def step(self) -> tuple[List[tuple], int]:
         """Execute one scheduling step.
@@ -267,6 +272,105 @@ class LLMEngine:
             pbar.close()
         
         return results
+
+    def iter_generate(
+        self,
+        prompts: List[Union[str, List[int]]],
+        sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
+    ):
+        """Yield token events as requests make progress through the scheduler."""
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+        elif len(sampling_params) != len(prompts):
+            raise ValueError("sampling_params length must match prompts length")
+
+        request_inputs: List[List[int]] = []
+        for prompt in prompts:
+            token_ids = self._tokenize(prompt) if isinstance(prompt, str) else list(prompt)
+            if not token_ids:
+                raise ValueError("prompt must contain at least one token")
+            request_inputs.append(token_ids)
+
+        for sp in sampling_params:
+            if sp.max_tokens <= 0:
+                raise ValueError("max_tokens must be positive")
+            if sp.temperature < 0:
+                raise ValueError("temperature must be non-negative")
+
+        seqs = [self.add_request(prompt, sp) for prompt, sp in zip(request_inputs, sampling_params)]
+        seq_to_request = {seq.seq_id: index for index, seq in enumerate(seqs)}
+        seen_completion_lengths = {seq.seq_id: 0 for seq in seqs}
+        emitted_finish = set()
+        stream_start = perf_counter()
+
+        while not self.is_finished():
+            step_start = perf_counter()
+            _, num_tokens = self.step()
+            step_end = perf_counter()
+            for seq in seqs:
+                request_index = seq_to_request[seq.seq_id]
+                completion = seq.completion_token_ids
+                previous_length = seen_completion_lengths[seq.seq_id]
+                if len(completion) > previous_length:
+                    for offset, token_id in enumerate(completion[previous_length:]):
+                        completion_index = previous_length + offset
+                        yield {
+                            "event": "token",
+                            "seq_id": seq.seq_id,
+                            "request_index": request_index,
+                            "completion_index": completion_index,
+                            "token_id": int(token_id),
+                            "text": self._detokenize([int(token_id)]),
+                            "elapsed_seconds": step_end - stream_start,
+                            "step_seconds": step_end - step_start,
+                            "step_start_seconds": step_start - stream_start,
+                            "step_end_seconds": step_end - stream_start,
+                            "scheduler_step_tokens": int(abs(num_tokens)),
+                            "scheduler_step_is_decode": bool(num_tokens < 0),
+                        }
+                    seen_completion_lengths[seq.seq_id] = len(completion)
+                if seq.is_finished and seq.seq_id not in emitted_finish:
+                    emitted_finish.add(seq.seq_id)
+                    yield {
+                        "event": "finished",
+                        "seq_id": seq.seq_id,
+                        "request_index": request_index,
+                        "elapsed_seconds": step_end - stream_start,
+                        "completion_tokens": len(seq.completion_token_ids),
+                    }
+
+        yield {
+            "event": "done",
+            "elapsed_seconds": perf_counter() - stream_start,
+            "results": [
+                {
+                    "request_index": index,
+                    "text": self._detokenize(seq.completion_token_ids),
+                    "token_ids": [int(token) for token in seq.completion_token_ids],
+                }
+                for index, seq in enumerate(seqs)
+            ],
+        }
+
+    def generate_with_trace(
+        self,
+        prompts: List[Union[str, List[int]]],
+        sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
+    ) -> dict:
+        """Generate requests and return server-side per-token timing events."""
+        events = []
+        results = []
+        for event in self.iter_generate(prompts, sampling_params=sampling_params):
+            events.append(event)
+            if event.get("event") == "done":
+                results = event.get("results", [])
+        return {
+            "results": results,
+            "events": events,
+        }
 
     def _tokenize(self, text: str) -> List[int]:
         """Tokenize text using Qwen tokenizer."""

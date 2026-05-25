@@ -123,9 +123,12 @@ def _to_jax_weight(
             value = value.astype(np_dtype)
     if transpose and not value.flags.c_contiguous:
         value = np.ascontiguousarray(value)
-    arr = jnp.array(value, dtype=jax_dtype)
     if exp:
-        arr = jnp.exp(arr)
+        # HF stores A_log in the checkpoint dtype but computes
+        # A_log.float().exp() at runtime.  Keep that derived parameter in FP32
+        # so BF16 checkpoint loading does not round exp(A_log) itself.
+        return jnp.exp(jnp.array(value, dtype=jax_dtype).astype(jnp.float32))
+    arr = jnp.array(value, dtype=jax_dtype)
     return arr
 
 
@@ -342,9 +345,9 @@ def convert_hf_to_jax(hf_weights: dict, config: Qwen3_5Config, verbose: bool = F
             # dt_bias: [16]
             layer_params["dt_bias"] = text_weights[f"{linear_prefix}dt_bias"]
             
-            # A_log: [16] -> exp to get A (HF computes g = -exp(A_log) * softplus(...))
-            # We store A = exp(A_log) and compute g = -A * softplus(...) in gated_deltanet_block
-            layer_params["A"] = jnp.exp(text_weights[f"{linear_prefix}A_log"])
+            # A_log: [16] -> exp to get A. HF computes A_log.float().exp()
+            # at runtime, so the derived A stays FP32 even for BF16 weights.
+            layer_params["A"] = jnp.exp(text_weights[f"{linear_prefix}A_log"].astype(jnp.float32))
             
             # norm: [128] - RMSNorm over head groups (no shift needed)
             layer_params["norm_weight"] = text_weights[f"{linear_prefix}norm.weight"]

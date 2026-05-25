@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import jax
@@ -90,12 +91,22 @@ class ModelExecutor:
 
     def _configure_persistent_cache(self):
         """Enable a deterministic JAX persistent compilation cache."""
+        mount_root = Path(os.getenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp"))
+        default_cache_dir = (
+            mount_root / ".cache" / "jax"
+            if mount_root.exists()
+            else Path.cwd() / ".cache" / "jax"
+        )
         cache_dir = os.getenv(
             "NANO_VLLM_JAX_COMPILE_CACHE_DIR",
-            os.path.expanduser("~/.cache/nano_vllm_jax/jax_compile_cache"),
+            os.getenv("JAX_COMPILATION_CACHE_DIR", str(default_cache_dir)),
         )
         if cache_dir:
             try:
+                Path(cache_dir).mkdir(parents=True, exist_ok=True)
+                os.environ.setdefault("NANO_VLLM_JAX_COMPILE_CACHE_DIR", cache_dir)
+                os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", cache_dir)
+                jax.config.update("jax_enable_compilation_cache", True)
                 jax.config.update("jax_compilation_cache_dir", cache_dir)
             except AttributeError:
                 # Older JAX releases do not expose this flag.
@@ -110,7 +121,8 @@ class ModelExecutor:
                 )
 
         try:
-            jax.config.update("jax_persistent_cache_min_compile_time_secs", 1)
+            jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+            jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
         except Exception:
             # Older JAX versions may not expose this flag in older releases.
             pass

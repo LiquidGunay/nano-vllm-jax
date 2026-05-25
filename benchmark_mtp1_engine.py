@@ -14,11 +14,15 @@ import os
 import time
 from pathlib import Path
 
+from runtime_paths import configure_compilation_cache
+from run_tracking import RunRecorder
+
 os.environ.setdefault("HF_HUB_OFFLINE", "0")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+configure_compilation_cache()
 _platform = os.getenv("NANO_VLLM_JAX_JAX_PLATFORMS") or os.getenv("NANO_VLLM_JAX_PLATFORMS")
 if _platform:
     os.environ["JAX_PLATFORMS"] = _platform
@@ -49,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--num-speculative-tokens", type=int, default=1)
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32", "auto"], default="auto")
+    parser.add_argument("--weight-dtype", choices=["float16", "bfloat16", "float32", "auto"], default="auto")
     parser.add_argument("--backend", default="auto")
     parser.add_argument("--jax-execution", choices=["eager", "decode-jit", "jit"], default="jit")
     parser.add_argument("--max-num-seqs", type=int, default=1)
@@ -140,6 +145,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", default="", help="Optional path to write the machine-readable summary")
     parser.add_argument("--show-outputs", action="store_true",
                         help="Include decoded baseline/MTP outputs in each variant row")
+    parser.add_argument(
+        "--profile",
+        dest="profile",
+        action="store_true",
+        default=os.environ.get("NANO_VLLM_JAX_PROFILE", "1") not in {"0", "false", "False", "no", "off"},
+        help="Write a JAX profiler trace under /mountpoint/.exp/profiles by default.",
+    )
+    parser.add_argument("--no-profile", dest="profile", action="store_false")
+    parser.add_argument("--profile-dir", default="", help="Directory for per-run JAX profiler traces.")
+    parser.add_argument("--run-log", default="", help="Append-only JSONL run journal path.")
+    parser.add_argument("--run-label", default="", help="Short label included in the profiler run directory name.")
     return parser.parse_args()
 
 
@@ -388,6 +404,8 @@ def run_hf_logits_check(
             trust_remote_code=True,
             local_files_only=bool(args.hf_offline),
         )
+        if dtype == "bfloat16":
+            hf_model.float()
         hf_model.eval()
         hf_model.to(device)
 
@@ -2188,8 +2206,7 @@ def _build_variant_rows(
     return baseline, variant_rows
 
 
-def main():
-    args = parse_args()
+def _main_impl(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     if args.hf_offline:
         os.environ["HF_HUB_OFFLINE"] = "1"
     if not args.hf_offline:
@@ -2217,6 +2234,7 @@ def main():
     prefill_buckets = parse_buckets(args.prefill_buckets)
     batch_size_buckets = parse_buckets(args.batch_size_buckets)
     dtype = choose_dtype(args.dtype, jax.default_backend())
+    weight_dtype = choose_dtype(args.weight_dtype, jax.default_backend()) if args.weight_dtype != "auto" else dtype
     batch_prompts = max(1, int(args.batch_prompts))
     requested_prompt_lengths = parse_prompt_lengths(args.prompt_lengths)
     requested_output_lengths = parse_int_tuple(args.output_lengths)
@@ -2239,6 +2257,7 @@ def main():
         backend=args.backend,
         **preset_config_kwargs,
         dtype=dtype,
+        weight_dtype=weight_dtype,
         max_kv_cache_bytes=args.max_kv_cache_mb * 1024 * 1024,
         num_kvcache_blocks=args.num_kvcache_blocks,
         max_num_seqs=max(args.max_num_seqs, batch_prompts),
@@ -2420,7 +2439,9 @@ def main():
         summary = {
             "model": args.model,
             "dtype": args.dtype,
+            "weight_dtype": args.weight_dtype,
             "resolved_dtype": dtype,
+            "resolved_weight_dtype": weight_dtype,
             "jax_backend": jax.default_backend(),
             "jax_execution": args.jax_execution,
             "max_tokens": args.max_tokens,
@@ -2508,7 +2529,9 @@ def main():
         summary = {
             "model": args.model,
             "dtype": args.dtype,
+            "weight_dtype": args.weight_dtype,
             "resolved_dtype": dtype,
+            "resolved_weight_dtype": weight_dtype,
             "jax_backend": jax.default_backend(),
             "jax_execution": args.jax_execution,
             "max_tokens": args.max_tokens,
@@ -2575,6 +2598,43 @@ def main():
         }
 
     summary = apply_correctness_gate(summary, args=args, hf_logits_check=hf_logits_check)
+    summary["run"] = recorder.metadata()
+    if not summary.get("all_correct", False):
+        recorder.record_issue(
+            summary="MTP generated tokens diverged from the regular JAX baseline",
+            severity="error",
+            status="open",
+            details={
+                "all_correct": summary.get("all_correct"),
+                "first_failures": [
+                    variant.get("first_diff")
+                    for row in summary.get("rows", [])
+                    for variant in row.get("variants", [])
+                    if not variant.get("correct", False)
+                ][:4],
+            },
+            learnings=["MTP correctness must be established before trusting any MTP throughput numbers."],
+            resolution="Use exact commit-select by default; isolate unsafe one-pass K=1 under explicit env flags.",
+        )
+    primary_metrics = summary.get("required_metrics", {})
+    if primary_metrics and float(primary_metrics.get("decode_speedup", 0.0) or 0.0) < 1.0:
+        recorder.record_issue(
+            summary="MTP decode path is slower than regular JAX baseline",
+            severity="info",
+            status="open",
+            details=primary_metrics,
+            learnings=["Correct MTP1 still needs a measured decode speedup before serving admission should enable it."],
+            resolution="pending after correctness is locked",
+        )
+    if hf_logits_check.get("checked") and not hf_logits_check.get("ok", False):
+        recorder.record_issue(
+            summary="HF logits check failed",
+            severity="error",
+            status="open",
+            details=hf_logits_check,
+            learnings=["Main-model/HF parity is a prerequisite for interpreting MTP benchmark results."],
+            resolution="pending",
+        )
 
     rendered = json.dumps(summary, indent=2)
     print(rendered)
@@ -2583,7 +2643,53 @@ def main():
 
     del engine
     gc.collect()
-    raise SystemExit(0 if summary.get("all_correct", False) else 1)
+    return summary
+
+
+def _summary_for_journal(summary: dict) -> dict:
+    return {
+        "model": summary.get("model"),
+        "dtype": summary.get("dtype"),
+        "weight_dtype": summary.get("weight_dtype"),
+        "all_correct": summary.get("all_correct"),
+        "acceptance_rate_mean": summary.get("acceptance_rate_mean"),
+        "decode_speedup_mean": summary.get("decode_speedup_mean"),
+        "required_metrics": summary.get("required_metrics", {}),
+        "stats_key": summary.get("stats_key"),
+    }
+
+
+def main():
+    args = parse_args()
+    recorder = RunRecorder.create(
+        script=Path(__file__).name,
+        args=vars(args),
+        run_label=args.run_label,
+        profile_dir=args.profile_dir or None,
+        run_log=args.run_log or None,
+    )
+    recorder.start_jax_profile(enabled=args.profile)
+    try:
+        summary = _main_impl(args, recorder)
+        recorder.stop_jax_profile()
+        recorder.finish(
+            status="ok" if summary.get("all_correct", False) else "failed_correctness",
+            summary=_summary_for_journal(summary),
+            learnings=[
+                "MTP correctness is evaluated against the regular JAX baseline on the same engine path.",
+                "Throughput is not considered valid when token correctness or next-step sanity fails.",
+            ],
+            resolution="Open correctness or speed issues are recorded as JSONL issue events.",
+        )
+        raise SystemExit(0 if summary.get("all_correct", False) else 1)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        recorder.stop_jax_profile()
+        recorder.finish_exception(exc)
+        raise
+    finally:
+        recorder.stop_jax_profile()
 
 
 if __name__ == "__main__":

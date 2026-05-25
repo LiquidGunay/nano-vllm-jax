@@ -4,18 +4,22 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from threading import Lock
 import time
 import traceback
 from typing import Any
 
+from runtime_paths import configure_compilation_cache
+
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+configure_compilation_cache()
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request, stream_with_context
 
 from nanovllm_jax.engine.llm_engine import LLMEngine
 from nanovllm_jax.engine.sequence import SamplingParams
@@ -129,6 +133,44 @@ def _sampling_from_request(data: dict) -> tuple[int, float]:
     return max_tokens, temperature
 
 
+def _sampling_params_for_inputs(data: dict, inputs: list[str | list[int]]) -> tuple[list[SamplingParams], int | list[int], float]:
+    try:
+        temperature = float(data.get("temperature", 0.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("temperature must be a number") from exc
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative")
+    raw_max_tokens = data.get("max_tokens", app.config["MAX_TOKENS_DEFAULT"])
+    if isinstance(raw_max_tokens, list):
+        if len(raw_max_tokens) != len(inputs):
+            raise ValueError("max_tokens list length must match number of prompts")
+        try:
+            token_limits = [int(value) for value in raw_max_tokens]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_tokens entries must be integers") from exc
+        if any(value <= 0 for value in token_limits):
+            raise ValueError("max_tokens entries must be positive")
+        params = [
+            SamplingParams(temperature=temperature, max_tokens=value, ignore_eos=bool(data.get("ignore_eos", False)))
+            for value in token_limits
+        ]
+        return params, token_limits, temperature
+    try:
+        max_tokens = int(raw_max_tokens)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_tokens must be an integer or a list of integers") from exc
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+    return (
+        [
+            SamplingParams(temperature=temperature, max_tokens=max_tokens, ignore_eos=bool(data.get("ignore_eos", False)))
+            for _ in inputs
+        ],
+        max_tokens,
+        temperature,
+    )
+
+
 def load_engine(args) -> LLMEngine:
     global engine
     prefill_buckets, batch_size_buckets = _validate_server_args(args)
@@ -137,6 +179,7 @@ def load_engine(args) -> LLMEngine:
         args.model,
         backend=args.backend,
         dtype=args.dtype,
+        weight_dtype=args.weight_dtype,
         max_kv_cache_bytes=max_kv_cache_bytes,
         num_kvcache_blocks=args.num_kvcache_blocks,
         max_num_seqs=args.max_num_seqs,
@@ -164,6 +207,46 @@ def _run_generation(inputs: list[str | list[int]], max_tokens: int, temperature:
     )
     with engine_lock:
         return engine.generate(inputs, sampling_params=sampling, use_tqdm=False)
+
+
+def _summarize_trace(trace: dict, prompt_tokens: list[int]) -> dict:
+    token_events = [event for event in trace["events"] if event.get("event") == "token"]
+    by_request: dict[int, list[float]] = {}
+    for event in token_events:
+        by_request.setdefault(int(event["request_index"]), []).append(float(event["elapsed_seconds"]))
+    itls_ms = []
+    ttfts_ms = []
+    for timestamps in by_request.values():
+        if timestamps:
+            ttfts_ms.append(1000.0 * timestamps[0])
+            itls_ms.extend(1000.0 * (right - left) for left, right in zip(timestamps, timestamps[1:]))
+    elapsed = max(
+        [float(event.get("elapsed_seconds", 0.0)) for event in trace["events"]]
+        or [0.0]
+    )
+    completion_tokens = [len(result["token_ids"]) for result in trace["results"]]
+    return {
+        "generation_time_ms": int(elapsed * 1000),
+        "tokens_per_second": sum(completion_tokens) / elapsed if elapsed > 0 else 0.0,
+        "ttft_ms_mean": float(sum(ttfts_ms) / len(ttfts_ms)) if ttfts_ms else None,
+        "itl_ms_mean": float(sum(itls_ms) / len(itls_ms)) if itls_ms else None,
+        "itl_ms_p50": float(_percentile(itls_ms, 50)) if itls_ms else None,
+        "itl_ms_p95": float(_percentile(itls_ms, 95)) if itls_ms else None,
+        "prompt_tokens": sum(prompt_tokens),
+        "completion_tokens": sum(completion_tokens),
+        "jit_cache_entries": len(engine.model_runner.executor._jit_cache) if engine is not None else 0,
+    }
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    index = (len(sorted_values) - 1) * percentile / 100.0
+    lower = int(index)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    fraction = index - lower
+    return sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction
 
 
 def _generation_payload(results, prompt_tokens: list[int], elapsed: float, is_batch: bool):
@@ -237,6 +320,67 @@ def generate():
         return jsonify({"error": str(exc), "traceback": traceback.format_exc()}), 500
 
 
+@app.route("/v1/generate_trace", methods=["POST"])
+def generate_trace():
+    data = request.get_json(force=True) or {}
+    try:
+        inputs, is_batch = _normalize_generation_inputs(data)
+        sampling_params, max_tokens_for_validation, _ = _sampling_params_for_inputs(data, inputs)
+        prompt_tokens = _token_counts(inputs)
+        validation_max_tokens = max(max_tokens_for_validation) if isinstance(max_tokens_for_validation, list) else max_tokens_for_validation
+        _validate_inputs_fit_config(inputs, prompt_tokens, validation_max_tokens)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+
+    try:
+        if engine is None:
+            raise RuntimeError("Model is not loaded")
+        with engine_lock:
+            trace = engine.generate_with_trace(inputs, sampling_params=sampling_params)
+        stats = _summarize_trace(trace, prompt_tokens)
+        payload = {
+            "results": trace["results"] if is_batch else trace["results"][0],
+            "events": trace["events"],
+            "stats": stats,
+        }
+        if engine is not None and hasattr(engine.model_runner, "get_speculative_stats"):
+            payload["stats"]["speculative"] = engine.model_runner.get_speculative_stats()
+        return jsonify(payload)
+    except Exception as exc:
+        return jsonify({"error": str(exc), "traceback": traceback.format_exc()}), 500
+
+
+@app.route("/v1/generate_stream", methods=["POST"])
+def generate_stream():
+    data = request.get_json(force=True) or {}
+    try:
+        inputs, _ = _normalize_generation_inputs(data)
+        sampling_params, max_tokens_for_validation, _ = _sampling_params_for_inputs(data, inputs)
+        prompt_tokens = _token_counts(inputs)
+        validation_max_tokens = max(max_tokens_for_validation) if isinstance(max_tokens_for_validation, list) else max_tokens_for_validation
+        _validate_inputs_fit_config(inputs, prompt_tokens, validation_max_tokens)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+
+    def event_stream():
+        if engine is None:
+            yield f"data: {json.dumps({'event': 'error', 'error': 'Model is not loaded'})}\n\n"
+            return
+        try:
+            with engine_lock:
+                for event in engine.iter_generate(inputs, sampling_params=sampling_params):
+                    yield f"data: {json.dumps(event, sort_keys=True)}\n\n"
+        except Exception as exc:
+            payload = {"event": "error", "error": str(exc), "traceback": traceback.format_exc()}
+            yield f"data: {json.dumps(payload, sort_keys=True)}\n\n"
+
+    return Response(stream_with_context(event_stream()), mimetype="text/event-stream")
+
+
 @app.route("/v1/completions", methods=["POST"])
 def completions():
     data = request.get_json(force=True) or {}
@@ -288,6 +432,7 @@ def main():
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--backend", default="auto")
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float16")
+    parser.add_argument("--weight-dtype", choices=["float16", "bfloat16", "float32"], default=None)
     parser.add_argument("--jax-execution", choices=["eager", "decode-jit", "jit"], default="jit")
     parser.add_argument("--prefill-buckets", default="16")
     parser.add_argument("--batch-size-buckets", default="1")
@@ -303,7 +448,7 @@ def main():
     app.config["MAX_TOKENS_DEFAULT"] = args.max_tokens_default
 
     print("nano-vllm-jax LLMEngine server")
-    print(f"model={args.model} dtype={args.dtype} execution={args.jax_execution}")
+    print(f"model={args.model} dtype={args.dtype} weight_dtype={args.weight_dtype or args.dtype} execution={args.jax_execution}")
     print(f"prefill_buckets={args.prefill_buckets} batch_size_buckets={args.batch_size_buckets}")
     load_engine(args)
     print(f"server_ready=http://{args.host}:{args.port}")

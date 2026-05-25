@@ -1,10 +1,26 @@
 # MTP Speculative Decoding
 
-MTP is experimental in this repository. The current serving policy is K=1 one-pass MTP only, with scheduler-owned admission and acceptance plus measured decode-latency EWMA gates.
+MTP is experimental in this repository. This page records the current GPU serving posture plus TPU-era K=1 semantics and benchmark findings. For current GPU correctness, use [GPU correctness guardrails](gpu_correctness_guardrails.md) and [benchmarks](benchmarks.md).
 
-Do not describe the current MTP path as production-ready.
+Do not describe the current MTP path as production-ready. Current GPU server-shape artifacts show exact commit-select MTP1 matching JAX/HF generated tokens across the suite, but still slower than the regular JAX paged baseline. Treat the TPU results below as historical for current GPU work.
 
-## Current validated state
+## Current GPU caveat
+
+The current GPU correctness contract is `dtype=float32` with `weight_dtype=bfloat16` for Qwen3.5 real weights. Under that contract:
+
+- the long-decode top-5 guardrail matches HF for 500/500 decode steps,
+- JAX paged generation matches HF across the current server-shape suite,
+- exact commit-select MTP1 generated tokens match JAX/HF across the current server-shape suite,
+- MTP1 throughput should not be reported as a serving win until it beats the JAX paged baseline on the same correctness-checked shapes.
+
+Current default posture:
+
+- regular serving uses `num_speculative_tokens=0` unless a caller opts into MTP,
+- unsafe one-pass K=1 verifier paths are opt-in through `NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1=1`,
+- the exact commit-select path is the correctness reference for focused MTP1 tests,
+- forced MTP benchmarks are diagnostics, not serving guidance, until they pass generated-token parity and measured decode speedup.
+
+## Historical TPU validated state
 
 Validated on 2026-05-09 through 2026-05-11 repo state:
 
@@ -65,9 +81,9 @@ The scheduler owns whether MTP is admitted for a row. Admission should consider:
 - measured decode-latency EWMA compared with baseline,
 - bucket and shape eligibility.
 
-Current implementation gates with acceptance and measured latency, but the latency EWMA is still global. Per-bucket EWMA remains pending.
+The TPU implementation described below gated with acceptance and measured latency, but its latency EWMA was still global. Treat per-bucket EWMA as a historical TPU follow-up item unless it is revalidated on GPU.
 
-## 2026-05-11 K=1 speed status
+## Historical 2026-05-11 K=1 speed status
 
 The corrected K=1 path is exact but does not yet beat baseline when MTP is forced on.
 
@@ -81,7 +97,7 @@ Validated TPU v6e-1 results, `Qwen/Qwen3.5-0.8B`, BF16, real weights, JIT, warme
 - mixed/interleaved B=4, prompt lengths `16,17,31,32`, arrivals `0,0,2,4`, output length 12: exact token match passed, next-step sanity passed, baseline decode `238.71 tok/s`, forced K=1 decode `141.88 tok/s`, speedup `0.594x`, acceptance `38.9%`.
 - measured-speed gate with `NANO_VLLM_JAX_MTP_MIN_SPEEDUP=1.0`: exact token match passed and decode throughput was effectively parity, `362.76 tok/s` baseline vs `362.72 tok/s` gated K=1, because admission disabled speculative decode after measured throughput was below threshold.
 
-Current blocker:
+Historical blocker:
 
 ```text
 Accepted K=1 steps can be faster per emitted token on 4B/B=1.
@@ -89,14 +105,14 @@ Rejected and fallback K=1 steps are much slower per emitted token, so forced MTP
 needs a high acceptance rate to break even.
 ```
 
-Do not seed a follow-up K=1 draft after a rejected row unless the rejected-row next-draft state invariant is proven. The current safe policy commits the target token and leaves no draft behind for rejected K=1 rows.
+Do not seed a follow-up K=1 draft after a rejected row unless the rejected-row next-draft state invariant is proven. The historical safe policy commits the target token and leaves no draft behind for rejected K=1 rows.
 
-The next implementation target is a safe fast verifier that preserves the cheap accepted path while exposing an after-current-token state for rejected rows. Without that prefix state, fast rejected rows must either be repaired or left uncommitted, which removes the expected K=1 speedup.
+The next MTP research target is a safe fast verifier that preserves the cheap accepted path while exposing an after-current-token state for rejected rows. Without that prefix state, fast rejected rows must either be repaired or left uncommitted, which removes the expected K=1 speedup.
 
 Break-even direction:
 
-- With the current safe path, increasing from 0.8B to 4B does not materially lower the threshold. The 4B accepted-step per-token latency is approximately baseline latency, while rejected rows remain about 2x baseline latency.
-- Therefore the current 4B forced-K=1 break-even acceptance threshold is effectively at or above 100%. A larger model alone is not enough; the accepted verifier path must become cheaper than two baseline decode steps and rejected/fallback rows must be gated or repaired cheaply.
+- With the historical safe path, increasing from 0.8B to 4B did not materially lower the threshold. The 4B accepted-step per-token latency was approximately baseline latency, while rejected rows remained about 2x baseline latency.
+- Therefore the historical 4B forced-K=1 break-even acceptance threshold was effectively at or above 100%. A larger model alone was not enough; the accepted verifier path had to become cheaper than two baseline decode steps and rejected/fallback rows had to be gated or repaired cheaply.
 
 Batch-shape correctness note:
 
@@ -105,7 +121,7 @@ Batch-shape correctness note:
 - This is now the default for multi-token decode. It preserves the canonical width-1 baseline contract but raises the forced-MTP speedup threshold.
 - Hybrid prefix-cache execution is disabled, so allocation must also avoid sharing content-addressed full blocks. Otherwise repeated prompts in the same prefill wave can write duplicate rows into one physical KV block. The scheduler now passes `use_prefix_cache=False` to allocation when prefix-cache execution is disabled; blocks still keep local hashes for decode append bookkeeping, but they are not inserted into the shared prefix-cache map.
 
-## Current K=2 status
+## Historical K=2 status
 
 K=2 is correctness-clean in focused TPU semantics testing, but slower in observed serving benchmarks. Treat it as experimental and non-serving.
 
@@ -120,4 +136,4 @@ K=2 should stay disabled for serving until it has:
 
 Historical unsafe fused one-pass experiments showed useful diagnostics but are not the serving reference. Width-dependent TPU BF16 numerics and hidden-state drift made those paths unsuitable for exact serving unless guarded by explicit experimental flags and correctness checks.
 
-Current canonical docs should describe the gated K=1 path, not older unsafe fused experiments.
+Current GPU docs should describe the BF16-weight/FP32-activation baseline, the exact commit-select MTP1 parity result, and the remaining MTP1 speed gap, not older unsafe fused TPU experiments.

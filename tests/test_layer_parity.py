@@ -61,7 +61,8 @@ def load_hf_model(model_name=MODEL_NAME):
             model_name,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-        ).to(hf_device)
+        )
+        model.float().to(hf_device)
     except ValueError as exc:
         if "not recognized" in str(exc).lower() or "model_type" in str(exc).lower():
             pytest.skip(
@@ -86,15 +87,15 @@ def test_rmsnorm(hf_model_and_tokenizer):
     
     # Get RMSNorm weight from HF model
     hf_norm = model.model.norm
-    weight = hf_norm.weight.detach().float().numpy()  # Convert bfloat16 → float32
+    weight = hf_norm.weight.detach().float().cpu().numpy()  # Convert bfloat16 to float32
     
     # Create input
     batch_size, seq_len, hidden_size = 2, 16, 1024
     x_np = np.random.randn(batch_size, seq_len, hidden_size).astype(np.float32)
     
     # HF forward
-    x_torch = torch.from_numpy(x_np)
-    hf_out = hf_norm(x_torch).detach().float().numpy()  # Convert to float32
+    x_torch = torch.from_numpy(x_np).to(device=hf_norm.weight.device)
+    hf_out = hf_norm(x_torch).detach().float().cpu().numpy()  # Convert to float32
     
     # JAX forward
     x_jax = jnp.array(x_np)
@@ -156,12 +157,12 @@ def test_full_attention(hf_model_and_tokenizer):
     hidden_np = np.random.randn(batch_size, seq_len, config.hidden_size).astype(np.float32)
     
     # Get layer weights
-    q_proj = hf_layer.self_attn.q_proj.weight.detach().T.float().numpy()
-    k_proj = hf_layer.self_attn.k_proj.weight.detach().T.float().numpy()
-    v_proj = hf_layer.self_attn.v_proj.weight.detach().T.float().numpy()
-    o_proj = hf_layer.self_attn.o_proj.weight.detach().T.float().numpy()
-    q_norm = hf_layer.self_attn.q_norm.weight.detach().float().numpy()
-    k_norm = hf_layer.self_attn.k_norm.weight.detach().float().numpy()
+    q_proj = hf_layer.self_attn.q_proj.weight.detach().T.float().cpu().numpy()
+    k_proj = hf_layer.self_attn.k_proj.weight.detach().T.float().cpu().numpy()
+    v_proj = hf_layer.self_attn.v_proj.weight.detach().T.float().cpu().numpy()
+    o_proj = hf_layer.self_attn.o_proj.weight.detach().T.float().cpu().numpy()
+    q_norm = hf_layer.self_attn.q_norm.weight.detach().float().cpu().numpy()
+    k_norm = hf_layer.self_attn.k_norm.weight.detach().float().cpu().numpy()
     
     print(f"  Testing layer {full_attn_layer_idx} (full attention)")
     print(f"  Input shape: {hidden_np.shape}")
@@ -174,9 +175,13 @@ def test_full_attention(hf_model_and_tokenizer):
     # This is a simplified test
     
     hidden_jax = jnp.array(hidden_np)
-    hidden_torch = torch.from_numpy(hidden_np).to(dtype=hf_layer.self_attn.q_proj.weight.dtype)
+    hf_device = hf_layer.self_attn.q_proj.weight.device
+    hidden_torch = torch.from_numpy(hidden_np).to(
+        device=hf_device,
+        dtype=hf_layer.self_attn.q_proj.weight.dtype,
+    )
 
-    hf_positions = torch.arange(seq_len, dtype=torch.int64).unsqueeze(0)
+    hf_positions = torch.arange(seq_len, dtype=torch.int64, device=hf_device).unsqueeze(0)
     hf_position_embeddings = model.model.rotary_emb(hidden_torch, hf_positions)
     hf_attn_out = hf_layer.self_attn(
         hidden_torch,
@@ -213,7 +218,7 @@ def test_full_attention(hf_model_and_tokenizer):
     )
 
     out_np = np.array(out)
-    hf_np = hf_attn_out.detach().float().numpy()
+    hf_np = hf_attn_out.detach().float().cpu().numpy()
     mse = np.mean((hf_np - out_np) ** 2)
     max_diff = np.max(np.abs(hf_np - out_np))
 
@@ -330,16 +335,16 @@ def test_mlp(hf_model_and_tokenizer):
     hidden_np = np.random.randn(batch_size, seq_len, config.hidden_size).astype(np.float32)
     
     # HF forward
-    hidden_torch = torch.from_numpy(hidden_np)
+    hidden_torch = torch.from_numpy(hidden_np).to(device=gate_weight_torch.device)
     gate_out = torch.nn.functional.silu(torch.matmul(hidden_torch, gate_weight_torch.T))
     up_out = torch.matmul(hidden_torch, up_weight_torch.T)
     mlp_hidden = gate_out * up_out
-    hf_out = torch.matmul(mlp_hidden, down_weight_torch.T).numpy()
+    hf_out = torch.matmul(mlp_hidden, down_weight_torch.T).detach().cpu().numpy()
     
     # Convert to numpy for JAX
-    gate_weight = gate_weight_torch.numpy()
-    up_weight = up_weight_torch.numpy()
-    down_weight = down_weight_torch.numpy()
+    gate_weight = gate_weight_torch.cpu().numpy()
+    up_weight = up_weight_torch.cpu().numpy()
+    down_weight = down_weight_torch.cpu().numpy()
     
     # JAX forward
     hidden_jax = jnp.array(hidden_np)

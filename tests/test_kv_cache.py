@@ -23,6 +23,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
+
+jax.config.update("jax_default_matmul_precision", "highest")
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.kv_cache import (
@@ -110,7 +113,8 @@ def test_paged_attention_vs_standard():
     assert not bool(jnp.any(jnp.isinf(standard_output)))
 
 
-def test_linear_attention_chunked_vs_recurrent():
+@pytest.mark.parametrize("seq_len", [64, 128])
+def test_linear_attention_chunked_vs_recurrent(seq_len):
     """Verify chunked and recurrent linear attention produce same results."""
     print("\n=== Testing Linear Attention: Chunked vs Recurrent ===")
     
@@ -121,8 +125,6 @@ def test_linear_attention_chunked_vs_recurrent():
     num_heads = config.linear_num_value_heads
     k_dim = config.linear_key_head_dim
     v_dim = config.linear_value_head_dim
-    seq_len = 64
-    
     # Create test inputs
     query = jnp.array(np.random.randn(batch_size, num_heads, seq_len, k_dim).astype(np.float32))
     key = jnp.array(np.random.randn(batch_size, num_heads, seq_len, k_dim).astype(np.float32))

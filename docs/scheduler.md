@@ -2,6 +2,8 @@
 
 The scheduler is the Python-side owner of runnable work, block allocation, preemption, and MTP admission.
 
+Current GPU work treats MTP admission as experimental. The TPU-era K=1 policy below is historical unless a GPU benchmark explicitly revalidates it with generated-token parity and measured decode speedup.
+
 ## Responsibilities
 
 The scheduler owns:
@@ -79,7 +81,7 @@ Admission is controlled by serving policy:
 - scheduler-owned admission,
 - acceptance gate,
 - measured decode-latency EWMA gate,
-- pure JAX/XLA TPU execution expectations.
+- backend-specific execution expectations.
 
 Current limitation:
 

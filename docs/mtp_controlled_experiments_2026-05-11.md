@@ -1,6 +1,6 @@
 # K=1 MTP controlled experiments, 2026-05-11
 
-This file records the controlled TPU experiments for the current K=1 MTP speedup work.
+This file records historical controlled TPU experiments. It is not current GPU serving guidance.
 
 ## Setup
 

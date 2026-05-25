@@ -2582,7 +2582,7 @@ class CanonicalModelRunner:
             in {"1", "true", "yes", "on", "True"}
         )
         allow_unsafe_one_pass_k1 = (
-            os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "1")
+            os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0")
             in {"1", "true", "yes", "on", "True"}
         )
         allow_mixed_fused_k1 = (
@@ -3455,7 +3455,7 @@ class CanonicalModelRunner:
             "on",
             "True",
         }
-        allow_unsafe_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "1") in {
+        allow_unsafe_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0") in {
             "1",
             "true",
             "yes",
@@ -3596,7 +3596,7 @@ class CanonicalModelRunner:
                 "on",
                 "True",
             }
-            allow_unsafe_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "1") in {
+            allow_unsafe_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0") in {
                 "1",
                 "true",
                 "yes",
