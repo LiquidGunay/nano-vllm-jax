@@ -197,6 +197,13 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "output_len": args.output_len,
             "output_lengths": output_lengths or None,
             "prompt_suite": args.prompt_suite,
+            "greedy_token_fastpath": os.environ.get("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            },
         },
         "performance": _timing_metrics(trace["events"], elapsed, total_tokens),
         "rows": rows,

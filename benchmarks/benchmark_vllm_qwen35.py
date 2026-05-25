@@ -495,20 +495,40 @@ def compare_reference(summary: dict, reference_json: str) -> dict:
     reference = json.loads(Path(reference_json).read_text())
     ref_by_len = {}
     ref_by_shape = {}
+    trace_refs = []
     for row in reference.get("rows", []):
-        lengths = row.get("prompt_lengths", [])
-        topk_rows = row.get("jax_paged", {}).get("topk_by_request") or []
-        refs = [
-            {
-                "generated_tokens": tokens,
-                "first_step_topk": (topk_rows[index] if index < len(topk_rows) else {}).get("ids", []),
+        if "jax_paged" in row:
+            lengths = row.get("prompt_lengths", [])
+            topk_rows = row.get("jax_paged", {}).get("topk_by_request") or []
+            refs = [
+                {
+                    "generated_tokens": tokens,
+                    "first_step_topk": (topk_rows[index] if index < len(topk_rows) else {}).get("ids", []),
+                }
+                for index, tokens in enumerate(row.get("jax_paged", {}).get("token_ids_by_request", []))
+            ]
+            if refs:
+                ref_by_shape[tuple(int(length) for length in lengths)] = refs
+            if len(lengths) == 1:
+                ref_by_len[int(lengths[0])] = refs[0] if refs else {"generated_tokens": [], "first_step_topk": []}
+            continue
+        if "generated_token_ids" in row:
+            topk_rows = row.get("topk_logprobs_by_step") or []
+            first_step_topk = [
+                int(item["token_id"])
+                for item in (topk_rows[0] if topk_rows else [])
+                if item.get("token_id") is not None
+            ]
+            ref = {
+                "generated_tokens": row.get("generated_token_ids", []),
+                "first_step_topk": first_step_topk,
             }
-            for index, tokens in enumerate(row.get("jax_paged", {}).get("token_ids_by_request", []))
-        ]
-        if refs:
-            ref_by_shape[tuple(int(length) for length in lengths)] = refs
-        if len(lengths) == 1:
-            ref_by_len[int(lengths[0])] = refs[0] if refs else {"generated_tokens": [], "first_step_topk": []}
+            trace_refs.append(ref)
+            if "prompt_length" in row:
+                ref_by_len[int(row["prompt_length"])] = ref
+    reference_shape = reference.get("run_config", {}).get("input_lens")
+    if trace_refs and reference_shape:
+        ref_by_shape[tuple(int(length) for length in reference_shape)] = trace_refs
     summary_shape = tuple(int(length) for length in summary.get("run_config", {}).get("input_lens", []))
     shape_refs = ref_by_shape.get(summary_shape)
     rows = []

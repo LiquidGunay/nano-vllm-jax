@@ -1281,6 +1281,7 @@ def reset_engine_runtime(engine: LLMEngine, *, reset_mtp_admission: bool = True)
     runner = engine.model_runner
     runner._mtp1_drafts.clear()
     runner._last_prefill_logits_by_seq = {}
+    runner._capture_prefill_logits = False
     runner.reset_speculative_stats()
     if hasattr(runner, "hybrid_states"):
         runner.hybrid_states.clear()
@@ -1321,6 +1322,7 @@ def run_generation_batch(
     runner.mtp_debug = debug_spec
     runner._mtp1_drafts.clear()
     runner._last_prefill_logits_by_seq = {}
+    runner._capture_prefill_logits = bool(return_prefill_logits)
     runner.reset_speculative_stats()
 
     if not prompts:
@@ -1550,6 +1552,7 @@ def run_generation_batch(
         runner.run = orig_run
         scheduler.postprocess = orig_postprocess
         runner.release = orig_release
+        runner._capture_prefill_logits = False
 
     if len(completion_by_seq) != len(prompts):
         raise RuntimeError(f"generation produced {len(completion_by_seq)} outputs for {len(prompts)} prompts")

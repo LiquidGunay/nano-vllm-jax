@@ -435,6 +435,145 @@ class ModelExecutor:
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
         )
 
+    def forward_step_token_ids_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state: HybridLayerState,
+    ) -> ExecutorOutput:
+        """JIT path that returns greedy token ids instead of full logits.
+
+        This is a serving-oriented specialization for temperature-0 generation.
+        The dense LM head still runs inside the compiled graph, but only the
+        small argmax result crosses the Python/JAX boundary. Correctness and
+        diagnostics that need logits should continue using ``forward_step_jit``.
+        """
+        if hybrid_state.conv_state is None or hybrid_state.recurrent_state is None:
+            raise ValueError("forward_step_token_ids_jit requires initialized hybrid_state")
+        self._log_step("forward_step_token_ids_jit", batch, return_hidden=True, last_logits_only=False)
+        self._validate_batch_contract(batch)
+
+        key = (
+            "token-ids",
+            tuple(batch.tokens.shape),
+            tuple(batch.positions.shape),
+            tuple(batch.block_tables.shape),
+            bool(batch.is_prefill),
+        )
+        if key not in self._jit_cache:
+            is_prefill = bool(batch.is_prefill)
+
+            def compiled(
+                params,
+                tokens,
+                positions,
+                seq_ids,
+                query_start_loc,
+                num_prefill_tokens,
+                num_decode_tokens,
+                block_tables,
+                seq_lens,
+                k_cache,
+                v_cache,
+                conv_state,
+                recurrent_state,
+            ):
+                step_batch = ScheduledBatch(
+                    tokens=tokens,
+                    positions=positions,
+                    seq_ids=seq_ids,
+                    query_start_loc=query_start_loc,
+                    is_prefill=is_prefill,
+                    num_prefill_tokens=num_prefill_tokens,
+                    num_decode_tokens=num_decode_tokens,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                )
+                attention_metadata = self.backend.build_attention_metadata(
+                    positions=step_batch.positions,
+                    block_tables=step_batch.block_tables,
+                    seq_lens=step_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=step_batch.is_prefill,
+                    query_start_loc=step_batch.query_start_loc,
+                    num_prefill_tokens=step_batch.num_prefill_tokens,
+                    num_decode_tokens=step_batch.num_decode_tokens,
+                )
+                kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=step_batch.block_tables,
+                    kv_lens=step_batch.seq_lens,
+                    slot_mapping=attention_metadata.slot_mapping,
+                )
+                hidden, updated_kv_state, updated_hybrid_state = model_forward_step(
+                    step_batch.tokens,
+                    params,
+                    self.config,
+                    positions=step_batch.positions,
+                    kv_cache_state=kv_state,
+                    attention_metadata=attention_metadata,
+                    hybrid_state=HybridLayerState(conv_state, recurrent_state),
+                    is_prefill=step_batch.is_prefill,
+                    return_hidden=True,
+                    return_hidden_with_logits=False,
+                    last_logits_only=False,
+                    backend=self.backend,
+                )
+                gather_positions = self._logit_positions(step_batch)
+                gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
+                gather_idx = gather_idx[:, None, None]
+                gather_idx = jnp.broadcast_to(gather_idx, (hidden.shape[0], 1, hidden.shape[-1]))
+                last_hidden = jnp.take_along_axis(hidden, gather_idx, axis=1)
+                token_ids, _, _ = lm_head_token_ids_and_topk(
+                    last_hidden,
+                    params,
+                    self.config,
+                    hidden_is_normed=False,
+                    is_prefill=step_batch.is_prefill,
+                    top_k=0,
+                )
+                return (
+                    token_ids[:, 0].astype(jnp.int32),
+                    updated_kv_state.k_cache,
+                    updated_kv_state.v_cache,
+                    updated_hybrid_state.conv_state,
+                    updated_hybrid_state.recurrent_state,
+                )
+
+            self._jit_cache[key] = jax.jit(
+                compiled,
+                donate_argnums=(9, 10),
+            )
+
+        token_ids, k_cache, v_cache, conv_state, recurrent_state = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self.params,
+                batch.tokens,
+                batch.positions,
+                batch.seq_ids,
+                batch.query_start_loc,
+                jnp.asarray(batch.num_prefill_tokens, dtype=jnp.int32),
+                jnp.asarray(batch.num_decode_tokens, dtype=jnp.int32),
+                batch.block_tables,
+                batch.seq_lens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state.conv_state,
+                hybrid_state.recurrent_state,
+            ),
+            f"forward_step_token_ids_jit:{'prefill' if batch.is_prefill else 'decode'}",
+        )
+        return ExecutorOutput(
+            activations=token_ids,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            attention_metadata=None,
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+        )
+
     def mtp1_greedy_step_jit(
         self,
         batch: ScheduledBatch,

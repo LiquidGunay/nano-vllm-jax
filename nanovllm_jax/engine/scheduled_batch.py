@@ -26,6 +26,9 @@ class ScheduledBatch:
     block_tables: jnp.ndarray
     seq_lens: jnp.ndarray
     prefill_is_final: list[bool] | tuple[bool, ...] | None = None
+    seq_ids_host: tuple[int, ...] | None = None
+    query_lens_host: tuple[int, ...] | None = None
+    hybrid_slot_ids_host: tuple[int, ...] | None = None
 
     @property
     def batch_size(self) -> int:

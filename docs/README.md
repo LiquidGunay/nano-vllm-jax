@@ -10,6 +10,7 @@ Start here for current documentation. Archived notes may be useful for history, 
 - [MTP](mtp.md): historical TPU K=1 terminology and invariants, with current GPU caveats.
 - [Scheduler](scheduler.md): prefill chunks, decode buckets, inactive rows, preemption, MTP lookahead.
 - [Benchmarks](benchmarks.md): GPU benchmark rules, warmup, server-shape recipe, current GPU caveats, and historical TPU table.
+- [Optimization logbook](optimization_logbook.md): profile-linked optimization runs and decisions.
 - [Roadmap](roadmap.md): pending correctness, serving, benchmark, optimization, and cleanup work.
 
 ## Current GPU findings

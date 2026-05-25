@@ -269,7 +269,86 @@ def test_scheduler_pads_scheduled_batch_to_static_buckets():
     assert batch.block_tables.shape == (4, 4)
     np.testing.assert_array_equal(np.array(batch.query_start_loc), np.array([0, 3, 4, 4, 4]))
     np.testing.assert_array_equal(np.array(batch.seq_ids), np.array([7, 8, -1, -1]))
+    assert batch.seq_ids_host == (7, 8, -1, -1)
+    assert batch.query_lens_host == (3, 1, 0, 0)
     assert batch.num_prefill_tokens == 4
+
+
+def _hybrid_state_runner_with_two_slots() -> ModelRunner:
+    runner = ModelRunner.__new__(ModelRunner)
+    runner._max_hybrid_slots = 2
+    runner._hybrid_slots = {0: 0, 1: 1}
+    runner._free_hybrid_slots = []
+    runner._hybrid_state_table = HybridLayerState(
+        conv_state=jnp.arange(24, dtype=jnp.float32).reshape(2, 1, 3, 4),
+        recurrent_state=jnp.arange(12, dtype=jnp.float32).reshape(2, 1, 1, 2, 3),
+    )
+    return runner
+
+
+def _hybrid_state_batch(seq_ids, query_lens) -> ScheduledBatch:
+    query_start_loc = [0]
+    for query_len in query_lens:
+        query_start_loc.append(query_start_loc[-1] + query_len)
+    return ScheduledBatch(
+        tokens=jnp.zeros((len(seq_ids), 1), dtype=jnp.int32),
+        positions=jnp.zeros((len(seq_ids), 1), dtype=jnp.int32),
+        seq_ids=jnp.array(seq_ids, dtype=jnp.int32),
+        query_start_loc=jnp.array(query_start_loc, dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=sum(1 for seq_id, query_len in zip(seq_ids, query_lens) if seq_id >= 0 and query_len > 0),
+        block_tables=jnp.zeros((len(seq_ids), 1), dtype=jnp.int32),
+        seq_lens=jnp.array([1 if seq_id >= 0 else 0 for seq_id in seq_ids], dtype=jnp.int32),
+        seq_ids_host=tuple(seq_ids),
+        query_lens_host=tuple(query_lens),
+    )
+
+
+def test_model_runner_hybrid_state_uses_full_table_fast_path():
+    runner = _hybrid_state_runner_with_two_slots()
+    batch = _hybrid_state_batch([0, 1], [1, 1])
+
+    batched_state = runner._batch_hybrid_state(batch)
+
+    assert batched_state is runner._hybrid_state_table
+    assert batch.hybrid_slot_ids_host == (0, 1)
+
+    new_state = HybridLayerState(
+        conv_state=jnp.full_like(runner._hybrid_state_table.conv_state, 10.0),
+        recurrent_state=jnp.full_like(runner._hybrid_state_table.recurrent_state, 20.0),
+    )
+    runner._store_batch_hybrid_state(batch, new_state)
+
+    assert runner._hybrid_state_table is new_state
+
+
+def test_model_runner_hybrid_state_does_not_replace_full_table_with_inactive_rows():
+    runner = _hybrid_state_runner_with_two_slots()
+    original_state = runner._hybrid_state_table
+    batch = _hybrid_state_batch([0, -1], [1, 0])
+
+    batched_state = runner._batch_hybrid_state(batch)
+
+    assert batched_state is not runner._hybrid_state_table
+    assert batch.hybrid_slot_ids_host == (0, -1)
+    np.testing.assert_array_equal(np.array(batched_state.conv_state[1]), np.zeros((1, 3, 4), dtype=np.float32))
+    np.testing.assert_array_equal(np.array(batched_state.recurrent_state[1]), np.zeros((1, 1, 2, 3), dtype=np.float32))
+
+    new_state = HybridLayerState(
+        conv_state=jnp.full_like(original_state.conv_state, 10.0),
+        recurrent_state=jnp.full_like(original_state.recurrent_state, 20.0),
+    )
+    runner._store_batch_hybrid_state(batch, new_state)
+
+    assert runner._hybrid_state_table is not new_state
+    np.testing.assert_array_equal(np.array(runner._hybrid_state_table.conv_state[0]), np.array(new_state.conv_state[0]))
+    np.testing.assert_array_equal(np.array(runner._hybrid_state_table.recurrent_state[0]), np.array(new_state.recurrent_state[0]))
+    np.testing.assert_array_equal(np.array(runner._hybrid_state_table.conv_state[1]), np.array(original_state.conv_state[1]))
+    np.testing.assert_array_equal(
+        np.array(runner._hybrid_state_table.recurrent_state[1]),
+        np.array(original_state.recurrent_state[1]),
+    )
 
 
 def test_mtp_admission_gate_tracks_logical_decode_rows(monkeypatch):
