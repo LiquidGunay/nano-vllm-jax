@@ -1,5 +1,6 @@
 """Load pretrained weights from HuggingFace and compare logits."""
 
+import os
 import sys
 import time
 import json
@@ -12,6 +13,16 @@ import numpy as np
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.model import Qwen3_5, ModelParams
 from nanovllm_jax.mtp.mtp_layer import MTPParams
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "1" if default else "0")
+    return value in {"1", "true", "yes", "on", "True"}
+
+
+def _materialize_tied_lm_head_enabled() -> bool:
+    """Materialize tied embeddings as a separate [hidden, vocab] LM-head leaf."""
+    return _env_flag("NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD")
 
 
 def download_hf_weights(model_name: str, cache_dir: str = None):
@@ -192,7 +203,13 @@ def load_weights_from_hf_streaming(
             print(f"  converted layer {i}: {layer_type}")
 
     norm_weight = _to_jax_weight(reader, "norm.weight", config) if reader.has("norm.weight") else jnp.ones(config.hidden_size)
-    lm_head = _to_jax_weight(reader, "lm_head.weight", config, transpose=True) if reader.has("lm_head.weight") else None
+    if reader.has("lm_head.weight"):
+        lm_head = _to_jax_weight(reader, "lm_head.weight", config, transpose=True)
+    elif config.tie_word_embeddings and _materialize_tied_lm_head_enabled():
+        print("Materializing tied LM head as a separate [hidden, vocab] weight...")
+        lm_head = _to_jax_weight(reader, "embed_tokens.weight", config, transpose=True)
+    else:
+        lm_head = None
     mtp_params = _load_mtp_weights_from_reader(reader, config, embed_tokens, lm_head) if load_mtp else None
 
     print(f"✓ Loaded weights: {len(layers)} layers")
@@ -381,9 +398,9 @@ def convert_hf_to_jax(hf_weights: dict, config: Qwen3_5Config, verbose: bool = F
         lm_head = jnp.array(lm_head_val).T
     # Tie weights if no separate LM head
     elif config.tie_word_embeddings:
-        # Keep tied weights implicit. Materializing embed_tokens.T costs ~485 MiB
-        # for Qwen3.5-0.8B and is unnecessary because forward() handles None.
-        lm_head = None
+        # Keep tied weights implicit by default. Materializing embed_tokens.T costs
+        # about 485 MiB for Qwen3.5-0.8B, but can be profiled as an opt-in layout.
+        lm_head = jnp.array(embed_tokens.T, copy=True) if _materialize_tied_lm_head_enabled() else None
     
     return ModelParams(
         embed_tokens=embed_tokens,
