@@ -145,15 +145,28 @@ def _enable_compact_prefill_mlp() -> bool:
     }
 
 
-def _compact_prefill_tokenwise_dot(
+def _enable_compact_prefill_gdn_z() -> bool:
+    """Compact true prefill tokens for the GDN Z input projection."""
+    return os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z", "0") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "True",
+    }
+
+
+def _compact_prefill_dot_if_enabled(
     x: jnp.ndarray,
     weight: jnp.ndarray,
     valid_token_mask: Optional[jnp.ndarray],
     compact_num_tokens: Optional[int],
+    *,
+    enabled: bool,
 ) -> jnp.ndarray:
     """Run a tokenwise projection only on true ragged prefill tokens."""
     if (
-        not _enable_compact_prefill_in_proj_qkv()
+        not enabled
         or valid_token_mask is None
         or compact_num_tokens is None
         or x.ndim != 3
@@ -166,6 +179,22 @@ def _compact_prefill_tokenwise_dot(
     compact_out = jnp.dot(compact_x, weight)
     out = jnp.zeros((batch, seq_len, output_features), dtype=compact_out.dtype)
     return out.at[row_idx, col_idx, :].set(compact_out)
+
+
+def _compact_prefill_tokenwise_dot(
+    x: jnp.ndarray,
+    weight: jnp.ndarray,
+    valid_token_mask: Optional[jnp.ndarray],
+    compact_num_tokens: Optional[int],
+) -> jnp.ndarray:
+    """Run a tokenwise projection only on true ragged prefill tokens."""
+    return _compact_prefill_dot_if_enabled(
+        x,
+        weight,
+        valid_token_mask,
+        compact_num_tokens,
+        enabled=_enable_compact_prefill_in_proj_qkv(),
+    )
 
 
 def _compact_prefill_mlp(
@@ -769,7 +798,16 @@ def gated_deltanet_block(
         )
     else:
         mixed_qkv = _tokenwise_decode_dot(x_cast, params["in_proj_qkv"], force_width1=force_width1_dot)
-    z = _tokenwise_decode_dot(x_cast, params["in_proj_z"], force_width1=force_width1_dot).reshape(batch, seq_len, -1)
+    if is_prefill:
+        z = _compact_prefill_dot_if_enabled(
+            x_cast,
+            params["in_proj_z"],
+            valid_token_mask,
+            compact_prefill_tokens,
+            enabled=_enable_compact_prefill_gdn_z(),
+        ).reshape(batch, seq_len, -1)
+    else:
+        z = _tokenwise_decode_dot(x_cast, params["in_proj_z"], force_width1=force_width1_dot).reshape(batch, seq_len, -1)
     a = _tokenwise_decode_dot(
         x_cast,
         params["in_proj_a"],

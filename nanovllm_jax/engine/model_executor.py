@@ -26,6 +26,7 @@ _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
 def _needs_static_prefill_token_count() -> bool:
     return (
         os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", "0") in _TRUE_ENV_VALUES
+        or os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z", "0") in _TRUE_ENV_VALUES
         or os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_MLP", "0") in _TRUE_ENV_VALUES
     )
 

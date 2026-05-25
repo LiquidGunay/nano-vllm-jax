@@ -5,7 +5,12 @@ from jax import nn
 import jax.numpy as jnp
 
 from nanovllm_jax.layers import rms_norm
-from nanovllm_jax.model import ModelParams, _compact_prefill_mlp, lm_head_token_ids_and_topk
+from nanovllm_jax.model import (
+    ModelParams,
+    _compact_prefill_dot_if_enabled,
+    _compact_prefill_mlp,
+    lm_head_token_ids_and_topk,
+)
 
 
 def test_lm_head_token_ids_and_topk_matches_full_logits():
@@ -83,6 +88,33 @@ def test_compact_prefill_mlp_matches_dense_on_valid_tokens(monkeypatch):
         compact_num_tokens=4,
     )
     dense = jnp.dot(nn.silu(jnp.dot(x, gate_weight)) * jnp.dot(x, up_weight), down_weight)
+
+    compact_np = np.array(compact)
+    dense_np = np.array(dense)
+    valid_np = np.array(valid_mask)
+    np.testing.assert_allclose(compact_np[valid_np], dense_np[valid_np], rtol=0, atol=1e-6)
+    np.testing.assert_array_equal(compact_np[~valid_np], np.zeros_like(compact_np[~valid_np]))
+
+
+def test_compact_prefill_dot_matches_dense_on_valid_tokens():
+    x = jnp.array(
+        [
+            [[0.2, -0.4, 0.7], [1.1, 0.3, -0.2], [0.5, 0.6, -0.8]],
+            [[-0.5, 0.8, 0.4], [0.9, -0.6, 0.2], [0.3, 0.1, -0.7]],
+        ],
+        dtype=jnp.float32,
+    )
+    weight = jnp.linspace(-0.6, 0.9, 12, dtype=jnp.float32).reshape(3, 4)
+    valid_mask = jnp.array([[True, True, False], [True, False, False]])
+
+    compact = _compact_prefill_dot_if_enabled(
+        x,
+        weight,
+        valid_mask,
+        compact_num_tokens=3,
+        enabled=True,
+    )
+    dense = jnp.dot(x, weight)
 
     compact_np = np.array(compact)
     dense_np = np.array(dense)
