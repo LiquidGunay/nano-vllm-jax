@@ -134,6 +134,17 @@ def _enable_compact_prefill_in_proj_qkv() -> bool:
     }
 
 
+def _enable_compact_prefill_mlp() -> bool:
+    """Compact true prefill tokens for tokenwise MLP projections."""
+    return os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_MLP", "0") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "True",
+    }
+
+
 def _compact_prefill_tokenwise_dot(
     x: jnp.ndarray,
     weight: jnp.ndarray,
@@ -153,6 +164,36 @@ def _compact_prefill_tokenwise_dot(
     row_idx, col_idx = jnp.nonzero(valid_token_mask, size=int(compact_num_tokens))
     compact_x = x[row_idx, col_idx, :]
     compact_out = jnp.dot(compact_x, weight)
+    out = jnp.zeros((batch, seq_len, output_features), dtype=compact_out.dtype)
+    return out.at[row_idx, col_idx, :].set(compact_out)
+
+
+def _compact_prefill_mlp(
+    x: jnp.ndarray,
+    gate_weight: jnp.ndarray,
+    up_weight: jnp.ndarray,
+    down_weight: jnp.ndarray,
+    activation_fn,
+    valid_token_mask: Optional[jnp.ndarray],
+    compact_num_tokens: Optional[int],
+) -> jnp.ndarray:
+    """Run tokenwise prefill MLP only on true ragged tokens."""
+    if (
+        not _enable_compact_prefill_mlp()
+        or valid_token_mask is None
+        or compact_num_tokens is None
+        or x.ndim != 3
+    ):
+        gate = _tokenwise_decode_dot(x, gate_weight, force_width1=False)
+        up = _tokenwise_decode_dot(x, up_weight, force_width1=False)
+        return _tokenwise_decode_dot(activation_fn(gate) * up, down_weight, force_width1=False)
+    batch, seq_len, _ = x.shape
+    output_features = down_weight.shape[-1]
+    row_idx, col_idx = jnp.nonzero(valid_token_mask, size=int(compact_num_tokens))
+    compact_x = x[row_idx, col_idx, :]
+    gate = jnp.dot(compact_x, gate_weight)
+    up = jnp.dot(compact_x, up_weight)
+    compact_out = jnp.dot(activation_fn(gate) * up, down_weight)
     out = jnp.zeros((batch, seq_len, output_features), dtype=compact_out.dtype)
     return out.at[row_idx, col_idx, :].set(compact_out)
 
@@ -1503,10 +1544,22 @@ def transformer_block(
 
     # MLP computation (stays in bfloat16)
     force_width1_dot = (not is_prefill) and x.ndim == 3 and x.shape[1] > 1 and _force_width1_decode_math()
-    gate = _tokenwise_decode_dot(x, params["gate_proj"], force_width1=force_width1_dot)
-    up = _tokenwise_decode_dot(x, params["up_proj"], force_width1=force_width1_dot)
-    x = get_activation(config.hidden_act)(gate) * up
-    x = _tokenwise_decode_dot(x, params["down_proj"], force_width1=force_width1_dot)
+    activation_fn = get_activation(config.hidden_act)
+    if is_prefill:
+        x = _compact_prefill_mlp(
+            x,
+            params["gate_proj"],
+            params["up_proj"],
+            params["down_proj"],
+            activation_fn,
+            valid_token_mask,
+            compact_prefill_tokens,
+        )
+    else:
+        gate = _tokenwise_decode_dot(x, params["gate_proj"], force_width1=force_width1_dot)
+        up = _tokenwise_decode_dot(x, params["up_proj"], force_width1=force_width1_dot)
+        x = activation_fn(gate) * up
+        x = _tokenwise_decode_dot(x, params["down_proj"], force_width1=force_width1_dot)
     mlp_out = x
 
     x = residual + x

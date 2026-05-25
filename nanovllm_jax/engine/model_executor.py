@@ -20,6 +20,16 @@ from nanovllm_jax.model import ModelParams, forward_step as model_forward_step, 
 from nanovllm_jax.mtp.mtp_layer import mtp_forward
 
 
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
+
+
+def _needs_static_prefill_token_count() -> bool:
+    return (
+        os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", "0") in _TRUE_ENV_VALUES
+        or os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_MLP", "0") in _TRUE_ENV_VALUES
+    )
+
+
 @dataclass
 class ExecutorOutput:
     activations: object
@@ -379,7 +389,7 @@ class ModelExecutor:
             bool(last_logits_only),
             int(batch.num_prefill_tokens)
             if batch.is_prefill
-            and os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", "0") in {"1", "true", "yes", "on", "True"}
+            and _needs_static_prefill_token_count()
             else 0,
         )
         if key not in self._jit_cache:
@@ -387,7 +397,7 @@ class ModelExecutor:
             static_num_prefill_tokens = (
                 int(batch.num_prefill_tokens)
                 if is_prefill
-                and os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", "0") in {"1", "true", "yes", "on", "True"}
+                and _needs_static_prefill_token_count()
                 else None
             )
 
@@ -513,7 +523,7 @@ class ModelExecutor:
             bool(batch.is_prefill),
             int(batch.num_prefill_tokens)
             if batch.is_prefill
-            and os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", "0") in {"1", "true", "yes", "on", "True"}
+            and _needs_static_prefill_token_count()
             else 0,
         )
         if key not in self._jit_cache:
@@ -521,7 +531,7 @@ class ModelExecutor:
             static_num_prefill_tokens = (
                 int(batch.num_prefill_tokens)
                 if is_prefill
-                and os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", "0") in {"1", "true", "yes", "on", "True"}
+                and _needs_static_prefill_token_count()
                 else None
             )
 
