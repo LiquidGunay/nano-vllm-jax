@@ -1081,3 +1081,40 @@ Decision:
 - Reject adopting the exact `34`-block window as the target hetero8 setting. The lower TTFT and host readback do not compensate for worse compiled execution and ITL.
 - Keep Entry 029's `--max-blocks-per-seq 40` as the current benchmark baseline for this workload. Revisit block-table width only as part of a broader shape-bucketing/server policy experiment, not as the next model-side optimization.
 - The next meaningful model-side win still likely needs an Ampere-compatible fused compact projection path or a decode LM-head/top-1 kernel with stronger HLO/kernel evidence.
+
+## Entry 033 - Accepted XLA GPU Autotune Level 4 Default
+
+- run id: `20260525-232138-1984042-jax_hetero8_64_512x32_xla_autotune4_default`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_xla_autotune4_default.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-232138-1984042-jax_hetero8_64_512x32_xla_autotune4_default`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-232138-1984042-jax_hetero8_64_512x32_xla_autotune4_default/plugins/profile/2026_05_25_23_22_03/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-232138-1984042-jax_hetero8_64_512x32_xla_autotune4_default/plugins/profile/2026_05_25_23_22_03/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- supporting first run: `results/qwen08_jax_server_trace_hetero8_64_512x32_xla_autotune4.json`, profile `/mountpoint/.exp/profiles/20260525-231513-1980896-jax_hetero8_64_512x32_xla_autotune4`, `319.08 tok/s`, exact correctness.
+- supporting repeat run: `results/qwen08_jax_server_trace_hetero8_64_512x32_xla_autotune4_repeat.json`, profile `/mountpoint/.exp/profiles/20260525-231752-1982659-jax_hetero8_64_512x32_xla_autotune4_repeat`, `353.85 tok/s`, exact correctness.
+- subagent audit: Kuhn recommended returning to lower-level compact projection kernels after this configuration check. The audit identified pure-JAX compact projection spellings as mostly exhausted and suggested an Ampere-compatible fused gather/dot/scatter projection kernel as the next high-upside model-side experiment.
+- change accepted: centralize XLA flag setup in `runtime_paths.configure_xla_flags()` and make benchmark/server entry points default to `--xla_gpu_autotune_level=4` unless `XLA_FLAGS` is explicitly provided. The helper also supports `NANO_VLLM_JAX_XLA_GPU_AUTOTUNE_LEVEL` for overriding the default autotune level without replacing unrelated XLA flags.
+- correctness: exact generated-token match for all 8 rows against the hetero8 reference, with BF16 weights and FP32 activations. A first default verification with the wrong prompt-length order was discarded; the committed default artifact is the corrected `[64, 128, 192, 256, 320, 384, 448, 512]` run.
+- JAX timing: `355.29 tok/s`, TTFT p50 `315.89 ms`, ITL p50 `12.86 ms`, ITL p95 `13.79 ms`.
+- delta vs Entry 029 repeat: `1.443x` total tok/s, TTFT p50 `0.560x`, ITL p50 `0.842x`, ITL p95 `0.876x`.
+- delta vs vLLM async baseline (`864.18 tok/s`): JAX improved from `0.285x` vLLM in Entry 029 repeat to `0.411x` vLLM with autotune level 4.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 029 repeat ms | Entry 033 repeat ms | note |
+| --- | ---: | ---: | --- |
+| `PjRtCApiLoadedExecutable::Execute` | 240.53 over 252 calls | 189.51 over 252 calls | same dispatch count, less compiled execution |
+| `jit_compiled:XLA GPU module` | 196.07 | 145.62 | better GPU lowering after autotune |
+| `command_buffer::execute` | 144.17 over 1575 calls | 91.31 over 1575 calls | large device command-buffer reduction |
+| `gemm_fusion_dot_234` | 45.68 | 31.88 | materialized LM-head decode bucket improved |
+| `gemm_fusion_dot_286` | 43.79 | 25.06 | narrow decode GEMM bucket improved |
+| `gemm_fusion_dot_285` | 39.52 | 23.47 | narrow decode GEMM bucket improved |
+| `gemm_fusion_dot_general_746` | 40.99 | 13.92 | compact projection/general-dot bucket improved |
+| `input_reduce_fusion` | 41.48 | 41.57 | unchanged |
+| `MemcpyD2D` | 24.37 | 24.62 | unchanged |
+| `cutlass_80_tensorop_s1688gemm_128x128_16x5_nn_align4` | 0.00 | 52.40 over 96 calls | new autotuned CUTLASS kernel bucket |
+
+Decision:
+
+- Accept XLA GPU autotune level 4 as the repo default for GPU benchmark/server entry points. It is a configuration fix rather than a model-code optimization, but it unlocks a large measured improvement while preserving exact correctness.
+- Preserve explicit `XLA_FLAGS` when users set them. This keeps debugging and reproduction control intact, while making the default GPU path match the fastest verified setting.
+- Continue model-side speed work from this stronger baseline. The next candidate should be an opt-in Ampere-compatible fused compact prefill projection kernel; the remaining pure-JAX projection variants have either been accepted already or rejected with profile evidence.

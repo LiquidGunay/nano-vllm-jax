@@ -17,12 +17,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from benchmarks.benchmark_vllm_qwen35 import compare_reference, make_prompts
 from run_tracking import RunRecorder
-from runtime_paths import configure_compilation_cache
+from runtime_paths import configure_compilation_cache, configure_xla_flags
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
-os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+configure_xla_flags()
 configure_compilation_cache()
 
 

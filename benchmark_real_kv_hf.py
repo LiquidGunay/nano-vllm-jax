@@ -16,12 +16,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from runtime_paths import configure_compilation_cache
+from runtime_paths import configure_compilation_cache, configure_xla_flags
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
-os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+configure_xla_flags()
 configure_compilation_cache()
 _platform = os.getenv("NANO_VLLM_JAX_JAX_PLATFORMS") or os.getenv("NANO_VLLM_JAX_PLATFORMS")
 if _platform:

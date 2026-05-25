@@ -52,7 +52,7 @@ export NANO_VLLM_JAX_COMPILE_CACHE_DIR=/mountpoint/.exp/.cache/jax
 export JAX_PLATFORMS=cuda
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export TF_GPU_ALLOCATOR=cuda_malloc_async
-export XLA_FLAGS=--xla_gpu_autotune_level=0
+export XLA_FLAGS=--xla_gpu_autotune_level=4
 ```
 
 Profiler and journal output should stay under the same root:

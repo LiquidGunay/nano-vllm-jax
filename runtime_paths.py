@@ -29,3 +29,14 @@ def configure_compilation_cache() -> str:
     os.environ.setdefault("NANO_VLLM_JAX_COMPILE_CACHE_DIR", str(cache_dir))
     os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", str(cache_dir))
     return str(cache_dir)
+
+
+def configure_xla_flags(default_gpu_autotune_level: int = 4) -> str:
+    """Set GPU-oriented XLA defaults while preserving explicit user flags."""
+    if "XLA_FLAGS" not in os.environ:
+        autotune_level = os.getenv(
+            "NANO_VLLM_JAX_XLA_GPU_AUTOTUNE_LEVEL",
+            str(default_gpu_autotune_level),
+        )
+        os.environ["XLA_FLAGS"] = f"--xla_gpu_autotune_level={autotune_level}"
+    return os.environ["XLA_FLAGS"]
