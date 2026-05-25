@@ -153,7 +153,10 @@ class LLMEngine:
         # Post-process
         prefill_chunk_lengths: list[int] | None = None
         if scheduled_batch.is_prefill:
-            prefill_chunk_lengths = [int(x) for x in scheduled_batch.query_lens.tolist()[:len(seqs)]]
+            if scheduled_batch.query_lens_host is not None:
+                prefill_chunk_lengths = [int(x) for x in scheduled_batch.query_lens_host[:len(seqs)]]
+            else:
+                prefill_chunk_lengths = [int(x) for x in scheduled_batch.query_lens.tolist()[:len(seqs)]]
         finished_flags = self.scheduler.postprocess(seqs, token_ids, prefill_chunk_lengths=prefill_chunk_lengths)
         finished_seq_ids = [seq.seq_id for seq, is_finished in zip(seqs, finished_flags) if is_finished]
         if finished_seq_ids:

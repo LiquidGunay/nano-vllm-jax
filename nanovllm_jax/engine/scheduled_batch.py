@@ -28,6 +28,7 @@ class ScheduledBatch:
     prefill_is_final: list[bool] | tuple[bool, ...] | None = None
     seq_ids_host: tuple[int, ...] | None = None
     query_lens_host: tuple[int, ...] | None = None
+    seq_lens_host: tuple[int, ...] | None = None
     hybrid_slot_ids_host: tuple[int, ...] | None = None
 
     @property

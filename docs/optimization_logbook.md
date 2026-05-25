@@ -403,3 +403,68 @@ Decision:
 
 - Keep the chunked cached GDN prefill fix as the default. It is correctness-clean on the real-weight hetero8 reference and directly attacks the largest model-side prefill bottleneck.
 - The next profile-backed target should be post-model host/token materialization (`np.asarray`, `tolist`) and then decode kernels. Scheduler changes remain lower priority unless they reduce that new host overhead without harming the paged/ragged contract.
+
+## Entry 014 - Host Batch Contract Validation
+
+- run id: `20260525-195424-1889297-jax_hetero8_64_512x32_host_validation_fastpath`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_host_validation_fastpath.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-195424-1889297-jax_hetero8_64_512x32_host_validation_fastpath`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-195424-1889297-jax_hetero8_64_512x32_host_validation_fastpath/plugins/profile/2026_05_25_19_54_50/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-195424-1889297-jax_hetero8_64_512x32_host_validation_fastpath/plugins/profile/2026_05_25_19_54_50/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change: scheduled batches now carry host-side `seq_lens` in addition to host `seq_ids` and query lengths. `ModelExecutor` validates the batch contract from host metadata when all three are available, and postprocess prefill chunk lengths use host query lengths.
+- correctness: full generated-token match against Entry 001 for all 8 rows; focused CUDA backend-boundary and GDN tests passed.
+- JAX timing: `191.48 tok/s`, TTFT p50 `734.82 ms`, ITL p50 `19.35 ms`, ITL p95 `22.57 ms`
+- delta vs Entry 013: `1.061x` total tok/s
+- gap vs vLLM Entry 001 comparison: JAX is now `0.222x` of vLLM total tokens/sec on this shape.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 013 ms | Entry 014 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1418.76 | 1336.97 | end-to-end improvement |
+| `_run_main_and_sample` | 1287.47 | 1198.97 | main runner hot path |
+| `forward_step_token_ids_jit` | 427.58 | 343.47 | compiled step measured lower in this run |
+| `_validate_batch_contract` | 94.83 | 2.48 | host fast path avoids JAX array reductions |
+| `_validate_batch_contract_host` | 0.00 | 1.06 | replacement validation work |
+| `_refresh_kv_snapshot` | 120.37 | 121.50 | unchanged and still visible |
+| `compute_slot_mapping` | 118.83 | 120.00 | unchanged and still visible |
+| `np.asarray(jax.Array)` / `tolist` | 728.50 / 696.31 | 689.19 / 689.58 | host token materialization remains the main visible host bucket |
+
+Decision:
+
+- Keep the host validation path. It preserves the same scheduler contract for scheduled batches built by this repo and removes a device-sync validation cost that became visible after chunked GDN prefill.
+- The next target remains legacy KV snapshot refresh, because it still rebuilds attention metadata every step even though the serving path already executes from `cache_storage` plus per-step scheduled metadata.
+
+## Entry 015 - Snapshot-Only Normal Greedy Path
+
+- run id: `20260525-200042-1891179-jax_hetero8_64_512x32_host_validation_record_snapshot_v2`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_host_validation_record_snapshot_v2.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-200042-1891179-jax_hetero8_64_512x32_host_validation_record_snapshot_v2`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-200042-1891179-jax_hetero8_64_512x32_host_validation_record_snapshot_v2/plugins/profile/2026_05_25_20_01_04/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-200042-1891179-jax_hetero8_64_512x32_host_validation_record_snapshot_v2/plugins/profile/2026_05_25_20_01_04/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change: normal greedy `_run_main_and_sample` now updates the legacy KV snapshot with `_record_kv_snapshot` by default instead of rebuilding attention metadata through `_refresh_kv_snapshot`. `NANO_VLLM_JAX_REFRESH_KV_SNAPSHOT=1` restores the full refresh path for debugging/introspection.
+- correctness: full generated-token match against Entry 001 for all 8 rows; focused CUDA backend-boundary and GDN tests passed.
+- JAX timing: `196.30 tok/s`, TTFT p50 `738.36 ms`, ITL p50 `17.95 ms`, ITL p95 `19.51 ms`
+- delta vs Entry 014: `1.025x` total tok/s
+- delta vs Entry 013: `1.088x` total tok/s
+- gap vs vLLM Entry 001 comparison: JAX is now `0.227x` of vLLM total tokens/sec on this shape.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 014 ms | Entry 015 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1336.97 | 1304.10 | end-to-end improvement |
+| `_run_main_and_sample` | 1198.97 | 1182.58 | main runner hot path |
+| `forward_step_token_ids_jit` | 343.47 | 322.73 | slightly lower in this run |
+| `_validate_batch_contract` | 2.48 | 2.00 | host validation retained |
+| `_refresh_kv_snapshot` | 121.50 | 0.00 | removed from normal greedy hot path |
+| `_record_kv_snapshot` | 0.00 | 0.49 | cheap replacement snapshot update |
+| `compute_slot_mapping` | 120.00 | 0.00 | removed from snapshot path |
+| `PjRtCApiLoadedExecutable::Execute` | 378.37 | 310.72 | fewer snapshot-related JAX executions |
+| `MemcpyD2D` | 36.95 | 33.71 | small reduction |
+| `np.asarray(jax.Array)` / `tolist` | 689.19 / 689.58 | 813.40 / 813.72 | still the largest visible host-sync bucket |
+
+Decision:
+
+- Keep snapshot-only updates for the normal greedy path with the refresh fallback env var. On the post-Entry013 codebase it is correctness-clean and improves throughput, unlike the earlier pre-GDN Entry 007 experiment.
+- The next high-confidence profile target is token readback/materialization (`output.activations[:len(seqs)]`, `tolist`, and related `np.asarray` ranges). After that, revisit decode kernels with HLO/kernel evidence rather than wider Python/JAX metadata tensors.

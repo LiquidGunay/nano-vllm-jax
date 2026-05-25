@@ -169,6 +169,14 @@ class ModelExecutor:
         if batch.query_start_loc.shape[0] != batch.tokens.shape[0] + 1:
             raise ValueError("Scheduled batch query_start_loc size must be batch_size + 1")
 
+        if (
+            batch.query_lens_host is not None
+            and batch.seq_ids_host is not None
+            and batch.seq_lens_host is not None
+        ):
+            self._validate_batch_contract_host(batch)
+            return
+
         query_lens = jnp.diff(batch.query_start_loc).astype(jnp.int32)
         if bool(jnp.any(query_lens < 0)):
             raise ValueError("Scheduled batch query lengths must be non-negative")
@@ -188,6 +196,40 @@ class ModelExecutor:
             if bool(jnp.any(active_rows != real_rows)):
                 raise ValueError("Decode rows must use seq_id=-1 exactly when query_len is 0")
             if bool(jnp.any(jnp.where(active_rows, batch.seq_lens < 1, batch.seq_lens != 0))):
+                raise ValueError("Decode inactive rows must have seq_len=0 and active rows must have seq_len>=1")
+
+    @staticmethod
+    def _validate_batch_contract_host(batch: ScheduledBatch):
+        query_lens = tuple(int(x) for x in batch.query_lens_host or ())
+        seq_ids = tuple(int(x) for x in batch.seq_ids_host or ())
+        seq_lens = tuple(int(x) for x in batch.seq_lens_host or ())
+        batch_size = int(batch.tokens.shape[0])
+        if len(query_lens) != batch_size:
+            raise ValueError("Scheduled batch host query_lens size must match batch size")
+        if len(seq_ids) != batch_size:
+            raise ValueError("Scheduled batch host seq_ids size must match batch size")
+        if len(seq_lens) != batch_size:
+            raise ValueError("Scheduled batch host seq_lens size must match batch size")
+        if any(query_len < 0 for query_len in query_lens):
+            raise ValueError("Scheduled batch query lengths must be non-negative")
+        if batch.is_prefill:
+            if sum(query_lens) != int(batch.num_prefill_tokens):
+                raise ValueError("Prefill num_prefill_tokens must match query lens sum")
+            return
+
+        if batch.positions.shape[1] < 1:
+            raise ValueError("Decode batches must have at least one query token")
+        if max(query_lens, default=0) > batch.positions.shape[1]:
+            raise ValueError("Decode query_lens must fit within the token width")
+        expected_decode = sum(query_lens)
+        if int(batch.num_decode_tokens) != expected_decode:
+            raise ValueError("Decode num_decode_tokens must match query lens sum")
+        for seq_id, query_len, seq_len in zip(seq_ids, query_lens, seq_lens):
+            active = query_len > 0
+            real = seq_id >= 0
+            if active != real:
+                raise ValueError("Decode rows must use seq_id=-1 exactly when query_len is 0")
+            if (active and seq_len < 1) or ((not active) and seq_len != 0):
                 raise ValueError("Decode inactive rows must have seq_len=0 and active rows must have seq_len>=1")
 
     def _jit_metric(self, key: tuple) -> dict:

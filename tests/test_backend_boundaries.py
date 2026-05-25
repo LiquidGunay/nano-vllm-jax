@@ -271,6 +271,7 @@ def test_scheduler_pads_scheduled_batch_to_static_buckets():
     np.testing.assert_array_equal(np.array(batch.seq_ids), np.array([7, 8, -1, -1]))
     assert batch.seq_ids_host == (7, 8, -1, -1)
     assert batch.query_lens_host == (3, 1, 0, 0)
+    assert batch.seq_lens_host == (3, 1, 0, 0)
     assert batch.num_prefill_tokens == 4
 
 
@@ -302,6 +303,7 @@ def _hybrid_state_batch(seq_ids, query_lens) -> ScheduledBatch:
         seq_lens=jnp.array([1 if seq_id >= 0 else 0 for seq_id in seq_ids], dtype=jnp.int32),
         seq_ids_host=tuple(seq_ids),
         query_lens_host=tuple(query_lens),
+        seq_lens_host=tuple(1 if seq_id >= 0 else 0 for seq_id in seq_ids),
     )
 
 

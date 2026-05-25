@@ -354,6 +354,7 @@ class Scheduler:
 
         seq_ids_host = tuple([seq.seq_id for seq in seqs] + [-1] * (batch_size_bucket - len(seqs)))
         query_lens_host = tuple(query_lens)
+        seq_lens_host = tuple(seq_lens)
         return ScheduledBatch(
             tokens=jnp.array(padded_tokens, dtype=jnp.int32),
             positions=jnp.array(padded_positions, dtype=jnp.int32),
@@ -367,6 +368,7 @@ class Scheduler:
             prefill_is_final=prefill_is_final if is_prefill else None,
             seq_ids_host=seq_ids_host,
             query_lens_host=query_lens_host,
+            seq_lens_host=seq_lens_host,
         )
 
     @staticmethod

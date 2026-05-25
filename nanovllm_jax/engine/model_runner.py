@@ -1503,7 +1503,7 @@ class CanonicalModelRunner:
         The canonical serving path uses ``cache_storage`` plus scheduled
         per-step metadata, not ``self.kv_state``, for execution. This snapshot is
         kept for compatibility/introspection only; rebuilding slot metadata here
-        is avoidable hot-path work for speculative decode.
+        is avoidable hot-path work for generation.
         """
         if hybrid_state is None:
             hybrid_state = self._batch_hybrid_state(batch)
@@ -1806,7 +1806,10 @@ class CanonicalModelRunner:
             )
         self.cache_storage = output.cache_storage
         self._store_batch_hybrid_state(batch, output.hybrid_state)
-        self._refresh_kv_snapshot(batch, output.hybrid_state)
+        if os.environ.get("NANO_VLLM_JAX_REFRESH_KV_SNAPSHOT", "0") in {"1", "true", "yes", "on", "True"}:
+            self._refresh_kv_snapshot(batch, output.hybrid_state)
+        else:
+            self._record_kv_snapshot(batch, output.hybrid_state)
 
         last_hidden = None
         seed_hidden = None
