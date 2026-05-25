@@ -279,3 +279,64 @@ Decision:
 
 - Keep lazy release zeroing. It is correctness-clean, removes redundant end-of-request device work, and gives a small but measurable throughput win.
 - The next meaningful speed work should move below Python runner bookkeeping: inspect compiled full-attention/GDN HLO and consider optional lowered decode attention or GDN kernels rather than wider metadata precomputation.
+
+## Entry 010 - Rejected Prefill Shape Guard
+
+- run id: `20260525-191103-1870680-jax_hetero8_64_512x32_prefill_shape_guard`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_prefill_shape_guard.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-191103-1870680-jax_hetero8_64_512x32_prefill_shape_guard`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-191103-1870680-jax_hetero8_64_512x32_prefill_shape_guard/plugins/profile/2026_05_25_19_13_24/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-191103-1870680-jax_hetero8_64_512x32_prefill_shape_guard/plugins/profile/2026_05_25_19_13_24/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: scheduler split heterogeneous prefill waves before admitting a prompt that would force both a larger batch-size bucket and a larger query-length bucket.
+- status: rejected and reverted from the working tree.
+- correctness: full generated-token match against Entry 001 for all 8 rows.
+- JAX timing: `103.71 tok/s`, TTFT p50 `633.37 ms`, ITL p50 `33.29 ms`, ITL p95 `39.60 ms`
+- delta vs Entry 009: `0.768x` total tok/s, despite much better median TTFT.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 009 ms | Entry 010 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1896.26 | 2468.38 | throughput regression from more waves |
+| `_run_main_and_sample` | 1769.72 | 2028.63 | fewer steps, but much more runner state movement |
+| `forward_step_token_ids_jit` | 1359.84 | 1305.27 | compiled model work fell slightly |
+| `_batch_hybrid_state` | 40.47 | 325.45 | splitting waves defeated the full-table fast path |
+| `_store_batch_hybrid_state` | 0.68 | 238.17 | hybrid-state scatter returned |
+| `PjRtCApiLoadedExecutable::Execute` | 1330.04 | 1440.88 | more compiled dispatch cost overall |
+| `MemcpyD2D` | 673.14 | 287.29 | lower copy bucket did not pay for runner and dispatch overhead |
+
+Decision:
+
+- Do not keep the prefill shape guard as a throughput default. It is useful evidence that smaller prefill waves can reduce TTFT, but it costs too much total decode throughput on the long heterogeneous batch.
+- If we expose TTFT-oriented scheduling later, make it a separate policy knob and benchmark it against latency SLOs, not the default throughput path.
+- For the current objective, keep the rectangular prefill and focus on lower-level compiled kernels or state movement that does not break row-local hybrid slots.
+
+## Entry 011 - Rejected Full-Active Decode KV Write
+
+- run id: `20260525-192029-1873379-jax_hetero8_64_512x32_full_decode_kv_write`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_full_decode_kv_write.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-192029-1873379-jax_hetero8_64_512x32_full_decode_kv_write`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-192029-1873379-jax_hetero8_64_512x32_full_decode_kv_write/plugins/profile/2026_05_25_19_21_05/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-192029-1873379-jax_hetero8_64_512x32_full_decode_kv_write/plugins/profile/2026_05_25_19_21_05/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: `AttentionMetadata` carried a static `all_slots_valid` flag for full-active decode batches, allowing `write_kv` to call `update_kv_cache(..., valid_mask=None)` and skip the sentinel-concat padding path.
+- status: rejected and reverted from the working tree.
+- correctness: full generated-token match against Entry 001 for all 8 rows; focused CUDA tests passed before the revert.
+- JAX timing: `134.19 tok/s`, TTFT p50 `1222.51 ms`, ITL p50 `21.80 ms`, ITL p95 `24.12 ms`
+- delta vs Entry 009: `0.994x` total tok/s, so the change was slightly slower end to end.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 009 ms | Entry 011 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 1896.26 | 1907.68 | slight regression |
+| `_run_main_and_sample` | 1769.72 | 1775.99 | slight regression |
+| `forward_step_token_ids_jit` | 1359.84 | 1374.04 | compiled step regressed |
+| `PjRtCApiLoadedExecutable::Execute` | 1330.04 | 1347.33 | compiled execution increased |
+| `command_buffer::update` | 31.69 | 36.14 | target bucket regressed |
+| `wrapped_concatenate` | 38.69 | 38.84 | effectively unchanged |
+| `MemcpyD2D` | 673.14 | 668.77 | small copy-bucket improvement did not pay for execution overhead |
+
+Decision:
+
+- Do not keep the full-active decode KV write specialization. Removing the sentinel-concat source branch did not translate into a better lowered plan on this profile.
+- The failed result is still useful: the dominant pure-JAX decode cost is not this padding mask construction. Continue below this level with decode attention/GDN lowering or broader compiled-step fusion evidence.

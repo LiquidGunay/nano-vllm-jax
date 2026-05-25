@@ -173,7 +173,7 @@ class Scheduler:
                         scheduled_running.append(seq)
                     break
                 chunk_len = min(chunk_len, available)
-            
+
             # Check constraints
             if from_waiting:
                 if not self.block_manager.can_allocate(
