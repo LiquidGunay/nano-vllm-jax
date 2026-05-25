@@ -123,6 +123,40 @@ def _enable_chunked_gdn_prefill() -> bool:
     }
 
 
+def _enable_compact_prefill_in_proj_qkv() -> bool:
+    """Compact true prefill tokens for the GDN QKV input projection."""
+    return os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", "0") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "True",
+    }
+
+
+def _compact_prefill_tokenwise_dot(
+    x: jnp.ndarray,
+    weight: jnp.ndarray,
+    valid_token_mask: Optional[jnp.ndarray],
+    compact_num_tokens: Optional[int],
+) -> jnp.ndarray:
+    """Run a tokenwise projection only on true ragged prefill tokens."""
+    if (
+        not _enable_compact_prefill_in_proj_qkv()
+        or valid_token_mask is None
+        or compact_num_tokens is None
+        or x.ndim != 3
+    ):
+        return jnp.dot(x, weight)
+    batch, seq_len, _ = x.shape
+    output_features = weight.shape[-1]
+    row_idx, col_idx = jnp.nonzero(valid_token_mask, size=int(compact_num_tokens))
+    compact_x = x[row_idx, col_idx, :]
+    compact_out = jnp.dot(compact_x, weight)
+    out = jnp.zeros((batch, seq_len, output_features), dtype=compact_out.dtype)
+    return out.at[row_idx, col_idx, :].set(compact_out)
+
+
 def lm_head_token_ids_and_topk(
     hidden: jnp.ndarray,
     params: ModelParams,
@@ -627,6 +661,7 @@ def gated_deltanet_block(
     is_prefill: bool = True,
     hybrid_state: Optional[HybridLayerState] = None,
     valid_token_mask: Optional[jnp.ndarray] = None,
+    compact_prefill_tokens: Optional[int] = None,
     backend: Optional[InferenceBackend] = None,
     return_prefix_state: bool = False,
     return_first_prefix_state: bool = False,
@@ -684,7 +719,15 @@ def gated_deltanet_block(
     
     # === PROJECTIONS (same for both modes) ===
     force_width1_dot = (not is_prefill) and seq_len > 1 and _force_width1_decode_math()
-    mixed_qkv = _tokenwise_decode_dot(x_cast, params["in_proj_qkv"], force_width1=force_width1_dot)
+    if is_prefill:
+        mixed_qkv = _compact_prefill_tokenwise_dot(
+            x_cast,
+            params["in_proj_qkv"],
+            valid_token_mask,
+            compact_prefill_tokens,
+        )
+    else:
+        mixed_qkv = _tokenwise_decode_dot(x_cast, params["in_proj_qkv"], force_width1=force_width1_dot)
     z = _tokenwise_decode_dot(x_cast, params["in_proj_z"], force_width1=force_width1_dot).reshape(batch, seq_len, -1)
     a = _tokenwise_decode_dot(
         x_cast,
@@ -1338,6 +1381,15 @@ def transformer_block(
     if attention_metadata is not None:
         query_lens = jnp.diff(attention_metadata.query_start_loc).astype(jnp.int32)
         valid_token_mask = jnp.arange(x.shape[1], dtype=jnp.int32)[None, :] < query_lens[:, None]
+    compact_prefill_tokens = (
+        int(attention_metadata.num_prefill_tokens)
+        if (
+            is_prefill
+            and attention_metadata is not None
+            and isinstance(attention_metadata.num_prefill_tokens, int)
+        )
+        else None
+    )
 
     # Apply attention/linear_attn
     layer_prewrite_k = jnp.zeros(
@@ -1386,6 +1438,7 @@ def transformer_block(
             is_prefill=is_prefill,
             hybrid_state=hybrid_state,
             valid_token_mask=valid_token_mask,
+            compact_prefill_tokens=compact_prefill_tokens,
             backend=backend,
             return_prefix_state=return_prefix_hybrid,
             return_first_prefix_state=return_first_prefix_hybrid,

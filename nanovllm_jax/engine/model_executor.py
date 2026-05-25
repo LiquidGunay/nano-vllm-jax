@@ -377,9 +377,19 @@ class ModelExecutor:
             bool(return_hidden),
             bool(return_hidden_with_logits),
             bool(last_logits_only),
+            int(batch.num_prefill_tokens)
+            if batch.is_prefill
+            and os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", "0") in {"1", "true", "yes", "on", "True"}
+            else 0,
         )
         if key not in self._jit_cache:
             is_prefill = bool(batch.is_prefill)
+            static_num_prefill_tokens = (
+                int(batch.num_prefill_tokens)
+                if is_prefill
+                and os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", "0") in {"1", "true", "yes", "on", "True"}
+                else None
+            )
 
             def compiled(
                 params_leaves,
@@ -395,13 +405,14 @@ class ModelExecutor:
             ):
                 params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
                 num_query_tokens = query_start_loc[-1].astype(jnp.int32)
+                num_prefill_tokens = static_num_prefill_tokens if static_num_prefill_tokens is not None else num_query_tokens
                 step_batch = ScheduledBatch(
                     tokens=tokens,
                     positions=positions,
                     seq_ids=jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
                     query_start_loc=query_start_loc,
                     is_prefill=is_prefill,
-                    num_prefill_tokens=num_query_tokens if is_prefill else 0,
+                    num_prefill_tokens=num_prefill_tokens if is_prefill else 0,
                     num_decode_tokens=0 if is_prefill else num_query_tokens,
                     block_tables=block_tables,
                     seq_lens=seq_lens,
@@ -500,9 +511,19 @@ class ModelExecutor:
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(batch.is_prefill),
+            int(batch.num_prefill_tokens)
+            if batch.is_prefill
+            and os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", "0") in {"1", "true", "yes", "on", "True"}
+            else 0,
         )
         if key not in self._jit_cache:
             is_prefill = bool(batch.is_prefill)
+            static_num_prefill_tokens = (
+                int(batch.num_prefill_tokens)
+                if is_prefill
+                and os.environ.get("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", "0") in {"1", "true", "yes", "on", "True"}
+                else None
+            )
 
             def compiled(
                 params_leaves,
@@ -518,13 +539,14 @@ class ModelExecutor:
             ):
                 params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
                 num_query_tokens = query_start_loc[-1].astype(jnp.int32)
+                num_prefill_tokens = static_num_prefill_tokens if static_num_prefill_tokens is not None else num_query_tokens
                 step_batch = ScheduledBatch(
                     tokens=tokens,
                     positions=positions,
                     seq_ids=jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
                     query_start_loc=query_start_loc,
                     is_prefill=is_prefill,
-                    num_prefill_tokens=num_query_tokens if is_prefill else 0,
+                    num_prefill_tokens=num_prefill_tokens if is_prefill else 0,
                     num_decode_tokens=0 if is_prefill else num_query_tokens,
                     block_tables=block_tables,
                     seq_lens=seq_lens,
