@@ -85,3 +85,16 @@ Expected long-decode result:
 The reusable HF artifact is:
 
 `results/qwen08_hf_bf16w_fp32act_long_decode_top5_500.npz`
+
+## Segmented GDN Override Gate
+
+The default segmented GDN policy requires standalone output and final-state max
+abs `<=1e-5` versus the current padded chunk32 reference before CUDA math. If we
+make an explicit design decision to accept a true-token packed ABI instead, that
+path must first pass the same long-decode real-weight gate above:
+
+- exact generated-token match
+- `top1_exact_matches = 500`
+- `ordered_top5_exact_matches = 500`
+- `top5_set_exact_matches = 500`
+- `max_hf_topk_id_logit_diff <= 2e-5`

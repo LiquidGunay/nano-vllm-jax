@@ -963,6 +963,19 @@ def _compare_outputs(reference: tuple[jnp.ndarray, jnp.ndarray], candidate: tupl
 
 SEGMENTED_GDN_STANDALONE_GATE_THRESHOLD = 1e-5
 
+SEGMENTED_GDN_FULL_MODEL_GATE = {
+    "name": "real_weight_full_model_token_logit_parity",
+    "reference_artifact": "results/qwen08_hf_bf16w_fp32act_long_decode_top5_500.npz",
+    "required_checks": {
+        "exact_generated_token_match": True,
+        "top1_exact_matches": 500,
+        "ordered_top5_exact_matches": 500,
+        "top5_set_exact_matches": 500,
+        "max_hf_topk_id_logit_diff_lte": 2e-5,
+    },
+    "required_command": "benchmark_long_decode_top5.py --max-new-tokens 500",
+}
+
 
 def _passes_segmented_standalone_gate(
     comparison: dict[str, Any] | None,
@@ -1035,6 +1048,7 @@ def _segmented_reference_policy(gate: dict[str, Any]) -> dict[str, Any]:
         "design_change_option": (
             "accept a true-token packed ABI only after an explicit full-model real-weight token/logit parity gate"
         ),
+        "design_change_required_gate": SEGMENTED_GDN_FULL_MODEL_GATE,
     }
 
 

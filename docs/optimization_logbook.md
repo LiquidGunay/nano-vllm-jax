@@ -3249,6 +3249,11 @@ Decision:
   - if the packed or row-padded gate misses the threshold, status is
     `blocked_on_correctness_policy`, `cuda_math_allowed=false`, and
     `requires_design_decision=true`.
+  - the blocked policy also names the required true-token packed override gate:
+    exact generated-token match, 500/500 top-1 match, 500/500 ordered top-5
+    match, 500/500 top-5 set match, and
+    `max_hf_topk_id_logit_diff <= 2e-5` against the stored HF long-decode
+    artifact.
 - motivation: Entries 078 and 079 showed that the true-token packed and
   row-padded segmented ABIs miss the full hetero8 state gate before any CUDA
   math is introduced. Future work should not silently continue from that failed

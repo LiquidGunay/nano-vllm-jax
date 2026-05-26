@@ -181,7 +181,10 @@ gdn_segmented_prefill_chunk32(
   output/state gate passes. Failed packed/row-padded gates are reported as
   `blocked_on_correctness_policy`; a true-token packed ABI requires an explicit
   design decision plus a separate real-weight full-model token/logit parity gate
-  before CUDA math.
+  before CUDA math. The required override gate is exact generated-token match,
+  500/500 top-1 match, 500/500 ordered top-5 match, 500/500 top-5 set match,
+  and `max_hf_topk_id_logit_diff <= 2e-5` against the stored HF long-decode
+  artifact.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 

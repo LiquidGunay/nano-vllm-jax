@@ -58,6 +58,12 @@ def test_segmented_reference_policy_blocks_rowwise_drift():
     assert not policy["serving_routing_allowed"]
     assert "row-wise decomposition" in policy["reason"]
     assert "full-model real-weight token/logit parity" in policy["design_change_option"]
+    assert policy["design_change_required_gate"]["name"] == "real_weight_full_model_token_logit_parity"
+    required = policy["design_change_required_gate"]["required_checks"]
+    assert required["top1_exact_matches"] == 500
+    assert required["ordered_top5_exact_matches"] == 500
+    assert required["top5_set_exact_matches"] == 500
+    assert required["max_hf_topk_id_logit_diff_lte"] == 2e-5
 
 
 def test_segmented_reference_policy_reports_gate_error():

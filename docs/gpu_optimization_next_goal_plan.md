@@ -645,7 +645,11 @@ gdn_segmented_prefill_chunk32(
   that gate, the benchmark reports `blocked_on_correctness_policy`,
   `cuda_math_allowed=false`, and `requires_design_decision=true`. A true-token
   packed ABI can only proceed after an explicit design decision and a separate
-  real-weight full-model token/logit parity gate.
+  real-weight full-model token/logit parity gate. That override gate is also
+  machine-readable now: exact generated-token match, 500/500 top-1 match,
+  500/500 ordered top-5 match, 500/500 top-5 set match, and
+  `max_hf_topk_id_logit_diff <= 2e-5` against the stored HF long-decode
+  artifact.
 - Keep it default-off and benchmark-only. Do not route into serving. The next
   attempt should move closer to the true segmented/nnz ABI and preserve FP32
   accumulation more closely before a server run.
