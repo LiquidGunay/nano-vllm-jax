@@ -1954,3 +1954,45 @@ Decision:
 - Reject and revert head-major KV cache plus Pallas decode attention. Removing the explicit per-layer Pallas layout transpose was not enough; the new physical cache layout and Pallas decode path still made compiled execution, command-buffer updates, GEMM lowering, and host synchronization worse.
 - Do not continue the Pallas paged decode family on this source layout. A future attention kernel must own both cache writes and decode attention in a coarser backend path, and should be gated by a microbenchmark that includes update/write cost, not only standalone attention.
 - Follow Locke's recommendation next: if staying with model-side GDN, the next viable version is a backend-owned segmented GDN prefill kernel at chunk size 32, not another source-level scan. Otherwise move to a fuller backend-owned attention/KV kernel rather than adapting the shipped Pallas op through layout plumbing.
+
+## Entry 055 - Rejected Skip-Unused Hidden Return Norm
+
+- run id: `20260526-040900-2130051-jax_hetero8_64_512x32_skip_unused_hidden_norm`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_skip_unused_hidden_norm.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-040900-2130051-jax_hetero8_64_512x32_skip_unused_hidden_norm`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-040900-2130051-jax_hetero8_64_512x32_skip_unused_hidden_norm/plugins/profile/2026_05_26_04_09_36/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-040900-2130051-jax_hetero8_64_512x32_skip_unused_hidden_norm/plugins/profile/2026_05_26_04_09_36/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Feynman confirmed the largest remaining model-side target is still rectangular padded chunked Gated DeltaNet prefill reached through `gated_deltanet_block -> backend.gated_delta_prefill`. The recommended next real experiment is `NANO_VLLM_JAX_GPU_SEGMENTED_GDN_PREFILL=1`: a backend-owned/lowered long-prefill chunk-32 path that consumes query lengths or a valid-token mask inside one coarse GPU operation per GDN layer. The audit explicitly warned that this must not repeat Entry 053's JAX-side `dynamic_slice`/`dynamic_update_slice` row-chunk scan.
+- change tested: a temporary `NANO_VLLM_JAX_SKIP_UNUSED_HIDDEN_RETURN_NORM=1` path returned `hidden_pre` before the full-sequence final RMSNorm when `forward_step(..., return_hidden=True, return_hidden_with_logits=False)` was used. The hypothesis was that the greedy token-id fast path, which gathers the last hidden token and applies `lm_head_token_ids_and_topk`, might still be paying for an otherwise unused full-sequence final norm. The source change was reverted after profiling.
+- focused CUDA checks: with `NANO_VLLM_JAX_SKIP_UNUSED_HIDDEN_RETURN_NORM=1` and accepted compact-prefill flags enabled, `tests/test_lm_head_helpers.py`, `tests/test_backend_boundaries.py::test_bucketed_prefill_last_logits_match_exact_prefill`, and `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute` passed under `JAX_PLATFORMS=cuda` (`5 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 045 chunk-32 reference.
+- JAX timing: `250.82 tok/s`, TTFT p50 `521.87 ms`, ITL p50 `15.72 ms`, ITL p95 `17.89 ms`.
+- delta vs Entry 045 chunk-32 default repeat: `0.682x` total tok/s, TTFT p50 `1.800x`, ITL p50 `1.196x`, ITL p95 `1.316x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 045 ms | skip-unused norm ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 696.03 | 1020.64 | overall much slower |
+| `_run_main_and_sample` | 572.99 | 890.85 | runner hot path much slower |
+| `forward_step_token_ids_jit` | 122.13 | 134.48 | compiled token-id path slower overall |
+| first `forward_step_token_ids_jit` | 30.83 | 29.81 | first prefill slightly lower but not useful |
+| `PjRtCApiLoadedExecutable::Execute` | 138.32 over 252 calls | 150.83 over 252 calls | same dispatch count, heavier device execution |
+| `jit_compiled:XLA GPU module` | 94.20 | 97.26 | module time regressed |
+| `command_buffer::execute` | 40.34 over 1143 calls | 40.92 over 1143 calls | slightly worse |
+| `command_buffer::update` | 27.13 over 248 calls | 30.27 over 248 calls | updates regressed |
+| `input_reduce_fusion` | 28.65 over 1936 calls | 28.62 over 1936 calls | unchanged |
+| `gemm_fusion_dot_general_746` | 13.92 over 24 calls | 40.81 over 24 calls | important GEMM bucket regressed |
+| `gemm_fusion_dot_2` | 120.93 over 2695 calls | 193.36 over 2695 calls | broader GEMM family regressed |
+| `gather` | 11.97 | 12.71 | worse |
+| `transpose` | 63.11 | 63.26 | unchanged/slightly worse |
+| `wrapped_concatenate` | 36.50 over 576 calls | 36.46 over 576 calls | unchanged |
+| `MemcpyD2D` | 24.69 over 1231 calls | 24.88 over 1232 calls | slightly worse |
+| `array.py:325 tolist` | 437.58 | 742.05 | host sync attribution much worse |
+| `np.asarray(jax.Array)` | 437.35 | 741.76 | host sync attribution much worse |
+
+Decision:
+
+- Reject and revert skip-unused hidden return norm. It preserved exact correctness and made only the first prefill range slightly smaller, while the integrated serving path regressed materially across compiled execution, GEMM lowering, command-buffer updates, and host synchronization.
+- Treat this as evidence that the greedy token-id path's visible final-norm structure is not a useful source-level optimization target; XLA's compiled plan is already dominated elsewhere or becomes worse when the branch changes the graph.
+- Follow Feynman's recommendation next: the viable model-side target is a backend-owned segmented GDN prefill kernel at chunk size 32, with acceptance gated on lower first `forward_step_token_ids_jit`, lower or flat `PjRt Execute`, `jit_compiled:XLA GPU module`, `command_buffer::update`, and no Entry 053-style kernel-count explosion.
