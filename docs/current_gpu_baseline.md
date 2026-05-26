@@ -63,16 +63,16 @@ optimization plan in `docs/gpu_optimization_next_goal_plan.md`.
 
 ## Current Long-Prefill Goal Target
 
-- artifact: `results/gpu_matrix_20260526_141130.json`
-- report: `results/gpu_matrix_20260526_141130.md`
+- artifact: `results/gpu_matrix_20260526_144104.json`
+- report: `results/gpu_matrix_20260526_144104.md`
 - benchmark: `long_prefill_512_2048/gpu_paged_default`
 - benchmark shape: input lengths `[512,1024,1536,2048]`, output length `16`
 - repeats: `2`
 - exact generated-token parity: yes
 - speed-claim-ready: yes
-- JAX throughput median: `88.91 tok/s`
+- JAX throughput median: `90.50 tok/s`
 - vLLM stored reference: `116.37 tok/s`
-- JAX/vLLM throughput ratio: `0.764x`
+- JAX/vLLM throughput ratio: `0.778x`
 - no-kernel target: `0.75x` vLLM, met
 - accepted long-target scheduler envelope:
   - `num_kvcache_blocks=384`

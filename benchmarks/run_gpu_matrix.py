@@ -159,6 +159,30 @@ WORKLOADS: dict[str, Workload] = {
         random_range_ratio='{"input":0.6,"output":0.0}',
         acceptance_scope="sidecar_only",
     ),
+    "vllm_random_longprefill_smoke": Workload(
+        name="vllm_random_longprefill_smoke",
+        input_lens="1280",
+        output_len=16,
+        prompt_suite="mixed",
+        arg_overrides={
+            "max_kv_cache_mb": 3072,
+            "num_kvcache_blocks": 768,
+            "max_num_seqs": 4,
+            "max_num_batched_tokens": 8192,
+            "prefill_buckets": "512,1024,2048",
+            "batch_size_buckets": "1,2,4",
+            "max_blocks_per_seq": 160,
+        },
+        vllm_overrides={"max_model_len": 4096, "gpu_memory_utilization": 0.65},
+        prompt_source="vllm_random",
+        dataset_name="random",
+        num_prompts=16,
+        seed=0,
+        random_input_len=1280,
+        random_output_len=16,
+        random_range_ratio='{"input":0.6,"output":0.0}',
+        acceptance_scope="sidecar_only",
+    ),
 }
 
 

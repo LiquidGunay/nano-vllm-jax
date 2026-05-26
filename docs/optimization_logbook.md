@@ -3673,3 +3673,102 @@ Decision:
 - Move the next performance target to the kernel roadmap: paged KV append,
   paged decode attention, then GDN decode/prefill, with exact-token and profile
   gates unchanged.
+
+## Entry 092 - Sidecar Smoke And Active-Slot Scheduler Fix
+
+- change accepted: `Scheduler.schedule` no longer admits a waiting prompt when
+  the already-active running set occupies `max_num_seqs`. This preserves the
+  global active sequence cap across multi-wave serving, not just within one
+  scheduling step.
+- motivation: the first full 128-prompt `vllm_random_longprefill` sidecar
+  exposed a real serving lifecycle bug before producing benchmark evidence:
+  after the first four requests were active, later waiting prompts could still
+  be admitted, eventually exhausting the model-runner hybrid-state slots with
+  `RuntimeError: No free hybrid-state slots; max_num_seqs is exhausted`.
+- sidecar scope: add `vllm_random_longprefill_smoke`, a 16-prompt smoke lane
+  with the same vLLM-random prompt semantics as the 128-prompt sidecar. The
+  128-prompt sidecar remains the broader comparability lane, but it is too heavy
+  for quick interactive validation.
+- subagent audit: the next kernel milestone should be treated as paired P0
+  append+decode work. Do not repeat standalone append/decode/GDN experiments
+  from Entries 070, 071, 073, 075, 076, 077, 078, or 079, and do not promote MTP
+  speed work before the non-speculative kernel target.
+
+Sidecar smoke command:
+
+```text
+.venv/bin/python benchmarks/run_gpu_matrix.py \
+  --configs gpu_paged_default \
+  --workloads vllm_random_longprefill_smoke \
+  --repeats 2 \
+  --jax-python /mountpoint/.exp/nano-vllm-jax/.venv/bin/python
+```
+
+- artifact: `results/gpu_matrix_20260526_143600.json`
+- report: `results/gpu_matrix_20260526_143600.md`
+- run directory: `results/gpu_matrix_runs/20260526_143600`
+- live JAX reference:
+  `results/gpu_matrix_runs/20260526_143600/references/jax_default_vllm_random_longprefill_smoke.json`
+- live vLLM reference:
+  `results/gpu_matrix_runs/20260526_143600/references/vllm_vllm_random_longprefill_smoke.json`
+
+Sidecar smoke result:
+
+| workload/config | repeats | exact tokens | speed-claim-ready | JAX tok/s median | vLLM tok/s | JAX/vLLM |
+|---|---:|---:|---:|---:|---:|---:|
+| `vllm_random_longprefill_smoke/gpu_paged_default` | 2 | yes | yes | `82.57` | `299.31` | `0.276x` |
+
+Goal-target revalidation command:
+
+```text
+.venv/bin/python benchmarks/run_gpu_matrix.py \
+  --goal-target-only --repeats 2 --no-live-vllm \
+  --require-stored-references --require-goal-target-ready \
+  --jax-python /mountpoint/.exp/nano-vllm-jax/.venv/bin/python
+```
+
+- artifact: `results/gpu_matrix_20260526_144104.json`
+- report: `results/gpu_matrix_20260526_144104.md`
+
+Goal-target result:
+
+| workload/config | repeats | exact tokens | speed-claim-ready | JAX tok/s median | vLLM tok/s | JAX/vLLM | target tok/s | gap |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `long_prefill_512_2048/gpu_paged_default` | 2 | yes | yes | `90.50` | `116.37` | `0.778x` | `87.28` | `0.00 tok/s` |
+
+Validation:
+
+```text
+JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  TMPDIR=/mountpoint/.exp/tmp \
+  XDG_CACHE_HOME=/mountpoint/.exp/.cache \
+  JAX_COMPILATION_CACHE_DIR=/mountpoint/.exp/.cache/jax \
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest -q \
+  tests/test_backend_boundaries.py::test_scheduler_does_not_admit_waiting_prompts_when_active_slots_are_full \
+  tests/test_backend_boundaries.py::test_scheduler_chunks_prefill_by_max_batched_tokens_budget \
+  tests/test_gpu_matrix_runner.py \
+  tests/test_gpu_matrix_summary_report.py
+```
+
+- result: `45 passed`.
+
+Interpretation:
+
+- The exact-token long-prefill target remains achieved after the scheduler
+  lifecycle fix.
+- The vLLM-random smoke result is valuable negative/comparability evidence:
+  deterministic long-prefill parity does not imply broad random-serving parity.
+  The next `0.9x` work should stay on the non-speculative kernel roadmap, not
+  MTP.
+- The sidecar smoke is not a replacement for the full 128-prompt sidecar. It is
+  a quick guard that the random-manifest path and multi-wave scheduler lifecycle
+  are functioning.
+
+Decision:
+
+- Keep the scheduler active-slot guard and the 16-prompt sidecar smoke lane.
+- Keep the 128-prompt `vllm_random_longprefill` lane as the heavier external
+  comparability run.
+- Proceed next to paired P0 kernel work: full-attention NHD KV append plus
+  paged decode attention with one shared layout and no hot-path conversion.

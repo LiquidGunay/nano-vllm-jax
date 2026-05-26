@@ -149,6 +149,8 @@ class Scheduler:
         # prompt tails from already-allocated running sequences.
         while num_seqs < self.max_num_seqs:
             if self.waiting:
+                if len(self.running) + len(scheduled_running) >= self.max_num_seqs:
+                    break
                 seq = self.waiting.popleft()
                 from_waiting = True
             else:

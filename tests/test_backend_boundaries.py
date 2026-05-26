@@ -509,6 +509,36 @@ def test_scheduler_chunks_prefill_by_max_batched_tokens_budget():
     assert second_batch_seqs[0].block_table == []
 
 
+def test_scheduler_does_not_admit_waiting_prompts_when_active_slots_are_full():
+    config = _tiny_full_attention_config()
+    config.max_num_seqs = 2
+    config.num_kvcache_blocks = 8
+    config.max_blocks_per_seq = 4
+    config.max_num_batched_tokens = 8
+    scheduler = Scheduler(config)
+
+    seqs = [
+        Sequence([1 + idx * 2, 2 + idx * 2], SamplingParams(temperature=0.0, max_tokens=2), seq_id=idx)
+        for idx in range(4)
+    ]
+    for seq in seqs:
+        scheduler.add(seq)
+
+    prefill_seqs, prefill_batch = scheduler.schedule()
+    assert prefill_batch.is_prefill
+    assert [seq.seq_id for seq in prefill_seqs] == [0, 1]
+
+    finished = scheduler.postprocess(prefill_seqs, [[], []], prefill_chunk_lengths=[2, 2])
+    assert finished == [False, False]
+    assert [seq.seq_id for seq in scheduler.running] == [0, 1]
+    assert [seq.seq_id for seq in scheduler.waiting] == [2, 3]
+
+    decode_seqs, decode_batch = scheduler.schedule()
+    assert not decode_batch.is_prefill
+    assert [seq.seq_id for seq in decode_seqs] == [0, 1]
+    assert [seq.seq_id for seq in scheduler.waiting] == [2, 3]
+
+
 def test_scheduler_rejects_single_prompt_larger_than_prefill_budget():
     config = _tiny_full_attention_config()
     config.max_blocks_per_seq = 1

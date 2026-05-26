@@ -322,7 +322,9 @@ def test_selected_matrix_names_uses_requested_matrix_without_goal_target_only():
 
 def test_default_workloads_keep_vllm_random_sidecar_opt_in():
     assert "vllm_random_longprefill" in WORKLOADS
+    assert "vllm_random_longprefill_smoke" in WORKLOADS
     assert "vllm_random_longprefill" not in DEFAULT_WORKLOADS
+    assert "vllm_random_longprefill_smoke" not in DEFAULT_WORKLOADS
 
 
 def test_configured_workload_reference_uses_workload_mapping(tmp_path):
@@ -420,7 +422,7 @@ def test_live_jax_default_capture_used_for_sidecar_even_when_default_runs_first(
     should_capture, missing = _should_capture_live_jax_default_reference(
         selected_configs=["gpu_paged_default"],
         configs={"gpu_paged_default": {"workload_reference_jsons": {}}},
-        workload=WORKLOADS["vllm_random_longprefill"],
+        workload=WORKLOADS["vllm_random_longprefill_smoke"],
         default_config={"allow_live_jax_default_if_reference_missing": True},
     )
 
@@ -562,7 +564,7 @@ def test_jax_command_applies_workload_overrides_and_reference(tmp_path):
 
 def test_jax_command_wires_vllm_random_sidecar_args(tmp_path):
     config = json.loads((CONFIG_DIR / "gpu_paged_default.json").read_text(encoding="utf-8"))
-    workload = WORKLOADS["vllm_random_longprefill"]
+    workload = WORKLOADS["vllm_random_longprefill_smoke"]
     command = _jax_command(
         config,
         workload,
@@ -574,14 +576,14 @@ def test_jax_command_wires_vllm_random_sidecar_args(tmp_path):
 
     assert _flag_value(command, "--prompt-source") == "vllm_random"
     assert _flag_value(command, "--dataset-name") == "random"
-    assert _flag_value(command, "--num-prompts") == "128"
+    assert _flag_value(command, "--num-prompts") == "16"
     assert _flag_value(command, "--random-input-len") == "1280"
     assert _flag_value(command, "--random-output-len") == "16"
     assert _flag_value(command, "--random-range-ratio") == '{"input":0.6,"output":0.0}'
 
 
 def test_artifact_matches_vllm_random_sidecar_metadata(tmp_path):
-    workload = WORKLOADS["vllm_random_longprefill"]
+    workload = WORKLOADS["vllm_random_longprefill_smoke"]
     artifact = tmp_path / "random.json"
     artifact.write_text(
         json.dumps(
@@ -589,7 +591,7 @@ def test_artifact_matches_vllm_random_sidecar_metadata(tmp_path):
                 "run_config": {
                     "prompt_source": "vllm_random",
                     "dataset_name": "random",
-                    "num_prompts": 128,
+                    "num_prompts": 16,
                     "seed": 0,
                     "random_input_len": 1280,
                     "random_output_len": 16,

@@ -476,6 +476,25 @@ end-to-end throughput.
   correctness-gated kernel-backed non-speculative serving on the same
   long-prefill/vLLM-style benchmark discipline. MTP remains diagnostic-only
   until that kernel target is met or explicitly reprioritized.
+- Sidecar smoke validation:
+  `results/gpu_matrix_20260526_143600.json` and
+  `results/gpu_matrix_20260526_143600.md`. A 16-prompt
+  `vllm_random_longprefill_smoke` lane now validates the vLLM-random prompt
+  manifest path quickly before the heavier 128-prompt sidecar. It is
+  speed-claim-ready in the matrix sense and exact against its live JAX default
+  reference, but it is not close to vLLM: JAX `82.57 tok/s`, vLLM
+  `299.31 tok/s`, JAX/vLLM `0.276x`. This confirms that the exact-token
+  long-prefill gate must not be described as a broad vLLM-random serving parity
+  claim.
+- Multi-wave scheduler fix: the scheduler no longer admits new waiting prompts
+  while the active running set already occupies `max_num_seqs`. This fixes the
+  sidecar's hybrid-state slot exhaustion class when many prompts are queued with
+  `max_num_seqs=4`.
+- Goal-target revalidation after the sidecar scheduler fix:
+  `results/gpu_matrix_20260526_144104.json` and
+  `results/gpu_matrix_20260526_144104.md`. The exact long-prefill target remains
+  speed-claim-ready and exact, improving to JAX `90.50 tok/s`, vLLM
+  `116.37 tok/s`, JAX/vLLM `0.778x`.
 
 ## Phase 2 - Kernel Roadmap
 
