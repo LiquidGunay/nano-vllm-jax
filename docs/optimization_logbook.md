@@ -1671,3 +1671,41 @@ Decision:
 - Reject chunk size 16. It improves the named `input_reduce_fusion` bucket, but the smaller chunking creates a much worse compiled plan overall, especially first prefill and GEMM/module execution.
 - Keep Entry 045's chunk size 32 default. The sweep now brackets 16, 32, 64, and 128, and 32 remains the best verified point for this hetero8 workload.
 - Next profile-backed work should move to `paged_attention_prefill` layout/HLO investigation rather than smaller GDN chunks.
+
+## Entry 048 - Rejected Paged Prefill Head-Major Layout
+
+- run id: `20260526-024346-2090819-jax_hetero8_64_512x32_prefill_head_major`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_prefill_head_major.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-024346-2090819-jax_hetero8_64_512x32_prefill_head_major`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-024346-2090819-jax_hetero8_64_512x32_prefill_head_major/plugins/profile/2026_05_26_02_44_39/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-024346-2090819-jax_hetero8_64_512x32_prefill_head_major/plugins/profile/2026_05_26_02_44_39/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: a temporary `NANO_VLLM_JAX_PREFILL_HEAD_MAJOR=1` path in `paged_attention_prefill` transposed gathered K/V to `[batch, kv_heads, tokens, head_dim]` and computed attention in `[batch, kv_heads, groups, query_tokens, key_tokens]`. The goal was to test whether head-major math lowered away the expensive prefill transpose/gather pattern. The source change was reverted after profiling.
+- focused CUDA checks: with `NANO_VLLM_JAX_PREFILL_HEAD_MAJOR=1`, `tests/test_kv_cache.py::test_paged_attention_prefill_head_major_matches_default`, `tests/test_kv_cache.py::test_paged_attention_non_identity_blocks`, `tests/test_kv_cache.py::test_paged_attention_grouped_gqa_matches_repeat_reference`, `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute`, and `tests/test_lm_head_helpers.py` passed under `JAX_PLATFORMS=cuda` (`7 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 045 chunk-32 reference.
+- JAX timing: `262.85 tok/s`, TTFT p50 `498.56 ms`, ITL p50 `15.17 ms`, ITL p95 `16.02 ms`.
+- delta vs Entry 045 chunk-32 default repeat: `0.715x` total tok/s, TTFT p50 `1.719x`, ITL p50 `1.154x`, ITL p95 `1.179x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 045 ms | head-major ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 696.03 | 973.93 | overall much slower |
+| `_run_main_and_sample` | 572.99 | 847.58 | runner hot path much slower |
+| `forward_step_token_ids_jit` | 122.13 | 121.41 | compiled token-id path tied/slightly better |
+| first `forward_step_token_ids_jit` | 30.83 | 30.74 | first prefill tied |
+| `PjRtCApiLoadedExecutable::Execute` | 138.32 over 252 calls | 135.04 over 252 calls | slightly lower device execution |
+| `jit_compiled:XLA GPU module` | 94.20 | 90.01 | slightly lower module time |
+| `command_buffer::execute` | 40.34 over 1143 calls | 36.52 over 1143 calls | slightly lower command-buffer execution |
+| `command_buffer::update` | 27.13 over 248 calls | 26.67 over 248 calls | tied/slightly lower |
+| `input_reduce_fusion` | 28.65 over 1936 calls | 26.98 over 1930 calls | small improvement |
+| `gather` | 11.97 | 12.94 | worse |
+| `transpose` | 63.11 | 61.14 | small improvement |
+| `gemm_fusion_dot_general_746` | 13.92 | 41.10 | important GEMM bucket regressed |
+| `array.py:325 tolist` | 437.58 | 712.38 | host sync attribution worsened badly |
+| `np.asarray(jax.Array)` | 437.35 | 712.04 | host sync attribution worsened badly |
+
+Decision:
+
+- Reject and revert the head-major `paged_attention_prefill` layout. It produced exact tokens and a tiny device-side improvement, but the server-critical path regressed sharply through host synchronization and an important GEMM bucket.
+- Do not keep this as an optional flag. The small transpose/module gains are not useful unless the dependency structure also prevents the later token readback from absorbing the cost.
+- The next attention-layout attempt should inspect lowered HLO/kernel names before changing source shape order again, or defer attention work until a backend-owned KV layout can avoid the transpose/gather pattern more directly.
