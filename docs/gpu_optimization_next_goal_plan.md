@@ -20,14 +20,11 @@ optimization work starts.
 5. If kernel integration is difficult, add a minimal optional kernel-backend
    strategy and ABI validation path before forcing it through the repo's final
    paging layout.
-
-## Remaining Questions Before Execution
-
-1. Should Phase 0 be a docs/config-only commit with no benchmark runner changes,
-   or should the benchmark config JSONs be committed together with the docs?
-2. Should the matrix runner be allowed to execute live vLLM comparisons when vLLM
-   is installed, or should it only compare JAX against stored reference
-   artifacts by default?
+6. Phase 0 should create the baseline docs and benchmark config JSONs in the
+   same commit. The benchmark matrix runner can follow in the next commit.
+7. The matrix runner should use stored local vLLM/JAX reference artifacts when
+   available. If no stored local reference exists for a requested comparison and
+   vLLM is installed, it may run the live vLLM comparison and store the result.
 
 ## Context
 
@@ -698,9 +695,9 @@ Commit 1:
 - Add docs/current_gpu_baseline.md
 - Add docs/rejected_optimization_index.md
 - Add docs/kernel_roadmap.md
+- Add benchmark config JSONs
 
 Commit 2:
-- Add benchmark config JSONs
 - Add benchmark matrix runner
 - Add summary JSON output schema
 
