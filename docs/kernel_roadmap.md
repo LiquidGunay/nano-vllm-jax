@@ -83,6 +83,9 @@ paged_decode_attention_gqa_nhd(
   BF16/FP16/low-precision oriented and do not satisfy the accepted FP32
   activation/KV-cache contract. Do not implement this FlashInfer wrapper for
   serving until there is a FP32-capable path or an explicit dtype-policy change.
+- current ABI status: a pure-JAX FP32 NHD reference and focused parity tests now
+  define the decode-attention contract a future CUDA/custom-call path must
+  satisfy before it can be routed into serving.
 
 ## P1.1 - `gdn_recurrent_decode_step`
 

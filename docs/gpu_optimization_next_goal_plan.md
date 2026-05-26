@@ -386,6 +386,10 @@ paged_decode_attention_gqa_nhd(
   FlashInfer `paged_decode_attention_gqa_nhd` wrapper as the next serving path.
   The viable options are a FP32-capable custom kernel, or an explicit separate
   decision to change the KV-cache/attention dtype policy.
+- A pure-JAX FP32 NHD ABI reference now exists for
+  `paged_decode_attention_gqa_nhd`, with focused parity tests against the
+  current decode attention path. This is an ABI/correctness target for a future
+  CUDA custom-call, not an accepted performance kernel.
 
 ## P1.1 - `gdn_recurrent_decode_step`
 
@@ -754,8 +758,13 @@ Interim ABI validation:
 
 Commit 6:
 
-- Add paged_decode_attention_gqa_nhd via FlashInfer/JAX FFI
-- Route only full-attention decode layers
+- Do not add `paged_decode_attention_gqa_nhd` via FlashInfer/JAX FFI under the
+  current FP32 activation/KV-cache contract.
+- ~~Add pure-JAX FP32 `paged_decode_attention_gqa_nhd` ABI reference~~
+- ~~Add focused parity tests against the current decode path~~
+- Add FP32-capable CUDA/custom-call implementation behind an opt-in backend
+- Route only full-attention decode layers after focused and integrated gates
+  pass
 
 Commit 7:
 
