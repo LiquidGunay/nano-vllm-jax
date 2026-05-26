@@ -3387,3 +3387,36 @@ Decision:
 - Use `--goal-target-only --require-goal-target-ready` for the final
   non-speculative target run. Add `--require-stored-references` when the run
   should fail instead of generating live references.
+
+## Entry 088 - Paged Prefill Attention Trace Check
+
+- artifact checked:
+  `results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json`
+- trace checked:
+  `/mountpoint/.exp/profiles/20260526-105636-2279943-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260526_105635/plugins/profile/2026_05_26_10_56_58/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- reason: Commit 9 says to add `paged_prefill_attention_gqa_nhd` only if traces
+  justify it. The stored long-prefill target trace is the closest available
+  evidence while GPU access is unavailable.
+- trace evidence:
+  - `generate_with_trace`: `820.31 ms / 1`
+  - `_run_main_and_sample`: `718.73 ms / 16`
+  - `np.asarray(jax.Array)`: `427.55 ms / 16`
+  - `PjRtCApiLoadedExecutable::Execute`: `289.24 ms / 140`
+  - `forward_step_token_ids_jit`: `280.56 ms / 16`
+  - `gemm_fusion`: `247.41 ms / 6496`
+  - `command_buffer::execute`: `229.21 ms / 1936`
+  - `while`: `210.45 ms / 36`
+  - `cutlass`: `70.68 ms / 84`
+  - `transpose`: `47.30 ms / 312`
+  - `input_reduce_fusion`: `37.87 ms / 797`
+  - `triton_softmax_*` attention-shaped buckets: about `10.16 ms` total.
+
+Decision:
+
+- Do not start Commit 9 from the current stored trace evidence. The profile does
+  not show paged prefill attention itself as a material TTFT bottleneck compared
+  with host sync/readback, GEMM/fusion, recurrent/GDN-shaped `while`, and
+  command-buffer work.
+- Revisit `paged_prefill_attention_gqa_nhd` only after a repeatable target
+  profile shows attention-specific prefill buckets are large enough that this
+  kernel can move the final `long_prefill_512_2048/gpu_paged_default` target.

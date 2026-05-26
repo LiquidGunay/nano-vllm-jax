@@ -710,6 +710,18 @@ paged_prefill_attention_gqa_nhd(
 - no per-layer layout conversion
 ```
 
+### Status - 2026-05-26
+
+- Current stored traces do not justify starting this kernel yet. In the stored
+  `long_prefill_512_2048/gpu_paged_default` profile, the whole
+  `generate_with_trace` range is about `820 ms`; the attention-shaped
+  `triton_softmax_*` buckets total only about `10 ms`, while larger buckets are
+  host readback/sync (`np.asarray(jax.Array)` about `428 ms`), GEMM/fusion
+  (`gemm_fusion` about `247 ms`), recurrent/GDN-shaped `while` work about
+  `210 ms`, command-buffer execute about `229 ms`, transpose about `47 ms`, and
+  `input_reduce_fusion` about `38 ms`. Keep Commit 9 blocked until a repeatable
+  profile shows paged-prefill attention itself is a material TTFT bottleneck.
+
 ## P2.2 - `qk_norm_rope_kv_append_fused`
 
 ### Motivation
