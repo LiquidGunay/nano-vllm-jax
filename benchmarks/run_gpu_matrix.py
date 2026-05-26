@@ -18,6 +18,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from subprocess import CompletedProcess
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -118,6 +119,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-live-vllm", dest="live_vllm", action="store_false", default=True)
     parser.add_argument(
+        "--skip-gpu-preflight",
+        action="store_true",
+        help="Skip the CUDA device availability check before launching real benchmark subprocesses.",
+    )
+    parser.add_argument(
         "--vllm-python",
         default=str(DEFAULT_VLLM_PYTHON if DEFAULT_VLLM_PYTHON.exists() else Path(sys.executable)),
     )
@@ -182,6 +188,42 @@ def _runtime_env(config_env: dict[str, str]) -> dict[str, str]:
     ):
         Path(env[key]).mkdir(parents=True, exist_ok=True)
     return env
+
+
+def _cuda_device_preflight(
+    *,
+    dev_dir: Path = Path("/dev"),
+    runner: Any = subprocess.run,
+) -> tuple[bool, str]:
+    """Return whether this process can see an NVIDIA GPU before JAX import.
+
+    The matrix runner intentionally avoids importing JAX. This preflight catches
+    the common no-device/container case early, before each subprocess starts
+    loading model weights and then fails during the first JAX array transfer.
+    """
+
+    nvidia_devices = sorted(dev_dir.glob("nvidia[0-9]*")) if dev_dir.exists() else []
+    if (dev_dir / "nvidiactl").exists() and nvidia_devices:
+        names = ", ".join(path.name for path in nvidia_devices[:4])
+        return True, f"visible device nodes: {names}"
+    try:
+        completed: CompletedProcess[str] = runner(
+            ["nvidia-smi", "-L"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False, "nvidia-smi is not installed and /dev/nvidia* device nodes are missing"
+    except subprocess.TimeoutExpired:
+        return False, "nvidia-smi -L timed out and /dev/nvidia* device nodes are missing"
+    output = (completed.stdout or "").strip()
+    if completed.returncode == 0 and output:
+        return True, output.splitlines()[0]
+    detail = output or f"nvidia-smi -L exited with {completed.returncode}"
+    return False, f"{detail}; /dev/nvidia* device nodes are missing"
 
 
 def _append_cli_arg(command: list[str], key: str, value: Any) -> None:
@@ -484,6 +526,15 @@ def main() -> None:
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
     run_dir = Path(args.run_dir) if args.run_dir else RESULTS_DIR / "gpu_matrix_runs" / timestamp
     output_json = Path(args.output_json) if args.output_json else RESULTS_DIR / f"gpu_matrix_{timestamp}.json"
+    if not args.dry_run and not args.skip_gpu_preflight:
+        gpu_ok, gpu_detail = _cuda_device_preflight()
+        if not gpu_ok:
+            raise SystemExit(
+                "CUDA GPU preflight failed: "
+                f"{gpu_detail}. Matrix runs are GPU-only; restore NVIDIA "
+                "device visibility before rerunning, or pass "
+                "--skip-gpu-preflight only for controlled failure diagnostics."
+            )
     vllm_python = Path(args.vllm_python)
     vllm_is_available = _vllm_available(vllm_python)
     run_dir.mkdir(parents=True, exist_ok=True)

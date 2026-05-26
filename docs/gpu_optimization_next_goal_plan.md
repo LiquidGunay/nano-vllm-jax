@@ -238,6 +238,12 @@ end-to-end throughput.
   `PjRtCApiLoadedExecutable::Execute=290.66 ms / 140`,
   `command_buffer::execute=228.13 ms / 1936`, and `np.asarray(jax.Array)=
   429.63 ms / 16`.
+- A two-repeat `hetero8,long_prefill_512_2048` matrix attempt could not produce
+  benchmark evidence because the current session had no visible NVIDIA device
+  nodes and `nvidia-smi` could not communicate with the driver. The runner now
+  has a CUDA preflight so future real matrix runs fail before loading weights
+  when GPU access is absent. The two-repeat performance artifact remains
+  pending until GPU access is restored.
 
 ## Phase 2 - Kernel Roadmap
 

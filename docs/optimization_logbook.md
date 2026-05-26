@@ -3089,3 +3089,41 @@ Decision:
   command-buffer, and host-sync buckets. This supports continuing with
   backend-owned serving kernels, but the segmented GDN route remains blocked on
   the Entry 078/079 correctness-policy decision.
+
+## Entry 081 - GPU Matrix Runner CUDA Preflight
+
+- change accepted: `benchmarks/run_gpu_matrix.py` now checks for visible CUDA
+  device access before launching real benchmark subprocesses. Dry runs are
+  unchanged, and `--skip-gpu-preflight` remains available for controlled failure
+  diagnostics.
+- trigger: a two-repeat `hetero8,long_prefill_512_2048` matrix attempt in the
+  current session produced only failed subprocess artifacts because
+  `nvidia-smi` could not communicate with the NVIDIA driver and `/dev/nvidia*`
+  device nodes were absent. Each JAX subprocess later failed with
+  `CUDA_ERROR_NO_DEVICE` while converting model weights.
+- focused tests:
+
+```text
+.venv/bin/python -m pytest tests/test_gpu_matrix_runner.py -q
+```
+
+- result: `5 passed`.
+- preflight verification:
+
+```text
+JAX_PLATFORMS=cuda ... benchmarks/run_gpu_matrix.py \
+  --configs gpu_paged_default --workloads hetero8 --repeats 1 \
+  --output-json results/gpu_matrix_preflight_no_gpu_probe.json --no-live-vllm
+```
+
+- result: failed early with a clear CUDA GPU preflight error and did not create
+  the output JSON.
+
+Decision:
+
+- Keep the preflight. It preserves the user's GPU-only constraint and prevents
+  misleading all-failed matrix summaries when the runner is launched without
+  device visibility.
+- Do not treat the failed two-repeat attempt as benchmark evidence. Re-run the
+  two-repeat `hetero8,long_prefill_512_2048` matrix with stored vLLM references
+  after NVIDIA device access is restored.
