@@ -357,6 +357,93 @@ def _pallas_active_chunk_local_math_probe_fn(
     return run
 
 
+def _pallas_rectangular_chunk_local_math_probe_fn(
+    batch_size: int,
+    num_heads: int,
+    n_chunks: int,
+    chunk_size: int,
+    key_dim: int,
+    value_dim: int,
+) -> Callable:
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as plt
+
+    def kernel(
+        key_ref,
+        value_ref,
+        g_ref,
+        beta_ref,
+        key_offsets_ref,
+        value_offsets_ref,
+        token_offsets_ref,
+        value_transformed_ref,
+        k_cumdecay_ref,
+        g_cumsum_ref,
+        attn_ref,
+    ):
+        row = pl.program_id(0)
+        head = pl.program_id(1)
+        chunk = pl.program_id(2)
+        start = chunk * chunk_size
+        token_offsets = token_offsets_ref[:]
+        key_offsets = key_offsets_ref[:]
+        value_offsets = value_offsets_ref[:]
+
+        key_block = key_ref[row, head, start + token_offsets[:, None], key_offsets[None, :]]
+        value_block = value_ref[row, head, start + token_offsets[:, None], value_offsets[None, :]]
+        g_block = g_ref[row, head, start + token_offsets]
+        beta_block = beta_ref[row, head, start + token_offsets]
+
+        g_cumsum = jnp.cumsum(g_block, axis=0)
+        lower_mask = token_offsets[:, None] >= token_offsets[None, :]
+        strict_lower_mask = token_offsets[:, None] > token_offsets[None, :]
+        decay_mask = jnp.exp(g_cumsum[:, None] - g_cumsum[None, :])
+        decay_mask = jnp.where(lower_mask, decay_mask, 0.0)
+
+        k_beta = key_block * beta_block[:, None]
+        kkt = pl.dot(k_beta, key_block, trans_b=True, allow_tf32=False)
+        attn = jnp.where(strict_lower_mask, -(kkt * decay_mask), 0.0)
+
+        for row_index in range(1, chunk_size):
+            valid_cols = token_offsets < row_index
+            selected_row = token_offsets[:, None] == row_index
+            row_values = jnp.sum(jnp.where(selected_row, attn, 0.0), axis=0)
+            row_values = jnp.where(valid_cols, row_values, 0.0)
+            submatrix = jnp.where(valid_cols[:, None] & valid_cols[None, :], attn, 0.0)
+            contribution = jnp.sum(row_values[:, None] * submatrix, axis=0)
+            updated_row = jnp.where(valid_cols, row_values + contribution, 0.0)
+            attn = jnp.where(selected_row, updated_row[None, :], attn)
+
+        attn_with_identity = attn + (token_offsets[:, None] == token_offsets[None, :]).astype(jnp.float32)
+        value_transformed = pl.dot(attn_with_identity, value_block * beta_block[:, None], allow_tf32=False)
+        k_cumdecay = pl.dot(
+            attn_with_identity,
+            k_beta * jnp.exp(g_cumsum)[:, None],
+            allow_tf32=False,
+        )
+
+        value_transformed_ref[row, head, chunk, token_offsets[:, None], value_offsets[None, :]] = value_transformed
+        k_cumdecay_ref[row, head, chunk, token_offsets[:, None], key_offsets[None, :]] = k_cumdecay
+        g_cumsum_ref[row, head, chunk, token_offsets] = g_cumsum
+        attn_ref[row, head, chunk, token_offsets[:, None], token_offsets[None, :]] = attn_with_identity
+
+    def run(key, value, g, beta, key_offsets, value_offsets, token_offsets):
+        return pl.pallas_call(
+            kernel,
+            out_shape=(
+                jax.ShapeDtypeStruct((batch_size, num_heads, n_chunks, chunk_size, value_dim), value.dtype),
+                jax.ShapeDtypeStruct((batch_size, num_heads, n_chunks, chunk_size, key_dim), key.dtype),
+                jax.ShapeDtypeStruct((batch_size, num_heads, n_chunks, chunk_size), g.dtype),
+                jax.ShapeDtypeStruct((batch_size, num_heads, n_chunks, chunk_size, chunk_size), jnp.float32),
+            ),
+            grid=(batch_size, num_heads, n_chunks),
+            name="gdn_rectangular_chunk_local_math_chunk32_probe",
+            compiler_params=plt.CompilerParams(num_warps=4),
+        )(key, value, g, beta, key_offsets, value_offsets, token_offsets)
+
+    return run
+
+
 def _active_input_pack_reference(
     query: jnp.ndarray,
     key: jnp.ndarray,
@@ -426,6 +513,47 @@ def _active_chunk_local_math_reference(
     return value_transformed, k_cumdecay, g_cumsum, attn_with_identity
 
 
+def _rectangular_local_math_reference(
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    g: jnp.ndarray,
+    beta: jnp.ndarray,
+    chunk_size: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    batch_size, num_heads, seq_len, key_dim = key.shape
+    value_dim = value.shape[-1]
+    n_chunks = seq_len // int(chunk_size)
+    key_chunks = key.reshape(batch_size, num_heads, n_chunks, chunk_size, key_dim)
+    value_chunks = value.reshape(batch_size, num_heads, n_chunks, chunk_size, value_dim)
+    g_chunks = g.reshape(batch_size, num_heads, n_chunks, chunk_size)
+    beta_chunks = beta.reshape(batch_size, num_heads, n_chunks, chunk_size)
+
+    g_cumsum = jnp.cumsum(g_chunks, axis=-1)
+    decay_mask = jnp.tril(jnp.exp(g_cumsum[..., :, None] - g_cumsum[..., None, :]))
+    k_beta_chunks = key_chunks * beta_chunks[..., None]
+    kkt = jnp.einsum("bhnck,bhnjk->bhncj", k_beta_chunks, key_chunks)
+    attn = -(kkt * decay_mask)
+    mask_upper = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_))
+    attn = jnp.where(mask_upper, 0.0, attn)
+
+    for row_index in range(1, chunk_size):
+        valid_cols = jnp.arange(chunk_size) < row_index
+        row_values = attn[..., row_index, :] * valid_cols
+        submatrix = attn * valid_cols[None, None, None, :, None] * valid_cols[None, None, None, None, :]
+        contribution = jnp.einsum("bhnj,bhnjk->bhnk", row_values, submatrix)
+        updated_row = (row_values + contribution) * valid_cols
+        attn = attn.at[..., row_index, :].set(updated_row)
+
+    attn_with_identity = attn + jnp.eye(chunk_size, dtype=jnp.float32)
+    value_transformed = jnp.einsum("bhnct,bhntv->bhncv", attn_with_identity, value_chunks * beta_chunks[..., None])
+    k_cumdecay = jnp.einsum(
+        "bhnct,bhntk->bhnck",
+        attn_with_identity,
+        k_beta_chunks * jnp.exp(g_cumsum)[..., None],
+    )
+    return value_transformed, k_cumdecay, g_cumsum, attn_with_identity
+
+
 def _scatter_active_local_math_to_chunks(
     value_transformed: jnp.ndarray,
     k_cumdecay: jnp.ndarray,
@@ -456,6 +584,64 @@ def _scatter_active_local_math_to_chunks(
         dtype=g_cumsum.dtype,
     ).at[rows, heads, chunks, :].set(g_cumsum)
     return value_transformed_chunks, k_cumdecay_chunks, g_cumsum_chunks
+
+
+def _rectangular_output_state_reconstruction_probe_fn(
+    batch_size: int,
+    num_heads: int,
+    n_chunks: int,
+    chunk_size: int,
+    key_dim: int,
+    value_dim: int,
+) -> Callable:
+    mask_strict_upper = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=1)
+
+    def run(
+        normalized_query_scaled,
+        normalized_key,
+        initial_state,
+        value_transformed_chunks,
+        k_cumdecay_chunks,
+        g_cumsum_chunks,
+    ):
+        query_chunks = normalized_query_scaled.reshape(batch_size, num_heads, n_chunks, chunk_size, key_dim)
+        key_chunks = normalized_key.reshape(batch_size, num_heads, n_chunks, chunk_size, key_dim)
+        decay_mask = jnp.tril(jnp.exp(g_cumsum_chunks[..., :, None] - g_cumsum_chunks[..., None, :]))
+        state = initial_state.astype(jnp.float32)
+
+        def process_chunk(carry, chunk_index):
+            state = carry
+            q_i = query_chunks[:, :, chunk_index]
+            k_i = key_chunks[:, :, chunk_index]
+            v_i = value_transformed_chunks[:, :, chunk_index]
+            decay_mask_i = decay_mask[:, :, chunk_index]
+            k_cumdecay_i = k_cumdecay_chunks[:, :, chunk_index]
+            g_cumsum_i = g_cumsum_chunks[:, :, chunk_index]
+
+            attn_i = jnp.einsum("bhck,bhdk->bhcd", q_i, k_i) * decay_mask_i
+            attn_i = jnp.where(mask_strict_upper, 0.0, attn_i)
+            v_prime = jnp.einsum("bhck,bhkv->bhcv", k_cumdecay_i, state)
+            v_new = v_i - v_prime
+            attn_inter = jnp.einsum("bhck,bhkv->bhcv", q_i * jnp.exp(g_cumsum_i)[..., None], state)
+            attn_v_new = jnp.einsum("bhcd,bhdv->bhcv", attn_i, v_new)
+            core_attn_out_i = attn_inter + attn_v_new
+
+            g_last_minus_g = g_cumsum_i[..., -1, None] - g_cumsum_i
+            k_weighted = k_i * jnp.exp(g_last_minus_g)[..., None]
+            state_update = jnp.einsum("bhck,bhcv->bhkv", k_weighted, v_new)
+            state = state * jnp.exp(g_cumsum_i[..., -1, None, None]) + state_update
+            return state, core_attn_out_i
+
+        final_state, core_attn_out_chunks = jax.lax.scan(process_chunk, state, jnp.arange(n_chunks))
+        core_attn_out = core_attn_out_chunks.transpose(1, 2, 0, 3, 4).reshape(
+            batch_size,
+            num_heads,
+            n_chunks * chunk_size,
+            value_dim,
+        )
+        return core_attn_out.astype(normalized_query_scaled.dtype), final_state
+
+    return run
 
 
 def _active_output_state_reconstruction_probe_fn(
@@ -674,6 +860,10 @@ def _profile_counters(profile_path: Path, profiled_iterations: int, variants: li
         "gdn_prefill/pallas_active_chunk_local_math_probe",
         "gdn_active_chunk_local_math_chunk32_probe",
         "gdn_prefill/pallas_active_output_state_reconstruction_probe",
+        "gdn_prefill/pallas_rectangular_chunk_local_math_probe",
+        "gdn_rectangular_chunk_local_math_chunk32_probe",
+        "gdn_prefill/rectangular_local_split_reconstruction_probe",
+        "gdn_prefill/pallas_rectangular_output_state_reconstruction_probe",
         "while",
         "fusion",
         "transpose",
@@ -759,6 +949,17 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
             "lowering_ok": None,
             "error": None,
         },
+        "rectangular_chunk_local_math_probe": {
+            "attempted": False,
+            "lowering_ok": None,
+            "error": None,
+            "custom_call_count": None,
+        },
+        "rectangular_local_split_reconstruction_probe": {
+            "attempted": False,
+            "lowering_ok": None,
+            "error": None,
+        },
     }
     pallas_pack_last_output = None
     pallas_pack_reference = None
@@ -766,6 +967,10 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
     pallas_local_math_reference = None
     reconstruction_reference_output = None
     reconstruction_pallas_last_output = None
+    rectangular_local_math_reference = None
+    pallas_rectangular_local_math_last_output = None
+    rectangular_reference_reconstruction_output = None
+    rectangular_pallas_reconstruction_output = None
 
     # Compile before profiling. The trace should focus on warmed kernel behavior.
     compiled_variants: list[tuple[str, Callable, Any, float]] = []
@@ -778,6 +983,8 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
     pallas_pack_probe = None
     pallas_local_math_probe = None
     reconstruction_probe = None
+    pallas_rectangular_local_math_probe = None
+    rectangular_reconstruction_probe = None
     if jax.default_backend() == "gpu":
         pallas_feasibility["attempted"] = True
         try:
@@ -918,6 +1125,81 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
                 if reconstruction_info.get("attempted"):
                     reconstruction_info["lowering_ok"] = False
                     reconstruction_info["error"] = f"{type(exc).__name__}: {exc}"
+
+            rectangular_info = pallas_feasibility["rectangular_chunk_local_math_probe"]
+            rectangular_reconstruction_info = pallas_feasibility["rectangular_local_split_reconstruction_probe"]
+            rectangular_info["attempted"] = True
+            rectangular_reconstruction_info["attempted"] = True
+            try:
+                rectangular_local_math_reference = _block_until_ready(
+                    _rectangular_local_math_reference(
+                        normalized_key,
+                        value,
+                        g,
+                        beta,
+                        int(args.chunk_size),
+                    )
+                )
+                rectangular_started = time.perf_counter()
+                rectangular_fn = _pallas_rectangular_chunk_local_math_probe_fn(
+                    int(args.batch_size),
+                    int(args.num_heads),
+                    int(args.seq_len // args.chunk_size),
+                    int(args.chunk_size),
+                    int(args.key_dim),
+                    int(args.value_dim),
+                )
+                pallas_rectangular_local_math_probe = jax.jit(rectangular_fn).lower(
+                    normalized_key,
+                    value,
+                    g,
+                    beta,
+                    key_offsets,
+                    value_offsets,
+                    token_offsets,
+                ).compile()
+                rectangular_info["compile_seconds"] = time.perf_counter() - rectangular_started
+                rectangular_info["lowering_ok"] = True
+
+                rectangular_reconstruction_started = time.perf_counter()
+                rectangular_reconstruction_fn = _rectangular_output_state_reconstruction_probe_fn(
+                    int(args.batch_size),
+                    int(args.num_heads),
+                    int(args.seq_len // args.chunk_size),
+                    int(args.chunk_size),
+                    int(args.key_dim),
+                    int(args.value_dim),
+                )
+                rectangular_reconstruction_probe = jax.jit(rectangular_reconstruction_fn).lower(
+                    normalized_query_scaled,
+                    normalized_key,
+                    initial_state,
+                    rectangular_local_math_reference[0],
+                    rectangular_local_math_reference[1],
+                    rectangular_local_math_reference[2],
+                ).compile()
+                rectangular_reconstruction_info["compile_seconds"] = (
+                    time.perf_counter() - rectangular_reconstruction_started
+                )
+                rectangular_reconstruction_info["lowering_ok"] = True
+                rectangular_reference_reconstruction_output = _block_until_ready(
+                    rectangular_reconstruction_probe(
+                        normalized_query_scaled,
+                        normalized_key,
+                        initial_state,
+                        rectangular_local_math_reference[0],
+                        rectangular_local_math_reference[1],
+                        rectangular_local_math_reference[2],
+                    )
+                )
+            except BaseException as exc:
+                pallas_rectangular_local_math_probe = None
+                rectangular_reconstruction_probe = None
+                rectangular_local_math_reference = None
+                rectangular_info["lowering_ok"] = False
+                rectangular_info["error"] = f"{type(exc).__name__}: {exc}"
+                rectangular_reconstruction_info["lowering_ok"] = False
+                rectangular_reconstruction_info["error"] = f"{type(exc).__name__}: {exc}"
 
     recorder.start_jax_profile(enabled=args.profile)
     try:
@@ -1090,6 +1372,142 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
                     "profiled_iterations": int(args.warmups) + int(args.repeats),
                 }
             )
+        if pallas_rectangular_local_math_probe is not None:
+            rectangular_info = pallas_feasibility["rectangular_chunk_local_math_probe"]
+            warmup_ms = []
+            for _ in range(args.warmups):
+                with _trace_annotation("gdn_prefill/pallas_rectangular_chunk_local_math_probe/warmup"):
+                    started = time.perf_counter()
+                    pallas_rectangular_local_math_last_output = _block_until_ready(
+                        pallas_rectangular_local_math_probe(
+                            normalized_key,
+                            value,
+                            g,
+                            beta,
+                            key_offsets,
+                            value_offsets,
+                            token_offsets,
+                        )
+                    )
+                    warmup_ms.append(1000.0 * (time.perf_counter() - started))
+            repeat_ms = []
+            for _ in range(args.repeats):
+                with _trace_annotation("gdn_prefill/pallas_rectangular_chunk_local_math_probe/repeat"):
+                    started = time.perf_counter()
+                    pallas_rectangular_local_math_last_output = _block_until_ready(
+                        pallas_rectangular_local_math_probe(
+                            normalized_key,
+                            value,
+                            g,
+                            beta,
+                            key_offsets,
+                            value_offsets,
+                            token_offsets,
+                        )
+                    )
+                    repeat_ms.append(1000.0 * (time.perf_counter() - started))
+            mean_ms = float(sum(repeat_ms) / len(repeat_ms)) if repeat_ms else None
+            rectangular_info.update(
+                {
+                    "warmup_ms": warmup_ms,
+                    "repeat_ms": repeat_ms,
+                    "mean_ms": mean_ms,
+                    "p50_ms": _percentile(repeat_ms, 50),
+                    "p95_ms": _percentile(repeat_ms, 95),
+                    "min_ms": min(repeat_ms) if repeat_ms else None,
+                    "max_ms": max(repeat_ms) if repeat_ms else None,
+                    "profiled_iterations": int(args.warmups) + int(args.repeats),
+                }
+            )
+        if rectangular_reconstruction_probe is not None and rectangular_local_math_reference is not None:
+            rectangular_reconstruction_info = pallas_feasibility["rectangular_local_split_reconstruction_probe"]
+            warmup_ms = []
+            for _ in range(args.warmups):
+                with _trace_annotation("gdn_prefill/rectangular_local_split_reconstruction_probe/warmup"):
+                    started = time.perf_counter()
+                    rectangular_reference_reconstruction_output = _block_until_ready(
+                        rectangular_reconstruction_probe(
+                            normalized_query_scaled,
+                            normalized_key,
+                            initial_state,
+                            rectangular_local_math_reference[0],
+                            rectangular_local_math_reference[1],
+                            rectangular_local_math_reference[2],
+                        )
+                    )
+                    warmup_ms.append(1000.0 * (time.perf_counter() - started))
+            repeat_ms = []
+            for _ in range(args.repeats):
+                with _trace_annotation("gdn_prefill/rectangular_local_split_reconstruction_probe/repeat"):
+                    started = time.perf_counter()
+                    rectangular_reference_reconstruction_output = _block_until_ready(
+                        rectangular_reconstruction_probe(
+                            normalized_query_scaled,
+                            normalized_key,
+                            initial_state,
+                            rectangular_local_math_reference[0],
+                            rectangular_local_math_reference[1],
+                            rectangular_local_math_reference[2],
+                        )
+                    )
+                    repeat_ms.append(1000.0 * (time.perf_counter() - started))
+            mean_ms = float(sum(repeat_ms) / len(repeat_ms)) if repeat_ms else None
+            rectangular_reconstruction_info.update(
+                {
+                    "warmup_ms": warmup_ms,
+                    "repeat_ms": repeat_ms,
+                    "mean_ms": mean_ms,
+                    "p50_ms": _percentile(repeat_ms, 50),
+                    "p95_ms": _percentile(repeat_ms, 95),
+                    "min_ms": min(repeat_ms) if repeat_ms else None,
+                    "max_ms": max(repeat_ms) if repeat_ms else None,
+                    "profiled_iterations": int(args.warmups) + int(args.repeats),
+                }
+            )
+        if rectangular_reconstruction_probe is not None and pallas_rectangular_local_math_last_output is not None:
+            rectangular_reconstruction_info = pallas_feasibility["rectangular_local_split_reconstruction_probe"]
+            pallas_warmup_ms = []
+            for _ in range(args.warmups):
+                with _trace_annotation("gdn_prefill/pallas_rectangular_output_state_reconstruction_probe/warmup"):
+                    started = time.perf_counter()
+                    rectangular_pallas_reconstruction_output = _block_until_ready(
+                        rectangular_reconstruction_probe(
+                            normalized_query_scaled,
+                            normalized_key,
+                            initial_state,
+                            pallas_rectangular_local_math_last_output[0],
+                            pallas_rectangular_local_math_last_output[1],
+                            pallas_rectangular_local_math_last_output[2],
+                        )
+                    )
+                    pallas_warmup_ms.append(1000.0 * (time.perf_counter() - started))
+            pallas_repeat_ms = []
+            for _ in range(args.repeats):
+                with _trace_annotation("gdn_prefill/pallas_rectangular_output_state_reconstruction_probe/repeat"):
+                    started = time.perf_counter()
+                    rectangular_pallas_reconstruction_output = _block_until_ready(
+                        rectangular_reconstruction_probe(
+                            normalized_query_scaled,
+                            normalized_key,
+                            initial_state,
+                            pallas_rectangular_local_math_last_output[0],
+                            pallas_rectangular_local_math_last_output[1],
+                            pallas_rectangular_local_math_last_output[2],
+                        )
+                    )
+                    pallas_repeat_ms.append(1000.0 * (time.perf_counter() - started))
+            pallas_mean_ms = float(sum(pallas_repeat_ms) / len(pallas_repeat_ms)) if pallas_repeat_ms else None
+            rectangular_reconstruction_info.update(
+                {
+                    "pallas_warmup_ms": pallas_warmup_ms,
+                    "pallas_repeat_ms": pallas_repeat_ms,
+                    "pallas_mean_ms": pallas_mean_ms,
+                    "pallas_p50_ms": _percentile(pallas_repeat_ms, 50),
+                    "pallas_p95_ms": _percentile(pallas_repeat_ms, 95),
+                    "pallas_min_ms": min(pallas_repeat_ms) if pallas_repeat_ms else None,
+                    "pallas_max_ms": max(pallas_repeat_ms) if pallas_repeat_ms else None,
+                }
+            )
         for name, _fn, compiled, compile_seconds in compiled_variants:
             warmup_ms = []
             last_output = None
@@ -1154,6 +1572,37 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
             and pallas_comparison["valid_output_max_abs"] <= 1e-5
             and pallas_comparison["state_max_abs"] <= 1e-5
         )
+    rectangular_info = pallas_feasibility["rectangular_chunk_local_math_probe"]
+    rectangular_reconstruction_info = pallas_feasibility["rectangular_local_split_reconstruction_probe"]
+    if pallas_rectangular_local_math_last_output is not None and rectangular_local_math_reference is not None:
+        rectangular_info["comparisons"] = _compare_local_math_outputs(
+            rectangular_local_math_reference,
+            pallas_rectangular_local_math_last_output,
+        )
+    if rectangular_reference_reconstruction_output is not None:
+        rectangular_reference_comparison = _compare_outputs(
+            outputs[reference_name],
+            rectangular_reference_reconstruction_output,
+            valid,
+        )
+        rectangular_reconstruction_info["reference_local_math_comparison"] = rectangular_reference_comparison
+        rectangular_reconstruction_info["reference_local_math_passes_1e_5_gate"] = bool(
+            rectangular_reference_comparison["output_max_abs"] <= 1e-5
+            and rectangular_reference_comparison["valid_output_max_abs"] <= 1e-5
+            and rectangular_reference_comparison["state_max_abs"] <= 1e-5
+        )
+    if rectangular_pallas_reconstruction_output is not None:
+        rectangular_pallas_comparison = _compare_outputs(
+            outputs[reference_name],
+            rectangular_pallas_reconstruction_output,
+            valid,
+        )
+        rectangular_reconstruction_info["pallas_local_math_comparison"] = rectangular_pallas_comparison
+        rectangular_reconstruction_info["pallas_local_math_passes_1e_5_gate"] = bool(
+            rectangular_pallas_comparison["output_max_abs"] <= 1e-5
+            and rectangular_pallas_comparison["valid_output_max_abs"] <= 1e-5
+            and rectangular_pallas_comparison["state_max_abs"] <= 1e-5
+        )
     profiled_iterations = len(variants) * (int(args.warmups) + int(args.repeats))
     profile_counters = _profile_counters(recorder.profile_path, profiled_iterations, list(variants)) if args.profile else None
     if profile_counters is not None:
@@ -1167,6 +1616,9 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         local_math_custom_call = ranges.get("gdn_active_chunk_local_math_chunk32_probe")
         if local_math_custom_call is not None:
             pallas_feasibility["active_chunk_local_math_probe"]["custom_call_count"] = int(local_math_custom_call.get("count", 0))
+        rectangular_custom_call = ranges.get("gdn_rectangular_chunk_local_math_chunk32_probe")
+        if rectangular_custom_call is not None:
+            pallas_feasibility["rectangular_chunk_local_math_probe"]["custom_call_count"] = int(rectangular_custom_call.get("count", 0))
 
     return {
         "run_config": {
@@ -1200,7 +1652,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         ],
         "decision": {
             "promote_to_server_routing": False,
-            "reason": "metadata/input-pack/local-math/reconstruction scaffold only; no backend-owned GDN candidate was routed",
+            "reason": "metadata/input-pack/local-math/reconstruction/rectangular-split scaffold only; no backend-owned GDN candidate was routed",
         },
         "run": recorder.metadata(),
     }

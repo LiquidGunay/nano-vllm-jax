@@ -2453,3 +2453,51 @@ Decision:
 - Reject active-local reconstruction as a candidate for server routing. It fails the final `1e-5` correctness gate before any server integration, even when using the active JAX local-math reference. This confirms that small active-shape local differences are amplified by the cross-chunk state recurrence into the same `1e-4` final-state drift class as Entries 058-060.
 - Keep the reconstruction probe in the standalone benchmark because it is a useful guardrail: future active/local Pallas work must pass both the local-intermediate gate and the final output/state reconstruction gate before moving toward `KernelBackendPlaceholder.gated_delta_prefill`.
 - The next viable GDN route should avoid composing active-shaped local intermediates with a separate rectangular state scan. Either the state/output recurrence must be owned by one lowered segmented kernel with its own final-state parity proof, or the active local math must be made shape-compatible with the current rectangular local intermediates before reuse.
+
+## Entry 067 - Rejected Rectangular Local-Math Split Reconstruction
+
+- run id: `20260526-063026-2178120-gdn_prefill_kernel_rectangular_local_split_hetero8_64_512x32`
+- benchmark artifact: `results/gdn_prefill_kernel_rectangular_local_split_hetero8_64_512x32.json`
+- benchmark script: `benchmarks/benchmark_gdn_prefill_kernel.py`
+- profile directory: `/mountpoint/.exp/profiles/20260526-063026-2178120-gdn_prefill_kernel_rectangular_local_split_hetero8_64_512x32`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-063026-2178120-gdn_prefill_kernel_rectangular_local_split_hetero8_64_512x32/plugins/profile/2026_05_26_06_30_43/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-063026-2178120-gdn_prefill_kernel_rectangular_local_split_hetero8_64_512x32/plugins/profile/2026_05_26_06_30_43/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Meitner recommended a rectangular Pallas local-math probe before attempting a full lowered state/output recurrence. It identified the open question after Entry 066 as whether active-shaped gather/scatter caused the final-state drift, and asked for a rectangular `(B,H,n_chunks)` local-math probe that emits `[B,H,n_chunks,chunk,*]` intermediates directly before any inactive-chunk skipping.
+- change tested: the standalone GDN benchmark now records `rectangular_chunk_local_math_probe` and `rectangular_local_split_reconstruction_probe`. The Pallas local probe computes all rectangular chunks, not only active chunks, and emits rectangular `value_transformed`, `k_cumdecay`, `g_cumsum`, and `attn` intermediates. The reconstruction probe feeds either rectangular JAX local intermediates or rectangular Pallas local intermediates into a separate rectangular JAX output/state scan. No model/server route changed.
+- CUDA run: `JAX_PLATFORMS=cuda`, A10G, JAX `0.10.0`, FP32 activations/state, chunk size `32`, lengths `64,128,192,256,320,384,448,512`, `5` warmups, `20` measured repeats, current padded chunk32 only.
+- current padded chunk32 correctness remains exact: `output_max_abs=0.0`, `valid_output_max_abs=0.0`, and `state_max_abs=0.0`.
+- rectangular Pallas local-math gate passed locally: combined local-intermediate max drift `9.537e-07`, with `value_transformed=9.537e-07`, `k_cumdecay=3.576e-07`, `g_cumsum=3.576e-07`, and `attn=2.384e-07`.
+- rectangular split reconstruction failed even from rectangular JAX local intermediates: `output_max_abs=1.335e-05`, `valid_output_max_abs=1.335e-05`, and `state_max_abs=1.678e-04`.
+- rectangular split reconstruction failed from rectangular Pallas local intermediates: `output_max_abs=1.907e-05`, `valid_output_max_abs=1.907e-05`, and `state_max_abs=3.052e-04`.
+- active split reconstruction continues to fail in the same run: active JAX-local reconstruction `state_max_abs=2.136e-04`; active Pallas-local reconstruction `state_max_abs=3.052e-04`.
+- rectangular local-math timing: p50 `3.317 ms`, mean `3.320 ms`, p95 `3.343 ms`. This computes all `128` rectangular chunks and is slower than Entry 065's active-local p50 near `1.94 ms`.
+- rectangular split reconstruction timing: p50 `4.543 ms`, mean `4.559 ms`, p95 `4.645 ms`; reconstruction from Pallas rectangular local intermediates had p50 `4.552 ms`, mean `4.557 ms`, p95 `4.614 ms`.
+- current padded chunk32 timing: p50 `6.500 ms`, mean `6.538 ms`, p95 `6.660 ms`, true-token throughput `352,426 tok/s`, rectangular-token throughput `626,534 tok/s`.
+
+Top profile counters:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `gdn_prefill/current_jax_chunk32_padded` | `165.31 ms / 25` | baseline annotation; repeat clock p50 was `6.500 ms` |
+| `gdn_prefill/pallas_rectangular_chunk_local_math_probe` | `85.58 ms / 25` | rectangular local annotation; repeat clock p50 was `3.317 ms` |
+| `gdn_rectangular_chunk_local_math_chunk32_probe` | `79.49 ms / 50` | actual rectangular local Pallas labels |
+| `gdn_prefill/rectangular_local_split_reconstruction_probe` | `114.29 ms / 25` | split reconstruction from rectangular JAX local intermediates |
+| `gdn_prefill/pallas_rectangular_output_state_reconstruction_probe` | `114.01 ms / 25` | split reconstruction from rectangular Pallas local intermediates |
+| `gdn_prefill/pallas_active_output_state_reconstruction_probe` | `114.38 ms / 25` | active split reconstruction still failing |
+| `gdn_prefill/pallas_active_chunk_local_math_probe` | `49.04 ms / 25` | active local annotation |
+| `gdn_active_chunk_local_math_chunk32_probe` | `43.63 ms / 50` | actual active local Pallas labels |
+| `PjRtCApiLoadedExecutable::Execute` | `108.16 ms / 176` | all benchmark probes plus baseline |
+| `command_buffer::execute` | `47.66 ms / 2500` | probe-heavy diagnostic run, not a serving candidate |
+| `command_buffer::update` | `4.69 ms / 244` | probe-heavy diagnostic run |
+| `input_reduce_fusion` | `14.65 ms / 775` | baseline GDN recurrence-family counter unchanged |
+| `loop_dynamic_update_slice_fusion` | `19.39 ms / 2375` | split reconstruction/scatter diagnostics add update work |
+| `loop_multiply_fusion` | `64.76 ms / 1625` | split reconstruction diagnostics add scan work |
+| `while` | `79.88 ms / 125` | split reconstruction diagnostics add scan loops |
+| `MemcpyD2D` | `28.08 ms / 3325` | diagnostic intermediates/copies |
+| `transpose` | `65.70 ms / 2375` | diagnostic layout work |
+
+Decision:
+
+- Reject rectangular local-math split reconstruction as a candidate path. Rectangular shape compatibility removes active gather/scatter as the root cause, but it does not solve final correctness: simply materializing local GDN intermediates across a separate reconstruction boundary changes numerics enough to miss the final-state gate.
+- Keep the rectangular local and rectangular split probes as benchmark guardrails. They prove that a local-only Pallas replacement, even one that is rectangular and locally accurate to `~1e-6`, is not sufficient for the current `1e-5` final output/state contract.
+- Do not spend more time on split-local GDN designs. The next viable GDN optimization must own local math and cross-chunk state/output recurrence in one lowered parity surface, or must improve a different model-side bottleneck without introducing a local-intermediate materialization boundary.
