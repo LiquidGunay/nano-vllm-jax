@@ -2039,3 +2039,40 @@ Decision:
 - Reject and revert static chunk-major GDN prefill. It preserved correctness, but it confirmed the audit's risk: reducing padded row arithmetic in source JAX destroyed the current vectorized chunked-GDN lowering and created many more small command-buffer executions.
 - Do not pursue further source-level segmented GDN prefill variants. Entry 053 and Entry 056 together bracket row-major and chunk-major segmentation, and both lose badly for the same module/kernel-count reason.
 - Next aligned work should be a backend-owned segmented GDN prefill scaffold and standalone CUDA microbenchmark for the exact hetero8 shape (`B=8`, `H=16`, `T=512`, `K=V=128`, `chunk=32`, lengths `64..512`) before any server routing. Promote it only if the microbenchmark reduces warmed kernel time without command-buffer or module-time growth.
+
+## Entry 057 - Accepted GDN Prefill Kernel Microbenchmark Scaffold
+
+- run id: `20260526-043748-2141732-gdn_prefill_kernel_baseline_hetero8_64_512x32`
+- benchmark artifact: `results/gdn_prefill_kernel_baseline_hetero8_64_512x32.json`
+- benchmark script: `benchmarks/benchmark_gdn_prefill_kernel.py`
+- profile directory: `/mountpoint/.exp/profiles/20260526-043748-2141732-gdn_prefill_kernel_baseline_hetero8_64_512x32`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-043748-2141732-gdn_prefill_kernel_baseline_hetero8_64_512x32/plugins/profile/2026_05_26_04_37_52/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-043748-2141732-gdn_prefill_kernel_baseline_hetero8_64_512x32/plugins/profile/2026_05_26_04_37_52/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Hume recommended keeping this turn to a standalone CUDA/JAX microbenchmark for `backend.gated_delta_prefill`, not server routing. The exact-shape reference should be the accepted current padded `jax_chunk_gated_delta_rule` chunk32 path on `B=8,H=16,T=512,K=V=128,chunk=32,lengths=64..512`; recurrent GDN should only be used as a reduced-shape correctness reference; and source-segmented row/chunk-major variants should not be rerun because Entries 053 and 056 already bracket them as negative controls.
+- change accepted: added `benchmarks/benchmark_gdn_prefill_kernel.py`, a standalone profiled microbenchmark scaffold for the current GDN prefill kernel shape. It records JAX device/version, git head, active vs rectangular tokens/chunks, compile time, warmup/repeat latencies, self-correctness deltas, profile trace path, and parsed Perfetto range counters. It intentionally defaults to only `current_jax_chunk32_padded`; future backend-owned candidates must be added here and win before any server path routes to them.
+- scope note: this is a synthetic kernel benchmark, not a replacement for real-weight generated-token correctness. Main-model correctness remains gated by the Entry 045 hetero8 real-weight reference before any serving change is accepted.
+- smoke check: a tiny CUDA no-profile run (`B=2,H=2,T=64,K=V=16,chunk=16,lengths=32,64`) produced valid JSON and zero self-delta.
+- full CUDA run: `JAX_PLATFORMS=cuda`, A10G, JAX `0.10.0`, FP32 activations/state, chunk size `32`, lengths `64,128,192,256,320,384,448,512`, `5` warmups, `20` measured repeats.
+- correctness: self-comparison for output/final-state is exactly zero (`output_max_abs=0.0`, `valid_output_max_abs=0.0`, `state_max_abs=0.0`). Future candidate comparisons in this benchmark should use `rtol=1e-5, atol=1e-5` as the initial gate, then server-generated exact-token gates.
+- timing: current padded chunk32 standalone GDN prefill p50 `6.477 ms`, mean `6.484 ms`, p95 `6.527 ms`, min `6.458 ms`, max `6.538 ms`, true-token throughput `355,323 tok/s` at `2304` active tokens and rectangular-token throughput `631,686 tok/s` at `4096` rectangular tokens. Compile time was `0.162 s` with the existing disk compile cache warm.
+
+Top profile counters from the standalone trace, normalized by `25` profiled calls (`5` warmup + `20` repeat):
+
+| range | total ms / count | per call | note |
+| --- | ---: | ---: | --- |
+| `gdn_prefill/current_jax_chunk32_padded` | `227.34 ms / 25` | `9.09 ms, 1.00 call` | annotation includes warmups and profiling overhead; use repeat p50 for timing gate |
+| `PjRtCApiLoadedExecutable::Execute` | `97.92 ms / 25` | `3.92 ms, 1.00 call` | device execute baseline |
+| `command_buffer::execute` | `20.65 ms / 1225` | `0.826 ms, 49.0 calls` | kernel-count baseline |
+| `command_buffer::update` | `1.48 ms / 96` | `0.059 ms, 3.84 calls` | update baseline |
+| `input_reduce_fusion` | `14.65 ms / 775` | `0.586 ms, 31.0 calls` | GDN reduce family baseline |
+| `loop_dynamic_update_slice_fusion` | `6.06 ms / 1175` | `0.242 ms, 47.0 calls` | scatter/update baseline to avoid Entry 053/056 explosion |
+| `loop_multiply_fusion` | `22.83 ms / 425` | `0.913 ms, 17.0 calls` | chunk recurrence baseline |
+| `MemcpyD2D` | `5.80 ms / 875` | `0.232 ms, 35.0 calls` | copy baseline |
+| `while` | `28.91 ms / 50` | `1.156 ms, 2.0 calls` | loop baseline |
+| `fusion` | `96.76 ms / 7800` | `3.870 ms, 312.0 calls` | broad fusion baseline |
+| `transpose` | `16.51 ms / 625` | `0.660 ms, 25.0 calls` | layout baseline |
+
+Decision:
+
+- Accept the standalone GDN prefill microbenchmark scaffold. It does not improve serving speed by itself, but it closes the measurement gap identified by Entries 053, 056, and the xhigh audits: backend-owned GDN candidates now have a narrow, reproducible CUDA gate before any model/server routing.
+- Future backend candidates must be added as explicit variants in `benchmark_gdn_prefill_kernel.py` and beat the current p50 `6.477 ms` without worsening command-buffer/module-like counters or correctness deltas. Only then should the candidate be threaded through `KernelBackendPlaceholder.gated_delta_prefill` and tested in the full hetero8 server path.
