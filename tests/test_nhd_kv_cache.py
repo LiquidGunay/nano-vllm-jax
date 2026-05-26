@@ -12,10 +12,12 @@ import pytest
 from nanovllm_jax.backends import PureJAXBackend
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.engine.model_runner import ModelRunner
+from nanovllm_jax.kernels.flashinfer_ffi import kv_append_paged_nhd_reference
 from nanovllm_jax.kv_cache import (
     KVCacheSpec,
     full_attention_nhd_kv_cache_shape,
     init_full_attention_nhd_kv_cache,
+    update_kv_cache,
 )
 from nanovllm_jax.model import init_params
 
@@ -133,3 +135,50 @@ def test_nhd_full_attention_shape_helper_does_not_allocate():
 def test_nhd_full_attention_cache_requires_full_attention_layers():
     with pytest.raises(ValueError, match="full_attention_layers"):
         init_full_attention_nhd_kv_cache(_spec(), full_attention_layers=())
+
+
+def test_kv_append_paged_nhd_reference_matches_canonical_update():
+    page_size = 4
+    num_pages = 8
+    num_kv_heads = 1
+    head_dim = 2
+    block_tables = jnp.array([[3, 1], [2, 4]], dtype=jnp.int32)
+    positions = jnp.array([[0, 4], [1, 6]], dtype=jnp.int32)
+    slot_mapping = block_tables[
+        jnp.arange(2, dtype=jnp.int32)[:, None],
+        positions // page_size,
+    ] * page_size + (positions % page_size)
+    new_k = jnp.arange(2 * 2 * num_kv_heads * head_dim, dtype=jnp.float32).reshape(
+        2,
+        2,
+        num_kv_heads,
+        head_dim,
+    )
+    new_v = new_k + 100.0
+    canonical_k = jnp.zeros((1, num_pages, page_size, num_kv_heads, head_dim), dtype=jnp.float32)
+    canonical_v = jnp.zeros_like(canonical_k)
+
+    canonical_k, canonical_v = update_kv_cache(
+        canonical_k,
+        canonical_v,
+        slot_mapping=slot_mapping,
+        new_k=new_k,
+        new_v=new_v,
+        layer_idx=0,
+    )
+    nhd_k, nhd_v = kv_append_paged_nhd_reference(
+        append_key=new_k.reshape(-1, num_kv_heads, head_dim),
+        append_value=new_v.reshape(-1, num_kv_heads, head_dim),
+        batch_indices=jnp.array([0, 0, 1, 1], dtype=jnp.int32),
+        positions=positions.reshape(-1),
+        k_cache=jnp.zeros((num_pages, page_size, num_kv_heads, head_dim), dtype=jnp.float32),
+        v_cache=jnp.zeros((num_pages, page_size, num_kv_heads, head_dim), dtype=jnp.float32),
+        kv_indices=jnp.array([3, 1, 2, 4], dtype=jnp.int32),
+        kv_indptr=jnp.array([0, 2, 4], dtype=jnp.int32),
+        kv_last_page_len=jnp.array([1, 3], dtype=jnp.int32),
+    )
+
+    assert nhd_k.shape == (num_pages, page_size, num_kv_heads, head_dim)
+    assert nhd_v.shape == (num_pages, page_size, num_kv_heads, head_dim)
+    assert jnp.array_equal(nhd_k, canonical_k[0])
+    assert jnp.array_equal(nhd_v, canonical_v[0])

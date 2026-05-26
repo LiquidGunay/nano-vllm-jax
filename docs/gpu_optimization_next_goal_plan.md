@@ -717,6 +717,11 @@ Commit 5:
 - Add kv_append_paged_nhd via FlashInfer/JAX FFI
 - Add focused tests and integrated benchmark
 
+Interim ABI validation:
+
+- ~~Add pure-JAX `kv_append_paged_nhd` ABI reference for the exact NHD append contract~~
+- ~~Add focused parity test against the canonical `update_kv_cache` path~~
+
 Commit 6:
 
 - Add paged_decode_attention_gqa_nhd via FlashInfer/JAX FFI
