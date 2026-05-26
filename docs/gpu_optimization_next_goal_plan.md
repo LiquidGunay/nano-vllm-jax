@@ -276,12 +276,10 @@ end-to-end throughput.
   `PjRtCApiLoadedExecutable::Execute=290.66 ms / 140`,
   `command_buffer::execute=228.13 ms / 1936`, and `np.asarray(jax.Array)=
   429.63 ms / 16`.
-- A two-repeat `hetero8,long_prefill_512_2048` matrix attempt could not produce
-  benchmark evidence because the current session had no visible NVIDIA device
-  nodes and `nvidia-smi` could not communicate with the driver. The runner now
-  has a CUDA preflight so future real matrix runs fail before loading weights
-  when GPU access is absent. The two-repeat performance artifact remains
-  pending until GPU access is restored.
+- ~~A two-repeat `hetero8,long_prefill_512_2048` matrix attempt could not
+  produce benchmark evidence because the sandboxed command session had no
+  visible NVIDIA device nodes.~~ The GPU was reachable outside that sandbox, and
+  the long-prefill goal-target slice has now been rerun with GPU access.
 - The matrix configs now carry workload-specific stored JAX and vLLM reference
   paths for `hetero8` and `long_prefill_512_2048`. A dry run verified that both
   repeats of `gpu_paged_default` and `gpu_paged_fast_optin` will compare against
@@ -357,6 +355,15 @@ end-to-end throughput.
   largest profile bucket deltas. It is a copyable starting point for the
   required profile-movement explanation; the final interpretation and
   keep/reject/follow-up decision still must be written by the reviewer.
+- Real two-repeat goal-target run:
+  `results/gpu_matrix_20260526_131031.json` and
+  `results/gpu_matrix_20260526_131031.md`. The run is speed-claim-ready in the
+  matrix-gate sense: both repeats succeeded, exact generated-token match held,
+  and all required latency/profile buckets were present. It still fails the
+  final speed target: JAX median throughput is `77.17 tok/s`, vLLM reference is
+  `116.37 tok/s`, JAX/vLLM is `0.663x`, and the `0.75x` target requires
+  `87.28 tok/s`, leaving a `10.11 tok/s` gap or about `1.13x` required JAX
+  speedup.
 
 ## Phase 2 - Kernel Roadmap
 

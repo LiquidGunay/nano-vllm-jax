@@ -3420,3 +3420,69 @@ Decision:
 - Revisit `paged_prefill_attention_gqa_nhd` only after a repeatable target
   profile shows attention-specific prefill buckets are large enough that this
   kernel can move the final `long_prefill_512_2048/gpu_paged_default` target.
+
+## Entry 089 - Two-Repeat Goal Target Matrix Run
+
+- command:
+
+```text
+.venv/bin/python benchmarks/run_gpu_matrix.py \
+  --goal-target-only --repeats 2 --no-live-vllm \
+  --require-stored-references --require-goal-target-ready \
+  --jax-python /mountpoint/.exp/nano-vllm-jax/.venv/bin/python
+```
+
+- artifact: `results/gpu_matrix_20260526_131031.json`
+- report: `results/gpu_matrix_20260526_131031.md`
+- run directory: `results/gpu_matrix_runs/20260526_131031`
+- repeat artifacts:
+  - `results/gpu_matrix_runs/20260526_131031/long_prefill_512_2048_gpu_paged_default_repeat1.json`
+  - `results/gpu_matrix_runs/20260526_131031/long_prefill_512_2048_gpu_paged_default_repeat2.json`
+- environment note: the default command sandbox did not expose `/dev/nvidia*`,
+  but the GPU was reachable outside that sandbox. The benchmark command was run
+  with GPU-visible execution and used the repo-local `.venv` JAX interpreter.
+
+Goal-target result:
+
+| workload/config | repeats | exact tokens | speed-claim-ready | JAX tok/s median | vLLM tok/s | JAX/vLLM | target tok/s | gap |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `long_prefill_512_2048/gpu_paged_default` | 2 | yes | yes | `77.17` | `116.37` | `0.663x` | `87.28` | `10.11 tok/s` |
+
+Repeat details:
+
+| repeat | tok/s | TTFT p50 | ITL p50 | ITL p95 | first `forward_step_token_ids_jit` |
+|---:|---:|---:|---:|---:|---:|
+| 1 | `77.27` | `583.14 ms` | `16.41 ms` | `19.13 ms` | `234.56 ms` |
+| 2 | `77.07` | `586.50 ms` | `15.99 ms` | `17.76 ms` | `235.78 ms` |
+
+Profile movement versus the stored Entry 080 long-prefill JAX reference:
+
+| bucket | current | reference | delta | note |
+|---|---:|---:|---:|---|
+| `PjRtCApiLoadedExecutable::Execute` | `297.86 ms / 140` | `289.24 ms / 140` | `+8.62 ms` | device execution slightly slower |
+| `forward_step_token_ids_jit` | `287.01 ms / 16` | `280.56 ms / 16` | `+6.45 ms` | same count, slower median |
+| `np.asarray(jax.Array)` | `425.38 ms / 16` | `427.55 ms / 16` | `-2.17 ms` | host-sync label slightly lower |
+| `array.py:325 tolist` | `425.53 ms / 16` | `427.68 ms / 16` | `-2.15 ms` | host-sync label slightly lower |
+| `command_buffer::execute` | `230.71 ms / 1936` | `229.21 ms / 1936` | `+1.50 ms` | same command count |
+| `command_buffer::update` | `11.20 ms / 194` | `10.46 ms / 195` | `+0.74 ms` | one fewer update, slightly slower total |
+
+Interpretation:
+
+- The run is valid benchmark evidence for the final non-speculative target:
+  both repeats succeeded, exact generated-token parity held against the stored
+  long-prefill JAX reference, and all required latency/profile counters were
+  present.
+- The default path is still below the target. It needs about `1.13x` more JAX
+  throughput on this workload to reach `0.75x` vLLM.
+- The profile deltas do not point to a new paged-prefill attention opportunity:
+  the largest movement is general compiled execution / decode-step time, while
+  host-sync attribution is slightly lower than the stored reference. This keeps
+  the next work aligned with the existing roadmap: improve the accepted
+  non-speculative model path before MTP, and prefer GDN/full-attention backend
+  work over another source-level JAX rewrite.
+
+Decision:
+
+- Keep the artifacts as the current speed-claim-ready target evidence, but do
+  not mark the goal complete. The final `0.75x` vLLM target is not met.
+- Continue optimization from this target run. Do not start MTP speed work.
