@@ -3486,3 +3486,90 @@ Decision:
 - Keep the artifacts as the current speed-claim-ready target evidence, but do
   not mark the goal complete. The final `0.75x` vLLM target is not met.
 - Continue optimization from this target run. Do not start MTP speed work.
+
+## Entry 090 - Accepted Scheduler Metadata Device-Put Handoff
+
+- change accepted: `Scheduler.build_scheduled_batch` now builds the six
+  `int32` `ScheduledBatch` metadata arrays through one `jax.device_put` of a
+  NumPy pytree instead of six separate `jnp.array(..., dtype=jnp.int32)` calls.
+  The host-side batch contract is unchanged.
+- motivation: Entry 089's fresh target trace showed scheduler/batch-building
+  overhead in the measured serving loop. A focused CUDA microbenchmark for the
+  long-target metadata shapes showed list-backed `jnp.array` construction was
+  materially slower than `jax.device_put(np.asarray(...))`, and one pytree
+  transfer was cheaper than six separate transfers.
+- command:
+
+```text
+.venv/bin/python benchmarks/run_gpu_matrix.py \
+  --goal-target-only --repeats 2 --no-live-vllm \
+  --require-stored-references --require-goal-target-ready \
+  --jax-python /mountpoint/.exp/nano-vllm-jax/.venv/bin/python
+```
+
+- artifact: `results/gpu_matrix_20260526_132210.json`
+- report: `results/gpu_matrix_20260526_132210.md`
+- run directory: `results/gpu_matrix_runs/20260526_132210`
+- repeat artifacts:
+  - `results/gpu_matrix_runs/20260526_132210/long_prefill_512_2048_gpu_paged_default_repeat1.json`
+  - `results/gpu_matrix_runs/20260526_132210/long_prefill_512_2048_gpu_paged_default_repeat2.json`
+
+Goal-target result:
+
+| workload/config | repeats | exact tokens | speed-claim-ready | JAX tok/s median | vLLM tok/s | JAX/vLLM | target tok/s | gap |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `long_prefill_512_2048/gpu_paged_default` | 2 | yes | yes | `85.98` | `116.37` | `0.739x` | `87.28` | `1.30 tok/s` |
+
+Repeat details:
+
+| repeat | tok/s | TTFT p50 | ITL p50 | ITL p95 | first `forward_step_token_ids_jit` |
+|---:|---:|---:|---:|---:|---:|
+| 1 | `85.67` | `553.46 ms` | `12.80 ms` | `13.53 ms` | `234.63 ms` |
+| 2 | `86.29` | `547.63 ms` | `12.75 ms` | `13.87 ms` | `230.41 ms` |
+
+Profile movement versus the stored Entry 080 long-prefill JAX reference:
+
+| bucket | current | reference | delta | note |
+|---|---:|---:|---:|---|
+| `PjRtCApiLoadedExecutable::Execute` | `273.85 ms / 44` | `289.24 ms / 140` | `-15.38 ms / -96` | removes metadata-array executable launches |
+| `forward_step_token_ids_jit` | `275.86 ms / 16` | `280.56 ms / 16` | `-4.70 ms` | decode step slightly lower |
+| `command_buffer::execute` | `227.80 ms / 1936` | `229.21 ms / 1936` | `-1.41 ms` | same command count |
+| `command_buffer::update` | `9.08 ms / 195` | `10.46 ms / 195` | `-1.38 ms` | same update count, lower time |
+| `MemcpyD2D` | `28.20 ms / 463` | `30.39 ms / 655` | `-2.18 ms / -192` | fewer metadata-related copies |
+| `np.asarray(jax.Array)` | `430.13 ms / 16` | `427.55 ms / 16` | `+2.58 ms` | host-sync label mostly waits on device work |
+
+Validation:
+
+```text
+JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  TMPDIR=/mountpoint/.exp/tmp \
+  XDG_CACHE_HOME=/mountpoint/.exp/.cache \
+  JAX_COMPILATION_CACHE_DIR=/mountpoint/.exp/.cache/jax \
+  .venv/bin/python -m pytest -q \
+  tests/test_backend_boundaries.py::test_scheduler_builds_scheduled_batch_for_uncached_suffix \
+  tests/test_backend_boundaries.py::test_scheduler_pads_scheduled_batch_to_static_buckets \
+  tests/test_backend_boundaries.py::test_scheduler_chunks_prefill_by_max_batched_tokens_budget \
+  tests/test_backend_boundaries.py::test_scheduler_rejects_single_prompt_larger_than_prefill_budget
+```
+
+- result: `4 passed`.
+- syntax check: `.venv/bin/python -m py_compile nanovllm_jax/engine/scheduler.py`
+  passed.
+- follow-up checked: a direct NumPy-buffer fill variant produced a similar but
+  slightly lower two-repeat median (`85.76 tok/s`) and was not kept.
+
+Interpretation:
+
+- This is an accepted non-speculative default-path improvement. It keeps exact
+  generated-token parity, improves throughput by `1.102x` versus the stored
+  long-prefill JAX reference, improves TTFT by `32.77 ms`, and improves ITL p50
+  by `3.05 ms`.
+- The change does not complete the thread goal. The current target ratio is
+  `0.739x` vLLM, so the default path still needs about `1.015x` more throughput
+  to reach `0.75x`.
+
+Decision:
+
+- Keep the scheduler metadata handoff change as the current accepted default.
+- Continue looking for a small non-speculative host-sync or compiled-execution
+  win before starting MTP speed work.

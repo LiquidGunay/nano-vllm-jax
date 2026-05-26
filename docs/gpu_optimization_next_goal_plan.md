@@ -364,6 +364,15 @@ end-to-end throughput.
   `116.37 tok/s`, JAX/vLLM is `0.663x`, and the `0.75x` target requires
   `87.28 tok/s`, leaving a `10.11 tok/s` gap or about `1.13x` required JAX
   speedup.
+- Accepted scheduler host-handoff optimization:
+  `results/gpu_matrix_20260526_132210.json` and
+  `results/gpu_matrix_20260526_132210.md`. The scheduler now batches the six
+  `int32` metadata arrays for each `ScheduledBatch` through one
+  `jax.device_put` of NumPy host arrays instead of separate `jnp.array` calls.
+  The two-repeat goal-target matrix remains speed-claim-ready and improves to
+  `85.98 tok/s`, `0.739x` vLLM, with exact generated-token parity. The final
+  target is still not met: it needs `87.28 tok/s`, leaving a `1.30 tok/s` gap
+  or about `1.015x` required JAX speedup.
 
 ## Phase 2 - Kernel Roadmap
 

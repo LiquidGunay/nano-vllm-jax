@@ -4,12 +4,17 @@ import os
 from collections import deque
 from typing import Deque, List, Tuple
 
-import jax.numpy as jnp
+import jax
+import numpy as np
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.engine.scheduled_batch import ScheduledBatch
 from nanovllm_jax.engine.sequence import Sequence, SequenceStatus, SamplingParams
 from nanovllm_jax.engine.block_manager import BlockManager
+
+
+def _device_int32_arrays(*values):
+    return jax.device_put(tuple(np.asarray(value, dtype=np.int32) for value in values))
 
 
 class Scheduler:
@@ -355,16 +360,31 @@ class Scheduler:
         seq_ids_host = tuple([seq.seq_id for seq in seqs] + [-1] * (batch_size_bucket - len(seqs)))
         query_lens_host = tuple(query_lens)
         seq_lens_host = tuple(seq_lens)
+        (
+            tokens_array,
+            positions_array,
+            seq_ids_array,
+            query_start_loc_array,
+            block_tables_array,
+            seq_lens_array,
+        ) = _device_int32_arrays(
+            padded_tokens,
+            padded_positions,
+            seq_ids_host,
+            query_start_loc,
+            block_tables,
+            seq_lens,
+        )
         return ScheduledBatch(
-            tokens=jnp.array(padded_tokens, dtype=jnp.int32),
-            positions=jnp.array(padded_positions, dtype=jnp.int32),
-            seq_ids=jnp.array(seq_ids_host, dtype=jnp.int32),
-            query_start_loc=jnp.array(query_start_loc, dtype=jnp.int32),
+            tokens=tokens_array,
+            positions=positions_array,
+            seq_ids=seq_ids_array,
+            query_start_loc=query_start_loc_array,
             is_prefill=is_prefill,
             num_prefill_tokens=sum(query_lens) if is_prefill else 0,
             num_decode_tokens=0 if is_prefill else sum(query_lens),
-            block_tables=jnp.array(block_tables, dtype=jnp.int32),
-            seq_lens=jnp.array(seq_lens, dtype=jnp.int32),
+            block_tables=block_tables_array,
+            seq_lens=seq_lens_array,
             prefill_is_final=prefill_is_final if is_prefill else None,
             seq_ids_host=seq_ids_host,
             query_lens_host=query_lens_host,
