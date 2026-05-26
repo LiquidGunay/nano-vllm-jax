@@ -1,0 +1,51 @@
+{
+  "name": "gpu_mtp_diagnostics",
+  "description": "MTP1 diagnostics profile. Not a speed-claim config until acceptance quality is meaningful.",
+  "benchmark_script": "benchmarks/benchmark_jax_server_trace.py",
+  "reference_json": "results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json",
+  "vllm_reference_json": "results/qwen08_vllm_async_delta_baseline_hetero8_64_512x32.json",
+  "allow_live_vllm_if_reference_missing": true,
+  "env": {
+    "JAX_PLATFORMS": "cuda",
+    "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH": "1",
+    "NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD": "1",
+    "NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV": "1",
+    "NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z": "1",
+    "NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ": "1",
+    "NANO_VLLM_JAX_COMPACT_PREFILL_MLP": "1",
+    "NANO_VLLM_JAX_KERNEL_BACKEND": "pure_jax"
+  },
+  "args": {
+    "model": "Qwen/Qwen3.5-0.8B",
+    "backend": "gpu",
+    "dtype": "float32",
+    "weight_dtype": "bfloat16",
+    "jax_execution": "jit",
+    "input_lens": "64,128,192,256,320,384,448,512",
+    "output_len": 32,
+    "prompt_suite": "mixed",
+    "num_speculative_tokens": 1,
+    "max_kv_cache_mb": 3072,
+    "num_kvcache_blocks": 256,
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 4096,
+    "prefill_buckets": "64,128,256,384,512",
+    "batch_size_buckets": "1,2,4,8",
+    "max_blocks_per_seq": 40,
+    "top_k": 5,
+    "warmup": true,
+    "profile": true
+  },
+  "diagnostics": {
+    "record_draft_token_rank": true,
+    "record_accepted_rejected_counts": true,
+    "record_acceptance_rate_by_prompt_bucket": true,
+    "record_verifier_overhead": true,
+    "record_commit_select_timing": true,
+    "speed_claim_allowed": false
+  },
+  "negative_control": {
+    "entry": "Entry 049",
+    "reason": "Default MTP1 serving was unusably slower and exact only because all verified drafts were rejected."
+  }
+}

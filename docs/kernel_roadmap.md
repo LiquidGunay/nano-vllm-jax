@@ -1,0 +1,195 @@
+# Kernel Roadmap
+
+This roadmap is the kernel-focused slice of
+`docs/gpu_optimization_next_goal_plan.md`. Every external or lowered kernel must
+remain optional until it passes the correctness and integrated-performance
+gates. The pure-JAX path is the fallback and correctness reference.
+
+## Priority Order
+
+| Priority | Kernel | Purpose |
+| --- | --- | --- |
+| P0.1 | `kv_append_paged_nhd` | Establish full-attention KV physical layout. |
+| P0.2 | `paged_decode_attention_gqa_nhd` | Replace the core full-attention decode read path. |
+| P1.1 | `gdn_recurrent_decode_step` | Own the GDN decode recurrence and state update. |
+| P1.2 | `gdn_segmented_prefill_chunk32` | Replace rectangular padded chunked GDN prefill with a coarse segmented kernel. |
+| P2.1 | `paged_prefill_attention_gqa_nhd` | Improve full-attention prefill after P0 layout is stable. |
+| P2.2 | `qk_norm_rope_kv_append_fused` | Fuse full-attention decode projection post-processing and cache append. |
+| P3 | `topk_logits` / sampling / logprob | Feature and diagnostics kernels after decode is closer to vLLM. |
+| P3 | `silu_and_mul` / RMSNorm smoke kernels | Optional FFI validation helpers only if needed. |
+
+## P0.1 - `kv_append_paged_nhd`
+
+- motivation: define the full-attention paged KV layout so later attention
+  kernels do not pay layout conversion overhead.
+- proposed source/reference implementation: FlashInfer `append_paged_kv_cache`
+  and vLLM `reshape_and_cache_flash_kernel`.
+- JAX-facing ABI:
+
+```python
+kv_append_paged_nhd(
+    append_key,        # [nnz_tokens, num_kv_heads, head_dim]
+    append_value,      # [nnz_tokens, num_kv_heads, head_dim]
+    batch_indices,     # [nnz_tokens]
+    positions,         # [nnz_tokens]
+    k_cache,           # [num_pages, page_size, num_kv_heads, head_dim]
+    v_cache,           # [num_pages, page_size, num_kv_heads, head_dim]
+    kv_indices,        # [total_pages]
+    kv_indptr,         # [batch + 1]
+    kv_last_page_len,  # [batch]
+) -> updated_cache
+```
+
+- fallback path: existing pure-JAX `update_kv_cache`.
+- correctness gate: exact generated-token match vs the current accepted baseline
+  and focused cache-layout parity tests.
+- performance gate: no TTFT or ITL p50/p95 regression; lower or flat cache
+  write/gather/transpose overhead; no new host sync around FFI setup.
+- do-not-merge conditions: per-layer layout conversions, FFI planning in the
+  decode loop, or an integrated regression hidden by a microbenchmark win.
+
+## P0.2 - `paged_decode_attention_gqa_nhd`
+
+- motivation: match the vLLM-style paged decode attention memory access pattern
+  for full-attention layers.
+- proposed source/reference implementation: FlashInfer
+  `BatchDecodeWithPagedKVCacheWrapper` and vLLM PagedAttention.
+- JAX-facing ABI:
+
+```python
+paged_decode_attention_gqa_nhd(
+    q,                 # [batch, num_q_heads, head_dim]
+    k_cache,           # [num_pages, page_size, num_kv_heads, head_dim]
+    v_cache,           # [num_pages, page_size, num_kv_heads, head_dim]
+    kv_indptr,         # [batch + 1]
+    kv_indices,        # [total_pages]
+    kv_last_page_len,  # [batch]
+    seq_lens,          # [batch]
+    softmax_scale,     # float
+) -> out               # [batch, num_q_heads, head_dim]
+```
+
+- fallback path: existing pure-JAX `paged_attention_decode`.
+- correctness gate: exact generated-token match and focused top-5 decode parity.
+- performance gate: ITL p50 improves, ITL p95 does not regress, PjRt Execute and
+  command-buffer update/execute stay flat or improve.
+- do-not-merge conditions: FFI setup inside the decode loop, per-layer layout
+  conversion, or microbenchmark-only improvement.
+
+## P1.1 - `gdn_recurrent_decode_step`
+
+- motivation: Qwen3.5-0.8B has 18 GDN layers and only 6 full-attention layers;
+  GDN decode remains a major model-specific target.
+- proposed source/reference implementation: Qwen 3 Next vLLM GDN path and Flash
+  Linear Attention Gated DeltaNet kernels.
+- JAX-facing ABI:
+
+```python
+gdn_recurrent_decode_step(
+    q,      # [batch, gdn_heads, head_dim], fp32 activation
+    k,      # [batch, gdn_heads, head_dim]
+    v,      # [batch, gdn_heads, head_dim]
+    beta,   # [batch, gdn_heads] or [batch, gdn_heads, 1]
+    gate,   # [batch, gdn_heads] or [batch, gdn_heads, 1]
+    state,  # [batch, gdn_heads, head_dim, head_dim], fp32
+) -> (out, new_state)
+```
+
+- fallback path: `jax_recurrent_gated_delta_rule`.
+- correctness gate: strict recurrent unit parity, exact 500-step generated-token
+  parity, no activation/state dtype downgrade.
+- performance gate: hetero8 ITL p50 improves, ITL p95 does not regress,
+  `forward_step_token_ids_jit` decreases.
+- do-not-merge conditions: state drift above gate, hidden dtype downgrade, or
+  integrated server regression despite a microbenchmark win.
+
+## P1.2 - `gdn_segmented_prefill_chunk32`
+
+- motivation: Entry 045 established chunk size 32 as the best verified point;
+  source-JAX row/chunk segmentation regressed badly, so the next attempt must be
+  backend-owned.
+- proposed source/reference implementation: current padded
+  `jax_chunk_gated_delta_rule` as the reference; Qwen 3 Next vLLM / Flash Linear
+  Attention as implementation references.
+- JAX-facing ABI:
+
+```python
+gdn_segmented_prefill_chunk32(
+    q,              # [nnz_tokens, gdn_heads, head_dim]
+    k,              # [nnz_tokens, gdn_heads, head_dim]
+    v,              # [nnz_tokens, gdn_heads, head_dim]
+    beta,           # [nnz_tokens, gdn_heads]
+    gate,           # [nnz_tokens, gdn_heads]
+    cu_seqlens,     # [batch + 1]
+    initial_state,  # [batch, gdn_heads, head_dim, head_dim]
+    chunk_size=32,
+) -> (y, final_state)
+```
+
+- fallback path: current padded chunk32 JAX implementation.
+- correctness gate: exact generated-token match before serving promotion;
+  standalone output and final-state max abs `<=1e-5` vs current padded chunk32.
+- performance gate: first `forward_step_token_ids_jit` and TTFT p50 improve;
+  PjRt Execute and command-buffer execute/update do not regress.
+- do-not-merge conditions: first prefill gets slower, dynamic-slice/update or
+  tiny-command-buffer count explodes, or the win exists only in a microbenchmark.
+
+## P2.1 - `paged_prefill_attention_gqa_nhd`
+
+- motivation: improve the 6 full-attention layers' prefill path after P0 owns
+  the cache layout.
+- proposed source/reference implementation: FlashInfer
+  `BatchPrefillWithPagedKVCacheWrapper`; MaxText paged/ragged attention design
+  patterns as non-drop-in references.
+- JAX-facing ABI:
+
+```python
+paged_prefill_attention_gqa_nhd(
+    q,                 # [nnz_q, num_q_heads, head_dim]
+    k_cache,
+    v_cache,
+    qo_indptr,          # [batch + 1]
+    kv_indptr,          # [batch + 1]
+    kv_indices,         # [total_pages]
+    kv_last_page_len,   # [batch]
+    causal=True,
+) -> out                # [nnz_q, num_q_heads, head_dim]
+```
+
+- fallback path: existing pure-JAX `paged_attention_prefill`.
+- correctness gate: exact generated-token match and focused attention parity.
+- performance gate: TTFT p50 improves with no ITL regression.
+- do-not-merge conditions: per-layer layout conversion or integrated prefill
+  regression.
+
+## P2.2 - `qk_norm_rope_kv_append_fused`
+
+- motivation: fuse the useful full-attention decode post-projection chain:
+  Q/K/V split, Q/K norm, RoPE, KV append, and returning Q for attention.
+- proposed source/reference implementation: local pure-JAX full-attention path,
+  FlashInfer RoPE/cache helpers where useful.
+- JAX-facing ABI: to be finalized after P0 stabilizes the NHD cache contract.
+- fallback path: current separate JAX norm/RoPE/cache append steps.
+- correctness gate: exact generated-token match and no host-side metadata change.
+- performance gate: lower decode-layer overhead after P0 kernels are stable.
+- do-not-merge conditions: starts before P0 is stable, adds layout conversion, or
+  profile no longer shows norm/RoPE/cache-write overhead.
+
+## P3 - Sampling, Top-k, Logprob, And Smoke Kernels
+
+- motivation: features and diagnostics, not the next greedy throughput lever.
+- proposed source/reference implementation: FlashInfer logits/sampling/norm/RoPE
+  APIs or minimal local FFI smoke kernels.
+- JAX-facing ABI examples:
+
+```python
+topk_logits(logits, k: int) -> (values, indices)
+sample_topk_topp(logits, temperature, top_k, top_p, rng_state) -> token_ids
+```
+
+- fallback path: existing JAX logits, top-k, and sampling code.
+- correctness gate: exact greedy parity where applicable; distribution tests for
+  non-greedy sampling when product requirements exist.
+- performance gate: only considered after decode ITL is closer to vLLM.
+- do-not-merge conditions: distracts from P0/P1, or adds complexity without a
+  product requirement or MTP diagnostic need.

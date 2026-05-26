@@ -58,14 +58,12 @@ not start by changing kernel code.
 
 Create these files:
 
-```text
-docs/current_gpu_baseline.md
-docs/rejected_optimization_index.md
-docs/kernel_roadmap.md
-benchmarks/configs/gpu_paged_default.json
-benchmarks/configs/gpu_paged_fast_optin.json
-benchmarks/configs/gpu_mtp_diagnostics.json
-```
+- ~~`docs/current_gpu_baseline.md`~~
+- ~~`docs/rejected_optimization_index.md`~~
+- ~~`docs/kernel_roadmap.md`~~
+- ~~`benchmarks/configs/gpu_paged_default.json`~~
+- ~~`benchmarks/configs/gpu_paged_fast_optin.json`~~
+- ~~`benchmarks/configs/gpu_mtp_diagnostics.json`~~
 
 ### `docs/current_gpu_baseline.md`
 
@@ -690,51 +688,62 @@ kernel boundaries, not a CUDA implementation to copy.
 
 ## Implementation Order
 
-```text
 Commit 1:
-- Add docs/current_gpu_baseline.md
-- Add docs/rejected_optimization_index.md
-- Add docs/kernel_roadmap.md
-- Add benchmark config JSONs
+
+- ~~Add `docs/current_gpu_baseline.md`~~
+- ~~Add `docs/rejected_optimization_index.md`~~
+- ~~Add `docs/kernel_roadmap.md`~~
+- ~~Add benchmark config JSONs~~
 
 Commit 2:
+
 - Add benchmark matrix runner
 - Add summary JSON output schema
 
 Commit 3:
+
 - Add kernel backend registry:
+
+```text
   nanovllm_jax/kernels/
     __init__.py
     registry.py
     flashinfer_ffi.py
     cuda_gdn.py
+```
 
 Commit 4:
+
 - Add NHD full-attention KV cache allocation behind a flag
 - Keep existing pure-JAX cache fallback
 
 Commit 5:
+
 - Add kv_append_paged_nhd via FlashInfer/JAX FFI
 - Add focused tests and integrated benchmark
 
 Commit 6:
+
 - Add paged_decode_attention_gqa_nhd via FlashInfer/JAX FFI
 - Route only full-attention decode layers
 
 Commit 7:
+
 - Add gdn_recurrent_decode_step prototype
 - First isolated tests, then integrated decode benchmark
 
 Commit 8:
+
 - Add gdn_segmented_prefill_chunk32 prototype
 - Compare against Entry 045 chunk-32 baseline
 
 Commit 9:
+
 - Add paged_prefill_attention_gqa_nhd only if traces justify it
 
 Commit 10:
+
 - Add MTP diagnostics; no MTP speed optimization yet
-```
 
 If FlashInfer/JAX FFI integration is harder than expected, insert a small ABI
 validation commit before Commit 4. That commit should prove an optional external

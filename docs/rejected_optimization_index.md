@@ -1,0 +1,60 @@
+# Rejected Optimization Index
+
+This file indexes rejected optimization experiments from
+`docs/optimization_logbook.md`. Rejected entries are evidence: they define
+negative controls and prevent repeating changes that looked locally attractive
+but lost integrated correctness or performance.
+
+| Entry | Experiment | Correct? | Perf result | Decision | Lesson |
+|---|---|---:|---|---|---|
+| [006](optimization_logbook.md#entry-006---rejected-width-1-gated-deltanet-scan-bypass) | Width-1 GDN scan bypass | Yes | `124.61 tok/s`, `0.942x`; D2D improved but compiled execute regressed | Reject/revert | Source simplification can worsen XLA's compiled plan. |
+| [007](optimization_logbook.md#entry-007---rejected-legacy-snapshot-only-update) | Legacy snapshot-only update | Yes | Slight throughput regression | Reject/revert | State snapshot shortcuts must be rechecked after larger model-path changes. |
+| [008](optimization_logbook.md#entry-008---rejected-decode-slot-mapping-reuse) | Decode slot-mapping reuse | Yes | `123.19 tok/s`, `0.932x`; `_refresh_kv_snapshot` regressed | Reject/revert | Wide reused metadata cost more than per-layer recompute. |
+| [010](optimization_logbook.md#entry-010---rejected-prefill-shape-guard) | Prefill shape guard | Yes | Throughput regressed despite lower median TTFT | Reject/revert | Shape guards must improve the whole serving loop, not one latency slice. |
+| [011](optimization_logbook.md#entry-011---rejected-full-active-decode-kv-write) | Full-active decode KV write | Yes | Slight end-to-end regression | Reject/revert | Decode padding-mask construction was not the bottleneck. |
+| [012](optimization_logbook.md#entry-012---rejected-hidden-select-token-fast-path) | Hidden-select token fast path | Yes | Throughput regressed; GDN prefill bucket unchanged | Reject/revert | Final hidden gathering was not the useful target. |
+| [017](optimization_logbook.md#entry-017---rejected-hybrid-state-donation) | Hybrid-state donation | Yes | Throughput regressed | Reject/revert | Buffer donation changed the compiled plan without a serving win. |
+| [018](optimization_logbook.md#entry-018---rejected-packed-mlp-gateup-projection) | Packed MLP gate/up projection | Yes | Throughput regressed | Reject/revert | Packing weights can move GEMM buckets but lose in the integrated graph. |
+| [021](optimization_logbook.md#entry-021---rejected-compact-banded-prefill) | Compact banded prefill | Yes | `0.931x`; TTFT and ITL regressed | Reject/revert | Whole-prefill source compaction was too broad. |
+| [022](optimization_logbook.md#entry-022---rejected-query-1-decode-attention-shape) | Query-1 decode attention shape | Yes | Slight throughput regression | Reject/revert | Equivalent source shapes can perturb XLA without removing real work. |
+| [023](optimization_logbook.md#entry-023---rejected-single-jit-compact-prefill) | Single-JIT compact prefill | Yes | Throughput regressed | Reject/revert | Repeated/unrolled source-level calls were not the right compact path. |
+| [024](optimization_logbook.md#entry-024---rejected-lm-head-top-k1-greedy-token) | LM-head top-k(1) greedy token | Yes | Throughput regressed | Reject/revert | A different reduction spelling did not reduce LM-head cost. |
+| [030](optimization_logbook.md#entry-030---rejected-compact-attention-output-projections) | Compact attention output projections | Yes | Throughput regressed | Reject/revert | Output-projection compaction added more overhead than it removed. |
+| [031](optimization_logbook.md#entry-031---rejected-laxragged_dot-compact-projections) | `lax.ragged_dot` compact projections | Yes | Not viable on A10G WGMMA path | Reject/revert | Mosaic WGMMA ragged dot is not available for `sm_86`. |
+| [032](optimization_logbook.md#entry-032---rejected-exact-max_blocks_per_seq34-kv-window) | Exact `max_blocks_per_seq=34` KV window | Yes | Throughput regressed | Reject/revert | Narrowing metadata alone did not improve attention/KV execution. |
+| [034](optimization_logbook.md#entry-034---rejected-broadcast-gdn-head-repeat) | Broadcast GDN head repeat | Yes | Throughput regressed | Reject/revert | Source-level repeat changes did not help the GDN decode path. |
+| [035](optimization_logbook.md#entry-035---rejected-packed-mlp-gateup-on-autotuned-baseline) | Packed MLP gate/up on autotuned baseline | Yes | Regressed integrated throughput | Reject/revert | Loader-level packing still lost after autotune. |
+| [036](optimization_logbook.md#entry-036---rejected-pallas-gpu-paged-decode-attention) | Pallas paged decode attention | Yes | `282.01 tok/s`, `0.794x`; ITL p50 `1.393x`; transpose cost rose | Reject/revert | Pallas decode needs a matching physical KV layout, not hot-path transposes. |
+| [037](optimization_logbook.md#entry-037---rejected-pallas-triton-lm-head-argmax) | Pallas LM-head argmax | Yes | Best `346.14 tok/s`, `0.974x`; similar cost to XLA | Reject/revert | Two-stage custom argmax did not beat XLA's dense path. |
+| [038](optimization_logbook.md#entry-038---rejected-unrolled-gdn-conv1d-decode-update) | Unrolled GDN Conv1D decode update | Yes | Integrated decode path regressed | Reject/revert | GDN decode should be one lowered recurrence/conv kernel, not source rewrites. |
+| [039](optimization_logbook.md#entry-039---rejected-pallas-fused-compact-prefill-projection) | Pallas fused compact prefill projection | Yes | BF16/BF16 was faster, FP32/BF16 was slower | Reject/revert | The real contract is FP32 activations with BF16 weights. |
+| [040](optimization_logbook.md#entry-040---rejected-pallas-gated-deltanet-decode-kernel) | Pallas GDN decode kernel | Yes | Microbench won, integrated server `0.977x` | Reject/revert | Microbenchmark-only kernel wins are insufficient. |
+| [041](optimization_logbook.md#entry-041---rejected-full-active-decode-valid-mask-skip) | Full-active decode valid-mask skip | Yes | Regressed target workload | Reject/revert | Mask-source cleanup did not remove a meaningful bottleneck. |
+| [042](optimization_logbook.md#entry-042---rejected-compact-prefill-metadata-indices) | Compact prefill metadata indices | Yes | Regressed target workload | Reject/revert | Precomputed compact metadata was not the bottleneck. |
+| [043](optimization_logbook.md#entry-043---rejected-initial-prefill-local-attention) | Initial-prefill local attention | Yes | Regressed target workload | Reject/revert | Bypassing paged attention locally changed the graph in the wrong direction. |
+| [044](optimization_logbook.md#entry-044---rejected-async-greedy-token-readback) | Async greedy token readback | Yes | `tolist`/`np.asarray` sync bucket did not move | Reject/revert | Copy scheduling alone did not change the dependency structure. |
+| [046](optimization_logbook.md#entry-046---rejected-initial-prefill-bounded-kv-window) | Initial-prefill bounded KV window | Yes | `350.75 tok/s`, `0.954x`; device path heavier | Reject/revert | Static KV bounds did not improve gather/transpose. |
+| [047](optimization_logbook.md#entry-047---rejected-gdn-prefill-chunk-size-16) | GDN chunk-size 16 | Yes | `248.36 tok/s`, `0.675x`; first prefill/module regressed | Reject | Smaller chunks hurt the overall compiled plan despite improving one bucket. |
+| [048](optimization_logbook.md#entry-048---rejected-paged-prefill-head-major-layout) | Head-major paged attention prefill | Yes | `262.85 tok/s`, `0.715x`; GEMM and host sync regressed | Reject/revert | Layout tweaks must preserve downstream GEMM/readback structure. |
+| [049](optimization_logbook.md#entry-049---rejected-default-mtp1-server-path) | Default MTP1 serving | Exact tokens, but `0/92` drafts accepted | Repeat `10.93 tok/s`, `0.030x`; ITL p95 `583x` | Reject | Output stayed exact only because every verified draft was rejected. |
+| [050](optimization_logbook.md#entry-050---rejected-prepacked-mlp-gateup-compact-prefill) | Prepacked MLP gate/up compact prefill | Yes | Local CUTLASS bucket improved, server regressed | Reject/revert | Packed leaves can worsen PjRt, command updates, and sync. |
+| [051](optimization_logbook.md#entry-051---rejected-gpu-flat-kv-cache-layout) | Flat KV cache allocation | Yes | `251.63 tok/s`, `0.684x`; execute/gather/host sync worsened | Reject/revert | New KV layouts need a consumer kernel. |
+| [052](optimization_logbook.md#entry-052---rejected-prepacked-full-attention-kv-projection) | Packed full-attention K/V projection | Yes | `258.87 tok/s`, `0.704x`; target bucket shrank, server regressed | Reject/revert | Local GEMM wins can be erased by compiled-plan changes. |
+| [053](optimization_logbook.md#entry-053---rejected-static-row-chunk-ragged-gdn-prefill) | Static row-chunk ragged GDN prefill | Yes | `131.33 tok/s`, `0.357x`; first prefill exploded | Reject/revert | Source-JAX segmentation produced many tiny kernels. |
+| [054](optimization_logbook.md#entry-054---rejected-head-major-kv-cache-with-pallas-decode-attention) | Head-major KV + Pallas decode attention | Yes | `245.23 tok/s`, `0.667x`; PjRt/GEMM/sync regressed | Reject/revert | KV write/layout/attention must be owned together. |
+| [055](optimization_logbook.md#entry-055---rejected-skip-unused-hidden-return-norm) | Skip-unused hidden return norm | Yes | `250.82 tok/s`, `0.682x`; graph worse overall | Reject/revert | Visible final-norm work was not the useful bottleneck. |
+| [056](optimization_logbook.md#entry-056---rejected-static-chunk-major-gdn-prefill) | Static chunk-major GDN prefill | Yes | `227.49 tok/s`, `0.619x`; many more command buffers | Reject/revert | Source-JAX segmentation de-vectorized chunked GDN. |
+| [058](optimization_logbook.md#entry-058---rejected-gdn-triangular-solve-recurrence) | GDN triangular-solve recurrence | No | Faster p50 but `state_max_abs=2.441e-04` | Reject | State drift above `1e-4` is not acceptable for a single layer. |
+| [059](optimization_logbook.md#entry-059---rejected-pallas-gdn-chunk-recurrence) | Pallas GDN chunk recurrence | No | Faster p50 but `state_max_abs=2.136e-04` | Reject | Pallas recurrence changed FP32 accumulation too much. |
+| [060](optimization_logbook.md#entry-060---rejected-rowwise-exact-length-gdn-prefill) | Rowwise exact-length GDN prefill | No | Slower and `state_max_abs=1.831e-04` | Reject | Smaller static shapes still changed accumulation beyond gate. |
+| [062](optimization_logbook.md#entry-062---rejected-strict-mask-gdn-micro-cleanup) | Strict-mask GDN micro-cleanup | Yes | Too small/noisy; missed historical gate | Reject/revert | Local algebraic cleanup was not a robust optimization. |
+| [066](optimization_logbook.md#entry-066---rejected-active-local-math-outputstate-reconstruction) | Active local-math output/state reconstruction | No | Local math close, final state failed | Reject | Split-local GDN materialization changed final recurrence numerics. |
+| [067](optimization_logbook.md#entry-067---rejected-rectangular-local-math-split-reconstruction) | Rectangular local-math split reconstruction | No | Local math `~1e-6`, final state failed | Reject | Rectangular shape did not fix split-boundary drift. |
+| [069](optimization_logbook.md#entry-069---rejected-one-piece-gdn-pallas-vblock64-compile-gate) | One-piece GDN Pallas vblock64 compile gate | Reduced shape yes; full hetero8 did not compile in time | Full shape spent `>10 min` compiling with no artifact | Reject as serving candidate | One-piece parity surface needs a compile-manageable backend design. |
+
+## MTP Status
+
+Default MTP1 serving is rejected for speed work. Entry 049 kept exact output
+only because all verified speculative drafts were rejected (`0/92` accepted).
+MTP remains diagnostics-only until draft acceptance is meaningfully nonzero and
+commit-select/verifier shapes are warmed before timing.
