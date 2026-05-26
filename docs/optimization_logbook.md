@@ -3885,3 +3885,18 @@ Decision:
 - Do not promote `NANO_VLLM_JAX_CUDA_FP32_KV_APPEND=1` +
   `NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN=1` to default or fast opt-in.
 - Keep the local FP32 CUDA kernels as focused ABI/toolchain diagnostics.
+
+### Entry 094 - Accepted kernel-phase goal target raise
+
+- change accepted: `benchmarks/run_gpu_matrix.py` now sets the active
+  `TARGET_VLLM_RATIO` to `0.9` instead of `0.75`.
+- motivation: Entry 091 and the post-sidecar revalidation closed the staged
+  no-kernel milestone on the deterministic long-prefill gate (`0.764x`, then
+  `0.778x` vLLM). The next goal should be harder and kernel-specific rather
+  than repeatedly validating the closed `0.75x` bar.
+- scope: this changes the executable `--require-goal-target-ready` acceptance
+  threshold, the target-token/s math in matrix summaries, and related tests.
+  Historical `0.75x` logbook entries remain unchanged.
+- decision: use `0.9x` vLLM as the active correctness-gated non-speculative
+  kernel-phase target. MTP remains diagnostic-only until this target is met or
+  explicitly reprioritized.

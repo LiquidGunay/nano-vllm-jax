@@ -15,6 +15,7 @@ from benchmarks.run_gpu_matrix import (
     DEFAULT_WORKLOADS,
     PROFILE_NEEDLES,
     REPO_ROOT,
+    TARGET_VLLM_RATIO,
     WORKLOADS,
     _acceptance_failures,
     _aggregate_repeats,
@@ -102,7 +103,7 @@ def _minimal_summary():
         "goal_target": {
             "workload": "long_prefill_512_2048",
             "config": "gpu_paged_default",
-            "target_vllm_ratio": 0.75,
+            "target_vllm_ratio": TARGET_VLLM_RATIO,
             "description": "test target",
         },
         "jax_python": {
@@ -157,7 +158,7 @@ def _minimal_summary():
                         "profile_counters_present": False,
                     },
                     "speed_claim_ready": False,
-                    "target_vllm_ratio": 0.75,
+                    "target_vllm_ratio": TARGET_VLLM_RATIO,
                     "target_vllm_ratio_met": False,
                     "missing_profile_counters": [],
                     "notes": "not enough evidence for a performance claim",
@@ -743,9 +744,9 @@ def test_comparison_summary_reports_gap_to_target():
     )
 
     assert comparison["jax_over_vllm_throughput"] == pytest.approx(78.0 / 116.0)
-    assert comparison["target_tokens_per_second"] == pytest.approx(87.0)
-    assert comparison["tokens_per_second_gap_to_target"] == pytest.approx(9.0)
-    assert comparison["required_jax_speedup_to_target"] == pytest.approx(87.0 / 78.0)
+    assert comparison["target_tokens_per_second"] == pytest.approx(104.4)
+    assert comparison["tokens_per_second_gap_to_target"] == pytest.approx(26.4)
+    assert comparison["required_jax_speedup_to_target"] == pytest.approx(104.4 / 78.0)
     assert comparison["ttft_ms_p50_delta_vs_vllm"] == 140.0
     assert comparison["itl_ms_p50_delta_vs_vllm"] == 10.0
     assert comparison["jax_reference_source"] == "stored_jax_default"
@@ -763,12 +764,12 @@ def test_comparison_summary_reports_gap_to_target():
 
 def test_comparison_summary_clamps_negative_gap_after_target_met():
     comparison = _comparison_summary(
-        {"tokens_per_second_median": 100.0},
+        {"tokens_per_second_median": 110.0},
         {"performance": {"tokens_per_second": 116.0}},
         "stored",
     )
 
-    assert comparison["target_tokens_per_second"] == pytest.approx(87.0)
+    assert comparison["target_tokens_per_second"] == pytest.approx(104.4)
     assert comparison["tokens_per_second_gap_to_target"] == 0.0
     assert comparison["required_jax_speedup_to_target"] == 1.0
 
@@ -851,7 +852,7 @@ def test_acceptance_failures_reports_missing_evidence_and_target():
                         "exact_generated_token_match": False,
                     },
                     "speed_claim_ready": False,
-                    "target_vllm_ratio": 0.75,
+                    "target_vllm_ratio": TARGET_VLLM_RATIO,
                     "target_vllm_ratio_met": False,
                     "missing_profile_counters": ["repeat1:gather"],
                 }
@@ -864,7 +865,7 @@ def test_acceptance_failures_reports_missing_evidence_and_target():
     assert failures == [
         "long_prefill_512_2048/gpu_paged_fast_optin: "
         "failed checks: correctness_checked,exact_generated_token_match; "
-        "speed_claim_ready=false; target_vllm_ratio_met=false target=0.75; "
+        f"speed_claim_ready=false; target_vllm_ratio_met=false target={TARGET_VLLM_RATIO}; "
         "missing_profile_counters=1"
     ]
 
@@ -883,7 +884,7 @@ def test_acceptance_failures_empty_when_ready_and_target_met():
                         "exact_generated_token_match": True,
                     },
                     "speed_claim_ready": True,
-                    "target_vllm_ratio": 0.75,
+                    "target_vllm_ratio": TARGET_VLLM_RATIO,
                     "target_vllm_ratio_met": True,
                     "missing_profile_counters": [],
                 }
@@ -926,7 +927,7 @@ def test_goal_target_failure_reports_failed_checks():
                         "runs_succeeded": False,
                     },
                     "speed_claim_ready": False,
-                    "target_vllm_ratio": 0.75,
+                    "target_vllm_ratio": TARGET_VLLM_RATIO,
                     "target_vllm_ratio_met": False,
                     "missing_profile_counters": ["repeat1:gather"],
                 }
@@ -939,7 +940,7 @@ def test_goal_target_failure_reports_failed_checks():
     assert failure == (
         "long_prefill_512_2048/gpu_paged_default: "
         "failed checks: runs_succeeded; speed_claim_ready=false; "
-        "target_vllm_ratio_met=false target=0.75; missing_profile_counters=1"
+        f"target_vllm_ratio_met=false target={TARGET_VLLM_RATIO}; missing_profile_counters=1"
     )
 
 
@@ -959,7 +960,7 @@ def test_goal_target_failure_empty_when_target_ready():
                         "runs_succeeded": True,
                     },
                     "speed_claim_ready": True,
-                    "target_vllm_ratio": 0.75,
+                    "target_vllm_ratio": TARGET_VLLM_RATIO,
                     "target_vllm_ratio_met": True,
                     "missing_profile_counters": [],
                 }

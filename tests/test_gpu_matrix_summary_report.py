@@ -7,8 +7,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from benchmarks.summarize_gpu_matrix import acceptance_failures, render_markdown
 
+TARGET_VLLM_RATIO = 0.9
+
 
 def _summary():
+    jax_tokens_per_second = 105.0
+    vllm_tokens_per_second = 116.0
+    target_tokens_per_second = vllm_tokens_per_second * TARGET_VLLM_RATIO
     return {
         "created_at_utc": "20260526_000000",
         "dry_run": False,
@@ -20,7 +25,7 @@ def _summary():
         "goal_target": {
             "workload": "long_prefill_512_2048",
             "config": "gpu_paged_default",
-            "target_vllm_ratio": 0.75,
+            "target_vllm_ratio": TARGET_VLLM_RATIO,
         },
         "jax_python": {
             "path": "/mountpoint/.exp/.venv/bin/python",
@@ -29,13 +34,13 @@ def _summary():
         "comparisons": {
             "long_prefill_512_2048": {
                 "gpu_paged_default": {
-                    "jax_tokens_per_second_median": 90.0,
-                    "vllm_tokens_per_second": 116.0,
-                    "jax_over_vllm_throughput": 90.0 / 116.0,
-                    "target_tokens_per_second": 87.0,
+                    "jax_tokens_per_second_median": jax_tokens_per_second,
+                    "vllm_tokens_per_second": vllm_tokens_per_second,
+                    "jax_over_vllm_throughput": jax_tokens_per_second / vllm_tokens_per_second,
+                    "target_tokens_per_second": target_tokens_per_second,
                     "tokens_per_second_gap_to_target": 0.0,
                     "jax_reference_tokens_per_second": 78.0,
-                    "jax_over_jax_reference_throughput": 90.0 / 78.0,
+                    "jax_over_jax_reference_throughput": jax_tokens_per_second / 78.0,
                     "profile_delta_vs_jax_reference": {
                         "small_bucket": {
                             "current_total_ms_median": 12.0,
@@ -69,7 +74,7 @@ def _summary():
                         "exact_generated_token_match": True,
                     },
                     "speed_claim_ready": True,
-                    "target_vllm_ratio": 0.75,
+                    "target_vllm_ratio": TARGET_VLLM_RATIO,
                     "target_vllm_ratio_met": True,
                     "missing_profile_counters": [],
                 }
@@ -84,7 +89,7 @@ def test_render_markdown_includes_goal_matrix_and_sorted_profile_deltas():
     assert "# GPU Matrix Report" in report
     assert "- target: `long_prefill_512_2048/gpu_paged_default`" in report
     assert "| workload | config | ready | target met | JAX tok/s |" in report
-    assert "| long_prefill_512_2048 | gpu_paged_default | yes | yes | 90.00 |" in report
+    assert "| long_prefill_512_2048 | gpu_paged_default | yes | yes | 105.00 |" in report
     assert "## Acceptance Failures\n\nNone." in report
     assert "## Logbook Entry Template" in report
     assert "- profile movement to explain:" in report
@@ -104,6 +109,6 @@ def test_acceptance_failures_reports_failed_checks_and_missing_profiles():
     assert acceptance_failures(summary) == [
         "long_prefill_512_2048/gpu_paged_default: "
         "failed checks: exact_generated_token_match; "
-        "speed_claim_ready=false; target_vllm_ratio_met=false target=0.75; "
+        f"speed_claim_ready=false; target_vllm_ratio_met=false target={TARGET_VLLM_RATIO}; "
         "missing_profile_counters=1"
     ]

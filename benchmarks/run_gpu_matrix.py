@@ -40,12 +40,12 @@ DEFAULT_JAX_PYTHON = Path(
 )
 DEFAULT_VLLM_PYTHON = Path("/mountpoint/.exp/vllm-venv/bin/python")
 MIN_ACCEPTANCE_REPEATS = 2
-TARGET_VLLM_RATIO = 0.75
+TARGET_VLLM_RATIO = 0.9
 FINAL_TARGET_WORKLOAD = "long_prefill_512_2048"
 FINAL_TARGET_CONFIG = "gpu_paged_default"
 FINAL_TARGET_DESCRIPTION = (
     "non-speculative Qwen/Qwen3.5-0.8B server on long heterogeneous mixed-shape "
-    "requests must be speed-claim-ready and reach at least 0.75x vLLM throughput"
+    "requests must be speed-claim-ready and reach at least 0.9x vLLM throughput"
 )
 PROFILE_NEEDLES = (
     "PjRtCApiLoadedExecutable::Execute",

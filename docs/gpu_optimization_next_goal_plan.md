@@ -311,16 +311,18 @@ end-to-end throughput.
   speed-claim evidence check explicit: successful subprocesses, minimum
   repeats, exact correctness, JAX/vLLM performance presence, TTFT/ITL p50/p95
   latency, first `forward_step_token_ids_jit`, profile counters, and the
-  `0.75x` vLLM target. All configured profile-counter buckets must be present
-  for every repeat. The runner validates the summary shape before writing it.
+  active vLLM ratio target. The active target is now `0.9x`; it was `0.75x`
+  for the closed no-kernel milestone. All configured profile-counter buckets
+  must be present for every repeat. The runner validates the summary shape
+  before writing it.
   Human explanation of profile bucket movement still belongs in the logbook.
 - `benchmarks/run_gpu_matrix.py --require-speed-claim-ready` can be used for
   the final benchmark command. It still writes the summary, then exits nonzero
-  if any selected workload/config is not speed-claim-ready or misses the `0.75x`
-  vLLM target.
+  if any selected workload/config is not speed-claim-ready or misses the active
+  vLLM target ratio.
 - Matrix summaries now record the final thread-goal target explicitly:
   `long_prefill_512_2048/gpu_paged_default` must be speed-claim-ready and reach
-  at least `0.75x` vLLM. `--require-goal-target-ready` writes the summary and
+  at least `0.9x` vLLM. `--require-goal-target-ready` writes the summary and
   exits nonzero unless that specific long heterogeneous non-speculative target
   is present, correctness-gated, profile-covered, and at/above the target
   throughput ratio.
@@ -331,9 +333,10 @@ end-to-end throughput.
   `--require-stored-references`.
 - Comparison rows now include the concrete throughput target and remaining gap:
   `target_tokens_per_second`, `tokens_per_second_gap_to_target`, and
-  `required_jax_speedup_to_target`. On the stored one-repeat long-prefill slice,
-  the target is about `87.28 tok/s`, leaving the default path about
-  `9.26 tok/s` short before repeat/profile/correctness gates are considered.
+  `required_jax_speedup_to_target`. With the active `0.9x` target and the
+  stored vLLM reference at `116.37 tok/s`, the target is about
+  `104.73 tok/s`; the accepted no-kernel default at `90.50 tok/s` is still
+  about `14.23 tok/s` short before kernel work.
 - `--require-stored-references` can be used before benchmark launch to fail
   fast when selected workloads/configs lack stored JAX or vLLM references.
 - Focused tests also verify that all GPU matrix configs have valid stored JAX
@@ -394,12 +397,11 @@ end-to-end throughput.
   `85.98 tok/s`, `0.739x` vLLM, with exact generated-token parity. The final
   target is still not met: it needs `87.28 tok/s`, leaving a `1.30 tok/s` gap
   or about `1.015x` required JAX speedup.
-- Updated parity ladder: keep pushing the pure-JAX/no-custom-kernel default
-  across the `0.75x` vLLM gate first. If that gate is cleared on the
-  vLLM-style diverse benchmark with two-repeat, exact-token, profile-covered
-  evidence, the kernel roadmap should use `0.9x` vLLM as the next accepted
-  serving target. MTP remains diagnostic-only until the non-speculative path
-  has met its staged targets.
+- ~~Updated parity ladder: keep pushing the pure-JAX/no-custom-kernel default
+  across the `0.75x` vLLM gate first.~~ This staged gate is now closed on the
+  deterministic long-prefill target. The active runner gate is `0.9x` vLLM for
+  correctness-gated kernel-backed non-speculative serving. MTP remains
+  diagnostic-only until the non-speculative path has met its staged targets.
 - vLLM benchmark audit: upstream vLLM now exposes `vllm bench serve` for
   online/server throughput and `vllm bench throughput` for offline engine
   throughput. Its benchmark datasets include ShareGPT, random, custom JSONL, HF
@@ -495,6 +497,11 @@ end-to-end throughput.
   `results/gpu_matrix_20260526_144104.md`. The exact long-prefill target remains
   speed-claim-ready and exact, improving to JAX `90.50 tok/s`, vLLM
   `116.37 tok/s`, JAX/vLLM `0.778x`.
+- Executable goal gate update: `benchmarks/run_gpu_matrix.py` now uses
+  `TARGET_VLLM_RATIO=0.9`. This aligns `--require-goal-target-ready`,
+  target-token/s math, and acceptance summaries with the kernel-phase target in
+  this plan. The earlier `0.75x` threshold remains historical evidence for the
+  closed no-kernel milestone, not the current acceptance bar.
 
 ## Phase 2 - Kernel Roadmap
 
