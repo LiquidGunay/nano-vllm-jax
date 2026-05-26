@@ -267,6 +267,12 @@ end-to-end throughput.
   the final benchmark command. It still writes the summary, then exits nonzero
   if any selected workload/config is not speed-claim-ready or misses the `0.75x`
   vLLM target.
+- Matrix summaries now record the final thread-goal target explicitly:
+  `long_prefill_512_2048/gpu_paged_default` must be speed-claim-ready and reach
+  at least `0.75x` vLLM. `--require-goal-target-ready` writes the summary and
+  exits nonzero unless that specific long heterogeneous non-speculative target
+  is present, correctness-gated, profile-covered, and at/above the target
+  throughput ratio.
 - `--require-stored-references` can be used before benchmark launch to fail
   fast when selected workloads/configs lack stored JAX or vLLM references.
 - Focused tests also verify that all GPU matrix configs have valid stored JAX

@@ -3274,3 +3274,42 @@ Decision:
   standalone gate, or require an explicit design decision to accept a
   true-token packed ABI with a separate real-weight full-model token/logit
   parity gate.
+
+## Entry 085 - Final Goal Target Matrix Gate
+
+- change accepted: `benchmarks/run_gpu_matrix.py` now records a `goal_target`
+  section in every summary. The target is
+  `long_prefill_512_2048/gpu_paged_default`, meaning the non-speculative
+  Qwen/Qwen3.5-0.8B server on long heterogeneous mixed-shape requests must be
+  speed-claim-ready and reach at least `0.75x` vLLM throughput.
+- enforcement flag: `--require-goal-target-ready` writes the summary, then exits
+  nonzero unless that exact workload/config is present, has successful repeats,
+  exact generated-token correctness, required latency/profile evidence, a vLLM
+  reference, and meets the `0.75x` throughput ratio.
+- schema update: `benchmarks/configs/gpu_matrix_summary_schema.json` now
+  requires the `goal_target` top-level object for new matrix summaries.
+- focused tests:
+
+```text
+.venv/bin/python -m pytest tests/test_gpu_matrix_runner.py -q
+```
+
+- result: `23 passed`.
+- dry-run verification:
+
+```text
+.venv/bin/python benchmarks/run_gpu_matrix.py \
+  --configs gpu_paged_default --workloads long_prefill_512_2048 \
+  --repeats 2 --dry-run --no-live-vllm --require-goal-target-ready \
+  --output-json /mountpoint/.exp/tmp/gpu_matrix_goal_target_dry_run.json
+```
+
+- result: wrote the summary with `goal_target`, then exited nonzero as expected
+  because dry-run rows have no successful JAX subprocesses, correctness,
+  latency, or profile evidence.
+
+Decision:
+
+- Keep this gate. It prevents a passing matrix on a different workload/config
+  from being mistaken for evidence that the thread's final long-heterogeneous
+  target has been met.

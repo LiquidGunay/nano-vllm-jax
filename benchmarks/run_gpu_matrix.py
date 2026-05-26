@@ -28,6 +28,12 @@ DEFAULT_CONFIGS = ("gpu_paged_default", "gpu_paged_fast_optin", "gpu_mtp_diagnos
 DEFAULT_VLLM_PYTHON = Path("/mountpoint/.exp/vllm-venv/bin/python")
 MIN_ACCEPTANCE_REPEATS = 2
 TARGET_VLLM_RATIO = 0.75
+FINAL_TARGET_WORKLOAD = "long_prefill_512_2048"
+FINAL_TARGET_CONFIG = "gpu_paged_default"
+FINAL_TARGET_DESCRIPTION = (
+    "non-speculative Qwen/Qwen3.5-0.8B server on long heterogeneous mixed-shape "
+    "requests must be speed-claim-ready and reach at least 0.75x vLLM throughput"
+)
 PROFILE_NEEDLES = (
     "PjRtCApiLoadedExecutable::Execute",
     "command_buffer::execute",
@@ -129,6 +135,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-goal-target-ready",
+        action="store_true",
+        help=(
+            "After writing the summary, exit nonzero unless the final goal target "
+            f"{FINAL_TARGET_WORKLOAD}/{FINAL_TARGET_CONFIG} is present, "
+            "speed-claim-ready, and reaches the target vLLM ratio."
+        ),
+    )
+    parser.add_argument(
         "--require-stored-references",
         action="store_true",
         help=(
@@ -188,6 +203,14 @@ def _validate_summary_shape(summary: dict[str, Any], schema: dict[str, Any]) -> 
         raise ValueError("summary.workloads must be a list of strings")
     if not isinstance(configs, list) or not all(isinstance(item, str) for item in configs):
         raise ValueError("summary.configs must be a list of strings")
+    goal_target = summary.get("goal_target")
+    if not isinstance(goal_target, dict):
+        raise ValueError("summary.goal_target must be an object")
+    _validate_required_keys(
+        goal_target,
+        ["workload", "config", "target_vllm_ratio", "description"],
+        "summary.goal_target",
+    )
 
     matrix_required = ["config", "repeats", "aggregate"]
     repeat_required = ["repeat", "artifact", "reference_json", "reference_source", "run", "metrics"]
@@ -757,6 +780,46 @@ def _acceptance_failures(summary: dict[str, Any]) -> list[str]:
     return failures
 
 
+def _format_acceptance_failure(workload_name: str, config_name: str, acceptance: dict[str, Any]) -> str:
+    checks = acceptance.get("checks") or {}
+    failed_checks = sorted(key for key, value in checks.items() if not value)
+    parts: list[str] = []
+    if failed_checks:
+        parts.append("failed checks: " + ",".join(failed_checks))
+    if not acceptance.get("speed_claim_ready"):
+        parts.append("speed_claim_ready=false")
+    if not acceptance.get("target_vllm_ratio_met"):
+        parts.append(
+            f"target_vllm_ratio_met=false target={acceptance.get('target_vllm_ratio')}"
+        )
+    missing_profile_counters = acceptance.get("missing_profile_counters") or []
+    if missing_profile_counters:
+        parts.append(f"missing_profile_counters={len(missing_profile_counters)}")
+    return f"{workload_name}/{config_name}: " + "; ".join(parts)
+
+
+def _goal_target_failure(summary: dict[str, Any]) -> str | None:
+    target = summary.get("goal_target") or {}
+    workload_name = str(target.get("workload") or FINAL_TARGET_WORKLOAD)
+    config_name = str(target.get("config") or FINAL_TARGET_CONFIG)
+    if workload_name not in (summary.get("workloads") or []):
+        return (
+            f"{workload_name}/{config_name}: final goal target workload is not in "
+            "this matrix summary"
+        )
+    if config_name not in (summary.get("configs") or []):
+        return (
+            f"{workload_name}/{config_name}: final goal target config is not in "
+            "this matrix summary"
+        )
+    acceptance = ((summary.get("acceptance") or {}).get(workload_name) or {}).get(config_name)
+    if not isinstance(acceptance, dict):
+        return f"{workload_name}/{config_name}: final goal target acceptance is missing"
+    if acceptance.get("speed_claim_ready") and acceptance.get("target_vllm_ratio_met"):
+        return None
+    return _format_acceptance_failure(workload_name, config_name, acceptance)
+
+
 def main() -> None:
     args = parse_args()
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
@@ -809,6 +872,12 @@ def main() -> None:
             "MemcpyD2D total",
             "tolist / np.asarray sync attribution",
         ],
+        "goal_target": {
+            "workload": FINAL_TARGET_WORKLOAD,
+            "config": FINAL_TARGET_CONFIG,
+            "target_vllm_ratio": TARGET_VLLM_RATIO,
+            "description": FINAL_TARGET_DESCRIPTION,
+        },
         "matrix": {},
         "vllm_references": {},
         "comparisons": {},
@@ -913,6 +982,10 @@ def main() -> None:
         failures = _acceptance_failures(summary)
         if failures:
             raise SystemExit("GPU matrix acceptance failed:\n- " + "\n- ".join(failures))
+    if args.require_goal_target_ready:
+        failure = _goal_target_failure(summary)
+        if failure:
+            raise SystemExit("GPU matrix final goal target failed:\n- " + failure)
 
 
 if __name__ == "__main__":

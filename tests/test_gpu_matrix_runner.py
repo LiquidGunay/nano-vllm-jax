@@ -19,6 +19,7 @@ from benchmarks.run_gpu_matrix import (
     _benchmark_acceptance_summary,
     _configured_workload_reference,
     _cuda_device_preflight,
+    _goal_target_failure,
     _reference_for,
     _find_local_vllm_reference,
     _jax_command,
@@ -56,6 +57,7 @@ def _minimal_schema():
             "configs",
             "workloads",
             "required_metrics",
+            "goal_target",
             "matrix",
             "vllm_references",
             "comparisons",
@@ -75,6 +77,12 @@ def _minimal_summary():
         "configs": ["gpu_paged_default"],
         "workloads": ["hetero8"],
         "required_metrics": [],
+        "goal_target": {
+            "workload": "long_prefill_512_2048",
+            "config": "gpu_paged_default",
+            "target_vllm_ratio": 0.75,
+            "description": "test target",
+        },
         "matrix": {
             "hetero8": {
                 "gpu_paged_default": {
@@ -148,6 +156,14 @@ def test_validate_summary_shape_rejects_missing_acceptance():
     del summary["acceptance"]["hetero8"]["gpu_paged_default"]["checks"]["profile_counters_present"]
 
     with pytest.raises(ValueError, match="profile_counters_present"):
+        _validate_summary_shape(summary, _minimal_schema())
+
+
+def test_validate_summary_shape_rejects_incomplete_goal_target():
+    summary = _minimal_summary()
+    del summary["goal_target"]["description"]
+
+    with pytest.raises(ValueError, match="summary.goal_target"):
         _validate_summary_shape(summary, _minimal_schema())
 
 
@@ -535,3 +551,79 @@ def test_acceptance_failures_empty_when_ready_and_target_met():
     }
 
     assert _acceptance_failures(summary) == []
+
+
+def test_goal_target_failure_reports_missing_target_workload():
+    summary = {
+        "workloads": ["hetero8"],
+        "configs": ["gpu_paged_default"],
+        "goal_target": {
+            "workload": "long_prefill_512_2048",
+            "config": "gpu_paged_default",
+        },
+        "acceptance": {},
+    }
+
+    failure = _goal_target_failure(summary)
+
+    assert "final goal target workload is not in this matrix summary" in failure
+
+
+def test_goal_target_failure_reports_failed_checks():
+    summary = {
+        "workloads": ["long_prefill_512_2048"],
+        "configs": ["gpu_paged_default"],
+        "goal_target": {
+            "workload": "long_prefill_512_2048",
+            "config": "gpu_paged_default",
+        },
+        "acceptance": {
+            "long_prefill_512_2048": {
+                "gpu_paged_default": {
+                    "checks": {
+                        "minimum_repeats": True,
+                        "runs_succeeded": False,
+                    },
+                    "speed_claim_ready": False,
+                    "target_vllm_ratio": 0.75,
+                    "target_vllm_ratio_met": False,
+                    "missing_profile_counters": ["repeat1:gather"],
+                }
+            }
+        },
+    }
+
+    failure = _goal_target_failure(summary)
+
+    assert failure == (
+        "long_prefill_512_2048/gpu_paged_default: "
+        "failed checks: runs_succeeded; speed_claim_ready=false; "
+        "target_vllm_ratio_met=false target=0.75; missing_profile_counters=1"
+    )
+
+
+def test_goal_target_failure_empty_when_target_ready():
+    summary = {
+        "workloads": ["long_prefill_512_2048"],
+        "configs": ["gpu_paged_default"],
+        "goal_target": {
+            "workload": "long_prefill_512_2048",
+            "config": "gpu_paged_default",
+        },
+        "acceptance": {
+            "long_prefill_512_2048": {
+                "gpu_paged_default": {
+                    "checks": {
+                        "minimum_repeats": True,
+                        "runs_succeeded": True,
+                    },
+                    "speed_claim_ready": True,
+                    "target_vllm_ratio": 0.75,
+                    "target_vllm_ratio_met": True,
+                    "missing_profile_counters": [],
+                }
+            }
+        },
+    }
+
+    assert _goal_target_failure(summary) is None

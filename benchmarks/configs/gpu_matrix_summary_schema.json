@@ -11,6 +11,7 @@
     "configs",
     "workloads",
     "required_metrics",
+    "goal_target",
     "matrix",
     "vllm_references",
     "comparisons",
@@ -59,6 +60,15 @@
       "items": {
         "type": "string"
       }
+    },
+    "goal_target": {
+      "type": "object",
+      "required": [
+        "workload",
+        "config",
+        "target_vllm_ratio",
+        "description"
+      ]
     },
     "matrix": {
       "type": "object",
