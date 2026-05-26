@@ -1709,3 +1709,46 @@ Decision:
 - Reject and revert the head-major `paged_attention_prefill` layout. It produced exact tokens and a tiny device-side improvement, but the server-critical path regressed sharply through host synchronization and an important GEMM bucket.
 - Do not keep this as an optional flag. The small transpose/module gains are not useful unless the dependency structure also prevents the later token readback from absorbing the cost.
 - The next attention-layout attempt should inspect lowered HLO/kernel names before changing source shape order again, or defer attention work until a backend-owned KV layout can avoid the transpose/gather pattern more directly.
+
+## Entry 049 - Rejected Default MTP1 Server Path
+
+- first run id: `20260526-025218-2093924-jax_hetero8_64_512x32_mtp1_default`
+- first benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_mtp1_default.json`
+- first profile directory: `/mountpoint/.exp/profiles/20260526-025218-2093924-jax_hetero8_64_512x32_mtp1_default`
+- first Perfetto trace: `/mountpoint/.exp/profiles/20260526-025218-2093924-jax_hetero8_64_512x32_mtp1_default/plugins/profile/2026_05_26_02_55_05/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- first TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-025218-2093924-jax_hetero8_64_512x32_mtp1_default/plugins/profile/2026_05_26_02_55_05/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- repeat run id: `20260526-025631-2095016-jax_hetero8_64_512x32_mtp1_default_repeat`
+- repeat benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_mtp1_default_repeat.json`
+- repeat profile directory: `/mountpoint/.exp/profiles/20260526-025631-2095016-jax_hetero8_64_512x32_mtp1_default_repeat`
+- repeat Perfetto trace: `/mountpoint/.exp/profiles/20260526-025631-2095016-jax_hetero8_64_512x32_mtp1_default_repeat/plugins/profile/2026_05_26_02_57_27/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- repeat TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-025631-2095016-jax_hetero8_64_512x32_mtp1_default_repeat/plugins/profile/2026_05_26_02_57_27/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Tesla reviewed Entries 045-048 and recommended three next model-side targets: Ampere-compatible compact projection fusion under the FP32/BF16 contract, HLO-guided paged/full-attention prefill layout that preserves the current GEMM plan, and a backend-owned transpose-free KV layout for decode. It explicitly warned not to repeat chunk-16, bounded initial-prefill KV windows, or simple head-major paged prefill.
+- change tested: no source change. The benchmark enabled the public server path with `--num-speculative-tokens 1`, BF16 weights, FP32 activations, the accepted chunk-32 default, and exact-token comparison against Entry 045.
+- correctness: exact generated-token match for all 8 rows in both runs, because MTP1 accepted no drafts and fell back to the main model path. Draft quality was not acceptable: `0/92` verified drafts accepted in both runs, with `115` drafts proposed.
+- first JAX timing: `2.21 tok/s`, TTFT p50 `577.89 ms`, ITL p50 `68.63 ms`, ITL p95 `34756.31 ms`.
+- repeat JAX timing: `10.93 tok/s`, TTFT p50 `571.94 ms`, ITL p50 `70.27 ms`, ITL p95 `7930.21 ms`.
+- repeat delta vs Entry 045 chunk-32 default repeat: `0.030x` total tok/s, TTFT p50 `1.972x`, ITL p50 `5.346x`, ITL p95 `583.41x`.
+- scheduler admission: the active `physical_batch_size=8, active_decode_rows=8` bucket reached `acceptance_ready=true` and disabled MTP with `admission_reason=low_acceptance`. The bucket reported `observed_rejected=92`, `observed_accepted=0`, `fallback_partial_rows=12`, and `fallback_seeded_main_steps=14`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 045 ms | MTP1 repeat ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 696.03 | 23421.92 | overall unusably slower |
+| `_run_main_and_sample` | 572.99 over 32 calls | 551.22 over 1 call | only the fallback/main-model step is comparable |
+| `_run_mtp1_batched` | n/a | 7902.83 | verifier path dominates |
+| `mtp1_commit_select_greedy_step_jit` | n/a | 7703.71 | commit-select path dominates |
+| `_profile_jit_call` | 120.22 over 32 calls | 7646.08 over 2 calls | JIT path dominated by MTP tracing/cache miss |
+| `PjitFunction(compiled)` | 240.04 over 64 calls | 15292.12 over 4 calls | huge MTP compiled/tracing attribution |
+| `cache_miss` | n/a | 8128.71 over 1660 calls | repeat still pays JAX tracing/cache-miss overhead |
+| `PjRtCApiLoadedExecutable::Execute` | 138.32 over 252 calls | 523.91 over 366 calls | more/heavier device execution |
+| `command_buffer::execute` | 40.34 over 1143 calls | 15.60 over 904 calls | not the limiting cost here |
+| `gather` | 11.97 | 337.25 | verifier/commit-select gathers are expensive |
+| `transpose` | 63.11 | 59.87 | unchanged |
+| `array.py:325 tolist` | 437.58 | 13.45 | token readback is no longer the limiting bucket |
+
+Decision:
+
+- Reject default MTP1 serving for this hetero8 workload. Output tokens remain exact, but only because all speculative drafts are rejected; MTP1 does not improve generation and the scheduler correctly disables it for low acceptance.
+- Do not optimize around MTP1 until the main model is much closer to vLLM and until the MTP draft path has meaningful acceptance. The current path also needs explicit server warmup coverage for commit-select shapes before any speed number is considered steady-state.
+- Near-term work should return to the main model targets from Tesla's audit: compact projection fusion under the current dtype contract, then HLO-guided attention/KV layout work.
