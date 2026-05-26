@@ -36,6 +36,7 @@ from nanovllm_jax.kv_cache import (
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
 _NHD_FULL_ATTN_CACHE_ENV = "NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE"
+_FLASHINFER_KV_APPEND_ENV = "NANO_VLLM_JAX_FLASHINFER_KV_APPEND"
 
 
 class InferenceBackend(Protocol):
@@ -217,6 +218,29 @@ class PureJAXBackend:
         cache: KVCacheStorage,
         metadata: AttentionMetadata,
     ) -> KVCacheStorage:
+        if os.environ.get(_FLASHINFER_KV_APPEND_ENV, "0") in _TRUE_ENV_VALUES:
+            if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
+                raise ValueError(
+                    "FlashInfer KV append requires cache shape "
+                    "[num_layers, num_pages, page_size, num_kv_heads, head_dim]"
+                )
+            from nanovllm_jax.kernels.flashinfer_ffi import (
+                kv_append_paged_nhd_from_metadata,
+            )
+
+            k_cache_layer, v_cache_layer = kv_append_paged_nhd_from_metadata(
+                k,
+                v,
+                cache.k_cache[layer_id],
+                cache.v_cache[layer_id],
+                metadata,
+                page_size=int(cache.k_cache.shape[2]),
+            )
+            return KVCacheStorage(
+                cache.k_cache.at[layer_id].set(k_cache_layer),
+                cache.v_cache.at[layer_id].set(v_cache_layer),
+            )
+
         query_lens = jnp.diff(metadata.query_start_loc).astype(jnp.int32)
         valid_mask = jnp.arange(metadata.slot_mapping.shape[1])[None, :] < query_lens[:, None]
         k_cache, v_cache = update_kv_cache(

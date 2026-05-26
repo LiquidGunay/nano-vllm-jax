@@ -253,6 +253,83 @@ def kv_append_paged_nhd(
     )
 
 
+def _static_int(value: Any, name: str) -> int:
+    try:
+        return int(value)
+    except Exception as exc:
+        raise ValueError(
+            f"{name} must be a static Python integer for FlashInfer append routing"
+        ) from exc
+
+
+def _kv_last_page_len(seq_lens: jnp.ndarray, page_size: int) -> jnp.ndarray:
+    seq_lens = seq_lens.astype(jnp.int32)
+    return jnp.where(
+        seq_lens > 0,
+        ((seq_lens - 1) % jnp.asarray(page_size, dtype=jnp.int32)) + 1,
+        0,
+    ).astype(jnp.int32)
+
+
+def kv_append_paged_nhd_from_metadata(
+    k: jnp.ndarray,
+    v: jnp.ndarray,
+    k_cache_layer: jnp.ndarray,
+    v_cache_layer: jnp.ndarray,
+    metadata: Any,
+    *,
+    page_size: int,
+):
+    """Append rectangular scheduled K/V tensors using ragged metadata.
+
+    `k` and `v` use the model/backend shape `[batch, query_len, num_kv_heads,
+    head_dim]`. Padded query slots are compacted away using
+    `metadata.query_start_loc` and the static token counters from the scheduled
+    batch.
+    """
+
+    if metadata.positions is None:
+        raise ValueError("metadata.positions is required for FlashInfer KV append")
+
+    num_tokens = _static_int(
+        metadata.num_prefill_tokens,
+        "metadata.num_prefill_tokens",
+    ) + _static_int(
+        metadata.num_decode_tokens,
+        "metadata.num_decode_tokens",
+    )
+    if num_tokens == 0:
+        return k_cache_layer, v_cache_layer
+
+    batch, query_len = k.shape[:2]
+    query_lens = jnp.diff(metadata.query_start_loc).astype(jnp.int32)
+    valid_mask = jnp.arange(query_len, dtype=jnp.int32)[None, :] < query_lens[:, None]
+    row_idx, col_idx = jnp.nonzero(valid_mask, size=num_tokens)
+
+    append_key = k[row_idx, col_idx]
+    append_value = v[row_idx, col_idx]
+    batch_indices = row_idx.astype(jnp.int32)
+    positions = metadata.positions[row_idx, col_idx].astype(jnp.int32)
+    max_pages_per_sequence = metadata.block_tables.shape[1]
+    kv_indices = metadata.block_tables.reshape(-1).astype(jnp.int32)
+    kv_indptr = (
+        jnp.arange(batch + 1, dtype=jnp.int32)
+        * jnp.asarray(max_pages_per_sequence, dtype=jnp.int32)
+    )
+    kv_last_page_len = _kv_last_page_len(metadata.seq_lens, page_size)
+    return kv_append_paged_nhd(
+        append_key,
+        append_value,
+        batch_indices,
+        positions,
+        k_cache_layer,
+        v_cache_layer,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+    )
+
+
 def paged_decode_attention_gqa_nhd(*args: Any, **kwargs: Any):
     require_available()
     raise NotImplementedError("paged_decode_attention_gqa_nhd FlashInfer FFI wrapper is not implemented yet")

@@ -314,11 +314,16 @@ scratch.
 ### Status
 
 - Focused CUDA FFI proof passed on 2026-05-26 for separate NHD K/V caches,
-  BF16 cache tensors, `head_dim=128`, and a non-contiguous page table.
+  BF16 cache tensors, `head_dim=128` and `head_dim=256`, and a non-contiguous
+  page table.
 - The working JAX FFI registration uses `arg_spec=["args", "attrs.layout"]`
   and `input_output_aliases={4: 0, 5: 1}` so FlashInfer can mutate cache inputs
   while JAX receives functional cache outputs with unwritten entries preserved.
-- This is not yet routed into serving and is not accepted as a default backend.
+- The opt-in route `NANO_VLLM_JAX_FLASHINFER_KV_APPEND=1` updates canonical
+  per-layer cache slices through FlashInfer and then returns the existing cache
+  layout to the pure-JAX attention path.
+- This is not yet exact-token/integrated-benchmark accepted and is not a
+  default backend.
 
 ## P0.2 - `paged_decode_attention_gqa_nhd`
 
@@ -725,7 +730,7 @@ Commit 5:
 
 - ~~Add `kv_append_paged_nhd` prototype via FlashInfer/JAX FFI~~
 - ~~Add focused CUDA parity test against the pure-JAX NHD append reference~~
-- Route full-attention layers through NHD append behind an opt-in flag
+- ~~Route full-attention layers through NHD append behind an opt-in flag~~
 - Run exact-token parity and integrated benchmark
 
 Interim ABI validation:
