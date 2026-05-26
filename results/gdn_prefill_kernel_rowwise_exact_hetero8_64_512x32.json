@@ -1,0 +1,248 @@
+{
+  "comparisons": {
+    "current_jax_chunk32_padded_vs_current_jax_chunk32_padded": {
+      "output_max_abs": 0.0,
+      "output_mse": 0.0,
+      "state_max_abs": 0.0,
+      "state_mse": 0.0,
+      "valid_output_max_abs": 0.0,
+      "valid_output_mse": 0.0
+    },
+    "rowwise_exact_chunk32_vs_current_jax_chunk32_padded": {
+      "output_max_abs": 1.9073486328125e-05,
+      "output_mse": 5.568651669749262e-15,
+      "state_max_abs": 0.00018310546875,
+      "state_mse": 1.3294925924056678e-11,
+      "valid_output_max_abs": 1.9073486328125e-05,
+      "valid_output_mse": 9.89982547300967e-15
+    }
+  },
+  "decision": {
+    "correctness_gate_ok": false,
+    "promote_to_server_routing": false,
+    "reason": "rowwise_exact_chunk32 was slower and rejected because valid_output_max_abs=1.907e-05 and state_max_abs=1.831e-04 missed the standalone correctness gate"
+  },
+  "historical_negative_controls": [
+    "Entry053 static row-chunk ragged GDN prefill",
+    "Entry056 static chunk-major GDN prefill"
+  ],
+  "pallas_feasibility": {
+    "attempted": false,
+    "custom_call_count": null,
+    "error": null,
+    "lowering_ok": null
+  },
+  "profile_counters": {
+    "profiled_iterations": 50,
+    "ranges": {
+      "MemcpyD2D": {
+        "count": 4875,
+        "count_per_iter": 97.5,
+        "ms_per_iter": 0.48724854000002166,
+        "total_ms": 24.362427000001084
+      },
+      "PjRtCApiLoadedExecutable::Execute": {
+        "count": 50,
+        "count_per_iter": 1.0,
+        "ms_per_iter": 6.893277300000001,
+        "total_ms": 344.66386500000004
+      },
+      "Thunks::Initialize": {
+        "count": 50,
+        "count_per_iter": 1.0,
+        "ms_per_iter": 0.20273796000000005,
+        "total_ms": 10.136898000000002
+      },
+      "command_buffer::execute": {
+        "count": 3425,
+        "count_per_iter": 68.5,
+        "ms_per_iter": 1.4099796600000019,
+        "total_ms": 70.4989830000001
+      },
+      "command_buffer::update": {
+        "count": 672,
+        "count_per_iter": 13.44,
+        "ms_per_iter": 0.23986221999999965,
+        "total_ms": 11.993110999999983
+      },
+      "fusion": {
+        "count": 100025,
+        "count_per_iter": 2000.5,
+        "ms_per_iter": 10.55172531999991,
+        "total_ms": 527.5862659999955
+      },
+      "gdn_prefill/current_jax_chunk32_padded": {
+        "count": 25,
+        "count_per_iter": 0.5,
+        "ms_per_iter": 3.3701558800000004,
+        "total_ms": 168.50779400000002
+      },
+      "gdn_prefill/rowwise_exact_chunk32": {
+        "count": 25,
+        "count_per_iter": 0.5,
+        "ms_per_iter": 6.284251199999999,
+        "total_ms": 314.21255999999994
+      },
+      "input_reduce_fusion": {
+        "count": 19375,
+        "count_per_iter": 387.5,
+        "ms_per_iter": 2.076966559999949,
+        "total_ms": 103.84832799999747
+      },
+      "loop_dynamic_update_slice_fusion": {
+        "count": 21575,
+        "count_per_iter": 431.5,
+        "ms_per_iter": 2.233887339999808,
+        "total_ms": 111.6943669999904
+      },
+      "loop_multiply_fusion": {
+        "count": 22525,
+        "count_per_iter": 450.5,
+        "ms_per_iter": 2.450408300000337,
+        "total_ms": 122.52041500001685
+      },
+      "transpose": {
+        "count": 1225,
+        "count_per_iter": 24.5,
+        "ms_per_iter": 0.44306874000000085,
+        "total_ms": 22.153437000000043
+      },
+      "while": {
+        "count": 450,
+        "count_per_iter": 9.0,
+        "ms_per_iter": 6.055398779999995,
+        "total_ms": 302.76993899999974
+      }
+    },
+    "trace_json_gz": "/mountpoint/.exp/profiles/20260526-050121-2152572-gdn_prefill_kernel_rowwise_exact_hetero8_64_512x32/plugins/profile/2026_05_26_05_01_36/INDCS0291.atrapa.deloitte.com.trace.json.gz"
+  },
+  "run": {
+    "issues": [],
+    "profile_enabled": true,
+    "profile_error": null,
+    "profile_path": "/mountpoint/.exp/profiles/20260526-050121-2152572-gdn_prefill_kernel_rowwise_exact_hetero8_64_512x32",
+    "profile_started": false,
+    "run_id": "20260526-050121-2152572-gdn_prefill_kernel_rowwise_exact_hetero8_64_512x32",
+    "run_label": "gdn_prefill_kernel_rowwise_exact_hetero8_64_512x32",
+    "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+  },
+  "run_config": {
+    "active_chunks": 72,
+    "batch_size": 8,
+    "chunk_size": 32,
+    "device": "cuda:0",
+    "device_kind": "NVIDIA A10G",
+    "devices": [
+      "cuda:0"
+    ],
+    "dtype_contract": "fp32 activations/state, output cast follows current jax_chunk_gated_delta_rule",
+    "git_head": "4d2fea0",
+    "jax_backend": "gpu",
+    "jax_version": "0.10.0",
+    "key_dim": 128,
+    "lengths": [
+      64,
+      128,
+      192,
+      256,
+      320,
+      384,
+      448,
+      512
+    ],
+    "num_heads": 16,
+    "platform": "gpu",
+    "rectangular_tokens": 4096,
+    "repeats": 20,
+    "seed": 1234,
+    "seq_len": 512,
+    "total_chunks": 128,
+    "true_tokens": 2304,
+    "value_dim": 128,
+    "variants": [
+      "current_jax_chunk32_padded",
+      "rowwise_exact_chunk32"
+    ],
+    "warmups": 5
+  },
+  "variants": {
+    "current_jax_chunk32_padded": {
+      "compile_seconds": 0.1613789979601279,
+      "max_ms": 7.118050940334797,
+      "mean_ms": 6.548805994680151,
+      "min_ms": 6.452706991694868,
+      "p50_ms": 6.4830975024960935,
+      "p95_ms": 6.822233396815137,
+      "rectangular_tokens_per_second": 625457.5266586519,
+      "repeat_ms": [
+        6.496938061900437,
+        6.4591869013383985,
+        6.467498023994267,
+        6.471527041867375,
+        6.476927897892892,
+        6.477106944657862,
+        6.474377936683595,
+        6.464696954935789,
+        6.46526797208935,
+        7.118050940334797,
+        6.518068024888635,
+        6.581849069334567,
+        6.556870066560805,
+        6.530468002893031,
+        6.504438002593815,
+        6.452706991694868,
+        6.8066640524193645,
+        6.687282002530992,
+        6.482247030362487,
+        6.4839479746297
+      ],
+      "true_tokens_per_second": 351819.85874549166,
+      "warmup_ms": [
+        10.906810988672078,
+        6.820323993451893,
+        6.6174500389024615,
+        6.5574090695008636,
+        6.5075180027633905
+      ]
+    },
+    "rowwise_exact_chunk32": {
+      "compile_seconds": 10.188544175005518,
+      "max_ms": 14.885726035572588,
+      "mean_ms": 12.043946253834292,
+      "min_ms": 10.729157947935164,
+      "p50_ms": 11.591121030505747,
+      "p95_ms": 14.544080320047215,
+      "rectangular_tokens_per_second": 340087.867686723,
+      "repeat_ms": [
+        12.07234594039619,
+        10.945003014057875,
+        10.730307083576918,
+        10.986294015310705,
+        10.928452014923096,
+        14.319634065032005,
+        14.308143989183009,
+        12.288721045479178,
+        11.686707963235676,
+        10.768629028461874,
+        10.729157947935164,
+        11.548044974915683,
+        11.080814991146326,
+        14.52609896659851,
+        14.885726035572588,
+        13.127558981068432,
+        11.847131070680916,
+        11.325049912557006,
+        11.140906950458884,
+        11.63419708609581
+      ],
+      "true_tokens_per_second": 191299.4255737817,
+      "warmup_ms": [
+        20.53431491367519,
+        12.162567931227386,
+        14.939767075702548,
+        14.133279910311103,
+        11.448801960796118
+      ]
+    }
+  }
+}

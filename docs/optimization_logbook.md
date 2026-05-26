@@ -2150,3 +2150,40 @@ Decision:
 - Reject and revert the Pallas chunk recurrence. It confirms Pallas/Triton can reduce this part of the standalone GDN profile on A10G, but it still changes FP32 accumulation enough to miss the output and final-state gates.
 - Do not route this through `KernelBackendPlaceholder.gated_delta_prefill` or keep it as an exposed variant. The current exact padded chunk32 source path remains the only accepted GDN prefill implementation.
 - Next viable Pallas work should not replace only mathematically equivalent reductions. It should target the actual segmented active-chunk problem while preserving the current outputs/final states within `1e-5`; otherwise move to JAX FFI/custom-call only with a clear build plan and the same standalone gate.
+
+## Entry 060 - Rejected Rowwise Exact-Length GDN Prefill
+
+- run id: `20260526-050121-2152572-gdn_prefill_kernel_rowwise_exact_hetero8_64_512x32`
+- benchmark artifact: `results/gdn_prefill_kernel_rowwise_exact_hetero8_64_512x32.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-050121-2152572-gdn_prefill_kernel_rowwise_exact_hetero8_64_512x32`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-050121-2152572-gdn_prefill_kernel_rowwise_exact_hetero8_64_512x32/plugins/profile/2026_05_26_05_01_36/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-050121-2152572-gdn_prefill_kernel_rowwise_exact_hetero8_64_512x32/plugins/profile/2026_05_26_05_01_36/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Peirce recommended a microbenchmark-only `length_bucketed_current_jax_chunk32` diagnostic: call the existing `jax_chunk_gated_delta_rule` unchanged on each static prompt length, pad outputs back to `T=512`, and compare against current padded chunk32. The audit framed this as the best source-JAX diagnostic because it skips inactive chunks without changing recurrence math and without repeating Entries 053/056's per-active-row/chunk dynamic-slice scans.
+- change tested: a temporary benchmark-only `rowwise_exact_chunk32` variant called the accepted chunked GDN implementation once per row/length (`64..512`) with the row's real prefix, then padded outputs and concatenated states back to the rectangular contract. It processed `72` real chunks instead of `128` rectangular chunks. The source hook was reverted after profiling.
+- smoke check: a tiny CUDA no-profile run (`B=2,H=2,T=64,K=V=16,chunk=16,lengths=32,64`) lowered and ran. It matched within `valid_output_max_abs=1.490e-07` and `state_max_abs=5.960e-07`.
+- full CUDA run: `JAX_PLATFORMS=cuda`, A10G, JAX `0.10.0`, FP32 activations/state, chunk size `32`, lengths `64,128,192,256,320,384,448,512`, `5` warmups, `20` measured repeats per variant.
+- timing: current padded chunk32 in the same run had p50 `6.483 ms`, mean `6.549 ms`, p95 `6.822 ms`; rowwise exact-length had p50 `11.591 ms`, mean `12.044 ms`, p95 `14.544 ms`. Compile time also grew from `0.161 s` to `10.189 s`.
+- correctness: reject. The rowwise candidate missed the Entry 057 standalone gate with `valid_output_max_abs=1.907e-05` and `state_max_abs=1.831e-04`. This shows that even reusing the same JAX source at smaller static shapes changes FP32 accumulation enough to fail the current state/output bar.
+
+Top profile counters from the mixed two-variant trace:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `gdn_prefill/current_jax_chunk32_padded` | `168.51 ms / 25` | about `6.74 ms` per current call including warmup/profile overhead |
+| `gdn_prefill/rowwise_exact_chunk32` | `314.21 ms / 25` | about `12.57 ms` per candidate call including warmup/profile overhead |
+| `PjRtCApiLoadedExecutable::Execute` | `344.66 ms / 50` | mixed current+candidate calls, about `6.89 ms` per profiled call |
+| `command_buffer::execute` | `70.50 ms / 3425` | mixed current+candidate, `68.5` calls per profiled call |
+| `command_buffer::update` | `11.99 ms / 672` | mixed current+candidate, `13.44` calls per profiled call |
+| `input_reduce_fusion` | `103.85 ms / 19375` | large recurrence-family expansion |
+| `loop_dynamic_update_slice_fusion` | `111.69 ms / 21575` | per-row subgraphs expanded update/scatter work |
+| `loop_multiply_fusion` | `122.52 ms / 22525` | per-row subgraphs expanded multiply work |
+| `while` | `302.77 ms / 450` | rowwise chunk scans multiplied loop work |
+| `fusion` | `527.59 ms / 100025` | broad fusion count exploded |
+| `MemcpyD2D` | `24.36 ms / 4875` | copy count increased to `97.5` per profiled call |
+| `transpose` | `22.15 ms / 1225` | lower than current in isolation but not relevant next to recurrence explosion |
+
+Decision:
+
+- Reject and revert rowwise exact-length GDN prefill. It failed both acceptance axes: correctness drift exceeded the standalone gate, and performance regressed badly from duplicated per-row compiled subgraphs.
+- Treat this as closure for source-JAX exact-length inactive-chunk skipping. Even the best diagnostic source spelling creates shape-dependent numerical drift and Entry-053/056-like module/kernel expansion.
+- The next GDN speed attempt should be a true backend-owned segmented kernel that preserves the exact padded chunk32 accumulation contract, or a lower-level custom implementation with explicit correctness controls; more source-JAX decomposition is not aligned with the current evidence.
