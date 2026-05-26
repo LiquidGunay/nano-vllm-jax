@@ -1510,3 +1510,46 @@ Decision:
 - Reject and revert initial-prefill local attention. Correctness was exact and the stricter gate was safe, but the profile did not show a real TTFT or first-prefill improvement. The repeat was only tied with Entry 033, while the first profiled run was materially slower.
 - Do not keep this source branch as an optional flag; it adds another compiled shape key and attention implementation for no durable win.
 - The useful follow-up from this experiment is negative evidence: avoiding the paged-cache gather for the whole initial prefill does not move the dominant prefill bucket in this hetero8 workload. The next prefill work should target the XLA full-attention/prefill HLO layout itself or run the controlled GDN chunk/layout sweep from the audit.
+
+## Entry 044 - Rejected Async Greedy Token Readback
+
+- run id: `20260526-015956-2070683-jax_hetero8_64_512x32_async_token_readback`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_async_token_readback.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-015956-2070683-jax_hetero8_64_512x32_async_token_readback`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-015956-2070683-jax_hetero8_64_512x32_async_token_readback/plugins/profile/2026_05_26_02_01_48/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-015956-2070683-jax_hetero8_64_512x32_async_token_readback/plugins/profile/2026_05_26_02_01_48/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- repeat run id: `20260526-020223-2071684-jax_hetero8_64_512x32_async_token_readback_repeat`
+- repeat benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_async_token_readback_repeat.json`
+- repeat profile directory: `/mountpoint/.exp/profiles/20260526-020223-2071684-jax_hetero8_64_512x32_async_token_readback_repeat`
+- repeat Perfetto trace: `/mountpoint/.exp/profiles/20260526-020223-2071684-jax_hetero8_64_512x32_async_token_readback_repeat/plugins/profile/2026_05_26_02_02_48/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- repeat TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-020223-2071684-jax_hetero8_64_512x32_async_token_readback_repeat/plugins/profile/2026_05_26_02_02_48/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Wegener reviewed the accepted Entry 033 and rejected Entries 040-043. It ranked the next high-probability model-side experiments as: (1) controlled GDN prefill chunk/layout sweep in `jax_chunk_gated_delta_rule`/`gated_deltanet_block`, expecting `input_reduce_fusion` and first prefill step movement; (2) HLO-guided full-attention/paged-prefill layout work in `paged_attention_prefill`; (3) a transpose-free GPU KV layout for future Pallas decode attention, only if the physical cache layout removes the transpose regression from Entry 036.
+- change tested: a temporary `NANO_VLLM_JAX_ASYNC_TOKEN_READBACK=1` path called `copy_to_host_async()` on the small greedy token-id result immediately after `forward_step_token_ids_jit`, before cache/hybrid snapshot bookkeeping. The goal was to overlap token-id device-to-host transfer with Python-side post-step bookkeeping and reduce the later `token_ids.tolist()` synchronization range. The source change was reverted after profiling.
+- focused CUDA checks: with `NANO_VLLM_JAX_ASYNC_TOKEN_READBACK=1` and `NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH=1`, `tests/test_backend_boundaries.py::test_model_runner_uses_bucketed_batched_jit_path`, `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute`, `tests/test_backend_boundaries.py::test_bucketed_prefill_last_logits_match_exact_prefill`, and `tests/test_lm_head_helpers.py` passed (`6 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 033 hetero8 reference in both profiled runs.
+- first JAX timing: `340.22 tok/s`, TTFT p50 `322.00 ms`, ITL p50 `13.56 ms`, ITL p95 `15.36 ms`.
+- repeat JAX timing: `355.19 tok/s`, TTFT p50 `318.38 ms`, ITL p50 `12.76 ms`, ITL p95 `13.66 ms`.
+- repeat delta vs Entry 033 default: `1.000x` total tok/s, TTFT p50 `1.008x`, ITL p50 `0.993x`, ITL p95 `0.991x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 033 ms | async readback repeat ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 720.52 | 720.73 | overall tied |
+| `_run_main_and_sample` | 598.60 | 598.10 | runner hot path tied |
+| `forward_step_token_ids_jit` | 175.81 | 172.01 | small cumulative improvement, not reflected in throughput |
+| `PjRtCApiLoadedExecutable::Execute` | 191.91 over 252 calls | 187.62 over 252 calls | slight cumulative improvement |
+| `jit_compiled:XLA GPU module` | 147.90 | 144.88 | slight cumulative improvement |
+| `command_buffer::execute` | 92.22 over 1575 calls | 91.14 over 1575 calls | same dispatch count |
+| `command_buffer::update` | 27.81 over 248 calls | 26.62 over 248 calls | slight cumulative improvement |
+| `array.py:325 tolist` | 409.69 | 410.12 | target host sync unchanged |
+| `np.asarray(jax.Array)` | 409.43 | 409.93 | target host sync unchanged |
+| `input_reduce_fusion` | 59.30 | 59.08 | unchanged |
+| `wrapped_concatenate` | 36.49 | 36.50 | unchanged |
+| `MemcpyD2D` | 24.62 | 24.84 | unchanged/slightly worse |
+
+Decision:
+
+- Reject and revert async greedy token readback. The idea was correctness-neutral, but the profile shows the actual `tolist`/`np.asarray(jax.Array)` synchronization bucket did not move.
+- Do not keep an optional flag for this. If host synchronization is revisited, it needs a larger serving-loop change that changes the dependency structure, not only `copy_to_host_async()` on the final token-id array.
+- Follow the xhigh audit for the next model-side experiment: controlled GDN prefill chunk/layout sweep with exact-token gates and profile focus on `input_reduce_fusion`, first `forward_step_token_ids_jit`, and total compiled execution.
