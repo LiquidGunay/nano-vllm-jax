@@ -2364,3 +2364,48 @@ Decision:
 - Keep the active-input pack probe as benchmark instrumentation. It proves that the active-chunk metadata can drive vectorized multi-output Pallas input movement on A10G and preserve exact FP32 input values.
 - Do not route a separate pack step through the server. The standalone pack costs about `0.455 ms` p50 and emits two custom-call labels per benchmark call, so as an isolated step it would spend a meaningful fraction of the current `6.47 ms` GDN prefill time before doing any GDN math.
 - The next real candidate should fuse this active-chunk indexing directly into `pallas_segmented_chunk32_skip_inactive`, so inactive chunks are skipped inside the GDN computation rather than copied into an intermediate buffer first.
+
+## Entry 065 - Pallas Active-Chunk Local Math Probe For Segmented GDN
+
+- run id: `20260526-060946-2172399-gdn_prefill_kernel_active_local_math_hetero8_64_512x32`
+- benchmark artifact: `results/gdn_prefill_kernel_active_local_math_hetero8_64_512x32.json`
+- benchmark script: `benchmarks/benchmark_gdn_prefill_kernel.py`
+- profile directory: `/mountpoint/.exp/profiles/20260526-060946-2172399-gdn_prefill_kernel_active_local_math_hetero8_64_512x32`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-060946-2172399-gdn_prefill_kernel_active_local_math_hetero8_64_512x32/plugins/profile/2026_05_26_06_09_59/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-060946-2172399-gdn_prefill_kernel_active_local_math_hetero8_64_512x32/plugins/profile/2026_05_26_06_09_59/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Arendt recommended a smaller fused per-active-chunk local-math probe before attempting the full segmented GDN kernel. It warned that Entries 058-060 already showed tiny recurrence-order changes can miss the final-state gate, so the next safe step should fuse active indexing into the first real chunk-local GDN math and compare local intermediates before adding the cross-chunk state scan.
+- change accepted: the standalone GDN benchmark now includes a benchmark-only Pallas/Triton local-math probe named `gdn_active_chunk_local_math_chunk32_probe`. It consumes the active-chunk metadata, gathers normalized rectangular `key` plus `value`/`g`/`beta`, and computes chunk-local `g_cumsum`, decay-masked HF row-recurrence `attn`, `value_transformed`, and `k_cumdecay`. It compares those intermediates against a JAX reference extracted from the current padded chunk32 math. No model/server route changed.
+- implementation note: an initial full-shape smoke with raw, unnormalized random keys produced huge local recurrence drift because it did not match the real `jax_chunk_gated_delta_rule` contract. The accepted probe uses the same L2-normalized key contract as the current path. A scalar per-entry active-KKT Pallas smoke also drifted by `3.05e-05`; the accepted version uses a per-active-chunk matrix `pl.dot(..., allow_tf32=False)` tile, which matched the JAX reference.
+- CUDA run: `JAX_PLATFORMS=cuda`, A10G, JAX `0.10.0`, FP32 activations/state, chunk size `32`, lengths `64,128,192,256,320,384,448,512`, `5` warmups, `20` measured repeats, current padded chunk32 only.
+- active-chunk contract: `72` active chunks, `128` total chunks, `56` inactive chunks, and `2304` active tokens.
+- local-math correctness: lowering succeeded, compile time `5.094 s`, and the local intermediate comparison passed the `1e-5` gate. Max-abs deltas were `value_transformed=9.537e-07`, `k_cumdecay=3.576e-07`, `g_cumsum=3.576e-07`, `attn=2.384e-07`, combined max `9.537e-07`.
+- local-math timing: p50 `1.967 ms`, mean `1.970 ms`, p95 `2.004 ms`, min `1.915 ms`, max `2.012 ms`.
+- active-input pack probe remains exact in this run, with p50 `0.498 ms`, mean `0.496 ms`, p95 `0.519 ms`.
+- current padded chunk32 correctness remains exact: `output_max_abs=0.0`, `valid_output_max_abs=0.0`, and `state_max_abs=0.0`.
+- current padded chunk32 timing: p50 `6.498 ms`, mean `6.504 ms`, p95 `6.546 ms`, true-token throughput `354,244 tok/s`, rectangular-token throughput `629,768 tok/s`.
+
+Top profile counters:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `gdn_prefill/current_jax_chunk32_padded` | `175.43 ms / 25` | baseline annotation; repeat clock p50 was `6.498 ms` |
+| `gdn_prefill/pallas_active_chunk_local_math_probe` | `51.77 ms / 25` | local-math annotation range; repeat clock p50 was `1.967 ms` |
+| `gdn_active_chunk_local_math_chunk32_probe` | `45.56 ms / 50` | actual local-math Pallas labels, two custom-call labels per benchmark call |
+| `gdn_prefill/pallas_active_input_pack_probe` | `13.54 ms / 25` | pack annotation range; repeat clock p50 was `0.498 ms` |
+| `gdn_active_input_pack_probe` | `6.67 ms / 50` | actual pack Pallas labels |
+| `gdn_prefill/pallas_active_chunk_probe` | `6.70 ms / 1` | metadata probe host-visible range |
+| `gdn_active_chunk_probe` | `0.058 ms / 2` | actual metadata Pallas labels |
+| `PjRtCApiLoadedExecutable::Execute` | `57.84 ms / 76` | baseline plus metadata, pack, and local-math probes |
+| `command_buffer::execute` | `23.20 ms / 1225` | baseline GDN command-buffer count unchanged |
+| `command_buffer::update` | `1.73 ms / 96` | baseline GDN command-buffer updates unchanged |
+| `input_reduce_fusion` | `14.63 ms / 775` | baseline recurrence-family counter unchanged |
+| `loop_dynamic_update_slice_fusion` | `6.54 ms / 1175` | baseline scatter/update counter |
+| `loop_multiply_fusion` | `22.86 ms / 425` | baseline chunk-recurrence counter |
+| `while` | `32.69 ms / 50` | baseline loop counter |
+| `MemcpyD2D` | `6.26 ms / 875` | copy counter |
+
+Decision:
+
+- Keep the local-math probe as benchmark instrumentation. It is the first exact Pallas path that fuses active-chunk indexing with nontrivial chunk-local GDN math under the BF16-weight/FP32-activation serving contract.
+- Do not route it through `KernelBackendPlaceholder.gated_delta_prefill` yet. It computes only local intermediates and still omits query-local output attention, the cross-chunk state scan, final rectangular output scatter, and final recurrent state. A standalone local probe cannot prove generated-token correctness.
+- The next GDN candidate should extend this exact local-math path with a benchmark-only cross-chunk state/output reconstruction over active chunks, then compare final `valid_output_max_abs` and `state_max_abs` against current padded chunk32 before any server integration.
