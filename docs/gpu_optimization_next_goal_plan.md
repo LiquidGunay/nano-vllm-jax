@@ -1074,6 +1074,13 @@ paged_prefill_attention_gqa_nhd(
   `210 ms`, command-buffer execute about `229 ms`, transpose about `47 ms`, and
   `input_reduce_fusion` about `38 ms`. Keep Commit 9 blocked until a repeatable
   profile shows paged-prefill attention itself is a material TTFT bottleneck.
+- Host token readback is a sync label on prior GPU work, not currently a proven
+  D2H copy bottleneck. Entry 044 already rejected `copy_to_host_async()` on the
+  token-id result. A follow-up subagent audit found no smaller local cleanup
+  likely to reduce sync count without changing scheduler semantics. Reducing the
+  sync count further likely requires a device-side multi-token greedy decode
+  loop or similar scheduler dependency change; ask for approval before starting
+  that design.
 
 ## P2.2 - `qk_norm_rope_kv_append_fused`
 
