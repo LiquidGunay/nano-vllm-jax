@@ -3172,12 +3172,12 @@ Decision:
 
 - change accepted: `benchmarks/run_gpu_matrix.py` now writes an `acceptance`
   section for each workload/config pair. It checks whether the summary has at
-  least two repeats, exact generated-token correctness, JAX performance metrics,
-  TTFT/ITL p50/p95 latency, first `forward_step_token_ids_jit`, a vLLM
-  throughput reference, profile counters, and whether the JAX/vLLM throughput
-  ratio reaches the `0.75x` target. Profile coverage is strict: every
-  configured profile bucket must be present in every repeat, and missing buckets
-  are listed in `missing_profile_counters`.
+  least two successful repeats, exact generated-token correctness, JAX
+  performance metrics, TTFT/ITL p50/p95 latency, first
+  `forward_step_token_ids_jit`, a vLLM throughput reference, profile counters,
+  and whether the JAX/vLLM throughput ratio reaches the `0.75x` target.
+  Profile coverage is strict: every configured profile bucket must be present
+  in every repeat, and missing buckets are listed in `missing_profile_counters`.
 - schema update: `benchmarks/configs/gpu_matrix_summary_schema.json` now
   requires the `acceptance` top-level key for new matrix summaries.
 - writer validation: the runner validates required top-level, matrix/repeat,
@@ -3221,7 +3221,8 @@ Decision:
   the writer accepted the validated summary shape.
 - enforcement verification: the same dry-run with
   `--require-speed-claim-ready` wrote its summary and exited nonzero with the
-  missing checks for `long_prefill_512_2048/gpu_paged_default`.
+  missing checks for `long_prefill_512_2048/gpu_paged_default`, including
+  `runs_succeeded=false`.
 - stored-reference verification: a dry run for `hetero8,long_prefill_512_2048`
   with `--require-stored-references` passed, while a `short_32_128` dry run
   failed before benchmark launch and reported the missing JAX/vLLM references.

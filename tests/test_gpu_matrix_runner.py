@@ -111,6 +111,7 @@ def _minimal_summary():
                 "gpu_paged_default": {
                     "checks": {
                         "minimum_repeats": False,
+                        "runs_succeeded": False,
                         "correctness_checked": False,
                         "exact_generated_token_match": False,
                         "jax_performance_present": False,
@@ -374,12 +375,14 @@ def test_benchmark_acceptance_summary_requires_plan_evidence():
     }
     repeats = [
         {
+            "run": {"status": "ok"},
             "metrics": {
                 "profile": complete_profile,
                 "first_forward_step_token_ids_jit_ms": 9.0,
             }
         },
         {
+            "run": {"status": "ok"},
             "metrics": {
                 "profile": complete_profile,
                 "first_forward_step_token_ids_jit_ms": 10.0,
@@ -434,6 +437,7 @@ def test_benchmark_acceptance_summary_rejects_incomplete_evidence():
     assert not acceptance["speed_claim_ready"]
     assert not acceptance["target_vllm_ratio_met"]
     assert not acceptance["checks"]["minimum_repeats"]
+    assert not acceptance["checks"]["runs_succeeded"]
     assert not acceptance["checks"]["profile_counters_present"]
     assert not acceptance["checks"]["jax_latency_present"]
     assert not acceptance["checks"]["first_forward_step_present"]
@@ -450,8 +454,8 @@ def test_benchmark_acceptance_summary_requires_all_profile_counters():
     }
     acceptance = _benchmark_acceptance_summary(
         [
-            {"metrics": {"profile": incomplete_profile}},
-            {"metrics": {"profile": incomplete_profile}},
+            {"run": {"status": "ok"}, "metrics": {"profile": incomplete_profile}},
+            {"run": {"status": "ok"}, "metrics": {"profile": incomplete_profile}},
         ],
         {
             "repeat_count": 2,
@@ -485,6 +489,7 @@ def test_acceptance_failures_reports_missing_evidence_and_target():
                 "gpu_paged_fast_optin": {
                     "checks": {
                         "minimum_repeats": True,
+                        "runs_succeeded": True,
                         "correctness_checked": False,
                         "exact_generated_token_match": False,
                     },
@@ -516,6 +521,7 @@ def test_acceptance_failures_empty_when_ready_and_target_met():
                 "gpu_paged_fast_optin": {
                     "checks": {
                         "minimum_repeats": True,
+                        "runs_succeeded": True,
                         "correctness_checked": True,
                         "exact_generated_token_match": True,
                     },

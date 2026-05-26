@@ -213,6 +213,7 @@ def _validate_summary_shape(summary: dict[str, Any], schema: dict[str, Any]) -> 
     ]
     acceptance_check_required = [
         "minimum_repeats",
+        "runs_succeeded",
         "correctness_checked",
         "exact_generated_token_match",
         "jax_performance_present",
@@ -698,6 +699,7 @@ def _benchmark_acceptance_summary(
     jax_ratio = comparison.get("jax_over_vllm_throughput")
     missing_profile_counters = _missing_profile_counters(repeats)
     checks = {
+        "runs_succeeded": all((row.get("run") or {}).get("status") == "ok" for row in repeats),
         "minimum_repeats": int(aggregate.get("repeat_count") or 0) >= MIN_ACCEPTANCE_REPEATS,
         "correctness_checked": bool(aggregate.get("all_correctness_checked")),
         "exact_generated_token_match": bool(aggregate.get("all_exact_generated_token_match")),

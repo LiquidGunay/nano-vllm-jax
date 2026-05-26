@@ -21,10 +21,14 @@ optimization work starts.
    strategy and ABI validation path before forcing it through the repo's final
    paging layout.
 6. Phase 0 should create the baseline docs and benchmark config JSONs in the
-   same commit. The benchmark matrix runner can follow in the next commit.
+   same commit. Treat docs plus config as the first deliverable; the benchmark
+   matrix runner can follow in the next commit.
 7. The matrix runner should use stored local vLLM/JAX reference artifacts when
-   available. If no stored local reference exists for a requested comparison and
-   vLLM is installed, it may run the live vLLM comparison and store the result.
+   available. If no stored local reference exists for a requested comparison,
+   it should run live where possible and store the resulting artifact: live
+   vLLM for missing vLLM references and live `gpu_paged_default` for missing
+   JAX default references. `--require-stored-references` remains an explicit
+   opt-in gate when live fallback is not acceptable.
 
 ## Context
 
@@ -220,8 +224,10 @@ end-to-end throughput.
 ### Status - 2026-05-26
 
 - Matrix configs and `benchmarks/run_gpu_matrix.py` are in place. The runner
-  uses stored local references when available and can run a live vLLM reference
-  when a workload-specific local artifact is missing.
+  uses stored local references when available. When no workload-specific local
+  artifact exists, it can run live vLLM for the vLLM reference and can use the
+  live `gpu_paged_default` artifact as the JAX default reference for subsequent
+  comparisons.
 - The first `long_prefill_512_2048` slice had no stored local vLLM reference, so
   it ran live vLLM and stored
   `results/gpu_matrix_runs/20260526_104818/references/vllm_long_prefill_512_2048.json`.
@@ -251,12 +257,12 @@ end-to-end throughput.
   long-prefill baseline unchecked. Stored references are preferred over
   generated same-run defaults so exact-token gates use stable baselines.
 - Matrix summaries now include an `acceptance` section that makes the plan's
-  speed-claim evidence check explicit: minimum repeats, exact correctness,
-  JAX/vLLM performance presence, TTFT/ITL p50/p95 latency, first
-  `forward_step_token_ids_jit`, profile counters, and the `0.75x` vLLM target.
-  All configured profile-counter buckets must be present for every repeat. The
-  runner validates the summary shape before writing it. Human explanation of
-  profile bucket movement still belongs in the logbook.
+  speed-claim evidence check explicit: successful subprocesses, minimum
+  repeats, exact correctness, JAX/vLLM performance presence, TTFT/ITL p50/p95
+  latency, first `forward_step_token_ids_jit`, profile counters, and the
+  `0.75x` vLLM target. All configured profile-counter buckets must be present
+  for every repeat. The runner validates the summary shape before writing it.
+  Human explanation of profile bucket movement still belongs in the logbook.
 - `benchmarks/run_gpu_matrix.py --require-speed-claim-ready` can be used for
   the final benchmark command. It still writes the summary, then exits nonzero
   if any selected workload/config is not speed-claim-ready or misses the `0.75x`
