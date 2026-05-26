@@ -3034,3 +3034,58 @@ Decision:
   a backend design that preserves the current batched rectangular accumulation
   contract, or explicitly accept a true-token packed reference only after a
   separate real-weight full-model token/logit parity gate proves it is safe.
+
+## Entry 080 - Long-Prefill GPU Matrix Slice
+
+- run id: `20260526_104818` / `20260526_105635`
+- matrix artifacts:
+  - `results/gpu_matrix_long_prefill_default_live.json`
+  - `results/gpu_matrix_long_prefill_default_fastoptin.json`
+- per-run artifacts:
+  - `results/gpu_matrix_runs/20260526_104818/references/vllm_long_prefill_512_2048.json`
+  - `results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json`
+  - `results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_fast_optin_repeat1.json`
+- benchmark: `long_prefill_512_2048`, input lengths
+  `[512,1024,1536,2048]`, output length `16`, BF16 checkpoint weights, FP32
+  activation math, `JAX_PLATFORMS=cuda`.
+- vLLM reference: first matrix run had no local workload-specific vLLM
+  reference, so the runner executed live vLLM and stored the result. vLLM logs
+  reported the Triton/FLA GDN prefill kernel and FlashAttention backend.
+
+Timing snapshot:
+
+| config | source | tok/s | JAX/vLLM | TTFT p50 | ITL p50 | ITL p95 | correctness |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| vLLM async | live/stored reference | `116.37` | `1.000x` | `439.63 ms` | `5.04 ms` | `19.75 ms` | not checked |
+| `gpu_paged_default` | rerun in stored-reference matrix | `78.02` | `0.670x` | `583.31 ms` | `15.82 ms` | `16.79 ms` | baseline capture |
+| `gpu_paged_fast_optin` | exact vs live JAX default | `78.27` | `0.673x` | `585.91 ms` | `15.23 ms` | `16.60 ms` | exact |
+
+Key JAX fast-optin profile counters:
+
+| bucket | total / count |
+| --- | ---: |
+| first `forward_step_token_ids_jit` | `237.75 ms` |
+| `PjRtCApiLoadedExecutable::Execute` | `290.66 ms / 140` |
+| `command_buffer::execute` | `228.13 ms / 1936` |
+| `command_buffer::update` | `9.64 ms / 195` |
+| `forward_step_token_ids_jit` | `281.15 ms / 16` |
+| `gather` | `14.70 ms / 103` |
+| `transpose` | `47.30 ms / 312` |
+| `MemcpyD2D` | `30.14 ms / 655` |
+| `array.py:325 tolist` | `429.76 ms / 16` |
+| `np.asarray(jax.Array)` | `429.63 ms / 16` |
+
+Decision:
+
+- Record this as a matrix diagnostic, not a speed claim. The plan's performance
+  acceptance rule requires at least two repeats, exact-token comparison for the
+  claimed configuration, and profile-bucket explanation.
+- `gpu_paged_fast_optin` is exact against the live JAX default for all four
+  long-prefill rows, but it is only marginally faster than default on this
+  single repeat. Do not infer a meaningful config win from this slice.
+- The long-prefill ratio is better than the tracked hetero8 Entry 045 ratio
+  (`~0.67x` vs `0.426x` vLLM), but still below the `0.75x` next-goal target.
+  The remaining gap is visible in both TTFT and ITL, with large compiled-step,
+  command-buffer, and host-sync buckets. This supports continuing with
+  backend-owned serving kernels, but the segmented GDN route remains blocked on
+  the Entry 078/079 correctness-policy decision.

@@ -217,6 +217,28 @@ improved but integrated throughput regressed. For example, smaller GDN chunking
 improved one reduce bucket but worsened first prefill, GEMM/module execution, and
 end-to-end throughput.
 
+### Status - 2026-05-26
+
+- Matrix configs and `benchmarks/run_gpu_matrix.py` are in place. The runner
+  uses stored local references when available and can run a live vLLM reference
+  when a workload-specific local artifact is missing.
+- The first `long_prefill_512_2048` slice had no stored local vLLM reference, so
+  it ran live vLLM and stored
+  `results/gpu_matrix_runs/20260526_104818/references/vllm_long_prefill_512_2048.json`.
+- One-repeat results: vLLM async `116.37 tok/s`, JAX `gpu_paged_default`
+  `78.02 tok/s` (`0.670x` vLLM), and JAX `gpu_paged_fast_optin`
+  `78.27 tok/s` (`0.673x` vLLM). Fast opt-in matched the live JAX default
+  exactly for all four rows; default was the baseline capture for this slice.
+- This is not a speed-claim artifact because it is one repeat and the default
+  row is not checked against a same-workload token reference. It is useful as
+  current target evidence: long-prefill is closer to vLLM than hetero8, but
+  still below the `0.75x` next-goal target.
+- The JAX gap remains visible in both TTFT and ITL. The fast-optin profile shows
+  first `forward_step_token_ids_jit=237.75 ms`,
+  `PjRtCApiLoadedExecutable::Execute=290.66 ms / 140`,
+  `command_buffer::execute=228.13 ms / 1936`, and `np.asarray(jax.Array)=
+  429.63 ms / 16`.
+
 ## Phase 2 - Kernel Roadmap
 
 ### Kernel Priority Table
@@ -552,6 +574,11 @@ gdn_segmented_prefill_chunk32(
 
 ### Status - 2026-05-26
 
+- GDN prefill is a profile-backed target, not just an architecture guess. Entry
+  045's chunk-size change moved the intended `input_reduce_fusion` bucket from
+  `59.30 ms / 2512` to `28.65 ms / 1936` and improved the accepted integrated
+  server baseline, while later row/chunk source rewrites showed matching
+  regressions in first prefill, `PjRt Execute`, and command-buffer work.
 - First local CUDA/JAX FFI prototype added as
   `gdn_prefill_chunk32_normalized_fp32` and benchmark variant
   `cuda_fp32_one_piece_chunk32`.

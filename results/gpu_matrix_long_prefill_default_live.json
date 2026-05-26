@@ -1,0 +1,355 @@
+{
+  "comparisons": {
+    "long_prefill_512_2048": {
+      "gpu_paged_default": {
+        "itl_ms_p50_delta_vs_vllm": 10.763978469185531,
+        "jax_over_vllm_throughput": 0.6649769268790964,
+        "jax_tokens_per_second_median": 77.38512490155684,
+        "ttft_ms_p50_delta_vs_vllm": 152.12266251910478,
+        "vllm_reference_source": "live",
+        "vllm_tokens_per_second": 116.37264658902475
+      }
+    }
+  },
+  "configs": [
+    "gpu_paged_default"
+  ],
+  "created_at_utc": "20260526_104818",
+  "dry_run": false,
+  "matrix": {
+    "long_prefill_512_2048": {
+      "gpu_paged_default": {
+        "aggregate": {
+          "all_correct": true,
+          "all_correctness_checked": false,
+          "all_exact_generated_token_match": false,
+          "itl_ms_p50_median": 15.80011600162834,
+          "repeat_count": 1,
+          "tokens_per_second_median": 77.38512490155684,
+          "ttft_ms_p50_median": 591.7477150214836
+        },
+        "config": {
+          "args": {
+            "backend": "gpu",
+            "batch_size_buckets": "1,2,4",
+            "dtype": "float32",
+            "input_lens": "512,1024,1536,2048",
+            "jax_execution": "jit",
+            "max_blocks_per_seq": 160,
+            "max_kv_cache_mb": 3072,
+            "max_num_batched_tokens": 8192,
+            "max_num_seqs": 4,
+            "model": "Qwen/Qwen3.5-0.8B",
+            "num_kvcache_blocks": 768,
+            "num_speculative_tokens": 0,
+            "output_len": 16,
+            "prefill_buckets": "512,1024,2048",
+            "profile": true,
+            "prompt_suite": "mixed",
+            "top_k": 5,
+            "warmup": true,
+            "weight_dtype": "bfloat16"
+          },
+          "description": "Fastest accepted non-MTP JAX CUDA serving baseline. No FFI/custom kernels.",
+          "env": {
+            "JAX_PLATFORMS": "cuda",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_MLP": "1",
+            "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH": "1",
+            "NANO_VLLM_JAX_KERNEL_BACKEND": "pure_jax",
+            "NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD": "1"
+          }
+        },
+        "repeats": [
+          {
+            "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json",
+            "metrics": {
+              "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json",
+              "correctness": {
+                "checked": false,
+                "exact_generated_token_match": false,
+                "full_length_ok": null,
+                "ok": true,
+                "rows": null
+              },
+              "exists": true,
+              "first_forward_step_token_ids_jit_ms": 234.30488200000002,
+              "mtp_admission": {
+                "active_bucket": null,
+                "buckets": [],
+                "confidence_min_accept_rate": 0.75,
+                "enabled": false,
+                "probe_steps": 2
+              },
+              "performance": {
+                "generated_tokens": 64,
+                "itl_ms_p50": 15.80011600162834,
+                "itl_ms_p95": 16.612684004940093,
+                "seconds": 0.8270323280012235,
+                "tokens_per_second": 77.38512490155684,
+                "ttft_ms_p50": 591.7477150214836,
+                "ttft_ms_p95": 591.7477150214836
+              },
+              "profile": {
+                "MemcpyD2D": {
+                  "count": 655,
+                  "total_ms": 30.430559000000034
+                },
+                "PjRtCApiLoadedExecutable::Execute": {
+                  "count": 140,
+                  "total_ms": 295.5390290000001
+                },
+                "array.py:325 tolist": {
+                  "count": 16,
+                  "total_ms": 426.51463500000006
+                },
+                "command_buffer::execute": {
+                  "count": 1936,
+                  "total_ms": 229.48557400000004
+                },
+                "command_buffer::update": {
+                  "count": 195,
+                  "total_ms": 11.041827999999999
+                },
+                "forward_step_token_ids_jit": {
+                  "count": 16,
+                  "total_ms": 282.67176300000006
+                },
+                "gather": {
+                  "count": 103,
+                  "total_ms": 16.844123999999994
+                },
+                "np.asarray(jax.Array)": {
+                  "count": 16,
+                  "total_ms": 426.38609299999985
+                },
+                "transpose": {
+                  "count": 312,
+                  "total_ms": 47.26183099999993
+                }
+              },
+              "profile_trace_json_gz": "/mountpoint/.exp/profiles/20260526-105338-2278718-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260526_104818/plugins/profile/2026_05_26_10_55_23/INDCS0291.atrapa.deloitte.com.trace.json.gz",
+              "run": {
+                "issues": [],
+                "profile_enabled": true,
+                "profile_error": null,
+                "profile_path": "/mountpoint/.exp/profiles/20260526-105338-2278718-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260526_104818",
+                "profile_started": false,
+                "run_id": "20260526-105338-2278718-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260526_104818",
+                "run_label": "gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260526_104818",
+                "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+              },
+              "speculative": {
+                "acceptance_rate": 0.0,
+                "bonus_tokens": 0,
+                "debug_events": [],
+                "draft_position_accepted": [],
+                "draft_position_proposed": [],
+                "drafts_accepted": 0,
+                "drafts_proposed": 0,
+                "drafts_rejected": 0,
+                "enabled": false,
+                "fallback_gated_no_spec_steps": 0,
+                "fallback_partial_rows": 0,
+                "fallback_seeded_main_steps": 0,
+                "fallback_steps": 0
+              }
+            },
+            "reference_json": null,
+            "reference_source": "none",
+            "repeat": 1,
+            "run": {
+              "command": [
+                "/mountpoint/.exp/nano-vllm-jax/.venv/bin/python",
+                "/mountpoint/.exp/nano-vllm-jax/benchmarks/benchmark_jax_server_trace.py",
+                "--model",
+                "Qwen/Qwen3.5-0.8B",
+                "--backend",
+                "gpu",
+                "--dtype",
+                "float32",
+                "--weight-dtype",
+                "bfloat16",
+                "--jax-execution",
+                "jit",
+                "--input-lens",
+                "512,1024,1536,2048",
+                "--output-len",
+                "16",
+                "--prompt-suite",
+                "mixed",
+                "--num-speculative-tokens",
+                "0",
+                "--max-kv-cache-mb",
+                "3072",
+                "--num-kvcache-blocks",
+                "768",
+                "--max-num-seqs",
+                "4",
+                "--max-num-batched-tokens",
+                "8192",
+                "--prefill-buckets",
+                "512,1024,2048",
+                "--batch-size-buckets",
+                "1,2,4",
+                "--max-blocks-per-seq",
+                "160",
+                "--top-k",
+                "5",
+                "--warmup",
+                "--profile",
+                "--output-json",
+                "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json",
+                "--run-label",
+                "gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260526_104818"
+              ],
+              "elapsed_seconds": 108.69966594001744,
+              "output_tail": "Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\nLoading pretrained weights from Qwen/Qwen3.5-0.8B...\nLoading weights for Qwen/Qwen3.5-0.8B...\nResolving Qwen/Qwen3.5-0.8B from Hugging Face cache...\n\nFetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]\nFetching 9 files: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 9/9 [00:00<00:00, 154076.47it/s]\nUsing snapshot: /mountpoint/.exp/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17\nConverting weights...\nMaterializing tied LM head as a separate [hidden, vocab] weight...\n\u2713 Loaded weights: 24 layers\n\u2713 Using pretrained weights\n",
+              "returncode": 0,
+              "status": "ok"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "output_json": "results/gpu_matrix_long_prefill_default_live.json",
+  "repeats": 1,
+  "required_metrics": [
+    "total tok/s",
+    "TTFT p50/p95",
+    "ITL p50/p95",
+    "exact generated-token match vs baseline",
+    "PjRt Execute total/count",
+    "command_buffer::execute total/count",
+    "command_buffer::update total/count",
+    "forward_step_token_ids_jit total/count",
+    "first forward_step_token_ids_jit",
+    "gather total",
+    "transpose total",
+    "MemcpyD2D total",
+    "tolist / np.asarray sync attribution"
+  ],
+  "run_dir": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260526_104818",
+  "schema_version": 1,
+  "vllm_references": {
+    "long_prefill_512_2048": {
+      "metrics": {
+        "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260526_104818/references/vllm_long_prefill_512_2048.json",
+        "correctness": {
+          "checked": false,
+          "exact_generated_token_match": false,
+          "full_length_ok": null,
+          "ok": true,
+          "rows": null
+        },
+        "exists": true,
+        "first_forward_step_token_ids_jit_ms": null,
+        "mtp_admission": null,
+        "performance": {
+          "generated_tokens": 64,
+          "itl_ms_p50": 5.036137532442808,
+          "itl_ms_p95": 19.74672873038793,
+          "seconds": 0.5499574159039184,
+          "tokens_per_second": 116.37264658902475,
+          "ttft_ms_p50": 439.6250525023788,
+          "ttft_ms_p95": 474.71485659480095
+        },
+        "profile": {
+          "MemcpyD2D": {
+            "count": null,
+            "total_ms": null
+          },
+          "PjRtCApiLoadedExecutable::Execute": {
+            "count": null,
+            "total_ms": null
+          },
+          "array.py:325 tolist": {
+            "count": null,
+            "total_ms": null
+          },
+          "command_buffer::execute": {
+            "count": null,
+            "total_ms": null
+          },
+          "command_buffer::update": {
+            "count": null,
+            "total_ms": null
+          },
+          "forward_step_token_ids_jit": {
+            "count": null,
+            "total_ms": null
+          },
+          "gather": {
+            "count": null,
+            "total_ms": null
+          },
+          "np.asarray(jax.Array)": {
+            "count": null,
+            "total_ms": null
+          },
+          "transpose": {
+            "count": null,
+            "total_ms": null
+          }
+        },
+        "profile_trace_json_gz": null,
+        "run": {
+          "issues": [],
+          "profile_enabled": false,
+          "profile_error": null,
+          "profile_path": "/mountpoint/.exp/profiles/20260526-104818-2277954-gpu_matrix_vllm_long_prefill_512_2048_20260526_104818",
+          "profile_started": false,
+          "run_id": "20260526-104818-2277954-gpu_matrix_vllm_long_prefill_512_2048_20260526_104818",
+          "run_label": "gpu_matrix_vllm_long_prefill_512_2048_20260526_104818",
+          "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+        },
+        "speculative": null
+      },
+      "python": "/mountpoint/.exp/vllm-venv/bin/python",
+      "run": {
+        "command": [
+          "/mountpoint/.exp/vllm-venv/bin/python",
+          "/mountpoint/.exp/nano-vllm-jax/benchmarks/benchmark_vllm_qwen35.py",
+          "--model",
+          "Qwen/Qwen3.5-0.8B",
+          "--dtype",
+          "bfloat16",
+          "--tensor-parallel-size",
+          "1",
+          "--execution",
+          "async",
+          "--mode",
+          "baseline",
+          "--input-lens",
+          "512,1024,1536,2048",
+          "--output-len",
+          "16",
+          "--prompt-suite",
+          "mixed",
+          "--top-k",
+          "5",
+          "--output-json",
+          "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260526_104818/references/vllm_long_prefill_512_2048.json",
+          "--run-label",
+          "gpu_matrix_vllm_long_prefill_512_2048_20260526_104818",
+          "--trust-remote-code",
+          "--max-model-len",
+          "4096",
+          "--gpu-memory-utilization",
+          "0.65"
+        ],
+        "elapsed_seconds": 320.4473353490466,
+        "output_tail": "er2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::gdn_attention_core', 'vllm::gdn_attention_core_xpu', 'vllm::olmo_hybrid_gdn_full_forward', 'vllm::kda_attention', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::deepseek_v4_attention', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update'], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [2048], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'fuse_act_padding': False}, 'max_cudagraph_capture_size': 256, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native']), enable_flashinfer_autotune=False, moe_backend='auto')\n(EngineCore pid=2278037) [transformers] `Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.\n(EngineCore pid=2278037) Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\n(EngineCore pid=2278037) INFO 05-26 10:49:16 [parallel_state.py:1410] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://10.89.130.219:60137 backend=nccl\n(EngineCore pid=2278037) INFO 05-26 10:49:16 [parallel_state.py:1723] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A\n(EngineCore pid=2278037) INFO 05-26 10:49:17 [topk_topp_sampler.py:45] Using FlashInfer for top-p & top-k sampling.\n(EngineCore pid=2278037) [transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend=\"torchvision\"` instead of `use_fast=True`, or `backend=\"pil\"` instead of `use_fast=False`.\n(EngineCore pid=2278037) INFO 05-26 10:49:34 [gpu_model_runner.py:4857] Starting to load model Qwen/Qwen3.5-0.8B...\n(EngineCore pid=2278037) INFO 05-26 10:49:35 [cuda.py:427] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention\n(EngineCore pid=2278037) INFO 05-26 10:49:35 [mm_encoder_attention.py:372] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.\n(EngineCore pid=2278037) INFO 05-26 10:49:35 [gdn_linear_attn.py:169] Using Triton/FLA GDN prefill kernel\n(EngineCore pid=2278037) INFO 05-26 10:49:35 [cuda.py:372] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].\n(EngineCore pid=2278037) INFO 05-26 10:49:35 [flash_attn.py:641] Using FlashAttention version 2\n(EngineCore pid=2278037) INFO 05-26 10:49:36 [weight_utils.py:938] Filesystem type for checkpoints: EXT4. Checkpoint size: 1.63 GiB. Available RAM: 8.61 GiB.\n(EngineCore pid=2278037) INFO 05-26 10:49:36 [weight_utils.py:961] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.\n(EngineCore pid=2278037) \nLoading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]\n(EngineCore pid=2278037) \nLoading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  1.94it/s]\n(EngineCore pid=2278037) \nLoading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  1.94it/s]\n(EngineCore pid=2278037) \n(EngineCore pid=2278037) INFO 05-26 10:49:37 [default_loader.py:397] Loading weights took 0.56 seconds\n(EngineCore pid=2278037) INFO 05-26 10:49:37 [gpu_model_runner.py:4959] Model loading took 1.72 GiB memory and 2.083099 seconds\n(EngineCore pid=2278037) INFO 05-26 10:49:37 [interface.py:645] Setting attention block size to 544 tokens to ensure that attention page size is >= mamba page size.\n(EngineCore pid=2278037) INFO 05-26 10:49:37 [interface.py:669] Padding mamba page size by 2.64% to ensure that mamba page size and attention page size are exactly equal.\n(EngineCore pid=2278037) INFO 05-26 10:49:37 [gpu_model_runner.py:5920] Encoder cache will be initialized with a budget of 16384 tokens, and profiled with 1 image items of the maximum feature size.\n(EngineCore pid=2278037) INFO 05-26 10:49:45 [backends.py:1089] Using cache directory: /mountpoint/.exp/.cache/vllm/torch_compile_cache/c1c1475c44/rank_0_0/backbone for vLLM's torch.compile\n(EngineCore pid=2278037) INFO 05-26 10:49:45 [backends.py:1148] Dynamo bytecode transform time: 5.71 s\n(EngineCore pid=2278037) INFO 05-26 10:49:47 [backends.py:378] Cache the graph of compile range (1, 2048) for later use\n(EngineCore pid=2278037) INFO 05-26 10:50:12 [backends.py:393] Compiling a graph for compile range (1, 2048) takes 26.25 s\n(EngineCore pid=2278037) INFO 05-26 10:50:15 [decorators.py:708] saved AOT compiled function to /mountpoint/.exp/.cache/vllm/torch_compile_cache/torch_aot_compile/18a3cdf0bbe6dc87ada568ed9eb73f0e9cc16ba0091982511950d70015456109/rank_0_0/model\n(EngineCore pid=2278037) INFO 05-26 10:50:15 [monitor.py:53] torch.compile took 35.12 s in total\n(EngineCore pid=2278037) INFO 05-26 10:51:29 [monitor.py:81] Initial profiling/warmup run took 74.74 s\n(EngineCore pid=2278037) INFO 05-26 10:53:21 [gpu_model_runner.py:6063] Profiling CUDA graph memory: PIECEWISE=35 (largest=256), FULL=19 (largest=128)\n(EngineCore pid=2278037) INFO 05-26 10:53:24 [gpu_model_runner.py:6142] Estimated CUDA graph memory: 0.19 GiB total\n(EngineCore pid=2278037) INFO 05-26 10:53:24 [gpu_worker.py:462] Available KV cache memory: 11.0 GiB\n(EngineCore pid=2278037) INFO 05-26 10:53:24 [gpu_worker.py:477] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.6500 is equivalent to --gpu-memory-utilization=0.6414 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.6586. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.\n(EngineCore pid=2278037) INFO 05-26 10:53:24 [kv_cache_utils.py:1710] GPU KV cache size: 657,594 tokens\n(EngineCore pid=2278037) INFO 05-26 10:53:24 [kv_cache_utils.py:1711] Maximum concurrency for 4,096 tokens per request: 160.55x\n(EngineCore pid=2278037) INFO 05-26 10:53:24 [kernel_warmup.py:44] Skipping FlashInfer autotune because it is disabled.\n(EngineCore pid=2278037) \nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):   0%|          | 0/35 [00:00<?, ?it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):   9%|\u258a         | 3/35 [00:00<00:01, 28.92it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  17%|\u2588\u258b        | 6/35 [00:00<00:00, 29.44it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  26%|\u2588\u2588\u258c       | 9/35 [00:00<00:00, 29.19it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  34%|\u2588\u2588\u2588\u258d      | 12/35 [00:00<00:00, 29.06it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  43%|\u2588\u2588\u2588\u2588\u258e     | 15/35 [00:00<00:00, 28.91it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  51%|\u2588\u2588\u2588\u2588\u2588\u258f    | 18/35 [00:00<00:00, 28.72it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  60%|\u2588\u2588\u2588\u2588\u2588\u2588    | 21/35 [00:00<00:00, 28.73it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  69%|\u2588\u2588\u2588\u2588\u2588\u2588\u258a   | 24/35 [00:00<00:00, 28.42it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  77%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258b  | 27/35 [00:00<00:00, 28.45it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  86%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258c | 30/35 [00:01<00:00, 26.52it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  94%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258d| 33/35 [00:01<00:00, 27.14it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE): 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 35/35 [00:01<00:00, 27.35it/s]\n(EngineCore pid=2278037) \nCapturing CUDA graphs (decode, FULL):   0%|          | 0/19 [00:00<?, ?it/s]\nCapturing CUDA graphs (decode, FULL):   5%|\u258c         | 1/19 [00:00<00:04,  3.74it/s]\nCapturing CUDA graphs (decode, FULL):  11%|\u2588         | 2/19 [00:00<00:04,  4.05it/s]\nCapturing CUDA graphs (decode, FULL):  26%|\u2588\u2588\u258b       | 5/19 [00:00<00:01,  9.77it/s]\nCapturing CUDA graphs (decode, FULL):  37%|\u2588\u2588\u2588\u258b      | 7/19 [00:00<00:00, 12.31it/s]\nCapturing CUDA graphs (decode, FULL):  47%|\u2588\u2588\u2588\u2588\u258b     | 9/19 [00:00<00:00, 14.13it/s]\nCapturing CUDA graphs (decode, FULL):  63%|\u2588\u2588\u2588\u2588\u2588\u2588\u258e   | 12/19 [00:00<00:00, 17.50it/s]\nCapturing CUDA graphs (decode, FULL):  79%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2589  | 15/19 [00:01<00:00, 19.82it/s]\nCapturing CUDA graphs (decode, FULL):  95%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258d| 18/19 [00:01<00:00, 21.57it/s]\nCapturing CUDA graphs (decode, FULL): 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 19/19 [00:01<00:00, 12.99it/s]\n(EngineCore pid=2278037) INFO 05-26 10:53:28 [gpu_model_runner.py:6243] Graph capturing finished in 3 secs, took 0.27 GiB\n(EngineCore pid=2278037) INFO 05-26 10:53:28 [gpu_worker.py:621] CUDA graph pool memory: 0.27 GiB (actual), 0.19 GiB (estimated), difference: 0.08 GiB (30.7%).\n(EngineCore pid=2278037) INFO 05-26 10:53:28 [jit_monitor.py:54] Kernel JIT monitor activated \u2014 Triton JIT compilations during inference will be logged as warnings.\n(EngineCore pid=2278037) INFO 05-26 10:53:28 [core.py:299] init engine (profile, create kv cache, warmup model) took 230.58 s (compilation: 35.12 s)\n(EngineCore pid=2278037) INFO 05-26 10:53:28 [vllm.py:886] Asynchronous scheduling is enabled.\n(EngineCore pid=2278037) INFO 05-26 10:53:28 [kernel.py:212] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])\nWARNING 05-26 10:53:28 [input_processor.py:274] Passing raw prompts to InputProcessor is deprecated and will be removed in v0.18. You should instead pass the outputs of Renderer.render_cmpl() or Renderer.render_chat().\n(EngineCore pid=2278037) WARNING 05-26 10:53:28 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _zero_kv_blocks_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.\n(EngineCore pid=2278037) WARNING 05-26 10:53:29 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _compute_slot_mapping_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.\n(EngineCore pid=2278037) WARNING 05-26 10:53:30 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _causal_conv1d_fwd_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.\n(EngineCore pid=2278037) WARNING 05-26 10:53:32 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _fused_post_conv_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.\n(EngineCore pid=2278037) INFO 05-26 10:53:33 [core.py:1242] Shutdown initiated (timeout=0)\n(EngineCore pid=2278037) INFO 05-26 10:53:33 [core.py:1265] Shutdown complete\n[rank0]:[W526 10:53:34.751235037 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())\n",
+        "returncode": 0,
+        "status": "ok"
+      },
+      "source": "live"
+    }
+  },
+  "workloads": [
+    "long_prefill_512_2048"
+  ]
+}

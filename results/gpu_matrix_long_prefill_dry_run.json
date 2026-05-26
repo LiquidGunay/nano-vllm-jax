@@ -1,0 +1,189 @@
+{
+  "comparisons": {
+    "long_prefill_512_2048": {
+      "gpu_paged_default": {
+        "itl_ms_p50_delta_vs_vllm": null,
+        "jax_over_vllm_throughput": null,
+        "jax_tokens_per_second_median": null,
+        "ttft_ms_p50_delta_vs_vllm": null,
+        "vllm_reference_source": "live",
+        "vllm_tokens_per_second": null
+      }
+    }
+  },
+  "configs": [
+    "gpu_paged_default"
+  ],
+  "created_at_utc": "20260526_104747",
+  "dry_run": true,
+  "matrix": {
+    "long_prefill_512_2048": {
+      "gpu_paged_default": {
+        "aggregate": {
+          "all_correct": false,
+          "all_correctness_checked": false,
+          "all_exact_generated_token_match": false,
+          "itl_ms_p50_median": null,
+          "repeat_count": 1,
+          "tokens_per_second_median": null,
+          "ttft_ms_p50_median": null
+        },
+        "config": {
+          "args": {
+            "backend": "gpu",
+            "batch_size_buckets": "1,2,4",
+            "dtype": "float32",
+            "input_lens": "512,1024,1536,2048",
+            "jax_execution": "jit",
+            "max_blocks_per_seq": 160,
+            "max_kv_cache_mb": 3072,
+            "max_num_batched_tokens": 8192,
+            "max_num_seqs": 4,
+            "model": "Qwen/Qwen3.5-0.8B",
+            "num_kvcache_blocks": 768,
+            "num_speculative_tokens": 0,
+            "output_len": 16,
+            "prefill_buckets": "512,1024,2048",
+            "profile": true,
+            "prompt_suite": "mixed",
+            "top_k": 5,
+            "warmup": true,
+            "weight_dtype": "bfloat16"
+          },
+          "description": "Fastest accepted non-MTP JAX CUDA serving baseline. No FFI/custom kernels.",
+          "env": {
+            "JAX_PLATFORMS": "cuda",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_MLP": "1",
+            "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH": "1",
+            "NANO_VLLM_JAX_KERNEL_BACKEND": "pure_jax",
+            "NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD": "1"
+          }
+        },
+        "repeats": [
+          {
+            "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260526_104747/long_prefill_512_2048_gpu_paged_default_repeat1.json",
+            "metrics": null,
+            "reference_json": null,
+            "reference_source": "none",
+            "repeat": 1,
+            "run": {
+              "command": [
+                "/mountpoint/.exp/nano-vllm-jax/.venv/bin/python",
+                "/mountpoint/.exp/nano-vllm-jax/benchmarks/benchmark_jax_server_trace.py",
+                "--model",
+                "Qwen/Qwen3.5-0.8B",
+                "--backend",
+                "gpu",
+                "--dtype",
+                "float32",
+                "--weight-dtype",
+                "bfloat16",
+                "--jax-execution",
+                "jit",
+                "--input-lens",
+                "512,1024,1536,2048",
+                "--output-len",
+                "16",
+                "--prompt-suite",
+                "mixed",
+                "--num-speculative-tokens",
+                "0",
+                "--max-kv-cache-mb",
+                "3072",
+                "--num-kvcache-blocks",
+                "768",
+                "--max-num-seqs",
+                "4",
+                "--max-num-batched-tokens",
+                "8192",
+                "--prefill-buckets",
+                "512,1024,2048",
+                "--batch-size-buckets",
+                "1,2,4",
+                "--max-blocks-per-seq",
+                "160",
+                "--top-k",
+                "5",
+                "--warmup",
+                "--profile",
+                "--output-json",
+                "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260526_104747/long_prefill_512_2048_gpu_paged_default_repeat1.json",
+                "--run-label",
+                "gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260526_104747"
+              ],
+              "returncode": null,
+              "status": "dry_run"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "output_json": "results/gpu_matrix_long_prefill_dry_run.json",
+  "repeats": 1,
+  "required_metrics": [
+    "total tok/s",
+    "TTFT p50/p95",
+    "ITL p50/p95",
+    "exact generated-token match vs baseline",
+    "PjRt Execute total/count",
+    "command_buffer::execute total/count",
+    "command_buffer::update total/count",
+    "forward_step_token_ids_jit total/count",
+    "first forward_step_token_ids_jit",
+    "gather total",
+    "transpose total",
+    "MemcpyD2D total",
+    "tolist / np.asarray sync attribution"
+  ],
+  "run_dir": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260526_104747",
+  "schema_version": 1,
+  "vllm_references": {
+    "long_prefill_512_2048": {
+      "metrics": null,
+      "python": "/mountpoint/.exp/vllm-venv/bin/python",
+      "run": {
+        "command": [
+          "/mountpoint/.exp/vllm-venv/bin/python",
+          "/mountpoint/.exp/nano-vllm-jax/benchmarks/benchmark_vllm_qwen35.py",
+          "--model",
+          "Qwen/Qwen3.5-0.8B",
+          "--dtype",
+          "bfloat16",
+          "--tensor-parallel-size",
+          "1",
+          "--execution",
+          "async",
+          "--mode",
+          "baseline",
+          "--input-lens",
+          "512,1024,1536,2048",
+          "--output-len",
+          "16",
+          "--prompt-suite",
+          "mixed",
+          "--top-k",
+          "5",
+          "--output-json",
+          "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260526_104747/references/vllm_long_prefill_512_2048.json",
+          "--run-label",
+          "gpu_matrix_vllm_long_prefill_512_2048_20260526_104747",
+          "--trust-remote-code",
+          "--max-model-len",
+          "4096",
+          "--gpu-memory-utilization",
+          "0.65"
+        ],
+        "returncode": null,
+        "status": "dry_run"
+      },
+      "source": "live"
+    }
+  },
+  "workloads": [
+    "long_prefill_512_2048"
+  ]
+}
