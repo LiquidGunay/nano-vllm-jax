@@ -426,6 +426,115 @@ def _active_chunk_local_math_reference(
     return value_transformed, k_cumdecay, g_cumsum, attn_with_identity
 
 
+def _scatter_active_local_math_to_chunks(
+    value_transformed: jnp.ndarray,
+    k_cumdecay: jnp.ndarray,
+    g_cumsum: jnp.ndarray,
+    active_rows: jnp.ndarray,
+    active_chunks: jnp.ndarray,
+    *,
+    batch_size: int,
+    num_heads: int,
+    n_chunks: int,
+    chunk_size: int,
+    key_dim: int,
+    value_dim: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    heads = jnp.arange(num_heads, dtype=jnp.int32)[None, :]
+    rows = active_rows[:, None]
+    chunks = active_chunks[:, None]
+    value_transformed_chunks = jnp.zeros(
+        (batch_size, num_heads, n_chunks, chunk_size, value_dim),
+        dtype=value_transformed.dtype,
+    ).at[rows, heads, chunks, :, :].set(value_transformed)
+    k_cumdecay_chunks = jnp.zeros(
+        (batch_size, num_heads, n_chunks, chunk_size, key_dim),
+        dtype=k_cumdecay.dtype,
+    ).at[rows, heads, chunks, :, :].set(k_cumdecay)
+    g_cumsum_chunks = jnp.zeros(
+        (batch_size, num_heads, n_chunks, chunk_size),
+        dtype=g_cumsum.dtype,
+    ).at[rows, heads, chunks, :].set(g_cumsum)
+    return value_transformed_chunks, k_cumdecay_chunks, g_cumsum_chunks
+
+
+def _active_output_state_reconstruction_probe_fn(
+    batch_size: int,
+    num_heads: int,
+    n_chunks: int,
+    chunk_size: int,
+    key_dim: int,
+    value_dim: int,
+) -> Callable:
+    mask_strict_upper = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=1)
+
+    def run(
+        normalized_query_scaled,
+        normalized_key,
+        initial_state,
+        active_rows,
+        active_chunks,
+        value_transformed,
+        k_cumdecay,
+        g_cumsum,
+    ):
+        query_chunks = normalized_query_scaled.reshape(batch_size, num_heads, n_chunks, chunk_size, key_dim)
+        key_chunks = normalized_key.reshape(batch_size, num_heads, n_chunks, chunk_size, key_dim)
+        value_transformed_chunks, k_cumdecay_chunks, g_cumsum_chunks = _scatter_active_local_math_to_chunks(
+            value_transformed,
+            k_cumdecay,
+            g_cumsum,
+            active_rows,
+            active_chunks,
+            batch_size=batch_size,
+            num_heads=num_heads,
+            n_chunks=n_chunks,
+            chunk_size=chunk_size,
+            key_dim=key_dim,
+            value_dim=value_dim,
+        )
+        decay_mask = jnp.tril(jnp.exp(g_cumsum_chunks[..., :, None] - g_cumsum_chunks[..., None, :]))
+        state = initial_state.astype(jnp.float32)
+
+        def process_chunk(carry, chunk_index):
+            state = carry
+            q_i = query_chunks[:, :, chunk_index]
+            k_i = key_chunks[:, :, chunk_index]
+            v_i = value_transformed_chunks[:, :, chunk_index]
+            decay_mask_i = decay_mask[:, :, chunk_index]
+            k_cumdecay_i = k_cumdecay_chunks[:, :, chunk_index]
+            g_cumsum_i = g_cumsum_chunks[:, :, chunk_index]
+
+            attn_i = jnp.einsum("bhck,bhdk->bhcd", q_i, k_i) * decay_mask_i
+            attn_i = jnp.where(mask_strict_upper, 0.0, attn_i)
+            v_prime = jnp.einsum("bhck,bhkv->bhcv", k_cumdecay_i, state)
+            v_new = v_i - v_prime
+            attn_inter = jnp.einsum("bhck,bhkv->bhcv", q_i * jnp.exp(g_cumsum_i)[..., None], state)
+            attn_v_new = jnp.einsum("bhcd,bhdv->bhcv", attn_i, v_new)
+            core_attn_out_i = attn_inter + attn_v_new
+
+            g_last_minus_g = g_cumsum_i[..., -1, None] - g_cumsum_i
+            k_weighted = k_i * jnp.exp(g_last_minus_g)[..., None]
+            state_update = jnp.einsum("bhck,bhcv->bhkv", k_weighted, v_new)
+            state = state * jnp.exp(g_cumsum_i[..., -1, None, None]) + state_update
+            return state, core_attn_out_i
+
+        final_state, core_attn_out_chunks = jax.lax.scan(
+            process_chunk,
+            state,
+            jnp.arange(n_chunks),
+        )
+        core_attn_out = core_attn_out_chunks.transpose(1, 2, 0, 3, 4).reshape(
+            batch_size,
+            num_heads,
+            n_chunks * chunk_size,
+            value_dim,
+        )
+        return core_attn_out.astype(normalized_query_scaled.dtype), final_state
+
+    return run
+
+
 def _compare_pack_outputs(
     reference: tuple[jnp.ndarray, ...],
     candidate: tuple[jnp.ndarray, ...],
@@ -564,6 +673,7 @@ def _profile_counters(profile_path: Path, profiled_iterations: int, variants: li
         "gdn_active_input_pack_probe",
         "gdn_prefill/pallas_active_chunk_local_math_probe",
         "gdn_active_chunk_local_math_chunk32_probe",
+        "gdn_prefill/pallas_active_output_state_reconstruction_probe",
         "while",
         "fusion",
         "transpose",
@@ -622,6 +732,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
     key_offsets = jnp.arange(args.key_dim, dtype=jnp.int32)
     value_offsets = jnp.arange(args.value_dim, dtype=jnp.int32)
     token_offsets = jnp.arange(args.chunk_size, dtype=jnp.int32)
+    normalized_query_scaled = l2norm(query.astype(jnp.float32), axis=-1, eps=1e-6) * (1.0 / jnp.sqrt(args.key_dim))
     normalized_key = l2norm(key.astype(jnp.float32), axis=-1, eps=1e-6)
 
     variant_results: dict[str, dict[str, Any]] = {}
@@ -643,11 +754,18 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
             "error": None,
             "custom_call_count": None,
         },
+        "active_output_state_reconstruction_probe": {
+            "attempted": False,
+            "lowering_ok": None,
+            "error": None,
+        },
     }
     pallas_pack_last_output = None
     pallas_pack_reference = None
     pallas_local_math_last_output = None
     pallas_local_math_reference = None
+    reconstruction_reference_output = None
+    reconstruction_pallas_last_output = None
 
     # Compile before profiling. The trace should focus on warmed kernel behavior.
     compiled_variants: list[tuple[str, Callable, Any, float]] = []
@@ -659,6 +777,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
     pallas_probe = None
     pallas_pack_probe = None
     pallas_local_math_probe = None
+    reconstruction_probe = None
     if jax.default_backend() == "gpu":
         pallas_feasibility["attempted"] = True
         try:
@@ -753,11 +872,52 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
                         int(args.chunk_size),
                     )
                 )
+                reconstruction_info = pallas_feasibility["active_output_state_reconstruction_probe"]
+                reconstruction_info["attempted"] = True
+                reconstruction_started = time.perf_counter()
+                reconstruction_fn = _active_output_state_reconstruction_probe_fn(
+                    int(args.batch_size),
+                    int(args.num_heads),
+                    int(args.seq_len // args.chunk_size),
+                    int(args.chunk_size),
+                    int(args.key_dim),
+                    int(args.value_dim),
+                )
+                reconstruction_probe = jax.jit(reconstruction_fn).lower(
+                    normalized_query_scaled,
+                    normalized_key,
+                    initial_state,
+                    active_rows,
+                    active_chunk_indices,
+                    pallas_local_math_reference[0],
+                    pallas_local_math_reference[1],
+                    pallas_local_math_reference[2],
+                ).compile()
+                reconstruction_info["compile_seconds"] = time.perf_counter() - reconstruction_started
+                reconstruction_info["lowering_ok"] = True
+                reconstruction_reference_output = _block_until_ready(
+                    reconstruction_probe(
+                        normalized_query_scaled,
+                        normalized_key,
+                        initial_state,
+                        active_rows,
+                        active_chunk_indices,
+                        pallas_local_math_reference[0],
+                        pallas_local_math_reference[1],
+                        pallas_local_math_reference[2],
+                    )
+                )
             except BaseException as exc:
                 pallas_local_math_probe = None
                 pallas_local_math_reference = None
+                reconstruction_probe = None
+                reconstruction_reference_output = None
                 local_math_info["lowering_ok"] = False
                 local_math_info["error"] = f"{type(exc).__name__}: {exc}"
+                reconstruction_info = pallas_feasibility["active_output_state_reconstruction_probe"]
+                if reconstruction_info.get("attempted"):
+                    reconstruction_info["lowering_ok"] = False
+                    reconstruction_info["error"] = f"{type(exc).__name__}: {exc}"
 
     recorder.start_jax_profile(enabled=args.profile)
     try:
@@ -881,6 +1041,55 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
                     "profiled_iterations": int(args.warmups) + int(args.repeats),
                 }
             )
+        if reconstruction_probe is not None and pallas_local_math_last_output is not None:
+            reconstruction_info = pallas_feasibility["active_output_state_reconstruction_probe"]
+            warmup_ms = []
+            for _ in range(args.warmups):
+                with _trace_annotation("gdn_prefill/pallas_active_output_state_reconstruction_probe/warmup"):
+                    started = time.perf_counter()
+                    reconstruction_pallas_last_output = _block_until_ready(
+                        reconstruction_probe(
+                            normalized_query_scaled,
+                            normalized_key,
+                            initial_state,
+                            active_rows,
+                            active_chunk_indices,
+                            pallas_local_math_last_output[0],
+                            pallas_local_math_last_output[1],
+                            pallas_local_math_last_output[2],
+                        )
+                    )
+                    warmup_ms.append(1000.0 * (time.perf_counter() - started))
+            repeat_ms = []
+            for _ in range(args.repeats):
+                with _trace_annotation("gdn_prefill/pallas_active_output_state_reconstruction_probe/repeat"):
+                    started = time.perf_counter()
+                    reconstruction_pallas_last_output = _block_until_ready(
+                        reconstruction_probe(
+                            normalized_query_scaled,
+                            normalized_key,
+                            initial_state,
+                            active_rows,
+                            active_chunk_indices,
+                            pallas_local_math_last_output[0],
+                            pallas_local_math_last_output[1],
+                            pallas_local_math_last_output[2],
+                        )
+                    )
+                    repeat_ms.append(1000.0 * (time.perf_counter() - started))
+            mean_ms = float(sum(repeat_ms) / len(repeat_ms)) if repeat_ms else None
+            reconstruction_info.update(
+                {
+                    "warmup_ms": warmup_ms,
+                    "repeat_ms": repeat_ms,
+                    "mean_ms": mean_ms,
+                    "p50_ms": _percentile(repeat_ms, 50),
+                    "p95_ms": _percentile(repeat_ms, 95),
+                    "min_ms": min(repeat_ms) if repeat_ms else None,
+                    "max_ms": max(repeat_ms) if repeat_ms else None,
+                    "profiled_iterations": int(args.warmups) + int(args.repeats),
+                }
+            )
         for name, _fn, compiled, compile_seconds in compiled_variants:
             warmup_ms = []
             last_output = None
@@ -928,6 +1137,23 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
             pallas_local_math_reference,
             pallas_local_math_last_output,
         )
+    reconstruction_info = pallas_feasibility["active_output_state_reconstruction_probe"]
+    if reconstruction_reference_output is not None:
+        reference_comparison = _compare_outputs(outputs[reference_name], reconstruction_reference_output, valid)
+        reconstruction_info["reference_local_math_comparison"] = reference_comparison
+        reconstruction_info["reference_local_math_passes_1e_5_gate"] = bool(
+            reference_comparison["output_max_abs"] <= 1e-5
+            and reference_comparison["valid_output_max_abs"] <= 1e-5
+            and reference_comparison["state_max_abs"] <= 1e-5
+        )
+    if reconstruction_pallas_last_output is not None:
+        pallas_comparison = _compare_outputs(outputs[reference_name], reconstruction_pallas_last_output, valid)
+        reconstruction_info["pallas_local_math_comparison"] = pallas_comparison
+        reconstruction_info["pallas_local_math_passes_1e_5_gate"] = bool(
+            pallas_comparison["output_max_abs"] <= 1e-5
+            and pallas_comparison["valid_output_max_abs"] <= 1e-5
+            and pallas_comparison["state_max_abs"] <= 1e-5
+        )
     profiled_iterations = len(variants) * (int(args.warmups) + int(args.repeats))
     profile_counters = _profile_counters(recorder.profile_path, profiled_iterations, list(variants)) if args.profile else None
     if profile_counters is not None:
@@ -974,7 +1200,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         ],
         "decision": {
             "promote_to_server_routing": False,
-            "reason": "metadata/input-pack/local-math scaffold only; no backend-owned GDN candidate was routed",
+            "reason": "metadata/input-pack/local-math/reconstruction scaffold only; no backend-owned GDN candidate was routed",
         },
         "run": recorder.metadata(),
     }

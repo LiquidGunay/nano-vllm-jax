@@ -2409,3 +2409,47 @@ Decision:
 - Keep the local-math probe as benchmark instrumentation. It is the first exact Pallas path that fuses active-chunk indexing with nontrivial chunk-local GDN math under the BF16-weight/FP32-activation serving contract.
 - Do not route it through `KernelBackendPlaceholder.gated_delta_prefill` yet. It computes only local intermediates and still omits query-local output attention, the cross-chunk state scan, final rectangular output scatter, and final recurrent state. A standalone local probe cannot prove generated-token correctness.
 - The next GDN candidate should extend this exact local-math path with a benchmark-only cross-chunk state/output reconstruction over active chunks, then compare final `valid_output_max_abs` and `state_max_abs` against current padded chunk32 before any server integration.
+
+## Entry 066 - Rejected Active Local-Math Output/State Reconstruction
+
+- run id: `20260526-062016-2175404-gdn_prefill_kernel_active_reconstruction_hetero8_64_512x32`
+- benchmark artifact: `results/gdn_prefill_kernel_active_reconstruction_hetero8_64_512x32.json`
+- benchmark script: `benchmarks/benchmark_gdn_prefill_kernel.py`
+- profile directory: `/mountpoint/.exp/profiles/20260526-062016-2175404-gdn_prefill_kernel_active_reconstruction_hetero8_64_512x32`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-062016-2175404-gdn_prefill_kernel_active_reconstruction_hetero8_64_512x32/plugins/profile/2026_05_26_06_20_25/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-062016-2175404-gdn_prefill_kernel_active_reconstruction_hetero8_64_512x32/plugins/profile/2026_05_26_06_20_25/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Poincare recommended a benchmark-only JAX reconstruction bridge before any Pallas state-scan kernel. It specifically called for dense-scattering active `value_transformed`, `k_cumdecay`, and `g_cumsum` back to rectangular chunk grids, then running the same cross-chunk `lax.scan` equations as `jax_chunk_gated_delta_rule.process_chunk`. It also warned not to use local `attn_with_identity` for query output attention; the reconstruction should recompute query-side decay and keep the strict-upper mask behavior from the current path.
+- change tested: the standalone GDN benchmark now has `active_output_state_reconstruction_probe`. It compiles a benchmark-only JAX reconstruction that consumes active local intermediates, scatters them to `[B,H,n_chunks,chunk,*]`, runs the rectangular cross-chunk state/output scan, and compares final output/state against `current_jax_chunk32_padded`. It records two gates: reconstruction from the active JAX local-math reference and reconstruction from the Pallas local-math output. No model/server route changed.
+- CUDA run: `JAX_PLATFORMS=cuda`, A10G, JAX `0.10.0`, FP32 activations/state, chunk size `32`, lengths `64,128,192,256,320,384,448,512`, `5` warmups, `20` measured repeats, current padded chunk32 only.
+- current padded chunk32 correctness remains exact: `output_max_abs=0.0`, `valid_output_max_abs=0.0`, and `state_max_abs=0.0`.
+- Entry 065 local-math gate still passes inside this run: combined local-intermediate max drift `9.537e-07`, with `value_transformed=9.537e-07`, `k_cumdecay=3.576e-07`, `g_cumsum=3.576e-07`, and `attn=2.384e-07`.
+- reconstruction gate failed from active JAX local intermediates: `output_max_abs=1.717e-05`, `valid_output_max_abs=1.717e-05`, and `state_max_abs=2.136e-04`.
+- reconstruction gate failed from Pallas local intermediates: `output_max_abs=1.907e-05`, `valid_output_max_abs=1.907e-05`, and `state_max_abs=3.052e-04`.
+- reconstruction timing: p50 `4.560 ms`, mean `4.566 ms`, p95 `4.632 ms`, min `4.533 ms`, max `4.649 ms`.
+- current padded chunk32 timing: p50 `6.472 ms`, mean `6.486 ms`, p95 `6.545 ms`, true-token throughput `355,240 tok/s`, rectangular-token throughput `631,537 tok/s`.
+
+Top profile counters:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `gdn_prefill/current_jax_chunk32_padded` | `164.23 ms / 25` | baseline annotation; repeat clock p50 was `6.472 ms` |
+| `gdn_prefill/pallas_active_output_state_reconstruction_probe` | `122.46 ms / 25` | reconstruction annotation; repeat clock p50 was `4.560 ms` |
+| `gdn_prefill/pallas_active_chunk_local_math_probe` | `51.91 ms / 25` | local-math annotation |
+| `gdn_active_chunk_local_math_chunk32_probe` | `46.33 ms / 50` | actual local-math Pallas labels |
+| `gdn_prefill/pallas_active_input_pack_probe` | `13.04 ms / 25` | pack annotation |
+| `gdn_active_input_pack_probe` | `6.70 ms / 50` | actual pack Pallas labels |
+| `PjRtCApiLoadedExecutable::Execute` | `68.06 ms / 101` | baseline plus metadata, pack, local-math, and reconstruction probes |
+| `command_buffer::execute` | `26.80 ms / 1650` | reconstruction adds command-buffer work vs Entry 065 |
+| `command_buffer::update` | `2.51 ms / 146` | reconstruction adds updates vs Entry 065 |
+| `input_reduce_fusion` | `14.68 ms / 775` | baseline GDN recurrence-family counter unchanged |
+| `loop_dynamic_update_slice_fusion` | `9.77 ms / 1575` | scatter/update count increases with reconstruction |
+| `loop_multiply_fusion` | `36.83 ms / 825` | reconstruction scan adds loop multiply work |
+| `while` | `41.69 ms / 75` | reconstruction adds one scan loop family |
+| `MemcpyD2D` | `12.35 ms / 1675` | reconstruction adds copies |
+| `transpose` | `28.15 ms / 1175` | reconstruction adds layout work |
+
+Decision:
+
+- Reject active-local reconstruction as a candidate for server routing. It fails the final `1e-5` correctness gate before any server integration, even when using the active JAX local-math reference. This confirms that small active-shape local differences are amplified by the cross-chunk state recurrence into the same `1e-4` final-state drift class as Entries 058-060.
+- Keep the reconstruction probe in the standalone benchmark because it is a useful guardrail: future active/local Pallas work must pass both the local-intermediate gate and the final output/state reconstruction gate before moving toward `KernelBackendPlaceholder.gated_delta_prefill`.
+- The next viable GDN route should avoid composing active-shaped local intermediates with a separate rectangular state scan. Either the state/output recurrence must be owned by one lowered segmented kernel with its own final-state parity proof, or the active local math must be made shape-compatible with the current rectangular local intermediates before reuse.
