@@ -2865,3 +2865,66 @@ Decision:
 - The next prefill attempt should address both issues before a server run:
   the full-shape value-block/grid overhead and the FP32 accumulation drift
   against the current chunk32 reference.
+
+## Entry 077 - Rejected FP32 CUDA GDN Prefill V64 Value-Block Follow-Up
+
+- reduced run id:
+  `20260526-102630-2266532-gdn_prefill_cuda_fp32_one_piece_v64_smoke`
+- reduced benchmark artifact:
+  `results/gdn_prefill_kernel_cuda_fp32_one_piece_v64_smoke.json`
+- full-shape run label:
+  `gdn_prefill_cuda_fp32_one_piece_v64_hetero8_64_512x32`
+- full-shape benchmark artifact:
+  `results/gdn_prefill_kernel_cuda_fp32_one_piece_v64_hetero8_64_512x32.json`
+- benchmark script: `benchmarks/benchmark_gdn_prefill_kernel.py`
+- change tested: a second local CUDA/JAX FFI target,
+  `gdn_prefill_chunk32_v64_normalized_fp32`, using `64` value columns per CUDA
+  block instead of `32`. This halves the full-shape value-block grid from four
+  blocks per row/head to two blocks per row/head for `value_dim=128`. It remains
+  benchmark-only and is not routed into serving.
+- focused CUDA tests:
+
+```text
+JAX_PLATFORMS=cuda ... NANO_VLLM_JAX_FORCE_CUDA_FFI_REBUILD=1 \
+  pytest tests/test_cuda_fp32_ffi.py -q
+```
+
+- result: `11 passed`, including V32 and V64 partial-sequence chunk-32 prefill
+  parity cases against `jax_chunk_gated_delta_rule`.
+
+Reduced smoke benchmark (`B=2,H=2,T=64,K=32,V=64`, lengths `37,64`):
+
+| variant | p50 ms | note |
+| --- | ---: | --- |
+| `current_jax_chunk32_padded` | `0.752` | current JAX chunk32 reference |
+| `cuda_fp32_one_piece_chunk32` | `0.279` | V32 custom call |
+| `cuda_fp32_one_piece_chunk32_v64` | `0.312` | V64 custom call; correct but slower than V32 at small shape |
+
+Full hetero8 model-shape microbenchmark:
+
+| variant | p50 ms | p95 ms | compile s |
+| --- | ---: | ---: | ---: |
+| `current_jax_chunk32_padded` | `5.435` | `5.471` | `0.109` |
+| `cuda_fp32_one_piece_chunk32` | `11.560` | `11.788` | `0.396` |
+| `cuda_fp32_one_piece_chunk32_v64` | `8.604` | `8.653` | `0.295` |
+
+Correctness deltas on the full shape:
+
+| metric | V32 | V64 |
+| --- | ---: | ---: |
+| output max abs | `2.289e-05` | `2.289e-05` |
+| valid output max abs | `2.289e-05` | `2.289e-05` |
+| output MSE | `6.943e-15` | `6.943e-15` |
+| state max abs | `2.441e-04` | `2.441e-04` |
+| state MSE | `1.708e-11` | `1.708e-11` |
+
+Decision:
+
+- Reject V64 as a serving candidate. It confirms value-block/grid overhead is a
+  material part of the V32 loss, but it still fails the full-shape
+  microbenchmark gate and does not improve accumulation drift.
+- Keep V64 default-off and benchmark-only beside V32.
+- Do not route either rectangular one-piece prefill custom call into serving.
+- Next prefill work should move closer to the planned segmented/nnz ABI or
+  borrow the GDN kernel structure from Qwen 3 Next / Flash Linear Attention
+  rather than only widening rectangular value blocks.

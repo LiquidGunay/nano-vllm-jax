@@ -167,7 +167,10 @@ gdn_segmented_prefill_chunk32(
   benchmark-only and rejected for serving promotion. It passed focused CUDA
   tests and a reduced-shape smoke benchmark, but the full hetero8 model-shape
   microbenchmark was slower than current JAX chunk32 and exceeded the standalone
-  state-drift gate.
+  state-drift gate. A V64 value-block follow-up reduced custom-call p50 at full
+  shape but still lost to current JAX and did not improve state drift, so the
+  next candidate should move closer to the segmented/nnz ABI instead of only
+  widening the rectangular value block.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 

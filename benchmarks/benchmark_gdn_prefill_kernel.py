@@ -34,7 +34,10 @@ import jax.numpy as jnp
 
 from nanovllm_jax.model import jax_chunk_gated_delta_rule
 from nanovllm_jax.layers import l2norm
-from nanovllm_jax.kernels.cuda_fp32_ffi import gdn_prefill_chunk32_normalized_fp32
+from nanovllm_jax.kernels.cuda_fp32_ffi import (
+    gdn_prefill_chunk32_normalized_fp32,
+    gdn_prefill_chunk32_v64_normalized_fp32,
+)
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
@@ -890,14 +893,18 @@ def _padded_chunked_fn(chunk_size: int) -> Callable:
     return run
 
 
-def _cuda_fp32_one_piece_chunk32_fn(args: argparse.Namespace, lengths: tuple[int, ...]) -> Callable:
+def _cuda_fp32_one_piece_chunk32_fn(
+    args: argparse.Namespace,
+    lengths: tuple[int, ...],
+    prefill_fn: Callable = gdn_prefill_chunk32_normalized_fp32,
+) -> Callable:
     seq_lens = jnp.asarray(lengths, dtype=jnp.int32)
     scale = 1.0 / jnp.sqrt(args.key_dim)
 
     def run(query, key, value, g, beta, initial_state):
         query_norm_scaled = l2norm(query.astype(jnp.float32), axis=-1, eps=1e-6) * scale
         key_norm = l2norm(key.astype(jnp.float32), axis=-1, eps=1e-6)
-        return gdn_prefill_chunk32_normalized_fp32(
+        return prefill_fn(
             query_norm_scaled,
             key_norm,
             value.astype(jnp.float32),
@@ -914,6 +921,11 @@ def _variant_fns(args: argparse.Namespace, lengths: tuple[int, ...]) -> dict[str
     available = {
         "current_jax_chunk32_padded": _padded_chunked_fn(args.chunk_size),
         "cuda_fp32_one_piece_chunk32": _cuda_fp32_one_piece_chunk32_fn(args, lengths),
+        "cuda_fp32_one_piece_chunk32_v64": _cuda_fp32_one_piece_chunk32_fn(
+            args,
+            lengths,
+            gdn_prefill_chunk32_v64_normalized_fp32,
+        ),
     }
     requested = [name.strip() for name in args.variants.split(",") if name.strip()]
     unknown = sorted(set(requested) - set(available))

@@ -560,9 +560,12 @@ gdn_segmented_prefill_chunk32(
 - Full hetero8 model-shape microbenchmark rejects this first prototype:
   `11.50 ms` p50 versus `5.43 ms` p50 for current JAX chunk32, with
   `state_max_abs=2.441e-04`.
+- A follow-up V64 value-block variant reduced full-shape p50 from `11.56 ms`
+  to `8.60 ms`, confirming value-block/grid overhead is real, but it still lost
+  to current JAX `5.44 ms` p50 and kept the same `state_max_abs=2.441e-04`.
 - Keep it default-off and benchmark-only. Do not route into serving. The next
-  attempt should either reduce the value-block/grid overhead and accumulation
-  drift or move closer to the true segmented/nnz ABI before a server run.
+  attempt should move closer to the true segmented/nnz ABI and preserve FP32
+  accumulation more closely before a server run.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 
@@ -838,6 +841,8 @@ Commit 8:
 - ~~Add first gdn_segmented_prefill_chunk32 prototype~~
 - Keep first CUDA one-piece chunk32 prototype default-off and benchmark-only;
   do not route it into serving
+- ~~Run value-block-width follow-up and record that V64 improves V32 but still
+  misses the full-shape microbenchmark gate~~
 - Compare a revised segmented prefill candidate against Entry 045 chunk-32
   baseline after it beats the full-shape GDN microbenchmark gate
 

@@ -19,6 +19,7 @@ from nanovllm_jax.backends import PureJAXBackend
 from nanovllm_jax.kernels.cuda_fp32_ffi import (
     build_cuda_fp32_kernels,
     gdn_prefill_chunk32_normalized_fp32,
+    gdn_prefill_chunk32_v64_normalized_fp32,
     gdn_recurrent_decode_step_fp32,
     gdn_recurrent_decode_step_fp32_reference,
     kv_append_paged_nhd_fp32,
@@ -449,7 +450,18 @@ def test_gdn_recurrent_decode_step_fp32_cuda_matches_reference(
 
 @pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
-def test_gdn_prefill_chunk32_normalized_fp32_cuda_matches_chunk_reference(monkeypatch):
+@pytest.mark.parametrize(
+    ("prefill_fn", "value_dim"),
+    [
+        (gdn_prefill_chunk32_normalized_fp32, 32),
+        (gdn_prefill_chunk32_v64_normalized_fp32, 64),
+    ],
+)
+def test_gdn_prefill_chunk32_normalized_fp32_cuda_matches_chunk_reference(
+    monkeypatch,
+    prefill_fn,
+    value_dim,
+):
     monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
     monkeypatch.setenv("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1")
 
@@ -457,7 +469,6 @@ def test_gdn_prefill_chunk32_normalized_fp32_cuda_matches_chunk_reference(monkey
     num_heads = 2
     seq_len = 64
     key_dim = 32
-    value_dim = 32
     lengths = jnp.array([37, 64], dtype=jnp.int32)
     valid = jnp.arange(seq_len, dtype=jnp.int32)[None, :] < lengths[:, None]
 
@@ -515,7 +526,7 @@ def test_gdn_prefill_chunk32_normalized_fp32_cuda_matches_chunk_reference(monkey
     )
     query_norm_scaled = l2norm(query, axis=-1, eps=1e-6) * (1.0 / jnp.sqrt(key_dim))
     key_norm = l2norm(key, axis=-1, eps=1e-6)
-    actual_out, actual_state = jax.jit(gdn_prefill_chunk32_normalized_fp32)(
+    actual_out, actual_state = jax.jit(prefill_fn)(
         query_norm_scaled,
         key_norm,
         value,

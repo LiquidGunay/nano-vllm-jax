@@ -27,6 +27,7 @@ _TARGET_KV_APPEND = "nanovllm_jax_fp32_kv_append_paged_nhd"
 _TARGET_PAGED_DECODE = "nanovllm_jax_fp32_paged_decode_attention_gqa_nhd"
 _TARGET_GDN_DECODE = "nanovllm_jax_fp32_gdn_recurrent_decode"
 _TARGET_GDN_PREFILL = "nanovllm_jax_fp32_gdn_prefill_chunk32"
+_TARGET_GDN_PREFILL_V64 = "nanovllm_jax_fp32_gdn_prefill_chunk32_v64"
 _REGISTER_LOCK = threading.Lock()
 _REGISTERED = False
 _LOADED_LIBS: list[ctypes.CDLL] = []
@@ -179,6 +180,7 @@ def _register_kv_append_target() -> None:
         decode_handler = library.NanoVllmJaxFp32PagedDecodeAttention
         gdn_decode_handler = library.NanoVllmJaxFp32GdnRecurrentDecode
         gdn_prefill_handler = library.NanoVllmJaxFp32GdnPrefillChunk32
+        gdn_prefill_v64_handler = library.NanoVllmJaxFp32GdnPrefillChunk32V64
         jax.ffi.register_ffi_target(
             _TARGET_KV_APPEND,
             jax.ffi.pycapsule(handler),
@@ -200,6 +202,12 @@ def _register_kv_append_target() -> None:
         jax.ffi.register_ffi_target(
             _TARGET_GDN_PREFILL,
             jax.ffi.pycapsule(gdn_prefill_handler),
+            platform="gpu",
+            api_version=1,
+        )
+        jax.ffi.register_ffi_target(
+            _TARGET_GDN_PREFILL_V64,
+            jax.ffi.pycapsule(gdn_prefill_v64_handler),
             platform="gpu",
             api_version=1,
         )
@@ -619,6 +627,8 @@ def _validate_fp32_gdn_prefill_inputs(
     beta: jnp.ndarray,
     seq_lens: jnp.ndarray,
     state: jnp.ndarray,
+    *,
+    value_dim_multiple: int = 32,
 ) -> None:
     for name, value_array, rank in (
         ("query", query, 4),
@@ -646,10 +656,53 @@ def _validate_fp32_gdn_prefill_inputs(
         raise ValueError("seq_lens must have shape [batch]")
     if query.shape[2] % 32 != 0:
         raise ValueError("FP32 GDN prefill prototype requires time divisible by 32")
-    if value.shape[3] % 32 != 0:
-        raise ValueError("FP32 GDN prefill prototype requires value_dim divisible by 32")
+    if value.shape[3] % value_dim_multiple != 0:
+        raise ValueError(
+            "FP32 GDN prefill prototype requires value_dim divisible by "
+            f"{value_dim_multiple}"
+        )
     if state.shape != (query.shape[0], query.shape[1], query.shape[3], value.shape[3]):
         raise ValueError("state must have shape [batch, heads, key_dim, value_dim]")
+
+
+def _gdn_prefill_chunk32_normalized_fp32_target(
+    target: str,
+    value_dim_multiple: int,
+    query: Any,
+    key: Any,
+    value: Any,
+    g: Any,
+    beta: Any,
+    seq_lens: Any,
+    state: Any,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    query = _as_jax_array("query", query)
+    key = _as_jax_array("key", key)
+    value = _as_jax_array("value", value)
+    g = _as_jax_array("g", g)
+    beta = _as_jax_array("beta", beta)
+    seq_lens = _as_jax_array("seq_lens", seq_lens)
+    state = _as_jax_array("state", state)
+    _validate_fp32_gdn_prefill_inputs(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        seq_lens,
+        state,
+        value_dim_multiple=value_dim_multiple,
+    )
+    _register_kv_append_target()
+    call = jax.ffi.ffi_call(
+        target,
+        (
+            jax.ShapeDtypeStruct(value.shape, value.dtype),
+            jax.ShapeDtypeStruct(state.shape, state.dtype),
+        ),
+        has_side_effect=False,
+    )
+    return call(query, key, value, g, beta, seq_lens, state)
 
 
 def gdn_prefill_chunk32_normalized_fp32(
@@ -669,21 +722,38 @@ def gdn_prefill_chunk32_normalized_fp32(
     default.
     """
 
-    query = _as_jax_array("query", query)
-    key = _as_jax_array("key", key)
-    value = _as_jax_array("value", value)
-    g = _as_jax_array("g", g)
-    beta = _as_jax_array("beta", beta)
-    seq_lens = _as_jax_array("seq_lens", seq_lens)
-    state = _as_jax_array("state", state)
-    _validate_fp32_gdn_prefill_inputs(query, key, value, g, beta, seq_lens, state)
-    _register_kv_append_target()
-    call = jax.ffi.ffi_call(
+    return _gdn_prefill_chunk32_normalized_fp32_target(
         _TARGET_GDN_PREFILL,
-        (
-            jax.ShapeDtypeStruct(value.shape, value.dtype),
-            jax.ShapeDtypeStruct(state.shape, state.dtype),
-        ),
-        has_side_effect=False,
+        32,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        seq_lens,
+        state,
     )
-    return call(query, key, value, g, beta, seq_lens, state)
+
+
+def gdn_prefill_chunk32_v64_normalized_fp32(
+    query: Any,
+    key: Any,
+    value: Any,
+    g: Any,
+    beta: Any,
+    seq_lens: Any,
+    state: Any,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Chunk-32 GDN prefill prototype using 64 value columns per CUDA block."""
+
+    return _gdn_prefill_chunk32_normalized_fp32_target(
+        _TARGET_GDN_PREFILL_V64,
+        64,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        seq_lens,
+        state,
+    )

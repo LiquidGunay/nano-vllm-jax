@@ -671,6 +671,7 @@ __global__ void Fp32GdnRecurrentDecodeKernel(
   }
 }
 
+template <int kBlockV>
 __global__ void Fp32GdnPrefillChunk32Kernel(
     const float* query,
     const float* key,
@@ -687,7 +688,6 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
     int64_t key_dim,
     int64_t value_dim) {
   constexpr int kChunk = 32;
-  constexpr int kBlockV = 32;
 
   extern __shared__ float shared[];
   float* local_attn = shared;                         // [32, 32]
@@ -1136,7 +1136,96 @@ extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPrefillChunk32(
       key_dim * kBlockV;      // state_tile
   size_t shared_bytes = shared_floats * sizeof(float);
 
-  Fp32GdnPrefillChunk32Kernel<<<grid, threads, shared_bytes, stream>>>(
+  Fp32GdnPrefillChunk32Kernel<kBlockV><<<grid, threads, shared_bytes, stream>>>(
+      static_cast<const float*>(query->data),
+      static_cast<const float*>(key->data),
+      static_cast<const float*>(value->data),
+      static_cast<const float*>(g->data),
+      static_cast<const float*>(beta->data),
+      static_cast<const int32_t*>(seq_lens->data),
+      static_cast<const float*>(state->data),
+      static_cast<float*>(out->data),
+      static_cast<float*>(new_state->data),
+      batch,
+      num_heads,
+      seq_len,
+      key_dim,
+      value_dim);
+  cudaError_t launch_error = cudaGetLastError();
+  if (launch_error != cudaSuccess) {
+    return CreateError(api, XLA_FFI_Error_Code_INTERNAL,
+                       cudaGetErrorString(launch_error));
+  }
+  return nullptr;
+}
+
+extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPrefillChunk32V64(
+    XLA_FFI_CallFrame* call_frame) {
+  MaybeSetMetadata(call_frame);
+  if (call_frame->extension_start != nullptr) {
+    return nullptr;
+  }
+
+  if (XLA_FFI_Error* error = CheckGdnPrefillCallFrame(call_frame)) {
+    return error;
+  }
+
+  const XLA_FFI_Api* api = call_frame->api;
+  XLA_FFI_Stream_Get_Args stream_args;
+  stream_args.struct_size = XLA_FFI_Stream_Get_Args_STRUCT_SIZE;
+  stream_args.extension_start = nullptr;
+  stream_args.ctx = call_frame->ctx;
+  stream_args.stream = nullptr;
+  if (XLA_FFI_Error* error = api->XLA_FFI_Stream_Get(&stream_args)) {
+    return error;
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_args.stream);
+
+  const XLA_FFI_Buffer* query = ArgBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* key = ArgBuffer(call_frame, 1);
+  const XLA_FFI_Buffer* value = ArgBuffer(call_frame, 2);
+  const XLA_FFI_Buffer* g = ArgBuffer(call_frame, 3);
+  const XLA_FFI_Buffer* beta = ArgBuffer(call_frame, 4);
+  const XLA_FFI_Buffer* seq_lens = ArgBuffer(call_frame, 5);
+  const XLA_FFI_Buffer* state = ArgBuffer(call_frame, 6);
+  XLA_FFI_Buffer* out = RetBuffer(call_frame, 0);
+  XLA_FFI_Buffer* new_state = RetBuffer(call_frame, 1);
+
+  int64_t batch = query->dims[0];
+  int64_t num_heads = query->dims[1];
+  int64_t seq_len = query->dims[2];
+  int64_t key_dim = query->dims[3];
+  int64_t value_dim = value->dims[3];
+  constexpr int kChunk = 32;
+  constexpr int kBlockV = 64;
+  if (value_dim % kBlockV != 0) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "GDN prefill v64 requires value_dim divisible by 64");
+  }
+  int threads = 256;
+  dim3 grid(
+      static_cast<unsigned int>(batch),
+      static_cast<unsigned int>(num_heads),
+      static_cast<unsigned int>(value_dim / kBlockV));
+  size_t shared_floats =
+      kChunk * kChunk +       // local_attn
+      kChunk * kChunk +       // query_attn
+      kChunk +                // g_cumsum
+      kChunk * kBlockV +      // value_work
+      kChunk * key_dim +      // k_cumdecay
+      key_dim * kBlockV;      // state_tile
+  size_t shared_bytes = shared_floats * sizeof(float);
+
+  cudaError_t attr_error = cudaFuncSetAttribute(
+      Fp32GdnPrefillChunk32Kernel<kBlockV>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(shared_bytes));
+  if (attr_error != cudaSuccess) {
+    return CreateError(api, XLA_FFI_Error_Code_INTERNAL,
+                       cudaGetErrorString(attr_error));
+  }
+
+  Fp32GdnPrefillChunk32Kernel<kBlockV><<<grid, threads, shared_bytes, stream>>>(
       static_cast<const float*>(query->data),
       static_cast<const float*>(key->data),
       static_cast<const float*>(value->data),
