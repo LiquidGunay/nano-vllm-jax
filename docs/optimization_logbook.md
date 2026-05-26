@@ -1828,3 +1828,44 @@ Decision:
 
 - Reject and revert GPU flat KV cache allocation. The HLO write-side simplification was real but too small; the integrated server trace regressed device execution, command-buffer updates, gather time, and host synchronization.
 - Do not pursue flat rank-4 KV layout as a standalone optimization. A future backend-owned KV layout should only be revisited when paired with a real attention kernel that consumes the new physical layout directly; reshaping the existing pure-JAX paged attention boundary is insufficient.
+
+## Entry 052 - Rejected Prepacked Full-Attention K/V Projection
+
+- run id: `20260526-032942-2104004-jax_hetero8_64_512x32_packed_full_attn_kv`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_packed_full_attn_kv.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-032942-2104004-jax_hetero8_64_512x32_packed_full_attn_kv`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-032942-2104004-jax_hetero8_64_512x32_packed_full_attn_kv/plugins/profile/2026_05_26_03_30_40/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-032942-2104004-jax_hetero8_64_512x32_packed_full_attn_kv/plugins/profile/2026_05_26_03_30_40/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Fermat reviewed the post-Entry-051 state and ranked the next model-side targets as: segmented ragged GDN prefill with chunk 32, backend-owned native paged-attention layout plus kernel, then mixed-dtype compact projection lowering gated by a standalone CUDA microbenchmark. The audit explicitly warned that Entries 048, 050, and 051 show local kernel wins can still lose if `PjRt Execute`, command-buffer updates, or host synchronization regress.
+- change tested: a temporary `NANO_VLLM_JAX_PACK_FULL_ATTN_KV=1` path added a precomputed `[K, V]` projection leaf for full-attention layers at HF load time, then projected K and V with one larger dot and split the result. The source change was reverted after profiling.
+- focused CUDA checks: with `NANO_VLLM_JAX_PACK_FULL_ATTN_KV=1` and accepted compact-prefill flags enabled, `tests/test_lm_head_helpers.py`, `tests/test_backend_boundaries.py::test_bucketed_prefill_last_logits_match_exact_prefill`, and `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute` passed under `JAX_PLATFORMS=cuda` (`6 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 045 chunk-32 reference.
+- JAX timing: `258.87 tok/s`, TTFT p50 `506.90 ms`, ITL p50 `15.42 ms`, ITL p95 `16.14 ms`.
+- delta vs Entry 045 chunk-32 default repeat: `0.704x` total tok/s, TTFT p50 `1.748x`, ITL p50 `1.173x`, ITL p95 `1.188x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 045 ms | packed full-attn K/V ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 696.03 | 988.92 | overall much slower |
+| `_run_main_and_sample` | 572.99 | 862.63 | runner hot path much slower |
+| `forward_step_token_ids_jit` | 122.13 | 136.80 | compiled token-id path slower |
+| first `forward_step_token_ids_jit` | 30.83 | 32.74 | first prefill slower |
+| `PjRtCApiLoadedExecutable::Execute` | 138.32 over 252 calls | 151.05 over 252 calls | same dispatch count, heavier device execution |
+| `jit_compiled:XLA GPU module` | 94.20 | 101.66 | module time regressed |
+| `command_buffer::execute` | 40.34 over 1143 calls | 42.24 over 1142 calls | command-buffer execution regressed |
+| `command_buffer::update` | 27.13 over 248 calls | 31.00 over 248 calls | command-buffer updates regressed |
+| `cutlass_80_tensorop_s1688gemm_128x128_16x5_nn_align4` | 52.40 over 96 calls | 4.53 over 12 calls | target compact GEMM bucket almost disappeared |
+| `input_reduce_fusion` | 28.65 over 1936 calls | 28.61 over 1936 calls | unchanged |
+| `gather` | 11.97 | 12.59 | worse |
+| `transpose` | 63.11 | 63.68 | worse |
+| `wrapped_concatenate` | 36.50 over 576 calls | 36.47 over 576 calls | unchanged |
+| `MemcpyD2D` | 24.69 over 1231 calls | 24.63 over 1232 calls | unchanged |
+| `array.py:325 tolist` | 437.58 | 711.53 | host sync attribution much worse |
+| `np.asarray(jax.Array)` | 437.35 | 711.26 | host sync attribution much worse |
+
+Decision:
+
+- Reject and revert prepacked full-attention K/V projection. The targeted compact CUTLASS bucket moved strongly in the intended direction, but the integrated serving path regressed in device execution, module time, command-buffer updates, gather/transpose work, and host synchronization.
+- Do not add persistent packed full-attention K/V leaves in this form. Like the prepacked MLP gate/up experiment, duplicating large projection leaves changes the compiled plan enough to erase the local GEMM win.
+- Next work should follow Fermat's ranking: first try ragged GDN prefill that keeps chunk 32 and removes padded work, or start a backend-owned paged-attention/KV kernel path. Avoid more loader-level packed-weight experiments unless a microbenchmark proves the mixed-dtype lowering improves the exact BF16-weight/FP32-activation contract without command-buffer or host-sync regressions.
