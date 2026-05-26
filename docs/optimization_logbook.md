@@ -2541,3 +2541,35 @@ Decision:
 - Keep the server profile-counter capture. Every future server-profile artifact can now carry its own Perfetto trace path plus machine-readable bottleneck summary, reducing manual logbook transcription errors.
 - Treat this run as instrumentation evidence, not a speed result. The exact-token gate passed, but wall timing is dominated by host synchronization labels already discussed in Entry 061.
 - Next optimization should follow the xhigh audit: attempt a benchmark-only one-piece lowered GDN prefill candidate that owns local math plus cross-chunk recurrence in one parity surface, or build a standalone fused compact projection microbenchmark. Do not retry split-local GDN reconstruction.
+
+## Entry 069 - Rejected One-Piece GDN Pallas vblock64 Compile Gate
+
+- reduced run id: `20260526-070338-2188325-gdn_prefill_kernel_one_piece_vblock64_smoke_profile`
+- reduced benchmark artifact: `results/gdn_prefill_kernel_one_piece_vblock64_smoke_profile.json`
+- benchmark script: `benchmarks/benchmark_gdn_prefill_kernel.py`
+- reduced profile directory: `/mountpoint/.exp/profiles/20260526-070338-2188325-gdn_prefill_kernel_one_piece_vblock64_smoke_profile`
+- reduced Perfetto trace: `/mountpoint/.exp/profiles/20260526-070338-2188325-gdn_prefill_kernel_one_piece_vblock64_smoke_profile/plugins/profile/2026_05_26_07_04_12/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- full-shape attempted profile directory: `/mountpoint/.exp/profiles/20260526-065006-2186508-gdn_prefill_kernel_one_piece_vblock64_hetero8_64_512x32`
+- change tested: the standalone GDN benchmark now contains an experimental one-piece Pallas probe that owns local GDN math plus cross-chunk state/output recurrence in one lowered kernel. The probe writes rectangular output/state directly and avoids the split-local intermediate boundary that failed Entries 066-067. It is guarded by `--enable-one-piece-gdn-probe`; normal benchmark runs leave `one_piece_gdn_prefill_probe.enabled=false` and `attempted=false`.
+- full-shape compile gate: `B=8,H=16,T=512,K=128,V=128`, lengths `64,128,192,256,320,384,448,512`, chunk size `32`, `block_v=64`. The full hetero8 run spent more than 10 minutes in XLA compile with 99 percent CPU, 0 percent GPU utilization, and no JSON/trace artifact before being stopped. This fails the practical compile gate for the target serving shape.
+- reduced CUDA run: `JAX_PLATFORMS=cuda`, A10G, JAX `0.10.0`, `B=2,H=2,T=64,K=64,V=64`, lengths `32,64`, chunk size `32`, `2` warmups, `5` measured repeats, `--enable-one-piece-gdn-probe`.
+- reduced correctness: one-piece Pallas probe passed the `1e-5` final gate with `output_max_abs=1.490e-07`, `valid_output_max_abs=1.490e-07`, `state_max_abs=1.192e-06`, and `state_mse=1.186e-14`.
+- reduced timing: current padded chunk32 p50 `1.162 ms`, mean `1.214 ms`, p95 `1.365 ms`; one-piece Pallas p50 `0.476 ms`, mean `0.471 ms`, p95 `0.481 ms`. The reduced compile still took `19.43 s`, so the runtime result is not enough to justify promotion.
+
+Reduced profile counters:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `gdn_prefill/current_jax_chunk32_padded` | `9.85 ms / 7` | reduced baseline annotation; repeat clock p50 was `1.162 ms` |
+| `gdn_prefill/pallas_one_piece_gdn_prefill_probe` | `6.73 ms / 7` | reduced one-piece annotation; repeat clock p50 was `0.476 ms` |
+| `gdn_one_piece_gdn_prefill_vblock64_probe` | `4.53 ms / 14` | actual one-piece Pallas kernel labels |
+| `PjRtCApiLoadedExecutable::Execute` | `21.32 ms / 58` | reduced diagnostic run, all probes plus baseline |
+| `while` | `9.64 ms / 35` | recurrence-family work remains visible |
+| `fusion` | `13.82 ms / 3409` | aggregate fusion bucket |
+| `input_reduce_fusion` | `2.80 ms / 651` | GDN-family baseline counter |
+
+Decision:
+
+- Reject the current one-piece Pallas vblock64 probe as a hetero8 serving candidate. It proves the one-piece parity surface can pass a small final-output/state gate, but its full-shape compile behavior is not acceptable.
+- Keep the probe behind the explicit opt-in flag as a recorded diagnostic only. Do not enable it in server routing or default benchmark runs.
+- If revisiting one-piece GDN, first reduce compile pressure through a smaller backend-owned surface or different blocking strategy, then rerun the full hetero8 compile gate before looking at runtime.

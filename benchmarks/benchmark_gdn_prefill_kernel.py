@@ -62,6 +62,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-dir", default="")
     parser.add_argument("--run-log", default="")
     parser.add_argument("--run-label", default="gdn_prefill_kernel_hetero8_64_512x32")
+    parser.add_argument(
+        "--enable-one-piece-gdn-probe",
+        action="store_true",
+        help="Opt into the experimental one-piece Pallas GDN prefill probe. Full hetero8 shapes can compile for minutes.",
+    )
     return parser.parse_args()
 
 
@@ -440,6 +445,110 @@ def _pallas_rectangular_chunk_local_math_probe_fn(
             name="gdn_rectangular_chunk_local_math_chunk32_probe",
             compiler_params=plt.CompilerParams(num_warps=4),
         )(key, value, g, beta, key_offsets, value_offsets, token_offsets)
+
+    return run
+
+
+def _pallas_one_piece_gdn_prefill_probe_fn(
+    batch_size: int,
+    num_heads: int,
+    n_chunks: int,
+    chunk_size: int,
+    key_dim: int,
+    value_dim: int,
+    block_v: int,
+) -> Callable:
+    if value_dim % block_v != 0:
+        raise ValueError("value_dim must be divisible by block_v")
+
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as plt
+
+    def kernel(
+        query_ref,
+        key_ref,
+        value_ref,
+        g_ref,
+        beta_ref,
+        initial_state_ref,
+        key_offsets_ref,
+        value_offsets_ref,
+        token_offsets_ref,
+        output_ref,
+        final_state_ref,
+    ):
+        row = pl.program_id(0)
+        head = pl.program_id(1)
+        value_block = pl.program_id(2)
+        key_offsets = key_offsets_ref[:]
+        value_offsets = value_block * block_v + value_offsets_ref[:]
+        token_offsets = token_offsets_ref[:]
+        lower_mask = token_offsets[:, None] >= token_offsets[None, :]
+        strict_lower_mask = token_offsets[:, None] > token_offsets[None, :]
+
+        state = initial_state_ref[row, head, key_offsets[:, None], value_offsets[None, :]].astype(jnp.float32)
+        for chunk_index in range(n_chunks):
+            start = chunk_index * chunk_size
+            query_block = query_ref[row, head, start + token_offsets[:, None], key_offsets[None, :]]
+            key_block = key_ref[row, head, start + token_offsets[:, None], key_offsets[None, :]]
+            value_block_i = value_ref[row, head, start + token_offsets[:, None], value_offsets[None, :]]
+            g_block = g_ref[row, head, start + token_offsets]
+            beta_block = beta_ref[row, head, start + token_offsets]
+
+            g_cumsum = jnp.cumsum(g_block, axis=0)
+            decay_mask = jnp.exp(g_cumsum[:, None] - g_cumsum[None, :])
+            decay_mask = jnp.where(lower_mask, decay_mask, 0.0)
+
+            k_beta = key_block * beta_block[:, None]
+            kkt = pl.dot(k_beta, key_block, trans_b=True, allow_tf32=False)
+            local_attn = jnp.where(strict_lower_mask, -(kkt * decay_mask), 0.0)
+
+            for row_index in range(1, chunk_size):
+                valid_cols = token_offsets < row_index
+                selected_row = token_offsets[:, None] == row_index
+                row_values = jnp.sum(jnp.where(selected_row, local_attn, 0.0), axis=0)
+                row_values = jnp.where(valid_cols, row_values, 0.0)
+                submatrix = jnp.where(valid_cols[:, None] & valid_cols[None, :], local_attn, 0.0)
+                contribution = jnp.sum(row_values[:, None] * submatrix, axis=0)
+                updated_row = jnp.where(valid_cols, row_values + contribution, 0.0)
+                local_attn = jnp.where(selected_row, updated_row[None, :], local_attn)
+
+            local_attn = local_attn + (token_offsets[:, None] == token_offsets[None, :]).astype(jnp.float32)
+            value_transformed = pl.dot(local_attn, value_block_i * beta_block[:, None], allow_tf32=False)
+            k_cumdecay = pl.dot(
+                local_attn,
+                k_beta * jnp.exp(g_cumsum)[:, None],
+                allow_tf32=False,
+            )
+
+            query_attn = pl.dot(query_block, key_block, trans_b=True, allow_tf32=False) * decay_mask
+            query_attn = jnp.where(lower_mask, query_attn, 0.0)
+            v_prime = pl.dot(k_cumdecay, state, allow_tf32=False)
+            v_new = value_transformed - v_prime
+            attn_inter = pl.dot(query_block * jnp.exp(g_cumsum)[:, None], state, allow_tf32=False)
+            attn_v_new = pl.dot(query_attn, v_new, allow_tf32=False)
+            output_i = attn_inter + attn_v_new
+
+            g_last = jnp.sum(jnp.where(token_offsets == (chunk_size - 1), g_cumsum, 0.0), axis=0)
+            g_last_minus_g = g_last - g_cumsum
+            k_weighted = key_block * jnp.exp(g_last_minus_g)[:, None]
+            state_update = pl.dot(k_weighted, v_new, trans_a=True, allow_tf32=False)
+            state = state * jnp.exp(g_last) + state_update
+            output_ref[row, head, start + token_offsets[:, None], value_offsets[None, :]] = output_i
+
+        final_state_ref[row, head, key_offsets[:, None], value_offsets[None, :]] = state
+
+    def run(query, key, value, g, beta, initial_state, key_offsets, value_offsets, token_offsets):
+        return pl.pallas_call(
+            kernel,
+            out_shape=(
+                jax.ShapeDtypeStruct((batch_size, num_heads, n_chunks * chunk_size, value_dim), query.dtype),
+                jax.ShapeDtypeStruct((batch_size, num_heads, key_dim, value_dim), jnp.float32),
+            ),
+            grid=(batch_size, num_heads, value_dim // block_v),
+            name=f"gdn_one_piece_gdn_prefill_vblock{block_v}_probe",
+            compiler_params=plt.CompilerParams(num_warps=4),
+        )(query, key, value, g, beta, initial_state, key_offsets, value_offsets, token_offsets)
 
     return run
 
@@ -864,6 +973,8 @@ def _profile_counters(profile_path: Path, profiled_iterations: int, variants: li
         "gdn_rectangular_chunk_local_math_chunk32_probe",
         "gdn_prefill/rectangular_local_split_reconstruction_probe",
         "gdn_prefill/pallas_rectangular_output_state_reconstruction_probe",
+        "gdn_prefill/pallas_one_piece_gdn_prefill_probe",
+        "gdn_one_piece_gdn_prefill_vblock64_probe",
         "while",
         "fusion",
         "transpose",
@@ -960,6 +1071,14 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
             "lowering_ok": None,
             "error": None,
         },
+        "one_piece_gdn_prefill_probe": {
+            "enabled": bool(args.enable_one_piece_gdn_probe),
+            "attempted": False,
+            "lowering_ok": None,
+            "error": None,
+            "custom_call_count": None,
+            "block_v": 64,
+        },
     }
     pallas_pack_last_output = None
     pallas_pack_reference = None
@@ -971,6 +1090,8 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
     pallas_rectangular_local_math_last_output = None
     rectangular_reference_reconstruction_output = None
     rectangular_pallas_reconstruction_output = None
+    one_piece_gdn_prefill_probe = None
+    one_piece_gdn_prefill_last_output = None
 
     # Compile before profiling. The trace should focus on warmed kernel behavior.
     compiled_variants: list[tuple[str, Callable, Any, float]] = []
@@ -1200,6 +1321,39 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
                 rectangular_info["error"] = f"{type(exc).__name__}: {exc}"
                 rectangular_reconstruction_info["lowering_ok"] = False
                 rectangular_reconstruction_info["error"] = f"{type(exc).__name__}: {exc}"
+
+            one_piece_info = pallas_feasibility["one_piece_gdn_prefill_probe"]
+            if args.enable_one_piece_gdn_probe:
+                one_piece_info["attempted"] = True
+                try:
+                    block_v = int(one_piece_info["block_v"])
+                    one_piece_started = time.perf_counter()
+                    one_piece_fn = _pallas_one_piece_gdn_prefill_probe_fn(
+                        int(args.batch_size),
+                        int(args.num_heads),
+                        int(args.seq_len // args.chunk_size),
+                        int(args.chunk_size),
+                        int(args.key_dim),
+                        int(args.value_dim),
+                        block_v,
+                    )
+                    one_piece_gdn_prefill_probe = jax.jit(one_piece_fn).lower(
+                        normalized_query_scaled,
+                        normalized_key,
+                        value,
+                        g,
+                        beta,
+                        initial_state,
+                        key_offsets,
+                        jnp.arange(block_v, dtype=jnp.int32),
+                        token_offsets,
+                    ).compile()
+                    one_piece_info["compile_seconds"] = time.perf_counter() - one_piece_started
+                    one_piece_info["lowering_ok"] = True
+                except BaseException as exc:
+                    one_piece_gdn_prefill_probe = None
+                    one_piece_info["lowering_ok"] = False
+                    one_piece_info["error"] = f"{type(exc).__name__}: {exc}"
 
     recorder.start_jax_profile(enabled=args.profile)
     try:
@@ -1508,6 +1662,59 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
                     "pallas_max_ms": max(pallas_repeat_ms) if pallas_repeat_ms else None,
                 }
             )
+        if one_piece_gdn_prefill_probe is not None:
+            one_piece_info = pallas_feasibility["one_piece_gdn_prefill_probe"]
+            block_v = int(one_piece_info["block_v"])
+            value_block_offsets = jnp.arange(block_v, dtype=jnp.int32)
+            warmup_ms = []
+            for _ in range(args.warmups):
+                with _trace_annotation("gdn_prefill/pallas_one_piece_gdn_prefill_probe/warmup"):
+                    started = time.perf_counter()
+                    one_piece_gdn_prefill_last_output = _block_until_ready(
+                        one_piece_gdn_prefill_probe(
+                            normalized_query_scaled,
+                            normalized_key,
+                            value,
+                            g,
+                            beta,
+                            initial_state,
+                            key_offsets,
+                            value_block_offsets,
+                            token_offsets,
+                        )
+                    )
+                    warmup_ms.append(1000.0 * (time.perf_counter() - started))
+            repeat_ms = []
+            for _ in range(args.repeats):
+                with _trace_annotation("gdn_prefill/pallas_one_piece_gdn_prefill_probe/repeat"):
+                    started = time.perf_counter()
+                    one_piece_gdn_prefill_last_output = _block_until_ready(
+                        one_piece_gdn_prefill_probe(
+                            normalized_query_scaled,
+                            normalized_key,
+                            value,
+                            g,
+                            beta,
+                            initial_state,
+                            key_offsets,
+                            value_block_offsets,
+                            token_offsets,
+                        )
+                    )
+                    repeat_ms.append(1000.0 * (time.perf_counter() - started))
+            mean_ms = float(sum(repeat_ms) / len(repeat_ms)) if repeat_ms else None
+            one_piece_info.update(
+                {
+                    "warmup_ms": warmup_ms,
+                    "repeat_ms": repeat_ms,
+                    "mean_ms": mean_ms,
+                    "p50_ms": _percentile(repeat_ms, 50),
+                    "p95_ms": _percentile(repeat_ms, 95),
+                    "min_ms": min(repeat_ms) if repeat_ms else None,
+                    "max_ms": max(repeat_ms) if repeat_ms else None,
+                    "profiled_iterations": int(args.warmups) + int(args.repeats),
+                }
+            )
         for name, _fn, compiled, compile_seconds in compiled_variants:
             warmup_ms = []
             last_output = None
@@ -1603,6 +1810,19 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
             and rectangular_pallas_comparison["valid_output_max_abs"] <= 1e-5
             and rectangular_pallas_comparison["state_max_abs"] <= 1e-5
         )
+    one_piece_info = pallas_feasibility["one_piece_gdn_prefill_probe"]
+    if one_piece_gdn_prefill_last_output is not None:
+        one_piece_comparison = _compare_outputs(
+            outputs[reference_name],
+            one_piece_gdn_prefill_last_output,
+            valid,
+        )
+        one_piece_info["comparison"] = one_piece_comparison
+        one_piece_info["passes_1e_5_gate"] = bool(
+            one_piece_comparison["output_max_abs"] <= 1e-5
+            and one_piece_comparison["valid_output_max_abs"] <= 1e-5
+            and one_piece_comparison["state_max_abs"] <= 1e-5
+        )
     profiled_iterations = len(variants) * (int(args.warmups) + int(args.repeats))
     profile_counters = _profile_counters(recorder.profile_path, profiled_iterations, list(variants)) if args.profile else None
     if profile_counters is not None:
@@ -1619,6 +1839,9 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         rectangular_custom_call = ranges.get("gdn_rectangular_chunk_local_math_chunk32_probe")
         if rectangular_custom_call is not None:
             pallas_feasibility["rectangular_chunk_local_math_probe"]["custom_call_count"] = int(rectangular_custom_call.get("count", 0))
+        one_piece_custom_call = ranges.get("gdn_one_piece_gdn_prefill_vblock64_probe")
+        if one_piece_custom_call is not None:
+            pallas_feasibility["one_piece_gdn_prefill_probe"]["custom_call_count"] = int(one_piece_custom_call.get("count", 0))
 
     return {
         "run_config": {
@@ -1640,6 +1863,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
             "repeats": args.repeats,
             "seed": args.seed,
             "variants": list(variants),
+            "enable_one_piece_gdn_probe": bool(args.enable_one_piece_gdn_probe),
             "dtype_contract": "fp32 activations/state, output cast follows current jax_chunk_gated_delta_rule",
         },
         "variants": variant_results,
@@ -1652,7 +1876,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         ],
         "decision": {
             "promote_to_server_routing": False,
-            "reason": "metadata/input-pack/local-math/reconstruction/rectangular-split scaffold only; no backend-owned GDN candidate was routed",
+            "reason": "standalone GDN probes only; no candidate was routed into the server",
         },
         "run": recorder.metadata(),
     }
