@@ -1231,3 +1231,55 @@ Decision:
 - Reject and revert the Pallas GPU paged decode attention path. It preserved exact correctness and reduced some copy/narrow-GEMM buckets, but the layer-local KV transpose/layout cost and heavier execution made decode latency much worse.
 - Do not integrate the shipped Pallas paged-attention op without changing the physical KV cache layout. It wants `[kv_heads, pages, page_size, head_dim]`, while the current pedagogical cache uses `[layers, pages, page_size, kv_heads, head_dim]`; transposing per full-attention layer in the hot decode path erases the kernel benefit.
 - Continue from Entry 033 as the accepted implementation baseline. The next lowered experiment should follow the side-audit recommendation: a streaming/top-1 LM-head kernel that avoids changing KV layout.
+
+## Entry 037 - Rejected Pallas Triton LM-Head Argmax
+
+- best run id: `20260526-002748-2034344-jax_hetero8_64_512x32_pallas_lm_head_argmax_bh128_bv256`
+- best benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_pallas_lm_head_argmax_bh128_bv256.json`
+- best profile directory: `/mountpoint/.exp/profiles/20260526-002748-2034344-jax_hetero8_64_512x32_pallas_lm_head_argmax_bh128_bv256`
+- best Perfetto trace: `/mountpoint/.exp/profiles/20260526-002748-2034344-jax_hetero8_64_512x32_pallas_lm_head_argmax_bh128_bv256/plugins/profile/2026_05_26_00_29_42/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- best TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-002748-2034344-jax_hetero8_64_512x32_pallas_lm_head_argmax_bh128_bv256/plugins/profile/2026_05_26_00_29_42/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- other benchmark artifacts:
+  - `results/qwen08_jax_server_trace_hetero8_64_512x32_pallas_lm_head_argmax.json`
+  - `results/qwen08_jax_server_trace_hetero8_64_512x32_pallas_lm_head_argmax_chunked512.json`
+- subagent audit: Harvey recommended trying a Pallas Triton streaming/top-1 LM-head kernel as a greedy-only, materialized-LM-head experiment, with explicit value/index tile reduction to preserve `jnp.argmax` lowest-index tie-breaking. The audit also predicted the main risk: this could still lose to XLA's autotuned GEMM because the arithmetic is unchanged and the only possible win is avoiding full-logits materialization.
+- change tested: a temporary `NANO_VLLM_JAX_PALLAS_LM_HEAD_ARGMAX=1` path replaced the decode-time `jnp.dot(hidden, lm_head) -> argmax` in `lm_head_token_ids_and_topk` with a Pallas Triton tile-argmax kernel. The path was gated to greedy decode only (`top_k == 0`, `is_prefill == False`, `[B, 1, H]` hidden, materialized `params.lm_head`) and left prefill/top-k/MTP verifier logits on the dense fallback. The source change was reverted after profiling.
+- feasibility checks: CUDA routed-JIT smokes matched dense `jnp.argmax(jnp.dot(hidden_fp32, weight_bf16))`. The first full-H tile prototype only fit at `BLOCK_V <= 32` on this GPU and was very slow. A chunked kernel over hidden tiles allowed larger vocab tiles; a real-shape microbenchmark over `[8, 1024] x [1024, 248320]` found `BLOCK_H=128`, `BLOCK_V=256`, `num_warps=8` fastest among tested Pallas settings (`1.172 ms` vs dense `1.196 ms` in isolation), but the integrated server profile still regressed.
+- correctness: all profiled full hetero8 runs had exact generated-token match for all 8 rows against the Entry 033 reference.
+
+Best tuned run vs Entry 033:
+
+| metric | Entry 033 | tuned Pallas LM-head | delta |
+| --- | ---: | ---: | ---: |
+| tok/s | 355.29 | 346.14 | 0.974x |
+| TTFT p50 | 315.89 ms | 321.46 ms | 1.018x |
+| ITL p50 | 12.86 ms | 13.55 ms | 1.054x |
+| ITL p95 | 13.79 ms | 14.15 ms | 1.027x |
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 033 ms | tuned Pallas LM-head ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 720.52 | 739.58 | overall slower |
+| `_run_main_and_sample` | 598.60 | 611.68 | runner hot path slower |
+| `forward_step_token_ids_jit` | 175.81 | 193.87 | decode token-id step slower |
+| `PjRtCApiLoadedExecutable::Execute` | 191.91 over 252 calls | 208.85 over 252 calls | same dispatch count, heavier execution |
+| `jit_compiled:XLA GPU module` | 147.90 | 157.32 | module time increased |
+| `command_buffer::execute` | 92.22 over 1575 calls | 94.05 over 1575 calls | slightly slower |
+| `gemm_fusion_dot_234` | 31.89 over 31 calls | 0.00 | dense LM-head GEMM removed |
+| `lm_head_tile_argmax` | 0.00 | 32.11 over 31 calls | Pallas replacement costs about the same as the removed GEMM |
+| `MemcpyD2D` | 24.62 | 24.55 | unchanged |
+| `input_reduce_fusion` | 41.57 | 40.99 | unchanged/slightly lower |
+
+Profiled variants:
+
+| variant | artifact | tok/s | ITL p50 | note |
+| --- | --- | ---: | ---: | --- |
+| full-H tile, `BLOCK_V=32` | `qwen08_jax_server_trace_hetero8_64_512x32_pallas_lm_head_argmax.json` | 285.53 | 18.26 ms | functional but many tiny tiles; `lm_head_tile_argmax` cost 188.17 ms |
+| chunked, `BLOCK_H=64`, `BLOCK_V=512` | `qwen08_jax_server_trace_hetero8_64_512x32_pallas_lm_head_argmax_chunked512.json` | 339.47 | 13.70 ms | much better, still slower than Entry 033 |
+| chunked, `BLOCK_H=128`, `BLOCK_V=256` | `qwen08_jax_server_trace_hetero8_64_512x32_pallas_lm_head_argmax_bh128_bv256.json` | 346.14 | 13.55 ms | best tested integrated setting, still slower |
+
+Decision:
+
+- Reject and revert the Pallas Triton LM-head argmax path. It preserved correctness and removed the dense LM-head GEMM bucket, but the custom call plus second-stage tile reduction did not beat XLA's autotuned dense GEMM inside the full server decode graph.
+- Do not revisit a two-stage Pallas argmax for this LM head on A10G unless the design eliminates the cross-tile reduction or fuses the final token selection into a single custom call. The current best path remains Entry 033.
