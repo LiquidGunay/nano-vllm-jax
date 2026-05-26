@@ -156,9 +156,7 @@ game.
 
 Add a benchmark matrix runner:
 
-```text
-benchmarks/run_gpu_matrix.py
-```
+- ~~`benchmarks/run_gpu_matrix.py`~~
 
 It should run:
 
@@ -172,9 +170,9 @@ Across at least:
 
 ```text
 - hetero8: [64,128,192,256,320,384,448,512] x 32 output
-- short prompts: [32..128] x 32 output
-- long-ish prefill: [512..2048] x 16 output
-- decode-heavy: [128] x 128 output
+- short_32_128: [32,64,96,128] x 32 output
+- long_prefill_512_2048: [512,1024,1536,2048] x 16 output
+- decode_heavy_128x128: [128] x 128 output
 ```
 
 Output one summary file:
@@ -697,8 +695,8 @@ Commit 1:
 
 Commit 2:
 
-- Add benchmark matrix runner
-- Add summary JSON output schema
+- ~~Add benchmark matrix runner~~
+- ~~Add summary JSON output schema~~
 
 Commit 3:
 

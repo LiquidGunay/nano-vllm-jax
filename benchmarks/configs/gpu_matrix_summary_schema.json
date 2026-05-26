@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "type": "object",
+  "required": [
+    "schema_version",
+    "created_at_utc",
+    "dry_run",
+    "repeats",
+    "run_dir",
+    "output_json",
+    "configs",
+    "workloads",
+    "required_metrics",
+    "matrix",
+    "vllm_references",
+    "comparisons"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "created_at_utc": {
+      "type": "string"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "repeats": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "run_dir": {
+      "type": "string"
+    },
+    "output_json": {
+      "type": "string"
+    },
+    "configs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "workloads": {
+      "type": "array",
+      "items": {
+        "type": "string",
+          "enum": [
+            "hetero8",
+            "short_32_128",
+            "long_prefill_512_2048",
+            "decode_heavy_128x128"
+          ]
+      }
+    },
+    "required_metrics": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "matrix": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "required": [
+            "config",
+            "repeats",
+            "aggregate"
+          ],
+          "properties": {
+            "config": {
+              "type": "object"
+            },
+            "repeats": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                                "repeat",
+                                "artifact",
+                                "reference_json",
+                                "reference_source",
+                                "run",
+                                "metrics"
+                              ]
+              }
+            },
+            "aggregate": {
+              "type": "object",
+              "required": [
+                "repeat_count",
+                "tokens_per_second_median",
+                "ttft_ms_p50_median",
+                "itl_ms_p50_median",
+                "all_correct",
+                "all_exact_generated_token_match",
+                "all_correctness_checked"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "vllm_references": {
+      "type": "object"
+    },
+    "comparisons": {
+      "type": "object"
+    }
+  }
+}
