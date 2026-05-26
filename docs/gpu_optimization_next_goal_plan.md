@@ -253,6 +253,7 @@ end-to-end throughput.
 - Matrix summaries now include an `acceptance` section that makes the plan's
   speed-claim evidence check explicit: minimum repeats, exact correctness,
   JAX/vLLM performance presence, profile counters, and the `0.75x` vLLM target.
+  All configured profile-counter buckets must be present for every repeat.
   Human explanation of profile bucket movement still belongs in the logbook.
 
 ## Phase 2 - Kernel Roadmap

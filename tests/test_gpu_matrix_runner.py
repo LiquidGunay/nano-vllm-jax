@@ -7,6 +7,7 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from benchmarks.run_gpu_matrix import (
+    PROFILE_NEEDLES,
     WORKLOADS,
     _aggregate_repeats,
     _benchmark_acceptance_summary,
@@ -151,27 +152,16 @@ def test_reference_for_uses_live_default_when_no_stored_reference(tmp_path):
 
 
 def test_benchmark_acceptance_summary_requires_plan_evidence():
+    complete_profile = {
+        needle: {
+            "total_ms": float(index + 1),
+            "count": index + 1,
+        }
+        for index, needle in enumerate(PROFILE_NEEDLES)
+    }
     repeats = [
-        {
-            "metrics": {
-                "profile": {
-                    "PjRtCApiLoadedExecutable::Execute": {
-                        "total_ms": 1.0,
-                        "count": 1,
-                    }
-                }
-            }
-        },
-        {
-            "metrics": {
-                "profile": {
-                    "PjRtCApiLoadedExecutable::Execute": {
-                        "total_ms": 2.0,
-                        "count": 1,
-                    }
-                }
-            }
-        },
+        {"metrics": {"profile": complete_profile}},
+        {"metrics": {"profile": complete_profile}},
     ]
     aggregate = {
         "repeat_count": 2,
@@ -192,6 +182,7 @@ def test_benchmark_acceptance_summary_requires_plan_evidence():
     assert all(acceptance["checks"].values())
     assert acceptance["speed_claim_ready"]
     assert acceptance["target_vllm_ratio_met"]
+    assert acceptance["missing_profile_counters"] == []
 
 
 def test_benchmark_acceptance_summary_rejects_incomplete_evidence():
@@ -211,3 +202,35 @@ def test_benchmark_acceptance_summary_rejects_incomplete_evidence():
     assert not acceptance["target_vllm_ratio_met"]
     assert not acceptance["checks"]["minimum_repeats"]
     assert not acceptance["checks"]["profile_counters_present"]
+    assert acceptance["missing_profile_counters"]
+
+
+def test_benchmark_acceptance_summary_requires_all_profile_counters():
+    incomplete_profile = {
+        needle: {
+            "total_ms": 1.0,
+            "count": 1,
+        }
+        for needle in PROFILE_NEEDLES[:-1]
+    }
+    acceptance = _benchmark_acceptance_summary(
+        [
+            {"metrics": {"profile": incomplete_profile}},
+            {"metrics": {"profile": incomplete_profile}},
+        ],
+        {
+            "repeat_count": 2,
+            "tokens_per_second_median": 90.0,
+            "all_correctness_checked": True,
+            "all_exact_generated_token_match": True,
+        },
+        {"jax_over_vllm_throughput": 0.9},
+        {"performance": {"tokens_per_second": 100.0}},
+    )
+
+    assert not acceptance["speed_claim_ready"]
+    assert not acceptance["checks"]["profile_counters_present"]
+    assert acceptance["missing_profile_counters"] == [
+        f"repeat1:{PROFILE_NEEDLES[-1]}",
+        f"repeat2:{PROFILE_NEEDLES[-1]}",
+    ]

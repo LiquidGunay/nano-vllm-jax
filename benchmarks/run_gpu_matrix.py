@@ -543,14 +543,16 @@ def _comparison_summary(
     }
 
 
-def _has_profile_counters(repeats: list[dict[str, Any]]) -> bool:
-    for row in repeats:
+def _missing_profile_counters(repeats: list[dict[str, Any]]) -> list[str]:
+    missing: set[str] = set()
+    for repeat_index, row in enumerate(repeats, start=1):
         metrics = row.get("metrics") or {}
         profile = metrics.get("profile") or {}
-        for bucket in profile.values():
-            if bucket.get("total_ms") is not None and bucket.get("count") is not None:
-                return True
-    return False
+        for needle in PROFILE_NEEDLES:
+            bucket = profile.get(needle) or {}
+            if bucket.get("total_ms") is None or bucket.get("count") is None:
+                missing.add(f"repeat{repeat_index}:{needle}")
+    return sorted(missing)
 
 
 def _benchmark_acceptance_summary(
@@ -561,13 +563,14 @@ def _benchmark_acceptance_summary(
 ) -> dict[str, Any]:
     vllm_performance = (vllm_metrics or {}).get("performance") or {}
     jax_ratio = comparison.get("jax_over_vllm_throughput")
+    missing_profile_counters = _missing_profile_counters(repeats)
     checks = {
         "minimum_repeats": int(aggregate.get("repeat_count") or 0) >= MIN_ACCEPTANCE_REPEATS,
         "correctness_checked": bool(aggregate.get("all_correctness_checked")),
         "exact_generated_token_match": bool(aggregate.get("all_exact_generated_token_match")),
         "jax_performance_present": aggregate.get("tokens_per_second_median") is not None,
         "vllm_reference_present": vllm_performance.get("tokens_per_second") is not None,
-        "profile_counters_present": _has_profile_counters(repeats),
+        "profile_counters_present": not missing_profile_counters,
     }
     speed_claim_ready = all(checks.values())
     return {
@@ -575,6 +578,7 @@ def _benchmark_acceptance_summary(
         "speed_claim_ready": speed_claim_ready,
         "target_vllm_ratio": TARGET_VLLM_RATIO,
         "target_vllm_ratio_met": bool(jax_ratio is not None and jax_ratio >= TARGET_VLLM_RATIO),
+        "missing_profile_counters": missing_profile_counters,
         "notes": (
             "profile bucket movement still needs human explanation in the logbook"
             if speed_claim_ready

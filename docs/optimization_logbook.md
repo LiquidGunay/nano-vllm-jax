@@ -3174,7 +3174,9 @@ Decision:
   section for each workload/config pair. It checks whether the summary has at
   least two repeats, exact generated-token correctness, JAX performance metrics,
   a vLLM throughput reference, profile counters, and whether the JAX/vLLM
-  throughput ratio reaches the `0.75x` target.
+  throughput ratio reaches the `0.75x` target. Profile coverage is strict:
+  every configured profile bucket must be present in every repeat, and missing
+  buckets are listed in `missing_profile_counters`.
 - schema update: `benchmarks/configs/gpu_matrix_summary_schema.json` now
   requires the `acceptance` top-level key for new matrix summaries.
 - focused tests:
@@ -3183,7 +3185,7 @@ Decision:
 .venv/bin/python -m pytest tests/test_gpu_matrix_runner.py -q
 ```
 
-- result: `10 passed`.
+- result: `11 passed`.
 - dry-run verification:
 
 ```text
@@ -3197,7 +3199,8 @@ Decision:
 - result: the dry-run summary includes `acceptance`. As expected for a dry run,
   `minimum_repeats` and stored vLLM reference checks can pass, but
   `speed_claim_ready=false` because no JAX performance, correctness, or profile
-  metrics exist.
+  metrics exist. The summary explicitly lists all missing profile buckets for
+  each dry-run repeat.
 
 Decision:
 
