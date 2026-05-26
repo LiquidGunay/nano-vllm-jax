@@ -2802,3 +2802,66 @@ Decision:
 - The next GDN attempt should use a coarser fused boundary, most likely the
   chunk-32 segmented prefill surface, or fuse more of decode than only the
   recurrent state step.
+
+## Entry 076 - Rejected First FP32 CUDA GDN Prefill Chunk32 Prototype
+
+- reduced run id:
+  `20260526-101237-2262259-gdn_prefill_cuda_fp32_one_piece_smoke`
+- reduced benchmark artifact:
+  `results/gdn_prefill_kernel_cuda_fp32_one_piece_smoke.json`
+- full-shape run label:
+  `gdn_prefill_cuda_fp32_one_piece_hetero8_64_512x32`
+- full-shape benchmark artifact:
+  `results/gdn_prefill_kernel_cuda_fp32_one_piece_hetero8_64_512x32.json`
+- benchmark script: `benchmarks/benchmark_gdn_prefill_kernel.py`
+- change tested: a local CUDA/JAX FFI
+  `gdn_prefill_chunk32_normalized_fp32` custom call plus explicit benchmark
+  variant `cuda_fp32_one_piece_chunk32`. The ABI takes already normalized/scaled
+  FP32 query, normalized FP32 key, FP32 value/g/beta/state, and int32 sequence
+  lengths. It owns chunk-32 local recurrence, cross-chunk output/state update,
+  and final FP32 state writeback for a rectangular padded batch with exact
+  `seq_lens`.
+- focused CUDA tests:
+
+```text
+JAX_PLATFORMS=cuda ... NANO_VLLM_JAX_FORCE_CUDA_FFI_REBUILD=1 \
+  pytest tests/test_cuda_fp32_ffi.py -q
+```
+
+- result: `10 passed`, including a partial-sequence chunk-32 prefill parity
+  case against `jax_chunk_gated_delta_rule`.
+
+Reduced smoke benchmark:
+
+| variant | p50 ms | note |
+| --- | ---: | --- |
+| `current_jax_chunk32_padded` | `0.698` | `B=2,H=2,T=64,K=32,V=32`, lengths `37,64` |
+| `cuda_fp32_one_piece_chunk32` | `0.291` | output max abs `1.49e-07`, state max abs `7.15e-07` |
+
+Full hetero8 model-shape microbenchmark:
+
+| variant | p50 ms | p95 ms | compile s |
+| --- | ---: | ---: | ---: |
+| `current_jax_chunk32_padded` | `5.431` | `5.443` | `18.436` |
+| `cuda_fp32_one_piece_chunk32` | `11.501` | `11.837` | `0.396` |
+
+Correctness deltas on the full shape:
+
+| metric | value |
+| --- | ---: |
+| output max abs | `2.289e-05` |
+| valid output max abs | `2.289e-05` |
+| output MSE | `6.943e-15` |
+| state max abs | `2.441e-04` |
+| state MSE | `1.708e-11` |
+
+Decision:
+
+- Reject this first CUDA chunk32 prefill prototype as a serving candidate.
+- Keep the wrapper and benchmark variant as a default-off diagnostic/prototype
+  surface only.
+- Do not route it through `KernelBackendPlaceholder.gated_delta_prefill` or any
+  server path.
+- The next prefill attempt should address both issues before a server run:
+  the full-shape value-block/grid overhead and the FP32 accumulation drift
+  against the current chunk32 reference.

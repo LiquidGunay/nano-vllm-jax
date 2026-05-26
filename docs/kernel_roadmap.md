@@ -163,6 +163,11 @@ gdn_segmented_prefill_chunk32(
   PjRt Execute and command-buffer execute/update do not regress.
 - do-not-merge conditions: first prefill gets slower, dynamic-slice/update or
   tiny-command-buffer count explodes, or the win exists only in a microbenchmark.
+- current status: first local CUDA/JAX FFI one-piece chunk32 prototype is
+  benchmark-only and rejected for serving promotion. It passed focused CUDA
+  tests and a reduced-shape smoke benchmark, but the full hetero8 model-shape
+  microbenchmark was slower than current JAX chunk32 and exceeded the standalone
+  state-drift gate.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 

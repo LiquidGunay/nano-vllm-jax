@@ -26,6 +26,7 @@ from nanovllm_jax.kernels.registry import backend_status
 _TARGET_KV_APPEND = "nanovllm_jax_fp32_kv_append_paged_nhd"
 _TARGET_PAGED_DECODE = "nanovllm_jax_fp32_paged_decode_attention_gqa_nhd"
 _TARGET_GDN_DECODE = "nanovllm_jax_fp32_gdn_recurrent_decode"
+_TARGET_GDN_PREFILL = "nanovllm_jax_fp32_gdn_prefill_chunk32"
 _REGISTER_LOCK = threading.Lock()
 _REGISTERED = False
 _LOADED_LIBS: list[ctypes.CDLL] = []
@@ -177,6 +178,7 @@ def _register_kv_append_target() -> None:
         handler = library.NanoVllmJaxFp32KvAppend
         decode_handler = library.NanoVllmJaxFp32PagedDecodeAttention
         gdn_decode_handler = library.NanoVllmJaxFp32GdnRecurrentDecode
+        gdn_prefill_handler = library.NanoVllmJaxFp32GdnPrefillChunk32
         jax.ffi.register_ffi_target(
             _TARGET_KV_APPEND,
             jax.ffi.pycapsule(handler),
@@ -192,6 +194,12 @@ def _register_kv_append_target() -> None:
         jax.ffi.register_ffi_target(
             _TARGET_GDN_DECODE,
             jax.ffi.pycapsule(gdn_decode_handler),
+            platform="gpu",
+            api_version=1,
+        )
+        jax.ffi.register_ffi_target(
+            _TARGET_GDN_PREFILL,
+            jax.ffi.pycapsule(gdn_prefill_handler),
             platform="gpu",
             api_version=1,
         )
@@ -601,3 +609,81 @@ def gdn_recurrent_decode_step_fp32_reference(
         initial_state=state,
         use_qk_l2norm_in_kernel=True,
     )
+
+
+def _validate_fp32_gdn_prefill_inputs(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    g: jnp.ndarray,
+    beta: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    state: jnp.ndarray,
+) -> None:
+    for name, value_array, rank in (
+        ("query", query, 4),
+        ("key", key, 4),
+        ("value", value, 4),
+        ("g", g, 3),
+        ("beta", beta, 3),
+        ("state", state, 4),
+    ):
+        if value_array.dtype != jnp.float32:
+            raise ValueError(f"{name} must be float32")
+        if value_array.ndim != rank:
+            raise ValueError(f"{name} must be rank-{rank}")
+    if seq_lens.dtype != jnp.int32:
+        raise ValueError("seq_lens must be int32")
+    if seq_lens.ndim != 1:
+        raise ValueError("seq_lens must be rank-1")
+    if query.shape != key.shape:
+        raise ValueError("query and key must have matching shape")
+    if value.shape[:3] != query.shape[:3]:
+        raise ValueError("value must have matching [batch, heads, time]")
+    if g.shape != query.shape[:3] or beta.shape != query.shape[:3]:
+        raise ValueError("g and beta must have shape [batch, heads, time]")
+    if seq_lens.shape != (query.shape[0],):
+        raise ValueError("seq_lens must have shape [batch]")
+    if query.shape[2] % 32 != 0:
+        raise ValueError("FP32 GDN prefill prototype requires time divisible by 32")
+    if value.shape[3] % 32 != 0:
+        raise ValueError("FP32 GDN prefill prototype requires value_dim divisible by 32")
+    if state.shape != (query.shape[0], query.shape[1], query.shape[3], value.shape[3]):
+        raise ValueError("state must have shape [batch, heads, key_dim, value_dim]")
+
+
+def gdn_prefill_chunk32_normalized_fp32(
+    query: Any,
+    key: Any,
+    value: Any,
+    g: Any,
+    beta: Any,
+    seq_lens: Any,
+    state: Any,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Chunk-32 GDN prefill for already-normalized FP32 q/k tensors.
+
+    The caller owns the model contract: query is L2-normalized and scaled by
+    1/sqrt(key_dim), key is L2-normalized, and value/g/beta/state are FP32.
+    This is intentionally a benchmark-facing prototype rather than a server
+    default.
+    """
+
+    query = _as_jax_array("query", query)
+    key = _as_jax_array("key", key)
+    value = _as_jax_array("value", value)
+    g = _as_jax_array("g", g)
+    beta = _as_jax_array("beta", beta)
+    seq_lens = _as_jax_array("seq_lens", seq_lens)
+    state = _as_jax_array("state", state)
+    _validate_fp32_gdn_prefill_inputs(query, key, value, g, beta, seq_lens, state)
+    _register_kv_append_target()
+    call = jax.ffi.ffi_call(
+        _TARGET_GDN_PREFILL,
+        (
+            jax.ShapeDtypeStruct(value.shape, value.dtype),
+            jax.ShapeDtypeStruct(state.shape, state.dtype),
+        ),
+        has_side_effect=False,
+    )
+    return call(query, key, value, g, beta, seq_lens, state)

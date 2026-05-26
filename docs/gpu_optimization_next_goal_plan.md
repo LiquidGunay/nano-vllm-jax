@@ -550,6 +550,20 @@ gdn_segmented_prefill_chunk32(
 - chunking creates many more command-buffer executions
 ```
 
+### Status - 2026-05-26
+
+- First local CUDA/JAX FFI prototype added as
+  `gdn_prefill_chunk32_normalized_fp32` and benchmark variant
+  `cuda_fp32_one_piece_chunk32`.
+- Focused CUDA FFI tests pass, and the reduced `B=2,H=2,T=64,K=32,V=32`
+  benchmark is faster with small drift.
+- Full hetero8 model-shape microbenchmark rejects this first prototype:
+  `11.50 ms` p50 versus `5.43 ms` p50 for current JAX chunk32, with
+  `state_max_abs=2.441e-04`.
+- Keep it default-off and benchmark-only. Do not route into serving. The next
+  attempt should either reduce the value-block/grid overhead and accumulation
+  drift or move closer to the true segmented/nnz ABI before a server run.
+
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 
 ### Motivation
@@ -821,8 +835,11 @@ Commit 7:
 
 Commit 8:
 
-- Add gdn_segmented_prefill_chunk32 prototype
-- Compare against Entry 045 chunk-32 baseline
+- ~~Add first gdn_segmented_prefill_chunk32 prototype~~
+- Keep first CUDA one-piece chunk32 prototype default-off and benchmark-only;
+  do not route it into serving
+- Compare a revised segmented prefill candidate against Entry 045 chunk-32
+  baseline after it beats the full-shape GDN microbenchmark gate
 
 Commit 9:
 

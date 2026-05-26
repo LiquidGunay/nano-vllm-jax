@@ -308,6 +308,106 @@ XLA_FFI_Error* CheckGdnDecodeCallFrame(XLA_FFI_CallFrame* call_frame) {
   return nullptr;
 }
 
+XLA_FFI_Error* CheckGdnPrefillCallFrame(XLA_FFI_CallFrame* call_frame) {
+  const XLA_FFI_Api* api = call_frame->api;
+  if (call_frame->stage != XLA_FFI_ExecutionStage_EXECUTE) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "fp32 GDN prefill only supports execute stage");
+  }
+  if (call_frame->args.size != 7 || call_frame->rets.size != 2) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "fp32 GDN prefill expects 7 arguments and 2 results");
+  }
+  for (int64_t i = 0; i < call_frame->args.size; ++i) {
+    if (!IsBufferArg(call_frame, i)) {
+      return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                         "all fp32 GDN prefill arguments must be buffers");
+    }
+  }
+  for (int64_t i = 0; i < call_frame->rets.size; ++i) {
+    if (!IsBufferRet(call_frame, i)) {
+      return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                         "all fp32 GDN prefill results must be buffers");
+    }
+  }
+
+  const XLA_FFI_Buffer* query = ArgBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* key = ArgBuffer(call_frame, 1);
+  const XLA_FFI_Buffer* value = ArgBuffer(call_frame, 2);
+  const XLA_FFI_Buffer* g = ArgBuffer(call_frame, 3);
+  const XLA_FFI_Buffer* beta = ArgBuffer(call_frame, 4);
+  const XLA_FFI_Buffer* seq_lens = ArgBuffer(call_frame, 5);
+  const XLA_FFI_Buffer* state = ArgBuffer(call_frame, 6);
+  const XLA_FFI_Buffer* out = RetBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* new_state = RetBuffer(call_frame, 1);
+
+  if (!HasTypeAndRank(query, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(key, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(value, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(out, XLA_FFI_DataType_F32, 4)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "query/key/value/output must be FP32 rank-4 buffers");
+  }
+  if (!HasTypeAndRank(g, XLA_FFI_DataType_F32, 3) ||
+      !HasTypeAndRank(beta, XLA_FFI_DataType_F32, 3)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "g and beta must be FP32 rank-3 buffers");
+  }
+  if (!HasTypeAndRank(seq_lens, XLA_FFI_DataType_S32, 1)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "seq_lens must be an int32 rank-1 buffer");
+  }
+  if (!HasTypeAndRank(state, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(new_state, XLA_FFI_DataType_F32, 4)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "state and new_state must be FP32 rank-4 buffers");
+  }
+  if (query->dims[0] != key->dims[0] ||
+      query->dims[0] != value->dims[0] ||
+      query->dims[0] != state->dims[0] ||
+      query->dims[0] != seq_lens->dims[0] ||
+      query->dims[1] != key->dims[1] ||
+      query->dims[1] != value->dims[1] ||
+      query->dims[1] != state->dims[1]) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "GDN prefill batch/head dimensions must match");
+  }
+  if (query->dims[2] != key->dims[2] ||
+      query->dims[2] != value->dims[2] ||
+      g->dims[2] != query->dims[2] ||
+      beta->dims[2] != query->dims[2] ||
+      query->dims[2] % 32 != 0) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "GDN prefill time dimension must match and be divisible by 32");
+  }
+  if (g->dims[0] != query->dims[0] || beta->dims[0] != query->dims[0] ||
+      g->dims[1] != query->dims[1] || beta->dims[1] != query->dims[1]) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "g/beta batch/head dimensions must match query");
+  }
+  if (query->dims[3] != key->dims[3] ||
+      query->dims[3] != state->dims[2] ||
+      value->dims[3] != state->dims[3] ||
+      value->dims[3] % 32 != 0) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "GDN prefill dimensions must match state and value_dim must be divisible by 32");
+  }
+  if (out->dims[0] != value->dims[0] ||
+      out->dims[1] != value->dims[1] ||
+      out->dims[2] != value->dims[2] ||
+      out->dims[3] != value->dims[3]) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "GDN prefill output shape must match value");
+  }
+  for (int i = 0; i < 4; ++i) {
+    if (new_state->dims[i] != state->dims[i]) {
+      return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                         "GDN prefill state output shape must match state input");
+    }
+  }
+  return nullptr;
+}
+
 void MaybeSetMetadata(XLA_FFI_CallFrame* call_frame) {
   XLA_FFI_Extension_Base* extension = call_frame->extension_start;
   if (extension == nullptr ||
@@ -571,6 +671,218 @@ __global__ void Fp32GdnRecurrentDecodeKernel(
   }
 }
 
+__global__ void Fp32GdnPrefillChunk32Kernel(
+    const float* query,
+    const float* key,
+    const float* value,
+    const float* g,
+    const float* beta,
+    const int32_t* seq_lens,
+    const float* initial_state,
+    float* out,
+    float* final_state,
+    int64_t batch,
+    int64_t num_heads,
+    int64_t seq_len,
+    int64_t key_dim,
+    int64_t value_dim) {
+  constexpr int kChunk = 32;
+  constexpr int kBlockV = 32;
+
+  extern __shared__ float shared[];
+  float* local_attn = shared;                         // [32, 32]
+  float* query_attn = local_attn + kChunk * kChunk;   // [32, 32]
+  float* g_cumsum = query_attn + kChunk * kChunk;     // [32]
+  float* value_work = g_cumsum + kChunk;              // [32, 32]
+  float* k_cumdecay = value_work + kChunk * kBlockV;  // [32, key_dim]
+  float* state_tile = k_cumdecay + kChunk * key_dim;  // [key_dim, 32]
+
+  int64_t batch_idx = blockIdx.x;
+  int64_t head = blockIdx.y;
+  int64_t value_block = blockIdx.z;
+  int64_t value_start = value_block * kBlockV;
+  int tid = threadIdx.x;
+
+  int64_t q_base = ((batch_idx * num_heads + head) * seq_len) * key_dim;
+  int64_t v_base = ((batch_idx * num_heads + head) * seq_len) * value_dim;
+  int64_t gate_base = (batch_idx * num_heads + head) * seq_len;
+  int64_t state_base = ((batch_idx * num_heads + head) * key_dim) * value_dim;
+
+  for (int64_t linear = tid; linear < seq_len * kBlockV; linear += blockDim.x) {
+    int64_t token = linear / kBlockV;
+    int64_t v_offset = linear - token * kBlockV;
+    out[v_base + token * value_dim + value_start + v_offset] = 0.0f;
+  }
+  for (int64_t linear = tid; linear < key_dim * kBlockV; linear += blockDim.x) {
+    int64_t k_offset = linear / kBlockV;
+    int64_t v_offset = linear - k_offset * kBlockV;
+    state_tile[linear] =
+        initial_state[state_base + k_offset * value_dim + value_start + v_offset];
+  }
+  __syncthreads();
+
+  int32_t row_len = seq_lens[batch_idx];
+  int64_t n_chunks = seq_len / kChunk;
+  for (int64_t chunk = 0; chunk < n_chunks; ++chunk) {
+    int64_t start = chunk * kChunk;
+    int32_t active_tokens = 0;
+    if (row_len > start) {
+      int32_t remaining = row_len - static_cast<int32_t>(start);
+      active_tokens = remaining < kChunk ? remaining : kChunk;
+    }
+    if (active_tokens <= 0) {
+      continue;
+    }
+
+    if (tid == 0) {
+      float running = 0.0f;
+      for (int i = 0; i < active_tokens; ++i) {
+        running += g[gate_base + start + i];
+        g_cumsum[i] = running;
+      }
+      for (int i = active_tokens; i < kChunk; ++i) {
+        g_cumsum[i] = running;
+      }
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < kChunk * kChunk; idx += blockDim.x) {
+      int i = idx / kChunk;
+      int j = idx - i * kChunk;
+      float value_ij = 0.0f;
+      if (i < active_tokens && j < i) {
+        float dot = 0.0f;
+        float beta_i = beta[gate_base + start + i];
+        int64_t key_i_base = q_base + (start + i) * key_dim;
+        int64_t key_j_base = q_base + (start + j) * key_dim;
+        for (int64_t k_offset = 0; k_offset < key_dim; ++k_offset) {
+          dot += key[key_i_base + k_offset] * beta_i *
+                 key[key_j_base + k_offset];
+        }
+        float decay = expf(g_cumsum[i] - g_cumsum[j]);
+        value_ij = -(dot * decay);
+      }
+      local_attn[idx] = value_ij;
+    }
+    __syncthreads();
+
+    for (int row = 1; row < active_tokens; ++row) {
+      for (int col = tid; col < kChunk; col += blockDim.x) {
+        float updated = 0.0f;
+        if (col < row) {
+          float row_value = local_attn[row * kChunk + col];
+          float contribution = 0.0f;
+          for (int j = 0; j < row; ++j) {
+            contribution += local_attn[row * kChunk + j] *
+                            local_attn[j * kChunk + col];
+          }
+          updated = row_value + contribution;
+        }
+        query_attn[row * kChunk + col] = updated;
+      }
+      __syncthreads();
+      for (int col = tid; col < kChunk; col += blockDim.x) {
+        if (col < row) {
+          local_attn[row * kChunk + col] = query_attn[row * kChunk + col];
+        }
+      }
+      __syncthreads();
+    }
+
+    for (int idx = tid; idx < active_tokens * kBlockV; idx += blockDim.x) {
+      int i = idx / kBlockV;
+      int v_offset = idx - i * kBlockV;
+      float acc = 0.0f;
+      for (int t = 0; t <= i; ++t) {
+        float attn = (i == t) ? 1.0f : local_attn[i * kChunk + t];
+        acc += attn * value[v_base + (start + t) * value_dim + value_start + v_offset] *
+               beta[gate_base + start + t];
+      }
+      value_work[i * kBlockV + v_offset] = acc;
+    }
+    for (int idx = tid; idx < active_tokens * key_dim; idx += blockDim.x) {
+      int i = idx / key_dim;
+      int k_offset = idx - i * key_dim;
+      float acc = 0.0f;
+      for (int t = 0; t <= i; ++t) {
+        float attn = (i == t) ? 1.0f : local_attn[i * kChunk + t];
+        acc += attn * key[q_base + (start + t) * key_dim + k_offset] *
+               beta[gate_base + start + t] * expf(g_cumsum[t]);
+      }
+      k_cumdecay[i * key_dim + k_offset] = acc;
+    }
+    for (int idx = tid; idx < active_tokens * active_tokens; idx += blockDim.x) {
+      int i = idx / active_tokens;
+      int j = idx - i * active_tokens;
+      float acc = 0.0f;
+      if (j <= i) {
+        int64_t q_i_base = q_base + (start + i) * key_dim;
+        int64_t k_j_base = q_base + (start + j) * key_dim;
+        for (int64_t k_offset = 0; k_offset < key_dim; ++k_offset) {
+          acc += query[q_i_base + k_offset] * key[k_j_base + k_offset];
+        }
+        acc *= expf(g_cumsum[i] - g_cumsum[j]);
+      }
+      query_attn[i * kChunk + j] = acc;
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < active_tokens * kBlockV; idx += blockDim.x) {
+      int i = idx / kBlockV;
+      int v_offset = idx - i * kBlockV;
+      float v_prime = 0.0f;
+      for (int64_t k_offset = 0; k_offset < key_dim; ++k_offset) {
+        v_prime += k_cumdecay[i * key_dim + k_offset] *
+                   state_tile[k_offset * kBlockV + v_offset];
+      }
+      value_work[i * kBlockV + v_offset] -= v_prime;
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < active_tokens * kBlockV; idx += blockDim.x) {
+      int i = idx / kBlockV;
+      int v_offset = idx - i * kBlockV;
+      float attn_inter = 0.0f;
+      for (int64_t k_offset = 0; k_offset < key_dim; ++k_offset) {
+        attn_inter += query[q_base + (start + i) * key_dim + k_offset] *
+                      expf(g_cumsum[i]) *
+                      state_tile[k_offset * kBlockV + v_offset];
+      }
+      float attn_v_new = 0.0f;
+      for (int j = 0; j <= i; ++j) {
+        attn_v_new += query_attn[i * kChunk + j] *
+                      value_work[j * kBlockV + v_offset];
+      }
+      out[v_base + (start + i) * value_dim + value_start + v_offset] =
+          attn_inter + attn_v_new;
+    }
+    __syncthreads();
+
+    float g_last = g_cumsum[active_tokens - 1];
+    float exp_g_last = expf(g_last);
+    for (int idx = tid; idx < key_dim * kBlockV; idx += blockDim.x) {
+      int k_offset = idx / kBlockV;
+      int v_offset = idx - k_offset * kBlockV;
+      float state_update = 0.0f;
+      for (int i = 0; i < active_tokens; ++i) {
+        state_update +=
+            key[q_base + (start + i) * key_dim + k_offset] *
+            expf(g_last - g_cumsum[i]) *
+            value_work[i * kBlockV + v_offset];
+      }
+      state_tile[idx] = state_tile[idx] * exp_g_last + state_update;
+    }
+    __syncthreads();
+  }
+
+  for (int64_t linear = tid; linear < key_dim * kBlockV; linear += blockDim.x) {
+    int64_t k_offset = linear / kBlockV;
+    int64_t v_offset = linear - k_offset * kBlockV;
+    final_state[state_base + k_offset * value_dim + value_start + v_offset] =
+        state_tile[linear];
+  }
+}
+
 }  // namespace
 
 extern "C" XLA_FFI_Error* NanoVllmJaxFp32KvAppend(
@@ -761,6 +1073,82 @@ extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnRecurrentDecode(
       static_cast<float*>(new_state->data),
       batch,
       num_heads,
+      key_dim,
+      value_dim);
+  cudaError_t launch_error = cudaGetLastError();
+  if (launch_error != cudaSuccess) {
+    return CreateError(api, XLA_FFI_Error_Code_INTERNAL,
+                       cudaGetErrorString(launch_error));
+  }
+  return nullptr;
+}
+
+extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPrefillChunk32(
+    XLA_FFI_CallFrame* call_frame) {
+  MaybeSetMetadata(call_frame);
+  if (call_frame->extension_start != nullptr) {
+    return nullptr;
+  }
+
+  if (XLA_FFI_Error* error = CheckGdnPrefillCallFrame(call_frame)) {
+    return error;
+  }
+
+  const XLA_FFI_Api* api = call_frame->api;
+  XLA_FFI_Stream_Get_Args stream_args;
+  stream_args.struct_size = XLA_FFI_Stream_Get_Args_STRUCT_SIZE;
+  stream_args.extension_start = nullptr;
+  stream_args.ctx = call_frame->ctx;
+  stream_args.stream = nullptr;
+  if (XLA_FFI_Error* error = api->XLA_FFI_Stream_Get(&stream_args)) {
+    return error;
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_args.stream);
+
+  const XLA_FFI_Buffer* query = ArgBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* key = ArgBuffer(call_frame, 1);
+  const XLA_FFI_Buffer* value = ArgBuffer(call_frame, 2);
+  const XLA_FFI_Buffer* g = ArgBuffer(call_frame, 3);
+  const XLA_FFI_Buffer* beta = ArgBuffer(call_frame, 4);
+  const XLA_FFI_Buffer* seq_lens = ArgBuffer(call_frame, 5);
+  const XLA_FFI_Buffer* state = ArgBuffer(call_frame, 6);
+  XLA_FFI_Buffer* out = RetBuffer(call_frame, 0);
+  XLA_FFI_Buffer* new_state = RetBuffer(call_frame, 1);
+
+  int64_t batch = query->dims[0];
+  int64_t num_heads = query->dims[1];
+  int64_t seq_len = query->dims[2];
+  int64_t key_dim = query->dims[3];
+  int64_t value_dim = value->dims[3];
+  constexpr int kChunk = 32;
+  constexpr int kBlockV = 32;
+  int threads = 256;
+  dim3 grid(
+      static_cast<unsigned int>(batch),
+      static_cast<unsigned int>(num_heads),
+      static_cast<unsigned int>(value_dim / kBlockV));
+  size_t shared_floats =
+      kChunk * kChunk +       // local_attn
+      kChunk * kChunk +       // query_attn
+      kChunk +                // g_cumsum
+      kChunk * kBlockV +      // value_work
+      kChunk * key_dim +      // k_cumdecay
+      key_dim * kBlockV;      // state_tile
+  size_t shared_bytes = shared_floats * sizeof(float);
+
+  Fp32GdnPrefillChunk32Kernel<<<grid, threads, shared_bytes, stream>>>(
+      static_cast<const float*>(query->data),
+      static_cast<const float*>(key->data),
+      static_cast<const float*>(value->data),
+      static_cast<const float*>(g->data),
+      static_cast<const float*>(beta->data),
+      static_cast<const int32_t*>(seq_lens->data),
+      static_cast<const float*>(state->data),
+      static_cast<float*>(out->data),
+      static_cast<float*>(new_state->data),
+      batch,
+      num_heads,
+      seq_len,
       key_dim,
       value_dim);
   cudaError_t launch_error = cudaGetLastError();
