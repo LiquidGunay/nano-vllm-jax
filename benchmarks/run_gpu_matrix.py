@@ -22,6 +22,10 @@ from subprocess import CompletedProcess
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from benchmarks.summarize_gpu_matrix import render_markdown
+
 CONFIG_DIR = REPO_ROOT / "benchmarks" / "configs"
 RESULTS_DIR = REPO_ROOT / "results"
 DEFAULT_CONFIGS = ("gpu_paged_default", "gpu_paged_fast_optin", "gpu_mtp_diagnostics")
@@ -131,6 +135,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workloads", default=",".join(WORKLOADS))
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--output-json", default="")
+    parser.add_argument(
+        "--report-md",
+        default="",
+        help=(
+            "Markdown report path. Defaults to the output JSON path with .md suffix; "
+            "use --no-report-md to skip writing it."
+        ),
+    )
+    parser.add_argument("--no-report-md", dest="write_report_md", action="store_false", default=True)
+    parser.add_argument("--report-top-profile-deltas", type=int, default=8)
     parser.add_argument("--run-dir", default="")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-live-vllm", dest="live_vllm", action="store_false", default=True)
@@ -1026,6 +1040,7 @@ def main() -> None:
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
     run_dir = Path(args.run_dir) if args.run_dir else RESULTS_DIR / "gpu_matrix_runs" / timestamp
     output_json = Path(args.output_json) if args.output_json else RESULTS_DIR / f"gpu_matrix_{timestamp}.json"
+    report_md = Path(args.report_md) if args.report_md else output_json.with_suffix(".md")
     if not args.dry_run and not args.skip_gpu_preflight:
         gpu_ok, gpu_detail = _cuda_device_preflight()
         if not gpu_ok:
@@ -1064,6 +1079,7 @@ def main() -> None:
         "repeats": int(args.repeats),
         "run_dir": str(run_dir),
         "output_json": str(output_json),
+        "report_md": str(report_md) if args.write_report_md else None,
         "configs": selected_configs,
         "workloads": selected_workloads,
         "required_metrics": [
@@ -1254,6 +1270,13 @@ def main() -> None:
     _validate_summary_shape(summary, _load_json(CONFIG_DIR / "gpu_matrix_summary_schema.json"))
     output_json.write_text(json.dumps(_json_safe(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(output_json)
+    if args.write_report_md:
+        report_md.parent.mkdir(parents=True, exist_ok=True)
+        report_md.write_text(
+            render_markdown(summary, top_profile_deltas=args.report_top_profile_deltas),
+            encoding="utf-8",
+        )
+        print(report_md)
     if args.require_speed_claim_ready:
         failures = _acceptance_failures(summary)
         if failures:

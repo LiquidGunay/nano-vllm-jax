@@ -39,6 +39,12 @@
     "output_json": {
       "type": "string"
     },
+    "report_md": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "configs": {
       "type": "array",
       "items": {

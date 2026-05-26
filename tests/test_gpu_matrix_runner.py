@@ -3,6 +3,7 @@
 import os
 import sys
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -859,3 +860,32 @@ def test_goal_target_failure_empty_when_target_ready():
     }
 
     assert _goal_target_failure(summary) is None
+
+
+def test_run_gpu_matrix_dry_run_writes_markdown_report(tmp_path):
+    output_json = tmp_path / "matrix.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "benchmarks/run_gpu_matrix.py",
+            "--goal-target-only",
+            "--dry-run",
+            "--no-live-vllm",
+            "--require-stored-references",
+            "--output-json",
+            str(output_json),
+        ],
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout
+    report_md = output_json.with_suffix(".md")
+    assert output_json.exists()
+    assert report_md.exists()
+    report = report_md.read_text(encoding="utf-8")
+    assert "# GPU Matrix Report" in report
+    assert "long_prefill_512_2048/gpu_paged_default" in report

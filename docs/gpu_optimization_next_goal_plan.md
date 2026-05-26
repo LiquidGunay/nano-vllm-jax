@@ -349,6 +349,9 @@ end-to-end throughput.
   and JAX/reference throughput rows, and the largest profile-bucket deltas
   versus the selected JAX reference. Use it after real GPU matrix runs to seed
   the required logbook explanation without hand-reading the raw JSON.
+- `benchmarks/run_gpu_matrix.py` now writes that Markdown report by default next
+  to the summary JSON, or to `--report-md` when supplied. `--no-report-md`
+  keeps report generation opt-out for controlled runs.
 
 ## Phase 2 - Kernel Roadmap
 
