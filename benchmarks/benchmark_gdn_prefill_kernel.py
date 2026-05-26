@@ -209,7 +209,7 @@ def _device_summary() -> dict[str, Any]:
     }
 
 
-def _profile_counters(profile_path: Path, profiled_iterations: int) -> dict[str, Any]:
+def _profile_counters(profile_path: Path, profiled_iterations: int, variants: list[str]) -> dict[str, Any]:
     traces = sorted(profile_path.glob("plugins/profile/*/*.trace.json.gz"))
     if not traces:
         return {
@@ -219,7 +219,7 @@ def _profile_counters(profile_path: Path, profiled_iterations: int) -> dict[str,
         }
     trace_path = traces[-1]
     needles = [
-        "gdn_prefill/current_jax_chunk32_padded",
+        *(f"gdn_prefill/{variant}" for variant in variants),
         "PjRtCApiLoadedExecutable::Execute",
         "jit_compiled:XLA GPU module",
         "command_buffer::execute",
@@ -355,7 +355,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         },
         "variants": variant_results,
         "comparisons": comparisons,
-        "profile_counters": _profile_counters(recorder.profile_path, profiled_iterations) if args.profile else None,
+        "profile_counters": _profile_counters(recorder.profile_path, profiled_iterations, list(variants)) if args.profile else None,
         "pallas_feasibility": {
             "attempted": False,
             "lowering_ok": None,

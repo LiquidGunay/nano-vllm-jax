@@ -2247,3 +2247,48 @@ Decision:
 - Correctness is still protected: the current server path exactly reproduces the Entry 045 generated-token reference under both scheduler envelopes.
 - The matched fair comparison does not show a model-kernel regression. `PjRt Execute`, command-buffer counts, GDN recurrence ranges, KV/layout ranges, and the first prefill forward are stable. The slower matched wall timing is dominated by `tolist`/`np.asarray` synchronization/readback labels, so it should not redirect kernel work by itself.
 - Continue with Mencius's recommendation: the next speed target should be a backend-owned segmented GDN prefill microbenchmark gated against Entry 057. Do not resume source-JAX GDN decomposition or recurrence-replacement work unless there is a new correctness plan.
+
+## Entry 062 - Rejected Strict-Mask GDN Micro-Cleanup
+
+- first run id: `20260526-052652-2161198-gdn_prefill_kernel_strict_decay_mask_hetero8_64_512x32`
+- first benchmark artifact: `results/gdn_prefill_kernel_strict_decay_mask_hetero8_64_512x32.json`
+- first profile directory: `/mountpoint/.exp/profiles/20260526-052652-2161198-gdn_prefill_kernel_strict_decay_mask_hetero8_64_512x32`
+- first Perfetto trace: `/mountpoint/.exp/profiles/20260526-052652-2161198-gdn_prefill_kernel_strict_decay_mask_hetero8_64_512x32/plugins/profile/2026_05_26_05_26_58/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- first TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-052652-2161198-gdn_prefill_kernel_strict_decay_mask_hetero8_64_512x32/plugins/profile/2026_05_26_05_26_58/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- repeat run id: `20260526-052746-2161461-gdn_prefill_kernel_strict_decay_mask_hetero8_64_512x32_repeat`
+- repeat benchmark artifact: `results/gdn_prefill_kernel_strict_decay_mask_hetero8_64_512x32_repeat.json`
+- repeat profile directory: `/mountpoint/.exp/profiles/20260526-052746-2161461-gdn_prefill_kernel_strict_decay_mask_hetero8_64_512x32_repeat`
+- repeat Perfetto trace: `/mountpoint/.exp/profiles/20260526-052746-2161461-gdn_prefill_kernel_strict_decay_mask_hetero8_64_512x32_repeat/plugins/profile/2026_05_26_05_27_51/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- repeat TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-052746-2161461-gdn_prefill_kernel_strict_decay_mask_hetero8_64_512x32_repeat/plugins/profile/2026_05_26_05_27_51/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Planck confirmed that backend-owned segmented GDN prefill remains the right next model-side target. It ranked rectangular padded chunked GDN as the strongest remaining model bottleneck because the workload has `2304` active prompt tokens but `4096` rectangular slots and Entry 057 recorded `72` active chunks vs `128` total chunks. It also warned not to reintroduce source-JAX row/chunk scans, rowwise exact-length calls, recurrence replacements, or scheduler-envelope comparisons as model-kernel evidence.
+- change tested: a temporary benchmark-only `strict_decay_mask_chunk32_padded` variant precomputed the initial chunk-recurrence mask as strict-lower triangular instead of computing lower-inclusive decay and then zeroing diagonal/upper entries with `where`. A first smoke attempt incorrectly removed the diagonal from output attention and failed output parity; the profiled version kept output attention lower-inclusive and only removed the recurrence-matrix diagonal/upper mask. The source hook was reverted after profiling. The retained code change only makes `benchmark_gdn_prefill_kernel.py` parse profile annotation ranges for whatever variants are requested, so future candidates get their own `gdn_prefill/<variant>` counters automatically.
+- full CUDA runs: `JAX_PLATFORMS=cuda`, A10G, JAX `0.10.0`, FP32 activations/state, chunk size `32`, lengths `64,128,192,256,320,384,448,512`, `5` warmups, `20` measured repeats per variant.
+- correctness: the fixed strict-mask candidate exactly matched the current padded chunk32 reference in both full runs: `output_max_abs=0.0`, `valid_output_max_abs=0.0`, and `state_max_abs=0.0`.
+
+Timing:
+
+| run | current p50 / mean / p95 | strict-mask p50 / mean / p95 | note |
+| --- | ---: | ---: | --- |
+| first | `6.482 / 6.549 / 6.677 ms` | `6.468 / 6.500 / 6.571 ms` | beats same-run current, but misses historical mean/p95 gates |
+| repeat | `6.498 / 6.524 / 6.630 ms` | `6.483 / 6.482 / 6.503 ms` | beats same-run current, but misses Entry 057 p50 gate `6.477 ms` |
+
+Top repeat profile counters from the mixed two-variant trace:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `gdn_prefill/current_jax_chunk32_padded` | `231.66 ms / 25` | annotation includes warmup/profile overhead |
+| `gdn_prefill/strict_decay_mask_chunk32_padded` | `164.50 ms / 25` | lower annotation range, but measured repeat p50 win is only about `0.015 ms` |
+| `PjRtCApiLoadedExecutable::Execute` | `140.09 ms / 50` | one execute per benchmark call, no dispatch growth |
+| `command_buffer::execute` | `42.76 ms / 2450` | `49.0` per profiled call, unchanged mixed count |
+| `command_buffer::update` | `3.36 ms / 192` | `3.84` per profiled call, unchanged mixed count |
+| `input_reduce_fusion` | `29.29 ms / 1550` | unchanged recurrence-family count |
+| `loop_dynamic_update_slice_fusion` | `12.62 ms / 2350` | unchanged recurrence-family count |
+| `loop_multiply_fusion` | `47.32 ms / 1250` | unchanged recurrence-family count |
+| `while` | `60.16 ms / 100` | unchanged mixed loop count |
+
+Decision:
+
+- Reject and revert strict-mask GDN as an optimization candidate. It is exact and slightly faster than the same-run current control, but the improvement is too small/noisy and does not consistently clear the historical Entry 057 standalone gates.
+- Do not route this through the server path or keep it as an exposed benchmark variant. It is a local algebraic cleanup, not the backend-owned segmented GDN prefill path we need.
+- Keep the dynamic profile-counter parsing improvement in the GDN microbenchmark because it reduces future logbook friction without changing model behavior.
+- Next work should follow Planck's gate: add a real backend-owned segmented GDN candidate that skips fully inactive row chunks inside one coarse operation and preserves the padded chunk32 output/final-state contract within `1e-5`.
