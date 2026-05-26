@@ -54,6 +54,13 @@ optimization plan in `docs/gpu_optimization_next_goal_plan.md`.
 - JAX/vLLM throughput ratio: `0.426x`
 - target ratio for this plan: `>=0.75x` on long heterogeneous mixed-shape
   requests before moving to MTP speed work
+- staged kernel target: after the no-kernel default reaches `>=0.75x` vLLM on
+  the vLLM-style benchmark, correctness-gated kernel-backed serving should
+  target `>=0.9x` vLLM before MTP speed work is promoted
+- benchmark caveat: the existing long-prefill target is an exact-token
+  shape-synthetic gate based on repeated tokenized seed prompts. A vLLM-style
+  random/custom-manifest sidecar should be run before making broader benchmark
+  comparability claims.
 
 ## Enabled Accepted Fast Flags
 

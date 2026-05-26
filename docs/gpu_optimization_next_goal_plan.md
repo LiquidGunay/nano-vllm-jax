@@ -29,6 +29,18 @@ optimization work starts.
    vLLM for missing vLLM references and live `gpu_paged_default` for missing
    JAX default references. `--require-stored-references` remains an explicit
    opt-in gate when live fallback is not acceptable.
+8. Parity targets are staged. The active no-kernel target remains
+   `gpu_paged_default >= 0.75x` vLLM on the long heterogeneous vLLM-style
+   benchmark. Once that gate is met without custom kernels, the kernel phase
+   should target at least `0.9x` vLLM on the same benchmark discipline before
+   MTP speed work is considered.
+9. The existing `long_prefill_512_2048` workload is a valid exact-token,
+   shape-synthetic gate, but it is not enough for an external vLLM-style
+   workload claim. Add a sidecar lane that follows vLLM benchmark conventions:
+   random/custom-manifest prompts, larger `num_prompts`, explicit seed,
+   prompt-manifest hash, output-token throughput, total-token throughput, and
+   request throughput. ShareGPT-style serving should be a separate comparability
+   track, not a replacement for the long-prefill correctness gate.
 
 ## Next Goal Handoff
 
@@ -46,6 +58,14 @@ documentation/configuration-first:
    comparisons.
 5. Do not start MTP speed work until the non-speculative long heterogeneous
    target is speed-claim-ready and reaches at least `0.75x` vLLM.
+6. After the no-kernel target reaches `0.75x` vLLM on the vLLM-style benchmark,
+   raise the active kernel-phase goal to `0.9x` vLLM. The `0.9x` target should
+   apply only to correctness-gated kernel-backed serving paths, not to MTP
+   speculative decoding.
+7. Before treating `0.75x` or `0.9x` as an externally comparable vLLM-benchmark
+   claim, run the new vLLM-style diverse sidecar as well as the existing
+   exact-token long-prefill gate. The current repeated-seed prompt suite remains
+   useful for regression control because it freezes token IDs and shapes.
 
 Current GDN status: serving GDN is still expressed as JAX and lowered by XLA to
 GPU work; there is no accepted hand-owned GDN kernel in the default path.
@@ -373,6 +393,32 @@ end-to-end throughput.
   `85.98 tok/s`, `0.739x` vLLM, with exact generated-token parity. The final
   target is still not met: it needs `87.28 tok/s`, leaving a `1.30 tok/s` gap
   or about `1.015x` required JAX speedup.
+- Updated parity ladder: keep pushing the pure-JAX/no-custom-kernel default
+  across the `0.75x` vLLM gate first. If that gate is cleared on the
+  vLLM-style diverse benchmark with two-repeat, exact-token, profile-covered
+  evidence, the kernel roadmap should use `0.9x` vLLM as the next accepted
+  serving target. MTP remains diagnostic-only until the non-speculative path
+  has met its staged targets.
+- vLLM benchmark audit: upstream vLLM now exposes `vllm bench serve` for
+  online/server throughput and `vllm bench throughput` for offline engine
+  throughput. Its benchmark datasets include ShareGPT, random, custom JSONL, HF
+  datasets, prefix repetition, BurstGPT, Spec Bench, and SPEED-Bench. The repo's
+  current vLLM comparison is a local exact-token harness, not the upstream
+  benchmark CLI, and the current prompt generator repeats tiny tokenized seed
+  prompts to force exact input lengths. Keep this harness for deterministic
+  correctness and shape comparisons, but label it as `tokenized_seed_repeat` or
+  `shape_synthetic`.
+- Add a vLLM-convention sidecar benchmark lane before making broader throughput
+  claims. The first sidecar should use either vLLM random sampling semantics or
+  a shared custom JSONL manifest such as one row per request with
+  `request_id`, `prompt_token_ids`, `prompt_len`, and `output_len`. Artifacts
+  should record `prompt_source`, `dataset_name`, `num_prompts`, `seed`,
+  `prompt_manifest_jsonl`, `prompt_manifest_sha256`, `total_input_tokens`,
+  `total_output_tokens`, `request_throughput`, `output_token_throughput`, and
+  `total_token_throughput`. A reasonable first long-prefill sidecar is
+  128 prompts, random input length around 1280, output length 16,
+  input range ratio 0.6, output range ratio 0.0, request rate `inf`, and
+  `ignore_eos=true`.
 
 ## Phase 2 - Kernel Roadmap
 
