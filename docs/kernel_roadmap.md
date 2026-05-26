@@ -199,11 +199,10 @@ gdn_segmented_prefill_chunk32(
   tests and a reduced-shape smoke benchmark. The benchmark-only FFI/probe
   boundary now uses native V,K state and passes a non-square
   `B=2,H=2,T=64,K=32,V=64` smoke comparison against current padded chunk32
-  (`output_max_abs=1.49e-07`, `state_max_abs=1.073e-06`). The full hetero8
-  model-shape microbenchmark was slower than current JAX chunk32 and exceeded
-  the standalone state-drift gate. A V64 value-block follow-up reduced
-  custom-call p50 at full shape but still lost to current JAX and did not
-  improve state drift, so the next candidate should move closer to the
+  (`output_max_abs=1.49e-07`, `state_max_abs=1.073e-06`). The post-V,K full
+  hetero8 model-shape microbenchmark is still rejected: V32 p50 `10.43 ms` and
+  V64 p50 `10.46 ms` versus current JAX chunk32 `5.60 ms`, with
+  `state_max_abs=2.441e-04`. The next candidate should move closer to the
   segmented/nnz ABI instead of only widening the rectangular value block. The
   first pure-JAX packed segmented ABI
   correctness gate passes reduced shape but fails the full hetero8 standalone

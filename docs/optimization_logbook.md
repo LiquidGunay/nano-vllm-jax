@@ -4094,3 +4094,20 @@ JAX_PLATFORMS=cuda ... pytest -q \
   benchmark-only. This validates the V,K boundary and fixes stale benchmark
   helpers, but it does not overturn the prior full-shape rejection or authorize
   serving promotion.
+
+### Entry 102 - Rejected Full-Shape Native V,K GDN Prefill Probe
+
+- experiment: reran the full model-shape standalone GDN prefill microbenchmark
+  after the benchmark-only CUDA prefill probes were moved to native V,K state.
+- artifact: `results/gdn_prefill_kernel_20260526_vk_native_fullshape.json`
+- shape: `B=8,H=16,T=512,K=128,V=128`, lengths
+  `[64,128,192,256,320,384,448,512]`, chunk size `32`, NVIDIA A10G.
+- result: current JAX chunk32 p50 `5.60 ms`; `cuda_fp32_one_piece_chunk32` p50
+  `10.43 ms`; `cuda_fp32_one_piece_chunk32_v64` p50 `10.46 ms`.
+- correctness drift: both CUDA one-piece variants have
+  `output_max_abs=1.907e-05` and `state_max_abs=2.441e-04` versus current padded
+  chunk32, so they still miss the standalone state gate.
+- decision: reject serving promotion and do not spend more effort on the
+  rectangular one-piece prefill prototype. The next GDN prefill candidate should
+  target the segmented/nnz boundary or a backend design that preserves the
+  current padded chunk32 accumulation contract.

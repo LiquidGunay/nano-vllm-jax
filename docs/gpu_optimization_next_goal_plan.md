@@ -989,8 +989,9 @@ full-model real-weight token/logit gate before any serving promotion.
   benchmark now use native V,K state. A non-square smoke shape
   `B=2,H=2,T=64,K=32,V=64` passes focused CUDA parity and standalone output/state
   comparisons: `output_max_abs=1.49e-07`, `state_max_abs=1.073e-06`.
-- Full hetero8 model-shape microbenchmark rejects this first prototype:
-  `11.50 ms` p50 versus `5.43 ms` p50 for current JAX chunk32, with
+- Full hetero8 model-shape microbenchmark still rejects this prototype after
+  the native V,K cleanup: `cuda_fp32_one_piece_chunk32` p50 `10.43 ms` and V64
+  p50 `10.46 ms` versus `5.60 ms` for current JAX chunk32, with
   `state_max_abs=2.441e-04`.
 - A follow-up V64 value-block variant reduced full-shape p50 from `11.56 ms`
   to `8.60 ms`, confirming value-block/grid overhead is real, but it still lost
