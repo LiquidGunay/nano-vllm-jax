@@ -476,14 +476,12 @@ def _reference_for(
     stored_workload_reference: Path | None,
     generated_default_reference: Path | None,
 ) -> tuple[Path | None, str]:
-    if config_name == "gpu_paged_default" and repeat_index == 0:
-        if stored_workload_reference and _artifact_matches_workload(stored_workload_reference, workload):
-            return stored_workload_reference, _stored_jax_reference_source(workload)
-        return None, "none"
-    if generated_default_reference and _artifact_matches_workload(generated_default_reference, workload):
-        return generated_default_reference, "live_jax_default"
     if stored_workload_reference and _artifact_matches_workload(stored_workload_reference, workload):
         return stored_workload_reference, _stored_jax_reference_source(workload)
+    if generated_default_reference and _artifact_matches_workload(generated_default_reference, workload):
+        return generated_default_reference, "live_jax_default"
+    if config_name == "gpu_paged_default" and repeat_index == 0:
+        return None, "none"
     return None, "none"
 
 

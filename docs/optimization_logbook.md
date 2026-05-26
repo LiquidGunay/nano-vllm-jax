@@ -3133,7 +3133,9 @@ Decision:
 - change accepted: the GPU matrix configs now include
   `workload_reference_jsons` and `workload_vllm_reference_jsons` for `hetero8`
   and `long_prefill_512_2048`. The runner resolves those maps before falling
-  back to legacy single-reference fields or live generated defaults.
+  back to legacy single-reference fields or live generated defaults. Stored
+  workload references take priority for every config and repeat; live default
+  artifacts are now only a fallback when no stored reference exists.
 - motivation: Entry 080 created a stored long-prefill JAX default artifact, but
   the runner still left the first `gpu_paged_default` long-prefill repeat
   unchecked because only hetero8 had a configured JAX reference. That would
@@ -3144,7 +3146,7 @@ Decision:
 .venv/bin/python -m pytest tests/test_gpu_matrix_runner.py -q
 ```
 
-- result: `7 passed`.
+- result: `8 passed`.
 - dry-run verification:
 
 ```text
@@ -3157,7 +3159,8 @@ Decision:
 
 - result: `hetero8` uses stored Entry 045 JAX/vLLM references for both configs
   and repeats; `long_prefill_512_2048` uses the stored Entry 080 JAX default
-  and vLLM references for both configs and repeats.
+  and vLLM references for both configs and repeats. This remains true for real
+  runs because stored references are preferred over generated same-run defaults.
 
 Decision:
 

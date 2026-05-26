@@ -248,7 +248,8 @@ end-to-end throughput.
   paths for `hetero8` and `long_prefill_512_2048`. A dry run verified that both
   repeats of `gpu_paged_default` and `gpu_paged_fast_optin` will compare against
   stored JAX references from repeat one instead of leaving the default
-  long-prefill baseline unchecked.
+  long-prefill baseline unchecked. Stored references are preferred over
+  generated same-run defaults so exact-token gates use stable baselines.
 
 ## Phase 2 - Kernel Roadmap
 

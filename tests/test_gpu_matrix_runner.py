@@ -113,18 +113,37 @@ def test_configured_workload_reference_uses_workload_mapping(tmp_path):
     assert selected == reference
 
 
-def test_reference_for_checks_default_first_repeat_against_stored_long_reference(tmp_path):
+def test_reference_for_prefers_stored_long_reference_for_default_repeats(tmp_path):
     workload = WORKLOADS["long_prefill_512_2048"]
     reference = tmp_path / "long.json"
+    generated = tmp_path / "generated.json"
     _write_workload_artifact(reference, workload)
+    _write_workload_artifact(generated, workload)
 
     selected, source = _reference_for(
         "gpu_paged_default",
         workload,
-        0,
+        1,
         reference,
-        generated_default_reference=None,
+        generated_default_reference=generated,
     )
 
     assert selected == reference
     assert source == "stored_jax_default"
+
+
+def test_reference_for_uses_live_default_when_no_stored_reference(tmp_path):
+    workload = WORKLOADS["long_prefill_512_2048"]
+    generated = tmp_path / "generated.json"
+    _write_workload_artifact(generated, workload)
+
+    selected, source = _reference_for(
+        "gpu_paged_fast_optin",
+        workload,
+        0,
+        stored_workload_reference=None,
+        generated_default_reference=generated,
+    )
+
+    assert selected == generated
+    assert source == "live_jax_default"
