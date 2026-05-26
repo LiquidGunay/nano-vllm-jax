@@ -60,7 +60,8 @@
             "short_32_128",
             "long_prefill_512_2048",
             "decode_heavy_128x128",
-            "vllm_random_longprefill"
+            "vllm_random_longprefill",
+            "vllm_random_longprefill_smoke"
           ]
       }
     },

@@ -3772,3 +3772,116 @@ Decision:
   comparability run.
 - Proceed next to paired P0 kernel work: full-attention NHD KV append plus
   paged decode attention with one shared layout and no hot-path conversion.
+
+## Entry 093 - Rejected Narrow P0 FP32 Append+Decode Pair
+
+- change tested: no default-path change. The live diagnostic enabled both local
+  FP32 CUDA full-attention routes:
+  `NANO_VLLM_JAX_CUDA_FP32_KV_APPEND=1` and
+  `NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN=1`, while keeping BF16 weights, FP32
+  activations/KV cache, greedy token fastpath, and all accepted compact prefill
+  flags.
+- motivation: Entries 071 and 073 rejected standalone FP32 append and standalone
+  FP32 decode-attention routing. The P0 question after Entry 092 was whether
+  pairing the two existing local CUDA routes over the same NHD-shaped physical
+  cache would remove enough overhead to become a viable full-attention kernel
+  path.
+- command:
+
+```text
+JAX_PLATFORMS=cuda \
+NANO_VLLM_JAX_CUDA_FP32_KV_APPEND=1 \
+NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN=1 \
+NANO_VLLM_JAX_KERNEL_BACKEND=pure_jax \
+NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH=1 \
+NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD=1 \
+NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV=1 \
+NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z=1 \
+NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ=1 \
+NANO_VLLM_JAX_COMPACT_PREFILL_MLP=1 \
+.venv/bin/python benchmarks/benchmark_jax_server_trace.py \
+  --model Qwen/Qwen3.5-0.8B \
+  --backend gpu \
+  --dtype float32 \
+  --weight-dtype bfloat16 \
+  --jax-execution jit \
+  --input-lens 512,1024,1536,2048 \
+  --output-len 16 \
+  --prompt-suite mixed \
+  --num-speculative-tokens 0 \
+  --max-kv-cache-mb 3072 \
+  --num-kvcache-blocks 384 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 8192 \
+  --prefill-buckets 512,1024,2048 \
+  --batch-size-buckets 1,2,4 \
+  --max-blocks-per-seq 129 \
+  --top-k 5 \
+  --warmup \
+  --profile \
+  --reference-json results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json \
+  --output-json results/qwen08_jax_server_trace_long_prefill_p0_paired_cuda_fp32_probe.json \
+  --run-label long_prefill_p0_paired_cuda_fp32_probe
+```
+
+- artifact:
+  `results/qwen08_jax_server_trace_long_prefill_p0_paired_cuda_fp32_probe.json`
+- trace:
+  `/mountpoint/.exp/profiles/20260526-144615-2378662-long_prefill_p0_paired_cuda_fp32_probe/plugins/profile/2026_05_26_14_47_04/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- correctness: exact generated-token match for all four long-prefill rows
+  against the stored JAX long-prefill reference.
+- trace confirmation: the Perfetto trace contains both
+  `(anonymous namespace)::Fp32KvAppendKernel(...)` and
+  `(anonymous namespace)::Fp32PagedDecodeAttentionKernel(...)`, so the probe did
+  exercise the paired local CUDA routes.
+
+Result:
+
+| workload/config | exact tokens | JAX tok/s | vLLM tok/s | JAX/vLLM | TTFT p50 | ITL p50 | ITL p95 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `long_prefill_512_2048/p0_fp32_append_decode_pair` | yes | `52.94` | `116.37` | `0.455x` | `600.25 ms` | `38.58 ms` | `46.72 ms` |
+
+Profile comparison against the accepted Entry 092 long-prefill repeat:
+
+| bucket | paired P0 | accepted default | delta | note |
+|---|---:|---:|---:|---|
+| `forward_step_token_ids_jit` | `641.18 ms / 16` | `272.67 ms / 16` | `+368.51 ms` | decode step gets much slower |
+| `PjRtCApiLoadedExecutable::Execute` | `295.31 ms / 44` | `270.18 ms / 44` | `+25.13 ms` | compiled execution regresses |
+| `np.asarray(jax.Array)` | `508.45 ms / 16` | `398.51 ms / 16` | `+109.94 ms` | host sync waits on slower device path |
+| `array.py:325 tolist` | `508.58 ms / 16` | `398.64 ms / 16` | `+109.94 ms` | mirrors sync attribution |
+| `command_buffer::execute` | `226.74 ms / 1864` | `223.59 ms / 1936` | `+3.15 ms / -72` | fewer commands did not help |
+| `gather` | `19.31 ms / 311` | `14.74 ms / 103` | `+4.57 ms / +208` | gather work increased |
+| `transpose` | `34.70 ms / 132` | `45.05 ms / 312` | `-10.35 ms / -180` | lower transpose did not offset kernel cost |
+| `MemcpyD2D` | `18.51 ms / 463` | `18.36 ms / 463` | `+0.15 ms` | unchanged |
+
+Validation:
+
+```text
+.venv/bin/python -m py_compile \
+  benchmarks/benchmark_jax_server_trace.py \
+  benchmarks/run_gpu_matrix.py
+
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest -q \
+  tests/test_gpu_matrix_runner.py \
+  tests/test_gpu_matrix_summary_report.py
+```
+
+- result: `43 passed`.
+
+Interpretation:
+
+- This rejects the narrow version of paired P0. The existing local FP32 append
+  and decode-attention custom calls are correctness-clean together, but they do
+  not own enough of the full-attention boundary to move integrated serving
+  performance.
+- The next kernel attempt should not be another spelling of these two isolated
+  custom calls. Viable next paths are a broader fused/layout P0 design with less
+  per-layer custom-call overhead, or moving to the higher-leverage GDN roadmap.
+- MTP remains out of scope for speed work.
+
+Decision:
+
+- Do not promote `NANO_VLLM_JAX_CUDA_FP32_KV_APPEND=1` +
+  `NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN=1` to default or fast opt-in.
+- Keep the local FP32 CUDA kernels as focused ABI/toolchain diagnostics.

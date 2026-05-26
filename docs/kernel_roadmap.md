@@ -56,6 +56,11 @@ kv_append_paged_nhd(
   Routed standalone append preserved exact hetero8 generated tokens, but
   regressed integrated throughput to `193.62 tok/s`; keep it as a toolchain
   smoke proof, not a serving candidate.
+- paired-route status: combining the local FP32 append route with the local FP32
+  decode-attention route on the long-prefill target preserved exact tokens but
+  regressed to `52.94 tok/s`. The trace confirmed both CUDA kernels ran. Do not
+  continue this narrow pair as the P0 serving strategy; the next P0 attempt must
+  own a broader fused/layout boundary or move to the GDN roadmap.
 
 ## P0.2 - `paged_decode_attention_gqa_nhd`
 
@@ -98,6 +103,10 @@ paged_decode_attention_gqa_nhd(
   preserved exact tokens while regressing throughput/ITL. Keep this route
   default-off as a diagnostic until it is paired with a broader layout/attention
   strategy that passes the integrated gate.
+- paired-route status: pairing this local FP32 decode route with the local FP32
+  append route still regressed the integrated long-prefill gate to
+  `52.94 tok/s` despite exact generated-token parity. Do not promote the
+  current narrow pair.
 
 ## P1.1 - `gdn_recurrent_decode_step`
 

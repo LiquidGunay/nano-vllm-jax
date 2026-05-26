@@ -342,6 +342,12 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "nhd_full_attention_kv_cache_enabled": nhd_cache is not None,
             "nhd_full_attention_kv_cache_shape": list(nhd_cache.k_cache.shape) if nhd_cache is not None else None,
             "nhd_full_attention_layers": list(nhd_cache.layer_indices) if nhd_cache is not None else None,
+            "full_attention_kernel_flags": {
+                "nhd_full_attention_kv_cache": _env_flag("NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE"),
+                "flashinfer_kv_append": _env_flag("NANO_VLLM_JAX_FLASHINFER_KV_APPEND"),
+                "cuda_fp32_kv_append": _env_flag("NANO_VLLM_JAX_CUDA_FP32_KV_APPEND"),
+                "cuda_fp32_decode_attention": _env_flag("NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"),
+            },
             "jax_execution": args.jax_execution,
             "linear_chunk_size": int(engine.config.linear_chunk_size),
             "num_speculative_tokens": args.num_speculative_tokens,

@@ -690,6 +690,12 @@ paged_decode_attention_gqa_nhd(
   was slower than Entry 045 despite exact generated-token parity. Keep it
   default-off as a diagnostic route; do not promote it to default or fast
   opt-in.
+- Pairing the local FP32 append route with the local FP32 decode attention route
+  on the long-prefill target preserved exact generated-token parity, and trace
+  inspection confirmed both `Fp32KvAppendKernel` and
+  `Fp32PagedDecodeAttentionKernel` executed. Integrated performance regressed to
+  `52.94 tok/s` (`0.455x` vLLM, below the accepted pure-JAX `90.50 tok/s`).
+  This rejects the narrow paired P0 route as a serving strategy.
 
 ## P1.1 - `gdn_recurrent_decode_step`
 
@@ -1200,6 +1206,8 @@ Commit 6:
   backend~~
 - ~~Run live integrated attempt and record rejection of standalone decode
   routing~~
+- ~~Run live integrated paired append+decode attempt and record rejection of the
+  narrow local FP32 pair~~
 - Route only full-attention decode layers as an accepted path after integrated
   gates pass
 
