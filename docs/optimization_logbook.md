@@ -1318,3 +1318,39 @@ Decision:
 - Reject and revert the unrolled GDN Conv1D decode update. The microbenchmark was slightly faster in isolation, but the integrated graph did not reduce the target `wrapped_concatenate` bucket and made the decode executable heavier.
 - Do not keep source-level rewrites of the GDN Conv1D state shift. If this area is revisited, it should be as part of a real lowered GDN decode kernel that owns the convolution update and recurrent state update together.
 - Follow the subagent recommendation for the next model-side experiment: an Ampere-compatible fused compact prefill projection path, with a microbenchmark gate before any full hetero8 run.
+
+## Entry 039 - Rejected Pallas Fused Compact Prefill Projection
+
+- run id: `20260526-005559-2044767-jax_hetero8_64_512x32_fused_compact_prefill_proj`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_fused_compact_prefill_proj.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-005559-2044767-jax_hetero8_64_512x32_fused_compact_prefill_proj`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-005559-2044767-jax_hetero8_64_512x32_fused_compact_prefill_proj/plugins/profile/2026_05_26_00_57_49/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-005559-2044767-jax_hetero8_64_512x32_fused_compact_prefill_proj/plugins/profile/2026_05_26_00_57_49/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: a temporary `NANO_VLLM_JAX_FUSED_COMPACT_PREFILL_PROJ=1` path added a Pallas Triton compact projection helper that loaded true ragged prefill rows directly, performed tiled matmul, and scattered directly into the rectangular `[batch, seq, output]` result via output aliasing. The path was intended for `_compact_prefill_dot_if_enabled` and left MLP packing unchanged. The source change was reverted after profiling.
+- microbenchmark gate: for BF16 activations with BF16 weights, the direct Pallas helper was exact and faster on real hetero8 prefill dimensions (`B=8`, `T=512`, `compact_tokens=2304`, `H=1024`): `O=512` was `0.95x`, `O=2048` was `0.85x`, `O=4096` was `0.93x`, and `O=6144` was `0.76x` the current compact helper time. This positive gate was misleading for the real serving contract because the benchmark uses FP32 activations with BF16 weights.
+- mixed-dtype gate: with FP32 activations and BF16 weights, the Pallas helper had to cast weights to FP32 inside the tile. It matched the current JAX result with default TF32 behavior on tested shapes, but was much slower: `O=2048` was `1.48x` current time and `O=6144` was `1.76x` current time. `allow_tf32=False` was unusably slow (`58x`-`79x`) and did not match the current XLA numerics.
+- full-run caveat: the profiled source path conservatively gated Pallas to matching BF16/BF16 dtypes after the FP32 drift smoke. Therefore the hetero8 profile did not replace the compact projection buckets under the actual FP32-activation/BF16-weight benchmark. The trace confirms the compact GEMM buckets were unchanged. The run is still useful evidence that this implementation should not be integrated without a faster mixed-dtype kernel.
+- correctness: exact generated-token match for all 8 rows against the Entry 033 hetero8 reference.
+- JAX timing: `339.28 tok/s`, TTFT p50 `321.69 ms`, ITL p50 `13.62 ms`, ITL p95 `15.61 ms`.
+- delta vs Entry 033 default: `0.955x` total tok/s, TTFT p50 `1.018x`, ITL p50 `1.059x`, ITL p95 `1.132x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 033 ms | fused compact flag ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 720.52 | 754.53 | overall slower |
+| `_run_main_and_sample` | 598.60 | 619.82 | runner hot path slower |
+| `forward_step_token_ids_jit` | 175.81 | 207.38 | decode token-id step slower |
+| `PjRtCApiLoadedExecutable::Execute` | 191.91 over 252 calls | 223.43 over 252 calls | same dispatch count, heavier execution |
+| `jit_compiled:XLA GPU module` | 147.90 | 164.14 | module time increased |
+| `command_buffer::execute` | 92.22 over 1575 calls | 96.62 over 1575 calls | command-buffer time worsened |
+| `cutlass_80_tensorop_s1688gemm_128x128_16x5_nn_align4` | 52.39 over 96 calls | 52.41 over 96 calls | compact prefill GEMM unchanged |
+| `gemm_fusion_dot_general_746` | 13.92 | 13.92 | unchanged |
+| `gemm_fusion_dot_2` | 13.79 | 13.79 | unchanged |
+| `input_reduce_fusion` | 41.57 | 41.53 | unchanged |
+| `wrapped_concatenate` | 36.49 | 36.48 | unchanged |
+
+Decision:
+
+- Reject and revert the Pallas fused compact prefill projection path for the current BF16-weight/FP32-activation serving contract. A BF16/BF16 helper is not aligned with the correctness contract, and the mixed FP32/BF16 version loses badly to XLA/CUTLASS.
+- Do not revisit this exact Pallas design unless it can use tensor cores efficiently while preserving FP32 activations and BF16 weights, or unless the accepted serving contract changes. The next prefill work should inspect HLO/layout around the existing XLA compact dots rather than replacing them with many small Pallas custom calls.
