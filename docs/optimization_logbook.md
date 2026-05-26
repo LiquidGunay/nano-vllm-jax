@@ -1633,3 +1633,41 @@ Decision:
 - Reject and revert initial-prefill bounded KV window. Correctness was exact, but the profile shows the static bound made the compiled/device path heavier and did not improve the target gather or transpose ranges.
 - Do not keep a flag for this path. The only clear improvement was host sync attribution, while end-to-end latency and device execution regressed.
 - Next candidates should follow McClintock's remaining list: bracket GDN prefill chunk size below 32 with `--linear-chunk-size 16`, then inspect `paged_attention_prefill` layout/HLO for head-major or transpose-free alternatives.
+
+## Entry 047 - Rejected GDN Prefill Chunk Size 16
+
+- run id: `20260526-023742-2087778-jax_hetero8_64_512x32_gdn_chunk16`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk16.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-023742-2087778-jax_hetero8_64_512x32_gdn_chunk16`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-023742-2087778-jax_hetero8_64_512x32_gdn_chunk16/plugins/profile/2026_05_26_02_38_45/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-023742-2087778-jax_hetero8_64_512x32_gdn_chunk16/plugins/profile/2026_05_26_02_38_45/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: benchmark-only `--linear-chunk-size 16`, leaving the accepted source default at 32. This brackets the Gated DeltaNet prefill chunk-size sweep below the accepted Entry 045 value without source changes.
+- focused CUDA checks: no new source path was introduced. The profiled run used `JAX_PLATFORMS=cuda`, BF16 weights, FP32 activations, the same hetero8 shape set as Entry 045, and exact generated-token comparison against `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json`.
+- correctness: exact generated-token match for all 8 rows against the Entry 045 chunk-32 reference.
+- JAX timing: `248.36 tok/s`, TTFT p50 `537.16 ms`, ITL p50 `15.80 ms`, ITL p95 `17.25 ms`.
+- delta vs Entry 045 chunk-32 default repeat: `0.675x` total tok/s, TTFT p50 `1.852x`, ITL p50 `1.202x`, ITL p95 `1.269x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 045 ms | chunk-16 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 696.03 | 1030.77 | overall much slower |
+| `_run_main_and_sample` | 572.99 | 898.42 | runner hot path much slower |
+| `forward_step_token_ids_jit` | 122.13 | 321.72 | compiled token-id path regressed heavily |
+| first `forward_step_token_ids_jit` | 30.83 | 211.34 | first prefill step regressed heavily |
+| `PjRtCApiLoadedExecutable::Execute` | 138.32 over 252 calls | 339.78 over 252 calls | same dispatch count, much heavier device execution |
+| `jit_compiled:XLA GPU module` | 94.20 | 284.66 | lowered module time regressed |
+| `command_buffer::execute` | 40.34 over 1143 calls | 195.32 over 873 calls | fewer executes, but much heavier total time |
+| `command_buffer::update` | 27.13 over 248 calls | 32.95 over 248 calls | heavier updates |
+| `input_reduce_fusion` | 28.65 over 1936 calls | 18.09 over 1378 calls | target reduce bucket improved, but not the bottleneck after the change |
+| `gemm_fusion_dot_general_746` | 13.92 | 40.98 | main GEMM bucket regressed |
+| `gemm_fusion_dot_2` | 13.79 | 33.25 | main GEMM bucket regressed |
+| `gather` | 11.97 | 12.93 | slightly worse |
+| `transpose` | 63.11 | 63.73 | unchanged/slightly worse |
+| `array.py:325 tolist` | 437.58 | 562.16 | host sync attribution worsened |
+
+Decision:
+
+- Reject chunk size 16. It improves the named `input_reduce_fusion` bucket, but the smaller chunking creates a much worse compiled plan overall, especially first prefill and GEMM/module execution.
+- Keep Entry 045's chunk size 32 default. The sweep now brackets 16, 32, 64, and 128, and 32 remains the best verified point for this hetero8 workload.
+- Next profile-backed work should move to `paged_attention_prefill` layout/HLO investigation rather than smaller GDN chunks.
