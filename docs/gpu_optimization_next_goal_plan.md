@@ -639,6 +639,13 @@ gdn_segmented_prefill_chunk32(
   1.831e-04`), so the drift is not just shorter per-row sequence length; the
   row-wise decomposition itself changes enough FP32 accumulation to miss the
   current gate.
+- Correctness policy is now encoded in the GDN prefill microbenchmark output.
+  The default policy keeps the strict padded chunk32 output/state gate as the
+  only route to segmented CUDA math. When the packed or row-padded ABI misses
+  that gate, the benchmark reports `blocked_on_correctness_policy`,
+  `cuda_math_allowed=false`, and `requires_design_decision=true`. A true-token
+  packed ABI can only proceed after an explicit design decision and a separate
+  real-weight full-model token/logit parity gate.
 - Keep it default-off and benchmark-only. Do not route into serving. The next
   attempt should move closer to the true segmented/nnz ABI and preserve FP32
   accumulation more closely before a server run.
@@ -922,8 +929,8 @@ Commit 8:
 - ~~Add packed segmented/nnz ABI correctness gate before CUDA math~~
 - ~~Run row-padded segmented reference diagnostic and record that row-wise
   decomposition still misses the full-shape gate~~
-- Resolve packed-ABI correctness policy after full hetero8 gate failure before
-  implementing segmented CUDA math
+- ~~Resolve packed-ABI correctness policy after full hetero8 gate failure before
+  implementing segmented CUDA math~~
 - Compare a revised segmented prefill candidate against Entry 045 chunk-32
   baseline after it beats the full-shape GDN microbenchmark gate
 

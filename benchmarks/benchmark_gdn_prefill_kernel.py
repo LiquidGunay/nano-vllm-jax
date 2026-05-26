@@ -961,6 +961,83 @@ def _compare_outputs(reference: tuple[jnp.ndarray, jnp.ndarray], candidate: tupl
     }
 
 
+SEGMENTED_GDN_STANDALONE_GATE_THRESHOLD = 1e-5
+
+
+def _passes_segmented_standalone_gate(
+    comparison: dict[str, Any] | None,
+    *,
+    threshold: float = SEGMENTED_GDN_STANDALONE_GATE_THRESHOLD,
+) -> bool:
+    if not comparison:
+        return False
+    return bool(
+        comparison.get("output_max_abs", float("inf")) <= threshold
+        and comparison.get("valid_output_max_abs", float("inf")) <= threshold
+        and comparison.get("state_max_abs", float("inf")) <= threshold
+    )
+
+
+def _segmented_reference_policy(gate: dict[str, Any]) -> dict[str, Any]:
+    """Summarize whether the planned packed GDN ABI is eligible for CUDA math."""
+
+    threshold = SEGMENTED_GDN_STANDALONE_GATE_THRESHOLD
+    if not gate.get("enabled"):
+        return {
+            "status": "not_checked",
+            "cuda_math_allowed": False,
+            "serving_routing_allowed": False,
+            "threshold": threshold,
+            "reason": "segmented reference gate was not requested",
+            "required_next_step": "run with --check-segmented-reference-gate before implementing segmented CUDA math",
+        }
+    if gate.get("error"):
+        return {
+            "status": "gate_error",
+            "cuda_math_allowed": False,
+            "serving_routing_allowed": False,
+            "threshold": threshold,
+            "reason": gate["error"],
+            "required_next_step": "fix the standalone segmented reference gate before implementing segmented CUDA math",
+        }
+
+    strict_pass = _passes_segmented_standalone_gate(gate.get("comparison"))
+    row_padded = gate.get("row_padded_to_seq_len") or {}
+    row_padded_pass = _passes_segmented_standalone_gate(row_padded.get("comparison"))
+    if strict_pass:
+        return {
+            "status": "eligible_for_segmented_cuda_math",
+            "cuda_math_allowed": True,
+            "serving_routing_allowed": False,
+            "threshold": threshold,
+            "reason": "packed segmented ABI passed the standalone padded-chunk32 output/state gate",
+            "required_next_step": "implement CUDA math as benchmark-only, then require integrated exact-token and latency gates before serving routing",
+        }
+
+    diagnosis = "packed true-token ABI misses the standalone padded-chunk32 gate"
+    if row_padded:
+        diagnosis = (
+            "row-wise decomposition changes enough FP32 accumulation to miss the "
+            "standalone padded-chunk32 gate"
+            if not row_padded_pass
+            else "actual-length packing misses the gate but row-padded diagnostic passes"
+        )
+    return {
+        "status": "blocked_on_correctness_policy",
+        "cuda_math_allowed": False,
+        "serving_routing_allowed": False,
+        "requires_design_decision": True,
+        "threshold": threshold,
+        "reason": diagnosis,
+        "allowed_without_design_change": (
+            "a backend design that preserves the current batched rectangular padded-chunk32 accumulation contract"
+        ),
+        "design_change_option": (
+            "accept a true-token packed ABI only after an explicit full-model real-weight token/logit parity gate"
+        ),
+    }
+
+
 def _git_head() -> str | None:
     try:
         return subprocess.check_output(
@@ -1889,6 +1966,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
             )
         except BaseException as exc:
             segmented_reference_gate["error"] = f"{type(exc).__name__}: {exc}"
+    segmented_reference_gate["policy"] = _segmented_reference_policy(segmented_reference_gate)
     if pallas_pack_last_output is not None and pallas_pack_reference is not None:
         pallas_feasibility["active_input_pack_probe"]["comparisons"] = _compare_pack_outputs(
             pallas_pack_reference,

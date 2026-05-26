@@ -3232,3 +3232,40 @@ Decision:
 - Keep the acceptance gate. It does not replace logbook judgment, but it makes
   missing benchmark evidence explicit before a run can be used for a speed
   claim.
+
+## Entry 084 - Segmented GDN Correctness Policy Gate
+
+- change accepted: `benchmarks/benchmark_gdn_prefill_kernel.py` now adds a
+  machine-readable `segmented_reference_gate.policy` section. The policy keeps
+  the strict padded chunk32 standalone output/state threshold at `1e-5` as the
+  default requirement before implementing segmented CUDA math.
+- policy behavior:
+  - if the segmented gate is not run, status is `not_checked` and
+    `cuda_math_allowed=false`.
+  - if the packed segmented gate passes the strict output/state threshold,
+    status is `eligible_for_segmented_cuda_math`, but
+    `serving_routing_allowed=false` until integrated exact-token and latency
+    gates pass.
+  - if the packed or row-padded gate misses the threshold, status is
+    `blocked_on_correctness_policy`, `cuda_math_allowed=false`, and
+    `requires_design_decision=true`.
+- motivation: Entries 078 and 079 showed that the true-token packed and
+  row-padded segmented ABIs miss the full hetero8 state gate before any CUDA
+  math is introduced. Future work should not silently continue from that failed
+  reference contract.
+- focused tests:
+
+```text
+.venv/bin/python -m pytest tests/test_gdn_segmented_policy.py -q
+```
+
+- result: `4 passed`.
+
+Decision:
+
+- Treat the packed/row-wise segmented ABI as blocked under the current default
+  correctness policy. The next GDN prefill candidate must either preserve the
+  current batched rectangular padded chunk32 accumulation contract and pass the
+  standalone gate, or require an explicit design decision to accept a
+  true-token packed ABI with a separate real-weight full-model token/logit
+  parity gate.

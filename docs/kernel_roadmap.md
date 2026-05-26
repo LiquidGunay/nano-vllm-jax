@@ -176,7 +176,12 @@ gdn_segmented_prefill_chunk32(
   deferred pending a correctness-contract decision. A row-padded diagnostic
   that keeps each packed row at `T=512` still fails the gate, so the issue is
   row-wise decomposition/accumulation order rather than only variable-length
-  chunk count.
+  chunk count. The benchmark now emits a machine-readable policy summary:
+  segmented CUDA math is allowed only after the strict padded chunk32
+  output/state gate passes. Failed packed/row-padded gates are reported as
+  `blocked_on_correctness_policy`; a true-token packed ABI requires an explicit
+  design decision plus a separate real-weight full-model token/logit parity gate
+  before CUDA math.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 
