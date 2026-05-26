@@ -3941,3 +3941,34 @@ JAX_PLATFORMS=cuda \
   GDN target is an opt-in FP32 packed decode core that borrows vLLM's packed
   `mixed_qkv + a/b/A_log/dt_bias` boundary while preserving nano's local
   `[B,H,K,V]` persistent state.
+
+### Entry 097 - Accepted packed FP32 GDN decode core
+
+- change accepted: added a local CUDA/JAX FFI target
+  `nanovllm_jax_fp32_gdn_packed_decode` plus Python wrapper
+  `gdn_packed_decode_step_fp32`.
+- scope: the core accepts vLLM-style `mixed_qkv [B, 2*H*K + HV*V]`, raw
+  `a/b [B,HV]`, `A_log/dt_bias [HV]`, and nano's local FP32 state
+  `[B,HV,K,V]`. It performs split, q/k L2 norm, query scaling, gate/beta
+  transform, and width-1 recurrence in one CUDA call.
+- correctness: focused CUDA parity passes against
+  `gdn_packed_decode_reference_local_state` for same-head and GVA q/k
+  repetition cases.
+- validation:
+
+```text
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest -q \
+  tests/test_gdn_packed_decode_reference.py \
+  tests/test_cuda_fp32_ffi.py \
+  -k 'packed_gdn_decode or gdn_packed_decode'
+
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest -q tests/test_cuda_fp32_ffi.py
+```
+
+- result: packed-focused test selection `5 passed, 11 deselected`; full local
+  CUDA FFI regression file `13 passed`.
+- decision: keep this default-off and unrouted for now. It is the packed GDN
+  ABI/toolchain step needed before a serving integration attempt, not an
+  integrated speed claim.

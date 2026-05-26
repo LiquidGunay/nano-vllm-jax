@@ -826,6 +826,12 @@ previous Pallas regressions, it should not be the first production path for GDN.
   activation dtype, or scheduler state-slot semantics without an explicit user
   design decision. The next local implementation target should be an opt-in
   FP32 packed GDN decode core that preserves nano's `[B,HV,K,V]` state.
+- A local CUDA/JAX FFI packed FP32 GDN decode core now exists as
+  `gdn_packed_decode_step_fp32`. It accepts vLLM-style
+  `mixed_qkv + a/b/A_log/dt_bias`, preserves nano's local `[B,HV,K,V]` state,
+  and passes focused CUDA parity against the pure-JAX packed reference for both
+  same-head and GVA q/k repetition cases. It is an ABI/toolchain step only; it
+  is not routed into serving and makes no speed claim yet.
 
 ### Acceptance Gate
 
@@ -1240,6 +1246,8 @@ Commit 7:
   `[B,H,K,V]` state layout~~
 - ~~Audit vLLM/FLA GDN references and record that packed decode with local
   state is the smallest non-design-changing next target~~
+- ~~Add local CUDA/JAX FFI packed FP32 GDN decode core with focused parity
+  tests~~
 - ~~Route through `gated_delta_decode` behind an opt-in flag~~
 - ~~Run integrated decode benchmark and record rejection of standalone GDN
   decode routing~~

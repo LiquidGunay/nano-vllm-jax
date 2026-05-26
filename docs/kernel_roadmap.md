@@ -145,6 +145,9 @@ gdn_recurrent_decode_step(
   and BF16-oriented prefill activations. The next non-design-changing target is
   a packed FP32 decode core that borrows vLLM's `mixed_qkv + a/b/A_log/dt_bias`
   boundary while preserving nano's local `[B,H,K,V]` persistent state.
+- packed-core status: `gdn_packed_decode_step_fp32` implements that boundary as
+  a local CUDA/JAX FFI target and passes focused CUDA parity for same-head and
+  GVA q/k repetition shapes. It is not a serving route or speed claim yet.
 
 ## P1.2 - `gdn_segmented_prefill_chunk32`
 

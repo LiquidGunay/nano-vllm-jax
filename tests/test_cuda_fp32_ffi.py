@@ -18,6 +18,8 @@ jax.config.update("jax_default_matmul_precision", "highest")
 from nanovllm_jax.backends import PureJAXBackend
 from nanovllm_jax.kernels.cuda_fp32_ffi import (
     build_cuda_fp32_kernels,
+    gdn_packed_decode_step_fp32,
+    gdn_packed_decode_step_fp32_reference,
     gdn_prefill_chunk32_normalized_fp32,
     gdn_prefill_chunk32_v64_normalized_fp32,
     gdn_recurrent_decode_step_fp32,
@@ -625,4 +627,78 @@ def test_backend_cuda_fp32_gdn_decode_opt_in_matches_pure_jax(monkeypatch):
         np.asarray(expected_state),
         rtol=2e-5,
         atol=2e-5,
+    )
+
+
+@pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.parametrize(
+    ("num_q_heads", "num_value_heads"),
+    [
+        (4, 4),
+        (2, 4),
+    ],
+)
+def test_gdn_packed_decode_step_fp32_matches_reference(
+    monkeypatch,
+    num_q_heads,
+    num_value_heads,
+):
+    monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
+
+    batch = 2
+    key_dim = 16
+    value_dim = 16
+    packed_dim = 2 * num_q_heads * key_dim + num_value_heads * value_dim
+    mixed_qkv = jnp.linspace(
+        -0.5,
+        0.5,
+        batch * packed_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, packed_dim)
+    a = jnp.linspace(-0.3, 0.2, batch * num_value_heads, dtype=jnp.float32).reshape(
+        batch,
+        num_value_heads,
+    )
+    b = jnp.linspace(-1.0, 1.0, batch * num_value_heads, dtype=jnp.float32).reshape(
+        batch,
+        num_value_heads,
+    )
+    a_log = jnp.linspace(-0.2, 0.1, num_value_heads, dtype=jnp.float32)
+    dt_bias = jnp.linspace(0.05, 0.2, num_value_heads, dtype=jnp.float32)
+    state = jnp.linspace(
+        -0.03,
+        0.04,
+        batch * num_value_heads * key_dim * value_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_value_heads, key_dim, value_dim)
+
+    expected_out, expected_state = gdn_packed_decode_step_fp32_reference(
+        mixed_qkv,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state,
+    )
+    actual_out, actual_state = jax.jit(gdn_packed_decode_step_fp32)(
+        mixed_qkv,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_out),
+        np.asarray(expected_out),
+        rtol=3e-5,
+        atol=3e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
+        rtol=3e-5,
+        atol=3e-5,
     )
