@@ -252,10 +252,11 @@ end-to-end throughput.
   generated same-run defaults so exact-token gates use stable baselines.
 - Matrix summaries now include an `acceptance` section that makes the plan's
   speed-claim evidence check explicit: minimum repeats, exact correctness,
-  JAX/vLLM performance presence, profile counters, and the `0.75x` vLLM target.
-  All configured profile-counter buckets must be present for every repeat.
-  The runner validates the summary shape before writing it. Human explanation
-  of profile bucket movement still belongs in the logbook.
+  JAX/vLLM performance presence, TTFT/ITL p50/p95 latency, first
+  `forward_step_token_ids_jit`, profile counters, and the `0.75x` vLLM target.
+  All configured profile-counter buckets must be present for every repeat. The
+  runner validates the summary shape before writing it. Human explanation of
+  profile bucket movement still belongs in the logbook.
 - Focused tests also verify that all GPU matrix configs have valid stored JAX
   and vLLM references for `hetero8` and `long_prefill_512_2048`, so the next
   GPU-visible two-repeat run should not silently fall back to unchecked

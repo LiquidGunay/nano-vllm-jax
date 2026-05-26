@@ -91,7 +91,10 @@ def _minimal_summary():
                         "repeat_count": 1,
                         "tokens_per_second_median": None,
                         "ttft_ms_p50_median": None,
+                        "ttft_ms_p95_median": None,
                         "itl_ms_p50_median": None,
+                        "itl_ms_p95_median": None,
+                        "first_forward_step_token_ids_jit_ms_median": None,
                         "all_correct": False,
                         "all_exact_generated_token_match": False,
                         "all_correctness_checked": False,
@@ -109,6 +112,8 @@ def _minimal_summary():
                         "correctness_checked": False,
                         "exact_generated_token_match": False,
                         "jax_performance_present": False,
+                        "jax_latency_present": False,
+                        "first_forward_step_present": False,
                         "vllm_reference_present": False,
                         "profile_counters_present": False,
                     },
@@ -148,7 +153,14 @@ def test_aggregate_repeats_requires_exact_full_length_match():
         [
             {
                 "metrics": {
-                    "performance": {"tokens_per_second": 10.0},
+                    "performance": {
+                        "tokens_per_second": 10.0,
+                        "ttft_ms_p50": 1.0,
+                        "ttft_ms_p95": 1.5,
+                        "itl_ms_p50": 2.0,
+                        "itl_ms_p95": 2.5,
+                    },
+                    "first_forward_step_token_ids_jit_ms": 3.0,
                     "correctness": {
                         "checked": True,
                         "ok": True,
@@ -163,6 +175,9 @@ def test_aggregate_repeats_requires_exact_full_length_match():
     assert aggregate["all_correct"]
     assert not aggregate["all_exact_generated_token_match"]
     assert aggregate["all_correctness_checked"]
+    assert aggregate["ttft_ms_p95_median"] == 1.5
+    assert aggregate["itl_ms_p95_median"] == 2.5
+    assert aggregate["first_forward_step_token_ids_jit_ms_median"] == 3.0
 
 
 def test_cuda_device_preflight_accepts_visible_device_nodes(tmp_path):
@@ -338,12 +353,27 @@ def test_benchmark_acceptance_summary_requires_plan_evidence():
         for index, needle in enumerate(PROFILE_NEEDLES)
     }
     repeats = [
-        {"metrics": {"profile": complete_profile}},
-        {"metrics": {"profile": complete_profile}},
+        {
+            "metrics": {
+                "profile": complete_profile,
+                "first_forward_step_token_ids_jit_ms": 9.0,
+            }
+        },
+        {
+            "metrics": {
+                "profile": complete_profile,
+                "first_forward_step_token_ids_jit_ms": 10.0,
+            }
+        },
     ]
     aggregate = {
         "repeat_count": 2,
         "tokens_per_second_median": 90.0,
+        "ttft_ms_p50_median": 1.0,
+        "ttft_ms_p95_median": 1.5,
+        "itl_ms_p50_median": 2.0,
+        "itl_ms_p95_median": 2.5,
+        "first_forward_step_token_ids_jit_ms_median": 9.5,
         "all_correctness_checked": True,
         "all_exact_generated_token_match": True,
     }
@@ -369,6 +399,11 @@ def test_benchmark_acceptance_summary_rejects_incomplete_evidence():
         {
             "repeat_count": 1,
             "tokens_per_second_median": None,
+            "ttft_ms_p50_median": None,
+            "ttft_ms_p95_median": None,
+            "itl_ms_p50_median": None,
+            "itl_ms_p95_median": None,
+            "first_forward_step_token_ids_jit_ms_median": None,
             "all_correctness_checked": False,
             "all_exact_generated_token_match": False,
         },
@@ -380,6 +415,8 @@ def test_benchmark_acceptance_summary_rejects_incomplete_evidence():
     assert not acceptance["target_vllm_ratio_met"]
     assert not acceptance["checks"]["minimum_repeats"]
     assert not acceptance["checks"]["profile_counters_present"]
+    assert not acceptance["checks"]["jax_latency_present"]
+    assert not acceptance["checks"]["first_forward_step_present"]
     assert acceptance["missing_profile_counters"]
 
 
@@ -399,6 +436,11 @@ def test_benchmark_acceptance_summary_requires_all_profile_counters():
         {
             "repeat_count": 2,
             "tokens_per_second_median": 90.0,
+            "ttft_ms_p50_median": 1.0,
+            "ttft_ms_p95_median": 1.5,
+            "itl_ms_p50_median": 2.0,
+            "itl_ms_p95_median": 2.5,
+            "first_forward_step_token_ids_jit_ms_median": 9.5,
             "all_correctness_checked": True,
             "all_exact_generated_token_match": True,
         },

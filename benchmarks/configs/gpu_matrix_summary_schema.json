@@ -95,7 +95,10 @@
                 "repeat_count",
                 "tokens_per_second_median",
                 "ttft_ms_p50_median",
+                "ttft_ms_p95_median",
                 "itl_ms_p50_median",
+                "itl_ms_p95_median",
+                "first_forward_step_token_ids_jit_ms_median",
                 "all_correct",
                 "all_exact_generated_token_match",
                 "all_correctness_checked"

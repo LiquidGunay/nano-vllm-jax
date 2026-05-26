@@ -3173,10 +3173,11 @@ Decision:
 - change accepted: `benchmarks/run_gpu_matrix.py` now writes an `acceptance`
   section for each workload/config pair. It checks whether the summary has at
   least two repeats, exact generated-token correctness, JAX performance metrics,
-  a vLLM throughput reference, profile counters, and whether the JAX/vLLM
-  throughput ratio reaches the `0.75x` target. Profile coverage is strict:
-  every configured profile bucket must be present in every repeat, and missing
-  buckets are listed in `missing_profile_counters`.
+  TTFT/ITL p50/p95 latency, first `forward_step_token_ids_jit`, a vLLM
+  throughput reference, profile counters, and whether the JAX/vLLM throughput
+  ratio reaches the `0.75x` target. Profile coverage is strict: every
+  configured profile bucket must be present in every repeat, and missing buckets
+  are listed in `missing_profile_counters`.
 - schema update: `benchmarks/configs/gpu_matrix_summary_schema.json` now
   requires the `acceptance` top-level key for new matrix summaries.
 - writer validation: the runner validates required top-level, matrix/repeat,
@@ -3209,7 +3210,8 @@ Decision:
   `minimum_repeats` and stored vLLM reference checks can pass, but
   `speed_claim_ready=false` because no JAX performance, correctness, or profile
   metrics exist. The summary explicitly lists all missing profile buckets for
-  each dry-run repeat, and the writer accepted the validated summary shape.
+  each dry-run repeat, reports missing latency and first-forward evidence, and
+  the writer accepted the validated summary shape.
 
 Decision:
 

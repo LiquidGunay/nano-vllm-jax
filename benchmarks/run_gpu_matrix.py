@@ -179,7 +179,10 @@ def _validate_summary_shape(summary: dict[str, Any], schema: dict[str, Any]) -> 
         "repeat_count",
         "tokens_per_second_median",
         "ttft_ms_p50_median",
+        "ttft_ms_p95_median",
         "itl_ms_p50_median",
+        "itl_ms_p95_median",
+        "first_forward_step_token_ids_jit_ms_median",
         "all_correct",
         "all_exact_generated_token_match",
         "all_correctness_checked",
@@ -197,6 +200,8 @@ def _validate_summary_shape(summary: dict[str, Any], schema: dict[str, Any]) -> 
         "correctness_checked",
         "exact_generated_token_match",
         "jax_performance_present",
+        "jax_latency_present",
+        "first_forward_step_present",
         "vllm_reference_present",
         "profile_counters_present",
     ]
@@ -498,7 +503,12 @@ def _aggregate_repeats(repeats: list[dict[str, Any]]) -> dict[str, Any]:
         "repeat_count": len(repeats),
         "tokens_per_second_median": _median([row.get("tokens_per_second") for row in perf_rows]),
         "ttft_ms_p50_median": _median([row.get("ttft_ms_p50") for row in perf_rows]),
+        "ttft_ms_p95_median": _median([row.get("ttft_ms_p95") for row in perf_rows]),
         "itl_ms_p50_median": _median([row.get("itl_ms_p50") for row in perf_rows]),
+        "itl_ms_p95_median": _median([row.get("itl_ms_p95") for row in perf_rows]),
+        "first_forward_step_token_ids_jit_ms_median": _median(
+            [row.get("first_forward_step_token_ids_jit_ms") for row in metric_rows]
+        ),
         "all_correct": all(bool(row.get("ok")) for row in correctness_rows),
         "all_exact_generated_token_match": all(
             bool(row.get("exact_generated_token_match")) for row in correctness_rows
@@ -652,6 +662,16 @@ def _benchmark_acceptance_summary(
         "correctness_checked": bool(aggregate.get("all_correctness_checked")),
         "exact_generated_token_match": bool(aggregate.get("all_exact_generated_token_match")),
         "jax_performance_present": aggregate.get("tokens_per_second_median") is not None,
+        "jax_latency_present": all(
+            aggregate.get(key) is not None
+            for key in (
+                "ttft_ms_p50_median",
+                "ttft_ms_p95_median",
+                "itl_ms_p50_median",
+                "itl_ms_p95_median",
+            )
+        ),
+        "first_forward_step_present": aggregate.get("first_forward_step_token_ids_jit_ms_median") is not None,
         "vllm_reference_present": vllm_performance.get("tokens_per_second") is not None,
         "profile_counters_present": not missing_profile_counters,
     }
