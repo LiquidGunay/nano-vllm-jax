@@ -1465,3 +1465,48 @@ Decision:
 - Reject and revert compact prefill metadata indices. Correctness was exact, but the profile proved the repeated compact-index work was not the limiting cost and the metadata extension made the compiled graph heavier.
 - Do not move compact projection indices into `AttentionMetadata` in this form. If compact prefill is revisited, inspect HLO/layout around the existing XLA compact dots or change the attention algorithm, not the index plumbing.
 - Next candidates should follow the audit's remaining list: initial-prefill local attention while preserving paged KV writes, or a controlled GDN chunk/layout sweep with exact-token gates.
+
+## Entry 043 - Rejected Initial-Prefill Local Attention
+
+- run id: `20260526-014543-2064227-jax_hetero8_64_512x32_initial_prefill_local_attention`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_initial_prefill_local_attention.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-014543-2064227-jax_hetero8_64_512x32_initial_prefill_local_attention`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-014543-2064227-jax_hetero8_64_512x32_initial_prefill_local_attention/plugins/profile/2026_05_26_01_47_32/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-014543-2064227-jax_hetero8_64_512x32_initial_prefill_local_attention/plugins/profile/2026_05_26_01_47_32/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- repeat run id: `20260526-014903-2065504-jax_hetero8_64_512x32_initial_prefill_local_attention_repeat`
+- repeat benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_initial_prefill_local_attention_repeat.json`
+- repeat profile directory: `/mountpoint/.exp/profiles/20260526-014903-2065504-jax_hetero8_64_512x32_initial_prefill_local_attention_repeat`
+- repeat Perfetto trace: `/mountpoint/.exp/profiles/20260526-014903-2065504-jax_hetero8_64_512x32_initial_prefill_local_attention_repeat/plugins/profile/2026_05_26_01_49_27/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- repeat TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-014903-2065504-jax_hetero8_64_512x32_initial_prefill_local_attention_repeat/plugins/profile/2026_05_26_01_49_27/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Archimedes reviewed the temporary path and found the local attention math shape-compatible with the paged path, including GQA head grouping and K/V write ordering, but required a stricter host-only gate than the first draft. The gate must only allow whole no-prefix prompt prefill: env on, prefill step, zero decode tokens, host query/seq/seq-id/final metadata present, active rows `query_len == seq_len`, inactive rows zeroed, final flags true, and `num_prefill_tokens == sum(query_lens)`. Cached-prefix chunks, first chunks of chunked prefill, and MTP verifier-like batches must stay on the paged path.
+- change tested: a temporary `NANO_VLLM_JAX_INITIAL_PREFILL_LOCAL_ATTN=1` path still wrote full-attention K/V through `backend.write_kv`, but for strictly gated whole prompt prefill computed attention output directly from the local projected K/V tensors instead of gathering through the paged cache. The static gate was included in the JIT cache key. The source change was reverted after profiling.
+- focused CUDA checks: after tightening the gate, `tests/test_backend_boundaries.py::test_initial_prefill_local_attention_static_gate`, `tests/test_backend_boundaries.py::test_initial_prefill_local_attention_matches_paged_prefill`, `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute`, `tests/test_backend_boundaries.py::test_bucketed_prefill_last_logits_match_exact_prefill`, `tests/test_backend_boundaries.py::test_executor_mtp1_greedy_step_jit_matches_separate_path`, and `tests/test_lm_head_helpers.py` passed under `JAX_PLATFORMS=cuda` with the env flag enabled (`8 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 033 hetero8 reference in both profiled runs.
+- first JAX timing: `330.57 tok/s`, TTFT p50 `324.90 ms`, ITL p50 `13.82 ms`, ITL p95 `17.54 ms`.
+- repeat JAX timing: `355.75 tok/s`, TTFT p50 `314.99 ms`, ITL p50 `12.90 ms`, ITL p95 `13.79 ms`.
+- repeat delta vs Entry 033 default: `1.001x` total tok/s, TTFT p50 `0.997x`, ITL p50 `1.004x`, ITL p95 `1.000x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 033 ms | local attention repeat ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 720.52 | 719.60 | overall tied |
+| `_run_main_and_sample` | 598.60 | 597.95 | runner hot path tied |
+| `forward_step_token_ids_jit` | 175.81 | 173.39 | small cumulative improvement, mostly noise scale |
+| first `forward_step_token_ids_jit` | 83.25 | 83.38 | initial prefill itself did not improve |
+| `PjRtCApiLoadedExecutable::Execute` | 191.91 over 252 calls | 188.94 over 252 calls | slight cumulative improvement |
+| `jit_compiled:XLA GPU module` | 147.90 | 145.88 | slight cumulative improvement |
+| `command_buffer::execute` | 92.22 over 1575 calls | 90.80 over 1566 calls | 9 fewer command-buffer execute ranges |
+| `command_buffer::update` | 27.81 over 248 calls | 26.69 over 248 calls | small improvement |
+| `cutlass_80_tensorop_s1688gemm_128x128_16x5_nn_align4` | 52.39 | 52.42 | compact prefill GEMM unchanged |
+| `gemm_fusion_dot_general_746` | 13.92 | 13.91 | unchanged |
+| `gemm_fusion_dot_2` | 117.43 | 117.84 | unchanged/slightly worse |
+| `input_reduce_fusion` | 59.30 | 58.79 | unchanged |
+| `wrapped_concatenate` | 36.49 | 36.49 | unchanged |
+| `MemcpyD2D` | 24.62 | 24.69 | unchanged |
+
+Decision:
+
+- Reject and revert initial-prefill local attention. Correctness was exact and the stricter gate was safe, but the profile did not show a real TTFT or first-prefill improvement. The repeat was only tied with Entry 033, while the first profiled run was materially slower.
+- Do not keep this source branch as an optional flag; it adds another compiled shape key and attention implementation for no durable win.
+- The useful follow-up from this experiment is negative evidence: avoiding the paged-cache gather for the whole initial prefill does not move the dominant prefill bucket in this hetero8 workload. The next prefill work should target the XLA full-attention/prefill HLO layout itself or run the controlled GDN chunk/layout sweep from the audit.
