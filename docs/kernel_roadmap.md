@@ -51,6 +51,10 @@ kv_append_paged_nhd(
   tensors, but rejected for the accepted FP32 activation/KV-cache serving
   contract. A future serving path needs either a FP32-capable append kernel or
   an explicit dtype-policy change.
+- current FP32 status: a local CUDA/JAX FFI append smoke kernel now preserves
+  the FP32 cache contract and matches the NHD reference in a focused CUDA test.
+  It remains an unrouted prototype until exact-token and integrated benchmark
+  gates pass.
 
 ## P0.2 - `paged_decode_attention_gqa_nhd`
 

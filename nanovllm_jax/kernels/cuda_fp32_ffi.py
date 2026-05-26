@@ -1,0 +1,298 @@
+"""Local CUDA/JAX FFI prototypes for FP32 serving kernels."""
+
+from __future__ import annotations
+
+import ctypes
+import os
+import shutil
+import subprocess
+import sys
+import sysconfig
+import threading
+from pathlib import Path
+from typing import Any
+
+import jax
+import jax.numpy as jnp
+
+from nanovllm_jax.kernels.flashinfer_ffi import (
+    kv_append_paged_nhd_reference,
+)
+from nanovllm_jax.kernels.registry import backend_status
+
+_TARGET_KV_APPEND = "nanovllm_jax_fp32_kv_append_paged_nhd"
+_REGISTER_LOCK = threading.Lock()
+_REGISTERED = False
+_LOADED_LIBS: list[ctypes.CDLL] = []
+
+
+def availability():
+    return backend_status("cuda_fp32")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _runtime_root() -> Path:
+    configured = os.getenv("NANO_VLLM_JAX_CACHE_ROOT")
+    if configured:
+        return Path(configured)
+    mountpoint = Path("/mountpoint/.exp")
+    if mountpoint.exists():
+        return mountpoint
+    return Path.cwd()
+
+
+def _build_dir() -> Path:
+    return _runtime_root() / ".cache" / "nano-vllm-jax" / "cuda_fp32"
+
+
+def _cuda_root_from_site_packages() -> Path | None:
+    purelib = sysconfig.get_paths().get("purelib")
+    if not purelib:
+        return None
+    candidate = Path(purelib) / "nvidia" / "cu13"
+    return candidate if candidate.exists() else None
+
+
+def _nvcc_path() -> Path:
+    configured = os.getenv("NANO_VLLM_JAX_NVCC")
+    if configured:
+        return Path(configured)
+    cuda_root = _cuda_root_from_site_packages()
+    if cuda_root is not None:
+        candidate = cuda_root / "bin" / "nvcc"
+        if candidate.exists():
+            return candidate
+    found = shutil.which("nvcc")
+    if found:
+        return Path(found)
+    raise RuntimeError(
+        "nvcc was not found; set NANO_VLLM_JAX_NVCC or install the cuda13 extra"
+    )
+
+
+def _cuda_root_from_nvcc(nvcc: Path) -> Path:
+    return nvcc.resolve().parents[1]
+
+
+def _shared_library_path() -> Path:
+    ext = ".dll" if sys.platform == "win32" else ".so"
+    return _build_dir() / f"libnano_vllm_jax_cuda_fp32_{_cuda_arch()}{ext}"
+
+
+def _source_path() -> Path:
+    return _repo_root() / "nanovllm_jax" / "kernels" / "csrc" / "fp32_kv_append.cu"
+
+
+def _cuda_arch() -> str:
+    return os.getenv("NANO_VLLM_JAX_CUDA_ARCH", "sm_86").strip()
+
+
+def _cuda_arch_flags() -> list[str]:
+    arch = _cuda_arch()
+    if not arch.startswith("sm_"):
+        raise ValueError(
+            "NANO_VLLM_JAX_CUDA_ARCH must use an sm_XX architecture string"
+        )
+    compute = "compute_" + arch.split("_", 1)[1]
+    return [f"--generate-code=arch={compute},code={arch}"]
+
+
+def _needs_rebuild(output_path: Path, source_path: Path) -> bool:
+    if os.getenv("NANO_VLLM_JAX_FORCE_CUDA_FFI_REBUILD", "0") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
+    if not output_path.exists():
+        return True
+    return source_path.stat().st_mtime > output_path.stat().st_mtime
+
+
+def build_cuda_fp32_kernels() -> Path:
+    """Build the local FP32 CUDA FFI shared object under the runtime cache."""
+
+    output_path = _shared_library_path()
+    source_path = _source_path()
+    if not _needs_rebuild(output_path, source_path):
+        return output_path
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    nvcc = _nvcc_path()
+    cuda_root = _cuda_root_from_nvcc(nvcc)
+    include_dir = jax.ffi.include_dir()
+    command = [
+        str(nvcc),
+        "-std=c++17",
+        "-O3",
+        "-shared",
+        *_cuda_arch_flags(),
+        "-Xcompiler",
+        "-fPIC",
+        str(source_path),
+        "-o",
+        str(output_path),
+        "-I",
+        include_dir,
+        "-I",
+        str(cuda_root / "include"),
+        "-L",
+        str(cuda_root / "lib"),
+        "-lcudart",
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=_repo_root(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Failed to build local FP32 CUDA FFI kernels with nvcc:\n"
+            + completed.stdout[-12000:]
+        )
+    return output_path
+
+
+def _register_kv_append_target() -> None:
+    global _REGISTERED
+    if _REGISTERED:
+        return
+    with _REGISTER_LOCK:
+        if _REGISTERED:
+            return
+        library_path = build_cuda_fp32_kernels()
+        library = ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
+        handler = library.NanoVllmJaxFp32KvAppend
+        jax.ffi.register_ffi_target(
+            _TARGET_KV_APPEND,
+            jax.ffi.pycapsule(handler),
+            platform="gpu",
+            api_version=1,
+        )
+        _LOADED_LIBS.append(library)
+        _REGISTERED = True
+
+
+def _as_jax_array(name: str, value: Any) -> jnp.ndarray:
+    try:
+        return jnp.asarray(value)
+    except Exception as exc:  # pragma: no cover - defensive type error path.
+        raise TypeError(f"{name} must be array-like") from exc
+
+
+def _validate_fp32_kv_append_inputs(
+    append_key: jnp.ndarray,
+    append_value: jnp.ndarray,
+    batch_indices: jnp.ndarray,
+    positions: jnp.ndarray,
+    k_cache: jnp.ndarray,
+    v_cache: jnp.ndarray,
+    kv_indices: jnp.ndarray,
+    kv_indptr: jnp.ndarray,
+    kv_last_page_len: jnp.ndarray,
+) -> None:
+    if append_key.dtype != jnp.float32 or append_value.dtype != jnp.float32:
+        raise ValueError("append_key and append_value must be float32")
+    if k_cache.dtype != jnp.float32 or v_cache.dtype != jnp.float32:
+        raise ValueError("k_cache and v_cache must be float32")
+    for name, value in (
+        ("batch_indices", batch_indices),
+        ("positions", positions),
+        ("kv_indices", kv_indices),
+        ("kv_indptr", kv_indptr),
+        ("kv_last_page_len", kv_last_page_len),
+    ):
+        if value.dtype != jnp.int32:
+            raise ValueError(f"{name} must have dtype int32")
+    if k_cache.shape != v_cache.shape:
+        raise ValueError("k_cache and v_cache must have the same shape")
+    if append_key.shape != append_value.shape:
+        raise ValueError("append_key and append_value must have the same shape")
+    if append_key.ndim != 3:
+        raise ValueError(
+            "append_key must have shape [nnz_tokens, num_kv_heads, head_dim]"
+        )
+    if k_cache.ndim != 4:
+        raise ValueError(
+            "k_cache must have NHD shape "
+            "[num_pages, page_size, num_kv_heads, head_dim]"
+        )
+    if append_key.shape[1:] != k_cache.shape[2:]:
+        raise ValueError(
+            "append_key trailing dimensions must match cache "
+            "[num_kv_heads, head_dim]"
+        )
+    nnz_tokens = append_key.shape[0]
+    if batch_indices.shape != (nnz_tokens,) or positions.shape != (nnz_tokens,):
+        raise ValueError(
+            "batch_indices and positions must both have shape [nnz_tokens]"
+        )
+    if kv_indices.ndim != 1 or kv_indptr.ndim != 1 or kv_last_page_len.ndim != 1:
+        raise ValueError("page metadata tensors must be rank-1")
+
+
+def kv_append_paged_nhd_fp32(
+    append_key: Any,
+    append_value: Any,
+    batch_indices: Any,
+    positions: Any,
+    k_cache: Any,
+    v_cache: Any,
+    kv_indices: Any,
+    kv_indptr: Any,
+    kv_last_page_len: Any,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Append FP32 K/V into an NHD paged cache using a local CUDA FFI kernel."""
+
+    append_key = _as_jax_array("append_key", append_key)
+    append_value = _as_jax_array("append_value", append_value)
+    batch_indices = _as_jax_array("batch_indices", batch_indices)
+    positions = _as_jax_array("positions", positions)
+    k_cache = _as_jax_array("k_cache", k_cache)
+    v_cache = _as_jax_array("v_cache", v_cache)
+    kv_indices = _as_jax_array("kv_indices", kv_indices)
+    kv_indptr = _as_jax_array("kv_indptr", kv_indptr)
+    kv_last_page_len = _as_jax_array("kv_last_page_len", kv_last_page_len)
+    _validate_fp32_kv_append_inputs(
+        append_key,
+        append_value,
+        batch_indices,
+        positions,
+        k_cache,
+        v_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+    )
+    _register_kv_append_target()
+    call = jax.ffi.ffi_call(
+        _TARGET_KV_APPEND,
+        (
+            jax.ShapeDtypeStruct(k_cache.shape, k_cache.dtype),
+            jax.ShapeDtypeStruct(v_cache.shape, v_cache.dtype),
+        ),
+        has_side_effect=True,
+        input_output_aliases={4: 0, 5: 1},
+    )
+    return call(
+        append_key,
+        append_value,
+        batch_indices,
+        positions,
+        k_cache,
+        v_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+    )
+
+
+def kv_append_paged_nhd_fp32_reference(*args: Any, **kwargs: Any):
+    return kv_append_paged_nhd_reference(*args, **kwargs)

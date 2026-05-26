@@ -73,6 +73,17 @@ _SPECS: dict[str, KernelBackendSpec] = {
         implemented=False,
         description="FlashInfer kernels called from JAX through jax-tvm-ffi.",
     ),
+    "cuda_fp32": KernelBackendSpec(
+        name="cuda_fp32",
+        aliases=("cuda_fp32", "fp32_cuda", "local_cuda"),
+        required_modules=(),
+        provided_kernels=(
+            "kv_append_paged_nhd",
+            "paged_decode_attention_gqa_nhd",
+        ),
+        implemented=False,
+        description="Local CUDA/JAX FFI kernels that preserve FP32 cache tensors.",
+    ),
     "gdn_cuda": KernelBackendSpec(
         name="gdn_cuda",
         aliases=("gdn_cuda", "cuda_gdn"),
@@ -166,7 +177,7 @@ def select_kernel_backend(name: str | None = None, *, strict: bool = False) -> K
 
     normalized = _normalize(name)
     if normalized == "auto":
-        for candidate in ("flashinfer", "gdn_cuda"):
+        for candidate in ("cuda_fp32", "flashinfer", "gdn_cuda"):
             status = _status_for_spec("auto", _SPECS[candidate])
             if status.external_kernels_enabled:
                 return status

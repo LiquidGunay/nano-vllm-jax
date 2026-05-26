@@ -41,14 +41,20 @@ def test_kernel_registry_records_planned_external_backends():
     assert statuses["pure_jax"].implemented
     assert "kv_append_paged_nhd" in statuses["flashinfer"].provided_kernels
     assert "paged_decode_attention_gqa_nhd" in statuses["flashinfer"].provided_kernels
+    assert "kv_append_paged_nhd" in statuses["cuda_fp32"].provided_kernels
+    assert "paged_decode_attention_gqa_nhd" in statuses["cuda_fp32"].provided_kernels
     assert "gdn_recurrent_decode_step" in statuses["gdn_cuda"].provided_kernels
     assert not statuses["flashinfer"].external_kernels_enabled
+    assert not statuses["cuda_fp32"].external_kernels_enabled
     assert not statuses["gdn_cuda"].external_kernels_enabled
 
 
 def test_explicit_unaccepted_kernel_backend_fails_strict():
     with pytest.raises(KernelBackendUnavailable):
         select_kernel_backend("flashinfer", strict=True)
+
+    with pytest.raises(KernelBackendUnavailable):
+        select_kernel_backend("cuda_fp32", strict=True)
 
     with pytest.raises(KernelBackendUnavailable):
         select_kernel_backend("gdn_cuda", strict=True)

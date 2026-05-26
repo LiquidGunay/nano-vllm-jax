@@ -327,6 +327,11 @@ scratch.
   support FP32 cache tensors. The current accepted contract keeps BF16 weights
   and FP32 activation/KV-cache tensors, so this route is rejected for default
   serving unless the dtype policy changes or a FP32 append kernel is added.
+- A local CUDA/JAX FFI FP32 append smoke kernel now builds under
+  `/mountpoint/.exp/.cache`, uses the same NHD append ABI and cache-output
+  aliasing contract, and passes a focused CUDA parity test against the pure-JAX
+  NHD append reference. This proves the FP32 custom-call toolchain but is not
+  routed into serving or accepted as a speed path yet.
 - This is not exact-token/integrated-benchmark accepted and is not a default
   backend.
 
@@ -755,6 +760,8 @@ Interim ABI validation:
 
 - ~~Add pure-JAX `kv_append_paged_nhd` ABI reference for the exact NHD append contract~~
 - ~~Add focused parity test against the canonical `update_kv_cache` path~~
+- ~~Add local CUDA/JAX FFI FP32 `kv_append_paged_nhd` smoke kernel~~
+- ~~Add focused CUDA parity test against the pure-JAX NHD append reference~~
 
 Commit 6:
 
@@ -762,7 +769,8 @@ Commit 6:
   current FP32 activation/KV-cache contract.
 - ~~Add pure-JAX FP32 `paged_decode_attention_gqa_nhd` ABI reference~~
 - ~~Add focused parity tests against the current decode path~~
-- Add FP32-capable CUDA/custom-call implementation behind an opt-in backend
+- Add FP32-capable CUDA/custom-call decode implementation behind an opt-in
+  backend
 - Route only full-attention decode layers after focused and integrated gates
   pass
 
