@@ -12,11 +12,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from benchmarks.run_gpu_matrix import (
     CONFIG_DIR,
+    DEFAULT_WORKLOADS,
     PROFILE_NEEDLES,
     REPO_ROOT,
     WORKLOADS,
     _acceptance_failures,
     _aggregate_repeats,
+    _artifact_matches_workload,
     _benchmark_acceptance_summary,
     _comparison_summary,
     _configured_workload_reference,
@@ -33,6 +35,18 @@ from benchmarks.run_gpu_matrix import (
     _stored_reference_gaps,
     _validate_summary_shape,
 )
+
+
+class _FakeTokenizer:
+    vocab_size = 128
+    eos_token_id = 2
+
+    def __len__(self):
+        return self.vocab_size
+
+    def __call__(self, text, add_special_tokens=False):
+        del add_special_tokens
+        return {"input_ids": [min(127, max(1, len(part))) for part in text.split()]}
 
 
 def _write_workload_artifact(path, workload):
@@ -306,6 +320,11 @@ def test_selected_matrix_names_uses_requested_matrix_without_goal_target_only():
     assert workloads == ["hetero8", "long_prefill_512_2048"]
 
 
+def test_default_workloads_keep_vllm_random_sidecar_opt_in():
+    assert "vllm_random_longprefill" in WORKLOADS
+    assert "vllm_random_longprefill" not in DEFAULT_WORKLOADS
+
+
 def test_configured_workload_reference_uses_workload_mapping(tmp_path):
     workload = WORKLOADS["long_prefill_512_2048"]
     reference = tmp_path / "long.json"
@@ -395,6 +414,18 @@ def test_live_jax_default_capture_skipped_when_default_runs_first():
 
     assert not should_capture
     assert missing == ["gpu_paged_default", "gpu_paged_fast_optin"]
+
+
+def test_live_jax_default_capture_used_for_sidecar_even_when_default_runs_first():
+    should_capture, missing = _should_capture_live_jax_default_reference(
+        selected_configs=["gpu_paged_default"],
+        configs={"gpu_paged_default": {"workload_reference_jsons": {}}},
+        workload=WORKLOADS["vllm_random_longprefill"],
+        default_config={"allow_live_jax_default_if_reference_missing": True},
+    )
+
+    assert should_capture
+    assert missing == ["gpu_paged_default"]
 
 
 def test_live_jax_default_capture_disabled_by_config():
@@ -518,6 +549,7 @@ def test_jax_command_applies_workload_overrides_and_reference(tmp_path):
     assert command[1].endswith("benchmarks/benchmark_jax_server_trace.py")
     assert _flag_value(command, "--input-lens") == "512,1024,1536,2048"
     assert _flag_value(command, "--output-len") == "16"
+    assert _flag_value(command, "--prompt-source") == "tokenized_seed_repeat"
     assert _flag_value(command, "--max-num-seqs") == "4"
     assert _flag_value(command, "--max-num-batched-tokens") == "8192"
     assert _flag_value(command, "--prefill-buckets") == "512,1024,2048"
@@ -526,6 +558,80 @@ def test_jax_command_applies_workload_overrides_and_reference(tmp_path):
     assert _flag_value(command, "--run-label") == "matrix_label"
     assert "--warmup" in command
     assert "--profile" in command
+
+
+def test_jax_command_wires_vllm_random_sidecar_args(tmp_path):
+    config = json.loads((CONFIG_DIR / "gpu_paged_default.json").read_text(encoding="utf-8"))
+    workload = WORKLOADS["vllm_random_longprefill"]
+    command = _jax_command(
+        config,
+        workload,
+        tmp_path / "out.json",
+        None,
+        "sidecar",
+        Path("/tmp/jax-python"),
+    )
+
+    assert _flag_value(command, "--prompt-source") == "vllm_random"
+    assert _flag_value(command, "--dataset-name") == "random"
+    assert _flag_value(command, "--num-prompts") == "128"
+    assert _flag_value(command, "--random-input-len") == "1280"
+    assert _flag_value(command, "--random-output-len") == "16"
+    assert _flag_value(command, "--random-range-ratio") == '{"input":0.6,"output":0.0}'
+
+
+def test_artifact_matches_vllm_random_sidecar_metadata(tmp_path):
+    workload = WORKLOADS["vllm_random_longprefill"]
+    artifact = tmp_path / "random.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "run_config": {
+                    "prompt_source": "vllm_random",
+                    "dataset_name": "random",
+                    "num_prompts": 128,
+                    "seed": 0,
+                    "random_input_len": 1280,
+                    "random_output_len": 16,
+                    "random_range_ratio": {"input": 0.6, "output": 0.0},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _artifact_matches_workload(artifact, workload)
+
+
+def test_prepare_vllm_random_prompts_writes_hashed_manifest(tmp_path):
+    from benchmarks.benchmark_vllm_qwen35 import prepare_prompt_rows
+
+    args = SimpleNamespace(
+        input_lens="1280",
+        output_len=16,
+        output_lengths="",
+        prompt_suite="mixed",
+        prompt_source="vllm_random",
+        prompt_manifest_jsonl="",
+        prompt_manifest_output_jsonl=str(tmp_path / "prompts.jsonl"),
+        dataset_name="random",
+        num_prompts=3,
+        seed=7,
+        random_input_len=8,
+        random_output_len=2,
+        random_range_ratio='{"input":0.5,"output":0.0}',
+        output_json=str(tmp_path / "artifact.json"),
+    )
+
+    rows, info = prepare_prompt_rows(_FakeTokenizer(), args)
+
+    assert len(rows) == 3
+    assert info["prompt_source"] == "vllm_random"
+    assert info["dataset_name"] == "random"
+    assert info["num_prompts"] == 3
+    assert info["prompt_manifest_sha256"]
+    assert Path(info["prompt_manifest_jsonl"]).exists()
+    assert all(row["output_len"] == 2 for row in rows)
 
 
 def test_runtime_env_roots_cache_and_temp_under_mountpoint(tmp_path, monkeypatch):

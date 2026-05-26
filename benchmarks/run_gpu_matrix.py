@@ -29,6 +29,7 @@ from benchmarks.summarize_gpu_matrix import render_markdown
 CONFIG_DIR = REPO_ROOT / "benchmarks" / "configs"
 RESULTS_DIR = REPO_ROOT / "results"
 DEFAULT_CONFIGS = ("gpu_paged_default", "gpu_paged_fast_optin", "gpu_mtp_diagnostics")
+DEFAULT_WORKLOADS = ("hetero8", "short_32_128", "long_prefill_512_2048", "decode_heavy_128x128")
 DEFAULT_JAX_PYTHON = Path(
     os.environ.get(
         "NANO_VLLM_JAX_PYTHON",
@@ -67,6 +68,14 @@ class Workload:
     prompt_suite: str
     arg_overrides: dict[str, Any]
     vllm_overrides: dict[str, Any]
+    prompt_source: str = "tokenized_seed_repeat"
+    dataset_name: str | None = None
+    num_prompts: int | None = None
+    seed: int = 0
+    random_input_len: int | None = None
+    random_output_len: int | None = None
+    random_range_ratio: str | None = None
+    acceptance_scope: str = "speed_claim"
 
 
 WORKLOADS: dict[str, Workload] = {
@@ -126,13 +135,37 @@ WORKLOADS: dict[str, Workload] = {
         },
         vllm_overrides={"max_model_len": 512, "gpu_memory_utilization": 0.55},
     ),
+    "vllm_random_longprefill": Workload(
+        name="vllm_random_longprefill",
+        input_lens="1280",
+        output_len=16,
+        prompt_suite="mixed",
+        arg_overrides={
+            "max_kv_cache_mb": 3072,
+            "num_kvcache_blocks": 768,
+            "max_num_seqs": 4,
+            "max_num_batched_tokens": 8192,
+            "prefill_buckets": "512,1024,2048",
+            "batch_size_buckets": "1,2,4",
+            "max_blocks_per_seq": 160,
+        },
+        vllm_overrides={"max_model_len": 4096, "gpu_memory_utilization": 0.65},
+        prompt_source="vllm_random",
+        dataset_name="random",
+        num_prompts=128,
+        seed=0,
+        random_input_len=1280,
+        random_output_len=16,
+        random_range_ratio='{"input":0.6,"output":0.0}',
+        acceptance_scope="sidecar_only",
+    ),
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--configs", default=",".join(DEFAULT_CONFIGS))
-    parser.add_argument("--workloads", default=",".join(WORKLOADS))
+    parser.add_argument("--workloads", default=",".join(DEFAULT_WORKLOADS))
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--output-json", default="")
     parser.add_argument(
@@ -353,7 +386,7 @@ def _runtime_env(config_env: dict[str, str]) -> dict[str, str]:
         "TOKENIZERS_PARALLELISM": "false",
     }
     for key, value in defaults.items():
-        env.setdefault(key, value)
+        env[key] = value
     env.update({str(key): str(value) for key, value in config_env.items()})
     for key in (
         "TMPDIR",
@@ -429,6 +462,18 @@ def _effective_jax_args(config: dict[str, Any], workload: Workload) -> dict[str,
     args["input_lens"] = workload.input_lens
     args["output_len"] = workload.output_len
     args["prompt_suite"] = workload.prompt_suite
+    args["prompt_source"] = workload.prompt_source
+    if workload.dataset_name is not None:
+        args["dataset_name"] = workload.dataset_name
+    if workload.num_prompts is not None:
+        args["num_prompts"] = workload.num_prompts
+    args["seed"] = workload.seed
+    if workload.random_input_len is not None:
+        args["random_input_len"] = workload.random_input_len
+    if workload.random_output_len is not None:
+        args["random_output_len"] = workload.random_output_len
+    if workload.random_range_ratio is not None:
+        args["random_range_ratio"] = workload.random_range_ratio
     return args
 
 
@@ -468,11 +513,23 @@ def _vllm_command(
         "input_lens": workload.input_lens,
         "output_len": workload.output_len,
         "prompt_suite": workload.prompt_suite,
+        "prompt_source": workload.prompt_source,
         "top_k": base_args.get("top_k", 5),
         "output_json": str(output_json),
         "run_label": run_label,
         "trust_remote_code": True,
     }
+    if workload.dataset_name is not None:
+        args["dataset_name"] = workload.dataset_name
+    if workload.num_prompts is not None:
+        args["num_prompts"] = workload.num_prompts
+    args["seed"] = workload.seed
+    if workload.random_input_len is not None:
+        args["random_input_len"] = workload.random_input_len
+    if workload.random_output_len is not None:
+        args["random_output_len"] = workload.random_output_len
+    if workload.random_range_ratio is not None:
+        args["random_range_ratio"] = workload.random_range_ratio
     args.update(workload.vllm_overrides)
     command = [str(vllm_python), str(REPO_ROOT / "benchmarks" / "benchmark_vllm_qwen35.py")]
     for key, value in args.items():
@@ -550,6 +607,11 @@ def _metric_summary(path: Path) -> dict[str, Any]:
         "exists": True,
         "performance": {
             "tokens_per_second": performance.get("tokens_per_second"),
+            "request_throughput": performance.get("request_throughput"),
+            "output_token_throughput": performance.get("output_token_throughput"),
+            "total_token_throughput": performance.get("total_token_throughput"),
+            "total_input_tokens": performance.get("total_input_tokens"),
+            "total_output_tokens": performance.get("total_output_tokens"),
             "ttft_ms_p50": performance.get("ttft_ms_p50"),
             "ttft_ms_p95": performance.get("ttft_ms_p95"),
             "itl_ms_p50": performance.get("itl_ms_p50"),
@@ -609,6 +671,11 @@ def _aggregate_repeats(repeats: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "repeat_count": len(repeats),
         "tokens_per_second_median": _median([row.get("tokens_per_second") for row in perf_rows]),
+        "request_throughput_median": _median([row.get("request_throughput") for row in perf_rows]),
+        "output_token_throughput_median": _median([row.get("output_token_throughput") for row in perf_rows]),
+        "total_token_throughput_median": _median([row.get("total_token_throughput") for row in perf_rows]),
+        "total_input_tokens_median": _median([row.get("total_input_tokens") for row in perf_rows]),
+        "total_output_tokens_median": _median([row.get("total_output_tokens") for row in perf_rows]),
         "ttft_ms_p50_median": _median([row.get("ttft_ms_p50") for row in perf_rows]),
         "ttft_ms_p95_median": _median([row.get("ttft_ms_p95") for row in perf_rows]),
         "itl_ms_p50_median": _median([row.get("itl_ms_p50") for row in perf_rows]),
@@ -637,6 +704,29 @@ def _artifact_matches_workload(path: Path, workload: Workload) -> bool:
     except Exception:
         return False
     run_config = artifact.get("run_config") or {}
+    prompt_source = run_config.get("prompt_source", "tokenized_seed_repeat")
+    if prompt_source != workload.prompt_source:
+        return False
+    if workload.prompt_source == "vllm_random":
+        if run_config.get("dataset_name") != (workload.dataset_name or "random"):
+            return False
+        if int(run_config.get("num_prompts") or 0) != int(workload.num_prompts or 0):
+            return False
+        if int(run_config.get("seed") or 0) != int(workload.seed):
+            return False
+        if int(run_config.get("random_input_len") or 0) != int(workload.random_input_len or 0):
+            return False
+        if int(run_config.get("random_output_len") or 0) != int(workload.random_output_len or workload.output_len):
+            return False
+        configured_ratio = json.loads(workload.random_range_ratio or '{"input":0.0,"output":0.0}')
+        artifact_ratio = run_config.get("random_range_ratio") or {}
+        return {
+            "input": float(artifact_ratio.get("input", 0.0)),
+            "output": float(artifact_ratio.get("output", 0.0)),
+        } == {
+            "input": float(configured_ratio.get("input", 0.0)),
+            "output": float(configured_ratio.get("output", 0.0)),
+        }
     input_lens = run_config.get("input_lens")
     output_len = run_config.get("output_len")
     prompt_suite = run_config.get("prompt_suite")
@@ -760,6 +850,8 @@ def _should_capture_live_jax_default_reference(
         return False, []
     if not bool(default_config.get("allow_live_jax_default_if_reference_missing", True)):
         return False, missing
+    if workload.acceptance_scope == "sidecar_only":
+        return True, missing
     if selected_configs and selected_configs[0] == FINAL_TARGET_CONFIG:
         return False, missing
     return True, missing
@@ -894,6 +986,16 @@ def _comparison_summary(
         "jax_tokens_per_second_median": jax_tps,
         "vllm_tokens_per_second": vllm_tps,
         "jax_over_vllm_throughput": (jax_tps / vllm_tps) if jax_tps and vllm_tps else None,
+        "jax_request_throughput_median": aggregate.get("request_throughput_median"),
+        "vllm_request_throughput": vllm_performance.get("request_throughput"),
+        "jax_output_token_throughput_median": aggregate.get("output_token_throughput_median"),
+        "vllm_output_token_throughput": vllm_performance.get("output_token_throughput"),
+        "jax_total_token_throughput_median": aggregate.get("total_token_throughput_median"),
+        "vllm_total_token_throughput": vllm_performance.get("total_token_throughput"),
+        "jax_over_vllm_total_token_throughput": _ratio_or_none(
+            aggregate.get("total_token_throughput_median"),
+            vllm_performance.get("total_token_throughput"),
+        ),
         "target_vllm_ratio": TARGET_VLLM_RATIO,
         "target_tokens_per_second": target_tps,
         "tokens_per_second_gap_to_target": gap_tps,
@@ -1084,6 +1186,9 @@ def main() -> None:
         "workloads": selected_workloads,
         "required_metrics": [
             "total tok/s",
+            "request throughput",
+            "output-token throughput",
+            "total-token throughput",
             "TTFT p50/p95",
             "ITL p50/p95",
             "exact generated-token match vs baseline",
@@ -1241,6 +1346,16 @@ def main() -> None:
                     "description": config.get("description"),
                     "env": config.get("env", {}),
                     "args": _effective_jax_args(config, workload),
+                },
+                "workload": {
+                    "prompt_source": workload.prompt_source,
+                    "dataset_name": workload.dataset_name,
+                    "num_prompts": workload.num_prompts,
+                    "seed": workload.seed,
+                    "random_input_len": workload.random_input_len,
+                    "random_output_len": workload.random_output_len,
+                    "random_range_ratio": workload.random_range_ratio,
+                    "acceptance_scope": workload.acceptance_scope,
                 },
                 "repeats": config_repeats,
                 "aggregate": _aggregate_repeats(config_repeats),

@@ -419,6 +419,22 @@ end-to-end throughput.
   128 prompts, random input length around 1280, output length 16,
   input range ratio 0.6, output range ratio 0.0, request rate `inf`, and
   `ignore_eos=true`.
+- Sidecar harness support added:
+  ~~JAX and vLLM benchmark artifacts record `prompt_source`, `dataset_name`,
+  `num_prompts`, `seed`, prompt manifest path/hash, request throughput,
+  output-token throughput, and total-token throughput.~~ The opt-in
+  `vllm_random_longprefill` matrix workload now wires a deterministic
+  vLLM-random-style prompt source with 128 prompts, input length centered at
+  1280 with range ratio 0.6, fixed output length 16, and `sidecar_only`
+  acceptance scope. This does not replace the exact-token
+  `long_prefill_512_2048/gpu_paged_default` gate.
+- Sidecar harness verification: `py_compile` passes for the touched benchmark
+  scripts; `tests/test_gpu_matrix_runner.py` and
+  `tests/test_gpu_matrix_summary_report.py` pass with 43 tests; a dry run of
+  `benchmarks/run_gpu_matrix.py --configs gpu_paged_default --workloads
+  vllm_random_longprefill --repeats 2` validates command construction, summary
+  schema, the opt-in workload metadata, and live JAX default reference planning
+  for sidecar correctness comparison.
 
 ## Phase 2 - Kernel Roadmap
 

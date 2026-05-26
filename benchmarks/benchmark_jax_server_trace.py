@@ -17,7 +17,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from benchmarks.benchmark_vllm_qwen35 import compare_reference, make_prompts
+from benchmarks.benchmark_vllm_qwen35 import compare_reference, prepare_prompt_rows
 from run_tracking import RunRecorder
 from runtime_paths import configure_compilation_cache, configure_flashinfer_cache, configure_xla_flags
 
@@ -40,6 +40,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-len", type=int, default=24)
     parser.add_argument("--output-lengths", default="")
     parser.add_argument("--prompt-suite", choices=["synthetic", "real", "mixed", "server_shapes"], default="server_shapes")
+    parser.add_argument(
+        "--prompt-source",
+        choices=["tokenized_seed_repeat", "manifest", "vllm_random"],
+        default="tokenized_seed_repeat",
+    )
+    parser.add_argument("--prompt-manifest-jsonl", default="")
+    parser.add_argument("--prompt-manifest-output-jsonl", default="")
+    parser.add_argument("--dataset-name", default="")
+    parser.add_argument("--num-prompts", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--random-input-len", type=int, default=1280)
+    parser.add_argument("--random-output-len", type=int, default=16)
+    parser.add_argument("--random-range-ratio", default='{"input":0.0,"output":0.0}')
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--num-speculative-tokens", type=int, choices=[0, 1], default=0)
     parser.add_argument("--max-kv-cache-mb", type=int, default=1024)
@@ -131,6 +144,23 @@ def _timing_metrics(events: list[dict[str, Any]], elapsed: float, total_tokens: 
         "itl_ms_p95": _percentile(itls, 95),
         "itl_source": "jax_server_step_trace",
     }
+
+
+def _performance_with_token_scopes(rows: list[dict[str, Any]], performance: dict[str, Any], elapsed: float) -> dict[str, Any]:
+    total_input_tokens = sum(int(row["prompt_length"]) for row in rows)
+    total_output_tokens = sum(int(row["generated_tokens"]) for row in rows)
+    request_count = len(rows)
+    performance.update(
+        {
+            "request_count": request_count,
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "request_throughput": request_count / max(elapsed, 1e-9),
+            "output_token_throughput": total_output_tokens / max(elapsed, 1e-9),
+            "total_token_throughput": (total_input_tokens + total_output_tokens) / max(elapsed, 1e-9),
+        }
+    )
+    return performance
 
 
 def _profile_counters(profile_path: Path) -> dict[str, Any]:
@@ -239,11 +269,9 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     from nanovllm_jax.engine.llm_engine import LLMEngine
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    input_lens = _parse_ints(args.input_lens)
-    output_lengths = _parse_ints(args.output_lengths)
-    if output_lengths and len(output_lengths) != len(input_lens):
-        raise ValueError("--output-lengths must match --input-lens length")
-    prompt_rows = make_prompts(tokenizer, input_lens, args.prompt_suite)
+    prompt_rows, prompt_info = prepare_prompt_rows(tokenizer, args)
+    input_lens = [int(row["prompt_length"]) for row in prompt_rows]
+    output_lengths = [int(row["output_len"]) for row in prompt_rows]
     prompts = [row["input_ids"] for row in prompt_rows]
 
     engine_kwargs = {
@@ -291,6 +319,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             {
                 "name": prompt["name"],
                 "prompt_length": prompt["prompt_length"],
+                "output_len": int(prompt["output_len"]),
                 "generated_token_ids": token_ids,
                 "generated_tokens": len(token_ids),
                 "topk_logprobs_by_step": [],
@@ -316,10 +345,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "jax_execution": args.jax_execution,
             "linear_chunk_size": int(engine.config.linear_chunk_size),
             "num_speculative_tokens": args.num_speculative_tokens,
-            "input_lens": input_lens,
-            "output_len": args.output_len,
-            "output_lengths": output_lengths or None,
-            "prompt_suite": args.prompt_suite,
+            **prompt_info,
             "greedy_token_fastpath": _env_flag("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH"),
             "serving_fastpath_flags": {
                 "greedy_token_fastpath": _env_flag("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH"),
@@ -330,7 +356,11 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 "compact_prefill_mlp": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_MLP"),
             },
         },
-        "performance": _timing_metrics(trace["events"], elapsed, total_tokens),
+        "performance": _performance_with_token_scopes(
+            rows,
+            _timing_metrics(trace["events"], elapsed, total_tokens),
+            elapsed,
+        ),
         "rows": rows,
         "events": trace["events"],
         "profile_counters": profile_counters,

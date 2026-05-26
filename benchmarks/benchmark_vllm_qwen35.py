@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gc
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -69,7 +70,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--input-lens", default="16,64,128")
     parser.add_argument("--output-len", type=int, default=24)
+    parser.add_argument("--output-lengths", default="")
     parser.add_argument("--prompt-suite", choices=["synthetic", "real", "mixed", "server_shapes"], default="mixed")
+    parser.add_argument(
+        "--prompt-source",
+        choices=["tokenized_seed_repeat", "manifest", "vllm_random"],
+        default="tokenized_seed_repeat",
+    )
+    parser.add_argument("--prompt-manifest-jsonl", default="")
+    parser.add_argument("--prompt-manifest-output-jsonl", default="")
+    parser.add_argument("--dataset-name", default="")
+    parser.add_argument("--num-prompts", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--random-input-len", type=int, default=1280)
+    parser.add_argument("--random-output-len", type=int, default=16)
+    parser.add_argument("--random-range-ratio", default='{"input":0.0,"output":0.0}')
     parser.add_argument("--output-json", default="results/qwen08_vllm_benchmark.json")
     parser.add_argument("--reference-json", default="", help="Optional benchmark_server_shapes.py JSON to compare generated IDs.")
     parser.add_argument("--profile", action="store_true", default=False, help="Reserved for parity with JAX harness; vLLM profiling is backend-specific.")
@@ -81,6 +96,14 @@ def parse_args() -> argparse.Namespace:
 
 def _parse_ints(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part.strip()]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _json_safe(value: Any) -> Any:
@@ -200,6 +223,160 @@ def make_prompts(tokenizer, lengths: list[int], suite: str) -> list[dict[str, An
     ]
 
 
+def _parse_range_ratio(value: str) -> dict[str, float]:
+    if not value:
+        return {"input": 0.0, "output": 0.0}
+    parsed = json.loads(value)
+    if isinstance(parsed, (int, float)):
+        ratio = float(parsed)
+        return {"input": ratio, "output": ratio}
+    if not isinstance(parsed, dict):
+        raise ValueError("--random-range-ratio must be a JSON object or number")
+    return {
+        "input": float(parsed.get("input", 0.0)),
+        "output": float(parsed.get("output", 0.0)),
+    }
+
+
+def _sample_length(rng: np.random.Generator, mean: int, ratio: float) -> int:
+    if ratio <= 0:
+        return max(1, int(mean))
+    low = max(1, int(round(mean * (1.0 - ratio))))
+    high = max(low, int(round(mean * (1.0 + ratio))))
+    return int(rng.integers(low, high + 1))
+
+
+def _random_prompt_rows(tokenizer, args: argparse.Namespace) -> list[dict[str, Any]]:
+    num_prompts = int(args.num_prompts or len(_parse_ints(args.input_lens)) or 1)
+    ratios = _parse_range_ratio(args.random_range_ratio)
+    rng = np.random.default_rng(int(args.seed))
+    vocab_size = int(getattr(tokenizer, "vocab_size", None) or len(tokenizer))
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    rows: list[dict[str, Any]] = []
+    for index in range(num_prompts):
+        prompt_len = _sample_length(rng, int(args.random_input_len), ratios["input"])
+        output_len = _sample_length(rng, int(args.random_output_len), ratios["output"])
+        token_ids = rng.integers(0, vocab_size, size=prompt_len, dtype=np.int64).tolist()
+        if eos_id is not None:
+            token_ids = [int((token + 1) % vocab_size) if int(token) == int(eos_id) else int(token) for token in token_ids]
+        rows.append(
+            {
+                "name": f"random_{index}",
+                "request_id": str(index),
+                "prompt_length": int(prompt_len),
+                "input_ids": [int(token) for token in token_ids],
+                "output_len": int(output_len),
+            }
+        )
+    return rows
+
+
+def _load_prompt_manifest(path: Path, default_output_len: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            input_ids = item.get("prompt_token_ids", item.get("input_ids"))
+            if input_ids is None:
+                raise ValueError(f"{path}:{index + 1} missing prompt_token_ids")
+            prompt_len = int(item.get("prompt_len", len(input_ids)))
+            if prompt_len != len(input_ids):
+                raise ValueError(f"{path}:{index + 1} prompt_len does not match token count")
+            request_id = str(item.get("request_id", index))
+            rows.append(
+                {
+                    "name": request_id,
+                    "request_id": request_id,
+                    "prompt_length": prompt_len,
+                    "input_ids": [int(token) for token in input_ids],
+                    "output_len": int(item.get("output_len", default_output_len)),
+                }
+            )
+    if not rows:
+        raise ValueError(f"{path} has no prompt rows")
+    return rows
+
+
+def _write_prompt_manifest(path: Path, rows: list[dict[str, Any]]) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for index, row in enumerate(rows):
+            handle.write(
+                json.dumps(
+                    {
+                        "request_id": str(row.get("request_id", index)),
+                        "prompt_token_ids": [int(token) for token in row["input_ids"]],
+                        "prompt_len": int(row["prompt_length"]),
+                        "output_len": int(row.get("output_len", 0)),
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+    return _sha256_file(path)
+
+
+def _default_manifest_output_path(output_json: str) -> Path:
+    output = Path(output_json)
+    return output.with_suffix(".prompts.jsonl")
+
+
+def prepare_prompt_rows(tokenizer, args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    output_lengths = _parse_ints(getattr(args, "output_lengths", ""))
+    source = getattr(args, "prompt_source", "tokenized_seed_repeat")
+    manifest_path: Path | None = None
+    manifest_sha: str | None = None
+    dataset_name = getattr(args, "dataset_name", "") or source
+
+    if source == "manifest":
+        if not getattr(args, "prompt_manifest_jsonl", ""):
+            raise ValueError("--prompt-manifest-jsonl is required for --prompt-source manifest")
+        manifest_path = Path(args.prompt_manifest_jsonl)
+        rows = _load_prompt_manifest(manifest_path, int(args.output_len))
+        manifest_sha = _sha256_file(manifest_path)
+    elif source == "vllm_random":
+        rows = _random_prompt_rows(tokenizer, args)
+        manifest_output = getattr(args, "prompt_manifest_output_jsonl", "")
+        manifest_path = Path(manifest_output) if manifest_output else _default_manifest_output_path(args.output_json)
+        manifest_sha = _write_prompt_manifest(manifest_path, rows)
+        dataset_name = getattr(args, "dataset_name", "") or "random"
+    else:
+        input_lens = _parse_ints(args.input_lens)
+        rows = make_prompts(tokenizer, input_lens, args.prompt_suite)
+        if output_lengths and len(output_lengths) != len(rows):
+            raise ValueError("--output-lengths must match --input-lens length")
+        for row, output_len in zip(rows, output_lengths or [int(args.output_len)] * len(rows)):
+            row["request_id"] = row["name"]
+            row["output_len"] = int(output_len)
+
+    if output_lengths and source != "tokenized_seed_repeat":
+        if len(output_lengths) != len(rows):
+            raise ValueError("--output-lengths must match generated prompt count")
+        for row, output_len in zip(rows, output_lengths):
+            row["output_len"] = int(output_len)
+
+    input_lens = [int(row["prompt_length"]) for row in rows]
+    per_request_output_lengths = [int(row.get("output_len", args.output_len)) for row in rows]
+    prompt_info = {
+        "prompt_source": source,
+        "prompt_suite": args.prompt_suite,
+        "dataset_name": dataset_name,
+        "num_prompts": len(rows),
+        "seed": int(getattr(args, "seed", 0)),
+        "prompt_manifest_jsonl": str(manifest_path) if manifest_path is not None else None,
+        "prompt_manifest_sha256": manifest_sha,
+        "input_lens": input_lens,
+        "output_len": int(per_request_output_lengths[0]) if len(set(per_request_output_lengths)) == 1 else None,
+        "output_lengths": per_request_output_lengths,
+        "random_input_len": int(getattr(args, "random_input_len", 0)),
+        "random_output_len": int(getattr(args, "random_output_len", 0)),
+        "random_range_ratio": _parse_range_ratio(getattr(args, "random_range_ratio", '{"input":0.0,"output":0.0}')),
+    }
+    return rows, prompt_info
+
+
 def _extract_logprob_topk(completion, top_k: int) -> list[dict[str, Any]]:
     rows = []
     for item in getattr(completion, "logprobs", None) or []:
@@ -225,6 +402,45 @@ def _extract_logprob_topk(completion, top_k: int) -> list[dict[str, Any]]:
     return rows
 
 
+def _make_sampling_params(SamplingParams, *, max_tokens: int, top_k: int, output_kind: Any = None):
+    kwargs = {
+        "temperature": 0.0,
+        "max_tokens": int(max_tokens),
+        "ignore_eos": True,
+        "logprobs": int(top_k),
+    }
+    if output_kind is not None:
+        kwargs["output_kind"] = output_kind
+    return SamplingParams(**kwargs)
+
+
+def _sampling_params_for_rows(rows: list[dict[str, Any]], SamplingParams, top_k: int, output_kind: Any = None):
+    lengths = [int(row["output_len"]) for row in rows]
+    if len(set(lengths)) == 1:
+        return _make_sampling_params(SamplingParams, max_tokens=lengths[0], top_k=top_k, output_kind=output_kind)
+    return [
+        _make_sampling_params(SamplingParams, max_tokens=length, top_k=top_k, output_kind=output_kind)
+        for length in lengths
+    ]
+
+
+def _performance_with_token_scopes(rows: list[dict[str, Any]], performance: dict[str, Any], elapsed: float) -> dict[str, Any]:
+    total_input_tokens = sum(int(row["prompt_length"]) for row in rows)
+    total_output_tokens = sum(int(row["generated_tokens"]) for row in rows)
+    request_count = len(rows)
+    performance.update(
+        {
+            "request_count": request_count,
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "request_throughput": request_count / max(elapsed, 1e-9),
+            "output_token_throughput": total_output_tokens / max(elapsed, 1e-9),
+            "total_token_throughput": (total_input_tokens + total_output_tokens) / max(elapsed, 1e-9),
+        }
+    )
+    return performance
+
+
 def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     if args.execution == "async":
         return asyncio.run(run_vllm_async(args, recorder))
@@ -245,7 +461,7 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
 
     env = configure_vllm_paths()
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    prompts = make_prompts(tokenizer, _parse_ints(args.input_lens), args.prompt_suite)
+    prompts, prompt_info = prepare_prompt_rows(tokenizer, args)
 
     speculative_config = None
     if args.mode == "mtp":
@@ -270,16 +486,16 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     llm = LLM(**llm_kwargs)
     load_seconds = time.perf_counter() - load_t0
 
-    sampling = SamplingParams(
-        temperature=0.0,
-        max_tokens=int(args.output_len),
-        ignore_eos=True,
-        logprobs=int(args.top_k),
-    )
+    sampling = _sampling_params_for_rows(prompts, SamplingParams, int(args.top_k))
     prompt_token_ids = [{"prompt_token_ids": row["input_ids"]} for row in prompts]
 
     # Warmup one prompt before timing.
-    _ = llm.generate([prompt_token_ids[0]], sampling)
+    warm_sampling = _make_sampling_params(
+        SamplingParams,
+        max_tokens=max(1, min(2, int(prompts[0]["output_len"]))),
+        top_k=int(args.top_k),
+    )
+    _ = llm.generate([prompt_token_ids[0]], warm_sampling)
 
     started = time.perf_counter()
     outputs = llm.generate(prompt_token_ids, sampling)
@@ -295,6 +511,7 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             {
                 "name": prompt["name"],
                 "prompt_length": prompt["prompt_length"],
+                "output_len": int(prompt["output_len"]),
                 "generated_token_ids": token_ids,
                 "generated_tokens": len(token_ids),
                 "topk_logprobs_by_step": _extract_logprob_topk(completion, int(args.top_k)),
@@ -304,7 +521,7 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     # Offline LLM.generate exposes end-to-end timing, not true streaming ITL.
     # Keep the ITL fields explicit so downstream reports do not confuse them
     # with server-stream token timestamps.
-    performance = {
+    performance = _performance_with_token_scopes(rows, {
         "seconds": elapsed,
         "generated_tokens": total_tokens,
         "tokens_per_second": total_tokens / max(elapsed, 1e-9),
@@ -312,7 +529,7 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "itl_ms_p50": None,
         "itl_ms_p95": None,
         "itl_source": "unavailable_from_offline_llm_generate",
-    }
+    }, elapsed)
     if len(rows) == 1 and rows[0]["generated_tokens"] > 1:
         synthetic_itl = 1000.0 * elapsed / max(1, rows[0]["generated_tokens"])
         performance["offline_avg_ms_per_token"] = synthetic_itl
@@ -331,8 +548,7 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "mode": args.mode,
             "execution": args.execution,
             "speculative_config": speculative_config,
-            "input_lens": _parse_ints(args.input_lens),
-            "output_len": args.output_len,
+            **prompt_info,
             "top_k": args.top_k,
         },
         "load_seconds": load_seconds,
@@ -359,7 +575,7 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
 
     env = configure_vllm_paths()
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    prompts = make_prompts(tokenizer, _parse_ints(args.input_lens), args.prompt_suite)
+    prompts, prompt_info = prepare_prompt_rows(tokenizer, args)
 
     speculative_config = None
     if args.mode == "mtp":
@@ -382,15 +598,17 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
     load_t0 = time.perf_counter()
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     load_seconds = time.perf_counter() - load_t0
-    sampling = SamplingParams(
-        temperature=0.0,
-        max_tokens=int(args.output_len),
-        ignore_eos=True,
-        logprobs=int(args.top_k),
-        output_kind=RequestOutputKind.DELTA,
-    )
+    sampling_by_prompt = [
+        _make_sampling_params(
+            SamplingParams,
+            max_tokens=int(prompt["output_len"]),
+            top_k=int(args.top_k),
+            output_kind=RequestOutputKind.DELTA,
+        )
+        for prompt in prompts
+    ]
 
-    async def consume_prompt(prompt: dict[str, Any], request_id: str, start: float) -> dict[str, Any]:
+    async def consume_prompt(prompt: dict[str, Any], request_id: str, sampling: SamplingParams, start: float) -> dict[str, Any]:
         token_events = []
         token_ids = []
         topk_rows = []
@@ -421,6 +639,7 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
         return {
             "name": prompt["name"],
             "prompt_length": prompt["prompt_length"],
+            "output_len": int(prompt["output_len"]),
             "generated_token_ids": token_ids,
             "generated_tokens": len(token_ids),
             "topk_logprobs_by_step": topk_rows,
@@ -437,16 +656,18 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
 
     # Warm up the full request shape so measured TTFT does not include
     # first-use per-shape Triton/JIT kernels.
-    warm_sampling = SamplingParams(
-        temperature=0.0,
-        max_tokens=max(1, min(2, int(args.output_len))),
-        ignore_eos=True,
-        logprobs=int(args.top_k),
-        output_kind=RequestOutputKind.DELTA,
-    )
     await asyncio.gather(
         *[
-            drain_prompt(prompt, f"warmup-{index}", warm_sampling)
+            drain_prompt(
+                prompt,
+                f"warmup-{index}",
+                _make_sampling_params(
+                    SamplingParams,
+                    max_tokens=max(1, min(2, int(prompt["output_len"]))),
+                    top_k=int(args.top_k),
+                    output_kind=RequestOutputKind.DELTA,
+                ),
+            )
             for index, prompt in enumerate(prompts)
         ]
     )
@@ -454,13 +675,17 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
     started = time.perf_counter()
     rows = await asyncio.gather(
         *[
-            consume_prompt(prompt, f"bench-{index}", started)
+            consume_prompt(prompt, f"bench-{index}", sampling_by_prompt[index], started)
             for index, prompt in enumerate(prompts)
         ]
     )
     elapsed = time.perf_counter() - started
     total_tokens = sum(int(row["generated_tokens"]) for row in rows)
-    performance = _timing_metrics(rows, elapsed, total_tokens, "vllm_async_generate")
+    performance = _performance_with_token_scopes(
+        rows,
+        _timing_metrics(rows, elapsed, total_tokens, "vllm_async_generate"),
+        elapsed,
+    )
 
     shutdown = getattr(engine, "shutdown", None)
     if shutdown is not None:
@@ -481,8 +706,7 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
             "mode": args.mode,
             "execution": args.execution,
             "speculative_config": speculative_config,
-            "input_lens": _parse_ints(args.input_lens),
-            "output_len": args.output_len,
+            **prompt_info,
             "top_k": args.top_k,
         },
         "load_seconds": load_seconds,
