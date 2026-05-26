@@ -105,7 +105,24 @@ def test_segmented_gdn_prefill_reference_matches_padded_chunk32(monkeypatch):
         chunk_size=32,
         use_qk_l2norm_in_kernel=True,
     )
+    padded_packed_out, padded_segmented_state = gdn_segmented_prefill_chunk32_reference(
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_beta,
+        packed_gate,
+        cu_seqlens,
+        initial_state,
+        chunk_size=32,
+        use_qk_l2norm_in_kernel=True,
+        reference_seq_len=seq_len,
+    )
     segmented_out = unpack_segmented_gdn_output(packed_out, cu_seqlens, seq_len)
+    padded_segmented_out = unpack_segmented_gdn_output(
+        padded_packed_out,
+        cu_seqlens,
+        seq_len,
+    )
 
     valid_output_diff = jnp.where(
         valid[:, None, :, None],
@@ -113,8 +130,18 @@ def test_segmented_gdn_prefill_reference_matches_padded_chunk32(monkeypatch):
         0.0,
     )
     state_diff = segmented_state.astype(jnp.float32) - padded_state.astype(jnp.float32)
+    padded_valid_output_diff = jnp.where(
+        valid[:, None, :, None],
+        padded_segmented_out.astype(jnp.float32) - padded_out.astype(jnp.float32),
+        0.0,
+    )
+    padded_state_diff = (
+        padded_segmented_state.astype(jnp.float32) - padded_state.astype(jnp.float32)
+    )
 
     assert np.asarray(packed_query).shape[0] == int(np.asarray(lengths).sum())
     assert np.asarray(cu_seqlens).tolist() == [0, 0, 5, 37, 74, 138]
     assert float(jnp.max(jnp.abs(valid_output_diff))) <= 1e-5
     assert float(jnp.max(jnp.abs(state_diff))) <= 1e-5
+    assert float(jnp.max(jnp.abs(padded_valid_output_diff))) <= 1e-5
+    assert float(jnp.max(jnp.abs(padded_state_diff))) <= 1e-5

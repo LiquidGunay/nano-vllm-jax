@@ -173,7 +173,10 @@ gdn_segmented_prefill_chunk32(
   widening the rectangular value block. The first pure-JAX packed segmented ABI
   correctness gate passes reduced shape but fails the full hetero8 standalone
   `1e-5` gate versus current padded chunk32, so CUDA math for that ABI is
-  deferred pending a correctness-contract decision.
+  deferred pending a correctness-contract decision. A row-padded diagnostic
+  that keeps each packed row at `T=512` still fails the gate, so the issue is
+  row-wise decomposition/accumulation order rather than only variable-length
+  chunk count.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 

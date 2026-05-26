@@ -2992,3 +2992,45 @@ Decision:
   padded rectangular accumulation contract exactly, or whether the correctness
   reference should switch to a higher-level full-model/token/logit gate for a
   true-token packed FLA/FlashInfer-style ABI.
+
+## Entry 079 - Row-Padded Segmented GDN Reference Diagnostic
+
+- run id:
+  `20260526-104722-2272587-gdn_prefill_segmented_reference_gate_row_padded_hetero8_64_512x32`
+- benchmark artifact:
+  `results/gdn_prefill_segmented_reference_gate_row_padded_hetero8_64_512x32.json`
+- benchmark script: `benchmarks/benchmark_gdn_prefill_kernel.py`
+- change tested: extended the packed segmented GDN reference gate with a
+  diagnostic mode that pads each packed row back to the original rectangular
+  `seq_len=512` before calling the current chunk32 JAX rule, then returns only
+  the true packed tokens. This tests whether Entry 078's full-shape drift is
+  mainly caused by shorter per-row sequence lengths or by decomposing the
+  current batched rectangular chunk computation into row-wise calls.
+- focused CUDA tests:
+
+```text
+JAX_PLATFORMS=cuda ... pytest \
+  tests/test_gdn_segmented_reference.py tests/test_kernel_registry.py -q
+```
+
+- result: `7 passed`.
+
+Full hetero8 diagnostic:
+
+| mode | output max abs | valid output max abs | state max abs | passes `1e-5` |
+| --- | ---: | ---: | ---: | --- |
+| actual-length packed rows | `1.431e-05` | `1.431e-05` | `1.678e-04` | no |
+| row-padded to `T=512` | `1.240e-05` | `1.240e-05` | `1.831e-04` | no |
+
+Decision:
+
+- Keep the diagnostic scaffold, but do not proceed to CUDA math for this
+  row-wise segmented ABI under the current strict standalone state gate.
+- Padding each row back to the original rectangular sequence length did not
+  fix the drift, so the issue is not simply variable-length chunk count. The
+  row-wise decomposition/accumulation order itself is enough to miss the
+  full-shape `1e-5` state gate.
+- The next GDN decision remains a correctness-policy decision: either require
+  a backend design that preserves the current batched rectangular accumulation
+  contract, or explicitly accept a true-token packed reference only after a
+  separate real-weight full-model token/logit parity gate proves it is safe.

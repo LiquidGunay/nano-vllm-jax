@@ -149,13 +149,16 @@ def gdn_segmented_prefill_chunk32_reference(
     *,
     chunk_size: int = 32,
     use_qk_l2norm_in_kernel: bool = True,
+    reference_seq_len: int | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Pure-JAX reference for the planned packed segmented GDN prefill ABI.
 
     Inputs use the planned compact layout: `query/key/value` are `[nnz, H, D]`,
     `beta/gate` are `[nnz, H]`, and `cu_seqlens` maps packed tokens to rows.
     This helper is intentionally not a speed path; it is the correctness oracle
-    for future CUDA/ported kernels.
+    for future CUDA/ported kernels. `reference_seq_len` is a diagnostic mode
+    that pads each packed row back to a fixed rectangular length before applying
+    the chunk rule, then returns only the true tokens.
     """
 
     offsets = np.asarray(jax.device_get(cu_seqlens), dtype=np.int64).reshape(-1)
@@ -185,11 +188,33 @@ def gdn_segmented_prefill_chunk32_reference(
         if end == start:
             final_states.append(initial_state[row])
             continue
-        q_row = jnp.transpose(query[start:end], (1, 0, 2))[None, ...]
-        k_row = jnp.transpose(key[start:end], (1, 0, 2))[None, ...]
-        v_row = jnp.transpose(value[start:end], (1, 0, 2))[None, ...]
-        g_row = jnp.transpose(gate[start:end], (1, 0))[None, ...]
-        beta_row = jnp.transpose(beta[start:end], (1, 0))[None, ...]
+        row_len = end - start
+        if reference_seq_len is not None and reference_seq_len < row_len:
+            raise ValueError("reference_seq_len must be >= every packed row length")
+        run_len = row_len if reference_seq_len is None else int(reference_seq_len)
+        if run_len == row_len:
+            q_segment = query[start:end]
+            k_segment = key[start:end]
+            v_segment = value[start:end]
+            g_segment = gate[start:end]
+            beta_segment = beta[start:end]
+        else:
+            q_segment = jnp.zeros((run_len, query.shape[1], query.shape[2]), dtype=query.dtype)
+            k_segment = jnp.zeros((run_len, key.shape[1], key.shape[2]), dtype=key.dtype)
+            v_segment = jnp.zeros((run_len, value.shape[1], value.shape[2]), dtype=value.dtype)
+            g_segment = jnp.zeros((run_len, gate.shape[1]), dtype=gate.dtype)
+            beta_segment = jnp.zeros((run_len, beta.shape[1]), dtype=beta.dtype)
+            q_segment = q_segment.at[:row_len].set(query[start:end])
+            k_segment = k_segment.at[:row_len].set(key[start:end])
+            v_segment = v_segment.at[:row_len].set(value[start:end])
+            g_segment = g_segment.at[:row_len].set(gate[start:end])
+            beta_segment = beta_segment.at[:row_len].set(beta[start:end])
+
+        q_row = jnp.transpose(q_segment, (1, 0, 2))[None, ...]
+        k_row = jnp.transpose(k_segment, (1, 0, 2))[None, ...]
+        v_row = jnp.transpose(v_segment, (1, 0, 2))[None, ...]
+        g_row = jnp.transpose(g_segment, (1, 0))[None, ...]
+        beta_row = jnp.transpose(beta_segment, (1, 0))[None, ...]
         out_row, state_row = jax_chunk_gated_delta_rule(
             q_row,
             k_row,
@@ -201,7 +226,7 @@ def gdn_segmented_prefill_chunk32_reference(
             output_final_state=True,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
-        output_parts.append(jnp.transpose(out_row[0], (1, 0, 2)))
+        output_parts.append(jnp.transpose(out_row[0, :, :row_len, :], (1, 0, 2)))
         final_states.append(state_row[0])
 
     if output_parts:

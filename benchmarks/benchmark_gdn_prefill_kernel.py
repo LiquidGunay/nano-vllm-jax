@@ -1834,10 +1834,50 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
             )
             segmented_output = _block_until_ready((segmented_output, segmented_state))
             comparison = _compare_outputs(outputs[reference_name], segmented_output, valid)
+            actual_length_run_ms = 1000.0 * (time.perf_counter() - started)
+            padded_started = time.perf_counter()
+            padded_packed_output, padded_segmented_state = (
+                gdn_segmented_prefill_chunk32_reference(
+                    packed_query,
+                    packed_key,
+                    packed_value,
+                    packed_beta,
+                    packed_g,
+                    cu_seqlens,
+                    initial_state,
+                    chunk_size=int(args.chunk_size),
+                    use_qk_l2norm_in_kernel=True,
+                    reference_seq_len=int(args.seq_len),
+                )
+            )
+            padded_segmented_output = unpack_segmented_gdn_output(
+                padded_packed_output,
+                cu_seqlens,
+                int(args.seq_len),
+            )
+            padded_segmented_output = _block_until_ready(
+                (padded_segmented_output, padded_segmented_state)
+            )
+            padded_comparison = _compare_outputs(
+                outputs[reference_name],
+                padded_segmented_output,
+                valid,
+            )
             segmented_reference_gate.update(
                 {
-                    "run_ms": 1000.0 * (time.perf_counter() - started),
+                    "run_ms": actual_length_run_ms,
+                    "total_gate_run_ms": 1000.0 * (time.perf_counter() - started),
                     "comparison": comparison,
+                    "row_padded_to_seq_len": {
+                        "reference_seq_len": int(args.seq_len),
+                        "run_ms": 1000.0 * (time.perf_counter() - padded_started),
+                        "comparison": padded_comparison,
+                        "passes_1e_5_gate": bool(
+                            padded_comparison["output_max_abs"] <= 1e-5
+                            and padded_comparison["valid_output_max_abs"] <= 1e-5
+                            and padded_comparison["state_max_abs"] <= 1e-5
+                        ),
+                    },
                     "cu_seqlens": np.asarray(cu_seqlens).tolist(),
                     "nnz_tokens": int(packed_query.shape[0]),
                     "passes_1e_5_gate": bool(

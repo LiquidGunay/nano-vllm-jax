@@ -568,6 +568,11 @@ gdn_segmented_prefill_chunk32(
   gate versus current padded chunk32: output max `1.431e-05`, state max
   `1.678e-04`. Do not implement CUDA math for this packed ABI until the
   correctness contract is resolved.
+- A row-padded diagnostic then padded each packed row back to rectangular
+  `T=512` before applying the chunk rule. It still failed (`state_max_abs=
+  1.831e-04`), so the drift is not just shorter per-row sequence length; the
+  row-wise decomposition itself changes enough FP32 accumulation to miss the
+  current gate.
 - Keep it default-off and benchmark-only. Do not route into serving. The next
   attempt should move closer to the true segmented/nnz ABI and preserve FP32
   accumulation more closely before a server run.
@@ -849,6 +854,8 @@ Commit 8:
 - ~~Run value-block-width follow-up and record that V64 improves V32 but still
   misses the full-shape microbenchmark gate~~
 - ~~Add packed segmented/nnz ABI correctness gate before CUDA math~~
+- ~~Run row-padded segmented reference diagnostic and record that row-wise
+  decomposition still misses the full-shape gate~~
 - Resolve packed-ABI correctness policy after full hetero8 gate failure before
   implementing segmented CUDA math
 - Compare a revised segmented prefill candidate against Entry 045 chunk-32
