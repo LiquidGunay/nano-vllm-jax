@@ -1193,3 +1193,41 @@ Decision:
 - Reject and revert packed MLP gate/up again, now with evidence on the accepted autotuned baseline. The packed path preserved correctness but made compiled execution, command-buffer time, host conversion, and ITL much worse.
 - Do not revisit source-level packed MLP projection unless the parameter representation changes fundamentally. Any future MLP work should be a real lowered compact projection kernel or a fused MLP kernel that avoids adding large parameter leaves and does not depend on XLA discovering the right split.
 - Continue from Entry 033 as the accepted implementation baseline.
+
+## Entry 036 - Rejected Pallas GPU Paged Decode Attention
+
+- run id: `20260525-235711-2023622-jax_hetero8_64_512x32_pallas_paged_decode_attention_ppb2`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_pallas_paged_decode_attention_ppb2.json`
+- profile directory: `/mountpoint/.exp/profiles/20260525-235711-2023622-jax_hetero8_64_512x32_pallas_paged_decode_attention_ppb2`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260525-235711-2023622-jax_hetero8_64_512x32_pallas_paged_decode_attention_ppb2/plugins/profile/2026_05_25_23_59_03/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260525-235711-2023622-jax_hetero8_64_512x32_pallas_paged_decode_attention_ppb2/plugins/profile/2026_05_25_23_59_03/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Harvey recommended a Pallas Triton streaming/top-1 LM-head kernel as the next most implementable lowered path. This paged-attention experiment was still run because JAX ships a GPU Pallas paged-attention op that matches the full-attention decode boundary closely enough to test quickly.
+- feasibility checks: a CUDA smoke test of `jax.experimental.pallas.ops.gpu.paged_attention` matched the current pure-JAX decode reference when the query was pre-scaled by `1 / sqrt(head_dim)` (`max_abs=0.00390625`, MSE `4.006872e-07`). The default `pages_per_compute_block=8` full benchmark failed at warmup with `RESOURCE_EXHAUSTED` shared memory (`286720` requested, `101376` available), so the profiled run used `NANO_VLLM_JAX_PALLAS_PAGED_DECODE_PAGES_PER_BLOCK=2`.
+- change tested: a temporary env-gated GPU backend path used Pallas paged attention for full-attention decode only (`query_len == 1`), transposing the layer KV cache from `[blocks, block, kv_heads, head_dim]` to the Pallas `[kv_heads, pages, page_size, head_dim]` layout and leaving prefill, MTP multi-token decode, and the pure-JAX fallback unchanged. The source change was reverted after profiling.
+- correctness: exact generated-token match for all 8 rows against the Entry 033 hetero8 reference.
+- JAX timing: `282.01 tok/s`, TTFT p50 `321.28 ms`, ITL p50 `17.91 ms`, ITL p95 `22.39 ms`.
+- delta vs Entry 033 default: `0.794x` total tok/s, TTFT p50 `1.017x`, ITL p50 `1.393x`, ITL p95 `1.624x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 033 ms | Entry 036 ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 720.52 | 907.78 | major regression |
+| `_run_main_and_sample` | 598.60 | 753.84 | runner hot path slower |
+| `forward_step_token_ids_jit` | 175.81 | 185.47 | compiled token-id step slower |
+| `PjRtCApiLoadedExecutable::Execute` | 191.91 over 252 calls | 207.62 over 252 calls | same dispatch count, heavier execution |
+| `jit_compiled:XLA GPU module` | 147.90 | 144.22 | slight GPU-module improvement did not translate to latency |
+| `command_buffer::execute` | 92.22 over 1575 calls | 94.36 over 1358 calls | fewer command buffers, slightly more time |
+| `paged_attention` | 0.00 | 7.15 over 186 calls | new Pallas paged-attention ranges |
+| `transpose` | 64.01 | 103.96 | layer KV layout conversion cost increased |
+| `gemm_fusion_dot_234` | 31.89 | 0.00 | bucket renamed to `gemm_fusion_dot_222`, not eliminated |
+| `gemm_fusion_dot_222` | 0.00 | 31.82 | LM-head-equivalent bucket unchanged |
+| `gemm_fusion_dot_286` | 25.05 | 3.86 | some narrow decode GEMM work moved, but not enough |
+| `MemcpyD2D` | 24.62 | 9.47 | copy bucket improved |
+| `wrapped_concatenate` | 36.49 | 36.23 | unchanged |
+
+Decision:
+
+- Reject and revert the Pallas GPU paged decode attention path. It preserved exact correctness and reduced some copy/narrow-GEMM buckets, but the layer-local KV transpose/layout cost and heavier execution made decode latency much worse.
+- Do not integrate the shipped Pallas paged-attention op without changing the physical KV cache layout. It wants `[kv_heads, pages, page_size, head_dim]`, while the current pedagogical cache uses `[layers, pages, page_size, kv_heads, head_dim]`; transposing per full-attention layer in the hot decode path erases the kernel benefit.
+- Continue from Entry 033 as the accepted implementation baseline. The next lowered experiment should follow the side-audit recommendation: a streaming/top-1 LM-head kernel that avoids changing KV layout.
