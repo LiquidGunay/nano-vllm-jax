@@ -64,6 +64,23 @@ def _summary():
                 }
             }
         },
+        "matrix": {
+            "long_prefill_512_2048": {
+                "gpu_paged_default": {
+                    "aggregate": {
+                        "scheduler_diagnostics_median": {
+                            "available": True,
+                            "prefill_step_count": 4,
+                            "decode_step_count": 60,
+                            "max_prefill_step_sequences": 4,
+                            "max_step_tokens": 8192,
+                            "prefill_step_seconds_total": 2.4,
+                            "decode_step_seconds_total": 0.8,
+                        }
+                    }
+                }
+            }
+        },
         "acceptance": {
             "long_prefill_512_2048": {
                 "gpu_paged_default": {
@@ -90,6 +107,8 @@ def test_render_markdown_includes_goal_matrix_and_sorted_profile_deltas():
     assert "- target: `long_prefill_512_2048/gpu_paged_default`" in report
     assert "| workload | config | ready | target met | JAX tok/s |" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | yes | yes | 105.00 |" in report
+    assert "## Scheduler Diagnostics" in report
+    assert "| long_prefill_512_2048 | gpu_paged_default | 4 | 60 | 4 | 8192 | 2.40 s | 0.80 s |" in report
     assert "## Acceptance Failures\n\nNone." in report
     assert "## Logbook Entry Template" in report
     assert "- profile movement to explain:" in report

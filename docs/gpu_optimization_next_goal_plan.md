@@ -64,9 +64,9 @@ documentation/configuration-first:
 2. Treat `gpu_paged_default` as the fastest accepted non-MTP default, not the
    most conservative historical baseline.
 3. Keep FlashInfer, `jax-tvm-ffi`, and FLA/vLLM-derived external kernels as
-   optional dependencies behind backend flags with pure-JAX fallbacks. Local
-   CUDA probes are diagnostic artifacts only unless a later design review
-   explicitly promotes a broader production kernel boundary.
+   optional dependencies behind backend flags with pure-JAX fallbacks. Do not
+   use, route, or extend the current local CUDA probes as the next optimization
+   path unless the user explicitly reopens that direction.
 4. Prefer stored local artifacts for JAX and vLLM comparisons. If a selected
    workload has no stored local artifact, run the missing comparison live when a
    GPU and dependency stack are available, then store that artifact for future
@@ -93,9 +93,9 @@ documentation/configuration-first:
    external-kernel compatibility, not a correctness-contract change for the
    default path.
 10. Do not use the current local CUDA GDN probes as the next optimization path.
-    They are useful ABI/correctness evidence, but the next real kernel route
-    should use FlashInfer for paged KV/attention and vLLM/Flash Linear
-    Attention references for GDN.
+    They are historical ABI/correctness evidence only. The next real kernel
+    route should use FlashInfer for paged KV/attention and vLLM/Flash Linear
+    Attention references for GDN, with pure-JAX fallbacks.
 
 Current GDN status: serving GDN is still expressed as JAX and lowered by XLA to
 GPU work; there is no accepted hand-owned GDN kernel in the default path.
@@ -136,7 +136,11 @@ Current tracked records:
   `results/gpu_matrix_20260526_vllm_random_longprefill_r1.json`,
   `84.45 tok/s`, live vLLM `354.24 tok/s`, `0.238x` vLLM, exact generated-token
   match against the stored JAX default reference. This sidecar is a broader
-  comparability lane, not the frozen exact-token goal gate.
+  comparability lane, not the frozen exact-token goal gate. Scheduler
+  diagnostics show 32 prefill waves at max 4 active sequences, 480 decode
+  steps, about `17.81 s` total prefill-step time, and about `6.28 s` total
+  decode-step time, so the sidecar gap is heavily TTFT/static-concurrency
+  driven.
 - Active target: fastest accepted kernel-backed non-speculative serving at
   `>=0.9x` vLLM on the same benchmark discipline, with MTP remaining
   diagnostic-only.
@@ -567,6 +571,17 @@ end-to-end throughput.
   target-token/s math, and acceptance summaries with the kernel-phase target in
   this plan. The earlier `0.75x` threshold remains historical evidence for the
   closed no-kernel milestone, not the current acceptance bar.
+- Scheduler diagnostics added to matrix summaries: `benchmarks/run_gpu_matrix.py`
+  now derives unique JAX scheduler steps from token events and
+  `benchmarks/summarize_gpu_matrix.py` reports median prefill/decode step
+  counts, max active prefill sequences, max step tokens, and total prefill/decode
+  step seconds. Existing artifacts show the 16-prompt sidecar smoke ran 4
+  prefill waves plus 60 decode steps, while the 128-prompt sidecar ran 32
+  prefill waves plus 480 decode steps. Attempts to raise sidecar
+  `max_num_seqs` to 5, 6, or 8 OOMed during warmup with static allocations of
+  about `10.05 GiB`, `10.66 GiB`, and `12.57 GiB`; no result JSONs were
+  produced. Treat this as evidence for a static-shape concurrency/TTFT problem
+  before assuming a narrow kernel swap will close the vLLM-random sidecar gap.
 
 ## Phase 2 - Kernel Roadmap
 
@@ -1443,7 +1458,7 @@ the pure-JAX correctness path.
 9. Maintain both accepted-baseline and fastest-achieved records for tracked workloads.
 10. For GDN, target V,K serving state; do not preserve K,V as the serving ABI merely because the old JAX path used it.
 11. Keep BF16 GDN prefill activations as a separate opt-in experiment after V,K correctness is established.
-12. Do not promote local CUDA probes as production kernels. Use FlashInfer for paged KV/attention and vLLM/FLA-derived kernels for GDN unless those routes are explicitly blocked.
+12. Do not use local CUDA probes as the optimization path. They are historical diagnostics only unless explicitly reauthorized. Use FlashInfer for paged KV/attention and vLLM/FLA-derived kernels for GDN unless those routes are explicitly blocked.
 ```
 
 ## Expected Strategic Outcome
@@ -1462,8 +1477,8 @@ Clean baseline
 
 The core bet is: keep the JAX model and correctness harness, but align the GDN
 state ABI with kernel-native V,K layout, then replace the few serving kernels
-where vLLM/FlashInfer/FLA have structural advantage. The local CUDA probes stay
-as ABI diagnostics; production speed work should come from FlashInfer
+where vLLM/FlashInfer/FLA have structural advantage. Local CUDA probes are
+historical diagnostics only; production speed work should come from FlashInfer
 paged-attention/KV kernels and vLLM/FLA-style GDN kernels.
 
 ## Reference Links From The Proposal

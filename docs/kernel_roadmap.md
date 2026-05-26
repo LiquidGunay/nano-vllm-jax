@@ -5,6 +5,12 @@ This roadmap is the kernel-focused slice of
 remain optional until it passes the correctness and integrated-performance
 gates. The pure-JAX path is the fallback and correctness reference.
 
+Local CUDA/JAX FFI probes recorded below are historical diagnostics only. Do not
+use, extend, or route them as the next optimization path unless the user
+explicitly reopens that direction. The planned production direction remains
+FlashInfer for paged KV/attention where dtype/layout gates allow, and
+vLLM/Flash Linear Attention-shaped GDN kernels with pure-JAX fallbacks.
+
 ## Priority Order
 
 | Priority | Kernel | Purpose |

@@ -138,6 +138,29 @@ def _profile_delta_bullets(comparison: dict[str, Any], *, limit: int) -> list[st
     ]
 
 
+def _scheduler_rows(summary: dict[str, Any]) -> list[list[str]]:
+    rows = []
+    for workload in summary.get("workloads") or []:
+        for config in summary.get("configs") or []:
+            matrix_row = ((summary.get("matrix") or {}).get(workload) or {}).get(config) or {}
+            scheduler = (matrix_row.get("aggregate") or {}).get("scheduler_diagnostics_median") or {}
+            if not scheduler.get("available"):
+                continue
+            rows.append(
+                [
+                    str(workload),
+                    str(config),
+                    _fmt(scheduler.get("prefill_step_count"), digits=1),
+                    _fmt(scheduler.get("decode_step_count"), digits=1),
+                    _fmt(scheduler.get("max_prefill_step_sequences"), digits=1),
+                    _fmt(scheduler.get("max_step_tokens"), digits=1),
+                    _fmt(scheduler.get("prefill_step_seconds_total"), suffix=" s"),
+                    _fmt(scheduler.get("decode_step_seconds_total"), suffix=" s"),
+                ]
+            )
+    return rows
+
+
 def _markdown_table(headers: list[str], rows: list[list[str]]) -> list[str]:
     if not rows:
         return ["No rows."]
@@ -233,6 +256,25 @@ def render_markdown(summary: dict[str, Any], *, top_profile_deltas: int = 8) -> 
             _matrix_rows(summary),
         )
     )
+
+    scheduler_rows = _scheduler_rows(summary)
+    if scheduler_rows:
+        lines.extend(["", "## Scheduler Diagnostics", ""])
+        lines.extend(
+            _markdown_table(
+                [
+                    "workload",
+                    "config",
+                    "prefill steps",
+                    "decode steps",
+                    "max prefill seqs",
+                    "max step tokens",
+                    "prefill step s",
+                    "decode step s",
+                ],
+                scheduler_rows,
+            )
+        )
 
     failures = acceptance_failures(summary)
     lines.extend(["", "## Acceptance Failures", ""])

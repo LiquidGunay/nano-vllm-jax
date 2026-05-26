@@ -32,6 +32,7 @@ from benchmarks.run_gpu_matrix import (
     _jax_available,
     _jax_command,
     _runtime_env,
+    _scheduler_diagnostics,
     _selected_matrix_names,
     _stored_reference_gaps,
     _validate_summary_shape,
@@ -244,6 +245,92 @@ def test_aggregate_repeats_requires_exact_full_length_match():
         "total_ms_median": 5.0,
         "count_median": 2.0,
     }
+
+
+def test_scheduler_diagnostics_deduplicates_token_events_by_step():
+    artifact = {
+        "events": [
+            {
+                "event": "token",
+                "step_start_seconds": 0.0,
+                "step_end_seconds": 0.5,
+                "step_seconds": 0.5,
+                "scheduler_step_is_decode": False,
+                "scheduler_step_tokens": 3000,
+                "request_index": 0,
+            },
+            {
+                "event": "token",
+                "step_start_seconds": 0.0,
+                "step_end_seconds": 0.5,
+                "step_seconds": 0.5,
+                "scheduler_step_is_decode": False,
+                "scheduler_step_tokens": 3000,
+                "request_index": 1,
+            },
+            {
+                "event": "token",
+                "step_start_seconds": 0.5,
+                "step_end_seconds": 0.51,
+                "step_seconds": 0.01,
+                "scheduler_step_is_decode": True,
+                "scheduler_step_tokens": 2,
+                "request_index": 0,
+            },
+            {
+                "event": "finished",
+                "request_index": 0,
+            },
+        ]
+    }
+
+    diagnostics = _scheduler_diagnostics(artifact)
+
+    assert diagnostics["available"]
+    assert diagnostics["step_count"] == 2
+    assert diagnostics["prefill_step_count"] == 1
+    assert diagnostics["decode_step_count"] == 1
+    assert diagnostics["max_prefill_step_sequences"] == 2
+    assert diagnostics["max_step_tokens"] == 3000
+    assert diagnostics["prefill_step_seconds_total"] == 0.5
+
+
+def test_aggregate_repeats_includes_scheduler_diagnostic_medians():
+    aggregate = _aggregate_repeats(
+        [
+            {
+                "metrics": {
+                    "scheduler_diagnostics": {
+                        "available": True,
+                        "prefill_step_count": 4,
+                        "decode_step_count": 60,
+                        "max_prefill_step_sequences": 4,
+                        "max_step_tokens": 6000,
+                    },
+                    "correctness": {},
+                }
+            },
+            {
+                "metrics": {
+                    "scheduler_diagnostics": {
+                        "available": True,
+                        "prefill_step_count": 6,
+                        "decode_step_count": 90,
+                        "max_prefill_step_sequences": 4,
+                        "max_step_tokens": 7000,
+                    },
+                    "correctness": {},
+                }
+            },
+        ]
+    )
+
+    scheduler = aggregate["scheduler_diagnostics_median"]
+    assert scheduler["available"]
+    assert scheduler["prefill_step_count"] == 5.0
+    assert scheduler["decode_step_count"] == 75.0
+    assert scheduler["max_prefill_step_sequences"] == 4.0
+    assert scheduler["max_step_tokens"] == 6500.0
 
 
 def test_cuda_device_preflight_accepts_visible_device_nodes(tmp_path):

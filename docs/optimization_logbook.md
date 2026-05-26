@@ -4177,5 +4177,34 @@ JAX_PLATFORMS=cuda ... pytest -q \
 - decision: do not switch to vLLM/FLA or FlashInfer kernels directly under the
   current BF16-weight/FP32-activation/KV contract. The next production kernel
   direction needs an explicit design choice: allow a BF16-prefill experiment
-  with full-model gates, or build/port FP32-capable FLA-shaped kernels while
-  keeping local CUDA probes diagnostic.
+  with full-model gates, or build/port FP32-capable FLA-shaped kernels. Do not
+  use the current local CUDA probes as the next optimization path.
+
+### Entry 106 - Scheduler Diagnostics For vLLM-Style Sidecar
+
+- change accepted: matrix summaries now record scheduler-step diagnostics from
+  existing JAX token events. The runner deduplicates token events by scheduler
+  step and the markdown summary reports median prefill/decode step counts, max
+  active prefill sequences, max step tokens, and total prefill/decode step
+  seconds.
+- validation:
+
+```text
+.venv/bin/python -m pytest -q tests/test_gpu_matrix_runner.py tests/test_gpu_matrix_summary_report.py
+```
+
+- result: `45 passed`.
+- sidecar evidence: the 16-prompt `vllm_random_longprefill_smoke` artifact has
+  4 prefill waves, 60 decode steps, max 4 active prefill sequences, about
+  `2.33 s` total prefill-step time, and about `0.77 s` total decode-step time.
+  The 128-prompt `vllm_random_longprefill` artifact has 32 prefill waves, 480
+  decode steps, max 4 active prefill sequences, about `17.81 s` total
+  prefill-step time, and about `6.28 s` total decode-step time.
+- failed probes: raising sidecar `max_num_seqs` to 5, 6, or 8 OOMed during
+  warmup with static allocations of about `10.05 GiB`, `10.66 GiB`, and
+  `12.57 GiB`; no result JSONs were produced.
+- decision: keep reporting scheduler diagnostics for sidecar comparisons. The
+  vLLM-random sidecar gap is strongly tied to static-shape concurrency and TTFT,
+  so the next design work should address compact/ragged prefill scheduling or
+  external kernel integration boundaries before assuming a narrow local probe
+  will close the gap.

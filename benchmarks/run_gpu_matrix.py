@@ -612,6 +612,66 @@ def _first_profile_event_ms(artifact: dict[str, Any], needle: str) -> float | No
     return float(candidates[0]["dur"]) / 1000.0
 
 
+def _scheduler_diagnostics(artifact: dict[str, Any]) -> dict[str, Any]:
+    """Summarize unique scheduler steps from JAX streaming events."""
+
+    steps: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for event in artifact.get("events") or []:
+        if event.get("event") != "token":
+            continue
+        if "step_start_seconds" not in event or "step_end_seconds" not in event:
+            continue
+        key = (
+            event.get("step_start_seconds"),
+            event.get("step_end_seconds"),
+            bool(event.get("scheduler_step_is_decode")),
+        )
+        step = steps.setdefault(
+            key,
+            {
+                "is_decode": bool(event.get("scheduler_step_is_decode")),
+                "seconds": event.get("step_seconds"),
+                "tokens": event.get("scheduler_step_tokens"),
+                "sequence_count": 0,
+            },
+        )
+        step["sequence_count"] += 1
+
+    if not steps:
+        return {
+            "available": False,
+            "step_count": 0,
+            "prefill_step_count": 0,
+            "decode_step_count": 0,
+        }
+
+    step_rows = list(steps.values())
+    prefill = [step for step in step_rows if not step["is_decode"]]
+    decode = [step for step in step_rows if step["is_decode"]]
+
+    def _max(rows: list[dict[str, Any]], key: str) -> int | float | None:
+        values = [row.get(key) for row in rows if row.get(key) is not None]
+        return max(values) if values else None
+
+    def _sum_seconds(rows: list[dict[str, Any]]) -> float | None:
+        values = [row.get("seconds") for row in rows if row.get("seconds") is not None]
+        return float(sum(values)) if values else None
+
+    return {
+        "available": True,
+        "step_count": len(step_rows),
+        "prefill_step_count": len(prefill),
+        "decode_step_count": len(decode),
+        "max_step_sequences": _max(step_rows, "sequence_count"),
+        "max_prefill_step_sequences": _max(prefill, "sequence_count"),
+        "max_decode_step_sequences": _max(decode, "sequence_count"),
+        "max_step_tokens": _max(step_rows, "tokens"),
+        "total_step_seconds": _sum_seconds(step_rows),
+        "prefill_step_seconds_total": _sum_seconds(prefill),
+        "decode_step_seconds_total": _sum_seconds(decode),
+    }
+
+
 def _metric_summary(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"artifact": str(path), "exists": False}
@@ -657,6 +717,7 @@ def _metric_summary(path: Path) -> dict[str, Any]:
             artifact,
             "forward_step_token_ids_jit",
         ),
+        "scheduler_diagnostics": _scheduler_diagnostics(artifact),
         "profile_trace_json_gz": (artifact.get("profile_counters") or {}).get("trace_json_gz"),
         "run": artifact.get("run"),
         "speculative": artifact.get("speculative"),
@@ -692,6 +753,32 @@ def _aggregate_repeats(repeats: list[dict[str, Any]]) -> dict[str, Any]:
             "total_ms_median": _median(total_values),
             "count_median": _median(count_values),
         }
+    scheduler_keys = (
+        "step_count",
+        "prefill_step_count",
+        "decode_step_count",
+        "max_step_sequences",
+        "max_prefill_step_sequences",
+        "max_decode_step_sequences",
+        "max_step_tokens",
+        "total_step_seconds",
+        "prefill_step_seconds_total",
+        "decode_step_seconds_total",
+    )
+    scheduler_medians = {
+        key: _median(
+            [
+                ((row.get("scheduler_diagnostics") or {}).get(key))
+                for row in metric_rows
+                if (row.get("scheduler_diagnostics") or {}).get("available")
+            ]
+        )
+        for key in scheduler_keys
+    }
+    scheduler_medians["available"] = any(
+        bool((row.get("scheduler_diagnostics") or {}).get("available"))
+        for row in metric_rows
+    )
     return {
         "repeat_count": len(repeats),
         "tokens_per_second_median": _median([row.get("tokens_per_second") for row in perf_rows]),
@@ -708,6 +795,7 @@ def _aggregate_repeats(repeats: list[dict[str, Any]]) -> dict[str, Any]:
             [row.get("first_forward_step_token_ids_jit_ms") for row in metric_rows]
         ),
         "profile_medians": profile_medians,
+        "scheduler_diagnostics_median": scheduler_medians,
         "all_correct": all(bool(row.get("ok")) for row in correctness_rows),
         "all_exact_generated_token_match": all(
             bool(row.get("exact_generated_token_match")) for row in correctness_rows
