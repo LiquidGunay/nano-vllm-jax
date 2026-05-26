@@ -337,6 +337,13 @@ end-to-end throughput.
   runs. This avoids accidentally launching live GPU benchmarks with the base
   shell Python when that interpreter has no JAX installed; the preflight does
   not import JAX or select a CPU backend.
+- Matrix summaries now aggregate profile-counter medians per selected
+  workload/config and add JAX-reference comparison fields:
+  throughput/TTFT/ITL deltas versus the selected JAX correctness reference plus
+  per-bucket profile deltas for the required trace needles. This does not
+  replace the required human logbook explanation, but it makes profile movement
+  concrete in the benchmark artifact instead of leaving it to ad hoc manual
+  inspection.
 
 ## Phase 2 - Kernel Roadmap
 

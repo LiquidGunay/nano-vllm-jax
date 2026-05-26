@@ -259,6 +259,7 @@ def _validate_summary_shape(summary: dict[str, Any], schema: dict[str, Any]) -> 
         "itl_ms_p50_median",
         "itl_ms_p95_median",
         "first_forward_step_token_ids_jit_ms_median",
+        "profile_medians",
         "all_correct",
         "all_exact_generated_token_match",
         "all_correctness_checked",
@@ -577,6 +578,20 @@ def _aggregate_repeats(repeats: list[dict[str, Any]]) -> dict[str, Any]:
     metric_rows = [(row.get("metrics") or {}) for row in repeats]
     perf_rows = [row.get("performance", {}) for row in metric_rows]
     correctness_rows = [row.get("correctness", {}) for row in metric_rows]
+    profile_medians = {}
+    for needle in PROFILE_NEEDLES:
+        total_values = []
+        count_values = []
+        for row in metric_rows:
+            bucket = ((row.get("profile") or {}).get(needle) or {})
+            if bucket.get("total_ms") is not None:
+                total_values.append(bucket.get("total_ms"))
+            if bucket.get("count") is not None:
+                count_values.append(bucket.get("count"))
+        profile_medians[needle] = {
+            "total_ms_median": _median(total_values),
+            "count_median": _median(count_values),
+        }
     return {
         "repeat_count": len(repeats),
         "tokens_per_second_median": _median([row.get("tokens_per_second") for row in perf_rows]),
@@ -587,6 +602,7 @@ def _aggregate_repeats(repeats: list[dict[str, Any]]) -> dict[str, Any]:
         "first_forward_step_token_ids_jit_ms_median": _median(
             [row.get("first_forward_step_token_ids_jit_ms") for row in metric_rows]
         ),
+        "profile_medians": profile_medians,
         "all_correct": all(bool(row.get("ok")) for row in correctness_rows),
         "all_exact_generated_token_match": all(
             bool(row.get("exact_generated_token_match")) for row in correctness_rows
@@ -756,6 +772,19 @@ def _vllm_available(vllm_python: Path) -> bool:
     return completed.returncode == 0
 
 
+def _reference_metrics_for_comparison(
+    repeats: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str, str | None]:
+    for row in repeats:
+        reference_json = row.get("reference_json")
+        if not reference_json:
+            continue
+        metrics = _metric_summary(Path(reference_json))
+        if metrics.get("exists"):
+            return metrics, row.get("reference_source") or "unknown", reference_json
+    return None, "none", None
+
+
 def _jax_available(jax_python: Path, *, runner: Any = subprocess.run) -> bool:
     """Check for the JAX package without importing JAX or selecting a backend."""
 
@@ -779,10 +808,51 @@ def _jax_available(jax_python: Path, *, runner: Any = subprocess.run) -> bool:
     return completed.returncode == 0
 
 
+def _ratio_or_none(current: float | int | None, reference: float | int | None) -> float | None:
+    if current is None or reference in (None, 0):
+        return None
+    return float(current) / float(reference)
+
+
+def _delta_or_none(current: float | int | None, reference: float | int | None) -> float | None:
+    if current is None or reference is None:
+        return None
+    return float(current) - float(reference)
+
+
+def _profile_delta_vs_reference(
+    aggregate: dict[str, Any],
+    jax_reference_metrics: dict[str, Any] | None,
+) -> dict[str, dict[str, float | None]]:
+    current_profile = aggregate.get("profile_medians") or {}
+    reference_profile = (jax_reference_metrics or {}).get("profile") or {}
+    result: dict[str, dict[str, float | None]] = {}
+    for needle in PROFILE_NEEDLES:
+        current_bucket = current_profile.get(needle) or {}
+        reference_bucket = reference_profile.get(needle) or {}
+        current_total = current_bucket.get("total_ms_median")
+        reference_total = reference_bucket.get("total_ms")
+        current_count = current_bucket.get("count_median")
+        reference_count = reference_bucket.get("count")
+        result[needle] = {
+            "current_total_ms_median": current_total,
+            "reference_total_ms": reference_total,
+            "total_ms_delta": _delta_or_none(current_total, reference_total),
+            "total_ms_ratio": _ratio_or_none(current_total, reference_total),
+            "current_count_median": current_count,
+            "reference_count": reference_count,
+            "count_delta": _delta_or_none(current_count, reference_count),
+        }
+    return result
+
+
 def _comparison_summary(
     aggregate: dict[str, Any],
     vllm_metrics: dict[str, Any] | None,
     vllm_source: str,
+    jax_reference_metrics: dict[str, Any] | None = None,
+    jax_reference_source: str = "none",
+    jax_reference_artifact: str | None = None,
 ) -> dict[str, Any]:
     jax_tps = aggregate.get("tokens_per_second_median")
     jax_ttft = aggregate.get("ttft_ms_p50_median")
@@ -791,6 +861,10 @@ def _comparison_summary(
     vllm_tps = vllm_performance.get("tokens_per_second")
     vllm_ttft = vllm_performance.get("ttft_ms_p50")
     vllm_itl = vllm_performance.get("itl_ms_p50")
+    reference_performance = (jax_reference_metrics or {}).get("performance") or {}
+    reference_tps = reference_performance.get("tokens_per_second")
+    reference_ttft = reference_performance.get("ttft_ms_p50")
+    reference_itl = reference_performance.get("itl_ms_p50")
     target_tps = (float(vllm_tps) * TARGET_VLLM_RATIO) if vllm_tps else None
     gap_tps = (
         max(0.0, float(target_tps) - float(jax_tps))
@@ -813,6 +887,17 @@ def _comparison_summary(
         "ttft_ms_p50_delta_vs_vllm": (jax_ttft - vllm_ttft) if jax_ttft is not None and vllm_ttft is not None else None,
         "itl_ms_p50_delta_vs_vllm": (jax_itl - vllm_itl) if jax_itl is not None and vllm_itl is not None else None,
         "vllm_reference_source": vllm_source,
+        "jax_reference_source": jax_reference_source,
+        "jax_reference_artifact": jax_reference_artifact,
+        "jax_reference_tokens_per_second": reference_tps,
+        "jax_over_jax_reference_throughput": _ratio_or_none(jax_tps, reference_tps),
+        "tokens_per_second_delta_vs_jax_reference": _delta_or_none(jax_tps, reference_tps),
+        "ttft_ms_p50_delta_vs_jax_reference": _delta_or_none(jax_ttft, reference_ttft),
+        "itl_ms_p50_delta_vs_jax_reference": _delta_or_none(jax_itl, reference_itl),
+        "profile_delta_vs_jax_reference": _profile_delta_vs_reference(
+            aggregate,
+            jax_reference_metrics,
+        ),
     }
 
 
@@ -1145,10 +1230,18 @@ def main() -> None:
                 "aggregate": _aggregate_repeats(config_repeats),
             }
             vllm_metrics = (summary["vllm_references"].get(workload_name) or {}).get("metrics")
+            (
+                jax_reference_metrics,
+                jax_reference_source,
+                jax_reference_artifact,
+            ) = _reference_metrics_for_comparison(config_repeats)
             comparison = _comparison_summary(
                 summary["matrix"][workload_name][config_name]["aggregate"],
                 vllm_metrics,
                 (summary["vllm_references"].get(workload_name) or {}).get("source", "none"),
+                jax_reference_metrics,
+                jax_reference_source,
+                jax_reference_artifact,
             )
             summary["comparisons"][workload_name][config_name] = comparison
             summary["acceptance"][workload_name][config_name] = _benchmark_acceptance_summary(

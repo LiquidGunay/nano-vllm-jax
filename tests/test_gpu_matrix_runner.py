@@ -23,6 +23,7 @@ from benchmarks.run_gpu_matrix import (
     _goal_target_failure,
     _should_capture_live_jax_default_reference,
     _reference_for,
+    _reference_metrics_for_comparison,
     _find_local_vllm_reference,
     _jax_available,
     _jax_command,
@@ -116,6 +117,7 @@ def _minimal_summary():
                         "itl_ms_p50_median": None,
                         "itl_ms_p95_median": None,
                         "first_forward_step_token_ids_jit_ms_median": None,
+                        "profile_medians": {},
                         "all_correct": False,
                         "all_exact_generated_token_match": False,
                         "all_correctness_checked": False,
@@ -199,6 +201,12 @@ def test_aggregate_repeats_requires_exact_full_length_match():
                         "itl_ms_p95": 2.5,
                     },
                     "first_forward_step_token_ids_jit_ms": 3.0,
+                    "profile": {
+                        PROFILE_NEEDLES[0]: {
+                            "total_ms": 5.0,
+                            "count": 2,
+                        }
+                    },
                     "correctness": {
                         "checked": True,
                         "ok": True,
@@ -216,6 +224,10 @@ def test_aggregate_repeats_requires_exact_full_length_match():
     assert aggregate["ttft_ms_p95_median"] == 1.5
     assert aggregate["itl_ms_p95_median"] == 2.5
     assert aggregate["first_forward_step_token_ids_jit_ms_median"] == 3.0
+    assert aggregate["profile_medians"][PROFILE_NEEDLES[0]] == {
+        "total_ms_median": 5.0,
+        "count_median": 2.0,
+    }
 
 
 def test_cuda_device_preflight_accepts_visible_device_nodes(tmp_path):
@@ -449,6 +461,39 @@ def test_reference_for_can_plan_unwritten_live_default_in_dry_run(tmp_path):
     assert source == "live_jax_default"
 
 
+def test_reference_metrics_for_comparison_uses_first_existing_reference(tmp_path):
+    workload = WORKLOADS["hetero8"]
+    missing = tmp_path / "missing.json"
+    reference = tmp_path / "reference.json"
+    _write_workload_artifact(reference, workload)
+    data = json.loads(reference.read_text(encoding="utf-8"))
+    data["performance"] = {"tokens_per_second": 10.0}
+    data["profile_counters"] = {
+        "ranges": {
+            PROFILE_NEEDLES[0]: {
+                "total_ms": 5.0,
+                "count": 1,
+            }
+        }
+    }
+    reference.write_text(json.dumps(data), encoding="utf-8")
+
+    metrics, source, artifact = _reference_metrics_for_comparison(
+        [
+            {"reference_json": str(missing), "reference_source": "missing"},
+            {"reference_json": str(reference), "reference_source": "stored"},
+        ]
+    )
+
+    assert source == "stored"
+    assert artifact == str(reference)
+    assert metrics["performance"]["tokens_per_second"] == 10.0
+    assert metrics["profile"][PROFILE_NEEDLES[0]] == {
+        "total_ms": 5.0,
+        "count": 1,
+    }
+
+
 def _flag_value(command, flag):
     return command[command.index(flag) + 1]
 
@@ -556,6 +601,12 @@ def test_comparison_summary_reports_gap_to_target():
             "tokens_per_second_median": 78.0,
             "ttft_ms_p50_median": 580.0,
             "itl_ms_p50_median": 15.0,
+            "profile_medians": {
+                PROFILE_NEEDLES[0]: {
+                    "total_ms_median": 12.0,
+                    "count_median": 3.0,
+                }
+            },
         },
         {
             "performance": {
@@ -565,6 +616,21 @@ def test_comparison_summary_reports_gap_to_target():
             }
         },
         "stored",
+        {
+            "performance": {
+                "tokens_per_second": 70.0,
+                "ttft_ms_p50": 600.0,
+                "itl_ms_p50": 20.0,
+            },
+            "profile": {
+                PROFILE_NEEDLES[0]: {
+                    "total_ms": 10.0,
+                    "count": 2,
+                }
+            },
+        },
+        "stored_jax_default",
+        "reference.json",
     )
 
     assert comparison["jax_over_vllm_throughput"] == pytest.approx(78.0 / 116.0)
@@ -573,6 +639,17 @@ def test_comparison_summary_reports_gap_to_target():
     assert comparison["required_jax_speedup_to_target"] == pytest.approx(87.0 / 78.0)
     assert comparison["ttft_ms_p50_delta_vs_vllm"] == 140.0
     assert comparison["itl_ms_p50_delta_vs_vllm"] == 10.0
+    assert comparison["jax_reference_source"] == "stored_jax_default"
+    assert comparison["jax_reference_artifact"] == "reference.json"
+    assert comparison["jax_reference_tokens_per_second"] == 70.0
+    assert comparison["jax_over_jax_reference_throughput"] == pytest.approx(78.0 / 70.0)
+    assert comparison["tokens_per_second_delta_vs_jax_reference"] == 8.0
+    assert comparison["ttft_ms_p50_delta_vs_jax_reference"] == -20.0
+    assert comparison["itl_ms_p50_delta_vs_jax_reference"] == -5.0
+    profile_delta = comparison["profile_delta_vs_jax_reference"][PROFILE_NEEDLES[0]]
+    assert profile_delta["total_ms_delta"] == 2.0
+    assert profile_delta["total_ms_ratio"] == pytest.approx(1.2)
+    assert profile_delta["count_delta"] == 1.0
 
 
 def test_comparison_summary_clamps_negative_gap_after_target_met():
