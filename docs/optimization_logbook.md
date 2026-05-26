@@ -3900,3 +3900,28 @@ Decision:
 - decision: use `0.9x` vLLM as the active correctness-gated non-speculative
   kernel-phase target. MTP remains diagnostic-only until this target is met or
   explicitly reprioritized.
+
+### Entry 095 - Kernel-phase top-5 guardrail revalidation
+
+- change accepted: `benchmark_long_decode_top5.py` now writes a machine-readable
+  `guardrail` block with exact-token/top-5 checks, the required numeric logit
+  threshold, pass/fail status, git head, JAX backend, and JAX version.
+- command:
+
+```text
+JAX_PLATFORMS=cuda \
+.venv/bin/python benchmark_long_decode_top5.py \
+  --max-new-tokens 500 \
+  --compare-json results/qwen08_jax_bf16w_fp32act_long_decode_top5_compare_20260526_kernel_phase_gate.json
+```
+
+- artifact:
+  `results/qwen08_jax_bf16w_fp32act_long_decode_top5_compare_20260526_kernel_phase_gate.json`
+- result: exact top-1, ordered top-5, and top-5 set parity all passed
+  `500/500` against `results/qwen08_hf_bf16w_fp32act_long_decode_top5_500.npz`.
+- numeric gate: `max_hf_topk_id_logit_diff=2.09808349609375e-05`, which is
+  slightly above the documented `2e-5` bound, so
+  `guardrail.passes_required_gate=false`.
+- decision: keep the `2e-5` bound. This evidence does not authorize the packed
+  segmented GDN override path; it either needs a candidate that passes the bound
+  or an explicit threshold decision.

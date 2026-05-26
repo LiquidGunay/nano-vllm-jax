@@ -86,6 +86,17 @@ The reusable HF artifact is:
 
 `results/qwen08_hf_bf16w_fp32act_long_decode_top5_500.npz`
 
+Latest kernel-phase revalidation:
+
+- artifact: `results/qwen08_jax_bf16w_fp32act_long_decode_top5_compare_20260526_kernel_phase_gate.json`
+- git head: `d66b285`
+- exact top-1/top-5 ranks: pass, `500/500`
+- numeric logit-diff bound: fail narrowly, `max_hf_topk_id_logit_diff =
+  2.09808349609375e-05` versus the required `2e-5`
+
+Do not use the segmented GDN override gate for a serving promotion until either
+a candidate passes this exact bound or we make an explicit threshold decision.
+
 ## Segmented GDN Override Gate
 
 The default segmented GDN policy requires standalone output and final-state max

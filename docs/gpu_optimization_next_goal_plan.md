@@ -939,6 +939,13 @@ full-model real-weight token/logit gate before any serving promotion.
   500/500 ordered top-5 match, 500/500 top-5 set match, and
   `max_hf_topk_id_logit_diff <= 2e-5` against the stored HF long-decode
   artifact.
+- Kernel-phase guardrail revalidation on 2026-05-26 produced
+  `results/qwen08_jax_bf16w_fp32act_long_decode_top5_compare_20260526_kernel_phase_gate.json`
+  at git head `d66b285`. It kept exact `500/500` top-1, ordered top-5, and
+  top-5-set matches, but the numeric `max_hf_topk_id_logit_diff` was
+  `2.09808349609375e-05`, narrowly above the `2e-5` override bound. Treat the
+  full-model override as not currently passed; do not relax the threshold
+  without an explicit correctness decision.
 - Keep it default-off and benchmark-only. Do not route into serving. The next
   attempt should move closer to the true segmented/nnz ABI and preserve FP32
   accumulation more closely before a server run.
@@ -1240,6 +1247,8 @@ Commit 8:
   decomposition still misses the full-shape gate~~
 - ~~Resolve packed-ABI correctness policy after full hetero8 gate failure before
   implementing segmented CUDA math~~
+- ~~Make the full-model token/logit override gate machine-readable in
+  `benchmark_long_decode_top5.py`~~
 - Compare a revised segmented prefill candidate against Entry 045 chunk-32
   baseline after it beats the full-shape GDN microbenchmark gate
 

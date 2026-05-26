@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import time
 from pathlib import Path
 
@@ -27,6 +28,20 @@ from nanovllm_jax.load_weights import load_weights_from_hf
 
 
 jax.config.update("jax_default_matmul_precision", "highest")
+
+REQUIRED_MAX_HF_TOPK_ID_LOGIT_DIFF = 2e-5
+
+
+def _git_head() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -304,16 +319,25 @@ def compare_jax_to_hf(args: argparse.Namespace) -> None:
             print(f"checked_steps={step + 1} mismatches={len(mismatches)}")
 
     elapsed = time.perf_counter() - started
+    top1_exact_matches = int(args.max_new_tokens - len(top1_mismatches))
+    ordered_top5_exact_matches = int(args.max_new_tokens - len(mismatches))
+    top5_set_exact_matches = int(args.max_new_tokens - len(topk_set_mismatches))
+    exact_generated_token_match = bool(top1_exact_matches == args.max_new_tokens)
+    ordered_top5_match = bool(ordered_top5_exact_matches == args.max_new_tokens)
+    top5_set_match = bool(top5_set_exact_matches == args.max_new_tokens)
+    logit_diff_within_gate = bool(
+        max_hf_topk_id_logit_diff <= REQUIRED_MAX_HF_TOPK_ID_LOGIT_DIFF
+    )
     summary = {
         "model": args.model,
         "prompt": metadata.get("prompt", args.prompt),
         "steps_checked": int(args.max_new_tokens),
         "top_k": int(args.top_k),
-        "top1_exact_matches": int(args.max_new_tokens - len(top1_mismatches)),
+        "top1_exact_matches": top1_exact_matches,
         "top1_mismatches": int(len(top1_mismatches)),
-        "ordered_top5_exact_matches": int(args.max_new_tokens - len(mismatches)),
+        "ordered_top5_exact_matches": ordered_top5_exact_matches,
         "ordered_top5_mismatches": int(len(mismatches)),
-        "top5_set_exact_matches": int(args.max_new_tokens - len(topk_set_mismatches)),
+        "top5_set_exact_matches": top5_set_exact_matches,
         "top5_set_mismatches": int(len(topk_set_mismatches)),
         "first_ordered_top5_mismatches": mismatches[:20],
         "first_top1_mismatches": top1_mismatches[:20],
@@ -324,7 +348,27 @@ def compare_jax_to_hf(args: argparse.Namespace) -> None:
         "elapsed_seconds": elapsed,
         "jax_weight_dtype": "bfloat16",
         "jax_activation_dtype": "float32",
+        "jax_backend": jax.default_backend(),
+        "jax_version": jax.__version__,
+        "git_head": _git_head(),
         "hf_reference": str(reference_path),
+        "guardrail": {
+            "exact_generated_token_match": exact_generated_token_match,
+            "top1_exact_matches_required": int(args.max_new_tokens),
+            "top1_exact_match": exact_generated_token_match,
+            "ordered_top5_exact_matches_required": int(args.max_new_tokens),
+            "ordered_top5_exact_match": ordered_top5_match,
+            "top5_set_exact_matches_required": int(args.max_new_tokens),
+            "top5_set_exact_match": top5_set_match,
+            "max_hf_topk_id_logit_diff_lte": REQUIRED_MAX_HF_TOPK_ID_LOGIT_DIFF,
+            "max_hf_topk_id_logit_diff_within_gate": logit_diff_within_gate,
+            "passes_required_gate": bool(
+                exact_generated_token_match
+                and ordered_top5_match
+                and top5_set_match
+                and logit_diff_within_gate
+            ),
+        },
     }
 
     compare_path = Path(args.compare_json)

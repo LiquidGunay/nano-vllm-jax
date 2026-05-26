@@ -193,7 +193,9 @@ gdn_segmented_prefill_chunk32(
   before CUDA math. The required override gate is exact generated-token match,
   500/500 top-1 match, 500/500 ordered top-5 match, 500/500 top-5 set match,
   and `max_hf_topk_id_logit_diff <= 2e-5` against the stored HF long-decode
-  artifact.
+  artifact. The 2026-05-26 kernel-phase revalidation kept all 500 top-1/top-5
+  matches but missed the numeric bound slightly (`2.09808349609375e-05`), so the
+  override gate is not currently passed.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 
