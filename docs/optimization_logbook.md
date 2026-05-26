@@ -1392,3 +1392,76 @@ Decision:
 - Reject and revert the Pallas Gated DeltaNet decode path. It was numerically clean under the FP32-activation/BF16-weight serving contract and faster in isolation, but the integrated server graph regressed throughput and ITL.
 - The profile shows the custom-call path adds `gated_delta_decode` ranges and more command-buffer update/execute activity without reducing the dominant dense/decode buckets. This is another case where a good isolated Pallas kernel loses once inserted 18 layers x 31 decode steps into the compiled server loop.
 - Do not revisit a per-head/per-value-tile Pallas GDN decode kernel in this shape. If GDN decode is revisited, it likely needs coarser fusion that also owns the Conv1D shift/projection boundary or reduces custom-call count, not only the recurrent state update.
+
+## Entry 041 - Rejected Full-Active Decode Valid-Mask Skip
+
+- run id: `20260526-012105-2053974-jax_hetero8_64_512x32_full_active_decode_mask`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_full_active_decode_mask.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-012105-2053974-jax_hetero8_64_512x32_full_active_decode_mask`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-012105-2053974-jax_hetero8_64_512x32_full_active_decode_mask/plugins/profile/2026_05_26_01_23_03/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-012105-2053974-jax_hetero8_64_512x32_full_active_decode_mask/plugins/profile/2026_05_26_01_23_03/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: a temporary static fast path detected normal width-1 decode batches where `num_decode_tokens == batch_size` and skipped per-layer `valid_token_mask` construction plus inactive-row preservation in `gated_deltanet_block`. Prefill, inactive padded decode, and wider verifier/MTP batches kept the existing logic. The source change was reverted after profiling.
+- focused CUDA checks: `tests/test_backend_boundaries.py::test_full_active_decode_mask_fastpath_matches_linear_fallback`, `tests/test_backend_boundaries.py::test_bucketed_linear_prefill_preserves_hybrid_state_for_decode`, `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute`, and `tests/test_lm_head_helpers.py` passed (`6 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 033 hetero8 reference.
+- JAX timing: `346.03 tok/s`, TTFT p50 `323.29 ms`, ITL p50 `13.56 ms`, ITL p95 `14.36 ms`.
+- delta vs Entry 033 default: `0.974x` total tok/s, TTFT p50 `1.023x`, ITL p50 `1.055x`, ITL p95 `1.041x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 033 ms | full-active mask ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 720.52 | 739.82 | overall slower |
+| `_run_main_and_sample` | 598.60 | 610.22 | runner hot path slower |
+| `forward_step_token_ids_jit` | 175.81 | 191.78 | decode token-id step slower |
+| `PjRtCApiLoadedExecutable::Execute` | 191.91 over 252 calls | 207.60 over 252 calls | same dispatch count, heavier execution |
+| `jit_compiled:XLA GPU module` | 147.90 | 155.85 | module time increased |
+| `command_buffer::execute` | 92.22 over 1575 calls | 94.89 over 1730 calls | more command-buffer work |
+| `command_buffer::update` | 27.81 over 248 calls | 35.03 over 403 calls | update count increased |
+| `input_reduce_fusion` | 41.57 | 41.52 | target reduction bucket unchanged |
+| `wrapped_concatenate` | 36.49 | 36.29 | negligible improvement |
+| `gemm_fusion_dot_286` | 25.05 | 24.55 | small local improvement did not pay for heavier graph |
+| `MemcpyD2D` | 24.62 | 25.54 | slightly worse |
+
+Decision:
+
+- Reject and revert the full-active valid-mask skip. It was correctness-clean, but XLA did not turn the source-level branch removal into a lighter decode graph.
+- The intended mask/reduction work was already effectively optimized or not on the critical path; the static key split and altered graph increased command-buffer update/execute cost instead.
+- Do not add full-active decode specializations unless the profile shows a real lowered bucket moving. The baseline's generic valid-mask path remains better for this workload.
+
+## Entry 042 - Rejected Compact Prefill Metadata Indices
+
+- run id: `20260526-012720-2056921-jax_hetero8_64_512x32_compact_prefill_metadata_indices`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_compact_prefill_metadata_indices.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-012720-2056921-jax_hetero8_64_512x32_compact_prefill_metadata_indices`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-012720-2056921-jax_hetero8_64_512x32_compact_prefill_metadata_indices/plugins/profile/2026_05_26_01_29_09/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-012720-2056921-jax_hetero8_64_512x32_compact_prefill_metadata_indices/plugins/profile/2026_05_26_01_29_09/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Banach reviewed Entry 033 plus rejected Entries 034-040 and ranked compact prefill index reuse as a plausible medium-reward experiment, but with an explicit gate: it should only be kept if repeated `nonzero`/mask work was not already CSE'd and the profile showed lower prefill buckets without dispatch tax.
+- change tested: a temporary `AttentionMetadata` extension precomputed compact prefill row/column indices once in `build_attention_metadata`, then `_compact_prefill_dot_if_enabled` and `_compact_prefill_mlp` reused those indices instead of calling `jnp.nonzero` locally in each compact projection helper. The source change was reverted after profiling.
+- focused CUDA checks: `tests/test_lm_head_helpers.py`, `tests/test_backend_boundaries.py::test_bucketed_prefill_last_logits_match_exact_prefill`, `tests/test_backend_boundaries.py::test_bucketed_linear_prefill_preserves_hybrid_state_for_decode`, and `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute` passed (`6 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 033 hetero8 reference.
+- JAX timing: `337.28 tok/s`, TTFT p50 `321.15 ms`, ITL p50 `13.88 ms`, ITL p95 `16.52 ms`.
+- delta vs Entry 033 default: `0.949x` total tok/s, TTFT p50 `1.017x`, ITL p50 `1.080x`, ITL p95 `1.199x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 033 ms | compact metadata indices ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 720.52 | 759.00 | overall slower |
+| `_run_main_and_sample` | 598.60 | 618.88 | runner hot path slower |
+| `forward_step_token_ids_jit` | 175.81 | 212.63 | compiled token-id step much slower |
+| `PjRtCApiLoadedExecutable::Execute` | 191.91 over 252 calls | 226.66 over 252 calls | same dispatch count, much heavier execution |
+| `jit_compiled:XLA GPU module` | 147.90 | 170.07 | module time increased |
+| `command_buffer::execute` | 92.22 over 1575 calls | 98.28 over 1575 calls | command-buffer time worsened |
+| `command_buffer::update` | 27.81 over 248 calls | 38.53 over 248 calls | same count, heavier updates |
+| `cutlass_80_tensorop_s1688gemm_128x128_16x5_nn_align4` | 52.39 over 96 calls | 52.43 over 96 calls | compact prefill GEMM unchanged |
+| `gemm_fusion_dot_general_746` | 13.92 | 13.92 | unchanged |
+| `gemm_fusion_dot_2` | 13.79 | 13.79 | unchanged |
+| `input_reduce_fusion` | 41.57 | 41.52 | unchanged |
+| `wrapped_concatenate` | 36.49 | 36.48 | unchanged |
+| `PjitFunction(compiled)` | 347.46 | 419.62 | higher compiled execution attribution |
+
+Decision:
+
+- Reject and revert compact prefill metadata indices. Correctness was exact, but the profile proved the repeated compact-index work was not the limiting cost and the metadata extension made the compiled graph heavier.
+- Do not move compact projection indices into `AttentionMetadata` in this form. If compact prefill is revisited, inspect HLO/layout around the existing XLA compact dots or change the attention algorithm, not the index plumbing.
+- Next candidates should follow the audit's remaining list: initial-prefill local attention while preserving paged KV writes, or a controlled GDN chunk/layout sweep with exact-token gates.
