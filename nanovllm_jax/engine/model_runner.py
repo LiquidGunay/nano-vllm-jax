@@ -417,7 +417,7 @@ class _LegacyModelRunner:
             positions: Absolute positions [batch, seq_len]
             is_prefill: Whether this is prefill
             conv_state: Conv state for linear attention [batch, num_linear_layers, conv_dim, kernel_size]
-            recurrent_state: Recurrent state for linear attention [batch, num_linear_layers, num_heads, k_dim, v_dim]
+            recurrent_state: Recurrent state for linear attention [batch, num_linear_layers, num_heads, v_dim, k_dim]
             
         Returns:
             Tuple of (logits, k_cache, v_cache, conv_state, recurrent_state)

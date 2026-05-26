@@ -294,7 +294,7 @@ def test_linear_attention_recurrent():
     beta_np = np.random.rand(batch_size, num_heads, seq_len).astype(np.float32)
     
     # Create initial state (zeros)
-    initial_state = jnp.zeros((batch_size, num_heads, k_dim, v_dim), dtype=jnp.float32)
+    initial_state = jnp.zeros((batch_size, num_heads, v_dim, k_dim), dtype=jnp.float32)
     
     # JAX recurrent forward
     q_jax = jnp.array(q_np)
@@ -312,7 +312,7 @@ def test_linear_attention_recurrent():
     print(f"  Output shape: {output.shape}")
     print(f"  State shape: {final_state.shape}")
     assert output.shape == (batch_size, num_heads, seq_len, k_dim)
-    assert final_state.shape == (batch_size, num_heads, k_dim, v_dim)
+    assert final_state.shape == (batch_size, num_heads, v_dim, k_dim)
 
 
 def test_mlp(hf_model_and_tokenizer):

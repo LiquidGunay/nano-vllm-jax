@@ -3972,3 +3972,47 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 - decision: keep this default-off and unrouted for now. It is the packed GDN
   ABI/toolchain step needed before a serving integration attempt, not an
   integrated speed claim.
+
+### Entry 098 - Accepted GDN V,K JAX Layout Migration
+
+- change accepted: switched the pure-JAX GDN serving state contract from
+  `[B,L,HV,K,V]` to kernel-native V,K `[B,L,HV,V,K]` and updated the JAX
+  recurrent/chunked fallback math to consume and return V,K state directly.
+- scope: `init_hybrid_state`, GDN recurrent/chunk rules, shape expectations,
+  focused state tests, and default-off CUDA FFI compatibility wrappers. The
+  legacy local CUDA probes now accept V,K at the Python boundary and transpose
+  internally into their old K,V implementation; they remain diagnostic only.
+- validation:
+
+```text
+JAX_PLATFORMS=cuda ... pytest -q \
+  tests/test_kv_cache.py::test_linear_attention_chunked_vs_recurrent \
+  tests/test_kv_cache.py::test_linear_attention_multichunk_matches_recurrent \
+  tests/test_kv_cache.py::test_linear_attention_state_persistence \
+  tests/test_kv_cache.py::test_multi_layer_linear_attention_states \
+  tests/test_layer_parity.py::test_linear_attention_recurrent \
+  tests/test_backend_boundaries.py::test_bucketed_linear_prefill_preserves_hybrid_state_for_decode \
+  tests/test_backend_boundaries.py::test_linear_suffix_prefill_matches_sequential_decode_state \
+  tests/test_gdn_segmented_reference.py \
+  tests/test_gdn_packed_decode_reference.py
+
+JAX_PLATFORMS=cuda ... pytest -q tests/test_cuda_fp32_ffi.py
+JAX_PLATFORMS=cuda ... pytest -q tests/test_mtp_commit_semantics.py
+JAX_PLATFORMS=cuda ... benchmark_long_decode_top5.py --max-new-tokens 500 \
+  --compare-json results/qwen08_jax_bf16w_fp32act_long_decode_top5_compare_20260526_vk_layout.json
+JAX_PLATFORMS=cuda ... benchmarks/run_gpu_matrix.py --goal-target-only --repeats 2 \
+  --no-live-vllm --require-stored-references \
+  --output-json results/gpu_matrix_20260526_vk_layout.json
+```
+
+- results: focused GDN/state suite `12 passed`; CUDA FFI suite `13 passed`; MTP
+  commit-state suite `15 passed, 1 xfailed`; 500-token guardrail passed exact
+  top-1, ordered top-5, and top-5 set parity `500/500` with
+  `max_hf_topk_id_logit_diff=1.9073486328125e-05` within the `2e-5` gate.
+- integrated benchmark: `results/gpu_matrix_20260526_vk_layout.json`, report
+  `results/gpu_matrix_20260526_vk_layout.md`, long-prefill goal target,
+  `90.65 tok/s`, `0.779x` vLLM, exact generated-token parity over two repeats,
+  speed-claim-ready, `target_vllm_ratio_met=false` for the active `0.9x` bar.
+- decision: keep V,K as the GDN serving state layout and continue toward a
+  kernel-native V,K GDN implementation. This is a correctness/layout migration,
+  not the final speed win.

@@ -33,19 +33,23 @@ def gdn_segmented_prefill_chunk32(*args: Any, **kwargs: Any):
 
 
 def local_gdn_state_to_k_last(state: jnp.ndarray) -> jnp.ndarray:
-    """Convert local `[B,H,K,V]` recurrent state to k-last `[B,H,V,K]`."""
+    """Return local recurrent state in k-last `[B,H,V,K]` layout.
 
-    if state.ndim != 4:
-        raise ValueError("state must have shape [batch, heads, key_dim, value_dim]")
-    return jnp.transpose(state, (0, 1, 3, 2))
-
-
-def k_last_gdn_state_to_local(state: jnp.ndarray) -> jnp.ndarray:
-    """Convert k-last `[B,H,V,K]` recurrent state to local `[B,H,K,V]`."""
+    Local serving state is now already k-last/V-first. This helper remains as a
+    compatibility boundary for older tests and migration diagnostics.
+    """
 
     if state.ndim != 4:
         raise ValueError("state must have shape [batch, heads, value_dim, key_dim]")
-    return jnp.transpose(state, (0, 1, 3, 2))
+    return state
+
+
+def k_last_gdn_state_to_local(state: jnp.ndarray) -> jnp.ndarray:
+    """Return k-last `[B,H,V,K]` recurrent state as local serving state."""
+
+    if state.ndim != 4:
+        raise ValueError("state must have shape [batch, heads, value_dim, key_dim]")
+    return state
 
 
 def split_packed_gdn_decode_mixed_qkv(
@@ -95,16 +99,15 @@ def gdn_packed_decode_reference_local_state(
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Pure-JAX reference for vLLM-style packed GDN decode input.
 
-    This mirrors the upstream packed decode boundary but intentionally keeps the
-    local recurrent-state contract as `[B,H,K,V]`. It is an ABI target for
-    future CUDA work, not a serving speed path.
+    This mirrors the upstream packed decode boundary while using the local
+    serving recurrent-state contract `[B,H,V,K]`.
     """
 
     from nanovllm_jax.model import jax_recurrent_gated_delta_rule
 
     if state.ndim != 4:
-        raise ValueError("state must have shape [batch, heads, key_dim, value_dim]")
-    batch, num_value_heads, key_dim, value_dim = state.shape
+        raise ValueError("state must have shape [batch, heads, value_dim, key_dim]")
+    batch, num_value_heads, value_dim, key_dim = state.shape
     if mixed_qkv.shape[0] != batch:
         raise ValueError("mixed_qkv batch must match state batch")
     if a.shape != (batch, num_value_heads) or b.shape != (batch, num_value_heads):

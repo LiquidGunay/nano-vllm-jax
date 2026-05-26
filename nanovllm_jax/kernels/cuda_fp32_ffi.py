@@ -573,8 +573,8 @@ def _validate_fp32_gdn_decode_inputs(
         raise ValueError("FP32 GDN decode prototype only supports time=1")
     if state.shape[:2] != query.shape[:2]:
         raise ValueError("state batch/head dimensions must match query")
-    if state.shape[2] != query.shape[3] or state.shape[3] != value.shape[3]:
-        raise ValueError("state must have shape [batch, heads, key_dim, value_dim]")
+    if state.shape[2] != value.shape[3] or state.shape[3] != query.shape[3]:
+        raise ValueError("state must have shape [batch, heads, value_dim, key_dim]")
 
 
 def gdn_recurrent_decode_step_fp32(
@@ -594,16 +594,21 @@ def gdn_recurrent_decode_step_fp32(
     beta = _as_jax_array("beta", beta)
     state = _as_jax_array("state", state)
     _validate_fp32_gdn_decode_inputs(query, key, value, g, beta, state)
+    # The legacy diagnostic CUDA kernel still stores state as K,V internally.
+    # Keep the public wrapper on the V,K serving ABI and transpose only for this
+    # default-off compatibility route.
+    state_kv = jnp.transpose(state, (0, 1, 3, 2))
     _register_kv_append_target()
     call = jax.ffi.ffi_call(
         _TARGET_GDN_DECODE,
         (
             jax.ShapeDtypeStruct(value.shape, value.dtype),
-            jax.ShapeDtypeStruct(state.shape, state.dtype),
+            jax.ShapeDtypeStruct(state_kv.shape, state_kv.dtype),
         ),
         has_side_effect=False,
     )
-    return call(query, key, value, g, beta, state)
+    output, new_state_kv = call(query, key, value, g, beta, state_kv)
+    return output, jnp.transpose(new_state_kv, (0, 1, 3, 2))
 
 
 def gdn_recurrent_decode_step_fp32_reference(
@@ -647,7 +652,7 @@ def _validate_fp32_gdn_packed_decode_inputs(
             raise ValueError(f"{name} must be float32")
         if value_array.ndim != rank:
             raise ValueError(f"{name} must be rank-{rank}")
-    batch, num_value_heads, key_dim, value_dim = state.shape
+    batch, num_value_heads, value_dim, key_dim = state.shape
     if mixed_qkv.shape[0] != batch:
         raise ValueError("mixed_qkv batch must match state batch")
     if a.shape != (batch, num_value_heads) or b.shape != (batch, num_value_heads):
@@ -660,7 +665,7 @@ def _validate_fp32_gdn_packed_decode_inputs(
     num_q_heads = qk_dim // (2 * key_dim)
     if num_value_heads % num_q_heads != 0:
         raise ValueError("value head count must be divisible by packed Q/K head count")
-    return batch, num_q_heads, num_value_heads, value_dim
+    return batch, num_q_heads, num_value_heads, value_dim, key_dim
 
 
 def gdn_packed_decode_step_fp32(
@@ -671,7 +676,7 @@ def gdn_packed_decode_step_fp32(
     dt_bias: Any,
     state: Any,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """vLLM-style packed width-1 GDN decode preserving local FP32 state layout."""
+    """vLLM-style packed width-1 GDN decode using local V,K FP32 state layout."""
 
     mixed_qkv = _as_jax_array("mixed_qkv", mixed_qkv)
     a = _as_jax_array("a", a)
@@ -679,7 +684,7 @@ def gdn_packed_decode_step_fp32(
     a_log = _as_jax_array("a_log", a_log)
     dt_bias = _as_jax_array("dt_bias", dt_bias)
     state = _as_jax_array("state", state)
-    batch, _, num_value_heads, value_dim = _validate_fp32_gdn_packed_decode_inputs(
+    batch, _, num_value_heads, value_dim, _ = _validate_fp32_gdn_packed_decode_inputs(
         mixed_qkv,
         a,
         b,
@@ -687,6 +692,7 @@ def gdn_packed_decode_step_fp32(
         dt_bias,
         state,
     )
+    state_kv = jnp.transpose(state, (0, 1, 3, 2))
     _register_kv_append_target()
     call = jax.ffi.ffi_call(
         _TARGET_GDN_PACKED_DECODE,
@@ -695,11 +701,12 @@ def gdn_packed_decode_step_fp32(
                 (batch, num_value_heads, 1, value_dim),
                 state.dtype,
             ),
-            jax.ShapeDtypeStruct(state.shape, state.dtype),
+            jax.ShapeDtypeStruct(state_kv.shape, state_kv.dtype),
         ),
         has_side_effect=False,
     )
-    return call(mixed_qkv, a, b, a_log, dt_bias, state)
+    output, new_state_kv = call(mixed_qkv, a, b, a_log, dt_bias, state_kv)
+    return output, jnp.transpose(new_state_kv, (0, 1, 3, 2))
 
 
 def gdn_packed_decode_step_fp32_reference(*args: Any, **kwargs: Any):
@@ -750,8 +757,8 @@ def _validate_fp32_gdn_prefill_inputs(
             "FP32 GDN prefill prototype requires value_dim divisible by "
             f"{value_dim_multiple}"
         )
-    if state.shape != (query.shape[0], query.shape[1], query.shape[3], value.shape[3]):
-        raise ValueError("state must have shape [batch, heads, key_dim, value_dim]")
+    if state.shape != (query.shape[0], query.shape[1], value.shape[3], query.shape[3]):
+        raise ValueError("state must have shape [batch, heads, value_dim, key_dim]")
 
 
 def _gdn_prefill_chunk32_normalized_fp32_target(
@@ -782,16 +789,18 @@ def _gdn_prefill_chunk32_normalized_fp32_target(
         state,
         value_dim_multiple=value_dim_multiple,
     )
+    state_kv = jnp.transpose(state, (0, 1, 3, 2))
     _register_kv_append_target()
     call = jax.ffi.ffi_call(
         target,
         (
             jax.ShapeDtypeStruct(value.shape, value.dtype),
-            jax.ShapeDtypeStruct(state.shape, state.dtype),
+            jax.ShapeDtypeStruct(state_kv.shape, state_kv.dtype),
         ),
         has_side_effect=False,
     )
-    return call(query, key, value, g, beta, seq_lens, state)
+    output, new_state_kv = call(query, key, value, g, beta, seq_lens, state_kv)
+    return output, jnp.transpose(new_state_kv, (0, 1, 3, 2))
 
 
 def gdn_prefill_chunk32_normalized_fp32(

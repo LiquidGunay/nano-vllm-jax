@@ -817,11 +817,11 @@ def test_bucketed_linear_prefill_preserves_hybrid_state_for_decode():
     bucketed_cache = executor.backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=3)
     exact_hybrid = HybridLayerState(
         conv_state=jnp.zeros((1, 1, 12, config.linear_conv_kernel_size), dtype=config.get_dtype()),
-        recurrent_state=jnp.zeros((1, 1, 1, config.linear_key_head_dim, config.linear_value_head_dim), dtype=jnp.float32),
+        recurrent_state=jnp.zeros((1, 1, 1, config.linear_value_head_dim, config.linear_key_head_dim), dtype=jnp.float32),
     )
     bucketed_hybrid = HybridLayerState(
         conv_state=jnp.zeros((1, 1, 12, config.linear_conv_kernel_size), dtype=config.get_dtype()),
-        recurrent_state=jnp.zeros((1, 1, 1, config.linear_key_head_dim, config.linear_value_head_dim), dtype=jnp.float32),
+        recurrent_state=jnp.zeros((1, 1, 1, config.linear_value_head_dim, config.linear_key_head_dim), dtype=jnp.float32),
     )
 
     exact_batch = _scheduled_batch(
@@ -910,7 +910,7 @@ def test_linear_suffix_prefill_matches_sequential_decode_state():
     cache = executor.backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=3)
     hybrid = HybridLayerState(
         conv_state=jnp.zeros((1, 1, 12, config.linear_conv_kernel_size), dtype=config.get_dtype()),
-        recurrent_state=jnp.zeros((1, 1, 1, config.linear_key_head_dim, config.linear_value_head_dim), dtype=jnp.float32),
+        recurrent_state=jnp.zeros((1, 1, 1, config.linear_value_head_dim, config.linear_key_head_dim), dtype=jnp.float32),
     )
 
     prefix_batch = _scheduled_batch(

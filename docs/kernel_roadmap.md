@@ -123,7 +123,7 @@ gdn_recurrent_decode_step(
     v,      # [batch, gdn_heads, head_dim]
     beta,   # [batch, gdn_heads] or [batch, gdn_heads, 1]
     gate,   # [batch, gdn_heads] or [batch, gdn_heads, 1]
-    state,  # [batch, gdn_heads, head_dim, head_dim], fp32
+    state,  # [batch, gdn_heads, value_dim, key_dim], fp32 V,K layout
 ) -> (out, new_state)
 ```
 
@@ -141,13 +141,25 @@ gdn_recurrent_decode_step(
   first integrated hetero8 run preserved exact tokens while regressing
   throughput/ITL. Keep this route default-off as a diagnostic; do not treat a
   standalone width-1 recurrence custom call as an accepted serving kernel.
-- external-audit status: vLLM/FLA Qwen GDN uses k-last/V-first recurrent state
-  and BF16-oriented prefill activations. The next non-design-changing target is
-  a packed FP32 decode core that borrows vLLM's `mixed_qkv + a/b/A_log/dt_bias`
-  boundary while preserving nano's local `[B,H,K,V]` persistent state.
+- layout decision: vLLM/FlashInfer Qwen GDN uses k-last/V-first recurrent state,
+  and the repo will move canonical serving GDN state to `[B,L,HV,V,K]` instead
+  of preserving the old JAX `[B,L,HV,K,V]` ABI. The pure-JAX fallback should be
+  adapted to V,K state so external kernels do not require hot-path state
+  transposes. BF16-oriented external prefill activations remain a separate dtype
+  decision and are not implied by the layout change. Test BF16 GDN prefill
+  activations later as an opt-in experiment after V,K FP32 correctness is
+  established.
 - packed-core status: `gdn_packed_decode_step_fp32` implements that boundary as
   a local CUDA/JAX FFI target and passes focused CUDA parity for same-head and
-  GVA q/k repetition shapes. It is not a serving route or speed claim yet.
+  GVA q/k repetition shapes using the pre-change K,V state. It is not a serving
+  route or speed claim yet; revise or replace it for V,K before serving
+  promotion.
+- V,K migration status: the pure-JAX fallback now consumes and returns V,K GDN
+  state directly. Focused CUDA tests, CUDA FFI compatibility tests, MTP
+  commit-state tests, the 500-token top-5 guardrail, and the long-prefill
+  integrated goal target passed. The integrated result is `90.65 tok/s`,
+  `0.779x` vLLM, so this is an accepted correctness/layout migration, not the
+  final `0.9x` speed target.
 
 ## P1.2 - `gdn_segmented_prefill_chunk32`
 
@@ -167,7 +179,7 @@ gdn_segmented_prefill_chunk32(
     beta,           # [nnz_tokens, gdn_heads]
     gate,           # [nnz_tokens, gdn_heads]
     cu_seqlens,     # [batch + 1]
-    initial_state,  # [batch, gdn_heads, head_dim, head_dim]
+    initial_state,  # [batch, gdn_heads, value_dim, key_dim]
     chunk_size=32,
 ) -> (y, final_state)
 ```
@@ -203,6 +215,11 @@ gdn_segmented_prefill_chunk32(
   artifact. The 2026-05-26 kernel-phase revalidation kept all 500 top-1/top-5
   matches but missed the numeric bound slightly (`2.09808349609375e-05`), so the
   override gate is not currently passed.
+- dtype experiment note: FLA/FlashInfer-oriented BF16 GDN prefill activations
+  are allowed only as a later opt-in experiment, not as part of the V,K layout
+  migration. Keep recurrent state and decode activation math FP32 for the first
+  experiment, and require exact generated-token parity plus long-decode top-5
+  guardrails and integrated TTFT/throughput improvement before promotion.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 

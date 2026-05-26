@@ -42,25 +42,26 @@ def _has_cuda_backend() -> bool:
 def test_packed_gdn_decode_reference_matches_current_recurrent_path():
     batch = 2
     num_heads = 4
-    head_dim = 8
+    key_dim = 6
+    value_dim = 8
     query = jnp.linspace(
         -0.5,
         0.5,
-        batch * num_heads * head_dim,
+        batch * num_heads * key_dim,
         dtype=jnp.float32,
-    ).reshape(batch, num_heads, 1, head_dim)
+    ).reshape(batch, num_heads, 1, key_dim)
     key = jnp.linspace(
         0.4,
         -0.4,
-        batch * num_heads * head_dim,
+        batch * num_heads * key_dim,
         dtype=jnp.float32,
-    ).reshape(batch, num_heads, 1, head_dim)
+    ).reshape(batch, num_heads, 1, key_dim)
     value = jnp.linspace(
         -0.2,
         0.3,
-        batch * num_heads * head_dim,
+        batch * num_heads * value_dim,
         dtype=jnp.float32,
-    ).reshape(batch, num_heads, 1, head_dim)
+    ).reshape(batch, num_heads, 1, value_dim)
     a = jnp.linspace(-0.3, 0.2, batch * num_heads, dtype=jnp.float32).reshape(
         batch,
         num_heads,
@@ -74,9 +75,9 @@ def test_packed_gdn_decode_reference_matches_current_recurrent_path():
     state = jnp.linspace(
         -0.03,
         0.04,
-        batch * num_heads * head_dim * head_dim,
+        batch * num_heads * value_dim * key_dim,
         dtype=jnp.float32,
-    ).reshape(batch, num_heads, head_dim, head_dim)
+    ).reshape(batch, num_heads, value_dim, key_dim)
 
     mixed_qkv = jnp.concatenate(
         [
@@ -127,8 +128,8 @@ def test_packed_gdn_decode_reference_repeats_qk_for_gva():
     batch = 2
     num_q_heads = 2
     num_value_heads = 4
-    key_dim = 8
-    value_dim = 8
+    key_dim = 6
+    value_dim = 10
     mixed_qkv = jnp.linspace(
         -0.4,
         0.4,
@@ -145,7 +146,7 @@ def test_packed_gdn_decode_reference_repeats_qk_for_gva():
     )
     a_log = jnp.zeros((num_value_heads,), dtype=jnp.float32)
     dt_bias = jnp.zeros((num_value_heads,), dtype=jnp.float32)
-    state = jnp.zeros((batch, num_value_heads, key_dim, value_dim), dtype=jnp.float32)
+    state = jnp.zeros((batch, num_value_heads, value_dim, key_dim), dtype=jnp.float32)
 
     query, key, value = split_packed_gdn_decode_mixed_qkv(
         mixed_qkv,
@@ -198,5 +199,5 @@ def test_gdn_state_k_last_roundtrip_preserves_local_layout():
     k_last = local_gdn_state_to_k_last(state)
     local = k_last_gdn_state_to_local(k_last)
 
-    assert k_last.shape == (2, 3, 5, 4)
+    assert k_last.shape == state.shape
     np.testing.assert_array_equal(np.asarray(local), np.asarray(state))

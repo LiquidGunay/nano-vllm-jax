@@ -140,7 +140,7 @@ def test_linear_attention_chunked_vs_recurrent(seq_len):
     )
     
     # Recurrent computation (decode mode) - step by step
-    state = jnp.zeros((batch_size, num_heads, k_dim, v_dim), dtype=jnp.float32)
+    state = jnp.zeros((batch_size, num_heads, v_dim, k_dim), dtype=jnp.float32)
     recurrent_outputs = []
     
     for t in range(seq_len):
@@ -199,7 +199,7 @@ def test_linear_attention_multichunk_matches_recurrent(monkeypatch):
         chunk_size=chunk_size,
         use_qk_l2norm_in_kernel=True,
     )
-    state = jnp.zeros((batch_size, num_heads, k_dim, v_dim), dtype=jnp.float32)
+    state = jnp.zeros((batch_size, num_heads, v_dim, k_dim), dtype=jnp.float32)
     recurrent_outputs = []
     for t in range(seq_len):
         out_t, state = jax_recurrent_gated_delta_rule(
@@ -229,7 +229,7 @@ def test_linear_attention_state_persistence():
     k_dim = config.linear_key_head_dim
     v_dim = config.linear_value_head_dim
     
-    state = jnp.zeros((batch_size, num_heads, k_dim, v_dim), dtype=jnp.float32)
+    state = jnp.zeros((batch_size, num_heads, v_dim, k_dim), dtype=jnp.float32)
     
     # Simulate multiple decode steps
     num_steps = 10
@@ -349,8 +349,8 @@ def test_multi_layer_linear_attention_states():
     
     # Check recurrent state shape
     if hasattr(kv_cache, 'recurrent_state') and kv_cache.recurrent_state is not None:
-        expected_shape = (batch_size, num_linear_layers, config.linear_num_value_heads, 
-                          config.linear_key_head_dim, config.linear_value_head_dim)
+        expected_shape = (batch_size, num_linear_layers, config.linear_num_value_heads,
+                          config.linear_value_head_dim, config.linear_key_head_dim)
         actual_shape = kv_cache.recurrent_state.shape
         
         print(f"  Expected recurrent state shape: {expected_shape}")

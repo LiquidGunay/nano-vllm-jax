@@ -65,7 +65,7 @@ def test_segmented_gdn_prefill_reference_matches_padded_chunk32(monkeypatch):
     )
     initial_state = jax.random.normal(
         keys[5],
-        (batch, num_heads, key_dim, value_dim),
+        (batch, num_heads, value_dim, key_dim),
         dtype=jnp.float32,
     ) * 0.01
 

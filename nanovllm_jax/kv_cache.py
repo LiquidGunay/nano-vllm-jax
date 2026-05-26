@@ -90,7 +90,7 @@ class KVCacheState:
     - kv_lens: Current length of each sequence [max_seqs]
     - slot_mapping: Maps token position -> (block_id, slot) [batch, seq_len]
     - conv_state: Linear attention conv state [batch, conv_dim, kernel_size]
-    - recurrent_state: Linear attention recurrent state [batch, num_heads, k_dim, v_dim]
+    - recurrent_state: Linear attention recurrent state [batch, num_heads, v_dim, k_dim]
     
     For vLLM compatibility, we use:
     - Block-based KV cache (not contiguous)
@@ -108,7 +108,7 @@ class KVCacheState:
     kv_lens: jnp.ndarray  # [max_seqs]
     slot_mapping: jnp.ndarray  # [batch, seq_len]
     conv_state: Optional[jnp.ndarray] = None  # [batch, conv_dim, kernel_size]
-    recurrent_state: Optional[jnp.ndarray] = None  # [batch, num_heads, k_dim, v_dim]
+    recurrent_state: Optional[jnp.ndarray] = None  # [batch, num_heads, v_dim, k_dim]
 
     @property
     def storage(self) -> KVCacheStorage:
@@ -390,8 +390,8 @@ def init_hybrid_state(
             batch_size,
             num_linear_layers,
             config.linear_num_value_heads,
-            config.linear_key_head_dim,
             config.linear_value_head_dim,
+            config.linear_key_head_dim,
         ),
         dtype=jnp.float32,
     )

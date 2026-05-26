@@ -507,7 +507,7 @@ def test_gdn_prefill_chunk32_normalized_fp32_cuda_matches_chunk_reference(
         0.04,
         batch * num_heads * key_dim * value_dim,
         dtype=jnp.float32,
-    ).reshape(batch, num_heads, key_dim, value_dim)
+    ).reshape(batch, num_heads, value_dim, key_dim)
 
     query = jnp.where(valid[:, None, :, None], query, 0.0)
     key = jnp.where(valid[:, None, :, None], key, 0.0)
@@ -671,7 +671,7 @@ def test_gdn_packed_decode_step_fp32_matches_reference(
         0.04,
         batch * num_value_heads * key_dim * value_dim,
         dtype=jnp.float32,
-    ).reshape(batch, num_value_heads, key_dim, value_dim)
+    ).reshape(batch, num_value_heads, value_dim, key_dim)
 
     expected_out, expected_state = gdn_packed_decode_step_fp32_reference(
         mixed_qkv,

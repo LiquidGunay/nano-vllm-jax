@@ -42,6 +42,18 @@ optimization work starts.
    prompt-manifest hash, output-token throughput, total-token throughput, and
    request throughput. ShareGPT-style serving should be a separate comparability
    track, not a replacement for the long-prefill correctness gate.
+10. GDN serving state should move to the kernel-native V,K layout. The canonical
+    recurrent-state shape for serving should become
+    `[batch, linear_layer, value_heads, value_dim, key_dim]`, with per-layer
+    state `[B,HV,V,K]`. The old JAX `[B,HV,K,V]` path is not a reason to keep
+    the serving ABI if usable Qwen/vLLM/FlashInfer-style kernels prefer V,K.
+    Adapt the pure-JAX fallback/reference math to the V,K layout instead of
+    paying hot-path state transposes. Any transition must remain
+    correctness-gated and must not silently change activation/state dtype.
+11. Keep BF16 GDN prefill activations as a later opt-in experiment, not part of
+    the V,K layout migration. The default dtype contract remains BF16 checkpoint
+    weights with FP32 activation/state math until a separate BF16-prefill
+    experiment passes the full correctness and speed gates.
 
 ## Next Goal Handoff
 
@@ -67,6 +79,15 @@ documentation/configuration-first:
    claim, run the new vLLM-style diverse sidecar as well as the existing
    exact-token long-prefill gate. The current repeated-seed prompt suite remains
    useful for regression control because it freezes token IDs and shapes.
+8. Treat V,K as the next GDN layout target. The first implementation slice
+   should update the JAX recurrence/chunk references and hybrid-state
+   initialization/tests for `[B,L,HV,V,K]`, then route external kernels against
+   that layout. Do not add per-token or per-layer K,V<->V,K adapters in the
+   server hot path.
+9. Do not combine the V,K layout migration with BF16 GDN prefill activation
+   changes. If FLA/FlashInfer integration suggests BF16 prefill is valuable,
+   add it later behind an explicit opt-in flag such as
+   `NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16`.
 
 Current GDN status: serving GDN is still expressed as JAX and lowered by XLA to
 GPU work; there is no accepted hand-owned GDN kernel in the default path.
@@ -74,7 +95,38 @@ The GDN bottleneck is profile-backed by XLA/PjRt trace buckets and integrated
 benchmark deltas, especially the accepted chunk-size-32 movement and later
 row/chunk regressions. It is not yet proven by a separate standalone HLO-only
 audit. The next GDN kernel attempt should use Qwen 3 Next vLLM and Flash Linear
-Attention as implementation references.
+Attention as implementation references. The GDN state-layout decision is now to
+move serving state to V,K `[B,L,HV,V,K]` and adapt the pure-JAX fallback to that
+layout, rather than preserving `[B,L,HV,K,V]` as the long-term ABI.
+
+## Baseline And Best-Run Tracking
+
+Keep two records for each tracked workload:
+
+- accepted baseline: the current default path that is correctness-gated and
+  eligible for comparison by future PRs.
+- fastest achieved run: the fastest locally observed run, even if it is not yet
+  accepted because it is experimental, missing a gate, or uses opt-in kernels.
+
+Each record must include artifact path, date, model, hardware, workload shape,
+env/kernel flags, generated-token parity, top-k/logit guardrail status when
+available, throughput, TTFT p50/p95, ITL p50/p95, and vLLM ratio when a vLLM
+reference exists. The accepted baseline remains the comparison anchor; the
+fastest achieved run is a progress marker and must not replace the baseline
+unless it passes the acceptance gates.
+
+Current tracked records:
+
+- Entry 045 hetero8 accepted baseline:
+  `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json`,
+  `367.80 tok/s`, `0.426x` the stored vLLM async reference.
+- Long-prefill accepted no-kernel best/default after the GDN V,K JAX layout
+  migration:
+  `results/gpu_matrix_20260526_vk_layout.json`, `90.65 tok/s`, `0.779x` the
+  stored vLLM reference, exact generated-token parity over two repeats.
+- Active target: fastest accepted kernel-backed non-speculative serving at
+  `>=0.9x` vLLM on the same benchmark discipline, with MTP remaining
+  diagnostic-only.
 
 If paged-layout kernels remain hard to integrate cleanly, insert a smaller
 kernel-integration probe before more complicated paging work. GEMM-shaped or
@@ -736,7 +788,9 @@ Local current path:
 - nanovllm_jax/model.py::gated_deltanet_block
 - nanovllm_jax/backends.py::PureJAXBackend.gated_delta_decode
 - nanovllm_jax/model.py::jax_recurrent_gated_delta_rule
-- tensors: q/k/v [B,H,T,D], g/beta [B,H,T], state [B,H,K,V]
+- pre-change tensors: q/k/v [B,H,T,D], g/beta [B,H,T], state [B,H,K,V]
+- target serving tensors: q/k/v [B,H,T,D], g/beta [B,H,T],
+  state [B,H,V,K]
 
 vLLM Qwen GDN path:
 - vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py::QwenGatedDeltaNetAttention
@@ -752,12 +806,12 @@ FLA reference path:
   optional cu_seqlens [N+1]
 ```
 
-Layout risk: vLLM's packed decode kernel uses a k-last state layout
-`[N,HV,V,K]`, while the local correctness path and current proposed ABI use
-`[B,H,K,V]`. Do not silently flip the serving recurrent-state layout. Either
-add an adapter at the backend boundary and prove it has no integrated
-performance cost, or ask for an explicit state-layout design decision before
-making k-last state canonical.
+Layout decision: make k-last/V-first state canonical for GDN serving. The
+target persistent shape is `[B,L,HV,V,K]`, matching the Qwen/vLLM/FlashInfer
+direction and avoiding hot-path state transposes. The old `[B,L,HV,K,V]` JAX
+layout should remain only as a short-term migration/reference aid. If a fallback
+uses it internally, conversion must happen outside the decode hot path or be
+removed before promotion.
 
 ### Proposed ABI
 
@@ -768,7 +822,7 @@ gdn_recurrent_decode_step(
     v,          # [batch, gdn_heads, head_dim]
     beta,       # [batch, gdn_heads] or [batch, gdn_heads, 1]
     gate,       # [batch, gdn_heads] or [batch, gdn_heads, 1]
-    state,      # [batch, gdn_heads, head_dim, head_dim], fp32 state
+    state,      # [batch, gdn_heads, value_dim, key_dim], fp32 state
 ) -> (
     out,        # [batch, gdn_heads, head_dim]
     new_state,  # same shape as state
@@ -787,10 +841,15 @@ state dtype = fp32 unless proven safe otherwise
 
 ```text
 1. Write isolated reference test comparing current JAX recurrence vs proposed kernel.
-2. Study Qwen 3 Next vLLM and Flash Linear Attention Gated DeltaNet kernels.
-3. Start with one CUDA custom-call/FFI kernel, not Pallas.
-4. Keep pure-JAX recurrence as default fallback.
-5. Integrate behind NANO_VLLM_JAX_KERNEL_BACKEND=gdn_cuda.
+2. Change hybrid recurrent-state initialization to `[B,L,HV,V,K]`.
+3. Adapt `jax_recurrent_gated_delta_rule` and `jax_chunk_gated_delta_rule` to
+   consume and return V,K state directly.
+4. Update state-table, prefix-state, MTP, and parity tests for the new shape.
+5. Study Qwen 3 Next vLLM and Flash Linear Attention Gated DeltaNet kernels.
+6. Start with one CUDA custom-call/FFI kernel, not Pallas.
+7. Keep pure-JAX recurrence as the fallback/reference, but in the same V,K
+   serving layout.
+8. Integrate behind NANO_VLLM_JAX_KERNEL_BACKEND=gdn_cuda.
 ```
 
 Pallas is still worth studying, but JAX documents Pallas as a custom-kernel
@@ -811,27 +870,28 @@ previous Pallas regressions, it should not be the first production path for GDN.
   was slower than Entry 045 despite exact generated-token parity. Keep it
   default-off as a diagnostic route; do not promote it to default or fast
   opt-in.
-- A pure-JAX vLLM-style packed decode reference now exists in
+- A pure-JAX vLLM-style packed decode reference currently exists in
   `nanovllm_jax/kernels/cuda_gdn.py` as
   `gdn_packed_decode_reference_local_state`. It accepts packed
   `mixed_qkv [B, 2*H*K + HV*V]` plus raw `a/b/A_log/dt_bias`, computes the
-  same gate/beta transform as vLLM's packed decode path, and calls the current
-  recurrent rule while preserving the local canonical state layout
-  `[B,HV,K,V]`. CUDA-gated focused tests cover same-head, GVA q/k repetition,
-  and k-last state roundtrip; they are skipped in CPU-only/no-JAX environments.
-- External GDN reference audit confirms this packed decode boundary is the next
-  smallest viable non-design-changing target. vLLM/FLA's natural Qwen GDN state
-  layout is k-last/V-first `[*,HV,V,K]`, and the vLLM/FLA prefill path is
-  BF16-activation oriented. Do not switch persistent state layout, prefill
-  activation dtype, or scheduler state-slot semantics without an explicit user
-  design decision. The next local implementation target should be an opt-in
-  FP32 packed GDN decode core that preserves nano's `[B,HV,K,V]` state.
+  same gate/beta transform as vLLM's packed decode path, and calls the
+  pre-change recurrent rule while preserving `[B,HV,K,V]`. This is now a
+  migration/reference artifact, not the target serving ABI.
+- External GDN reference audit confirms vLLM/FLA's natural Qwen GDN state layout
+  is k-last/V-first `[*,HV,V,K]`, and the vLLM/FLA prefill path is
+  BF16-activation oriented. The explicit decision is to switch persistent GDN
+  state layout to V,K while preserving the repo's BF16-weight/FP32-activation
+  contract unless a separate dtype decision is made. The next local
+  implementation target should update the packed FP32 decode core and pure-JAX
+  fallback to consume/return `[B,HV,V,K]`.
 - A local CUDA/JAX FFI packed FP32 GDN decode core now exists as
   `gdn_packed_decode_step_fp32`. It accepts vLLM-style
-  `mixed_qkv + a/b/A_log/dt_bias`, preserves nano's local `[B,HV,K,V]` state,
+  `mixed_qkv + a/b/A_log/dt_bias`, preserves nano's pre-change `[B,HV,K,V]`
+  state,
   and passes focused CUDA parity against the pure-JAX packed reference for both
   same-head and GVA q/k repetition cases. It is an ABI/toolchain step only; it
-  is not routed into serving and makes no speed claim yet.
+  is not routed into serving and makes no speed claim yet. It should either be
+  revised to V,K or replaced by the external-kernel-native implementation.
 
 ### Acceptance Gate
 
@@ -1252,6 +1312,41 @@ Commit 7:
 - ~~Run integrated decode benchmark and record rejection of standalone GDN
   decode routing~~
 
+Commit 7b - GDN V,K layout migration:
+
+- ~~Add a layout migration note/tests for the pre-change `[B,L,HV,K,V]` state and
+  target `[B,L,HV,V,K]` state.~~
+- ~~Change `init_hybrid_state` and recurrent-state shape expectations to
+  `[batch, linear_layer, value_heads, value_dim, key_dim]`.~~
+- ~~Adapt `jax_recurrent_gated_delta_rule` and `jax_chunk_gated_delta_rule` so the
+  pure-JAX fallback consumes and returns V,K state natively.~~
+- ~~Update state-table, MTP commit-select, and focused parity tests for the new
+  shape.~~
+- Local CUDA FFI diagnostic wrappers now accept V,K state and transpose only
+  inside default-off compatibility wrappers for the legacy K,V CUDA probes.
+  Replace this with a kernel-native V,K implementation before any serving
+  promotion.
+- ~~Run layer parity, cached prefill/decode equivalence, 500-token top-5/logit
+  guardrail, and integrated server benchmark before promoting the layout.~~
+  Validation: focused CUDA suite `12 passed`; CUDA FFI suite `13 passed`; MTP
+  commit-state suite `15 passed, 1 xfailed`; long-decode top-5 guardrail passed
+  `500/500` with max HF top-k-id logit diff `1.9073486328125e-05`;
+  integrated long-prefill goal target is speed-claim-ready at `90.65 tok/s`,
+  `0.779x` vLLM, exact generated-token parity over two repeats.
+
+Commit 7c - Optional BF16 GDN prefill activation experiment:
+
+- Add `NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16` or equivalent opt-in flag.
+- Limit the first experiment to GDN prefill activations; keep recurrent state
+  and decode activation math FP32 unless a separate decision changes that
+  contract.
+- Compare against the V,K FP32-prefill baseline, not against the old K,V layout.
+- Require layer/state drift checks, cached prefill plus long-decode top-5/logit
+  guardrails, exact generated-token parity, and an integrated TTFT/throughput
+  win before promotion.
+- If the BF16 path only helps an external-kernel microbenchmark but fails the
+  full-model gates, keep it rejected/default-off.
+
 Commit 8:
 
 - ~~Add first gdn_segmented_prefill_chunk32 prototype~~
@@ -1293,6 +1388,9 @@ the pure-JAX correctness path.
 6. Do not add per-layer layout conversions to use an external kernel.
 7. Keep every external kernel behind a backend flag and fallback path.
 8. Record rejected experiments. Rejected experiments are useful evidence, not failure.
+9. Maintain both accepted-baseline and fastest-achieved records for tracked workloads.
+10. For GDN, target V,K serving state; do not preserve K,V as the serving ABI merely because the old JAX path used it.
+11. Keep BF16 GDN prefill activations as a separate opt-in experiment after V,K correctness is established.
 ```
 
 ## Expected Strategic Outcome
@@ -1302,16 +1400,17 @@ The path is:
 ```text
 Clean baseline
 -> stable benchmark matrix
--> FlashInfer paged KV append
--> FlashInfer paged decode attention
--> custom/ported GDN decode recurrence
+-> GDN V,K state migration with pure-JAX fallback updated
+-> kernel-native GDN decode recurrence
 -> custom/ported segmented GDN prefill
+-> full-attention paged KV/attention kernels when traces justify renewed P0 work
 -> only then revisit MTP or finer fusions
 ```
 
-The core bet is: keep the JAX model and correctness harness, but replace the few
-serving kernels where vLLM has structural advantage: paged KV append, paged
-decode attention, and GDN recurrence/prefill.
+The core bet is: keep the JAX model and correctness harness, but align the GDN
+state ABI with kernel-native V,K layout, then replace the few serving kernels
+where vLLM/FlashInfer have structural advantage: GDN recurrence/prefill first,
+then renewed full-attention paged KV/attention work if the traces justify it.
 
 ## Reference Links From The Proposal
 

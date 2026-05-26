@@ -151,7 +151,7 @@ def jax_chunk_gated_delta_rule_metal(
     k_cumdecay = jnp.einsum('bhnct,bhntv->bhncv', attn, k_beta_chunks * jnp.exp(g_chunks)[..., None])
     
     if initial_state is None:
-        state = jnp.zeros((batch_size, num_heads, k_head_dim, v_head_dim), dtype=jnp.float32)
+        state = jnp.zeros((batch_size, num_heads, v_head_dim, k_head_dim), dtype=jnp.float32)
     else:
         state = initial_state.astype(jnp.float32)
     
@@ -167,18 +167,18 @@ def jax_chunk_gated_delta_rule_metal(
         attn_i = jnp.einsum('bhck,bhdk->bhcd', q_i, k_i) * decay_mask_i
         attn_i = jnp.where(mask_strict_upper, 0.0, attn_i)
         
-        v_prime = jnp.einsum('bhck,bhkv->bhcv', k_cumdecay_i, state)
+        v_prime = jnp.einsum('bhck,bhvk->bhcv', k_cumdecay_i, state)
         
         v_new = v_i - v_prime
         
-        attn_inter = jnp.einsum('bhck,bhkv->bhcv', q_i * jnp.exp(g_cumsum_i)[..., None], state)
+        attn_inter = jnp.einsum('bhck,bhvk->bhcv', q_i * jnp.exp(g_cumsum_i)[..., None], state)
         
         attn_v_new = jnp.einsum('bhcd,bhdv->bhcv', attn_i, v_new)
         core_attn_out_i = attn_inter + attn_v_new
         
         g_last_minus_g = g_cumsum_i[..., -1, None] - g_cumsum_i
         k_weighted = k_i * jnp.exp(g_last_minus_g)[..., None]
-        state_update = jnp.einsum('bhck,bhcv->bhkv', k_weighted, v_new)
+        state_update = jnp.einsum('bhcv,bhck->bhvk', v_new, k_weighted)
         state = state * jnp.exp(g_cumsum_i[..., -1, None, None]) + state_update
         
         return state, core_attn_out_i

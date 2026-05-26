@@ -527,9 +527,9 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
     # Initial-state correction uses decay from the start of each chunk.
     k_cumdecay = jnp.einsum('bhnct,bhntv->bhncv', attn, k_beta_chunks * jnp.exp(g_cumsum)[..., None])
     
-    # Initialize state [B, H, K, V]
+    # Initialize state [B, H, V, K].
     if initial_state is None:
-        state = jnp.zeros((batch_size, num_heads, k_head_dim, v_head_dim), dtype=jnp.float32)
+        state = jnp.zeros((batch_size, num_heads, v_head_dim, k_head_dim), dtype=jnp.float32)
     else:
         state = initial_state.astype(jnp.float32)
     
@@ -540,7 +540,7 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
         k_i = key_chunks[:, :, i]        # [B, H, cs, K]
         v_i = value_transformed[:, :, i] # [B, H, cs, V]
         decay_mask_i = decay_mask[:, :, i]  # [B, H, cs, cs]
-        k_cumdecay_i = k_cumdecay[:, :, i]  # [B, H, cs, V]
+        k_cumdecay_i = k_cumdecay[:, :, i]  # [B, H, cs, K]
         g_cumsum_i = g_cumsum[:, :, i]    # [B, H, cs] - use cumsum version!
         
         # Within-chunk attention: attn = (q @ k.T * decay_mask), masked to strict upper triangle
@@ -548,17 +548,17 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
         attn_i = jnp.where(mask_strict_upper, 0.0, attn_i)
         
         # v_prime = k_cumdecay @ state
-        # k_cumdecay_i: [B, H, cs, V], state: [B, H, K, V]
-        # v_prime[b,h,c,v] = sum_k(k_cumdecay_i[b,h,c,k] * state[b,h,k,v])
-        v_prime = jnp.einsum('bhck,bhkv->bhcv', k_cumdecay_i, state)
+        # k_cumdecay_i: [B, H, cs, K], state: [B, H, V, K]
+        # v_prime[b,h,c,v] = sum_k(k_cumdecay_i[b,h,c,k] * state[b,h,v,k])
+        v_prime = jnp.einsum('bhck,bhvk->bhcv', k_cumdecay_i, state)
         
         # v_new = v_i - v_prime
         v_new = v_i - v_prime
         
         # attn_inter = (q * exp(g)) @ state
         # q_i * exp(g_cumsum_i): [B, H, cs, K]
-        # result: [B, H, cs, V] = sum_K(q[b,h,c,k] * exp(g_cumsum[b,h,c]) * state[b,h,k,v])
-        attn_inter = jnp.einsum('bhck,bhkv->bhcv', q_i * jnp.exp(g_cumsum_i)[..., None], state)
+        # result: [B, H, cs, V] = sum_K(q[b,h,c,k] * exp(g_cumsum[b,h,c]) * state[b,h,v,k])
+        attn_inter = jnp.einsum('bhck,bhvk->bhcv', q_i * jnp.exp(g_cumsum_i)[..., None], state)
         
         # core_attn_out = attn_inter + attn @ v_new
         # attn_i: [B, H, cs, cs], v_new: [B, H, cs, V]
@@ -572,8 +572,8 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
         g_last_minus_g = g_cumsum_i[..., -1, None] - g_cumsum_i  # [B, H, cs]
         # k_weighted[b,h,c,k] = k_i[b,h,c,k] * exp(g_last_minus_g[b,h,c])
         k_weighted = k_i * jnp.exp(g_last_minus_g)[..., None]  # [B, H, cs, K]
-        # state_update[b,h,k,v] = sum_c(k_weighted[b,h,c,k] * v_new[b,h,c,v])
-        state_update = jnp.einsum('bhck,bhcv->bhkv', k_weighted, v_new)
+        # state_update[b,h,v,k] = sum_c(v_new[b,h,c,v] * k_weighted[b,h,c,k])
+        state_update = jnp.einsum('bhcv,bhck->bhvk', v_new, k_weighted)
         state = state * jnp.exp(g_cumsum_i[..., -1, None, None]) + state_update
         
         return state, core_attn_out_i
@@ -608,7 +608,7 @@ def jax_recurrent_gated_delta_rule(
     JAX implementation of recurrent gated delta rule (matching HF torch_recurrent_gated_delta_rule).
     Input shapes: [B, H, T, D] for query/key/value, [B, H, T] for g/beta
     Output shape: [B, H, T, D]
-    State shape: [B, H, k_head_dim, v_head_dim] (per-head state, matching HF)
+    State shape: [B, H, v_head_dim, k_head_dim] (kernel-native V,K layout)
     """
     initial_dtype = query.dtype
 
@@ -630,9 +630,10 @@ def jax_recurrent_gated_delta_rule(
     # Scale query
     query = query * (1.0 / jnp.sqrt(k_head_dim))
 
-    # Initialize state: [B, H, K, V] (per-head state, matching HF)
+    # Initialize state: [B, H, V, K] so decode uses the same V,K layout as
+    # the planned external GDN kernels.
     if initial_state is None:
-        state = jnp.zeros((batch, num_heads, k_head_dim, v_head_dim), dtype=jnp.float32)
+        state = jnp.zeros((batch, num_heads, v_head_dim, k_head_dim), dtype=jnp.float32)
     else:
         state = initial_state.astype(jnp.float32)
 
@@ -642,22 +643,22 @@ def jax_recurrent_gated_delta_rule(
         # Reshape for broadcasting
         g_t_exp = g_t[:, :, None, None]    # [B, H, 1, 1]
         beta_t_exp = beta_t[:, :, None]    # [B, H, 1]
-        k_t_exp = k_t[:, :, :, None]       # [B, H, D, 1]
+        k_t_exp = k_t[:, :, None, :]       # [B, H, 1, K]
 
         # Decay state: state * exp(g_t)
         state = state * g_t_exp
 
         # kv_mem = (state * k_t[..., None]).sum(-2)
-        kv_mem = jnp.einsum('bhkv,bhk->bhv', state, k_t)
+        kv_mem = jnp.einsum('bhvk,bhk->bhv', state, k_t)
 
         # delta = (v_t - kv_mem) * beta_t
         delta = (v_t - kv_mem) * beta_t_exp  # [B, H, V]
 
-        # state = state + k_t[..., None] * delta[..., None, :]
-        state = state + k_t_exp * delta[:, :, None, :]
+        # state = state + delta[..., None] * k_t[:, :, None, :]
+        state = state + delta[:, :, :, None] * k_t_exp
 
-        # output_t = (state * q_t[..., None]).sum(-2)
-        out_t = jnp.einsum('bhkv,bhk->bhv', state, q_t)
+        # output_t = (state * q_t[:, :, None, :]).sum(-1)
+        out_t = jnp.einsum('bhvk,bhk->bhv', state, q_t)
 
         return state, out_t
 
@@ -906,8 +907,8 @@ def gated_deltanet_block(
         beta = beta.transpose(0, 2, 1)  # [B, H, T]
         
         # 6. Recurrent update
-        # recurrent_state shape: [batch, num_layers, num_heads, k_dim, v_dim]
-        # Extract recurrent state for this layer: [batch, num_heads, k_dim, v_dim]
+        # recurrent_state shape: [batch, num_layers, num_heads, v_dim, k_dim]
+        # Extract recurrent state for this layer: [batch, num_heads, v_dim, k_dim]
         # linear_layer_idx computed above
         initial_recurrent = hybrid_state.recurrent_state[:, linear_layer_idx] if hybrid_state.recurrent_state is not None else None
 
@@ -954,7 +955,7 @@ def gated_deltanet_block(
                 use_qk_l2norm_in_kernel=True,
             )
             prefix_recurrent_state_single = None
-        # new_recurrent_state_single has shape [batch, num_heads, k_dim, v_dim]
+        # new_recurrent_state_single has shape [batch, num_heads, v_dim, k_dim]
         if valid_token_mask is not None:
             row_valid = (valid_token_mask.astype(jnp.int32).sum(axis=1) > 0)
             conv_keep = row_valid[:, None, None]
