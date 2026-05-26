@@ -1283,3 +1283,38 @@ Decision:
 
 - Reject and revert the Pallas Triton LM-head argmax path. It preserved correctness and removed the dense LM-head GEMM bucket, but the custom call plus second-stage tile reduction did not beat XLA's autotuned dense GEMM inside the full server decode graph.
 - Do not revisit a two-stage Pallas argmax for this LM head on A10G unless the design eliminates the cross-tile reduction or fuses the final token selection into a single custom call. The current best path remains Entry 033.
+
+## Entry 038 - Rejected Unrolled GDN Conv1D Decode Update
+
+- run id: `20260526-004143-2040570-jax_hetero8_64_512x32_unrolled_conv1d_update`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_unrolled_conv1d_update.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-004143-2040570-jax_hetero8_64_512x32_unrolled_conv1d_update`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-004143-2040570-jax_hetero8_64_512x32_unrolled_conv1d_update/plugins/profile/2026_05_26_00_43_35/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-004143-2040570-jax_hetero8_64_512x32_unrolled_conv1d_update/plugins/profile/2026_05_26_00_43_35/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Turing recommended making fused compact prefill projection the next serious optimization target and ranked Pallas RMSNorm and GDN decode lowering behind it. Local RMSNorm CUDA microbenchmarks supported that ranking: for representative Qwen shapes (`[8, 1, 8, 256]`, `[8, 512, 8, 256]`, `[8, 512, 1024]`), the shipped Pallas RMSNorm wrapper was equal or slower than XLA, so it was not promoted to a full source experiment.
+- change tested: a temporary `NANO_VLLM_JAX_UNROLLED_CONV1D_UPDATE=1` path special-cased `causal_conv1d_update` for kernel size 4. It replaced `jnp.roll(...).at[..., -1].set(...)` plus `einsum` with an explicit four-tap update and direct multiply/add in an attempt to reduce the `wrapped_concatenate` bucket from decode-time GDN convolution state shifts. The source change was reverted after profiling.
+- smoke checks: a CUDA microbenchmark on the decode shape `[B=8, D=6144, K=4]` matched the current state exactly and had `max_abs=1.9073486328125e-06` on the convolution output. Focused CUDA tests passed with the flag enabled: `tests/test_layer_parity.py tests/test_lm_head_helpers.py` (`9 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 033 hetero8 reference.
+- JAX timing: `341.62 tok/s`, TTFT p50 `327.96 ms`, ITL p50 `13.13 ms`, ITL p95 `15.70 ms`.
+- delta vs Entry 033 default: `0.962x` total tok/s, TTFT p50 `1.038x`, ITL p50 `1.021x`, ITL p95 `1.139x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 033 ms | unrolled Conv1D ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 720.52 | 749.35 | overall regression |
+| `_run_main_and_sample` | 598.60 | 620.46 | runner hot path slower |
+| `forward_step_token_ids_jit` | 175.81 | 201.59 | compiled decode token-id step much slower |
+| `PjRtCApiLoadedExecutable::Execute` | 191.91 over 252 calls | 216.62 over 252 calls | same dispatch count, heavier execution |
+| `jit_compiled:XLA GPU module` | 147.90 | 163.83 | module time increased |
+| `command_buffer::execute` | 92.22 over 1575 calls | 95.96 over 1575 calls | command-buffer time worsened |
+| `wrapped_concatenate` | 36.49 over 576 calls | 36.26 over 576 calls | target bucket barely moved |
+| `MemcpyD2D` | 24.62 | 24.75 | unchanged/slightly worse |
+| `input_reduce_fusion` | 41.57 | 41.52 | unchanged |
+| `cutlass_80_tensorop_s1688gemm_128x128_16x5_nn_align4` | 52.39 | 52.46 | compact prefill GEMM unchanged |
+
+Decision:
+
+- Reject and revert the unrolled GDN Conv1D decode update. The microbenchmark was slightly faster in isolation, but the integrated graph did not reduce the target `wrapped_concatenate` bucket and made the decode executable heavier.
+- Do not keep source-level rewrites of the GDN Conv1D state shift. If this area is revisited, it should be as part of a real lowered GDN decode kernel that owns the convolution update and recurrent state update together.
+- Follow the subagent recommendation for the next model-side experiment: an Ampere-compatible fused compact prefill projection path, with a microbenchmark gate before any full hetero8 run.
