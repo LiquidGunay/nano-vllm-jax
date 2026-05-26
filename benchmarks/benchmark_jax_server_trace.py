@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +132,95 @@ def _timing_metrics(events: list[dict[str, Any]], elapsed: float, total_tokens: 
     }
 
 
+def _profile_counters(profile_path: Path) -> dict[str, Any]:
+    traces = sorted(profile_path.glob("plugins/profile/*/*.trace.json.gz"))
+    if not traces:
+        return {
+            "trace_json_gz": None,
+            "ranges": {},
+            "top_events_by_total_ms": [],
+        }
+    trace_path = traces[-1]
+    needles = [
+        "generate_with_trace",
+        "_run_main_and_sample",
+        "forward_step_token_ids_jit",
+        "forward_step_jit",
+        "PjRtCApiLoadedExecutable::Execute",
+        "jit_compiled:XLA GPU module",
+        "command_buffer::execute",
+        "command_buffer::update",
+        "input_reduce_fusion",
+        "loop_dynamic_update_slice_fusion",
+        "loop_multiply_fusion",
+        "wrapped_concatenate",
+        "MemcpyD2D",
+        "Thunks::Initialize",
+        "_batch_hybrid_state",
+        "_store_batch_hybrid_state",
+        "_record_kv_snapshot",
+        "_refresh_kv_snapshot",
+        "array.py:325 tolist",
+        "np.asarray(jax.Array)",
+        "gemm_fusion",
+        "cutlass",
+        "gather",
+        "transpose",
+        "fusion",
+        "while",
+    ]
+    range_totals: dict[str, list[float | int]] = defaultdict(lambda: [0.0, 0])
+    event_totals: dict[str, list[float | int]] = defaultdict(lambda: [0.0, 0])
+    try:
+        with gzip.open(trace_path, "rt", encoding="utf-8") as handle:
+            events = json.load(handle).get("traceEvents", [])
+    except Exception as exc:
+        return {
+            "trace_json_gz": str(trace_path),
+            "error": f"{type(exc).__name__}: {exc}",
+            "ranges": {},
+            "top_events_by_total_ms": [],
+        }
+
+    for event in events:
+        duration = event.get("dur")
+        if duration is None:
+            continue
+        name = str(event.get("name", ""))
+        duration_ms = float(duration) / 1000.0
+        event_totals[name][0] += duration_ms
+        event_totals[name][1] += 1
+        for needle in needles:
+            if needle in name:
+                range_totals[needle][0] += duration_ms
+                range_totals[needle][1] += 1
+
+    top_events = sorted(
+        (
+            {
+                "name": name,
+                "total_ms": float(total),
+                "count": int(count),
+            }
+            for name, (total, count) in event_totals.items()
+            if total > 0
+        ),
+        key=lambda row: row["total_ms"],
+        reverse=True,
+    )[:40]
+    return {
+        "trace_json_gz": str(trace_path),
+        "ranges": {
+            needle: {
+                "total_ms": float(total),
+                "count": int(count),
+            }
+            for needle, (total, count) in sorted(range_totals.items())
+        },
+        "top_events_by_total_ms": top_events,
+    }
+
+
 def _build_sampling_params(output_lengths: list[int], default_output_len: int):
     from nanovllm_jax.engine.sequence import SamplingParams
 
@@ -185,6 +276,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     trace = engine.generate_with_trace(prompts, sampling_params=sampling_params)
     elapsed = time.perf_counter() - started
     recorder.stop_jax_profile()
+    profile_counters = _profile_counters(recorder.profile_path) if args.profile else None
 
     rows = []
     total_tokens = 0
@@ -227,6 +319,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "performance": _timing_metrics(trace["events"], elapsed, total_tokens),
         "rows": rows,
         "events": trace["events"],
+        "profile_counters": profile_counters,
         "speculative": engine.model_runner.get_speculative_stats(),
         "mtp_admission": engine.get_mtp_admission_report(),
     }

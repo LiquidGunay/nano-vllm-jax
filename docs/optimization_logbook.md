@@ -2501,3 +2501,43 @@ Decision:
 - Reject rectangular local-math split reconstruction as a candidate path. Rectangular shape compatibility removes active gather/scatter as the root cause, but it does not solve final correctness: simply materializing local GDN intermediates across a separate reconstruction boundary changes numerics enough to miss the final-state gate.
 - Keep the rectangular local and rectangular split probes as benchmark guardrails. They prove that a local-only Pallas replacement, even one that is rectangular and locally accurate to `~1e-6`, is not sufficient for the current `1e-5` final output/state contract.
 - Do not spend more time on split-local GDN designs. The next viable GDN optimization must own local math and cross-chunk state/output recurrence in one lowered parity surface, or must improve a different model-side bottleneck without introducing a local-intermediate materialization boundary.
+
+## Entry 068 - Accepted Server Profile Counter Capture
+
+- run id: `20260526-063943-2182005-jax_hetero8_64_512x32_profile_counters`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_profile_counters.json`
+- benchmark script: `benchmarks/benchmark_jax_server_trace.py`
+- profile directory: `/mountpoint/.exp/profiles/20260526-063943-2182005-jax_hetero8_64_512x32_profile_counters`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-063943-2182005-jax_hetero8_64_512x32_profile_counters/plugins/profile/2026_05_26_06_40_06/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-063943-2182005-jax_hetero8_64_512x32_profile_counters/plugins/profile/2026_05_26_06_40_06/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Helmholtz ranked the next optimization targets as (1) a backend-owned one-piece GDN prefill kernel, not any split-local GDN path; (2) an Ampere-compatible fused compact projection microbenchmark under BF16 weights and FP32 activations; and (3) a lower-confidence coherent backend-owned KV write plus paged-attention path. It explicitly treated Entries 066-067 as closing the split-local GDN route.
+- change accepted: the server trace benchmark now parses the emitted JAX Perfetto trace and writes `profile_counters` into its JSON artifact, including selected range totals and the top trace events by total time. This does not change model execution, scheduling, or server routing.
+- CUDA run: `JAX_PLATFORMS=cuda`, A10G, BF16 weights, FP32 activations, accepted compact prefill/materialized-LM-head flags enabled, chunk size `32`, input lengths `64,128,192,256,320,384,448,512`, output length `32`, Entry 045 scheduler envelope.
+- correctness: exact generated-token match for all 8 rows against `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json`.
+- timing: `248.83 tok/s`, TTFT p50 `524.16 ms`, ITL p50 `16.07 ms`, ITL p95 `17.56 ms`. This matches the slower Entry 061 wall-clock class rather than the accepted Entry 045 wall timing, and should not be read as a model-kernel regression by itself.
+
+Parsed profile counters now stored in the JSON artifact:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `generate_with_trace` | `1028.81 ms / 1` | end-to-end measured region |
+| `_run_main_and_sample` | `891.33 ms / 32` | runner hot path |
+| `forward_step_token_ids_jit` | `140.14 ms / 32` | compiled greedy model path |
+| `PjRtCApiLoadedExecutable::Execute` | `157.86 ms / 252` | all compiled executions |
+| `jit_compiled:XLA GPU module` | `103.70 ms / 32` | compiled GPU module work |
+| `command_buffer::execute` | `42.32 ms / 1143` | command-buffer execution |
+| `command_buffer::update` | `33.80 ms / 248` | command-buffer updates |
+| `input_reduce_fusion` | `28.64 ms / 1936` | GDN-family prefill/decode counter, in line with Entry 045 |
+| `loop_multiply_fusion` | `8.46 ms / 1550` | GDN recurrence-family counter |
+| `gemm_fusion` | `542.46 ms / 4712` | aggregate GEMM/fusion substring counter; individual names still shift by compile |
+| `transpose` | `63.48 ms / 1236` | attention/KV/layout target bucket |
+| `gather` | `12.21 ms / 135` | attention/KV/layout target bucket |
+| `MemcpyD2D` | `25.04 ms / 1232` | device copy bucket |
+| `array.py:325 tolist` | `736.27 ms / 32` | host token readback attribution dominates wall timing |
+| `np.asarray(jax.Array)` | `735.93 ms / 32` | same host sync attribution |
+
+Decision:
+
+- Keep the server profile-counter capture. Every future server-profile artifact can now carry its own Perfetto trace path plus machine-readable bottleneck summary, reducing manual logbook transcription errors.
+- Treat this run as instrumentation evidence, not a speed result. The exact-token gate passed, but wall timing is dominated by host synchronization labels already discussed in Entry 061.
+- Next optimization should follow the xhigh audit: attempt a benchmark-only one-piece lowered GDN prefill candidate that owns local math plus cross-chunk recurrence in one parity surface, or build a standalone fused compact projection microbenchmark. Do not retry split-local GDN reconstruction.
