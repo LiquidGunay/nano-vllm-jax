@@ -12,6 +12,7 @@
     "workloads",
     "required_metrics",
     "goal_target",
+    "jax_default_references",
     "matrix",
     "vllm_references",
     "comparisons",
@@ -69,6 +70,9 @@
         "target_vllm_ratio",
         "description"
       ]
+    },
+    "jax_default_references": {
+      "type": "object"
     },
     "matrix": {
       "type": "object",

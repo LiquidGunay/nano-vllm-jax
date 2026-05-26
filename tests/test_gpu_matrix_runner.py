@@ -21,6 +21,7 @@ from benchmarks.run_gpu_matrix import (
     _configured_workload_reference,
     _cuda_device_preflight,
     _goal_target_failure,
+    _should_capture_live_jax_default_reference,
     _reference_for,
     _find_local_vllm_reference,
     _jax_command,
@@ -60,6 +61,7 @@ def _minimal_schema():
             "workloads",
             "required_metrics",
             "goal_target",
+            "jax_default_references",
             "matrix",
             "vllm_references",
             "comparisons",
@@ -85,6 +87,7 @@ def _minimal_summary():
             "target_vllm_ratio": 0.75,
             "description": "test target",
         },
+        "jax_default_references": {"hetero8": {"source": "stored"}},
         "matrix": {
             "hetero8": {
                 "gpu_paged_default": {
@@ -324,6 +327,45 @@ def test_stored_reference_gaps_reports_uncovered_workloads(tmp_path):
     ]
 
 
+def test_live_jax_default_capture_needed_when_selected_config_lacks_reference():
+    should_capture, missing = _should_capture_live_jax_default_reference(
+        selected_configs=["gpu_paged_fast_optin"],
+        configs={"gpu_paged_fast_optin": {"workload_reference_jsons": {}}},
+        workload=WORKLOADS["short_32_128"],
+        default_config={"allow_live_jax_default_if_reference_missing": True},
+    )
+
+    assert should_capture
+    assert missing == ["gpu_paged_fast_optin"]
+
+
+def test_live_jax_default_capture_skipped_when_default_runs_first():
+    should_capture, missing = _should_capture_live_jax_default_reference(
+        selected_configs=["gpu_paged_default", "gpu_paged_fast_optin"],
+        configs={
+            "gpu_paged_default": {"workload_reference_jsons": {}},
+            "gpu_paged_fast_optin": {"workload_reference_jsons": {}},
+        },
+        workload=WORKLOADS["short_32_128"],
+        default_config={"allow_live_jax_default_if_reference_missing": True},
+    )
+
+    assert not should_capture
+    assert missing == ["gpu_paged_default", "gpu_paged_fast_optin"]
+
+
+def test_live_jax_default_capture_disabled_by_config():
+    should_capture, missing = _should_capture_live_jax_default_reference(
+        selected_configs=["gpu_paged_fast_optin"],
+        configs={"gpu_paged_fast_optin": {"workload_reference_jsons": {}}},
+        workload=WORKLOADS["short_32_128"],
+        default_config={"allow_live_jax_default_if_reference_missing": False},
+    )
+
+    assert not should_capture
+    assert missing == ["gpu_paged_fast_optin"]
+
+
 def test_reference_for_prefers_stored_long_reference_for_default_repeats(tmp_path):
     workload = WORKLOADS["long_prefill_512_2048"]
     reference = tmp_path / "long.json"
@@ -354,6 +396,23 @@ def test_reference_for_uses_live_default_when_no_stored_reference(tmp_path):
         0,
         stored_workload_reference=None,
         generated_default_reference=generated,
+    )
+
+    assert selected == generated
+    assert source == "live_jax_default"
+
+
+def test_reference_for_can_plan_unwritten_live_default_in_dry_run(tmp_path):
+    workload = WORKLOADS["short_32_128"]
+    generated = tmp_path / "planned.json"
+
+    selected, source = _reference_for(
+        "gpu_paged_fast_optin",
+        workload,
+        0,
+        stored_workload_reference=None,
+        generated_default_reference=generated,
+        allow_unverified_generated_default=True,
     )
 
     assert selected == generated

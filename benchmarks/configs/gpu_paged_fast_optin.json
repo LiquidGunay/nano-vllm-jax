@@ -13,6 +13,7 @@
     "long_prefill_512_2048": "results/gpu_matrix_runs/20260526_104818/references/vllm_long_prefill_512_2048.json"
   },
   "allow_live_vllm_if_reference_missing": true,
+  "allow_live_jax_default_if_reference_missing": true,
   "env": {
     "JAX_PLATFORMS": "cuda",
     "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH": "1",

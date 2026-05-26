@@ -225,6 +225,8 @@ def _validate_summary_shape(summary: dict[str, Any], schema: dict[str, Any]) -> 
         ["workload", "config", "target_vllm_ratio", "description"],
         "summary.goal_target",
     )
+    if not isinstance(summary.get("jax_default_references"), dict):
+        raise ValueError("summary.jax_default_references must be an object")
 
     matrix_required = ["config", "repeats", "aggregate"]
     repeat_required = ["repeat", "artifact", "reference_json", "reference_source", "run", "metrics"]
@@ -624,10 +626,14 @@ def _reference_for(
     repeat_index: int,
     stored_workload_reference: Path | None,
     generated_default_reference: Path | None,
+    *,
+    allow_unverified_generated_default: bool = False,
 ) -> tuple[Path | None, str]:
     if stored_workload_reference and _artifact_matches_workload(stored_workload_reference, workload):
         return stored_workload_reference, _stored_jax_reference_source(workload)
     if generated_default_reference and _artifact_matches_workload(generated_default_reference, workload):
+        return generated_default_reference, "live_jax_default"
+    if generated_default_reference and allow_unverified_generated_default:
         return generated_default_reference, "live_jax_default"
     if config_name == "gpu_paged_default" and repeat_index == 0:
         return None, "none"
@@ -669,6 +675,42 @@ def _stored_reference_gaps(
             ):
                 gaps.append(f"{workload_name}/{config_name}: missing stored JAX reference")
     return gaps
+
+
+def _configs_missing_stored_jax_reference(
+    configs: dict[str, dict[str, Any]],
+    workload: Workload,
+) -> list[str]:
+    missing: list[str] = []
+    for config_name, config in configs.items():
+        if (
+            _configured_workload_reference(
+                config,
+                workload,
+                mapping_key="workload_reference_jsons",
+                legacy_key="reference_json",
+            )
+            is None
+        ):
+            missing.append(config_name)
+    return missing
+
+
+def _should_capture_live_jax_default_reference(
+    *,
+    selected_configs: list[str],
+    configs: dict[str, dict[str, Any]],
+    workload: Workload,
+    default_config: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    missing = _configs_missing_stored_jax_reference(configs, workload)
+    if not missing:
+        return False, []
+    if not bool(default_config.get("allow_live_jax_default_if_reference_missing", True)):
+        return False, missing
+    if selected_configs and selected_configs[0] == FINAL_TARGET_CONFIG:
+        return False, missing
+    return True, missing
 
 
 def _vllm_available(vllm_python: Path) -> bool:
@@ -906,6 +948,7 @@ def main() -> None:
             "target_vllm_ratio": TARGET_VLLM_RATIO,
             "description": FINAL_TARGET_DESCRIPTION,
         },
+        "jax_default_references": {},
         "matrix": {},
         "vllm_references": {},
         "comparisons": {},
@@ -917,6 +960,51 @@ def main() -> None:
         summary["matrix"][workload_name] = {}
         summary["comparisons"][workload_name] = {}
         summary["acceptance"][workload_name] = {}
+        default_config = configs.get(FINAL_TARGET_CONFIG) or _load_json(
+            CONFIG_DIR / f"{FINAL_TARGET_CONFIG}.json"
+        )
+        capture_live_default, missing_jax_refs = _should_capture_live_jax_default_reference(
+            selected_configs=selected_configs,
+            configs=configs,
+            workload=workload,
+            default_config=default_config,
+        )
+        if capture_live_default:
+            generated_default_reference = reference_dir / f"jax_default_{workload_name}.json"
+            default_command = _jax_command(
+                default_config,
+                workload,
+                generated_default_reference,
+                None,
+                f"gpu_matrix_jax_default_reference_{workload_name}_{timestamp}",
+            )
+            default_result = _run_command(
+                default_command,
+                _runtime_env(default_config.get("env", {})),
+                dry_run=args.dry_run,
+            )
+            if not args.dry_run and default_result["status"] != "ok" and not args.continue_on_error:
+                raise SystemExit(
+                    f"JAX default reference failed for {workload_name}: "
+                    f"{default_result.get('output_tail', '')}"
+                )
+            summary["jax_default_references"][workload_name] = {
+                "source": "dry_run" if args.dry_run else "live_jax_default",
+                "artifact": str(generated_default_reference),
+                "missing_selected_config_references": missing_jax_refs,
+                "run": default_result,
+                "metrics": _metric_summary(generated_default_reference)
+                if generated_default_reference.exists()
+                else None,
+            }
+        else:
+            summary["jax_default_references"][workload_name] = {
+                "source": "stored" if not missing_jax_refs else "none",
+                "artifact": None,
+                "missing_selected_config_references": missing_jax_refs,
+                "run": None,
+                "metrics": None,
+            }
         vllm_config = configs.get("gpu_paged_default") or next(iter(configs.values()))
         vllm_reference = _find_local_vllm_reference(vllm_config, workload, reference_dir)
         if vllm_reference is None and args.live_vllm and bool(vllm_config.get("allow_live_vllm_if_reference_missing", True)):
@@ -960,6 +1048,7 @@ def main() -> None:
                     repeat_index,
                     stored_workload_reference,
                     generated_default_reference,
+                    allow_unverified_generated_default=bool(args.dry_run),
                 )
                 run_label = f"gpu_matrix_{workload_name}_{config_name}_r{repeat_index + 1}_{timestamp}"
                 command = _jax_command(config, workload, output_path, reference_path, run_label)

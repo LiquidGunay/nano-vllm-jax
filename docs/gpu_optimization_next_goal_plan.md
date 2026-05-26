@@ -321,6 +321,12 @@ end-to-end throughput.
   and vLLM references for `hetero8` and `long_prefill_512_2048`, so the next
   GPU-visible two-repeat run should not silently fall back to unchecked
   baselines for the tracked workloads.
+- The live JAX fallback is now explicit for uncovered workloads. If a selected
+  config lacks a stored JAX reference and `gpu_paged_default` is not the first
+  selected config, the runner first captures a live `gpu_paged_default`
+  artifact under the run's `references/` directory and uses it as the
+  correctness baseline for the selected configs. Dry runs record that planned
+  reference command without importing JAX.
 - The same focused suite verifies command construction and runtime environment
   defaults for matrix runs: workload overrides, `--reference-json`, warmup,
   profile, `JAX_PLATFORMS=cuda`, and cache/temp roots under the configured
