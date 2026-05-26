@@ -2292,3 +2292,38 @@ Decision:
 - Do not route this through the server path or keep it as an exposed benchmark variant. It is a local algebraic cleanup, not the backend-owned segmented GDN prefill path we need.
 - Keep the dynamic profile-counter parsing improvement in the GDN microbenchmark because it reduces future logbook friction without changing model behavior.
 - Next work should follow Planck's gate: add a real backend-owned segmented GDN candidate that skips fully inactive row chunks inside one coarse operation and preserves the padded chunk32 output/final-state contract within `1e-5`.
+
+## Entry 063 - Pallas Active-Chunk Metadata Probe For Segmented GDN
+
+- run id: `20260526-054325-2166013-gdn_prefill_kernel_active_chunk_plan_hetero8_64_512x32`
+- benchmark artifact: `results/gdn_prefill_kernel_active_chunk_plan_hetero8_64_512x32.json`
+- benchmark script: `benchmarks/benchmark_gdn_prefill_kernel.py`
+- profile directory: `/mountpoint/.exp/profiles/20260526-054325-2166013-gdn_prefill_kernel_active_chunk_plan_hetero8_64_512x32`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-054325-2166013-gdn_prefill_kernel_active_chunk_plan_hetero8_64_512x32/plugins/profile/2026_05_26_05_43_30/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-054325-2166013-gdn_prefill_kernel_active_chunk_plan_hetero8_64_512x32/plugins/profile/2026_05_26_05_43_30/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Sagan recommended the next real candidate be benchmark-only `pallas_segmented_chunk32_skip_inactive`, taking `query_lens` or `valid_chunk_mask` as metadata and preserving the exact rectangular output/final-state contract. It confirmed that Pallas/Triton is viable on this A10G/JAX 0.10 setup, but warned to avoid direct dynamic slices and `einsum` inside Pallas. If the full kernel is too large, the smallest useful diagnostic is a Pallas metadata probe that consumes `query_lens`, computes active chunks, and records `72 active / 128 total / 56 skipped`.
+- change accepted: the standalone GDN benchmark now records a host-side active-chunk plan in `run_config.active_chunk_plan`, including `active_rows`, `active_chunks`, `active_starts`, `active_token_counts`, `chunks_per_row`, `row_offsets`, and active/partial masks. It also runs a tiny Pallas/Triton metadata probe on GPU that consumes `query_lens`, writes the active-chunk mask, and stores the result in `pallas_feasibility`. No model/server route changed.
+- full CUDA run: `JAX_PLATFORMS=cuda`, A10G, JAX `0.10.0`, FP32 activations/state, chunk size `32`, lengths `64,128,192,256,320,384,448,512`, `5` warmups, `20` measured repeats, current padded chunk32 only.
+- active-chunk contract: `72` active chunks, `128` total chunks, `56` inactive chunks, `0` partial chunks for this length set. `chunks_per_row=[2,4,6,8,10,12,14,16]` and `row_offsets=[0,2,6,12,20,30,42,56,72]`.
+- Pallas metadata probe: lowering succeeded, `mask_matches_plan=true`, `custom_call_count=2`, compile time `0.288 s`, host-visible run time `2.637 ms`, and the traced kernel label `gdn_active_chunk_probe` took `0.038 ms` total.
+- correctness: current padded chunk32 self-comparison remains exact: `output_max_abs=0.0`, `valid_output_max_abs=0.0`, `state_max_abs=0.0`.
+- timing: current padded chunk32 p50 `6.479 ms`, mean `6.483 ms`, p95 `6.509 ms`, true-token throughput `355,391 tok/s`, rectangular-token throughput `631,806 tok/s`.
+
+Top profile counters:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `gdn_prefill/current_jax_chunk32_padded` | `229.65 ms / 25` | baseline annotation including warmup/profile overhead |
+| `gdn_prefill/pallas_active_chunk_probe` | `2.67 ms / 1` | host-visible probe range with synchronization |
+| `gdn_active_chunk_probe` | `0.038 ms / 2` | actual tiny Pallas kernel labels |
+| `PjRtCApiLoadedExecutable::Execute` | `99.58 ms / 26` | one extra execute from the metadata probe |
+| `command_buffer::execute` | `19.69 ms / 1225` | baseline GDN command-buffer count unchanged |
+| `command_buffer::update` | `1.48 ms / 96` | baseline GDN command-buffer updates unchanged |
+| `input_reduce_fusion` | `14.64 ms / 775` | baseline recurrence counter |
+| `while` | `27.50 ms / 50` | baseline loop counter |
+
+Decision:
+
+- Keep this benchmark scaffold. It proves that the active-chunk metadata contract is explicit, serializable in artifacts, and consumable by an A10G-compatible Pallas/Triton kernel without touching model behavior.
+- This is not a speed win and must not be promoted to server routing. It is a prerequisite for the real `pallas_segmented_chunk32_skip_inactive` candidate.
+- The next implementation step should replace the metadata-only kernel with a benchmark-only Pallas segmented GDN candidate over the same `query_lens`/active-chunk plan, preserving the current padded chunk32 reference within `1e-5`.

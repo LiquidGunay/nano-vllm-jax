@@ -139,6 +139,67 @@ def _make_inputs(args: argparse.Namespace, lengths: tuple[int, ...]):
     return query, key, value, g, beta, initial_state, valid
 
 
+def _active_chunk_plan(args: argparse.Namespace, lengths: tuple[int, ...]) -> dict[str, Any]:
+    n_chunks = args.seq_len // args.chunk_size
+    length_array = np.asarray(lengths, dtype=np.int32)
+    chunk_ids = np.arange(n_chunks, dtype=np.int32)
+    chunk_starts = chunk_ids * int(args.chunk_size)
+    chunk_ends = chunk_starts + int(args.chunk_size)
+    active_mask = chunk_starts[None, :] < length_array[:, None]
+    full_mask = chunk_ends[None, :] <= length_array[:, None]
+    partial_mask = active_mask & ~full_mask
+    active_rows, active_chunks = np.nonzero(active_mask)
+    active_starts = active_chunks.astype(np.int32) * int(args.chunk_size)
+    if active_rows.size:
+        active_token_counts = np.minimum(
+            int(args.chunk_size),
+            length_array[active_rows] - active_starts,
+        ).astype(np.int32)
+    else:
+        active_token_counts = np.zeros((0,), dtype=np.int32)
+    chunks_per_row = active_mask.sum(axis=1).astype(np.int32)
+    row_offsets = np.concatenate(
+        [np.zeros((1,), dtype=np.int32), np.cumsum(chunks_per_row, dtype=np.int32)]
+    )
+    return {
+        "n_chunks": int(n_chunks),
+        "active_chunk_count": int(active_rows.size),
+        "total_chunk_count": int(args.batch_size * n_chunks),
+        "inactive_chunk_count": int(args.batch_size * n_chunks - active_rows.size),
+        "partial_chunk_count": int(partial_mask.sum()),
+        "chunks_per_row": chunks_per_row.tolist(),
+        "row_offsets": row_offsets.tolist(),
+        "active_rows": active_rows.astype(np.int32).tolist(),
+        "active_chunks": active_chunks.astype(np.int32).tolist(),
+        "active_starts": active_starts.astype(np.int32).tolist(),
+        "active_token_counts": active_token_counts.tolist(),
+        "active_mask": active_mask.astype(np.int32).tolist(),
+        "partial_mask": partial_mask.astype(np.int32).tolist(),
+    }
+
+
+def _pallas_active_chunk_probe_fn(batch_size: int, n_chunks: int, chunk_size: int) -> Callable:
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as plt
+
+    def kernel(lengths_ref, out_ref):
+        row = pl.program_id(0)
+        chunk = pl.program_id(1)
+        length = lengths_ref[row]
+        out_ref[row, chunk] = ((chunk * chunk_size) < length).astype(jnp.int32)
+
+    def run(query_lens):
+        return pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((batch_size, n_chunks), jnp.int32),
+            grid=(batch_size, n_chunks),
+            name="gdn_active_chunk_probe",
+            compiler_params=plt.CompilerParams(num_warps=1),
+        )(query_lens)
+
+    return run
+
+
 def _padded_chunked_fn(chunk_size: int) -> Callable:
     def run(query, key, value, g, beta, initial_state):
         return jax_chunk_gated_delta_rule(
@@ -229,6 +290,8 @@ def _profile_counters(profile_path: Path, profiled_iterations: int, variants: li
         "loop_multiply_fusion",
         "MemcpyD2D",
         "Thunks::Initialize",
+        "gdn_prefill/pallas_active_chunk_probe",
+        "gdn_active_chunk_probe",
         "while",
         "fusion",
         "transpose",
@@ -280,9 +343,17 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
     rectangular_tokens = int(args.batch_size * args.seq_len)
     active_chunks = int(sum((length + args.chunk_size - 1) // args.chunk_size for length in lengths))
     total_chunks = int(args.batch_size * (args.seq_len // args.chunk_size))
+    active_chunk_plan = _active_chunk_plan(args, lengths)
+    query_lens = jnp.asarray(lengths, dtype=jnp.int32)
 
     variant_results: dict[str, dict[str, Any]] = {}
     outputs: dict[str, tuple[jnp.ndarray, jnp.ndarray]] = {}
+    pallas_feasibility: dict[str, Any] = {
+        "attempted": False,
+        "lowering_ok": None,
+        "error": None,
+        "custom_call_count": None,
+    }
 
     # Compile before profiling. The trace should focus on warmed kernel behavior.
     compiled_variants: list[tuple[str, Callable, Any, float]] = []
@@ -291,8 +362,40 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         compiled = jax.jit(fn).lower(*inputs).compile()
         compiled_variants.append((name, fn, compiled, time.perf_counter() - started))
 
+    pallas_probe = None
+    if jax.default_backend() == "gpu":
+        pallas_feasibility["attempted"] = True
+        try:
+            started = time.perf_counter()
+            probe_fn = _pallas_active_chunk_probe_fn(
+                int(args.batch_size),
+                int(args.seq_len // args.chunk_size),
+                int(args.chunk_size),
+            )
+            pallas_probe = jax.jit(probe_fn).lower(query_lens).compile()
+            pallas_feasibility["compile_seconds"] = time.perf_counter() - started
+            pallas_feasibility["lowering_ok"] = True
+        except BaseException as exc:
+            pallas_feasibility["lowering_ok"] = False
+            pallas_feasibility["error"] = f"{type(exc).__name__}: {exc}"
+
     recorder.start_jax_profile(enabled=args.profile)
     try:
+        if pallas_probe is not None:
+            with _trace_annotation("gdn_prefill/pallas_active_chunk_probe"):
+                started = time.perf_counter()
+                pallas_mask = _block_until_ready(pallas_probe(query_lens))
+                pallas_feasibility["run_ms"] = 1000.0 * (time.perf_counter() - started)
+            pallas_mask_host = np.asarray(pallas_mask)
+            expected_mask = np.asarray(active_chunk_plan["active_mask"], dtype=np.int32)
+            pallas_feasibility.update(
+                {
+                    "mask_matches_plan": bool(np.array_equal(pallas_mask_host, expected_mask)),
+                    "active_chunk_count": int(pallas_mask_host.sum()),
+                    "inactive_chunk_count": int(pallas_mask_host.size - pallas_mask_host.sum()),
+                    "total_chunk_count": int(pallas_mask_host.size),
+                }
+            )
         for name, _fn, compiled, compile_seconds in compiled_variants:
             warmup_ms = []
             last_output = None
@@ -331,6 +434,12 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
     for name, output in outputs.items():
         comparisons[f"{name}_vs_{reference_name}"] = _compare_outputs(outputs[reference_name], output, valid)
     profiled_iterations = len(variants) * (int(args.warmups) + int(args.repeats))
+    profile_counters = _profile_counters(recorder.profile_path, profiled_iterations, list(variants)) if args.profile else None
+    if profile_counters is not None:
+        ranges = profile_counters.get("ranges", {})
+        probe_custom_call = ranges.get("gdn_active_chunk_probe")
+        if probe_custom_call is not None:
+            pallas_feasibility["custom_call_count"] = int(probe_custom_call.get("count", 0))
 
     return {
         "run_config": {
@@ -347,6 +456,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
             "rectangular_tokens": rectangular_tokens,
             "active_chunks": active_chunks,
             "total_chunks": total_chunks,
+            "active_chunk_plan": active_chunk_plan,
             "warmups": args.warmups,
             "repeats": args.repeats,
             "seed": args.seed,
@@ -355,13 +465,8 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         },
         "variants": variant_results,
         "comparisons": comparisons,
-        "profile_counters": _profile_counters(recorder.profile_path, profiled_iterations, list(variants)) if args.profile else None,
-        "pallas_feasibility": {
-            "attempted": False,
-            "lowering_ok": None,
-            "error": None,
-            "custom_call_count": None,
-        },
+        "profile_counters": profile_counters,
+        "pallas_feasibility": pallas_feasibility,
         "historical_negative_controls": [
             "Entry053 static row-chunk ragged GDN prefill",
             "Entry056 static chunk-major GDN prefill",
