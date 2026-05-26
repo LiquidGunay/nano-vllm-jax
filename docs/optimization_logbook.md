@@ -2187,3 +2187,63 @@ Decision:
 - Reject and revert rowwise exact-length GDN prefill. It failed both acceptance axes: correctness drift exceeded the standalone gate, and performance regressed badly from duplicated per-row compiled subgraphs.
 - Treat this as closure for source-JAX exact-length inactive-chunk skipping. Even the best diagnostic source spelling creates shape-dependent numerical drift and Entry-053/056-like module/kernel expansion.
 - The next GDN speed attempt should be a true backend-owned segmented kernel that preserves the exact padded chunk32 accumulation contract, or a lower-level custom implementation with explicit correctness controls; more source-JAX decomposition is not aligned with the current evidence.
+
+## Entry 061 - Current Server Reprofile After GDN Microbench Closure
+
+- matched run id: `20260526-051717-2158089-jax_hetero8_64_512x32_current_matched_reprofile`
+- matched benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_current_matched_reprofile.json`
+- matched profile directory: `/mountpoint/.exp/profiles/20260526-051717-2158089-jax_hetero8_64_512x32_current_matched_reprofile`
+- matched Perfetto trace: `/mountpoint/.exp/profiles/20260526-051717-2158089-jax_hetero8_64_512x32_current_matched_reprofile/plugins/profile/2026_05_26_05_17_39/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- matched TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-051717-2158089-jax_hetero8_64_512x32_current_matched_reprofile/plugins/profile/2026_05_26_05_17_39/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- scheduler-envelope artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_current_reprofile.json`
+- scheduler-envelope profile directory: `/mountpoint/.exp/profiles/20260526-050707-2154593-jax_hetero8_64_512x32_current_reprofile`
+- scheduler-envelope Perfetto trace: `/mountpoint/.exp/profiles/20260526-050707-2154593-jax_hetero8_64_512x32_current_reprofile/plugins/profile/2026_05_26_05_13_52/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- scheduler-envelope TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-050707-2154593-jax_hetero8_64_512x32_current_reprofile/plugins/profile/2026_05_26_05_13_52/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Mencius recommended first confirming the current server contract against Entry 045, then avoiding more source-JAX inactive-chunk GDN work. The audit identified the next useful target as a backend-owned segmented GDN prefill microbenchmark that preserves the current padded chunk32 outputs/final states within `1e-5`, beats Entry 057's p50 `6.477 ms`, and does not increase command-buffer or module counts.
+- change tested: no source change. This reprofile records current HEAD after Entries 057-060 closed the source-JAX and recurrence-replacement GDN routes. The matched run used the Entry 045 scheduler envelope: `max_kv_cache_mb=3072`, `num_kvcache_blocks=256`, `max_num_batched_tokens=4096`, `max_num_seqs=8`, BF16 weights, FP32 activations, hetero8 input lengths `64..512`, `32` output tokens, `jit`, greedy token fastpath, materialized tied LM head, and all accepted compact prefill flags.
+- correctness: both artifacts exactly matched the Entry 045 generated-token reference for all 8 prompts over all 32 generated tokens.
+
+Matched-envelope performance compared with Entry 045:
+
+| metric | Entry 045 | matched reprofile | note |
+| --- | ---: | ---: | --- |
+| throughput | `367.797 tok/s` | `256.382 tok/s` | slower wall time, but GPU execute ranges did not regress |
+| seconds | `0.696 s` | `0.999 s` | total server trace wall time |
+| TTFT p50 | `289.979 ms` | `521.910 ms` | single full-prefill step in both runs (`2304` scheduler tokens) |
+| ITL p50 | `13.145 ms` | `15.219 ms` | decode path still exact |
+| ITL p95 | `13.593 ms` | `16.181 ms` | decode path still exact |
+
+Matched-envelope profile comparison:
+
+| range | Entry 045 total ms / count | matched total ms / count | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | `696.03 / 1` | `998.50 / 1` | wall range slower |
+| `_run_main_and_sample` | `572.99 / 32` | `877.08 / 32` | host-visible sample loop slower |
+| `forward_step_token_ids_jit` | `122.13 / 32` | `118.43 / 32` | model forward range stable/slightly lower |
+| first `forward_step_token_ids_jit` | `30.83 / 1` | `27.26 / 1` | prefill forward stable |
+| `PjRtCApiLoadedExecutable::Execute` | `138.32 / 252` | `132.64 / 252` | GPU executable time stable/slightly lower |
+| `jit_compiled:XLA GPU module` | `94.20 / 32` | `89.17 / 32` | stable |
+| `command_buffer::execute` | `40.34 / 1143` | `37.73 / 1143` | stable/slightly lower |
+| `command_buffer::update` | `27.13 / 248` | `26.88 / 248` | stable |
+| `input_reduce_fusion` | `28.65 / 1936` | `28.64 / 1936` | GDN recurrence range unchanged |
+| `loop_dynamic_update_slice_fusion` | `10.47 / 1328` | `10.53 / 1328` | unchanged |
+| `loop_multiply_fusion` | `8.67 / 1550` | `8.47 / 1550` | unchanged |
+| `gather` | `11.97 / 135` | `12.16 / 135` | unchanged |
+| `transpose` | `63.11 / 1236` | `63.25 / 1236` | unchanged |
+| `wrapped_concatenate` | `36.50 / 576` | `36.46 / 576` | unchanged |
+| `MemcpyD2D` | `24.69 / 1231` | `24.62 / 1232` | unchanged |
+| `array.py:325 tolist` | `437.58 / 32` | `745.22 / 32` | dominant source of slower wall timing |
+| `np.asarray(jax.Array)` | `437.35 / 32` | `744.96 / 32` | synchronization/readback label, not a model-kernel regression |
+| `while` | `13.48 / 36` | `12.33 / 36` | stable/slightly lower |
+
+Scheduler-envelope check:
+
+- A first reprofile used `max_kv_cache_mb=1024`, `num_kvcache_blocks=64`, and `max_num_batched_tokens=512`. It is not comparable to Entry 045 because prefill was split into several scheduler steps instead of a single `2304` token prefill step.
+- That smaller-envelope run remained correct but measured only `9.313 tok/s`, TTFT p50 `12731.629 ms`, ITL p50 `22.116 ms`, and ITL p95 `25.784 ms`. The trace showed `generate_with_trace=27487.12 ms`, `_run_main_and_sample=25132.42 ms`, `forward_step_token_ids_jit=24552.00 ms`, `PjRt Execute=441.60 ms / 2179`, `gather=930.86 ms / 2076`, `MemcpyD2D=85.80 ms / 3209`, and `while=79.01 ms / 76`.
+- Treat this as evidence that the smaller scheduler envelope is a separate throughput problem; do not compare it to Entry 045's accepted baseline.
+
+Decision:
+
+- Correctness is still protected: the current server path exactly reproduces the Entry 045 generated-token reference under both scheduler envelopes.
+- The matched fair comparison does not show a model-kernel regression. `PjRt Execute`, command-buffer counts, GDN recurrence ranges, KV/layout ranges, and the first prefill forward are stable. The slower matched wall timing is dominated by `tolist`/`np.asarray` synchronization/readback labels, so it should not redirect kernel work by itself.
+- Continue with Mencius's recommendation: the next speed target should be a backend-owned segmented GDN prefill microbenchmark gated against Entry 057. Do not resume source-JAX GDN decomposition or recurrence-replacement work unless there is a new correctness plan.
