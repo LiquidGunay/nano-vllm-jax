@@ -1354,3 +1354,41 @@ Decision:
 
 - Reject and revert the Pallas fused compact prefill projection path for the current BF16-weight/FP32-activation serving contract. A BF16/BF16 helper is not aligned with the correctness contract, and the mixed FP32/BF16 version loses badly to XLA/CUTLASS.
 - Do not revisit this exact Pallas design unless it can use tensor cores efficiently while preserving FP32 activations and BF16 weights, or unless the accepted serving contract changes. The next prefill work should inspect HLO/layout around the existing XLA compact dots rather than replacing them with many small Pallas custom calls.
+
+## Entry 040 - Rejected Pallas Gated DeltaNet Decode Kernel
+
+- run id: `20260526-010942-2048273-jax_hetero8_64_512x32_pallas_gdn_decode`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_pallas_gdn_decode.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-010942-2048273-jax_hetero8_64_512x32_pallas_gdn_decode`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-010942-2048273-jax_hetero8_64_512x32_pallas_gdn_decode/plugins/profile/2026_05_26_01_11_26/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-010942-2048273-jax_hetero8_64_512x32_pallas_gdn_decode/plugins/profile/2026_05_26_01_11_26/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: a temporary `NANO_VLLM_JAX_PALLAS_GDN_DECODE=1` path routed width-1 cached Gated DeltaNet decode to a Pallas Triton helper for FP32 activations/state. The kernel owned Q/K L2 normalization, state decay, KV memory read, delta update, state writeback, and output projection. The source change was reverted after profiling.
+- microbenchmark gate: on representative decode shape (`B=8`, `H=16`, `D=128`, `T=1`), the Pallas helper with `BLOCK_V=64` and `allow_tf32=False` matched the JAX recurrent path (`out_max ~= 1.34e-7`, `state_max ~= 4.77e-7`, `out_mse ~= 4.22e-16`) and was faster in isolation (`0.185 ms` vs `0.237 ms`, `0.783x`). The faster default-TF32 variant had about `1.1e-4` output drift and was not used.
+- focused CUDA checks: `tests/test_layer_parity.py::test_linear_attention_recurrent`, the temporary routed Pallas parity test, and `tests/test_lm_head_helpers.py` passed before the full run (`5 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 033 hetero8 reference.
+- JAX timing: `347.11 tok/s`, TTFT p50 `322.66 ms`, ITL p50 `13.22 ms`, ITL p95 `14.07 ms`.
+- delta vs Entry 033 default: `0.977x` total tok/s, TTFT p50 `1.021x`, ITL p50 `1.028x`, ITL p95 `1.020x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 033 ms | Pallas GDN decode ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 720.52 | 737.51 | overall slower |
+| `_run_main_and_sample` | 598.60 | 609.89 | runner hot path slower |
+| `forward_step_token_ids_jit` | 175.81 | 179.80 | decode token-id step slightly slower |
+| `PjRtCApiLoadedExecutable::Execute` | 191.91 over 252 calls | 194.69 over 252 calls | same dispatch count, heavier execution |
+| `jit_compiled:XLA GPU module` | 147.90 | 148.38 | module bucket nearly unchanged |
+| `command_buffer::execute` | 92.22 over 1575 calls | 93.58 over 1730 calls | more command-buffer work |
+| `command_buffer::update` | 27.81 over 248 calls | 29.53 over 403 calls | more command-buffer updates |
+| `gated_delta_decode` | 0.00 | 18.39 over 558 calls | new custom-call work; did not reduce total step latency |
+| `gemm_fusion_dot_286` | 25.05 | 25.78 | unchanged/slightly worse |
+| `gemm_fusion_dot_285` | 23.45 | 23.14 | small local improvement did not pay for custom calls |
+| `wrapped_concatenate` | 36.49 | 36.20 | effectively unchanged |
+| `MemcpyD2D` | 24.62 | 25.61 | slightly worse |
+| `input_reduce_fusion` | 41.57 | 41.54 | unchanged |
+
+Decision:
+
+- Reject and revert the Pallas Gated DeltaNet decode path. It was numerically clean under the FP32-activation/BF16-weight serving contract and faster in isolation, but the integrated server graph regressed throughput and ITL.
+- The profile shows the custom-call path adds `gated_delta_decode` ranges and more command-buffer update/execute activity without reducing the dominant dense/decode buckets. This is another case where a good isolated Pallas kernel loses once inserted 18 layers x 31 decode steps into the compiled server loop.
+- Do not revisit a per-head/per-value-tile Pallas GDN decode kernel in this shape. If GDN decode is revisited, it likely needs coarser fusion that also owns the Conv1D shift/projection boundary or reduces custom-call count, not only the recurrent state update.
