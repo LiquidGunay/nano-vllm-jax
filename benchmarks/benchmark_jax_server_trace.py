@@ -46,6 +46,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefill-buckets", default="16,32,64,128")
     parser.add_argument("--batch-size-buckets", default="1,2,4")
     parser.add_argument("--max-blocks-per-seq", type=int, default=16)
+    parser.add_argument(
+        "--linear-chunk-size",
+        type=int,
+        default=0,
+        help="Override Qwen3.5 Gated DeltaNet prefill chunk size; 0 keeps the model default.",
+    )
     parser.add_argument("--warmup", action="store_true", default=True)
     parser.add_argument("--no-warmup", dest="warmup", action="store_false")
     parser.add_argument("--reference-json", default="")
@@ -148,20 +154,26 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     prompt_rows = make_prompts(tokenizer, input_lens, args.prompt_suite)
     prompts = [row["input_ids"] for row in prompt_rows]
 
+    engine_kwargs = {
+        "backend": args.backend,
+        "dtype": args.dtype,
+        "weight_dtype": args.weight_dtype,
+        "max_kv_cache_bytes": int(args.max_kv_cache_mb * 1024 * 1024),
+        "num_kvcache_blocks": args.num_kvcache_blocks,
+        "max_num_seqs": args.max_num_seqs,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "prefill_buckets": tuple(_parse_ints(args.prefill_buckets)),
+        "batch_size_buckets": tuple(_parse_ints(args.batch_size_buckets)),
+        "max_blocks_per_seq": args.max_blocks_per_seq,
+        "jax_execution": args.jax_execution,
+        "num_speculative_tokens": args.num_speculative_tokens,
+    }
+    if args.linear_chunk_size:
+        engine_kwargs["linear_chunk_size"] = args.linear_chunk_size
+
     engine = LLMEngine(
         args.model,
-        backend=args.backend,
-        dtype=args.dtype,
-        weight_dtype=args.weight_dtype,
-        max_kv_cache_bytes=int(args.max_kv_cache_mb * 1024 * 1024),
-        num_kvcache_blocks=args.num_kvcache_blocks,
-        max_num_seqs=args.max_num_seqs,
-        max_num_batched_tokens=args.max_num_batched_tokens,
-        prefill_buckets=tuple(_parse_ints(args.prefill_buckets)),
-        batch_size_buckets=tuple(_parse_ints(args.batch_size_buckets)),
-        max_blocks_per_seq=args.max_blocks_per_seq,
-        jax_execution=args.jax_execution,
-        num_speculative_tokens=args.num_speculative_tokens,
+        **engine_kwargs,
     )
     if args.warmup:
         warmup_params = _build_sampling_params([], min(2, args.output_len))
@@ -196,6 +208,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "weight_dtype": args.weight_dtype,
             "backend": args.backend,
             "jax_execution": args.jax_execution,
+            "linear_chunk_size": int(engine.config.linear_chunk_size),
             "num_speculative_tokens": args.num_speculative_tokens,
             "input_lens": input_lens,
             "output_len": args.output_len,

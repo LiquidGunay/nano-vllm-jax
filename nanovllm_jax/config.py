@@ -31,7 +31,7 @@ class Qwen3_5Config:
     linear_key_head_dim: int = 128
     linear_value_head_dim: int = 128
     linear_conv_kernel_size: int = 4
-    linear_chunk_size: int = 64
+    linear_chunk_size: int = 32
     linear_recurrent_prefill_threshold: int = 8
     use_qk_norm_in_gdn: bool = True
     
@@ -164,7 +164,7 @@ class Qwen3_5Config:
             linear_key_head_dim=128,
             linear_value_head_dim=128,
             linear_conv_kernel_size=4,
-            linear_chunk_size=64,
+            linear_chunk_size=32,
             use_qk_norm_in_gdn=True,
             rope_theta=10_000_000,
             max_position_embeddings=262144,
@@ -187,7 +187,7 @@ class Qwen3_5Config:
             linear_key_head_dim=128,
             linear_value_head_dim=128,
             linear_conv_kernel_size=4,
-            linear_chunk_size=64,
+            linear_chunk_size=32,
             use_qk_norm_in_gdn=True,
             rope_theta=10_000_000,
             max_position_embeddings=262144,
@@ -210,7 +210,7 @@ class Qwen3_5Config:
             linear_key_head_dim=128,
             linear_value_head_dim=128,
             linear_conv_kernel_size=4,
-            linear_chunk_size=64,
+            linear_chunk_size=32,
             use_qk_norm_in_gdn=True,
             rope_theta=1_000_000,
             max_position_embeddings=262144,

@@ -1553,3 +1553,46 @@ Decision:
 - Reject and revert async greedy token readback. The idea was correctness-neutral, but the profile shows the actual `tolist`/`np.asarray(jax.Array)` synchronization bucket did not move.
 - Do not keep an optional flag for this. If host synchronization is revisited, it needs a larger serving-loop change that changes the dependency structure, not only `copy_to_host_async()` on the final token-id array.
 - Follow the xhigh audit for the next model-side experiment: controlled GDN prefill chunk/layout sweep with exact-token gates and profile focus on `input_reduce_fusion`, first `forward_step_token_ids_jit`, and total compiled execution.
+
+## Entry 045 - Accepted GDN Prefill Chunk Size 32
+
+- accepted run id: `20260526-022026-2079580-jax_hetero8_64_512x32_gdn_chunk32_default_repeat`
+- accepted benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json`
+- accepted profile directory: `/mountpoint/.exp/profiles/20260526-022026-2079580-jax_hetero8_64_512x32_gdn_chunk32_default_repeat`
+- accepted Perfetto trace: `/mountpoint/.exp/profiles/20260526-022026-2079580-jax_hetero8_64_512x32_gdn_chunk32_default_repeat/plugins/profile/2026_05_26_02_20_50/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- accepted TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-022026-2079580-jax_hetero8_64_512x32_gdn_chunk32_default_repeat/plugins/profile/2026_05_26_02_20_50/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- supporting chunk-32 first run: `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32.json`, profile `/mountpoint/.exp/profiles/20260526-020811-2074219-jax_hetero8_64_512x32_gdn_chunk32`, `358.77 tok/s`, exact correctness.
+- supporting chunk-32 explicit repeat: `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_repeat.json`, profile `/mountpoint/.exp/profiles/20260526-021331-2076191-jax_hetero8_64_512x32_gdn_chunk32_repeat`, `369.14 tok/s`, exact correctness.
+- rejected chunk-128 sweep: `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk128.json`, profile `/mountpoint/.exp/profiles/20260526-021053-2075185-jax_hetero8_64_512x32_gdn_chunk128`, `293.75 tok/s`, exact correctness but TTFT p50 `457.02 ms`.
+- change accepted: set `Qwen3_5Config.linear_chunk_size` and Qwen3.5 preset chunk sizes from `64` to `32`. Also add a benchmark-only `--linear-chunk-size` override to `benchmark_jax_server_trace.py` so future sweeps can reproduce alternate GDN chunk sizes without changing source defaults.
+- focused CUDA checks: after promoting chunk size 32 as the default, `tests/test_kv_cache.py::test_linear_attention_chunked_vs_recurrent`, `tests/test_kv_cache.py::test_linear_attention_multichunk_matches_recurrent`, `tests/test_backend_boundaries.py::test_bucketed_linear_prefill_preserves_hybrid_state_for_decode`, `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute`, and `tests/test_lm_head_helpers.py` passed under `JAX_PLATFORMS=cuda` (`8 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 033 hetero8 reference in all chunk-size sweep runs.
+- accepted JAX timing: `367.80 tok/s`, TTFT p50 `289.98 ms`, ITL p50 `13.14 ms`, ITL p95 `13.59 ms`.
+- delta vs Entry 033 default: `1.035x` total tok/s, TTFT p50 `0.918x`, ITL p50 `1.022x`, ITL p95 `0.986x`.
+- delta vs vLLM async baseline (`864.18 tok/s`): JAX moves from `0.411x` vLLM in Entry 033 to `0.426x` vLLM.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 033 ms | chunk-32 default repeat ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 720.52 | 696.03 | overall improved |
+| `_run_main_and_sample` | 598.60 | 572.99 | runner hot path improved |
+| `forward_step_token_ids_jit` | 175.81 | 122.13 | compiled model path improved |
+| first `forward_step_token_ids_jit` | 83.25 | 30.83 | prefill step improved materially |
+| `PjRtCApiLoadedExecutable::Execute` | 191.91 over 252 calls | 138.32 over 252 calls | same dispatch count, less device execution |
+| `jit_compiled:XLA GPU module` | 147.90 | 94.20 | improved lowered module time |
+| `command_buffer::execute` | 92.22 over 1575 calls | 40.34 over 1143 calls | fewer/lighter command-buffer executes |
+| `command_buffer::update` | 27.81 over 248 calls | 27.13 over 248 calls | unchanged |
+| `input_reduce_fusion` | 59.30 over 2512 calls | 28.65 over 1936 calls | target GDN prefill bucket roughly halved |
+| `cutlass_80_tensorop_s1688gemm_128x128_16x5_nn_align4` | 52.39 | 52.40 | compact projection GEMM unchanged |
+| `gemm_fusion_dot_general_746` | 13.92 | 13.92 | unchanged |
+| `wrapped_concatenate` | 36.49 | 36.50 | unchanged |
+| `MemcpyD2D` | 24.62 | 24.69 | unchanged |
+| `array.py:325 tolist` | 409.69 | 437.58 | host sync attribution worsened, but end-to-end still improved |
+
+Decision:
+
+- Accept chunk size 32 as the default GDN prefill chunk size. This is the first post-Entry-033 model-side change with clear profile evidence on the intended bucket and exact generated-token correctness.
+- Keep the benchmark override for future controlled sweeps, but do not expose a new server flag yet. The library default should get the faster path without extra user setup.
+- Do not use chunk size 128 for this workload. It greatly increases first prefill cost, `input_reduce_fusion`, and command-buffer executes.
+- Next candidates remain HLO-guided full-attention/paged-prefill layout work and, later, a transpose-free backend-owned KV layout for Pallas decode attention.
