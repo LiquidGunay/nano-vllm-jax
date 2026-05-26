@@ -151,6 +151,89 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _validate_required_keys(row: dict[str, Any], required: list[str], path: str) -> None:
+    missing = [key for key in required if key not in row]
+    if missing:
+        raise ValueError(f"{path} missing required keys: {', '.join(missing)}")
+
+
+def _validate_summary_shape(summary: dict[str, Any], schema: dict[str, Any]) -> None:
+    """Validate the matrix summary shape without depending on jsonschema."""
+
+    _validate_required_keys(summary, list(schema.get("required") or []), "summary")
+    if summary.get("schema_version") != schema.get("schema_version"):
+        raise ValueError(
+            f"summary schema_version={summary.get('schema_version')} does not match "
+            f"schema={schema.get('schema_version')}"
+        )
+    workloads = summary.get("workloads")
+    configs = summary.get("configs")
+    if not isinstance(workloads, list) or not all(isinstance(item, str) for item in workloads):
+        raise ValueError("summary.workloads must be a list of strings")
+    if not isinstance(configs, list) or not all(isinstance(item, str) for item in configs):
+        raise ValueError("summary.configs must be a list of strings")
+
+    matrix_required = ["config", "repeats", "aggregate"]
+    repeat_required = ["repeat", "artifact", "reference_json", "reference_source", "run", "metrics"]
+    aggregate_required = [
+        "repeat_count",
+        "tokens_per_second_median",
+        "ttft_ms_p50_median",
+        "itl_ms_p50_median",
+        "all_correct",
+        "all_exact_generated_token_match",
+        "all_correctness_checked",
+    ]
+    acceptance_required = [
+        "checks",
+        "speed_claim_ready",
+        "target_vllm_ratio",
+        "target_vllm_ratio_met",
+        "missing_profile_counters",
+        "notes",
+    ]
+    acceptance_check_required = [
+        "minimum_repeats",
+        "correctness_checked",
+        "exact_generated_token_match",
+        "jax_performance_present",
+        "vllm_reference_present",
+        "profile_counters_present",
+    ]
+    for workload_name in workloads:
+        if workload_name not in summary["matrix"]:
+            raise ValueError(f"summary.matrix missing workload {workload_name}")
+        if workload_name not in summary["comparisons"]:
+            raise ValueError(f"summary.comparisons missing workload {workload_name}")
+        if workload_name not in summary["acceptance"]:
+            raise ValueError(f"summary.acceptance missing workload {workload_name}")
+        for config_name in configs:
+            path = f"summary.matrix.{workload_name}.{config_name}"
+            matrix_row = summary["matrix"][workload_name].get(config_name)
+            if not isinstance(matrix_row, dict):
+                raise ValueError(f"{path} must be an object")
+            _validate_required_keys(matrix_row, matrix_required, path)
+            for index, repeat in enumerate(matrix_row["repeats"], start=1):
+                if not isinstance(repeat, dict):
+                    raise ValueError(f"{path}.repeats[{index}] must be an object")
+                _validate_required_keys(repeat, repeat_required, f"{path}.repeats[{index}]")
+            _validate_required_keys(matrix_row["aggregate"], aggregate_required, f"{path}.aggregate")
+
+            acceptance = summary["acceptance"][workload_name].get(config_name)
+            if not isinstance(acceptance, dict):
+                raise ValueError(f"summary.acceptance.{workload_name}.{config_name} must be an object")
+            _validate_required_keys(
+                acceptance,
+                acceptance_required,
+                f"summary.acceptance.{workload_name}.{config_name}",
+            )
+            _validate_required_keys(
+                acceptance["checks"],
+                acceptance_check_required,
+                f"summary.acceptance.{workload_name}.{config_name}.checks",
+            )
+
+
 def _runtime_env(config_env: dict[str, str]) -> dict[str, str]:
     env = os.environ.copy()
     root = Path(env.get("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp"))
@@ -732,6 +815,7 @@ def main() -> None:
                 vllm_metrics,
             )
 
+    _validate_summary_shape(summary, _load_json(CONFIG_DIR / "gpu_matrix_summary_schema.json"))
     output_json.write_text(json.dumps(_json_safe(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(output_json)
 

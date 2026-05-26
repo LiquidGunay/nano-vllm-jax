@@ -3179,13 +3179,16 @@ Decision:
   buckets are listed in `missing_profile_counters`.
 - schema update: `benchmarks/configs/gpu_matrix_summary_schema.json` now
   requires the `acceptance` top-level key for new matrix summaries.
+- writer validation: the runner validates required top-level, matrix/repeat,
+  aggregate, and acceptance keys before writing a matrix summary. This is a
+  lightweight in-repo shape check and does not add a `jsonschema` dependency.
 - focused tests:
 
 ```text
 .venv/bin/python -m pytest tests/test_gpu_matrix_runner.py -q
 ```
 
-- result: `11 passed`.
+- result: `13 passed`.
 - dry-run verification:
 
 ```text
@@ -3200,7 +3203,7 @@ Decision:
   `minimum_repeats` and stored vLLM reference checks can pass, but
   `speed_claim_ready=false` because no JAX performance, correctness, or profile
   metrics exist. The summary explicitly lists all missing profile buckets for
-  each dry-run repeat.
+  each dry-run repeat, and the writer accepted the validated summary shape.
 
 Decision:
 

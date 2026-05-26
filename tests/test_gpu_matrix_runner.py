@@ -3,6 +3,7 @@
 import os
 import sys
 from types import SimpleNamespace
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,6 +15,7 @@ from benchmarks.run_gpu_matrix import (
     _configured_workload_reference,
     _cuda_device_preflight,
     _reference_for,
+    _validate_summary_shape,
 )
 
 
@@ -32,12 +34,106 @@ def _write_workload_artifact(path, workload):
     )
 
 
+def _minimal_schema():
+    return {
+        "schema_version": 1,
+        "required": [
+            "schema_version",
+            "created_at_utc",
+            "dry_run",
+            "repeats",
+            "run_dir",
+            "output_json",
+            "configs",
+            "workloads",
+            "required_metrics",
+            "matrix",
+            "vllm_references",
+            "comparisons",
+            "acceptance",
+        ],
+    }
+
+
+def _minimal_summary():
+    return {
+        "schema_version": 1,
+        "created_at_utc": "20260526_000000",
+        "dry_run": True,
+        "repeats": 1,
+        "run_dir": "results/gpu_matrix_runs/test",
+        "output_json": "results/gpu_matrix_test.json",
+        "configs": ["gpu_paged_default"],
+        "workloads": ["hetero8"],
+        "required_metrics": [],
+        "matrix": {
+            "hetero8": {
+                "gpu_paged_default": {
+                    "config": {},
+                    "repeats": [
+                        {
+                            "repeat": 1,
+                            "artifact": "artifact.json",
+                            "reference_json": None,
+                            "reference_source": "none",
+                            "run": {"status": "dry_run"},
+                            "metrics": None,
+                        }
+                    ],
+                    "aggregate": {
+                        "repeat_count": 1,
+                        "tokens_per_second_median": None,
+                        "ttft_ms_p50_median": None,
+                        "itl_ms_p50_median": None,
+                        "all_correct": False,
+                        "all_exact_generated_token_match": False,
+                        "all_correctness_checked": False,
+                    },
+                }
+            }
+        },
+        "vllm_references": {"hetero8": {"source": "none"}},
+        "comparisons": {"hetero8": {"gpu_paged_default": {}}},
+        "acceptance": {
+            "hetero8": {
+                "gpu_paged_default": {
+                    "checks": {
+                        "minimum_repeats": False,
+                        "correctness_checked": False,
+                        "exact_generated_token_match": False,
+                        "jax_performance_present": False,
+                        "vllm_reference_present": False,
+                        "profile_counters_present": False,
+                    },
+                    "speed_claim_ready": False,
+                    "target_vllm_ratio": 0.75,
+                    "target_vllm_ratio_met": False,
+                    "missing_profile_counters": [],
+                    "notes": "not enough evidence for a performance claim",
+                }
+            }
+        },
+    }
+
+
 def test_aggregate_repeats_does_not_treat_missing_correctness_as_correct():
     aggregate = _aggregate_repeats([{"metrics": None}])
 
     assert not aggregate["all_correct"]
     assert not aggregate["all_exact_generated_token_match"]
     assert not aggregate["all_correctness_checked"]
+
+
+def test_validate_summary_shape_accepts_minimal_summary():
+    _validate_summary_shape(_minimal_summary(), _minimal_schema())
+
+
+def test_validate_summary_shape_rejects_missing_acceptance():
+    summary = _minimal_summary()
+    del summary["acceptance"]["hetero8"]["gpu_paged_default"]["checks"]["profile_counters_present"]
+
+    with pytest.raises(ValueError, match="profile_counters_present"):
+        _validate_summary_shape(summary, _minimal_schema())
 
 
 def test_aggregate_repeats_requires_exact_full_length_match():
