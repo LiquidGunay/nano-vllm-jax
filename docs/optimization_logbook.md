@@ -4016,3 +4016,45 @@ JAX_PLATFORMS=cuda ... benchmarks/run_gpu_matrix.py --goal-target-only --repeats
 - decision: keep V,K as the GDN serving state layout and continue toward a
   kernel-native V,K GDN implementation. This is a correctness/layout migration,
   not the final speed win.
+
+### Entry 099 - Native V,K CUDA GDN Decode Probes
+
+- change accepted: updated the default-off local CUDA/JAX FFI recurrent and
+  packed GDN decode probes to consume and return native V,K state directly.
+- scope: `gdn_recurrent_decode_step_fp32` and `gdn_packed_decode_step_fp32`
+  no longer transpose V,K state into legacy K,V at the Python boundary. The CUDA
+  decode kernels and shape checks now index state as `[B,H,V,K]`. The separate
+  chunked prefill prototype still owns its legacy compatibility transpose and
+  remains benchmark-only/default-off.
+- validation:
+
+```text
+JAX_PLATFORMS=cuda ... pytest -q tests/test_cuda_fp32_ffi.py \
+  -k 'gdn_recurrent_decode_step_fp32_cuda_matches_reference or gdn_packed_decode_step_fp32_matches_reference'
+
+JAX_PLATFORMS=cuda ... pytest -q tests/test_cuda_fp32_ffi.py
+```
+
+- result: focused recurrent/packed CUDA decode selection `4 passed, 9
+  deselected`; full CUDA FFI regression file `13 passed`.
+- decision: keep the probes default-off until an integrated serving route wins
+  the benchmark. This removes a layout adapter and keeps future GDN kernel work
+  aligned with the accepted V,K serving state.
+
+### Entry 100 - Rejected Native V,K Width-1 CUDA GDN Decode Routing Probe
+
+- experiment: reran the long-prefill goal target with
+  `NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE=1` after the recurrent decode CUDA probe
+  was moved to native V,K state.
+- artifact: `results/gpu_matrix_20260526_vk_cuda_gdn_decode_probe.json`
+- report: `results/gpu_matrix_20260526_vk_cuda_gdn_decode_probe.md`
+- result: exact generated-token parity held, but the one-repeat diagnostic
+  reached only `88.07 tok/s`, `0.757x` vLLM. That is below the accepted V,K
+  baseline of `90.65 tok/s`, `0.779x` vLLM, and below the active `0.9x` target.
+- profile movement vs stored JAX reference: `PjRt Execute` dropped to
+  `273.86 ms`, `MemcpyD2D` dropped to `18.24 ms`, and `transpose` dropped to
+  `45.05 ms`, but the integrated throughput still did not beat the current
+  accepted baseline.
+- decision: reject promotion of the standalone width-1 CUDA GDN decode route.
+  Keep it default-off for diagnostics and continue toward a coarser/fused GDN
+  kernel boundary rather than adding this custom call to the hot path.

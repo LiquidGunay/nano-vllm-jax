@@ -585,7 +585,7 @@ def gdn_recurrent_decode_step_fp32(
     beta: Any,
     state: Any,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Width-1 GDN recurrent decode with FP32 state and q/k L2 normalization."""
+    """Width-1 GDN recurrent decode with native V,K FP32 state layout."""
 
     query = _as_jax_array("query", query)
     key = _as_jax_array("key", key)
@@ -594,21 +594,16 @@ def gdn_recurrent_decode_step_fp32(
     beta = _as_jax_array("beta", beta)
     state = _as_jax_array("state", state)
     _validate_fp32_gdn_decode_inputs(query, key, value, g, beta, state)
-    # The legacy diagnostic CUDA kernel still stores state as K,V internally.
-    # Keep the public wrapper on the V,K serving ABI and transpose only for this
-    # default-off compatibility route.
-    state_kv = jnp.transpose(state, (0, 1, 3, 2))
     _register_kv_append_target()
     call = jax.ffi.ffi_call(
         _TARGET_GDN_DECODE,
         (
             jax.ShapeDtypeStruct(value.shape, value.dtype),
-            jax.ShapeDtypeStruct(state_kv.shape, state_kv.dtype),
+            jax.ShapeDtypeStruct(state.shape, state.dtype),
         ),
         has_side_effect=False,
     )
-    output, new_state_kv = call(query, key, value, g, beta, state_kv)
-    return output, jnp.transpose(new_state_kv, (0, 1, 3, 2))
+    return call(query, key, value, g, beta, state)
 
 
 def gdn_recurrent_decode_step_fp32_reference(
@@ -639,7 +634,7 @@ def _validate_fp32_gdn_packed_decode_inputs(
     a_log: jnp.ndarray,
     dt_bias: jnp.ndarray,
     state: jnp.ndarray,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     for name, value_array, rank in (
         ("mixed_qkv", mixed_qkv, 2),
         ("a", a, 2),
@@ -692,7 +687,6 @@ def gdn_packed_decode_step_fp32(
         dt_bias,
         state,
     )
-    state_kv = jnp.transpose(state, (0, 1, 3, 2))
     _register_kv_append_target()
     call = jax.ffi.ffi_call(
         _TARGET_GDN_PACKED_DECODE,
@@ -701,12 +695,11 @@ def gdn_packed_decode_step_fp32(
                 (batch, num_value_heads, 1, value_dim),
                 state.dtype,
             ),
-            jax.ShapeDtypeStruct(state_kv.shape, state_kv.dtype),
+            jax.ShapeDtypeStruct(state.shape, state.dtype),
         ),
         has_side_effect=False,
     )
-    output, new_state_kv = call(mixed_qkv, a, b, a_log, dt_bias, state_kv)
-    return output, jnp.transpose(new_state_kv, (0, 1, 3, 2))
+    return call(mixed_qkv, a, b, a_log, dt_bias, state)
 
 
 def gdn_packed_decode_step_fp32_reference(*args: Any, **kwargs: Any):

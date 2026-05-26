@@ -371,37 +371,38 @@ def test_backend_cuda_fp32_decode_attention_opt_in_matches_pure_jax(monkeypatch)
 @pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.parametrize(
-    ("batch", "num_heads", "head_dim"),
+    ("batch", "num_heads", "key_dim", "value_dim"),
     [
-        (2, 2, 8),
-        (2, 16, 128),
+        (2, 2, 8, 12),
+        (2, 16, 128, 128),
     ],
 )
 def test_gdn_recurrent_decode_step_fp32_cuda_matches_reference(
     monkeypatch,
     batch,
     num_heads,
-    head_dim,
+    key_dim,
+    value_dim,
 ):
     monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
     query = jnp.linspace(
         -0.5,
         0.5,
-        batch * num_heads * head_dim,
+        batch * num_heads * key_dim,
         dtype=jnp.float32,
-    ).reshape(batch, num_heads, 1, head_dim)
+    ).reshape(batch, num_heads, 1, key_dim)
     key = jnp.linspace(
         0.4,
         -0.4,
-        batch * num_heads * head_dim,
+        batch * num_heads * key_dim,
         dtype=jnp.float32,
-    ).reshape(batch, num_heads, 1, head_dim)
+    ).reshape(batch, num_heads, 1, key_dim)
     value = jnp.linspace(
         -0.2,
         0.3,
-        batch * num_heads * head_dim,
+        batch * num_heads * value_dim,
         dtype=jnp.float32,
-    ).reshape(batch, num_heads, 1, head_dim)
+    ).reshape(batch, num_heads, 1, value_dim)
     g = jnp.linspace(-0.08, -0.02, batch * num_heads, dtype=jnp.float32).reshape(
         batch,
         num_heads,
@@ -415,9 +416,9 @@ def test_gdn_recurrent_decode_step_fp32_cuda_matches_reference(
     state = jnp.linspace(
         -0.03,
         0.04,
-        batch * num_heads * head_dim * head_dim,
+        batch * num_heads * value_dim * key_dim,
         dtype=jnp.float32,
-    ).reshape(batch, num_heads, head_dim, head_dim)
+    ).reshape(batch, num_heads, value_dim, key_dim)
 
     expected_out, expected_state = gdn_recurrent_decode_step_fp32_reference(
         query,
@@ -633,22 +634,22 @@ def test_backend_cuda_fp32_gdn_decode_opt_in_matches_pure_jax(monkeypatch):
 @pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.parametrize(
-    ("num_q_heads", "num_value_heads"),
+    ("num_q_heads", "num_value_heads", "key_dim", "value_dim"),
     [
-        (4, 4),
-        (2, 4),
+        (4, 4, 16, 12),
+        (2, 4, 16, 16),
     ],
 )
 def test_gdn_packed_decode_step_fp32_matches_reference(
     monkeypatch,
     num_q_heads,
     num_value_heads,
+    key_dim,
+    value_dim,
 ):
     monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
 
     batch = 2
-    key_dim = 16
-    value_dim = 16
     packed_dim = 2 * num_q_heads * key_dim + num_value_heads * value_dim
     mixed_qkv = jnp.linspace(
         -0.5,

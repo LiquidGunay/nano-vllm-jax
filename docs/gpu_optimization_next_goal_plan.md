@@ -87,7 +87,9 @@ documentation/configuration-first:
 9. Do not combine the V,K layout migration with BF16 GDN prefill activation
    changes. If FLA/FlashInfer integration suggests BF16 prefill is valuable,
    add it later behind an explicit opt-in flag such as
-   `NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16`.
+   `NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16`. This is a speed experiment for
+   external-kernel compatibility, not a correctness-contract change for the
+   default path.
 
 Current GDN status: serving GDN is still expressed as JAX and lowered by XLA to
 GPU work; there is no accepted hand-owned GDN kernel in the default path.
@@ -867,31 +869,29 @@ previous Pallas regressions, it should not be the first production path for GDN.
   model's `batch=2`, `gdn_heads=16`, `head_dim=128` shape.
 - The local FP32 CUDA GDN decode route is available behind
   `NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE=1`, but the first integrated hetero8 run
-  was slower than Entry 045 despite exact generated-token parity. Keep it
-  default-off as a diagnostic route; do not promote it to default or fast
-  opt-in.
+  was slower than Entry 045 despite exact generated-token parity. After the V,K
+  native decode cleanup, a one-repeat long-prefill probe also missed the active
+  target: `88.07 tok/s`, `0.757x` vLLM, exact generated-token parity, below the
+  accepted V,K baseline of `90.65 tok/s`. Keep it default-off as a diagnostic
+  route; do not promote it to default or fast opt-in.
 - A pure-JAX vLLM-style packed decode reference currently exists in
   `nanovllm_jax/kernels/cuda_gdn.py` as
   `gdn_packed_decode_reference_local_state`. It accepts packed
   `mixed_qkv [B, 2*H*K + HV*V]` plus raw `a/b/A_log/dt_bias`, computes the
-  same gate/beta transform as vLLM's packed decode path, and calls the
-  pre-change recurrent rule while preserving `[B,HV,K,V]`. This is now a
-  migration/reference artifact, not the target serving ABI.
+  same gate/beta transform as vLLM's packed decode path, and calls the V,K
+  recurrent rule with `[B,HV,V,K]` state. This is a reference artifact, not the
+  final target serving ABI.
 - External GDN reference audit confirms vLLM/FLA's natural Qwen GDN state layout
   is k-last/V-first `[*,HV,V,K]`, and the vLLM/FLA prefill path is
   BF16-activation oriented. The explicit decision is to switch persistent GDN
   state layout to V,K while preserving the repo's BF16-weight/FP32-activation
-  contract unless a separate dtype decision is made. The next local
-  implementation target should update the packed FP32 decode core and pure-JAX
-  fallback to consume/return `[B,HV,V,K]`.
+  contract unless a separate dtype decision is made.
 - A local CUDA/JAX FFI packed FP32 GDN decode core now exists as
   `gdn_packed_decode_step_fp32`. It accepts vLLM-style
-  `mixed_qkv + a/b/A_log/dt_bias`, preserves nano's pre-change `[B,HV,K,V]`
-  state,
+  `mixed_qkv + a/b/A_log/dt_bias`, consumes native `[B,HV,V,K]` state,
   and passes focused CUDA parity against the pure-JAX packed reference for both
   same-head and GVA q/k repetition cases. It is an ABI/toolchain step only; it
-  is not routed into serving and makes no speed claim yet. It should either be
-  revised to V,K or replaced by the external-kernel-native implementation.
+  is not routed into serving and makes no speed claim yet.
 
 ### Acceptance Gate
 
@@ -1322,10 +1322,12 @@ Commit 7b - GDN V,K layout migration:
   pure-JAX fallback consumes and returns V,K state natively.~~
 - ~~Update state-table, MTP commit-select, and focused parity tests for the new
   shape.~~
-- Local CUDA FFI diagnostic wrappers now accept V,K state and transpose only
-  inside default-off compatibility wrappers for the legacy K,V CUDA probes.
-  Replace this with a kernel-native V,K implementation before any serving
-  promotion.
+- ~~Make the default-off local CUDA FFI recurrent and packed GDN decode probes
+  consume V,K state natively, with no Python K,V compatibility transpose.~~
+  Validation: focused recurrent/packed CUDA decode selection `4 passed, 9
+  deselected`; full CUDA FFI suite `13 passed`. The separate chunked prefill
+  prototype still owns its legacy compatibility transpose and remains
+  benchmark-only/default-off.
 - ~~Run layer parity, cached prefill/decode equivalence, 500-token top-5/logit
   guardrail, and integrated server benchmark before promoting the layout.~~
   Validation: focused CUDA suite `12 passed`; CUDA FFI suite `13 passed`; MTP
@@ -1336,11 +1338,16 @@ Commit 7b - GDN V,K layout migration:
 
 Commit 7c - Optional BF16 GDN prefill activation experiment:
 
+- Defer this until after the V,K FP32 path has a stable correctness and speed
+  baseline. Do not make BF16 prefill part of the default migration.
 - Add `NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16` or equivalent opt-in flag.
 - Limit the first experiment to GDN prefill activations; keep recurrent state
   and decode activation math FP32 unless a separate decision changes that
   contract.
 - Compare against the V,K FP32-prefill baseline, not against the old K,V layout.
+- Treat FLA/FlashInfer BF16 prefill as an integration/performance hypothesis:
+  useful only if it reduces integrated TTFT or throughput bottlenecks after
+  full-model gates, not merely because the external kernel prefers BF16 inputs.
 - Require layer/state drift checks, cached prefill plus long-decode top-5/logit
   guardrails, exact generated-token parity, and an integrated TTFT/throughput
   win before promotion.

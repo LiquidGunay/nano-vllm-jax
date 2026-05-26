@@ -139,7 +139,9 @@ gdn_recurrent_decode_step(
   including the model's `16` GDN heads and `128`-wide state shape. The backend
   route is available behind `NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE=1`, but the
   first integrated hetero8 run preserved exact tokens while regressing
-  throughput/ITL. Keep this route default-off as a diagnostic; do not treat a
+  throughput/ITL, and the V,K-native one-repeat long-prefill probe reached only
+  `88.07 tok/s`, `0.757x` vLLM, below the accepted V,K baseline of
+  `90.65 tok/s`. Keep this route default-off as a diagnostic; do not treat a
   standalone width-1 recurrence custom call as an accepted serving kernel.
 - layout decision: vLLM/FlashInfer Qwen GDN uses k-last/V-first recurrent state,
   and the repo will move canonical serving GDN state to `[B,L,HV,V,K]` instead
@@ -151,11 +153,12 @@ gdn_recurrent_decode_step(
   established.
 - packed-core status: `gdn_packed_decode_step_fp32` implements that boundary as
   a local CUDA/JAX FFI target and passes focused CUDA parity for same-head and
-  GVA q/k repetition shapes using the pre-change K,V state. It is not a serving
-  route or speed claim yet; revise or replace it for V,K before serving
-  promotion.
+  GVA q/k repetition shapes using native V,K state. It is still not a serving
+  route or speed claim until the integrated decode path improves the server
+  benchmark.
 - V,K migration status: the pure-JAX fallback now consumes and returns V,K GDN
-  state directly. Focused CUDA tests, CUDA FFI compatibility tests, MTP
+  state directly, and the local recurrent/packed CUDA decode probes now accept
+  V,K without Python-side K,V transposes. Focused CUDA tests, CUDA FFI tests, MTP
   commit-state tests, the 500-token top-5 guardrail, and the long-prefill
   integrated goal target passed. The integrated result is `90.65 tok/s`,
   `0.779x` vLLM, so this is an accepted correctness/layout migration, not the

@@ -287,10 +287,10 @@ XLA_FFI_Error* CheckGdnDecodeCallFrame(XLA_FFI_CallFrame* call_frame) {
                        "fp32 GDN decode prototype only supports width-1 decode");
   }
   if (query->dims[3] != key->dims[3] ||
-      query->dims[3] != state->dims[2] ||
-      value->dims[3] != state->dims[3]) {
+      value->dims[3] != state->dims[2] ||
+      query->dims[3] != state->dims[3]) {
     return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
-                       "GDN decode head dimensions must match state");
+                       "GDN decode state must have shape [B,H,V,K]");
   }
   if (out->dims[0] != value->dims[0] ||
       out->dims[1] != value->dims[1] ||
@@ -354,8 +354,8 @@ XLA_FFI_Error* CheckGdnPackedDecodeCallFrame(XLA_FFI_CallFrame* call_frame) {
 
   int64_t batch = state->dims[0];
   int64_t num_value_heads = state->dims[1];
-  int64_t key_dim = state->dims[2];
-  int64_t value_dim = state->dims[3];
+  int64_t value_dim = state->dims[2];
+  int64_t key_dim = state->dims[3];
   if (mixed_qkv->dims[0] != batch ||
       a->dims[0] != batch ||
       b->dims[0] != batch ||
@@ -692,7 +692,7 @@ __global__ void Fp32GdnRecurrentDecodeKernel(
 
   int64_t q_base = ((batch_idx * num_heads + head) * 1) * key_dim;
   int64_t v_base = ((batch_idx * num_heads + head) * 1) * value_dim;
-  int64_t state_base = ((batch_idx * num_heads + head) * key_dim) * value_dim;
+  int64_t state_base = ((batch_idx * num_heads + head) * value_dim) * key_dim;
   int64_t gate_offset = (batch_idx * num_heads + head) * 1;
 
   float local_q_sum = 0.0f;
@@ -730,7 +730,7 @@ __global__ void Fp32GdnRecurrentDecodeKernel(
     float kv_mem = 0.0f;
     for (int64_t k_dim = 0; k_dim < key_dim; ++k_dim) {
       kv_mem +=
-          state[state_base + k_dim * value_dim + v_dim] * gate * k_norm[k_dim];
+          state[state_base + v_dim * key_dim + k_dim] * gate * k_norm[k_dim];
     }
     delta[v_dim] = (value[v_base + v_dim] - kv_mem) * beta_value;
   }
@@ -738,10 +738,10 @@ __global__ void Fp32GdnRecurrentDecodeKernel(
 
   int64_t state_elements = key_dim * value_dim;
   for (int64_t linear = tid; linear < state_elements; linear += blockDim.x) {
-    int64_t k_dim = linear / value_dim;
-    int64_t v_dim = linear - k_dim * value_dim;
+    int64_t v_dim = linear / key_dim;
+    int64_t k_dim = linear - v_dim * key_dim;
     float updated =
-        state[state_base + linear] * gate + k_norm[k_dim] * delta[v_dim];
+        state[state_base + linear] * gate + delta[v_dim] * k_norm[k_dim];
     new_state[state_base + linear] = updated;
   }
   __syncthreads();
@@ -749,7 +749,7 @@ __global__ void Fp32GdnRecurrentDecodeKernel(
   for (int64_t v_dim = tid; v_dim < value_dim; v_dim += blockDim.x) {
     float acc = 0.0f;
     for (int64_t k_dim = 0; k_dim < key_dim; ++k_dim) {
-      acc += new_state[state_base + k_dim * value_dim + v_dim] * q_norm[k_dim];
+      acc += new_state[state_base + v_dim * key_dim + k_dim] * q_norm[k_dim];
     }
     out[v_base + v_dim] = acc;
   }
@@ -795,7 +795,7 @@ __global__ void Fp32GdnPackedDecodeKernel(
       mixed_base + 2 * num_q_heads * key_dim + value_head * value_dim;
   int64_t gate_base = batch_idx * num_value_heads + value_head;
   int64_t state_base =
-      ((batch_idx * num_value_heads + value_head) * key_dim) * value_dim;
+      ((batch_idx * num_value_heads + value_head) * value_dim) * key_dim;
 
   float local_q_sum = 0.0f;
   float local_k_sum = 0.0f;
@@ -835,7 +835,7 @@ __global__ void Fp32GdnPackedDecodeKernel(
     float kv_mem = 0.0f;
     for (int64_t k_dim = 0; k_dim < key_dim; ++k_dim) {
       kv_mem +=
-          state[state_base + k_dim * value_dim + v_dim] * gate * k_norm[k_dim];
+          state[state_base + v_dim * key_dim + k_dim] * gate * k_norm[k_dim];
     }
     delta[v_dim] = (mixed_qkv[value_base + v_dim] - kv_mem) * beta_value;
   }
@@ -843,10 +843,10 @@ __global__ void Fp32GdnPackedDecodeKernel(
 
   int64_t state_elements = key_dim * value_dim;
   for (int64_t linear = tid; linear < state_elements; linear += blockDim.x) {
-    int64_t k_dim = linear / value_dim;
-    int64_t v_dim = linear - k_dim * value_dim;
+    int64_t v_dim = linear / key_dim;
+    int64_t k_dim = linear - v_dim * key_dim;
     float updated =
-        state[state_base + linear] * gate + k_norm[k_dim] * delta[v_dim];
+        state[state_base + linear] * gate + delta[v_dim] * k_norm[k_dim];
     new_state[state_base + linear] = updated;
   }
   __syncthreads();
@@ -855,7 +855,7 @@ __global__ void Fp32GdnPackedDecodeKernel(
   for (int64_t v_dim = tid; v_dim < value_dim; v_dim += blockDim.x) {
     float acc = 0.0f;
     for (int64_t k_dim = 0; k_dim < key_dim; ++k_dim) {
-      acc += new_state[state_base + k_dim * value_dim + v_dim] * q_norm[k_dim];
+      acc += new_state[state_base + v_dim * key_dim + k_dim] * q_norm[k_dim];
     }
     out[out_base + v_dim] = acc;
   }
@@ -1306,8 +1306,8 @@ extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPackedDecode(
 
   int64_t batch = state->dims[0];
   int64_t num_value_heads = state->dims[1];
-  int64_t key_dim = state->dims[2];
-  int64_t value_dim = state->dims[3];
+  int64_t value_dim = state->dims[2];
+  int64_t key_dim = state->dims[3];
   int64_t packed_dim = mixed_qkv->dims[1];
   int64_t qk_dim = packed_dim - num_value_heads * value_dim;
   int64_t num_q_heads = qk_dim / (2 * key_dim);
