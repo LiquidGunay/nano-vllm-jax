@@ -232,6 +232,10 @@ gdn_segmented_prefill_chunk32(
   migration. Keep recurrent state and decode activation math FP32 for the first
   experiment, and require exact generated-token parity plus long-decode top-5
   guardrails and integrated TTFT/throughput improvement before promotion.
+- compatibility note: the installed vLLM/FLA chunk prefill path rejects FP32
+  activation tensors, and FlashInfer GDN prefill is Torch-only plus gated to
+  newer CUDA targets than the A10G baseline. Direct reuse therefore needs a
+  BF16-prefill design decision or a FP32-capable port.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 

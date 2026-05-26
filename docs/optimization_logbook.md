@@ -3931,16 +3931,17 @@ JAX_PLATFORMS=cuda \
 - audit source: subagent review of vLLM Qwen GDN and Flash Linear Attention
   Gated DeltaNet references.
 - finding: vLLM's Qwen GDN path naturally uses k-last/V-first recurrent state
-  (`[*,HV,V,K]`) and a state-slot/index model, while nano's serving state is
-  `[B,H,K,V]`.
+  (`[*,HV,V,K]`) and a state-slot/index model. At the time of this audit nano's
+  serving state was `[B,H,K,V]`; Entry 098 later migrated nano's serving state
+  to V,K as well.
 - dtype finding: the vLLM/FLA prefill path is BF16-activation oriented even when
   state math/cache can be FP32. That does not match the current BF16
   weights/FP32 activation contract.
 - decision: do not silently adopt vLLM/FLA state layout, BF16 prefill
   activations, or state-slot scheduler semantics. The next non-design-changing
   GDN target is an opt-in FP32 packed decode core that borrows vLLM's packed
-  `mixed_qkv + a/b/A_log/dt_bias` boundary while preserving nano's local
-  `[B,H,K,V]` persistent state.
+  `mixed_qkv + a/b/A_log/dt_bias` boundary while preserving nano's current
+  persistent-state layout.
 
 ### Entry 097 - Accepted packed FP32 GDN decode core
 
@@ -4153,3 +4154,28 @@ JAX_PLATFORMS=cuda ... pytest -q \
 - decision: keep `gdn_fla` unimplemented and default-off. The local CUDA GDN
   probes remain diagnostics; this registry change only prevents the plan's
   intended backend name from being an unknown request.
+
+### Entry 105 - External Kernel Compatibility Recheck
+
+- audit source: subagent review of local installed packages plus direct local
+  inspection. No internet was used and no files were edited by the subagent.
+- environment: repo venv has FlashInfer/JAX FFI and Triton but no vLLM or FLA
+  package; vLLM is installed separately at `/mountpoint/.exp/vllm-venv` and
+  includes its vendored FLA kernels.
+- vLLM GDN finding: Qwen3.5 uses
+  `GatedDeltaNetAttention(..., gqa_interleaved_layout=False)`, with non-
+  interleaved `[q,k,v,z]` and `[b,a]` projection splits. The packed decode
+  kernel uses state `[slots,HV,V,K]`, `mixed_qkv [B,2*H*K+HV*V]`, `a/b [B,HV]`,
+  and output `[B,1,HV,V]`.
+- dtype finding: vLLM's FLA chunk prefill rejects `torch.float32` activation
+  tensors and expects BF16/FP16-style q/k/v, while final state can remain FP32.
+  FlashInfer's GDN prefill path is Torch-only in the installed environment and
+  is gated to newer CUDA targets than the current A10G baseline.
+- FlashInfer/JAX finding: the repo's FlashInfer JAX shim only implements KV
+  append today, only for FP16/BF16 cache tensors. Paged attention FFI wrappers
+  remain stubs, and installed FlashInfer dtype maps omit FP32 for these paths.
+- decision: do not switch to vLLM/FLA or FlashInfer kernels directly under the
+  current BF16-weight/FP32-activation/KV contract. The next production kernel
+  direction needs an explicit design choice: allow a BF16-prefill experiment
+  with full-model gates, or build/port FP32-capable FLA-shaped kernels while
+  keeping local CUDA probes diagnostic.

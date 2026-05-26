@@ -969,12 +969,18 @@ FlashInfer GDN prefill traces:
 - flashinfer.gdn_prefill.chunk_gated_delta_rule
 - q/k/v [total_seq_len, heads, head_size], cu_seqlens [num_seqs+1]
 - state is documented as k-last [N,H,V,K] with FP32 state and BF16 q/k/v.
+- local 2026-05-26 audit found this path is Torch-only in the installed vLLM
+  environment and gated to newer CUDA targets (`sm90/sm100`) than the current
+  A10G baseline.
 ```
 
 Under the current BF16-weight/FP32-activation contract, treat FLA/FlashInfer
 prefill as algorithm and layout references first. Directly adopting their BF16
 activation or k-last state contract is a design change and must go through the
 full-model real-weight token/logit gate before any serving promotion.
+The installed vLLM/FLA chunk path explicitly rejects FP32 activation tensors,
+so using that prefill kernel directly requires either a BF16-prefill design
+decision or a separate FP32-capable port.
 
 ### Acceptance Gate
 
