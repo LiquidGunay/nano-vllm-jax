@@ -86,6 +86,10 @@ def test_render_markdown_includes_goal_matrix_and_sorted_profile_deltas():
     assert "| workload | config | ready | target met | JAX tok/s |" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | yes | yes | 90.00 |" in report
     assert "## Acceptance Failures\n\nNone." in report
+    assert "## Logbook Entry Template" in report
+    assert "- profile movement to explain:" in report
+    assert "- interpretation: <explain whether the profile movement supports the claimed change>" in report
+    assert "- decision: <keep/reject/follow up, with reason>" in report
     assert report.index("large_bucket") < report.index("small_bucket")
 
 

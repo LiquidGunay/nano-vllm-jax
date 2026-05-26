@@ -352,6 +352,11 @@ end-to-end throughput.
 - `benchmarks/run_gpu_matrix.py` now writes that Markdown report by default next
   to the summary JSON, or to `--report-md` when supplied. `--no-report-md`
   keeps report generation opt-out for controlled runs.
+- The Markdown report includes a logbook-entry template with the target
+  artifact paths, JAX/vLLM and JAX/reference ratios, TTFT/ITL deltas, and the
+  largest profile bucket deltas. It is a copyable starting point for the
+  required profile-movement explanation; the final interpretation and
+  keep/reject/follow-up decision still must be written by the reviewer.
 
 ## Phase 2 - Kernel Roadmap
 

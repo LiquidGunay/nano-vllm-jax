@@ -125,6 +125,19 @@ def _profile_delta_rows(comparison: dict[str, Any], *, limit: int) -> list[list[
     return [row for _, row in rows[: max(0, int(limit))]]
 
 
+def _profile_delta_bullets(comparison: dict[str, Any], *, limit: int) -> list[str]:
+    rows = _profile_delta_rows(comparison, limit=limit)
+    if not rows:
+        return ["- No profile delta rows are available."]
+    return [
+        (
+            f"- `{row[0]}`: current {row[1]}, reference {row[2]}, "
+            f"delta {row[3]}, ratio {row[4]}, count delta {row[7]}"
+        )
+        for row in rows
+    ]
+
+
 def _markdown_table(headers: list[str], rows: list[list[str]]) -> list[str]:
     if not rows:
         return ["No rows."]
@@ -133,6 +146,34 @@ def _markdown_table(headers: list[str], rows: list[list[str]]) -> list[str]:
         "| " + " | ".join("---" for _ in headers) + " |",
     ]
     lines.extend("| " + " | ".join(row) + " |" for row in rows)
+    return lines
+
+
+def _logbook_template(summary: dict[str, Any], *, top_profile_deltas: int) -> list[str]:
+    workload, config, goal_comparison, goal_acceptance = _goal_target_row(summary)
+    lines = [
+        "## Logbook Entry Template",
+        "",
+        "Copy this into `docs/optimization_logbook.md` after replacing the interpretation and decision text.",
+        "",
+        f"- artifact: `{summary.get('output_json', '-')}`",
+        f"- report: `{summary.get('report_md', '-')}`",
+        f"- target: `{workload}/{config}`",
+        f"- speed_claim_ready: {_fmt(goal_acceptance.get('speed_claim_ready'))}",
+        f"- target_vllm_ratio_met: {_fmt(goal_acceptance.get('target_vllm_ratio_met'))}",
+        f"- JAX/vLLM: {_fmt_ratio(goal_comparison.get('jax_over_vllm_throughput'))}",
+        f"- JAX/reference: {_fmt_ratio(goal_comparison.get('jax_over_jax_reference_throughput'))}",
+        f"- TTFT delta vs reference: {_fmt(goal_comparison.get('ttft_ms_p50_delta_vs_jax_reference'), suffix=' ms')}",
+        f"- ITL delta vs reference: {_fmt(goal_comparison.get('itl_ms_p50_delta_vs_jax_reference'), suffix=' ms')}",
+        "- profile movement to explain:",
+    ]
+    lines.extend(_profile_delta_bullets(goal_comparison, limit=top_profile_deltas))
+    lines.extend(
+        [
+            "- interpretation: <explain whether the profile movement supports the claimed change>",
+            "- decision: <keep/reject/follow up, with reason>",
+        ]
+    )
     return lines
 
 
@@ -228,6 +269,7 @@ def render_markdown(summary: dict[str, Any], *, top_profile_deltas: int = 8) -> 
             lines.append("")
     if not any_profile_rows:
         lines.append("No profile deltas available.")
+    lines.extend(["", *_logbook_template(summary, top_profile_deltas=top_profile_deltas)])
     return "\n".join(lines).rstrip() + "\n"
 
 
