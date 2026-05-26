@@ -552,6 +552,36 @@ Study:
 Flash Linear Attention provides hardware-efficient building blocks for linear
 attention, sparse attention, state-space models, and hybrid LLM architectures.
 
+Concrete reference mapping:
+
+```text
+Local current path:
+- nanovllm_jax/model.py::gated_deltanet_block
+- nanovllm_jax/backends.py::PureJAXBackend.gated_delta_decode
+- nanovllm_jax/model.py::jax_recurrent_gated_delta_rule
+- tensors: q/k/v [B,H,T,D], g/beta [B,H,T], state [B,H,K,V]
+
+vLLM Qwen GDN path:
+- vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py::QwenGatedDeltaNetAttention
+- vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py::ChunkGatedDeltaRule
+- vllm/model_executor/layers/fla/ops/fused_recurrent.py::fused_recurrent_gated_delta_rule_packed_decode
+- packed decode tensors: mixed_qkv [B, 2*H*K + HV*V], a/b [B,HV],
+  output [B,1,HV,V], state in-place through ssm_state_indices
+
+FLA reference path:
+- fla/ops/gated_delta_rule/fused_recurrent.py::fused_recurrent_gated_delta_rule
+- fla/ops/gated_delta_rule/chunk.py::chunk_gated_delta_rule
+- tensors: q/k [B,T,H,K], v [B,T,HV,V], g/beta [B,T,HV],
+  optional cu_seqlens [N+1]
+```
+
+Layout risk: vLLM's packed decode kernel uses a k-last state layout
+`[N,HV,V,K]`, while the local correctness path and current proposed ABI use
+`[B,H,K,V]`. Do not silently flip the serving recurrent-state layout. Either
+add an adapter at the backend boundary and prove it has no integrated
+performance cost, or ask for an explicit state-layout design decision before
+making k-last state canonical.
+
 ### Proposed ABI
 
 ```python
@@ -645,6 +675,26 @@ gdn_segmented_prefill_chunk32(
     final_state,    # [batch, gdn_heads, head_dim, head_dim]
 )
 ```
+
+External prefill references use a related but not identical ABI:
+
+```text
+FLA chunk prefill:
+- fla/ops/gated_delta_rule/chunk.py::chunk_gated_delta_rule
+- q/k [B,T,H,K], v [B,T,HV,V], g/beta [B,T,HV], cu_seqlens [N+1]
+- default chunk size in that path is 64, while this repo's accepted Qwen3.5
+  point is chunk size 32.
+
+FlashInfer GDN prefill traces:
+- flashinfer.gdn_prefill.chunk_gated_delta_rule
+- q/k/v [total_seq_len, heads, head_size], cu_seqlens [num_seqs+1]
+- state is documented as k-last [N,H,V,K] with FP32 state and BF16 q/k/v.
+```
+
+Under the current BF16-weight/FP32-activation contract, treat FLA/FlashInfer
+prefill as algorithm and layout references first. Directly adopting their BF16
+activation or k-last state contract is a design change and must go through the
+full-model real-weight token/logit gate before any serving promotion.
 
 ### Acceptance Gate
 
