@@ -1596,3 +1596,40 @@ Decision:
 - Keep the benchmark override for future controlled sweeps, but do not expose a new server flag yet. The library default should get the faster path without extra user setup.
 - Do not use chunk size 128 for this workload. It greatly increases first prefill cost, `input_reduce_fusion`, and command-buffer executes.
 - Next candidates remain HLO-guided full-attention/paged-prefill layout work and, later, a transpose-free backend-owned KV layout for Pallas decode attention.
+
+## Entry 046 - Rejected Initial-Prefill Bounded KV Window
+
+- run id: `20260526-022846-2084640-jax_hetero8_64_512x32_initial_prefill_bound_kv`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_initial_prefill_bound_kv.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-022846-2084640-jax_hetero8_64_512x32_initial_prefill_bound_kv`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-022846-2084640-jax_hetero8_64_512x32_initial_prefill_bound_kv/plugins/profile/2026_05_26_02_30_36/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-022846-2084640-jax_hetero8_64_512x32_initial_prefill_bound_kv/plugins/profile/2026_05_26_02_30_36/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: McClintock reviewed the current accepted state and ranked the best follow-ups as: (1) profile the initial-prefill KV-window bound already sketched in the tree, but only with a strict host gate for whole no-prefix prompt prefill; (2) bracket GDN prefill chunk size below 32, starting with `--linear-chunk-size 16`, watching `input_reduce_fusion` and the first prefill step; (3) try a head-major reshape/layout path in `paged_attention_prefill`. Pallas/CuteDSL paged attention should wait until the KV cache layout can remove the transpose penalty seen in earlier attempts.
+- change tested: a temporary `NANO_VLLM_JAX_INITIAL_PREFILL_BOUND_KV=1` path carried a static `max_kv_len` through attention metadata into `paged_attention_prefill`, limiting initial no-prefix prefill key positions to the active prompt bucket width instead of the full paged block-table capacity. The source change was reverted after profiling.
+- focused CUDA checks: with `NANO_VLLM_JAX_INITIAL_PREFILL_BOUND_KV=1`, `tests/test_backend_boundaries.py::test_initial_prefill_bounded_kv_window_matches_unbounded_paged_prefill`, `tests/test_backend_boundaries.py::test_executor_cached_prefill_matches_no_cache_prefill_logits`, `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute`, `tests/test_kv_cache.py::test_paged_attention_non_identity_blocks`, `tests/test_kv_cache.py::test_paged_attention_grouped_gqa_matches_repeat_reference`, and `tests/test_lm_head_helpers.py` passed under `JAX_PLATFORMS=cuda` (`8 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 045 chunk-32 reference.
+- JAX timing: `350.75 tok/s`, TTFT p50 `297.24 ms`, ITL p50 `13.84 ms`, ITL p95 `15.05 ms`.
+- delta vs Entry 045 chunk-32 default repeat: `0.954x` total tok/s, TTFT p50 `1.025x`, ITL p50 `1.053x`, ITL p95 `1.107x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 045 ms | bounded KV ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 696.03 | 729.86 | overall slower |
+| `_run_main_and_sample` | 572.99 | 592.08 | runner hot path slower |
+| `forward_step_token_ids_jit` | 122.13 | 158.40 | compiled token-id path regressed |
+| first `forward_step_token_ids_jit` | 30.83 | 33.65 | first prefill step regressed |
+| `PjRtCApiLoadedExecutable::Execute` | 138.32 over 252 calls | 173.59 over 252 calls | same dispatch count, heavier device execution |
+| `jit_compiled:XLA GPU module` | 94.20 | 114.34 | lowered module time regressed |
+| `command_buffer::execute` | 40.34 over 1143 calls | 45.11 over 1143 calls | same count, heavier execution |
+| `command_buffer::update` | 27.13 over 248 calls | 37.03 over 248 calls | heavier updates |
+| `input_reduce_fusion` | 28.65 over 1936 calls | 28.23 over 1936 calls | target GDN bucket unchanged |
+| `gather` | 11.97 | 12.54 | target gather path regressed |
+| `transpose` | 63.11 | 63.52 | unchanged/slightly worse |
+| `array.py:325 tolist` | 437.58 | 418.26 | host sync attribution improved, but not enough to matter |
+
+Decision:
+
+- Reject and revert initial-prefill bounded KV window. Correctness was exact, but the profile shows the static bound made the compiled/device path heavier and did not improve the target gather or transpose ranges.
+- Do not keep a flag for this path. The only clear improvement was host sync attribution, while end-to-end latency and device execution regressed.
+- Next candidates should follow McClintock's remaining list: bracket GDN prefill chunk size below 32 with `--linear-chunk-size 16`, then inspect `paged_attention_prefill` layout/HLO for head-major or transpose-free alternatives.
