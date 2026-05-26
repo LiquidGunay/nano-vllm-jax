@@ -18,6 +18,8 @@ jax.config.update("jax_default_matmul_precision", "highest")
 from nanovllm_jax.backends import PureJAXBackend
 from nanovllm_jax.kernels.cuda_fp32_ffi import (
     build_cuda_fp32_kernels,
+    gdn_recurrent_decode_step_fp32,
+    gdn_recurrent_decode_step_fp32_reference,
     kv_append_paged_nhd_fp32,
     paged_decode_attention_gqa_nhd_fp32,
 )
@@ -355,6 +357,88 @@ def test_backend_cuda_fp32_decode_attention_opt_in_matches_pure_jax(monkeypatch)
     np.testing.assert_allclose(
         np.asarray(actual),
         np.asarray(expected),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+
+
+@pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.parametrize(
+    ("batch", "num_heads", "head_dim"),
+    [
+        (2, 2, 8),
+        (2, 16, 128),
+    ],
+)
+def test_gdn_recurrent_decode_step_fp32_cuda_matches_reference(
+    monkeypatch,
+    batch,
+    num_heads,
+    head_dim,
+):
+    monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
+    query = jnp.linspace(
+        -0.5,
+        0.5,
+        batch * num_heads * head_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_heads, 1, head_dim)
+    key = jnp.linspace(
+        0.4,
+        -0.4,
+        batch * num_heads * head_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_heads, 1, head_dim)
+    value = jnp.linspace(
+        -0.2,
+        0.3,
+        batch * num_heads * head_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_heads, 1, head_dim)
+    g = jnp.linspace(-0.08, -0.02, batch * num_heads, dtype=jnp.float32).reshape(
+        batch,
+        num_heads,
+        1,
+    )
+    beta = jnp.linspace(0.2, 0.8, batch * num_heads, dtype=jnp.float32).reshape(
+        batch,
+        num_heads,
+        1,
+    )
+    state = jnp.linspace(
+        -0.03,
+        0.04,
+        batch * num_heads * head_dim * head_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_heads, head_dim, head_dim)
+
+    expected_out, expected_state = gdn_recurrent_decode_step_fp32_reference(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        state,
+    )
+    actual_out, actual_state = jax.jit(gdn_recurrent_decode_step_fp32)(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        state,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_out),
+        np.asarray(expected_out),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
         rtol=2e-5,
         atol=2e-5,
     )

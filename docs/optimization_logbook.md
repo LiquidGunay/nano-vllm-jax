@@ -2718,3 +2718,37 @@ Decision:
   kernel. Either pair attention with a broader layout/KV strategy that removes
   downstream overhead, or move to the higher-leverage GDN decode/prefill kernel
   path.
+
+## Entry 074 - FP32 CUDA GDN Recurrent Decode Focused ABI Validation
+
+- change tested: a local CUDA/JAX FFI width-1
+  `gdn_recurrent_decode_step` prototype for FP32 Gated DeltaNet recurrent
+  decode. The kernel owns Q/K L2 normalization, query scaling, recurrent state
+  decay, delta update, output projection through state, and FP32 state writeback.
+- reference: existing pure-JAX `jax_recurrent_gated_delta_rule` with
+  `use_qk_l2norm_in_kernel=True`.
+- focused CUDA tests: direct FFI parity passed for a small shape and for the
+  Qwen3.5-0.8B GDN shape `batch=2`, `gdn_heads=16`, `head_dim=128`, with FP32
+  state `[batch, heads, 128, 128]`.
+- broader focused suite:
+
+```text
+JAX_PLATFORMS=cuda ... pytest \
+  tests/test_cuda_fp32_ffi.py \
+  tests/test_kv_cache.py::test_linear_attention_chunked_vs_recurrent \
+  tests/test_kv_cache.py::test_linear_attention_multichunk_matches_recurrent \
+  tests/test_kv_cache.py::test_linear_attention_state_persistence \
+  tests/test_backend_boundaries.py::test_bucketed_linear_prefill_preserves_hybrid_state_for_decode \
+  tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute -q
+```
+
+- result: `14 passed`.
+
+Decision:
+
+- Accept this as a focused ABI/toolchain milestone only.
+- Do not claim a serving speedup yet. The kernel is not routed through
+  `PureJAXBackend.gated_delta_decode`, has not run exact generated-token parity,
+  and has not run the integrated hetero8 benchmark/profile gate.
+- Next step is an explicit backend opt-in for width-1 GDN decode only, then
+  exact-token parity and integrated performance comparison against Entry 045.

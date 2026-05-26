@@ -125,6 +125,11 @@ gdn_recurrent_decode_step(
   `forward_step_token_ids_jit` decreases.
 - do-not-merge conditions: state drift above gate, hidden dtype downgrade, or
   integrated server regression despite a microbenchmark win.
+- current CUDA status: a local FP32 CUDA/JAX FFI width-1 recurrent decode
+  prototype passes focused parity against `jax_recurrent_gated_delta_rule`,
+  including the model's `16` GDN heads and `128`-wide state shape. It remains
+  default-off and unrouted until exact generated-token and integrated
+  performance gates pass.
 
 ## P1.2 - `gdn_segmented_prefill_chunk32`
 

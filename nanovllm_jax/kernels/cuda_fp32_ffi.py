@@ -25,6 +25,7 @@ from nanovllm_jax.kernels.registry import backend_status
 
 _TARGET_KV_APPEND = "nanovllm_jax_fp32_kv_append_paged_nhd"
 _TARGET_PAGED_DECODE = "nanovllm_jax_fp32_paged_decode_attention_gqa_nhd"
+_TARGET_GDN_DECODE = "nanovllm_jax_fp32_gdn_recurrent_decode"
 _REGISTER_LOCK = threading.Lock()
 _REGISTERED = False
 _LOADED_LIBS: list[ctypes.CDLL] = []
@@ -175,6 +176,7 @@ def _register_kv_append_target() -> None:
         library = ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
         handler = library.NanoVllmJaxFp32KvAppend
         decode_handler = library.NanoVllmJaxFp32PagedDecodeAttention
+        gdn_decode_handler = library.NanoVllmJaxFp32GdnRecurrentDecode
         jax.ffi.register_ffi_target(
             _TARGET_KV_APPEND,
             jax.ffi.pycapsule(handler),
@@ -184,6 +186,12 @@ def _register_kv_append_target() -> None:
         jax.ffi.register_ffi_target(
             _TARGET_PAGED_DECODE,
             jax.ffi.pycapsule(decode_handler),
+            platform="gpu",
+            api_version=1,
+        )
+        jax.ffi.register_ffi_target(
+            _TARGET_GDN_DECODE,
+            jax.ffi.pycapsule(gdn_decode_handler),
             platform="gpu",
             api_version=1,
         )
@@ -509,3 +517,87 @@ def paged_decode_attention_gqa_nhd_fp32(
 
 def paged_decode_attention_gqa_nhd_fp32_reference(*args: Any, **kwargs: Any):
     return paged_decode_attention_gqa_nhd_reference(*args, **kwargs)
+
+
+def _validate_fp32_gdn_decode_inputs(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    g: jnp.ndarray,
+    beta: jnp.ndarray,
+    state: jnp.ndarray,
+) -> None:
+    for name, value_array, rank in (
+        ("query", query, 4),
+        ("key", key, 4),
+        ("value", value, 4),
+        ("g", g, 3),
+        ("beta", beta, 3),
+        ("state", state, 4),
+    ):
+        if value_array.dtype != jnp.float32:
+            raise ValueError(f"{name} must be float32")
+        if value_array.ndim != rank:
+            raise ValueError(f"{name} must be rank-{rank}")
+    if query.shape[:3] != key.shape[:3]:
+        raise ValueError("query and key must have matching [batch, heads, time]")
+    if value.shape[:3] != query.shape[:3]:
+        raise ValueError("value must have matching [batch, heads, time]")
+    if g.shape != query.shape[:3] or beta.shape != query.shape[:3]:
+        raise ValueError("g and beta must have shape [batch, heads, time]")
+    if query.shape[2] != 1:
+        raise ValueError("FP32 GDN decode prototype only supports time=1")
+    if state.shape[:2] != query.shape[:2]:
+        raise ValueError("state batch/head dimensions must match query")
+    if state.shape[2] != query.shape[3] or state.shape[3] != value.shape[3]:
+        raise ValueError("state must have shape [batch, heads, key_dim, value_dim]")
+
+
+def gdn_recurrent_decode_step_fp32(
+    query: Any,
+    key: Any,
+    value: Any,
+    g: Any,
+    beta: Any,
+    state: Any,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Width-1 GDN recurrent decode with FP32 state and q/k L2 normalization."""
+
+    query = _as_jax_array("query", query)
+    key = _as_jax_array("key", key)
+    value = _as_jax_array("value", value)
+    g = _as_jax_array("g", g)
+    beta = _as_jax_array("beta", beta)
+    state = _as_jax_array("state", state)
+    _validate_fp32_gdn_decode_inputs(query, key, value, g, beta, state)
+    _register_kv_append_target()
+    call = jax.ffi.ffi_call(
+        _TARGET_GDN_DECODE,
+        (
+            jax.ShapeDtypeStruct(value.shape, value.dtype),
+            jax.ShapeDtypeStruct(state.shape, state.dtype),
+        ),
+        has_side_effect=False,
+    )
+    return call(query, key, value, g, beta, state)
+
+
+def gdn_recurrent_decode_step_fp32_reference(
+    query: Any,
+    key: Any,
+    value: Any,
+    g: Any,
+    beta: Any,
+    state: Any,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    from nanovllm_jax.model import jax_recurrent_gated_delta_rule
+
+    return jax_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=state,
+        use_qk_l2norm_in_kernel=True,
+    )

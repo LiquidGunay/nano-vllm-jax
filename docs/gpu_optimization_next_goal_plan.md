@@ -475,6 +475,17 @@ Pallas is still worth studying, but JAX documents Pallas as a custom-kernel
 language for GPU/TPU and marks it with experimental caveats. Given the repo's
 previous Pallas regressions, it should not be the first production path for GDN.
 
+### Status
+
+- Current serving GDN decode/prefill is still pure JAX/XLA at the backend
+  boundary. `PureJAXBackend.gated_delta_decode` calls
+  `jax_recurrent_gated_delta_rule`; `PureJAXBackend.gated_delta_prefill` calls
+  `jax_chunk_gated_delta_rule`.
+- A local FP32 CUDA/JAX FFI width-1 `gdn_recurrent_decode_step` prototype now
+  passes focused parity against `jax_recurrent_gated_delta_rule`, including the
+  model's `batch=2`, `gdn_heads=16`, `head_dim=128` shape. It is not routed into
+  serving yet and has no integrated performance claim.
+
 ### Acceptance Gate
 
 ```text
@@ -798,8 +809,10 @@ Commit 6:
 
 Commit 7:
 
-- Add gdn_recurrent_decode_step prototype
-- First isolated tests, then integrated decode benchmark
+- ~~Add gdn_recurrent_decode_step prototype~~
+- ~~First isolated tests~~
+- Route through `gated_delta_decode` behind an opt-in flag
+- Run integrated decode benchmark
 
 Commit 8:
 
