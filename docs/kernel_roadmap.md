@@ -134,7 +134,7 @@ gdn_recurrent_decode_step(
   `forward_step_token_ids_jit` decreases.
 - do-not-merge conditions: state drift above gate, hidden dtype downgrade, or
   integrated server regression despite a microbenchmark win.
-- current CUDA status: a local FP32 CUDA/JAX FFI width-1 recurrent decode
+- local probe status: a local FP32 CUDA/JAX FFI width-1 recurrent decode
   prototype passes focused parity against `jax_recurrent_gated_delta_rule`,
   including the model's `16` GDN heads and `128`-wide state shape. The backend
   route is available behind `NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE=1`, but the
@@ -142,7 +142,8 @@ gdn_recurrent_decode_step(
   throughput/ITL, and the V,K-native one-repeat long-prefill probe reached only
   `88.07 tok/s`, `0.757x` vLLM, below the accepted V,K baseline of
   `90.65 tok/s`. Keep this route default-off as a diagnostic; do not treat a
-  standalone width-1 recurrence custom call as an accepted serving kernel.
+  standalone width-1 recurrence custom call as an accepted serving kernel or as
+  the next production implementation path.
 - layout decision: vLLM/FlashInfer Qwen GDN uses k-last/V-first recurrent state,
   and the repo will move canonical serving GDN state to `[B,L,HV,V,K]` instead
   of preserving the old JAX `[B,L,HV,K,V]` ABI. The pure-JAX fallback should be
@@ -154,8 +155,9 @@ gdn_recurrent_decode_step(
 - packed-core status: `gdn_packed_decode_step_fp32` implements that boundary as
   a local CUDA/JAX FFI target and passes focused CUDA parity for same-head and
   GVA q/k repetition shapes using native V,K state. It is still not a serving
-  route or speed claim until the integrated decode path improves the server
-  benchmark.
+  route, speed claim, or planned production route. The next GDN implementation
+  should be vLLM/FLA-shaped and should borrow their kernel structure rather than
+  promoting this local probe.
 - V,K migration status: the pure-JAX fallback now consumes and returns V,K GDN
   state directly, and the local recurrent/packed CUDA decode probes now accept
   V,K without Python-side K,V transposes. Focused CUDA tests, CUDA FFI tests, MTP

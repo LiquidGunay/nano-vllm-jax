@@ -4111,3 +4111,27 @@ JAX_PLATFORMS=cuda ... pytest -q \
   rectangular one-piece prefill prototype. The next GDN prefill candidate should
   target the segmented/nnz boundary or a backend design that preserves the
   current padded chunk32 accumulation contract.
+
+### Entry 103 - vLLM-Style Random Long-Prefill Sidecar
+
+- experiment: ran the new vLLM-style random long-prefill sidecar with 128
+  prompts, random input length centered at `1280`, range ratio `0.6`, output
+  length `16`, `max_num_seqs=4`, and one repeat. The run used
+  `gpu_paged_default`; no CUDA GDN probe flag was enabled.
+- artifact: `results/gpu_matrix_20260526_vllm_random_longprefill_r1.json`
+- report: `results/gpu_matrix_20260526_vllm_random_longprefill_r1.md`
+- result: JAX default reached `84.45 tok/s`; live vLLM reached
+  `354.24 tok/s`; JAX/vLLM was `0.238x`. Exact generated-token match held
+  against the stored JAX default reference, and JAX/reference throughput was
+  `1.009x`, but the run is not speed-claim-ready because it has only one
+  repeat and misses the `0.9x` target.
+- latency: JAX `TTFT p50 12420.89 ms`, `TTFT p95 23289.88 ms`,
+  `ITL p50 13.30 ms`, `ITL p95 14.22 ms`; live vLLM `TTFT p50 2946.94 ms`,
+  `TTFT p95 5403.52 ms`, `ITL p50 71.30 ms`, `ITL p95 75.08 ms`.
+- profile movement vs the stored JAX reference is small: `forward_step_token_ids_jit`
+  improved by `120.55 ms`, `PjRt Execute` improved by `102.97 ms`, while
+  `tolist`/`np.asarray` attribution worsened by about `43.9 ms`.
+- decision: record this as a sidecar comparability data point, not as the main
+  exact-token goal gate. The large gap is primarily TTFT/serving-batch behavior
+  on the vLLM-style random prompt lane, so future kernel work should continue to
+  report this lane separately from the frozen long-prefill correctness gate.

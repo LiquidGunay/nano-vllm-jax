@@ -63,8 +63,10 @@ documentation/configuration-first:
 1. Keep the docs plus benchmark config JSONs as the first deliverable.
 2. Treat `gpu_paged_default` as the fastest accepted non-MTP default, not the
    most conservative historical baseline.
-3. Keep FlashInfer, `jax-tvm-ffi`, and local CUDA kernels as optional
-   dependencies behind backend flags with pure-JAX fallbacks.
+3. Keep FlashInfer, `jax-tvm-ffi`, and FLA/vLLM-derived external kernels as
+   optional dependencies behind backend flags with pure-JAX fallbacks. Local
+   CUDA probes are diagnostic artifacts only unless a later design review
+   explicitly promotes a broader production kernel boundary.
 4. Prefer stored local artifacts for JAX and vLLM comparisons. If a selected
    workload has no stored local artifact, run the missing comparison live when a
    GPU and dependency stack are available, then store that artifact for future
@@ -90,6 +92,10 @@ documentation/configuration-first:
    `NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16`. This is a speed experiment for
    external-kernel compatibility, not a correctness-contract change for the
    default path.
+10. Do not use the current local CUDA GDN probes as the next optimization path.
+    They are useful ABI/correctness evidence, but the next real kernel route
+    should use FlashInfer for paged KV/attention and vLLM/Flash Linear
+    Attention references for GDN.
 
 Current GDN status: serving GDN is still expressed as JAX and lowered by XLA to
 GPU work; there is no accepted hand-owned GDN kernel in the default path.
@@ -126,6 +132,11 @@ Current tracked records:
   migration:
   `results/gpu_matrix_20260526_vk_layout.json`, `90.65 tok/s`, `0.779x` the
   stored vLLM reference, exact generated-token parity over two repeats.
+- vLLM-style random long-prefill sidecar, one repeat, not speed-claim-ready:
+  `results/gpu_matrix_20260526_vllm_random_longprefill_r1.json`,
+  `84.45 tok/s`, live vLLM `354.24 tok/s`, `0.238x` vLLM, exact generated-token
+  match against the stored JAX default reference. This sidecar is a broader
+  comparability lane, not the frozen exact-token goal gate.
 - Active target: fastest accepted kernel-backed non-speculative serving at
   `>=0.9x` vLLM on the same benchmark discipline, with MTP remaining
   diagnostic-only.
@@ -847,11 +858,15 @@ state dtype = fp32 unless proven safe otherwise
 3. Adapt `jax_recurrent_gated_delta_rule` and `jax_chunk_gated_delta_rule` to
    consume and return V,K state directly.
 4. Update state-table, prefix-state, MTP, and parity tests for the new shape.
-5. Study Qwen 3 Next vLLM and Flash Linear Attention Gated DeltaNet kernels.
-6. Start with one CUDA custom-call/FFI kernel, not Pallas.
+5. Integrate against Qwen 3 Next vLLM and Flash Linear Attention Gated DeltaNet
+   kernels where practical, preserving their natural V,K state layout.
+6. Do not promote the local width-1 CUDA GDN probe as the serving path. If a
+   native custom-call is needed later, it must be a broader FLA/vLLM-shaped
+   kernel boundary with an integrated serving win, not the standalone probe.
 7. Keep pure-JAX recurrence as the fallback/reference, but in the same V,K
    serving layout.
-8. Integrate behind NANO_VLLM_JAX_KERNEL_BACKEND=gdn_cuda.
+8. Integrate behind a named optional backend flag such as
+   NANO_VLLM_JAX_KERNEL_BACKEND=gdn_fla.
 ```
 
 Pallas is still worth studying, but JAX documents Pallas as a custom-kernel
@@ -873,7 +888,8 @@ previous Pallas regressions, it should not be the first production path for GDN.
   native decode cleanup, a one-repeat long-prefill probe also missed the active
   target: `88.07 tok/s`, `0.757x` vLLM, exact generated-token parity, below the
   accepted V,K baseline of `90.65 tok/s`. Keep it default-off as a diagnostic
-  route; do not promote it to default or fast opt-in.
+  route; do not promote it to default, fast opt-in, or the next kernel
+  implementation path.
 - A pure-JAX vLLM-style packed decode reference currently exists in
   `nanovllm_jax/kernels/cuda_gdn.py` as
   `gdn_packed_decode_reference_local_state`. It accepts packed
@@ -891,7 +907,8 @@ previous Pallas regressions, it should not be the first production path for GDN.
   `mixed_qkv + a/b/A_log/dt_bias`, consumes native `[B,HV,V,K]` state,
   and passes focused CUDA parity against the pure-JAX packed reference for both
   same-head and GVA q/k repetition cases. It is an ABI/toolchain step only; it
-  is not routed into serving and makes no speed claim yet.
+  is not routed into serving, is not the planned production route, and makes no
+  speed claim.
 
 ### Acceptance Gate
 
@@ -1412,6 +1429,7 @@ the pure-JAX correctness path.
 9. Maintain both accepted-baseline and fastest-achieved records for tracked workloads.
 10. For GDN, target V,K serving state; do not preserve K,V as the serving ABI merely because the old JAX path used it.
 11. Keep BF16 GDN prefill activations as a separate opt-in experiment after V,K correctness is established.
+12. Do not promote local CUDA probes as production kernels. Use FlashInfer for paged KV/attention and vLLM/FLA-derived kernels for GDN unless those routes are explicitly blocked.
 ```
 
 ## Expected Strategic Outcome
@@ -1422,16 +1440,17 @@ The path is:
 Clean baseline
 -> stable benchmark matrix
 -> GDN V,K state migration with pure-JAX fallback updated
--> kernel-native GDN decode recurrence
--> custom/ported segmented GDN prefill
--> full-attention paged KV/attention kernels when traces justify renewed P0 work
+-> FlashInfer paged KV/attention where dtype/layout gates allow
+-> vLLM/FLA-shaped GDN decode recurrence
+-> vLLM/FLA-shaped segmented GDN prefill
 -> only then revisit MTP or finer fusions
 ```
 
 The core bet is: keep the JAX model and correctness harness, but align the GDN
 state ABI with kernel-native V,K layout, then replace the few serving kernels
-where vLLM/FlashInfer have structural advantage: GDN recurrence/prefill first,
-then renewed full-attention paged KV/attention work if the traces justify it.
+where vLLM/FlashInfer/FLA have structural advantage. The local CUDA probes stay
+as ABI diagnostics; production speed work should come from FlashInfer
+paged-attention/KV kernels and vLLM/FLA-style GDN kernels.
 
 ## Reference Links From The Proposal
 
