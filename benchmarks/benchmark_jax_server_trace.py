@@ -268,6 +268,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     )
     kernel_backend = getattr(engine.model_runner.backend, "kernel_backend", None)
     kernel_backend_dict = kernel_backend.as_dict() if kernel_backend is not None else None
+    nhd_cache = getattr(engine.model_runner, "full_attention_nhd_cache", None)
     if args.warmup:
         warmup_params = _build_sampling_params([], min(2, args.output_len))
         engine.generate_with_trace(prompts, sampling_params=warmup_params)
@@ -308,6 +309,9 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "kernel_backend_unavailable_reason": (kernel_backend_dict or {}).get("reason"),
             "kernel_backend_external_call_counts": {},
             "kernel_backend_fallback_counts": {},
+            "nhd_full_attention_kv_cache_enabled": nhd_cache is not None,
+            "nhd_full_attention_kv_cache_shape": list(nhd_cache.k_cache.shape) if nhd_cache is not None else None,
+            "nhd_full_attention_layers": list(nhd_cache.layer_indices) if nhd_cache is not None else None,
             "jax_execution": args.jax_execution,
             "linear_chunk_size": int(engine.config.linear_chunk_size),
             "num_speculative_tokens": args.num_speculative_tokens,

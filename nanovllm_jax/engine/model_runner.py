@@ -934,6 +934,14 @@ class CanonicalModelRunner:
             max_seqs=max_seqs,
             max_blocks_per_seq=self.max_blocks_per_seq,
         )
+        self.full_attention_nhd_cache = self.backend.allocate_full_attention_nhd_kv_cache(
+            replace(kv_spec, num_blocks=effective_num_blocks),
+            full_attention_layers=tuple(
+                layer_id
+                for layer_id, layer_type in enumerate(config.layer_types)
+                if layer_type == "full_attention"
+            ),
+        )
         self.hybrid_states: Dict[int, HybridLayerState] = {}
         self._max_hybrid_slots = max_seqs
         self._hybrid_slots: Dict[int, int] = {}

@@ -32,6 +32,22 @@ class KVCacheStorage:
     v_cache: jnp.ndarray
 
 
+@dataclass(frozen=True)
+class FullAttentionNHDKVCacheStorage:
+    """Optional NHD cache for full-attention external kernels.
+
+    Shape: [num_full_attention_layers, num_pages, page_size, num_kv_heads, head_dim].
+    Individual kernel calls receive one layer slice with FlashInfer's NHD layout:
+    [num_pages, page_size, num_kv_heads, head_dim].
+    """
+
+    k_cache: jnp.ndarray
+    v_cache: jnp.ndarray
+    layer_indices: tuple[int, ...]
+    page_size: int
+    layout: str = "NHD"
+
+
 @dataclass
 class AttentionMetadata:
     """Per-step paged/ragged attention metadata."""
@@ -250,6 +266,47 @@ def init_kv_cache(
         block_table=block_table,
         kv_lens=kv_lens,
         slot_mapping=slot_mapping,
+    )
+
+
+def init_full_attention_nhd_kv_cache(
+    spec: KVCacheSpec,
+    full_attention_layers: tuple[int, ...],
+) -> FullAttentionNHDKVCacheStorage:
+    """Allocate an optional full-attention KV cache in NHD page layout.
+
+    The caller is expected to pass an already-capped `spec.num_blocks`, so this
+    helper does not change scheduler/block-manager capacity.
+    """
+
+    shape = full_attention_nhd_kv_cache_shape(spec, full_attention_layers)
+    k_cache = jnp.zeros(
+        shape,
+        dtype=spec.dtype,
+    )
+    v_cache = jnp.zeros_like(k_cache)
+    return FullAttentionNHDKVCacheStorage(
+        k_cache=k_cache,
+        v_cache=v_cache,
+        layer_indices=tuple(int(layer) for layer in full_attention_layers),
+        page_size=int(spec.block_size),
+    )
+
+
+def full_attention_nhd_kv_cache_shape(
+    spec: KVCacheSpec,
+    full_attention_layers: tuple[int, ...],
+) -> tuple[int, int, int, int, int]:
+    """Return the NHD full-attention cache shape without allocating arrays."""
+
+    if not full_attention_layers:
+        raise ValueError("full_attention_layers must contain at least one layer")
+    return (
+        len(full_attention_layers),
+        int(spec.num_blocks),
+        int(spec.block_size),
+        int(spec.num_kv_heads),
+        int(spec.head_dim),
     )
 
 

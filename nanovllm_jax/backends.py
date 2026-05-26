@@ -7,6 +7,7 @@ path; GPU/TPU backends should override only the operations that need kernels.
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from typing import Protocol
 
@@ -20,16 +21,21 @@ from nanovllm_jax.kernels.registry import (
 )
 from nanovllm_jax.kv_cache import (
     AttentionMetadata,
+    FullAttentionNHDKVCacheStorage,
     KVCacheSpec,
     KVCacheStorage,
     cap_num_kv_cache_blocks,
     compute_slot_mapping,
     init_kv_cache,
+    init_full_attention_nhd_kv_cache,
     paged_attention,
     paged_attention_prefill,
     paged_attention_decode,
     update_kv_cache,
 )
+
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
+_NHD_FULL_ATTN_CACHE_ENV = "NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE"
 
 
 class InferenceBackend(Protocol):
@@ -43,6 +49,13 @@ class InferenceBackend(Protocol):
         max_seqs: int,
         max_blocks_per_seq: int,
     ) -> KVCacheStorage:
+        ...
+
+    def allocate_full_attention_nhd_kv_cache(
+        self,
+        spec: KVCacheSpec,
+        full_attention_layers: tuple[int, ...],
+    ) -> FullAttentionNHDKVCacheStorage | None:
         ...
 
     def build_attention_metadata(
@@ -131,6 +144,18 @@ class PureJAXBackend:
             max_kv_cache_bytes=capped_spec.max_kv_cache_bytes,
         )
         return state.storage
+
+    def allocate_full_attention_nhd_kv_cache(
+        self,
+        spec: KVCacheSpec,
+        full_attention_layers: tuple[int, ...],
+    ) -> FullAttentionNHDKVCacheStorage | None:
+        if os.environ.get(_NHD_FULL_ATTN_CACHE_ENV, "0") not in _TRUE_ENV_VALUES:
+            return None
+        return init_full_attention_nhd_kv_cache(
+            spec=replace(spec, num_blocks=cap_num_kv_cache_blocks(spec)),
+            full_attention_layers=full_attention_layers,
+        )
 
     def build_attention_metadata(
         self,

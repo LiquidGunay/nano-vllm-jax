@@ -709,8 +709,8 @@ Commit 3:
 
 Commit 4:
 
-- Add NHD full-attention KV cache allocation behind a flag
-- Keep existing pure-JAX cache fallback
+- ~~Add NHD full-attention KV cache allocation behind a flag~~
+- ~~Keep existing pure-JAX cache fallback~~
 
 Commit 5:
 
