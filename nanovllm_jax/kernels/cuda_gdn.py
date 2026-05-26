@@ -32,6 +32,116 @@ def gdn_segmented_prefill_chunk32(*args: Any, **kwargs: Any):
     raise NotImplementedError("gdn_segmented_prefill_chunk32 CUDA wrapper is not implemented yet")
 
 
+def local_gdn_state_to_k_last(state: jnp.ndarray) -> jnp.ndarray:
+    """Convert local `[B,H,K,V]` recurrent state to k-last `[B,H,V,K]`."""
+
+    if state.ndim != 4:
+        raise ValueError("state must have shape [batch, heads, key_dim, value_dim]")
+    return jnp.transpose(state, (0, 1, 3, 2))
+
+
+def k_last_gdn_state_to_local(state: jnp.ndarray) -> jnp.ndarray:
+    """Convert k-last `[B,H,V,K]` recurrent state to local `[B,H,K,V]`."""
+
+    if state.ndim != 4:
+        raise ValueError("state must have shape [batch, heads, value_dim, key_dim]")
+    return jnp.transpose(state, (0, 1, 3, 2))
+
+
+def split_packed_gdn_decode_mixed_qkv(
+    mixed_qkv: jnp.ndarray,
+    *,
+    num_q_heads: int,
+    num_value_heads: int,
+    key_dim: int,
+    value_dim: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Split vLLM-style packed decode QKV into local `[B,H,1,D]` tensors."""
+
+    if mixed_qkv.ndim != 2:
+        raise ValueError("mixed_qkv must have shape [batch, packed_dim]")
+    if num_q_heads <= 0 or num_value_heads <= 0:
+        raise ValueError("head counts must be positive")
+    if key_dim <= 0 or value_dim <= 0:
+        raise ValueError("head dimensions must be positive")
+    if num_value_heads % num_q_heads != 0:
+        raise ValueError("num_value_heads must be divisible by num_q_heads")
+    query_size = num_q_heads * key_dim
+    key_size = num_q_heads * key_dim
+    value_size = num_value_heads * value_dim
+    expected = query_size + key_size + value_size
+    if mixed_qkv.shape[1] != expected:
+        raise ValueError(
+            "mixed_qkv last dimension must equal "
+            f"2*num_q_heads*key_dim + num_value_heads*value_dim ({expected})"
+        )
+    query, key, value = jnp.split(mixed_qkv, (query_size, query_size + key_size), axis=-1)
+    batch = mixed_qkv.shape[0]
+    query = query.reshape(batch, num_q_heads, 1, key_dim)
+    key = key.reshape(batch, num_q_heads, 1, key_dim)
+    value = value.reshape(batch, num_value_heads, 1, value_dim)
+    return query, key, value
+
+
+def gdn_packed_decode_reference_local_state(
+    mixed_qkv: jnp.ndarray,
+    a: jnp.ndarray,
+    b: jnp.ndarray,
+    a_log: jnp.ndarray,
+    dt_bias: jnp.ndarray,
+    state: jnp.ndarray,
+    *,
+    use_qk_l2norm_in_kernel: bool = True,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Pure-JAX reference for vLLM-style packed GDN decode input.
+
+    This mirrors the upstream packed decode boundary but intentionally keeps the
+    local recurrent-state contract as `[B,H,K,V]`. It is an ABI target for
+    future CUDA work, not a serving speed path.
+    """
+
+    from nanovllm_jax.model import jax_recurrent_gated_delta_rule
+
+    if state.ndim != 4:
+        raise ValueError("state must have shape [batch, heads, key_dim, value_dim]")
+    batch, num_value_heads, key_dim, value_dim = state.shape
+    if mixed_qkv.shape[0] != batch:
+        raise ValueError("mixed_qkv batch must match state batch")
+    if a.shape != (batch, num_value_heads) or b.shape != (batch, num_value_heads):
+        raise ValueError("a and b must have shape [batch, value_heads]")
+    if a_log.shape != (num_value_heads,) or dt_bias.shape != (num_value_heads,):
+        raise ValueError("a_log and dt_bias must have shape [value_heads]")
+
+    qk_dim = mixed_qkv.shape[1] - num_value_heads * value_dim
+    if qk_dim <= 0 or qk_dim % (2 * key_dim) != 0:
+        raise ValueError("mixed_qkv has an invalid packed Q/K dimension")
+    num_q_heads = qk_dim // (2 * key_dim)
+    query, key, value = split_packed_gdn_decode_mixed_qkv(
+        mixed_qkv,
+        num_q_heads=num_q_heads,
+        num_value_heads=num_value_heads,
+        key_dim=key_dim,
+        value_dim=value_dim,
+    )
+    if num_value_heads != num_q_heads:
+        repeat = num_value_heads // num_q_heads
+        query = jnp.repeat(query, repeat, axis=1)
+        key = jnp.repeat(key, repeat, axis=1)
+
+    gate = -jnp.exp(a_log[None, :]) * jax.nn.softplus(a.astype(jnp.float32) + dt_bias[None, :])
+    beta = jax.nn.sigmoid(b).astype(jnp.float32)
+    output, new_state = jax_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        gate[:, :, None],
+        beta[:, :, None],
+        initial_state=state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+    return output, new_state
+
+
 def _seq_lens_to_tuple(seq_lens: Any) -> tuple[int, ...]:
     values = np.asarray(jax.device_get(seq_lens), dtype=np.int64).reshape(-1)
     if np.any(values < 0):

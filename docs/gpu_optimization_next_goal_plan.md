@@ -634,6 +634,14 @@ previous Pallas regressions, it should not be the first production path for GDN.
   was slower than Entry 045 despite exact generated-token parity. Keep it
   default-off as a diagnostic route; do not promote it to default or fast
   opt-in.
+- A pure-JAX vLLM-style packed decode reference now exists in
+  `nanovllm_jax/kernels/cuda_gdn.py` as
+  `gdn_packed_decode_reference_local_state`. It accepts packed
+  `mixed_qkv [B, 2*H*K + HV*V]` plus raw `a/b/A_log/dt_bias`, computes the
+  same gate/beta transform as vLLM's packed decode path, and calls the current
+  recurrent rule while preserving the local canonical state layout
+  `[B,HV,K,V]`. CUDA-gated focused tests cover same-head, GVA q/k repetition,
+  and k-last state roundtrip; they are skipped in CPU-only/no-JAX environments.
 
 ### Acceptance Gate
 
@@ -1035,6 +1043,8 @@ Commit 7:
 
 - ~~Add gdn_recurrent_decode_step prototype~~
 - ~~First isolated tests~~
+- ~~Add vLLM-style packed GDN decode ABI reference while preserving local
+  `[B,H,K,V]` state layout~~
 - ~~Route through `gated_delta_decode` behind an opt-in flag~~
 - ~~Run integrated decode benchmark and record rejection of standalone GDN
   decode routing~~
