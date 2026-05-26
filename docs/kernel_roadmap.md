@@ -170,7 +170,10 @@ gdn_segmented_prefill_chunk32(
   state-drift gate. A V64 value-block follow-up reduced custom-call p50 at full
   shape but still lost to current JAX and did not improve state drift, so the
   next candidate should move closer to the segmented/nnz ABI instead of only
-  widening the rectangular value block.
+  widening the rectangular value block. The first pure-JAX packed segmented ABI
+  correctness gate passes reduced shape but fails the full hetero8 standalone
+  `1e-5` gate versus current padded chunk32, so CUDA math for that ABI is
+  deferred pending a correctness-contract decision.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 

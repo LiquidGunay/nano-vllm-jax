@@ -1,0 +1,120 @@
+"""Focused tests for the planned segmented GDN prefill ABI."""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from nanovllm_jax.kernels.cuda_gdn import (
+    gdn_segmented_prefill_chunk32_reference,
+    pack_padded_gdn_inputs,
+    unpack_segmented_gdn_output,
+)
+from nanovllm_jax.model import jax_chunk_gated_delta_rule
+
+
+def _has_cuda_backend() -> bool:
+    try:
+        return bool(jax.devices("gpu"))
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_segmented_gdn_prefill_reference_matches_padded_chunk32(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1")
+
+    batch = 5
+    num_heads = 3
+    seq_len = 64
+    key_dim = 16
+    value_dim = 16
+    lengths = jnp.array([0, 5, 32, 37, 64], dtype=jnp.int32)
+    valid = jnp.arange(seq_len, dtype=jnp.int32)[None, :] < lengths[:, None]
+
+    keys = jax.random.split(jax.random.PRNGKey(20260526), 6)
+    query = jax.random.normal(
+        keys[0],
+        (batch, num_heads, seq_len, key_dim),
+        dtype=jnp.float32,
+    )
+    key = jax.random.normal(
+        keys[1],
+        (batch, num_heads, seq_len, key_dim),
+        dtype=jnp.float32,
+    )
+    value = jax.random.normal(
+        keys[2],
+        (batch, num_heads, seq_len, value_dim),
+        dtype=jnp.float32,
+    )
+    gate = jax.random.normal(
+        keys[3],
+        (batch, num_heads, seq_len),
+        dtype=jnp.float32,
+    ) * 0.1
+    beta = jax.random.uniform(
+        keys[4],
+        (batch, num_heads, seq_len),
+        dtype=jnp.float32,
+    )
+    initial_state = jax.random.normal(
+        keys[5],
+        (batch, num_heads, key_dim, value_dim),
+        dtype=jnp.float32,
+    ) * 0.01
+
+    query = jnp.where(valid[:, None, :, None], query, 0.0)
+    key = jnp.where(valid[:, None, :, None], key, 0.0)
+    value = jnp.where(valid[:, None, :, None], value, 0.0)
+    gate = jnp.where(valid[:, None, :], gate, 0.0)
+    beta = jnp.where(valid[:, None, :], beta, 0.0)
+
+    padded_out, padded_state = jax_chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        chunk_size=32,
+        initial_state=initial_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    (
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_gate,
+        packed_beta,
+        cu_seqlens,
+    ) = pack_padded_gdn_inputs(query, key, value, gate, beta, lengths)
+    packed_out, segmented_state = gdn_segmented_prefill_chunk32_reference(
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_beta,
+        packed_gate,
+        cu_seqlens,
+        initial_state,
+        chunk_size=32,
+        use_qk_l2norm_in_kernel=True,
+    )
+    segmented_out = unpack_segmented_gdn_output(packed_out, cu_seqlens, seq_len)
+
+    valid_output_diff = jnp.where(
+        valid[:, None, :, None],
+        segmented_out.astype(jnp.float32) - padded_out.astype(jnp.float32),
+        0.0,
+    )
+    state_diff = segmented_state.astype(jnp.float32) - padded_state.astype(jnp.float32)
+
+    assert np.asarray(packed_query).shape[0] == int(np.asarray(lengths).sum())
+    assert np.asarray(cu_seqlens).tolist() == [0, 0, 5, 37, 74, 138]
+    assert float(jnp.max(jnp.abs(valid_output_diff))) <= 1e-5
+    assert float(jnp.max(jnp.abs(state_diff))) <= 1e-5

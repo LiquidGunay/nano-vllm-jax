@@ -2928,3 +2928,67 @@ Decision:
 - Next prefill work should move closer to the planned segmented/nnz ABI or
   borrow the GDN kernel structure from Qwen 3 Next / Flash Linear Attention
   rather than only widening rectangular value blocks.
+
+## Entry 078 - Packed Segmented GDN Prefill ABI Correctness Gate
+
+- reduced run id:
+  `20260526-103723-2269640-gdn_prefill_segmented_reference_gate_smoke`
+- reduced benchmark artifact:
+  `results/gdn_prefill_segmented_reference_gate_smoke.json`
+- full-shape run id:
+  `20260526-103747-2269798-gdn_prefill_segmented_reference_gate_hetero8_64_512x32`
+- full-shape benchmark artifact:
+  `results/gdn_prefill_segmented_reference_gate_hetero8_64_512x32.json`
+- benchmark script: `benchmarks/benchmark_gdn_prefill_kernel.py`
+- change tested: added a pure-JAX packed segmented/nnz GDN ABI reference and a
+  benchmark gate behind `--check-segmented-reference-gate`. The gate packs
+  current padded `[B,H,T,D]` tensors into planned `[nnz,H,D]` tensors, builds
+  FlashAttention-style `cu_seqlens`, computes each sequence through the current
+  chunk32 JAX reference, unpacks back to rectangular layout, and compares
+  against `current_jax_chunk32_padded`.
+- focused CUDA test:
+
+```text
+JAX_PLATFORMS=cuda ... pytest tests/test_gdn_segmented_reference.py -q
+```
+
+- result: `1 passed` for mixed reduced lengths including zero-length and
+  partial-chunk rows.
+
+Reduced smoke gate:
+
+| metric | value |
+| --- | ---: |
+| `nnz_tokens` | `101` |
+| `cu_seqlens` | `[0, 37, 101]` |
+| output max abs | `1.490e-07` |
+| valid output max abs | `1.490e-07` |
+| state max abs | `4.768e-07` |
+| passes `1e-5` gate | `true` |
+
+Full hetero8 gate:
+
+| metric | value |
+| --- | ---: |
+| `nnz_tokens` | `2304` |
+| `cu_seqlens` | `[0,64,192,384,640,960,1344,1792,2304]` |
+| current JAX p50 | `5.445 ms` |
+| output max abs | `1.431e-05` |
+| valid output max abs | `1.431e-05` |
+| output MSE | `5.191e-15` |
+| state max abs | `1.678e-04` |
+| state MSE | `1.170e-11` |
+| passes `1e-5` gate | `false` |
+
+Decision:
+
+- Accept the helper and benchmark flag as a correctness-gate scaffold only.
+- Do not implement CUDA math for the true-token packed segmented ABI until its
+  correctness contract is resolved.
+- This result is important because it shows the packed ABI itself, before any
+  CUDA implementation, can miss the strict padded-chunk32 state gate at the
+  full model shape.
+- The next design decision is whether segmented GDN must preserve the current
+  padded rectangular accumulation contract exactly, or whether the correctness
+  reference should switch to a higher-level full-model/token/logit gate for a
+  true-token packed FLA/FlashInfer-style ABI.

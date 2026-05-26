@@ -563,6 +563,11 @@ gdn_segmented_prefill_chunk32(
 - A follow-up V64 value-block variant reduced full-shape p50 from `11.56 ms`
   to `8.60 ms`, confirming value-block/grid overhead is real, but it still lost
   to current JAX `5.44 ms` p50 and kept the same `state_max_abs=2.441e-04`.
+- A pure-JAX packed segmented/nnz ABI gate was added before CUDA math. It passes
+  reduced shape, but full hetero8 true-token packing fails the strict standalone
+  gate versus current padded chunk32: output max `1.431e-05`, state max
+  `1.678e-04`. Do not implement CUDA math for this packed ABI until the
+  correctness contract is resolved.
 - Keep it default-off and benchmark-only. Do not route into serving. The next
   attempt should move closer to the true segmented/nnz ABI and preserve FP32
   accumulation more closely before a server run.
@@ -843,6 +848,9 @@ Commit 8:
   do not route it into serving
 - ~~Run value-block-width follow-up and record that V64 improves V32 but still
   misses the full-shape microbenchmark gate~~
+- ~~Add packed segmented/nnz ABI correctness gate before CUDA math~~
+- Resolve packed-ABI correctness policy after full hetero8 gate failure before
+  implementing segmented CUDA math
 - Compare a revised segmented prefill candidate against Entry 045 chunk-32
   baseline after it beats the full-shape GDN microbenchmark gate
 

@@ -38,6 +38,11 @@ from nanovllm_jax.kernels.cuda_fp32_ffi import (
     gdn_prefill_chunk32_normalized_fp32,
     gdn_prefill_chunk32_v64_normalized_fp32,
 )
+from nanovllm_jax.kernels.cuda_gdn import (
+    gdn_segmented_prefill_chunk32_reference,
+    pack_padded_gdn_inputs,
+    unpack_segmented_gdn_output,
+)
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
@@ -70,6 +75,11 @@ def parse_args() -> argparse.Namespace:
         "--enable-one-piece-gdn-probe",
         action="store_true",
         help="Opt into the experimental one-piece Pallas GDN prefill probe. Full hetero8 shapes can compile for minutes.",
+    )
+    parser.add_argument(
+        "--check-segmented-reference-gate",
+        action="store_true",
+        help="Run the pure-JAX packed segmented ABI correctness gate after timed variants.",
     )
     return parser.parse_args()
 
@@ -1786,6 +1796,59 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
     comparisons = {}
     for name, output in outputs.items():
         comparisons[f"{name}_vs_{reference_name}"] = _compare_outputs(outputs[reference_name], output, valid)
+    segmented_reference_gate: dict[str, Any] = {
+        "enabled": bool(args.check_segmented_reference_gate),
+        "attempted": False,
+        "passes_1e_5_gate": None,
+        "comparison": None,
+        "run_ms": None,
+        "error": None,
+    }
+    if args.check_segmented_reference_gate:
+        segmented_reference_gate["attempted"] = True
+        try:
+            started = time.perf_counter()
+            (
+                packed_query,
+                packed_key,
+                packed_value,
+                packed_g,
+                packed_beta,
+                cu_seqlens,
+            ) = pack_padded_gdn_inputs(query, key, value, g, beta, lengths)
+            packed_output, segmented_state = gdn_segmented_prefill_chunk32_reference(
+                packed_query,
+                packed_key,
+                packed_value,
+                packed_beta,
+                packed_g,
+                cu_seqlens,
+                initial_state,
+                chunk_size=int(args.chunk_size),
+                use_qk_l2norm_in_kernel=True,
+            )
+            segmented_output = unpack_segmented_gdn_output(
+                packed_output,
+                cu_seqlens,
+                int(args.seq_len),
+            )
+            segmented_output = _block_until_ready((segmented_output, segmented_state))
+            comparison = _compare_outputs(outputs[reference_name], segmented_output, valid)
+            segmented_reference_gate.update(
+                {
+                    "run_ms": 1000.0 * (time.perf_counter() - started),
+                    "comparison": comparison,
+                    "cu_seqlens": np.asarray(cu_seqlens).tolist(),
+                    "nnz_tokens": int(packed_query.shape[0]),
+                    "passes_1e_5_gate": bool(
+                        comparison["output_max_abs"] <= 1e-5
+                        and comparison["valid_output_max_abs"] <= 1e-5
+                        and comparison["state_max_abs"] <= 1e-5
+                    ),
+                }
+            )
+        except BaseException as exc:
+            segmented_reference_gate["error"] = f"{type(exc).__name__}: {exc}"
     if pallas_pack_last_output is not None and pallas_pack_reference is not None:
         pallas_feasibility["active_input_pack_probe"]["comparisons"] = _compare_pack_outputs(
             pallas_pack_reference,
@@ -1904,6 +1967,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         "comparisons": comparisons,
         "profile_counters": profile_counters,
         "pallas_feasibility": pallas_feasibility,
+        "segmented_reference_gate": segmented_reference_gate,
         "historical_negative_controls": [
             "Entry053 static row-chunk ragged GDN prefill",
             "Entry056 static chunk-major GDN prefill",
