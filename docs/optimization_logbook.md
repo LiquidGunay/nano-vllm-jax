@@ -1752,3 +1752,41 @@ Decision:
 - Reject default MTP1 serving for this hetero8 workload. Output tokens remain exact, but only because all speculative drafts are rejected; MTP1 does not improve generation and the scheduler correctly disables it for low acceptance.
 - Do not optimize around MTP1 until the main model is much closer to vLLM and until the MTP draft path has meaningful acceptance. The current path also needs explicit server warmup coverage for commit-select shapes before any speed number is considered steady-state.
 - Near-term work should return to the main model targets from Tesla's audit: compact projection fusion under the current dtype contract, then HLO-guided attention/KV layout work.
+
+## Entry 050 - Rejected Prepacked MLP Gate/Up Compact Prefill
+
+- run id: `20260526-030536-2097294-jax_hetero8_64_512x32_packed_mlp_gate_up`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_prepacked_mlp_gate_up.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-030536-2097294-jax_hetero8_64_512x32_packed_mlp_gate_up`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-030536-2097294-jax_hetero8_64_512x32_packed_mlp_gate_up/plugins/profile/2026_05_26_03_06_15/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-030536-2097294-jax_hetero8_64_512x32_packed_mlp_gate_up/plugins/profile/2026_05_26_03_06_15/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change tested: a temporary `NANO_VLLM_JAX_PACK_MLP_GATE_UP=1` path packed each layer's `gate_proj` and `up_proj` into a precomputed `[gate, up]` MLP weight leaf at HF load time, then the compact prefill MLP used one larger input GEMM and split the result. This avoided runtime weight concatenation and was meant to cut compact projection GEMM launches under the BF16-weight/FP32-activation contract. The source change was reverted after profiling.
+- focused CUDA checks: with `NANO_VLLM_JAX_PACK_MLP_GATE_UP=1` and compact MLP enabled, `tests/test_lm_head_helpers.py`, `tests/test_backend_boundaries.py::test_bucketed_prefill_last_logits_match_exact_prefill`, `tests/test_backend_boundaries.py::test_bucketed_linear_prefill_preserves_hybrid_state_for_decode`, and `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute` passed under `JAX_PLATFORMS=cuda` (`6 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 045 chunk-32 reference.
+- JAX timing: `270.57 tok/s`, TTFT p50 `440.13 ms`, ITL p50 `16.15 ms`, ITL p95 `17.46 ms`.
+- delta vs Entry 045 chunk-32 default repeat: `0.736x` total tok/s, TTFT p50 `1.518x`, ITL p50 `1.229x`, ITL p95 `1.284x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 045 ms | prepacked gate/up ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 696.03 | 946.13 | overall much slower |
+| `_run_main_and_sample` | 572.99 | 809.97 | runner hot path much slower |
+| `forward_step_token_ids_jit` | 122.13 | 147.65 | compiled token-id path slower |
+| first `forward_step_token_ids_jit` | 30.83 | 30.88 | first prefill tied |
+| `PjRtCApiLoadedExecutable::Execute` | 138.32 over 252 calls | 165.74 over 252 calls | same dispatch count, heavier device execution |
+| `jit_compiled:XLA GPU module` | 94.20 | 107.62 | module time regressed |
+| `command_buffer::execute` | 40.34 over 1143 calls | 44.41 over 1143 calls | same count, heavier execution |
+| `command_buffer::update` | 27.13 over 248 calls | 34.35 over 248 calls | heavier updates |
+| `cutlass_80_tensorop_s1688gemm_128x128_16x5_nn_align4` | 52.40 over 96 calls | 25.74 over 48 calls | target compact GEMM bucket halved |
+| `input_reduce_fusion` | 28.65 over 1936 calls | 28.57 over 1936 calls | unchanged |
+| `gather` | 11.97 | 12.98 | worse |
+| `transpose` | 63.11 | 63.74 | unchanged/slightly worse |
+| `array.py:325 tolist` | 437.58 | 647.28 | host sync attribution worsened |
+| `np.asarray(jax.Array)` | 437.35 | 646.96 | host sync attribution worsened |
+
+Decision:
+
+- Reject and revert prepacked MLP gate/up compact prefill. The intended compact CUTLASS bucket did move in the right direction, but the larger packed parameter leaf and altered compiled plan increased device execution, command-buffer update time, and host synchronization enough to lose badly end to end.
+- Do not add persistent packed MLP gate/up weights for serving in this form. Any future compact projection fusion should avoid duplicating large weight leaves and should verify that `PjRt Execute`, `command_buffer::update`, and host sync stay flat before considering the compact GEMM win meaningful.
+- Next model-side candidates remain HLO-guided attention/KV layout or a lower-level compact projection kernel that does not expand the model parameter tree.
