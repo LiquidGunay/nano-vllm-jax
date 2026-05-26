@@ -1996,3 +1996,46 @@ Decision:
 - Reject and revert skip-unused hidden return norm. It preserved exact correctness and made only the first prefill range slightly smaller, while the integrated serving path regressed materially across compiled execution, GEMM lowering, command-buffer updates, and host synchronization.
 - Treat this as evidence that the greedy token-id path's visible final-norm structure is not a useful source-level optimization target; XLA's compiled plan is already dominated elsewhere or becomes worse when the branch changes the graph.
 - Follow Feynman's recommendation next: the viable model-side target is a backend-owned segmented GDN prefill kernel at chunk size 32, with acceptance gated on lower first `forward_step_token_ids_jit`, lower or flat `PjRt Execute`, `jit_compiled:XLA GPU module`, `command_buffer::update`, and no Entry 053-style kernel-count explosion.
+
+## Entry 056 - Rejected Static Chunk-Major GDN Prefill
+
+- run id: `20260526-042323-2137008-jax_hetero8_64_512x32_static_chunk_major_gdn_prefill`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_static_chunk_major_gdn_prefill.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-042323-2137008-jax_hetero8_64_512x32_static_chunk_major_gdn_prefill`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-042323-2137008-jax_hetero8_64_512x32_static_chunk_major_gdn_prefill/plugins/profile/2026_05_26_04_25_25/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-042323-2137008-jax_hetero8_64_512x32_static_chunk_major_gdn_prefill/plugins/profile/2026_05_26_04_25_25/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Hilbert warned against promoting the source-JAX chunk-major segmented GDN path. It reduced Entry 053's outer segmentation from about `72` row-chunks to `16` chunk-major steps, but it still de-vectorized the existing chunked GDN triangular solve across `n_chunks`, ran the 31-row inner scan separately per chunk, added per-chunk state/output scatters, and specialized the JIT key on exact query-length tuples. The recommended next step is a backend-owned segmented GDN prefill scaffold plus standalone hetero8 microbenchmark, promoted to server routing only if the standalone candidate beats current chunk32.
+- change tested: a temporary `NANO_VLLM_JAX_STATIC_CHUNK_MAJOR_GDN_PREFILL=1` path passed static host query lengths into the GDN prefill call, unrolled over the fixed time-chunk index, gathered only rows active in that chunk, and scattered the updated recurrent state/output back to the rectangular layout. This avoided Entry 053's per-row/per-chunk outer scan but remained a source-JAX segmented path. The source change and its focused test were reverted after profiling.
+- focused CUDA checks: with `NANO_VLLM_JAX_STATIC_CHUNK_MAJOR_GDN_PREFILL=1` and accepted compact-prefill flags enabled, the temporary segmented-vs-padded GDN parity test, `tests/test_backend_boundaries.py::test_bucketed_linear_prefill_preserves_hybrid_state_for_decode`, `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute`, `tests/test_backend_boundaries.py::test_bucketed_prefill_last_logits_match_exact_prefill`, and `tests/test_lm_head_helpers.py` passed under `JAX_PLATFORMS=cuda` (`7 passed`). A broader run including `test_linear_attention_chunked_vs_recurrent`, `test_linear_attention_multichunk_matches_recurrent`, and `test_linear_suffix_prefill_matches_sequential_decode_state` also passed (`11 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 045 chunk-32 reference.
+- JAX timing: `227.49 tok/s`, TTFT p50 `626.80 ms`, ITL p50 `16.05 ms`, ITL p95 `16.76 ms`.
+- delta vs Entry 045 chunk-32 default repeat: `0.619x` total tok/s, TTFT p50 `2.162x`, ITL p50 `1.221x`, ITL p95 `1.233x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 045 ms | static chunk-major GDN ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 696.03 | 1125.30 | overall much slower |
+| `_run_main_and_sample` | 572.99 | 992.72 | runner hot path much slower |
+| `forward_step_token_ids_jit` | 122.13 | 659.37 | compiled token-id path much slower |
+| first `forward_step_token_ids_jit` | 30.83 | 539.25 | first prefill exploded |
+| `PjRtCApiLoadedExecutable::Execute` | 138.32 over 252 calls | 673.34 over 252 calls | same dispatch count, far heavier device execution |
+| `jit_compiled:XLA GPU module` | 94.20 | 613.25 | module time exploded |
+| `command_buffer::execute` | 40.34 over 1143 calls | 467.52 over 9477 calls | many more command-buffer executes |
+| `command_buffer::update` | 27.13 over 248 calls | 36.90 over 248 calls | updates heavier |
+| `input_reduce_fusion` | 28.65 over 1936 calls | 44.80 over 19234 calls | intended GDN bucket regressed |
+| `loop_dynamic_update_slice_fusion` | 10.47 over 1328 calls | 18.67 over 9428 calls | per-chunk scatters expanded |
+| `loop_multiply_fusion` | 8.67 over 1550 calls | 25.86 over 10604 calls | de-vectorized chunk work expanded |
+| `gemm_fusion_dot_2` | 120.93 over 2695 calls | 172.42 over 1543 calls | broader GEMM family regressed |
+| `gather` | 11.97 | 19.59 | worse |
+| `transpose` | 63.11 | 39.99 | lower, but irrelevant next to GDN/module regression |
+| `wrapped_concatenate` | 36.50 over 576 calls | 36.46 over 576 calls | unchanged |
+| `MemcpyD2D` | 24.69 over 1231 calls | 22.11 over 1465 calls | slightly lower total, more copies |
+| `array.py:325 tolist` | 437.58 | 317.74 | host sync lower only because device critical path moved elsewhere |
+| `np.asarray(jax.Array)` | 437.35 | 317.47 | host sync lower only because device critical path moved elsewhere |
+
+Decision:
+
+- Reject and revert static chunk-major GDN prefill. It preserved correctness, but it confirmed the audit's risk: reducing padded row arithmetic in source JAX destroyed the current vectorized chunked-GDN lowering and created many more small command-buffer executions.
+- Do not pursue further source-level segmented GDN prefill variants. Entry 053 and Entry 056 together bracket row-major and chunk-major segmentation, and both lose badly for the same module/kernel-count reason.
+- Next aligned work should be a backend-owned segmented GDN prefill scaffold and standalone CUDA microbenchmark for the exact hetero8 shape (`B=8`, `H=16`, `T=512`, `K=V=128`, `chunk=32`, lengths `64..512`) before any server routing. Promote it only if the microbenchmark reduces warmed kernel time without command-buffer or module-time growth.
