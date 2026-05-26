@@ -129,6 +129,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-stored-references",
+        action="store_true",
+        help=(
+            "Exit before launching benchmarks unless every selected workload/config "
+            "has a stored JAX reference and every selected workload has a stored vLLM reference."
+        ),
+    )
+    parser.add_argument(
         "--skip-gpu-preflight",
         action="store_true",
         help="Skip the CUDA device availability check before launching real benchmark subprocesses.",
@@ -601,6 +609,30 @@ def _find_local_vllm_reference(config: dict[str, Any], workload: Workload, refer
     return candidate if _artifact_matches_workload(candidate, workload) else None
 
 
+def _stored_reference_gaps(
+    configs: dict[str, dict[str, Any]],
+    workloads: dict[str, Workload],
+    reference_dir: Path,
+) -> list[str]:
+    gaps: list[str] = []
+    vllm_config = configs.get("gpu_paged_default") or next(iter(configs.values()))
+    for workload_name, workload in workloads.items():
+        if _find_local_vllm_reference(vllm_config, workload, reference_dir) is None:
+            gaps.append(f"{workload_name}: missing stored vLLM reference")
+        for config_name, config in configs.items():
+            if (
+                _configured_workload_reference(
+                    config,
+                    workload,
+                    mapping_key="workload_reference_jsons",
+                    legacy_key="reference_json",
+                )
+                is None
+            ):
+                gaps.append(f"{workload_name}/{config_name}: missing stored JAX reference")
+    return gaps
+
+
 def _vllm_available(vllm_python: Path) -> bool:
     if vllm_python == Path(sys.executable):
         return importlib.util.find_spec("vllm") is not None
@@ -747,6 +779,10 @@ def main() -> None:
     workloads = {name: WORKLOADS[name] for name in selected_workloads}
     reference_dir = run_dir / "references"
     reference_dir.mkdir(parents=True, exist_ok=True)
+    if args.require_stored_references:
+        reference_gaps = _stored_reference_gaps(configs, workloads, reference_dir)
+        if reference_gaps:
+            raise SystemExit("Stored reference coverage failed:\n- " + "\n- ".join(reference_gaps))
     summary: dict[str, Any] = {
         "schema_version": 1,
         "created_at_utc": timestamp,

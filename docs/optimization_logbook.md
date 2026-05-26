@@ -3187,6 +3187,9 @@ Decision:
   then exits nonzero if any selected workload/config is not speed-claim-ready or
   misses the `0.75x` vLLM target. This gives the final benchmark command a
   machine-checkable pass/fail condition.
+- reference coverage flag: `--require-stored-references` exits before launching
+  benchmarks if any selected workload/config lacks a stored JAX reference, or if
+  any selected workload lacks a stored vLLM reference.
 - config-reference guard: focused tests now verify that every GPU matrix config
   has valid stored JAX and vLLM references for `hetero8` and
   `long_prefill_512_2048`.
@@ -3199,7 +3202,7 @@ Decision:
 .venv/bin/python -m pytest tests/test_gpu_matrix_runner.py -q
 ```
 
-- result: `18 passed`.
+- result: `19 passed`.
 - dry-run verification:
 
 ```text
@@ -3219,6 +3222,9 @@ Decision:
 - enforcement verification: the same dry-run with
   `--require-speed-claim-ready` wrote its summary and exited nonzero with the
   missing checks for `long_prefill_512_2048/gpu_paged_default`.
+- stored-reference verification: a dry run for `hetero8,long_prefill_512_2048`
+  with `--require-stored-references` passed, while a `short_32_128` dry run
+  failed before benchmark launch and reported the missing JAX/vLLM references.
 
 Decision:
 

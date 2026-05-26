@@ -261,6 +261,8 @@ end-to-end throughput.
   the final benchmark command. It still writes the summary, then exits nonzero
   if any selected workload/config is not speed-claim-ready or misses the `0.75x`
   vLLM target.
+- `--require-stored-references` can be used before benchmark launch to fail
+  fast when selected workloads/configs lack stored JAX or vLLM references.
 - Focused tests also verify that all GPU matrix configs have valid stored JAX
   and vLLM references for `hetero8` and `long_prefill_512_2048`, so the next
   GPU-visible two-repeat run should not silently fall back to unchecked

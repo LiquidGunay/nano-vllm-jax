@@ -23,6 +23,7 @@ from benchmarks.run_gpu_matrix import (
     _find_local_vllm_reference,
     _jax_command,
     _runtime_env,
+    _stored_reference_gaps,
     _validate_summary_shape,
 )
 
@@ -258,6 +259,24 @@ def test_gpu_matrix_configs_have_valid_stored_references():
             assert vllm_reference is not None, f"{config_name} missing vLLM reference for {workload_name}"
             assert (REPO_ROOT / jax_reference).exists()
             assert (REPO_ROOT / vllm_reference).exists()
+
+
+def test_stored_reference_gaps_reports_uncovered_workloads(tmp_path):
+    config = {
+        "workload_reference_jsons": {},
+        "workload_vllm_reference_jsons": {},
+    }
+
+    gaps = _stored_reference_gaps(
+        {"gpu_paged_default": config},
+        {"short_32_128": WORKLOADS["short_32_128"]},
+        reference_dir=tmp_path,
+    )
+
+    assert gaps == [
+        "short_32_128: missing stored vLLM reference",
+        "short_32_128/gpu_paged_default: missing stored JAX reference",
+    ]
 
 
 def test_reference_for_prefers_stored_long_reference_for_default_repeats(tmp_path):
