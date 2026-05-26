@@ -266,6 +266,8 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         args.model,
         **engine_kwargs,
     )
+    kernel_backend = getattr(engine.model_runner.backend, "kernel_backend", None)
+    kernel_backend_dict = kernel_backend.as_dict() if kernel_backend is not None else None
     if args.warmup:
         warmup_params = _build_sampling_params([], min(2, args.output_len))
         engine.generate_with_trace(prompts, sampling_params=warmup_params)
@@ -299,6 +301,13 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "dtype": args.dtype,
             "weight_dtype": args.weight_dtype,
             "backend": args.backend,
+            "kernel_backend": kernel_backend_dict,
+            "kernel_backend_requested": (kernel_backend_dict or {}).get("requested"),
+            "kernel_backend_resolved": (kernel_backend_dict or {}).get("selected"),
+            "kernel_backend_external_enabled": (kernel_backend_dict or {}).get("external_kernels_enabled"),
+            "kernel_backend_unavailable_reason": (kernel_backend_dict or {}).get("reason"),
+            "kernel_backend_external_call_counts": {},
+            "kernel_backend_fallback_counts": {},
             "jax_execution": args.jax_execution,
             "linear_chunk_size": int(engine.config.linear_chunk_size),
             "num_speculative_tokens": args.num_speculative_tokens,

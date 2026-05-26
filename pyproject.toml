@@ -27,6 +27,10 @@ cuda13 = [
 hf-parity = [
     "torch>=2.0.0",
 ]
+flashinfer-ffi = [
+    "flashinfer-python",
+    "jax-tvm-ffi",
+]
 
 [dependency-groups]
 dev = [

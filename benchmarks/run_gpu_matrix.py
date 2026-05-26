@@ -368,7 +368,7 @@ def _aggregate_repeats(repeats: list[dict[str, Any]]) -> dict[str, Any]:
         "tokens_per_second_median": _median([row.get("tokens_per_second") for row in perf_rows]),
         "ttft_ms_p50_median": _median([row.get("ttft_ms_p50") for row in perf_rows]),
         "itl_ms_p50_median": _median([row.get("itl_ms_p50") for row in perf_rows]),
-        "all_correct": all(row.get("ok", True) for row in correctness_rows),
+        "all_correct": all(bool(row.get("ok")) for row in correctness_rows),
         "all_exact_generated_token_match": all(
             bool(row.get("exact_generated_token_match")) for row in correctness_rows
         ),

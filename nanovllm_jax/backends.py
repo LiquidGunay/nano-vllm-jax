@@ -13,6 +13,11 @@ from typing import Protocol
 import jax
 import jax.numpy as jnp
 
+from nanovllm_jax.kernels.registry import (
+    KernelBackendStatus,
+    KernelBackendUnavailable,
+    select_kernel_backend,
+)
 from nanovllm_jax.kv_cache import (
     AttentionMetadata,
     KVCacheSpec,
@@ -103,6 +108,9 @@ class PureJAXBackend:
     """Reference backend implemented with ordinary JAX operations."""
 
     name = "pure_jax"
+
+    def __init__(self, kernel_backend: KernelBackendStatus | None = None):
+        self.kernel_backend = kernel_backend or select_kernel_backend("pure_jax")
 
     def allocate_kv_cache(
         self,
@@ -302,7 +310,8 @@ class PureJAXBackend:
 class KernelBackendPlaceholder(PureJAXBackend):
     """Explicit placeholder until GPU/TPU kernels are implemented."""
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, kernel_backend: KernelBackendStatus):
+        super().__init__(kernel_backend=kernel_backend)
         self.name = name
 
 
@@ -314,7 +323,15 @@ def select_backend(name: str = "auto") -> InferenceBackend:
     """
 
     normalized = name.lower()
-    if normalized in {"auto", "pure_jax", "jax"}:
+    if normalized == "auto":
+        kernel_backend = select_kernel_backend()
+        if (
+            kernel_backend.requested not in {"auto", "pure_jax"}
+            and not kernel_backend.external_kernels_enabled
+        ):
+            raise KernelBackendUnavailable(kernel_backend.reason)
+        return PureJAXBackend(kernel_backend=kernel_backend)
+    if normalized in {"pure_jax", "jax"}:
         return PureJAXBackend()
     if normalized in {"gpu", "cuda", "tpu"}:
         platform = jax.default_backend()
@@ -322,5 +339,11 @@ def select_backend(name: str = "auto") -> InferenceBackend:
             raise RuntimeError(f"Requested GPU backend, but JAX default backend is {platform!r}")
         if normalized == "tpu" and platform != "tpu":
             raise RuntimeError(f"Requested TPU backend, but JAX default backend is {platform!r}")
-        return KernelBackendPlaceholder(normalized)
+        kernel_backend = select_kernel_backend()
+        if (
+            kernel_backend.requested not in {"auto", "pure_jax"}
+            and not kernel_backend.external_kernels_enabled
+        ):
+            raise KernelBackendUnavailable(kernel_backend.reason)
+        return KernelBackendPlaceholder(normalized, kernel_backend)
     raise ValueError(f"Unknown backend {name!r}; expected auto, pure_jax, gpu, or tpu")

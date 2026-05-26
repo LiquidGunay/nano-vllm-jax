@@ -700,15 +700,12 @@ Commit 2:
 
 Commit 3:
 
-- Add kernel backend registry:
+- ~~Add kernel backend registry:~~
 
-```text
-  nanovllm_jax/kernels/
-    __init__.py
-    registry.py
-    flashinfer_ffi.py
-    cuda_gdn.py
-```
+- ~~`nanovllm_jax/kernels/__init__.py`~~
+- ~~`nanovllm_jax/kernels/registry.py`~~
+- ~~`nanovllm_jax/kernels/flashinfer_ffi.py`~~
+- ~~`nanovllm_jax/kernels/cuda_gdn.py`~~
 
 Commit 4:
 
