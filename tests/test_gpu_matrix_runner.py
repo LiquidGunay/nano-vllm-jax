@@ -6,7 +6,28 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from benchmarks.run_gpu_matrix import _aggregate_repeats, _cuda_device_preflight
+from benchmarks.run_gpu_matrix import (
+    WORKLOADS,
+    _aggregate_repeats,
+    _configured_workload_reference,
+    _cuda_device_preflight,
+    _reference_for,
+)
+
+
+def _write_workload_artifact(path, workload):
+    path.write_text(
+        (
+            '{"run_config": {"input_lens": %s, "output_len": %d, '
+            '"prompt_suite": "%s"}}\n'
+        )
+        % (
+            [int(part) for part in workload.input_lens.split(",")],
+            workload.output_len,
+            workload.prompt_suite,
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_aggregate_repeats_does_not_treat_missing_correctness_as_correct():
@@ -70,3 +91,40 @@ def test_cuda_device_preflight_rejects_missing_gpu(tmp_path):
 
     assert not ok
     assert "NVIDIA-SMI has failed" in detail
+
+
+def test_configured_workload_reference_uses_workload_mapping(tmp_path):
+    workload = WORKLOADS["long_prefill_512_2048"]
+    reference = tmp_path / "long.json"
+    legacy = tmp_path / "legacy.json"
+    _write_workload_artifact(reference, workload)
+    _write_workload_artifact(legacy, WORKLOADS["hetero8"])
+
+    selected = _configured_workload_reference(
+        {
+            "reference_json": str(legacy),
+            "workload_reference_jsons": {"long_prefill_512_2048": str(reference)},
+        },
+        workload,
+        mapping_key="workload_reference_jsons",
+        legacy_key="reference_json",
+    )
+
+    assert selected == reference
+
+
+def test_reference_for_checks_default_first_repeat_against_stored_long_reference(tmp_path):
+    workload = WORKLOADS["long_prefill_512_2048"]
+    reference = tmp_path / "long.json"
+    _write_workload_artifact(reference, workload)
+
+    selected, source = _reference_for(
+        "gpu_paged_default",
+        workload,
+        0,
+        reference,
+        generated_default_reference=None,
+    )
+
+    assert selected == reference
+    assert source == "stored_jax_default"

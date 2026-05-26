@@ -444,35 +444,57 @@ def _artifact_matches_workload(path: Path, workload: Workload) -> bool:
     return prompt_suite in (None, workload.prompt_suite)
 
 
+def _configured_workload_reference(
+    config: dict[str, Any],
+    workload: Workload,
+    *,
+    mapping_key: str,
+    legacy_key: str,
+) -> Path | None:
+    mapping = config.get(mapping_key) or {}
+    candidate_value = mapping.get(workload.name) if isinstance(mapping, dict) else None
+    if candidate_value:
+        candidate = Path(candidate_value)
+        if _artifact_matches_workload(candidate, workload):
+            return candidate
+    legacy = Path(config.get(legacy_key, ""))
+    if _artifact_matches_workload(legacy, workload):
+        return legacy
+    return None
+
+
+def _stored_jax_reference_source(workload: Workload) -> str:
+    if workload.name == "hetero8":
+        return "stored_entry045"
+    return "stored_jax_default"
+
+
 def _reference_for(
     config_name: str,
     workload: Workload,
     repeat_index: int,
-    stored_config_reference: Path | None,
+    stored_workload_reference: Path | None,
     generated_default_reference: Path | None,
 ) -> tuple[Path | None, str]:
     if config_name == "gpu_paged_default" and repeat_index == 0:
-        if (
-            workload.name == "hetero8"
-            and stored_config_reference
-            and _artifact_matches_workload(stored_config_reference, workload)
-        ):
-            return stored_config_reference, "stored_entry045"
+        if stored_workload_reference and _artifact_matches_workload(stored_workload_reference, workload):
+            return stored_workload_reference, _stored_jax_reference_source(workload)
         return None, "none"
     if generated_default_reference and _artifact_matches_workload(generated_default_reference, workload):
         return generated_default_reference, "live_jax_default"
-    if (
-        workload.name == "hetero8"
-        and stored_config_reference
-        and _artifact_matches_workload(stored_config_reference, workload)
-    ):
-        return stored_config_reference, "stored_entry045"
+    if stored_workload_reference and _artifact_matches_workload(stored_workload_reference, workload):
+        return stored_workload_reference, _stored_jax_reference_source(workload)
     return None, "none"
 
 
 def _find_local_vllm_reference(config: dict[str, Any], workload: Workload, reference_dir: Path) -> Path | None:
-    configured = Path(config.get("vllm_reference_json", ""))
-    if workload.name == "hetero8" and _artifact_matches_workload(configured, workload):
+    configured = _configured_workload_reference(
+        config,
+        workload,
+        mapping_key="workload_vllm_reference_jsons",
+        legacy_key="vllm_reference_json",
+    )
+    if configured:
         return configured
     candidate = reference_dir / f"vllm_{workload.name}.json"
     return candidate if _artifact_matches_workload(candidate, workload) else None
@@ -607,14 +629,19 @@ def main() -> None:
 
         for config_name, config in configs.items():
             config_repeats = []
-            stored_config_reference = Path(config.get("reference_json", ""))
+            stored_workload_reference = _configured_workload_reference(
+                config,
+                workload,
+                mapping_key="workload_reference_jsons",
+                legacy_key="reference_json",
+            )
             for repeat_index in range(int(args.repeats)):
                 output_path = run_dir / f"{workload_name}_{config_name}_repeat{repeat_index + 1}.json"
                 reference_path, reference_source = _reference_for(
                     config_name,
                     workload,
                     repeat_index,
-                    stored_config_reference,
+                    stored_workload_reference,
                     generated_default_reference,
                 )
                 run_label = f"gpu_matrix_{workload_name}_{config_name}_r{repeat_index + 1}_{timestamp}"

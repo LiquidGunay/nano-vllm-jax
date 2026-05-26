@@ -4,6 +4,14 @@
   "benchmark_script": "benchmarks/benchmark_jax_server_trace.py",
   "reference_json": "results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json",
   "vllm_reference_json": "results/qwen08_vllm_async_delta_baseline_hetero8_64_512x32.json",
+  "workload_reference_jsons": {
+    "hetero8": "results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json",
+    "long_prefill_512_2048": "results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json"
+  },
+  "workload_vllm_reference_jsons": {
+    "hetero8": "results/qwen08_vllm_async_delta_baseline_hetero8_64_512x32.json",
+    "long_prefill_512_2048": "results/gpu_matrix_runs/20260526_104818/references/vllm_long_prefill_512_2048.json"
+  },
   "allow_live_vllm_if_reference_missing": true,
   "env": {
     "JAX_PLATFORMS": "cuda",

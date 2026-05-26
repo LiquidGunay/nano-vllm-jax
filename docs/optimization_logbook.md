@@ -3127,3 +3127,40 @@ Decision:
 - Do not treat the failed two-repeat attempt as benchmark evidence. Re-run the
   two-repeat `hetero8,long_prefill_512_2048` matrix with stored vLLM references
   after NVIDIA device access is restored.
+
+## Entry 082 - Workload-Specific Matrix Reference Selection
+
+- change accepted: the GPU matrix configs now include
+  `workload_reference_jsons` and `workload_vllm_reference_jsons` for `hetero8`
+  and `long_prefill_512_2048`. The runner resolves those maps before falling
+  back to legacy single-reference fields or live generated defaults.
+- motivation: Entry 080 created a stored long-prefill JAX default artifact, but
+  the runner still left the first `gpu_paged_default` long-prefill repeat
+  unchecked because only hetero8 had a configured JAX reference. That would
+  weaken the next two-repeat matrix under the plan's exact-token gate.
+- focused tests:
+
+```text
+.venv/bin/python -m pytest tests/test_gpu_matrix_runner.py -q
+```
+
+- result: `7 passed`.
+- dry-run verification:
+
+```text
+.venv/bin/python benchmarks/run_gpu_matrix.py \
+  --configs gpu_paged_default,gpu_paged_fast_optin \
+  --workloads hetero8,long_prefill_512_2048 --repeats 2 \
+  --dry-run --no-live-vllm \
+  --output-json /mountpoint/.exp/tmp/gpu_matrix_reference_mapping_dry_run.json
+```
+
+- result: `hetero8` uses stored Entry 045 JAX/vLLM references for both configs
+  and repeats; `long_prefill_512_2048` uses the stored Entry 080 JAX default
+  and vLLM references for both configs and repeats.
+
+Decision:
+
+- Keep the workload-specific reference maps. The next GPU-visible two-repeat
+  matrix can now satisfy the exact-token comparison setup from repeat one for
+  both tracked workloads without rerunning vLLM.

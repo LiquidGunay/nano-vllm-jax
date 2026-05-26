@@ -244,6 +244,11 @@ end-to-end throughput.
   has a CUDA preflight so future real matrix runs fail before loading weights
   when GPU access is absent. The two-repeat performance artifact remains
   pending until GPU access is restored.
+- The matrix configs now carry workload-specific stored JAX and vLLM reference
+  paths for `hetero8` and `long_prefill_512_2048`. A dry run verified that both
+  repeats of `gpu_paged_default` and `gpu_paged_fast_optin` will compare against
+  stored JAX references from repeat one instead of leaving the default
+  long-prefill baseline unchecked.
 
 ## Phase 2 - Kernel Roadmap
 
