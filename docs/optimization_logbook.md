@@ -3182,13 +3182,19 @@ Decision:
 - writer validation: the runner validates required top-level, matrix/repeat,
   aggregate, and acceptance keys before writing a matrix summary. This is a
   lightweight in-repo shape check and does not add a `jsonschema` dependency.
+- config-reference guard: focused tests now verify that every GPU matrix config
+  has valid stored JAX and vLLM references for `hetero8` and
+  `long_prefill_512_2048`.
+- command/env guard: focused tests now verify workload override flags,
+  `--reference-json`, warmup/profile flags, `JAX_PLATFORMS=cuda`, and
+  cache/temp roots under the configured `/mountpoint` runtime root.
 - focused tests:
 
 ```text
 .venv/bin/python -m pytest tests/test_gpu_matrix_runner.py -q
 ```
 
-- result: `13 passed`.
+- result: `16 passed`.
 - dry-run verification:
 
 ```text

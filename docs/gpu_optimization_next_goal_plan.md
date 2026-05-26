@@ -256,6 +256,14 @@ end-to-end throughput.
   All configured profile-counter buckets must be present for every repeat.
   The runner validates the summary shape before writing it. Human explanation
   of profile bucket movement still belongs in the logbook.
+- Focused tests also verify that all GPU matrix configs have valid stored JAX
+  and vLLM references for `hetero8` and `long_prefill_512_2048`, so the next
+  GPU-visible two-repeat run should not silently fall back to unchecked
+  baselines for the tracked workloads.
+- The same focused suite verifies command construction and runtime environment
+  defaults for matrix runs: workload overrides, `--reference-json`, warmup,
+  profile, `JAX_PLATFORMS=cuda`, and cache/temp roots under the configured
+  `/mountpoint` runtime root.
 
 ## Phase 2 - Kernel Roadmap
 
