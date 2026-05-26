@@ -196,12 +196,16 @@ gdn_segmented_prefill_chunk32(
   tiny-command-buffer count explodes, or the win exists only in a microbenchmark.
 - current status: first local CUDA/JAX FFI one-piece chunk32 prototype is
   benchmark-only and rejected for serving promotion. It passed focused CUDA
-  tests and a reduced-shape smoke benchmark, but the full hetero8 model-shape
-  microbenchmark was slower than current JAX chunk32 and exceeded the standalone
-  state-drift gate. A V64 value-block follow-up reduced custom-call p50 at full
-  shape but still lost to current JAX and did not improve state drift, so the
-  next candidate should move closer to the segmented/nnz ABI instead of only
-  widening the rectangular value block. The first pure-JAX packed segmented ABI
+  tests and a reduced-shape smoke benchmark. The benchmark-only FFI/probe
+  boundary now uses native V,K state and passes a non-square
+  `B=2,H=2,T=64,K=32,V=64` smoke comparison against current padded chunk32
+  (`output_max_abs=1.49e-07`, `state_max_abs=1.073e-06`). The full hetero8
+  model-shape microbenchmark was slower than current JAX chunk32 and exceeded
+  the standalone state-drift gate. A V64 value-block follow-up reduced
+  custom-call p50 at full shape but still lost to current JAX and did not
+  improve state drift, so the next candidate should move closer to the
+  segmented/nnz ABI instead of only widening the rectangular value block. The
+  first pure-JAX packed segmented ABI
   correctness gate passes reduced shape but fails the full hetero8 standalone
   `1e-5` gate versus current padded chunk32, so CUDA math for that ABI is
   deferred pending a correctness-contract decision. A row-padded diagnostic

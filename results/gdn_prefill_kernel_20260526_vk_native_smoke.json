@@ -1,0 +1,426 @@
+{
+  "comparisons": {
+    "cuda_fp32_one_piece_chunk32_v64_vs_current_jax_chunk32_padded": {
+      "output_max_abs": 1.4901161193847656e-07,
+      "output_mse": 1.914112216362161e-16,
+      "state_max_abs": 1.0728836059570312e-06,
+      "state_mse": 1.114884246933897e-14,
+      "valid_output_max_abs": 1.4901161193847656e-07,
+      "valid_output_mse": 2.425805481542974e-16
+    },
+    "cuda_fp32_one_piece_chunk32_vs_current_jax_chunk32_padded": {
+      "output_max_abs": 1.4901161193847656e-07,
+      "output_mse": 1.914112216362161e-16,
+      "state_max_abs": 1.0728836059570312e-06,
+      "state_mse": 1.114884246933897e-14,
+      "valid_output_max_abs": 1.4901161193847656e-07,
+      "valid_output_mse": 2.425805481542974e-16
+    },
+    "current_jax_chunk32_padded_vs_current_jax_chunk32_padded": {
+      "output_max_abs": 0.0,
+      "output_mse": 0.0,
+      "state_max_abs": 0.0,
+      "state_mse": 0.0,
+      "valid_output_max_abs": 0.0,
+      "valid_output_mse": 0.0
+    }
+  },
+  "decision": {
+    "promote_to_server_routing": false,
+    "reason": "standalone GDN probes only; no candidate was routed into the server"
+  },
+  "historical_negative_controls": [
+    "Entry053 static row-chunk ragged GDN prefill",
+    "Entry056 static chunk-major GDN prefill"
+  ],
+  "pallas_feasibility": {
+    "active_chunk_count": 4,
+    "active_chunk_local_math_probe": {
+      "active_chunk_count": 4,
+      "attempted": true,
+      "comparisons": {
+        "attn_max_abs": 8.940696716308594e-08,
+        "attn_mse": 2.524764340770694e-17,
+        "g_cumsum_max_abs": 1.7881393432617188e-07,
+        "g_cumsum_mse": 1.1322865388352366e-15,
+        "k_cumdecay_max_abs": 1.1920928955078125e-07,
+        "k_cumdecay_mse": 4.7158321110366756e-17,
+        "max_abs": 4.76837158203125e-07,
+        "passes_1e_5_gate": true,
+        "value_transformed_max_abs": 4.76837158203125e-07,
+        "value_transformed_mse": 6.682868137083367e-16
+      },
+      "compile_seconds": 0.13680838502477854,
+      "custom_call_count": null,
+      "error": null,
+      "lowering_ok": true,
+      "max_ms": 0.18185400404036045,
+      "mean_ms": 0.166413684686025,
+      "min_ms": 0.15862402506172657,
+      "p50_ms": 0.15876302495598793,
+      "p95_ms": 0.1795449061319232,
+      "profiled_iterations": 4,
+      "repeat_ms": [
+        0.18185400404036045,
+        0.15876302495598793,
+        0.15862402506172657
+      ],
+      "warmup_ms": [
+        0.5092119099572301
+      ]
+    },
+    "active_input_pack_probe": {
+      "active_chunk_count": 4,
+      "attempted": true,
+      "comparisons": {
+        "beta_max_abs": 0.0,
+        "beta_mse": 0.0,
+        "g_max_abs": 0.0,
+        "g_mse": 0.0,
+        "key_max_abs": 0.0,
+        "key_mse": 0.0,
+        "max_abs": 0.0,
+        "query_max_abs": 0.0,
+        "query_mse": 0.0,
+        "value_max_abs": 0.0,
+        "value_mse": 0.0
+      },
+      "compile_seconds": 0.10031971603166312,
+      "custom_call_count": null,
+      "error": null,
+      "lowering_ok": true,
+      "max_ms": 0.1704040914773941,
+      "mean_ms": 0.1582103626181682,
+      "min_ms": 0.14635396655648947,
+      "p50_ms": 0.157873029820621,
+      "p95_ms": 0.1691509853117168,
+      "packed_true_tokens": 128,
+      "profiled_iterations": 4,
+      "repeat_ms": [
+        0.1704040914773941,
+        0.157873029820621,
+        0.14635396655648947
+      ],
+      "warmup_ms": [
+        0.46630995348095894
+      ]
+    },
+    "active_output_state_reconstruction_probe": {
+      "attempted": true,
+      "compile_seconds": 0.7092498680576682,
+      "error": null,
+      "lowering_ok": true,
+      "max_ms": 0.22265396546572447,
+      "mean_ms": 0.20198399821917215,
+      "min_ms": 0.18851400818675756,
+      "p50_ms": 0.19478402100503445,
+      "p95_ms": 0.21986697101965547,
+      "pallas_local_math_comparison": {
+        "output_max_abs": 1.4901161193847656e-07,
+        "output_mse": 2.1242413705901497e-16,
+        "state_max_abs": 4.76837158203125e-07,
+        "state_mse": 9.480170622589053e-15,
+        "valid_output_max_abs": 1.4901161193847656e-07,
+        "valid_output_mse": 2.6921078755993977e-16
+      },
+      "pallas_local_math_passes_1e_5_gate": true,
+      "profiled_iterations": 4,
+      "reference_local_math_comparison": {
+        "output_max_abs": 8.940696716308594e-08,
+        "output_mse": 4.728999833771785e-17,
+        "state_max_abs": 4.76837158203125e-07,
+        "state_mse": 2.9758787360061652e-15,
+        "valid_output_max_abs": 8.940696716308594e-08,
+        "valid_output_mse": 5.993187573998212e-17
+      },
+      "reference_local_math_passes_1e_5_gate": true,
+      "repeat_ms": [
+        0.22265396546572447,
+        0.18851400818675756,
+        0.19478402100503445
+      ],
+      "warmup_ms": [
+        0.42605900671333075
+      ]
+    },
+    "attempted": true,
+    "compile_seconds": 0.2980222050100565,
+    "custom_call_count": null,
+    "error": null,
+    "inactive_chunk_count": 0,
+    "lowering_ok": true,
+    "mask_matches_plan": true,
+    "one_piece_gdn_prefill_probe": {
+      "attempted": false,
+      "block_v": 64,
+      "custom_call_count": null,
+      "enabled": false,
+      "error": null,
+      "lowering_ok": null
+    },
+    "rectangular_chunk_local_math_probe": {
+      "attempted": true,
+      "comparisons": {
+        "attn_max_abs": 8.940696716308594e-08,
+        "attn_mse": 2.6329949682228472e-17,
+        "g_cumsum_max_abs": 1.7881393432617188e-07,
+        "g_cumsum_mse": 1.1322865388352366e-15,
+        "k_cumdecay_max_abs": 1.1920928955078125e-07,
+        "k_cumdecay_mse": 4.688023953203868e-17,
+        "max_abs": 4.76837158203125e-07,
+        "passes_1e_5_gate": true,
+        "value_transformed_max_abs": 4.76837158203125e-07,
+        "value_transformed_mse": 6.887313303188586e-16
+      },
+      "compile_seconds": 0.1200992800295353,
+      "custom_call_count": null,
+      "error": null,
+      "lowering_ok": true,
+      "max_ms": 0.20181492436677217,
+      "mean_ms": 0.1851543008039395,
+      "min_ms": 0.17680402379482985,
+      "p50_ms": 0.17684395425021648,
+      "p95_ms": 0.1993178273551166,
+      "profiled_iterations": 4,
+      "repeat_ms": [
+        0.17684395425021648,
+        0.20181492436677217,
+        0.17680402379482985
+      ],
+      "warmup_ms": [
+        0.49333099741488695
+      ]
+    },
+    "rectangular_local_split_reconstruction_probe": {
+      "attempted": true,
+      "compile_seconds": 0.5544265179196373,
+      "error": null,
+      "lowering_ok": true,
+      "max_ms": 0.19132404122501612,
+      "mean_ms": 0.18741768629600605,
+      "min_ms": 0.18307496793568134,
+      "p50_ms": 0.18785404972732067,
+      "p95_ms": 0.19097704207524657,
+      "pallas_local_math_comparison": {
+        "output_max_abs": 1.4901161193847656e-07,
+        "output_mse": 2.1242413705901497e-16,
+        "state_max_abs": 4.76837158203125e-07,
+        "state_mse": 9.480170622589053e-15,
+        "valid_output_max_abs": 1.4901161193847656e-07,
+        "valid_output_mse": 2.6921078755993977e-16
+      },
+      "pallas_local_math_passes_1e_5_gate": true,
+      "pallas_max_ms": 0.20303402561694384,
+      "pallas_mean_ms": 0.1897939946502447,
+      "pallas_min_ms": 0.1812339760363102,
+      "pallas_p50_ms": 0.1851139822974801,
+      "pallas_p95_ms": 0.20124202128499746,
+      "pallas_repeat_ms": [
+        0.20303402561694384,
+        0.1851139822974801,
+        0.1812339760363102
+      ],
+      "pallas_warmup_ms": [
+        0.20142493303865194
+      ],
+      "profiled_iterations": 4,
+      "reference_local_math_comparison": {
+        "output_max_abs": 0.0,
+        "output_mse": 0.0,
+        "state_max_abs": 0.0,
+        "state_mse": 0.0,
+        "valid_output_max_abs": 0.0,
+        "valid_output_mse": 0.0
+      },
+      "reference_local_math_passes_1e_5_gate": true,
+      "repeat_ms": [
+        0.18785404972732067,
+        0.18307496793568134,
+        0.19132404122501612
+      ],
+      "warmup_ms": [
+        0.23745500948280096
+      ]
+    },
+    "run_ms": 0.39376807399094105,
+    "total_chunk_count": 4
+  },
+  "profile_counters": null,
+  "run": {
+    "issues": [],
+    "profile_enabled": false,
+    "profile_error": null,
+    "profile_path": "/mountpoint/.exp/profiles/20260526-171443-2428828-gdn_prefill_vk_native_smoke",
+    "profile_started": false,
+    "run_id": "20260526-171443-2428828-gdn_prefill_vk_native_smoke",
+    "run_label": "gdn_prefill_vk_native_smoke",
+    "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+  },
+  "run_config": {
+    "active_chunk_plan": {
+      "active_chunk_count": 4,
+      "active_chunks": [
+        0,
+        1,
+        0,
+        1
+      ],
+      "active_mask": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "active_rows": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "active_starts": [
+        0,
+        32,
+        0,
+        32
+      ],
+      "active_token_counts": [
+        32,
+        5,
+        32,
+        32
+      ],
+      "chunks_per_row": [
+        2,
+        2
+      ],
+      "inactive_chunk_count": 0,
+      "n_chunks": 2,
+      "partial_chunk_count": 1,
+      "partial_mask": [
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          0
+        ]
+      ],
+      "row_offsets": [
+        0,
+        2,
+        4
+      ],
+      "total_chunk_count": 4
+    },
+    "active_chunks": 4,
+    "batch_size": 2,
+    "chunk_size": 32,
+    "device": "cuda:0",
+    "device_kind": "NVIDIA A10G",
+    "devices": [
+      "cuda:0"
+    ],
+    "dtype_contract": "fp32 activations/state, output cast follows current jax_chunk_gated_delta_rule",
+    "enable_one_piece_gdn_probe": false,
+    "git_head": "43f39fd",
+    "jax_backend": "gpu",
+    "jax_version": "0.10.1",
+    "key_dim": 32,
+    "lengths": [
+      37,
+      64
+    ],
+    "num_heads": 2,
+    "platform": "gpu",
+    "rectangular_tokens": 128,
+    "repeats": 3,
+    "seed": 1234,
+    "seq_len": 64,
+    "total_chunks": 4,
+    "true_tokens": 101,
+    "value_dim": 64,
+    "variants": [
+      "current_jax_chunk32_padded",
+      "cuda_fp32_one_piece_chunk32",
+      "cuda_fp32_one_piece_chunk32_v64"
+    ],
+    "warmups": 1
+  },
+  "segmented_reference_gate": {
+    "attempted": false,
+    "comparison": null,
+    "enabled": false,
+    "error": null,
+    "passes_1e_5_gate": null,
+    "policy": {
+      "cuda_math_allowed": false,
+      "reason": "segmented reference gate was not requested",
+      "required_next_step": "run with --check-segmented-reference-gate before implementing segmented CUDA math",
+      "serving_routing_allowed": false,
+      "status": "not_checked",
+      "threshold": 1e-05
+    },
+    "run_ms": null
+  },
+  "variants": {
+    "cuda_fp32_one_piece_chunk32": {
+      "compile_seconds": 0.19050908996723592,
+      "max_ms": 0.2968860790133476,
+      "mean_ms": 0.2802193242435654,
+      "min_ms": 0.26973593048751354,
+      "p50_ms": 0.27403596322983503,
+      "p95_ms": 0.29460106743499637,
+      "rectangular_tokens_per_second": 456785.0570103544,
+      "repeat_ms": [
+        0.2968860790133476,
+        0.27403596322983503,
+        0.26973593048751354
+      ],
+      "true_tokens_per_second": 360431.95904723275,
+      "warmup_ms": [
+        2.340432023629546
+      ]
+    },
+    "cuda_fp32_one_piece_chunk32_v64": {
+      "compile_seconds": 0.10330046201124787,
+      "max_ms": 0.3288569860160351,
+      "mean_ms": 0.31642701166371506,
+      "min_ms": 0.30850700568407774,
+      "p50_ms": 0.3119170432910323,
+      "p95_ms": 0.3271629917435348,
+      "rectangular_tokens_per_second": 404516.66666192474,
+      "repeat_ms": [
+        0.3119170432910323,
+        0.3288569860160351,
+        0.30850700568407774
+      ],
+      "true_tokens_per_second": 319188.932287925,
+      "warmup_ms": [
+        0.654124072752893
+      ]
+    },
+    "current_jax_chunk32_padded": {
+      "compile_seconds": 0.10872616001870483,
+      "max_ms": 0.9922420140355825,
+      "mean_ms": 0.8879797145103415,
+      "min_ms": 0.8272080449387431,
+      "p50_ms": 0.8444890845566988,
+      "p95_ms": 0.9774667210876942,
+      "rectangular_tokens_per_second": 144147.43705106262,
+      "repeat_ms": [
+        0.9922420140355825,
+        0.8444890845566988,
+        0.8272080449387431
+      ],
+      "true_tokens_per_second": 113741.33704810409,
+      "warmup_ms": [
+        2.2211880423128605
+      ]
+    }
+  }
+}

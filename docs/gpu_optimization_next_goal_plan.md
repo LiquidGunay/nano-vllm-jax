@@ -985,6 +985,10 @@ full-model real-weight token/logit gate before any serving promotion.
   `cuda_fp32_one_piece_chunk32`.
 - Focused CUDA FFI tests pass, and the reduced `B=2,H=2,T=64,K=32,V=32`
   benchmark is faster with small drift.
+- The benchmark-only CUDA/JAX FFI prefill prototype and standalone GDN prefill
+  benchmark now use native V,K state. A non-square smoke shape
+  `B=2,H=2,T=64,K=32,V=64` passes focused CUDA parity and standalone output/state
+  comparisons: `output_max_abs=1.49e-07`, `state_max_abs=1.073e-06`.
 - Full hetero8 model-shape microbenchmark rejects this first prototype:
   `11.50 ms` p50 versus `5.43 ms` p50 for current JAX chunk32, with
   `state_max_abs=2.441e-04`.
@@ -1329,12 +1333,12 @@ Commit 7b - GDN V,K layout migration:
   pure-JAX fallback consumes and returns V,K state natively.~~
 - ~~Update state-table, MTP commit-select, and focused parity tests for the new
   shape.~~
-- ~~Make the default-off local CUDA FFI recurrent and packed GDN decode probes
-  consume V,K state natively, with no Python K,V compatibility transpose.~~
-  Validation: focused recurrent/packed CUDA decode selection `4 passed, 9
-  deselected`; full CUDA FFI suite `13 passed`. The separate chunked prefill
-  prototype still owns its legacy compatibility transpose and remains
-  benchmark-only/default-off.
+- ~~Make the default-off local CUDA FFI recurrent, packed decode, and chunked
+  prefill probes consume V,K state natively, with no Python K,V compatibility
+  transpose.~~ Validation: focused recurrent/packed CUDA decode selection
+  `4 passed, 9 deselected`; focused prefill selection `2 passed, 11
+  deselected`; full CUDA FFI suite `13 passed`; focused GDN CUDA/segmented suite
+  `18 passed`.
 - ~~Run layer parity, cached prefill/decode equivalence, 500-token top-5/logit
   guardrail, and integrated server benchmark before promoting the layout.~~
   Validation: focused CUDA suite `12 passed`; CUDA FFI suite `13 passed`; MTP
@@ -1375,6 +1379,8 @@ Commit 8:
   implementing segmented CUDA math~~
 - ~~Make the full-model token/logit override gate machine-readable in
   `benchmark_long_decode_top5.py`~~
+- ~~Fix the standalone GDN prefill benchmark/probes to generate and reconstruct
+  native V,K state, including non-square K/V smoke coverage.~~
 - Compare a revised segmented prefill candidate against Entry 045 chunk-32
   baseline after it beats the full-shape GDN microbenchmark gate
 

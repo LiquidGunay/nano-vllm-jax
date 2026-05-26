@@ -4024,8 +4024,8 @@ JAX_PLATFORMS=cuda ... benchmarks/run_gpu_matrix.py --goal-target-only --repeats
 - scope: `gdn_recurrent_decode_step_fp32` and `gdn_packed_decode_step_fp32`
   no longer transpose V,K state into legacy K,V at the Python boundary. The CUDA
   decode kernels and shape checks now index state as `[B,H,V,K]`. The separate
-  chunked prefill prototype still owns its legacy compatibility transpose and
-  remains benchmark-only/default-off.
+  chunked prefill prototype remained benchmark-only/default-off and was moved to
+  native V,K in Entry 101.
 - validation:
 
 ```text
@@ -4058,3 +4058,39 @@ JAX_PLATFORMS=cuda ... pytest -q tests/test_cuda_fp32_ffi.py
 - decision: reject promotion of the standalone width-1 CUDA GDN decode route.
   Keep it default-off for diagnostics and continue toward a coarser/fused GDN
   kernel boundary rather than adding this custom call to the hot path.
+
+### Entry 101 - Native V,K GDN Prefill Probe Cleanup
+
+- change accepted: updated the benchmark-only CUDA/JAX FFI GDN prefill probes
+  and standalone GDN prefill benchmark helpers to use native V,K state.
+- scope: `gdn_prefill_chunk32_normalized_fp32`,
+  `gdn_prefill_chunk32_v64_normalized_fp32`, the CUDA prefill state loads/stores,
+  and `benchmark_gdn_prefill_kernel.py` state generation/reconstruction probes.
+  No serving route changed.
+- validation:
+
+```text
+JAX_PLATFORMS=cuda ... pytest -q tests/test_cuda_fp32_ffi.py \
+  -k 'gdn_prefill_chunk32_normalized_fp32_cuda_matches_chunk_reference'
+
+JAX_PLATFORMS=cuda ... pytest -q \
+  tests/test_cuda_fp32_ffi.py \
+  tests/test_gdn_segmented_reference.py \
+  tests/test_gdn_segmented_policy.py
+```
+
+- result: focused prefill CUDA selection `2 passed, 11 deselected`; focused GDN
+  CUDA/segmented suite `18 passed`.
+- smoke artifacts:
+  `results/gdn_prefill_kernel_20260526_vk_native_smoke.json` and
+  `results/gdn_prefill_kernel_20260526_vk_native_segmented_gate_smoke.json`,
+  both at git head `43f39fd`.
+- smoke result: non-square `B=2,H=2,T=64,K=32,V=64` one-piece CUDA prefill
+  comparisons match current padded chunk32 with `output_max_abs=1.49e-07` and
+  `state_max_abs=1.073e-06`. The packed segmented reference gate passes on the
+  same reduced smoke shape with `output_max_abs=1.788e-07` and
+  `state_max_abs=5.364e-07`.
+- decision: keep the one-piece prefill prototypes default-off and
+  benchmark-only. This validates the V,K boundary and fixes stale benchmark
+  helpers, but it does not overturn the prior full-shape rejection or authorize
+  serving promotion.
