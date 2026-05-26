@@ -38,6 +38,7 @@ _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
 _NHD_FULL_ATTN_CACHE_ENV = "NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE"
 _FLASHINFER_KV_APPEND_ENV = "NANO_VLLM_JAX_FLASHINFER_KV_APPEND"
 _CUDA_FP32_KV_APPEND_ENV = "NANO_VLLM_JAX_CUDA_FP32_KV_APPEND"
+_CUDA_FP32_DECODE_ATTN_ENV = "NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"
 
 
 class InferenceBackend(Protocol):
@@ -322,6 +323,41 @@ class PureJAXBackend:
             raise ValueError("metadata.positions is required for decode attention")
         if metadata.positions.shape[0] != metadata.block_tables.shape[0]:
             raise ValueError("positions and block_tables batch dimensions must match")
+        if (
+            os.environ.get(_CUDA_FP32_DECODE_ATTN_ENV, "0") in _TRUE_ENV_VALUES
+            and query.shape[1] == 1
+            and query.dtype == jnp.float32
+            and cache.k_cache.dtype == jnp.float32
+            and cache.v_cache.dtype == jnp.float32
+            and cache.k_cache.ndim == 5
+            and cache.v_cache.ndim == 5
+        ):
+            from nanovllm_jax.kernels.cuda_fp32_ffi import (
+                paged_decode_attention_gqa_nhd_fp32,
+            )
+            from nanovllm_jax.kernels.paged_attention import (
+                dense_block_tables_to_kv_indptr,
+                kv_last_page_len_from_seq_lens,
+            )
+
+            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
+                metadata.block_tables,
+            )
+            out = paged_decode_attention_gqa_nhd_fp32(
+                query[:, 0],
+                cache.k_cache[layer_id],
+                cache.v_cache[layer_id],
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len_from_seq_lens(metadata.seq_lens, block_size),
+                metadata.seq_lens.astype(jnp.int32),
+                scale,
+            )
+            return out.reshape(
+                query.shape[0],
+                1,
+                query.shape[2] * query.shape[3],
+            )
         return paged_attention_decode(
             query=query,
             k_cache=cache.k_cache,

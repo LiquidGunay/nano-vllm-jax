@@ -2667,3 +2667,54 @@ Decision:
 - Next step is an explicit backend opt-in for full-attention single-token
   decode only, then exact-token parity and integrated performance comparison
   against Entry 045.
+
+## Entry 073 - Rejected Standalone FP32 CUDA Decode Attention Routing
+
+- run id: `20260526-093652-2248722-cuda_fp32_decode_attn_hetero8_64_512x32`
+- benchmark artifact:
+  `results/qwen08_jax_server_trace_hetero8_64_512x32_cuda_fp32_decode_attn.json`
+- benchmark script: `benchmarks/benchmark_jax_server_trace.py`
+- profile directory:
+  `/mountpoint/.exp/profiles/20260526-093652-2248722-cuda_fp32_decode_attn_hetero8_64_512x32`
+- change tested: `NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN=1` routes
+  single-token FP32 decode attention through the local CUDA/JAX FFI
+  `paged_decode_attention_gqa_nhd` kernel. Prefill, multi-token decode/MTP, KV
+  append, and default serving remain pure JAX.
+- focused CUDA tests: direct FFI decode parity and backend-level opt-in parity
+  passed for the Qwen3.5-0.8B full-attention `8q/2kv/head_dim=256` shape.
+- full CUDA run: `JAX_PLATFORMS=cuda`, A10G, model `Qwen/Qwen3.5-0.8B`, BF16
+  weights, FP32 runtime dtype/KV cache, accepted compact prefill/materialized
+  LM-head flags, hetero8 lengths `64,128,192,256,320,384,448,512`, output
+  length `32`, Entry 045 reference
+  `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json`.
+- correctness: exact generated-token match for all 8 rows against Entry 045.
+- timing: `320.68 tok/s`, TTFT p50 `292.36 ms`, ITL p50 `16.09 ms`, ITL p95
+  `17.27 ms`. This is `0.872x` of Entry 045 throughput and `0.371x` of the
+  tracked vLLM async baseline.
+
+Profile counters:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `forward_step_token_ids_jit` | `131.31 ms / 32` | decode step slower than Entry 045 timing envelope |
+| `PjRtCApiLoadedExecutable::Execute` | `147.92 ms / 252` | execute count/cost rose with the standalone custom call route |
+| `command_buffer::execute` | `46.01 ms / 1112` | no integrated win |
+| `command_buffer::update` | `19.85 ms / 217` | update cost rose |
+| `gather` | `12.95 ms / 135` | lower count, but not enough to offset overhead |
+| `transpose` | `17.36 ms / 132` | lower count, but end-to-end still regressed |
+| `MemcpyD2D` | `25.71 ms / 1231` | D2D work increased |
+| `array.py:325 tolist` | `512.26 ms / 32` | host sync attribution still dominates wall timing |
+| `np.asarray(jax.Array)` | `511.97 ms / 32` | same host sync attribution |
+
+Decision:
+
+- Reject standalone FP32 CUDA decode attention routing as a serving
+  optimization. It passes focused parity and exact generated-token parity, but
+  fails the integrated performance gate.
+- Keep `NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN=1` default-off as a diagnostic
+  route only.
+- Do not promote this to `gpu_paged_default` or `gpu_paged_fast_optin`.
+- The next full-attention attempt should not be another isolated per-row decode
+  kernel. Either pair attention with a broader layout/KV strategy that removes
+  downstream overhead, or move to the higher-leverage GDN decode/prefill kernel
+  path.

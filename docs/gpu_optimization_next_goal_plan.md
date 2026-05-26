@@ -405,8 +405,12 @@ paged_decode_attention_gqa_nhd(
   passes focused CUDA parity against the pure-JAX reference, including the
   model's full-attention `8q/2kv/head_dim=256` shape, under the same
   `jax_default_matmul_precision=highest` correctness mode used by the long
-  decode top-5 harness. It is not routed into serving yet and has no integrated
-  performance claim.
+  decode top-5 harness.
+- The local FP32 CUDA decode attention route is available behind
+  `NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN=1`, but the first integrated hetero8 run
+  was slower than Entry 045 despite exact generated-token parity. Keep it
+  default-off as a diagnostic route; do not promote it to default or fast
+  opt-in.
 
 ## P1.1 - `gdn_recurrent_decode_step`
 
@@ -785,10 +789,12 @@ Commit 6:
 - ~~Add focused parity tests against the current decode path~~
 - ~~Add FP32-capable CUDA/custom-call decode implementation with focused CUDA
   parity tests~~
-- Route FP32-capable CUDA/custom-call decode implementation behind an opt-in
-  backend
-- Route only full-attention decode layers after focused and integrated gates
-  pass
+- ~~Route FP32-capable CUDA/custom-call decode implementation behind an opt-in
+  backend~~
+- ~~Run live integrated attempt and record rejection of standalone decode
+  routing~~
+- Route only full-attention decode layers as an accepted path after integrated
+  gates pass
 
 Commit 7:
 

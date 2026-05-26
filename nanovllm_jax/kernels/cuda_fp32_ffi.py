@@ -467,7 +467,7 @@ def paged_decode_attention_gqa_nhd_fp32(
     kv_indices: Any,
     kv_last_page_len: Any,
     seq_lens: Any,
-    softmax_scale: float,
+    softmax_scale: Any,
 ) -> jnp.ndarray:
     """Decode attention over an FP32 NHD paged cache using local CUDA FFI."""
 

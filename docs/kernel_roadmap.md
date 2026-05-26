@@ -93,8 +93,11 @@ paged_decode_attention_gqa_nhd(
   satisfy before it can be routed into serving.
 - current CUDA status: a local FP32 CUDA/JAX FFI implementation satisfies the
   focused ABI parity gate, including the Qwen3.5-0.8B full-attention
-  `8q/2kv/head_dim=256` shape. It remains default-off and unrouted until the
-  backend-level opt-in and integrated exact-token/performance gates pass.
+  `8q/2kv/head_dim=256` shape. The backend route is available behind
+  `NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN=1`, but the first integrated hetero8 run
+  preserved exact tokens while regressing throughput/ITL. Keep this route
+  default-off as a diagnostic until it is paired with a broader layout/attention
+  strategy that passes the integrated gate.
 
 ## P1.1 - `gdn_recurrent_decode_step`
 

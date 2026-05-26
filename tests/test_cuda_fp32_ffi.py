@@ -271,3 +271,90 @@ def test_paged_decode_attention_gqa_nhd_fp32_cuda_matches_reference(
         rtol=2e-5,
         atol=2e-5,
     )
+
+
+@pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_backend_cuda_fp32_decode_attention_opt_in_matches_pure_jax(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
+    monkeypatch.delenv("NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN", raising=False)
+
+    page_size = 16
+    max_pages_per_sequence = 2
+    batch = 2
+    num_pages = max_pages_per_sequence * batch + 1
+    num_q_heads = 8
+    num_kv_heads = 2
+    head_dim = 256
+    layer_id = 0
+    seq_lens = jnp.array([page_size + 1, max_pages_per_sequence * page_size - 1], dtype=jnp.int32)
+    positions = (seq_lens - 1)[:, None]
+    block_tables = jnp.array(
+        [
+            [num_pages - 1, 1],
+            [0, 3],
+        ],
+        dtype=jnp.int32,
+    )
+    k_cache = jnp.linspace(
+        -0.3,
+        0.4,
+        num_pages * page_size * num_kv_heads * head_dim,
+        dtype=jnp.float32,
+    ).reshape(1, num_pages, page_size, num_kv_heads, head_dim)
+    v_cache = jnp.linspace(
+        0.2,
+        0.9,
+        num_pages * page_size * num_kv_heads * head_dim,
+        dtype=jnp.float32,
+    ).reshape(1, num_pages, page_size, num_kv_heads, head_dim)
+    query = jnp.linspace(
+        -0.5,
+        0.5,
+        batch * num_q_heads * head_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, 1, num_q_heads, head_dim)
+    metadata = AttentionMetadata(
+        slot_mapping=compute_slot_mapping(
+            positions=positions,
+            block_table=block_tables,
+            block_size=page_size,
+            is_prefill=False,
+        ),
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        query_start_loc=jnp.arange(batch + 1, dtype=jnp.int32),
+        num_prefill_tokens=0,
+        num_decode_tokens=batch,
+        positions=positions,
+        max_kv_len=max_pages_per_sequence * page_size,
+    )
+
+    expected = PureJAXBackend().attention(
+        layer_id=layer_id,
+        query=query,
+        cache=KVCacheStorage(k_cache, v_cache),
+        metadata=metadata,
+        block_size=page_size,
+        scale=1.0 / np.sqrt(head_dim),
+        num_key_value_groups=num_q_heads // num_kv_heads,
+        is_prefill=False,
+    )
+    monkeypatch.setenv("NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN", "1")
+    actual = PureJAXBackend().attention(
+        layer_id=layer_id,
+        query=query,
+        cache=KVCacheStorage(k_cache, v_cache),
+        metadata=metadata,
+        block_size=page_size,
+        scale=1.0 / np.sqrt(head_dim),
+        num_key_value_groups=num_q_heads // num_kv_heads,
+        is_prefill=False,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual),
+        np.asarray(expected),
+        rtol=2e-5,
+        atol=2e-5,
+    )
