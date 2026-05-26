@@ -782,18 +782,16 @@ def _gdn_prefill_chunk32_normalized_fp32_target(
         state,
         value_dim_multiple=value_dim_multiple,
     )
-    state_kv = jnp.transpose(state, (0, 1, 3, 2))
     _register_kv_append_target()
     call = jax.ffi.ffi_call(
         target,
         (
             jax.ShapeDtypeStruct(value.shape, value.dtype),
-            jax.ShapeDtypeStruct(state_kv.shape, state_kv.dtype),
+            jax.ShapeDtypeStruct(state.shape, state.dtype),
         ),
         has_side_effect=False,
     )
-    output, new_state_kv = call(query, key, value, g, beta, seq_lens, state_kv)
-    return output, jnp.transpose(new_state_kv, (0, 1, 3, 2))
+    return call(query, key, value, g, beta, seq_lens, state)
 
 
 def gdn_prefill_chunk32_normalized_fp32(

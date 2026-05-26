@@ -141,7 +141,7 @@ def _make_inputs(args: argparse.Namespace, lengths: tuple[int, ...]):
     keys = jax.random.split(jax.random.PRNGKey(args.seed), 6)
     shape_k = (args.batch_size, args.num_heads, args.seq_len, args.key_dim)
     shape_v = (args.batch_size, args.num_heads, args.seq_len, args.value_dim)
-    state_shape = (args.batch_size, args.num_heads, args.key_dim, args.value_dim)
+    state_shape = (args.batch_size, args.num_heads, args.value_dim, args.key_dim)
 
     query = jax.random.normal(keys[0], shape_k, dtype=jnp.float32)
     key = jax.random.normal(keys[1], shape_k, dtype=jnp.float32)
@@ -500,7 +500,7 @@ def _pallas_one_piece_gdn_prefill_probe_fn(
         lower_mask = token_offsets[:, None] >= token_offsets[None, :]
         strict_lower_mask = token_offsets[:, None] > token_offsets[None, :]
 
-        state = initial_state_ref[row, head, key_offsets[:, None], value_offsets[None, :]].astype(jnp.float32)
+        state = initial_state_ref[row, head, value_offsets[None, :], key_offsets[:, None]].astype(jnp.float32)
         for chunk_index in range(n_chunks):
             start = chunk_index * chunk_size
             query_block = query_ref[row, head, start + token_offsets[:, None], key_offsets[None, :]]
@@ -550,14 +550,14 @@ def _pallas_one_piece_gdn_prefill_probe_fn(
             state = state * jnp.exp(g_last) + state_update
             output_ref[row, head, start + token_offsets[:, None], value_offsets[None, :]] = output_i
 
-        final_state_ref[row, head, key_offsets[:, None], value_offsets[None, :]] = state
+        final_state_ref[row, head, value_offsets[None, :], key_offsets[:, None]] = state
 
     def run(query, key, value, g, beta, initial_state, key_offsets, value_offsets, token_offsets):
         return pl.pallas_call(
             kernel,
             out_shape=(
                 jax.ShapeDtypeStruct((batch_size, num_heads, n_chunks * chunk_size, value_dim), query.dtype),
-                jax.ShapeDtypeStruct((batch_size, num_heads, key_dim, value_dim), jnp.float32),
+                jax.ShapeDtypeStruct((batch_size, num_heads, value_dim, key_dim), jnp.float32),
             ),
             grid=(batch_size, num_heads, value_dim // block_v),
             name=f"gdn_one_piece_gdn_prefill_vblock{block_v}_probe",
@@ -743,15 +743,15 @@ def _rectangular_output_state_reconstruction_probe_fn(
 
             attn_i = jnp.einsum("bhck,bhdk->bhcd", q_i, k_i) * decay_mask_i
             attn_i = jnp.where(mask_strict_upper, 0.0, attn_i)
-            v_prime = jnp.einsum("bhck,bhkv->bhcv", k_cumdecay_i, state)
+            v_prime = jnp.einsum("bhck,bhvk->bhcv", k_cumdecay_i, state)
             v_new = v_i - v_prime
-            attn_inter = jnp.einsum("bhck,bhkv->bhcv", q_i * jnp.exp(g_cumsum_i)[..., None], state)
+            attn_inter = jnp.einsum("bhck,bhvk->bhcv", q_i * jnp.exp(g_cumsum_i)[..., None], state)
             attn_v_new = jnp.einsum("bhcd,bhdv->bhcv", attn_i, v_new)
             core_attn_out_i = attn_inter + attn_v_new
 
             g_last_minus_g = g_cumsum_i[..., -1, None] - g_cumsum_i
             k_weighted = k_i * jnp.exp(g_last_minus_g)[..., None]
-            state_update = jnp.einsum("bhck,bhcv->bhkv", k_weighted, v_new)
+            state_update = jnp.einsum("bhcv,bhck->bhvk", v_new, k_weighted)
             state = state * jnp.exp(g_cumsum_i[..., -1, None, None]) + state_update
             return state, core_attn_out_i
 
@@ -816,15 +816,15 @@ def _active_output_state_reconstruction_probe_fn(
 
             attn_i = jnp.einsum("bhck,bhdk->bhcd", q_i, k_i) * decay_mask_i
             attn_i = jnp.where(mask_strict_upper, 0.0, attn_i)
-            v_prime = jnp.einsum("bhck,bhkv->bhcv", k_cumdecay_i, state)
+            v_prime = jnp.einsum("bhck,bhvk->bhcv", k_cumdecay_i, state)
             v_new = v_i - v_prime
-            attn_inter = jnp.einsum("bhck,bhkv->bhcv", q_i * jnp.exp(g_cumsum_i)[..., None], state)
+            attn_inter = jnp.einsum("bhck,bhvk->bhcv", q_i * jnp.exp(g_cumsum_i)[..., None], state)
             attn_v_new = jnp.einsum("bhcd,bhdv->bhcv", attn_i, v_new)
             core_attn_out_i = attn_inter + attn_v_new
 
             g_last_minus_g = g_cumsum_i[..., -1, None] - g_cumsum_i
             k_weighted = k_i * jnp.exp(g_last_minus_g)[..., None]
-            state_update = jnp.einsum("bhck,bhcv->bhkv", k_weighted, v_new)
+            state_update = jnp.einsum("bhcv,bhck->bhvk", v_new, k_weighted)
             state = state * jnp.exp(g_cumsum_i[..., -1, None, None]) + state_update
             return state, core_attn_out_i
 

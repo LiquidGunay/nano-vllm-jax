@@ -470,11 +470,11 @@ XLA_FFI_Error* CheckGdnPrefillCallFrame(XLA_FFI_CallFrame* call_frame) {
                        "g/beta batch/head dimensions must match query");
   }
   if (query->dims[3] != key->dims[3] ||
-      query->dims[3] != state->dims[2] ||
-      value->dims[3] != state->dims[3] ||
+      value->dims[3] != state->dims[2] ||
+      query->dims[3] != state->dims[3] ||
       value->dims[3] % 32 != 0) {
     return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
-                       "GDN prefill dimensions must match state and value_dim must be divisible by 32");
+                       "GDN prefill state must have shape [B,H,V,K] and value_dim must be divisible by 32");
   }
   if (out->dims[0] != value->dims[0] ||
       out->dims[1] != value->dims[1] ||
@@ -896,7 +896,7 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
   int64_t q_base = ((batch_idx * num_heads + head) * seq_len) * key_dim;
   int64_t v_base = ((batch_idx * num_heads + head) * seq_len) * value_dim;
   int64_t gate_base = (batch_idx * num_heads + head) * seq_len;
-  int64_t state_base = ((batch_idx * num_heads + head) * key_dim) * value_dim;
+  int64_t state_base = ((batch_idx * num_heads + head) * value_dim) * key_dim;
 
   for (int64_t linear = tid; linear < seq_len * kBlockV; linear += blockDim.x) {
     int64_t token = linear / kBlockV;
@@ -907,7 +907,7 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
     int64_t k_offset = linear / kBlockV;
     int64_t v_offset = linear - k_offset * kBlockV;
     state_tile[linear] =
-        initial_state[state_base + k_offset * value_dim + value_start + v_offset];
+        initial_state[state_base + (value_start + v_offset) * key_dim + k_offset];
   }
   __syncthreads();
 
@@ -1068,7 +1068,7 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
   for (int64_t linear = tid; linear < key_dim * kBlockV; linear += blockDim.x) {
     int64_t k_offset = linear / kBlockV;
     int64_t v_offset = linear - k_offset * kBlockV;
-    final_state[state_base + k_offset * value_dim + value_start + v_offset] =
+    final_state[state_base + (value_start + v_offset) * key_dim + k_offset] =
         state_tile[linear];
   }
 }
