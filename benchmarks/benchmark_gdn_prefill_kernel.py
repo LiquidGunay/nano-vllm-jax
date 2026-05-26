@@ -200,6 +200,111 @@ def _pallas_active_chunk_probe_fn(batch_size: int, n_chunks: int, chunk_size: in
     return run
 
 
+def _pallas_active_input_pack_probe_fn(
+    active_chunk_count: int,
+    num_heads: int,
+    chunk_size: int,
+    key_dim: int,
+    value_dim: int,
+) -> Callable:
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as plt
+
+    def kernel(
+        query_ref,
+        key_ref,
+        value_ref,
+        g_ref,
+        beta_ref,
+        active_rows_ref,
+        active_chunks_ref,
+        key_offsets_ref,
+        value_offsets_ref,
+        query_out_ref,
+        key_out_ref,
+        value_out_ref,
+        g_out_ref,
+        beta_out_ref,
+    ):
+        active = pl.program_id(0)
+        head = pl.program_id(1)
+        token = pl.program_id(2)
+        row = active_rows_ref[active]
+        time_index = active_chunks_ref[active] * chunk_size + token
+        key_offsets = key_offsets_ref[:]
+        value_offsets = value_offsets_ref[:]
+
+        query_out_ref[active, head, token, key_offsets] = query_ref[row, head, time_index, key_offsets]
+        key_out_ref[active, head, token, key_offsets] = key_ref[row, head, time_index, key_offsets]
+        value_out_ref[active, head, token, value_offsets] = value_ref[row, head, time_index, value_offsets]
+        g_out_ref[active, head, token] = g_ref[row, head, time_index]
+        beta_out_ref[active, head, token] = beta_ref[row, head, time_index]
+
+    def run(query, key, value, g, beta, active_rows, active_chunks, key_offsets, value_offsets):
+        return pl.pallas_call(
+            kernel,
+            out_shape=(
+                jax.ShapeDtypeStruct((active_chunk_count, num_heads, chunk_size, key_dim), query.dtype),
+                jax.ShapeDtypeStruct((active_chunk_count, num_heads, chunk_size, key_dim), key.dtype),
+                jax.ShapeDtypeStruct((active_chunk_count, num_heads, chunk_size, value_dim), value.dtype),
+                jax.ShapeDtypeStruct((active_chunk_count, num_heads, chunk_size), g.dtype),
+                jax.ShapeDtypeStruct((active_chunk_count, num_heads, chunk_size), beta.dtype),
+            ),
+            grid=(active_chunk_count, num_heads, chunk_size),
+            name="gdn_active_input_pack_probe",
+            compiler_params=plt.CompilerParams(num_warps=1),
+        )(query, key, value, g, beta, active_rows, active_chunks, key_offsets, value_offsets)
+
+    return run
+
+
+def _active_input_pack_reference(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    g: jnp.ndarray,
+    beta: jnp.ndarray,
+    active_rows: jnp.ndarray,
+    active_chunks: jnp.ndarray,
+    chunk_size: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    heads = jnp.arange(query.shape[1], dtype=jnp.int32)[None, :, None]
+    token_offsets = jnp.arange(chunk_size, dtype=jnp.int32)[None, :]
+    time_indices = active_chunks[:, None] * int(chunk_size) + token_offsets
+    rows = active_rows[:, None, None]
+    times = time_indices[:, None, :]
+    return (
+        query[rows, heads, times, :],
+        key[rows, heads, times, :],
+        value[rows, heads, times, :],
+        g[rows, heads, times],
+        beta[rows, heads, times],
+    )
+
+
+def _compare_pack_outputs(
+    reference: tuple[jnp.ndarray, ...],
+    candidate: tuple[jnp.ndarray, ...],
+) -> dict[str, float]:
+    names = ("query", "key", "value", "g", "beta")
+    comparisons: dict[str, float] = {}
+    max_abs_values: list[float] = []
+    for name, ref, out in zip(names, reference, candidate):
+        diff = out.astype(jnp.float32) - ref.astype(jnp.float32)
+        element_count = int(np.prod(out.shape))
+        if element_count == 0:
+            max_abs = 0.0
+            mse = 0.0
+        else:
+            max_abs = float(jnp.max(jnp.abs(diff)))
+            mse = float(jnp.mean(jnp.square(diff)))
+        comparisons[f"{name}_max_abs"] = max_abs
+        comparisons[f"{name}_mse"] = mse
+        max_abs_values.append(max_abs)
+    comparisons["max_abs"] = max(max_abs_values) if max_abs_values else 0.0
+    return comparisons
+
+
 def _padded_chunked_fn(chunk_size: int) -> Callable:
     def run(query, key, value, g, beta, initial_state):
         return jax_chunk_gated_delta_rule(
@@ -292,6 +397,8 @@ def _profile_counters(profile_path: Path, profiled_iterations: int, variants: li
         "Thunks::Initialize",
         "gdn_prefill/pallas_active_chunk_probe",
         "gdn_active_chunk_probe",
+        "gdn_prefill/pallas_active_input_pack_probe",
+        "gdn_active_input_pack_probe",
         "while",
         "fusion",
         "transpose",
@@ -345,6 +452,10 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
     total_chunks = int(args.batch_size * (args.seq_len // args.chunk_size))
     active_chunk_plan = _active_chunk_plan(args, lengths)
     query_lens = jnp.asarray(lengths, dtype=jnp.int32)
+    active_rows = jnp.asarray(active_chunk_plan["active_rows"], dtype=jnp.int32)
+    active_chunk_indices = jnp.asarray(active_chunk_plan["active_chunks"], dtype=jnp.int32)
+    key_offsets = jnp.arange(args.key_dim, dtype=jnp.int32)
+    value_offsets = jnp.arange(args.value_dim, dtype=jnp.int32)
 
     variant_results: dict[str, dict[str, Any]] = {}
     outputs: dict[str, tuple[jnp.ndarray, jnp.ndarray]] = {}
@@ -353,7 +464,15 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         "lowering_ok": None,
         "error": None,
         "custom_call_count": None,
+        "active_input_pack_probe": {
+            "attempted": False,
+            "lowering_ok": None,
+            "error": None,
+            "custom_call_count": None,
+        },
     }
+    pallas_pack_last_output = None
+    pallas_pack_reference = None
 
     # Compile before profiling. The trace should focus on warmed kernel behavior.
     compiled_variants: list[tuple[str, Callable, Any, float]] = []
@@ -363,6 +482,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         compiled_variants.append((name, fn, compiled, time.perf_counter() - started))
 
     pallas_probe = None
+    pallas_pack_probe = None
     if jax.default_backend() == "gpu":
         pallas_feasibility["attempted"] = True
         try:
@@ -379,6 +499,49 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
             pallas_feasibility["lowering_ok"] = False
             pallas_feasibility["error"] = f"{type(exc).__name__}: {exc}"
 
+        pack_info = pallas_feasibility["active_input_pack_probe"]
+        if int(active_chunk_plan["active_chunk_count"]) > 0:
+            pack_info["attempted"] = True
+            try:
+                started = time.perf_counter()
+                pack_fn = _pallas_active_input_pack_probe_fn(
+                    int(active_chunk_plan["active_chunk_count"]),
+                    int(args.num_heads),
+                    int(args.chunk_size),
+                    int(args.key_dim),
+                    int(args.value_dim),
+                )
+                pallas_pack_probe = jax.jit(pack_fn).lower(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    active_rows,
+                    active_chunk_indices,
+                    key_offsets,
+                    value_offsets,
+                ).compile()
+                pack_info["compile_seconds"] = time.perf_counter() - started
+                pack_info["lowering_ok"] = True
+                pallas_pack_reference = _block_until_ready(
+                    _active_input_pack_reference(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        active_rows,
+                        active_chunk_indices,
+                        int(args.chunk_size),
+                    )
+                )
+            except BaseException as exc:
+                pallas_pack_probe = None
+                pallas_pack_reference = None
+                pack_info["lowering_ok"] = False
+                pack_info["error"] = f"{type(exc).__name__}: {exc}"
+
     recorder.start_jax_profile(enabled=args.profile)
     try:
         if pallas_probe is not None:
@@ -394,6 +557,59 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
                     "active_chunk_count": int(pallas_mask_host.sum()),
                     "inactive_chunk_count": int(pallas_mask_host.size - pallas_mask_host.sum()),
                     "total_chunk_count": int(pallas_mask_host.size),
+                }
+            )
+        if pallas_pack_probe is not None:
+            pack_info = pallas_feasibility["active_input_pack_probe"]
+            warmup_ms = []
+            for _ in range(args.warmups):
+                with _trace_annotation("gdn_prefill/pallas_active_input_pack_probe/warmup"):
+                    started = time.perf_counter()
+                    pallas_pack_last_output = _block_until_ready(
+                        pallas_pack_probe(
+                            query,
+                            key,
+                            value,
+                            g,
+                            beta,
+                            active_rows,
+                            active_chunk_indices,
+                            key_offsets,
+                            value_offsets,
+                        )
+                    )
+                    warmup_ms.append(1000.0 * (time.perf_counter() - started))
+            repeat_ms = []
+            for _ in range(args.repeats):
+                with _trace_annotation("gdn_prefill/pallas_active_input_pack_probe/repeat"):
+                    started = time.perf_counter()
+                    pallas_pack_last_output = _block_until_ready(
+                        pallas_pack_probe(
+                            query,
+                            key,
+                            value,
+                            g,
+                            beta,
+                            active_rows,
+                            active_chunk_indices,
+                            key_offsets,
+                            value_offsets,
+                        )
+                    )
+                    repeat_ms.append(1000.0 * (time.perf_counter() - started))
+            mean_ms = float(sum(repeat_ms) / len(repeat_ms)) if repeat_ms else None
+            pack_info.update(
+                {
+                    "active_chunk_count": int(active_chunk_plan["active_chunk_count"]),
+                    "packed_true_tokens": int(active_chunk_plan["active_chunk_count"]) * int(args.chunk_size),
+                    "warmup_ms": warmup_ms,
+                    "repeat_ms": repeat_ms,
+                    "mean_ms": mean_ms,
+                    "p50_ms": _percentile(repeat_ms, 50),
+                    "p95_ms": _percentile(repeat_ms, 95),
+                    "min_ms": min(repeat_ms) if repeat_ms else None,
+                    "max_ms": max(repeat_ms) if repeat_ms else None,
+                    "profiled_iterations": int(args.warmups) + int(args.repeats),
                 }
             )
         for name, _fn, compiled, compile_seconds in compiled_variants:
@@ -433,6 +649,11 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
     comparisons = {}
     for name, output in outputs.items():
         comparisons[f"{name}_vs_{reference_name}"] = _compare_outputs(outputs[reference_name], output, valid)
+    if pallas_pack_last_output is not None and pallas_pack_reference is not None:
+        pallas_feasibility["active_input_pack_probe"]["comparisons"] = _compare_pack_outputs(
+            pallas_pack_reference,
+            pallas_pack_last_output,
+        )
     profiled_iterations = len(variants) * (int(args.warmups) + int(args.repeats))
     profile_counters = _profile_counters(recorder.profile_path, profiled_iterations, list(variants)) if args.profile else None
     if profile_counters is not None:
@@ -440,6 +661,9 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         probe_custom_call = ranges.get("gdn_active_chunk_probe")
         if probe_custom_call is not None:
             pallas_feasibility["custom_call_count"] = int(probe_custom_call.get("count", 0))
+        pack_custom_call = ranges.get("gdn_active_input_pack_probe")
+        if pack_custom_call is not None:
+            pallas_feasibility["active_input_pack_probe"]["custom_call_count"] = int(pack_custom_call.get("count", 0))
 
     return {
         "run_config": {
@@ -473,7 +697,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict[str, 
         ],
         "decision": {
             "promote_to_server_routing": False,
-            "reason": "baseline scaffold only; no backend-owned candidate was routed",
+            "reason": "metadata/input-pack scaffold only; no backend-owned GDN candidate was routed",
         },
         "run": recorder.metadata(),
     }

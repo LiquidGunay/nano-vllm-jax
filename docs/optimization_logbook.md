@@ -2327,3 +2327,40 @@ Decision:
 - Keep this benchmark scaffold. It proves that the active-chunk metadata contract is explicit, serializable in artifacts, and consumable by an A10G-compatible Pallas/Triton kernel without touching model behavior.
 - This is not a speed win and must not be promoted to server routing. It is a prerequisite for the real `pallas_segmented_chunk32_skip_inactive` candidate.
 - The next implementation step should replace the metadata-only kernel with a benchmark-only Pallas segmented GDN candidate over the same `query_lens`/active-chunk plan, preserving the current padded chunk32 reference within `1e-5`.
+
+## Entry 064 - Pallas Active-Input Pack Probe For Segmented GDN
+
+- run id: `20260526-055311-2168055-gdn_prefill_kernel_active_input_pack_hetero8_64_512x32`
+- benchmark artifact: `results/gdn_prefill_kernel_active_input_pack_hetero8_64_512x32.json`
+- benchmark script: `benchmarks/benchmark_gdn_prefill_kernel.py`
+- profile directory: `/mountpoint/.exp/profiles/20260526-055311-2168055-gdn_prefill_kernel_active_input_pack_hetero8_64_512x32`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-055311-2168055-gdn_prefill_kernel_active_input_pack_hetero8_64_512x32/plugins/profile/2026_05_26_05_53_17/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-055311-2168055-gdn_prefill_kernel_active_input_pack_hetero8_64_512x32/plugins/profile/2026_05_26_05_53_17/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- change accepted: the standalone GDN benchmark now includes a benchmark-only Pallas/Triton active-input pack probe. It consumes the host active-chunk plan, gathers active `query`, `key`, `value`, `g`, and `beta` chunk inputs into dense active-chunk buffers, and compares the packed result against a JAX gather reference. No model/server route changed.
+- CUDA run: `JAX_PLATFORMS=cuda`, A10G, JAX `0.10.0`, FP32 activations/state, chunk size `32`, lengths `64,128,192,256,320,384,448,512`, `5` warmups, `20` measured repeats, current padded chunk32 only.
+- active-chunk contract: `72` active chunks, `128` total chunks, `56` inactive chunks, and `2304` packed active tokens.
+- pack probe: lowering succeeded, compile time `0.157 s`, and the packed `query`/`key`/`value`/`g`/`beta` outputs matched the JAX reference exactly: all max-abs deltas `0.0`. Repeat timing was p50 `0.455 ms`, mean `0.456 ms`, p95 `0.472 ms`.
+- metadata probe: lowering still succeeded and matched the active plan (`72` active, `56` inactive). Its host-visible one-shot range was slower in this trace (`4.991 ms`) because the new pack probe changes the warmup/profile envelope; the actual metadata custom-call label remained tiny at `0.056 ms` total.
+- current padded chunk32 correctness remains exact: `output_max_abs=0.0`, `valid_output_max_abs=0.0`, and `state_max_abs=0.0`.
+- current padded chunk32 timing: p50 `6.473 ms`, mean `6.474 ms`, p95 `6.495 ms`, true-token throughput `355,903 tok/s`, rectangular-token throughput `632,716 tok/s`.
+
+Top profile counters:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `gdn_prefill/current_jax_chunk32_padded` | `223.47 ms / 25` | baseline annotation including warmup/profile overhead |
+| `gdn_prefill/pallas_active_input_pack_probe` | `16.69 ms / 25` | pack annotation range; repeat clock p50 was `0.455 ms` |
+| `gdn_active_input_pack_probe` | `6.66 ms / 50` | actual Pallas pack kernel labels, two custom-call labels per benchmark call |
+| `gdn_prefill/pallas_active_chunk_probe` | `5.06 ms / 1` | metadata probe host-visible range |
+| `gdn_active_chunk_probe` | `0.056 ms / 2` | actual metadata Pallas kernel labels |
+| `PjRtCApiLoadedExecutable::Execute` | `100.14 ms / 51` | baseline calls plus metadata and pack probes |
+| `command_buffer::execute` | `19.20 ms / 1225` | baseline GDN command-buffer count unchanged; pack probe labels are separate |
+| `command_buffer::update` | `1.65 ms / 96` | baseline GDN command-buffer updates unchanged |
+| `input_reduce_fusion` | `14.66 ms / 775` | baseline recurrence counter |
+| `while` | `26.93 ms / 50` | baseline loop counter |
+
+Decision:
+
+- Keep the active-input pack probe as benchmark instrumentation. It proves that the active-chunk metadata can drive vectorized multi-output Pallas input movement on A10G and preserve exact FP32 input values.
+- Do not route a separate pack step through the server. The standalone pack costs about `0.455 ms` p50 and emits two custom-call labels per benchmark call, so as an isolated step it would spend a meaningful fraction of the current `6.47 ms` GDN prefill time before doing any GDN math.
+- The next real candidate should fuse this active-chunk indexing directly into `pallas_segmented_chunk32_skip_inactive`, so inactive chunks are skipped inside the GDN computation rather than copied into an intermediate buffer first.
