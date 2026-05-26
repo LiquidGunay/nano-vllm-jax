@@ -24,6 +24,26 @@ from nanovllm_jax.kv_cache import (
 )
 
 
+def test_kv_append_paged_nhd_rejects_fp32_cache_before_ffi_registration():
+    append_key = jnp.zeros((1, 2, 4), dtype=jnp.float32)
+    append_value = jnp.zeros_like(append_key)
+    k_cache = jnp.zeros((1, 1, 2, 4), dtype=jnp.float32)
+    v_cache = jnp.zeros_like(k_cache)
+
+    with pytest.raises(ValueError, match="supports only FP16/BF16"):
+        kv_append_paged_nhd(
+            append_key,
+            append_value,
+            jnp.array([0], dtype=jnp.int32),
+            jnp.array([0], dtype=jnp.int32),
+            k_cache,
+            v_cache,
+            jnp.array([0], dtype=jnp.int32),
+            jnp.array([0, 1], dtype=jnp.int32),
+            jnp.array([1], dtype=jnp.int32),
+        )
+
+
 def _has_module(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 

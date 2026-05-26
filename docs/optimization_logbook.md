@@ -2573,3 +2573,27 @@ Decision:
 - Reject the current one-piece Pallas vblock64 probe as a hetero8 serving candidate. It proves the one-piece parity surface can pass a small final-output/state gate, but its full-shape compile behavior is not acceptable.
 - Keep the probe behind the explicit opt-in flag as a recorded diagnostic only. Do not enable it in server routing or default benchmark runs.
 - If revisiting one-piece GDN, first reduce compile pressure through a smaller backend-owned surface or different blocking strategy, then rerun the full hetero8 compile gate before looking at runtime.
+
+## Entry 070 - Rejected FlashInfer KV Append Under FP32 Cache Contract
+
+- attempted run id: `20260526-084105-2227625-flashinfer_kv_append_hetero8_64_512x32`
+- attempted benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_flashinfer_kv_append.json`
+- benchmark script: `benchmarks/benchmark_jax_server_trace.py`
+- attempted profile directory: `/mountpoint/.exp/profiles/20260526-084105-2227625-flashinfer_kv_append_hetero8_64_512x32`
+- change tested: an opt-in `NANO_VLLM_JAX_FLASHINFER_KV_APPEND=1` route updates each canonical full-attention layer cache slice through FlashInfer's `append_paged_kv_cache` JAX FFI wrapper, then writes the updated slice back into the existing pure-JAX cache layout. The default path remains pure JAX.
+- focused CUDA tests passed before the server attempt: separate NHD K/V caches, non-contiguous page tables, BF16 tensors, and both `head_dim=128` and the model's full-attention `head_dim=256` matched the pure-JAX NHD append reference. A backend-level opt-in unit test also matched canonical `update_kv_cache` for BF16 cache tensors.
+- full server attempt: `JAX_PLATFORMS=cuda`, A10G, model `Qwen/Qwen3.5-0.8B`, BF16 weights, FP32 runtime dtype, accepted compact prefill/materialized-LM-head flags, hetero8 lengths `64,128,192,256,320,384,448,512`, output length `32`, Entry 045 scheduler envelope, stored reference `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json`.
+- result: the run failed during warmup before producing the JSON artifact. The failure happened inside FlashInfer's `append_paged_kv_cache` dispatch:
+
+```text
+append_paged_kv_cache(...) failed to dispatch data type
+```
+
+- root cause: FlashInfer's `page.cu` dispatches `append_paged_kv_cache` through `DISPATCH_DLPACK_DTYPE_TO_CTYPE`, which covers FP16/BF16 and low-precision FP8/FP4 cache tensors, not FP32. The current accepted serving contract uses BF16 checkpoint weights with FP32 activation/KV-cache tensors, so the FlashInfer append route is dtype-incompatible without changing that policy.
+
+Decision:
+
+- Reject FlashInfer `append_paged_kv_cache` as a serving KV append path under the current BF16-weights/FP32-activation contract.
+- Keep the FFI wrapper and BF16-focused tests as ABI documentation only. They prove the JAX FFI aliasing and page-table contract, but they are not an accepted optimization.
+- Add a Python-side dtype guard so `NANO_VLLM_JAX_FLASHINFER_KV_APPEND=1` fails clearly for FP32 cache tensors before launching the FFI.
+- Do not cast the cache to BF16 to make this route work. That would change the activation/KV-cache dtype contract and must be a separate explicit decision.

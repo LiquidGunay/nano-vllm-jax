@@ -21,6 +21,7 @@ from nanovllm_jax.kernels.registry import KernelBackendUnavailable, backend_stat
 
 _APPEND_PAGED_KV_CACHE_TARGET = "nanovllm_jax_flashinfer_append_paged_kv_cache"
 _NHD_LAYOUT = 0
+_SUPPORTED_KV_APPEND_DTYPES = (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
 _REGISTER_LOCK = threading.Lock()
 _APPEND_PAGED_KV_CACHE_REGISTERED = False
 
@@ -123,6 +124,18 @@ def _validate_kv_append_inputs(
         raise ValueError("k_cache must have NHD shape [num_pages, page_size, num_kv_heads, head_dim]")
     if append_key.shape[1:] != k_cache.shape[2:]:
         raise ValueError("append_key trailing dimensions must match cache [num_kv_heads, head_dim]")
+    if k_cache.dtype != v_cache.dtype:
+        raise ValueError("k_cache and v_cache must have the same dtype")
+    if append_key.dtype != k_cache.dtype or append_value.dtype != v_cache.dtype:
+        raise ValueError("append_key/value dtype must match the cache dtype")
+    if k_cache.dtype not in _SUPPORTED_KV_APPEND_DTYPES:
+        raise ValueError(
+            "FlashInfer append_paged_kv_cache supports only FP16/BF16 cache tensors "
+            f"through this JAX FFI route; got {k_cache.dtype}. The current serving "
+            "contract keeps FP32 activation/KV-cache tensors, so this route must "
+            "stay disabled unless that dtype policy changes or a FP32 append kernel "
+            "is added."
+        )
 
     nnz_tokens = append_key.shape[0]
     if batch_indices.shape != (nnz_tokens,) or positions.shape != (nnz_tokens,):
@@ -206,9 +219,6 @@ def kv_append_paged_nhd(
     values.
     """
 
-    _require_flashinfer_modules()
-    _register_append_paged_kv_cache()
-
     append_key = _as_jax_array("append_key", append_key)
     append_value = _as_jax_array("append_value", append_value)
     batch_indices = _as_jax_array("batch_indices", batch_indices)
@@ -229,6 +239,8 @@ def kv_append_paged_nhd(
         kv_indptr,
         kv_last_page_len,
     )
+    _require_flashinfer_modules()
+    _register_append_paged_kv_cache()
 
     call = jax.ffi.ffi_call(
         _APPEND_PAGED_KV_CACHE_TARGET,

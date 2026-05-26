@@ -322,8 +322,13 @@ scratch.
 - The opt-in route `NANO_VLLM_JAX_FLASHINFER_KV_APPEND=1` updates canonical
   per-layer cache slices through FlashInfer and then returns the existing cache
   layout to the pure-JAX attention path.
-- This is not yet exact-token/integrated-benchmark accepted and is not a
-  default backend.
+- A full hetero8 server run with the opt-in route failed during warmup before
+  producing a benchmark artifact because FlashInfer's append dispatcher does not
+  support FP32 cache tensors. The current accepted contract keeps BF16 weights
+  and FP32 activation/KV-cache tensors, so this route is rejected for default
+  serving unless the dtype policy changes or a FP32 append kernel is added.
+- This is not exact-token/integrated-benchmark accepted and is not a default
+  backend.
 
 ## P0.2 - `paged_decode_attention_gqa_nhd`
 
@@ -731,7 +736,7 @@ Commit 5:
 - ~~Add `kv_append_paged_nhd` prototype via FlashInfer/JAX FFI~~
 - ~~Add focused CUDA parity test against the pure-JAX NHD append reference~~
 - ~~Route full-attention layers through NHD append behind an opt-in flag~~
-- Run exact-token parity and integrated benchmark
+- ~~Run live integrated attempt and record rejection under the current FP32 KV-cache contract~~
 
 Interim ABI validation:
 

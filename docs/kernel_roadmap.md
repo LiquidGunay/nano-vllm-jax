@@ -47,6 +47,10 @@ kv_append_paged_nhd(
   write/gather/transpose overhead; no new host sync around FFI setup.
 - do-not-merge conditions: per-layer layout conversions, FFI planning in the
   decode loop, or an integrated regression hidden by a microbenchmark win.
+- current status: FlashInfer's append route is ABI-proven for BF16/FP16 cache
+  tensors, but rejected for the accepted FP32 activation/KV-cache serving
+  contract. A future serving path needs either a FP32-capable append kernel or
+  an explicit dtype-policy change.
 
 ## P0.2 - `paged_decode_attention_gqa_nhd`
 
