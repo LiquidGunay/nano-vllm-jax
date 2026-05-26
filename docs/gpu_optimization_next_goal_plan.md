@@ -378,6 +378,15 @@ paged_decode_attention_gqa_nhd(
 - benchmark only wins in a microbenchmark but loses integrated server throughput
 ```
 
+### Status
+
+- FlashInfer's batch decode/prefill JIT dtype maps do not include FP32 for the
+  Q/KV/O attention path, and the KV dtype map is BF16/FP16/low-precision only.
+- Under the current BF16-weights/FP32-activation contract, do not start a
+  FlashInfer `paged_decode_attention_gqa_nhd` wrapper as the next serving path.
+  The viable options are a FP32-capable custom kernel, or an explicit separate
+  decision to change the KV-cache/attention dtype policy.
+
 ## P1.1 - `gdn_recurrent_decode_step`
 
 ### Motivation

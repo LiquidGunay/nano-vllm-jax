@@ -79,6 +79,10 @@ paged_decode_attention_gqa_nhd(
   command-buffer update/execute stay flat or improve.
 - do-not-merge conditions: FFI setup inside the decode loop, per-layer layout
   conversion, or microbenchmark-only improvement.
+- current status: FlashInfer decode/prefill attention JIT dtype maps are
+  BF16/FP16/low-precision oriented and do not satisfy the accepted FP32
+  activation/KV-cache contract. Do not implement this FlashInfer wrapper for
+  serving until there is a FP32-capable path or an explicit dtype-policy change.
 
 ## P1.1 - `gdn_recurrent_decode_step`
 
