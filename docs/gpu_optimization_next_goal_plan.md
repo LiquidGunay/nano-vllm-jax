@@ -311,6 +311,15 @@ scratch.
 - no new host sync around FFI workspace setup
 ```
 
+### Status
+
+- Focused CUDA FFI proof passed on 2026-05-26 for separate NHD K/V caches,
+  BF16 cache tensors, `head_dim=128`, and a non-contiguous page table.
+- The working JAX FFI registration uses `arg_spec=["args", "attrs.layout"]`
+  and `input_output_aliases={4: 0, 5: 1}` so FlashInfer can mutate cache inputs
+  while JAX receives functional cache outputs with unwritten entries preserved.
+- This is not yet routed into serving and is not accepted as a default backend.
+
 ## P0.2 - `paged_decode_attention_gqa_nhd`
 
 ### Motivation
@@ -714,8 +723,10 @@ Commit 4:
 
 Commit 5:
 
-- Add kv_append_paged_nhd via FlashInfer/JAX FFI
-- Add focused tests and integrated benchmark
+- ~~Add `kv_append_paged_nhd` prototype via FlashInfer/JAX FFI~~
+- ~~Add focused CUDA parity test against the pure-JAX NHD append reference~~
+- Route full-attention layers through NHD append behind an opt-in flag
+- Run exact-token parity and integrated benchmark
 
 Interim ABI validation:
 
