@@ -39,6 +39,7 @@ _NHD_FULL_ATTN_CACHE_ENV = "NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE"
 _FLASHINFER_KV_APPEND_ENV = "NANO_VLLM_JAX_FLASHINFER_KV_APPEND"
 _CUDA_FP32_KV_APPEND_ENV = "NANO_VLLM_JAX_CUDA_FP32_KV_APPEND"
 _CUDA_FP32_DECODE_ATTN_ENV = "NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"
+_CUDA_FP32_GDN_DECODE_ENV = "NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE"
 
 
 class InferenceBackend(Protocol):
@@ -407,6 +408,31 @@ class PureJAXBackend:
         initial_state: jnp.ndarray | None,
         use_qk_l2norm_in_kernel: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        if (
+            os.environ.get(_CUDA_FP32_GDN_DECODE_ENV, "0") in _TRUE_ENV_VALUES
+            and use_qk_l2norm_in_kernel
+            and initial_state is not None
+            and query.shape[2] == 1
+            and query.dtype == jnp.float32
+            and key.dtype == jnp.float32
+            and value.dtype == jnp.float32
+            and g.dtype == jnp.float32
+            and beta.dtype == jnp.float32
+            and initial_state.dtype == jnp.float32
+        ):
+            from nanovllm_jax.kernels.cuda_fp32_ffi import (
+                gdn_recurrent_decode_step_fp32,
+            )
+
+            return gdn_recurrent_decode_step_fp32(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                initial_state,
+            )
+
         from nanovllm_jax.model import jax_recurrent_gated_delta_rule
 
         return jax_recurrent_gated_delta_rule(

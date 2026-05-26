@@ -483,8 +483,12 @@ previous Pallas regressions, it should not be the first production path for GDN.
   `jax_chunk_gated_delta_rule`.
 - A local FP32 CUDA/JAX FFI width-1 `gdn_recurrent_decode_step` prototype now
   passes focused parity against `jax_recurrent_gated_delta_rule`, including the
-  model's `batch=2`, `gdn_heads=16`, `head_dim=128` shape. It is not routed into
-  serving yet and has no integrated performance claim.
+  model's `batch=2`, `gdn_heads=16`, `head_dim=128` shape.
+- The local FP32 CUDA GDN decode route is available behind
+  `NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE=1`, but the first integrated hetero8 run
+  was slower than Entry 045 despite exact generated-token parity. Keep it
+  default-off as a diagnostic route; do not promote it to default or fast
+  opt-in.
 
 ### Acceptance Gate
 
@@ -811,8 +815,9 @@ Commit 7:
 
 - ~~Add gdn_recurrent_decode_step prototype~~
 - ~~First isolated tests~~
-- Route through `gated_delta_decode` behind an opt-in flag
-- Run integrated decode benchmark
+- ~~Route through `gated_delta_decode` behind an opt-in flag~~
+- ~~Run integrated decode benchmark and record rejection of standalone GDN
+  decode routing~~
 
 Commit 8:
 

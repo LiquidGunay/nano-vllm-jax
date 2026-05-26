@@ -127,9 +127,11 @@ gdn_recurrent_decode_step(
   integrated server regression despite a microbenchmark win.
 - current CUDA status: a local FP32 CUDA/JAX FFI width-1 recurrent decode
   prototype passes focused parity against `jax_recurrent_gated_delta_rule`,
-  including the model's `16` GDN heads and `128`-wide state shape. It remains
-  default-off and unrouted until exact generated-token and integrated
-  performance gates pass.
+  including the model's `16` GDN heads and `128`-wide state shape. The backend
+  route is available behind `NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE=1`, but the
+  first integrated hetero8 run preserved exact tokens while regressing
+  throughput/ITL. Keep this route default-off as a diagnostic; do not treat a
+  standalone width-1 recurrence custom call as an accepted serving kernel.
 
 ## P1.2 - `gdn_segmented_prefill_chunk32`
 

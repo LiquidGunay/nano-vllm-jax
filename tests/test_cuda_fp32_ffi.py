@@ -442,3 +442,81 @@ def test_gdn_recurrent_decode_step_fp32_cuda_matches_reference(
         rtol=2e-5,
         atol=2e-5,
     )
+
+
+@pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_backend_cuda_fp32_gdn_decode_opt_in_matches_pure_jax(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
+    monkeypatch.delenv("NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE", raising=False)
+
+    batch = 2
+    num_heads = 16
+    head_dim = 128
+    query = jnp.linspace(
+        -0.5,
+        0.5,
+        batch * num_heads * head_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_heads, 1, head_dim)
+    key = jnp.linspace(
+        0.4,
+        -0.4,
+        batch * num_heads * head_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_heads, 1, head_dim)
+    value = jnp.linspace(
+        -0.2,
+        0.3,
+        batch * num_heads * head_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_heads, 1, head_dim)
+    g = jnp.linspace(-0.08, -0.02, batch * num_heads, dtype=jnp.float32).reshape(
+        batch,
+        num_heads,
+        1,
+    )
+    beta = jnp.linspace(0.2, 0.8, batch * num_heads, dtype=jnp.float32).reshape(
+        batch,
+        num_heads,
+        1,
+    )
+    state = jnp.linspace(
+        -0.03,
+        0.04,
+        batch * num_heads * head_dim * head_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_heads, head_dim, head_dim)
+
+    expected_out, expected_state = PureJAXBackend().gated_delta_decode(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=state,
+        use_qk_l2norm_in_kernel=True,
+    )
+    monkeypatch.setenv("NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE", "1")
+    actual_out, actual_state = PureJAXBackend().gated_delta_decode(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=state,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_out),
+        np.asarray(expected_out),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
+        rtol=2e-5,
+        atol=2e-5,
+    )

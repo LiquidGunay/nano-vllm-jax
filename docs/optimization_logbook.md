@@ -2752,3 +2752,53 @@ Decision:
   and has not run the integrated hetero8 benchmark/profile gate.
 - Next step is an explicit backend opt-in for width-1 GDN decode only, then
   exact-token parity and integrated performance comparison against Entry 045.
+
+## Entry 075 - Rejected Standalone FP32 CUDA GDN Decode Routing
+
+- run id: `20260526-095354-2258619-cuda_fp32_gdn_decode_hetero8_64_512x32`
+- benchmark artifact:
+  `results/qwen08_jax_server_trace_hetero8_64_512x32_cuda_fp32_gdn_decode.json`
+- benchmark script: `benchmarks/benchmark_jax_server_trace.py`
+- profile directory:
+  `/mountpoint/.exp/profiles/20260526-095354-2258619-cuda_fp32_gdn_decode_hetero8_64_512x32`
+- change tested: `NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE=1` routes width-1 FP32
+  GDN recurrent decode through the local CUDA/JAX FFI kernel. Projections,
+  convolution update, prefill, full-attention kernels, and default serving
+  remain pure JAX.
+- focused CUDA tests: direct FFI GDN parity and backend-level opt-in parity
+  passed for the Qwen3.5-0.8B GDN `16`-head, `128`-wide FP32 state shape.
+- full CUDA run: `JAX_PLATFORMS=cuda`, A10G, model `Qwen/Qwen3.5-0.8B`, BF16
+  weights, FP32 runtime dtype/state, accepted compact prefill/materialized
+  LM-head flags, hetero8 lengths `64,128,192,256,320,384,448,512`, output
+  length `32`, Entry 045 reference
+  `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json`.
+- correctness: exact generated-token match for all 8 rows against Entry 045.
+- timing: `322.68 tok/s`, TTFT p50 `290.90 ms`, ITL p50 `15.99 ms`, ITL p95
+  `17.36 ms`. This is `0.877x` of Entry 045 throughput and `0.373x` of the
+  tracked vLLM async baseline.
+
+Profile counters:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `forward_step_token_ids_jit` | `127.59 ms / 32` | decode step slower than Entry 045 timing envelope |
+| `PjRtCApiLoadedExecutable::Execute` | `141.75 ms / 252` | execute count/cost rose with the standalone custom call route |
+| `command_buffer::execute` | `54.43 ms / 1298` | command-buffer execute work rose materially |
+| `command_buffer::update` | `18.49 ms / 402` | many more command-buffer updates |
+| `gather` | `12.67 ms / 135` | not enough movement to offset overhead |
+| `transpose` | `35.06 ms / 504` | transpose cost rose |
+| `MemcpyD2D` | `25.66 ms / 1231` | D2D work increased |
+| `array.py:325 tolist` | `509.64 ms / 32` | host sync attribution still dominates wall timing |
+| `np.asarray(jax.Array)` | `509.38 ms / 32` | same host sync attribution |
+
+Decision:
+
+- Reject standalone FP32 CUDA GDN decode routing as a serving optimization. It
+  passes focused parity and exact generated-token parity, but fails the
+  integrated performance gate.
+- Keep `NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE=1` default-off as a diagnostic route
+  only.
+- Do not promote this to `gpu_paged_default` or `gpu_paged_fast_optin`.
+- The next GDN attempt should use a coarser fused boundary, most likely the
+  chunk-32 segmented prefill surface, or fuse more of decode than only the
+  recurrent state step.
