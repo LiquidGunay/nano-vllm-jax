@@ -1869,3 +1869,45 @@ Decision:
 - Reject and revert prepacked full-attention K/V projection. The targeted compact CUTLASS bucket moved strongly in the intended direction, but the integrated serving path regressed in device execution, module time, command-buffer updates, gather/transpose work, and host synchronization.
 - Do not add persistent packed full-attention K/V leaves in this form. Like the prepacked MLP gate/up experiment, duplicating large projection leaves changes the compiled plan enough to erase the local GEMM win.
 - Next work should follow Fermat's ranking: first try ragged GDN prefill that keeps chunk 32 and removes padded work, or start a backend-owned paged-attention/KV kernel path. Avoid more loader-level packed-weight experiments unless a microbenchmark proves the mixed-dtype lowering improves the exact BF16-weight/FP32-activation contract without command-buffer or host-sync regressions.
+
+## Entry 053 - Rejected Static Row-Chunk Ragged GDN Prefill
+
+- run id: `20260526-034521-2112444-jax_hetero8_64_512x32_static_ragged_gdn_prefill`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_static_ragged_gdn_prefill.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-034521-2112444-jax_hetero8_64_512x32_static_ragged_gdn_prefill`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-034521-2112444-jax_hetero8_64_512x32_static_ragged_gdn_prefill/plugins/profile/2026_05_26_03_46_07/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-034521-2112444-jax_hetero8_64_512x32_static_ragged_gdn_prefill/plugins/profile/2026_05_26_03_46_07/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Raman confirmed the next reasonable target was segmented/ragged chunk-32 GDN prefill, but warned that a source-level row-chunk scan would trade `16` vectorized time-chunk steps for about `72` active row-chunk steps on the hetero8 workload. The required gate was a lower `input_reduce_fusion` and first prefill step without increasing `PjRt Execute`, GPU module time, or command-buffer work.
+- change tested: a temporary `NANO_VLLM_JAX_STATIC_RAGGED_GDN_PREFILL=1` path propagated static host query lengths into the JIT key and added a row-chunk scan that skipped padded GDN chunks while preserving one compiled model call. The path used `dynamic_slice`/`dynamic_update_slice` to process valid `[row, chunk]` descriptors one at a time, then the source change was reverted after profiling.
+- focused CUDA checks: with `NANO_VLLM_JAX_STATIC_RAGGED_GDN_PREFILL=1` and accepted compact-prefill flags enabled, `tests/test_kv_cache.py::test_static_ragged_gdn_prefill_matches_padded_chunked`, `tests/test_kv_cache.py::test_linear_attention_chunked_vs_recurrent`, `tests/test_kv_cache.py::test_linear_attention_multichunk_matches_recurrent`, `tests/test_backend_boundaries.py::test_bucketed_prefill_last_logits_match_exact_prefill`, `tests/test_backend_boundaries.py::test_bucketed_linear_prefill_preserves_hybrid_state_for_decode`, `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute`, and `tests/test_lm_head_helpers.py` passed under `JAX_PLATFORMS=cuda` (`10 passed`). `tests/test_backend_boundaries.py::test_linear_suffix_prefill_matches_sequential_decode_state` also passed separately.
+- correctness: exact generated-token match for all 8 rows against the Entry 045 chunk-32 reference.
+- JAX timing: `131.33 tok/s`, TTFT p50 `1431.02 ms`, ITL p50 `16.78 ms`, ITL p95 `17.98 ms`.
+- delta vs Entry 045 chunk-32 default repeat: `0.357x` total tok/s, TTFT p50 `4.935x`, ITL p50 `1.277x`, ITL p95 `1.323x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 045 ms | static row-chunk GDN ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 696.03 | 1949.22 | overall much slower |
+| `_run_main_and_sample` | 572.99 | 1806.58 | runner hot path much slower |
+| `forward_step_token_ids_jit` | 122.13 | 1507.56 | compiled token-id path much slower |
+| first `forward_step_token_ids_jit` | 30.83 | 1374.45 | first prefill exploded |
+| `PjRtCApiLoadedExecutable::Execute` | 138.32 over 252 calls | 1525.34 over 252 calls | same dispatch count, far heavier device execution |
+| `jit_compiled:XLA GPU module` | 94.20 | 1459.76 | module time exploded |
+| `command_buffer::execute` | 40.34 over 1143 calls | 101.12 over 2871 calls | many more command-buffer executions |
+| `command_buffer::update` | 27.13 over 248 calls | 37.19 over 248 calls | updates heavier |
+| `input_reduce_fusion` | 28.65 over 1936 calls | 265.47 over 82615 calls | intended GDN bucket regressed badly |
+| `loop_dynamic_update_slice_fusion` | 2.24 over 589 calls | 263.69 over 82615 calls | row-chunk writes dominate |
+| `loop_multiply_fusion` | n/a | 494.93 over 82584 calls | row-chunk scan generated tiny repeated kernels |
+| `gather` | 11.97 | 12.71 | slightly worse |
+| `transpose` | 63.11 | 44.41 | lower, but irrelevant next to GDN regression |
+| `wrapped_concatenate` | 36.50 over 576 calls | 36.54 over 576 calls | unchanged |
+| `MemcpyD2D` | 24.69 over 1231 calls | 27.43 over 2510 calls | more copies |
+| `array.py:325 tolist` | 437.58 | 282.82 | host sync lower only because device critical path moved elsewhere |
+| `np.asarray(jax.Array)` | 437.35 | 282.49 | host sync lower only because device critical path moved elsewhere |
+
+Decision:
+
+- Reject and revert static row-chunk ragged GDN prefill. It preserved correctness and one model dispatch, but converted a vectorized chunked GDN into many tiny dynamic-slice/update kernels and made the first prefill step unusable.
+- Do not revisit source-level per-row/per-chunk scans for GDN prefill. Skipping padded GDN work is still conceptually valid, but it needs a backend-owned/lowered kernel that keeps row chunks inside coarse GPU work rather than expressing them as thousands of JAX dynamic updates.
+- Next model-side work should move to a backend-owned paged-attention/KV kernel path or a lower-level GDN prefill kernel design. Pure-JAX static ragged scans should be treated as rejected along with earlier multi-dispatch and single-JIT compact-prefill attempts.
