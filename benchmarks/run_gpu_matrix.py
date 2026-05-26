@@ -157,6 +157,8 @@ def _runtime_env(config_env: dict[str, str]) -> dict[str, str]:
         "HF_HUB_CACHE": str(root / ".cache" / "huggingface" / "hub"),
         "JAX_COMPILATION_CACHE_DIR": str(root / ".cache" / "jax"),
         "NANO_VLLM_JAX_COMPILE_CACHE_DIR": str(root / ".cache" / "jax"),
+        "FLASHINFER_WORKSPACE_BASE": str(root),
+        "FLASHINFER_CUBIN_DIR": str(root / ".cache" / "flashinfer" / "cubins"),
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
         "TF_GPU_ALLOCATOR": "cuda_malloc_async",
         "XLA_FLAGS": "--xla_gpu_autotune_level=4",
@@ -175,6 +177,8 @@ def _runtime_env(config_env: dict[str, str]) -> dict[str, str]:
         "HF_HUB_CACHE",
         "JAX_COMPILATION_CACHE_DIR",
         "NANO_VLLM_JAX_COMPILE_CACHE_DIR",
+        "FLASHINFER_WORKSPACE_BASE",
+        "FLASHINFER_CUBIN_DIR",
     ):
         Path(env[key]).mkdir(parents=True, exist_ok=True)
     return env

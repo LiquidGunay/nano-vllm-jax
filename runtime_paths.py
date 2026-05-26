@@ -31,6 +31,18 @@ def configure_compilation_cache() -> str:
     return str(cache_dir)
 
 
+def configure_flashinfer_cache() -> str:
+    """Set FlashInfer JIT/cache roots under the runtime root."""
+
+    root = default_runtime_root()
+    os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", str(root))
+    cubin_dir = root / ".cache" / "flashinfer" / "cubins"
+    os.environ.setdefault("FLASHINFER_CUBIN_DIR", str(cubin_dir))
+    Path(os.environ["FLASHINFER_WORKSPACE_BASE"]).mkdir(parents=True, exist_ok=True)
+    Path(os.environ["FLASHINFER_CUBIN_DIR"]).mkdir(parents=True, exist_ok=True)
+    return os.environ["FLASHINFER_WORKSPACE_BASE"]
+
+
 def configure_xla_flags(default_gpu_autotune_level: int = 4) -> str:
     """Set GPU-oriented XLA defaults while preserving explicit user flags."""
     if "XLA_FLAGS" not in os.environ:

@@ -36,6 +36,8 @@ def configure_vllm_paths() -> dict[str, str]:
         "VLLM_CACHE_ROOT": str(root / ".cache" / "vllm"),
         "VLLM_XLA_CACHE_PATH": str(root / ".cache" / "vllm" / "xla_cache"),
         "VLLM_RPC_BASE_PATH": str(root / "tmp" / "vllm-rpc"),
+        "FLASHINFER_WORKSPACE_BASE": str(root),
+        "FLASHINFER_CUBIN_DIR": str(root / ".cache" / "flashinfer" / "cubins"),
         "VLLM_DO_NOT_TRACK": "1",
     }
     for key, value in values.items():
