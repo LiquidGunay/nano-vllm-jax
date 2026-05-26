@@ -1911,3 +1911,46 @@ Decision:
 - Reject and revert static row-chunk ragged GDN prefill. It preserved correctness and one model dispatch, but converted a vectorized chunked GDN into many tiny dynamic-slice/update kernels and made the first prefill step unusable.
 - Do not revisit source-level per-row/per-chunk scans for GDN prefill. Skipping padded GDN work is still conceptually valid, but it needs a backend-owned/lowered kernel that keeps row chunks inside coarse GPU work rather than expressing them as thousands of JAX dynamic updates.
 - Next model-side work should move to a backend-owned paged-attention/KV kernel path or a lower-level GDN prefill kernel design. Pure-JAX static ragged scans should be treated as rejected along with earlier multi-dispatch and single-JIT compact-prefill attempts.
+
+## Entry 054 - Rejected Head-Major KV Cache with Pallas Decode Attention
+
+- run id: `20260526-035950-2127348-jax_hetero8_64_512x32_head_major_kv_pallas_decode`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_head_major_kv_pallas_decode.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-035950-2127348-jax_hetero8_64_512x32_head_major_kv_pallas_decode`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-035950-2127348-jax_hetero8_64_512x32_head_major_kv_pallas_decode/plugins/profile/2026_05_26_04_00_25/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-035950-2127348-jax_hetero8_64_512x32_head_major_kv_pallas_decode/plugins/profile/2026_05_26_04_00_25/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Locke reviewed Entries 045-053 and recommended a backend-owned segmented GDN prefill kernel as the better next bet. It warned not to continue the head-major KV/Pallas decode family unless a clean profile win already existed, because Entry 036 showed a Pallas decode kernel can lose to layout and compiled-plan costs.
+- change tested: a temporary `NANO_VLLM_JAX_GPU_HEAD_MAJOR_KV_CACHE=1` path allocated GPU KV as `[layers, kv_heads, pages, page_size, head_dim]` so `jax.experimental.pallas.ops.gpu.paged_attention` could consume the decode cache without a per-layer transpose. `NANO_VLLM_JAX_PALLAS_HEAD_MAJOR_DECODE=1` routed width-1 full-attention decode to the Pallas kernel; prefill and multi-token decode kept the pure-JAX fallback. The source change was reverted after profiling.
+- feasibility checks: a CUDA smoke test showed head-major KV storage matched the standard block layout exactly in the pure-JAX decode path (`max_abs=0.0`). The Pallas decode output matched the standard reference within BF16 tolerance (`max_abs=0.0079`, MSE `1.41e-6`) with `pages_per_compute_block=2`, `k_splits=4` on a small shape. The first full warmup with `pages_per_compute_block=2`, `k_splits=8` failed because Pallas required `pages_per_partition=5` to be divisible by `pages_per_compute_block`; the profiled run used `pages_per_compute_block=1`, `k_splits=8`.
+- focused CUDA checks: with head-major KV and Pallas decode flags enabled, `tests/test_kv_cache.py::test_paged_attention_non_identity_blocks`, `tests/test_kv_cache.py::test_paged_attention_grouped_gqa_matches_repeat_reference`, `tests/test_kv_cache.py::test_masked_update_kv_cache_preserves_invalid_and_duplicate_slots`, `tests/test_backend_boundaries.py::test_executor_jit_matches_eager_cached_decode`, `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute`, and `tests/test_lm_head_helpers.py` passed under `JAX_PLATFORMS=cuda` (`8 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 045 chunk-32 reference.
+- JAX timing: `245.23 tok/s`, TTFT p50 `524.85 ms`, ITL p50 `16.66 ms`, ITL p95 `18.40 ms`.
+- delta vs Entry 045 chunk-32 default repeat: `0.667x` total tok/s, TTFT p50 `1.810x`, ITL p50 `1.267x`, ITL p95 `1.353x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 045 ms | head-major KV + Pallas decode ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 696.03 | 1043.91 | overall much slower |
+| `_run_main_and_sample` | 572.99 | 897.15 | runner hot path much slower |
+| `forward_step_token_ids_jit` | 122.13 | 155.45 | compiled token-id path slower |
+| first `forward_step_token_ids_jit` | 30.83 | 31.94 | first prefill slightly slower |
+| `PjRtCApiLoadedExecutable::Execute` | 138.32 over 252 calls | 171.55 over 252 calls | same dispatch count, heavier device execution |
+| `jit_compiled:XLA GPU module` | 94.20 | 111.85 | module time regressed |
+| `command_buffer::execute` | 40.34 over 1143 calls | 44.65 over 1112 calls | fewer ranges but more time |
+| `command_buffer::update` | 27.13 over 248 calls | 37.50 over 217 calls | fewer ranges but much more time |
+| `paged_attention` | 0.00 | 9.47 over 186 calls | new Pallas decode kernel work |
+| `gemm_fusion_dot_general_746` | 13.92 | 41.04 | important GEMM bucket regressed |
+| `input_reduce_fusion` | 28.65 over 1936 calls | 28.64 over 1936 calls | unchanged |
+| `gather` | 11.97 | 12.88 | worse |
+| `transpose` | 63.11 | 56.46 | lower, but not enough to offset other regressions |
+| `wrapped_concatenate` | 36.50 over 576 calls | 36.47 over 576 calls | unchanged |
+| `MemcpyD2D` | 24.69 over 1231 calls | 26.92 over 1232 calls | worse |
+| `array.py:325 tolist` | 437.58 | 725.82 | host sync attribution much worse |
+| `np.asarray(jax.Array)` | 437.35 | 725.33 | host sync attribution much worse |
+
+Decision:
+
+- Reject and revert head-major KV cache plus Pallas decode attention. Removing the explicit per-layer Pallas layout transpose was not enough; the new physical cache layout and Pallas decode path still made compiled execution, command-buffer updates, GEMM lowering, and host synchronization worse.
+- Do not continue the Pallas paged decode family on this source layout. A future attention kernel must own both cache writes and decode attention in a coarser backend path, and should be gated by a microbenchmark that includes update/write cost, not only standalone attention.
+- Follow Locke's recommendation next: if staying with model-side GDN, the next viable version is a backend-owned segmented GDN prefill kernel at chunk size 32, not another source-level scan. Otherwise move to a fuller backend-owned attention/KV kernel rather than adapting the shipped Pallas op through layout plumbing.
