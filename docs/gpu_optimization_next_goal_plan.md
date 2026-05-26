@@ -344,6 +344,11 @@ end-to-end throughput.
   replace the required human logbook explanation, but it makes profile movement
   concrete in the benchmark artifact instead of leaving it to ad hoc manual
   inspection.
+- `benchmarks/summarize_gpu_matrix.py` renders a concise Markdown report from a
+  matrix summary, including final-target status, acceptance failures, JAX/vLLM
+  and JAX/reference throughput rows, and the largest profile-bucket deltas
+  versus the selected JAX reference. Use it after real GPU matrix runs to seed
+  the required logbook explanation without hand-reading the raw JSON.
 
 ## Phase 2 - Kernel Roadmap
 
