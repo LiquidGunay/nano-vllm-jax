@@ -158,6 +158,10 @@ gdn_recurrent_decode_step(
   route, speed claim, or planned production route. The next GDN implementation
   should be vLLM/FLA-shaped and should borrow their kernel structure rather than
   promoting this local probe.
+- backend-selection status: the registry recognizes `gdn_fla` plus
+  `fla_gdn`, `vllm_fla`, and `flash_linear_attention` aliases. They are
+  intentionally unimplemented and fall back to pure JAX until a vLLM/FLA-shaped
+  GDN path passes the correctness and benchmark gates.
 - V,K migration status: the pure-JAX fallback now consumes and returns V,K GDN
   state directly, and the local recurrent/packed CUDA decode probes now accept
   V,K without Python-side K,V transposes. Focused CUDA tests, CUDA FFI tests, MTP

@@ -93,7 +93,18 @@ _SPECS: dict[str, KernelBackendSpec] = {
             "gdn_segmented_prefill_chunk32",
         ),
         implemented=False,
-        description="Future CUDA/ported Gated DeltaNet kernels.",
+        description="Local CUDA Gated DeltaNet probes kept for diagnostics.",
+    ),
+    "gdn_fla": KernelBackendSpec(
+        name="gdn_fla",
+        aliases=("gdn_fla", "fla_gdn", "vllm_fla", "flash_linear_attention"),
+        required_modules=("triton",),
+        provided_kernels=(
+            "gdn_recurrent_decode_step",
+            "gdn_segmented_prefill_chunk32",
+        ),
+        implemented=False,
+        description="Future vLLM/Flash Linear Attention-style Gated DeltaNet kernels.",
     ),
 }
 
@@ -177,7 +188,7 @@ def select_kernel_backend(name: str | None = None, *, strict: bool = False) -> K
 
     normalized = _normalize(name)
     if normalized == "auto":
-        for candidate in ("cuda_fp32", "flashinfer", "gdn_cuda"):
+        for candidate in ("cuda_fp32", "flashinfer", "gdn_fla", "gdn_cuda"):
             status = _status_for_spec("auto", _SPECS[candidate])
             if status.external_kernels_enabled:
                 return status

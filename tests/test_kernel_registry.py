@@ -44,9 +44,12 @@ def test_kernel_registry_records_planned_external_backends():
     assert "kv_append_paged_nhd" in statuses["cuda_fp32"].provided_kernels
     assert "paged_decode_attention_gqa_nhd" in statuses["cuda_fp32"].provided_kernels
     assert "gdn_recurrent_decode_step" in statuses["gdn_cuda"].provided_kernels
+    assert "gdn_recurrent_decode_step" in statuses["gdn_fla"].provided_kernels
+    assert "gdn_segmented_prefill_chunk32" in statuses["gdn_fla"].provided_kernels
     assert not statuses["flashinfer"].external_kernels_enabled
     assert not statuses["cuda_fp32"].external_kernels_enabled
     assert not statuses["gdn_cuda"].external_kernels_enabled
+    assert not statuses["gdn_fla"].external_kernels_enabled
 
 
 def test_explicit_unaccepted_kernel_backend_fails_strict():
@@ -58,6 +61,18 @@ def test_explicit_unaccepted_kernel_backend_fails_strict():
 
     with pytest.raises(KernelBackendUnavailable):
         select_kernel_backend("gdn_cuda", strict=True)
+
+    with pytest.raises(KernelBackendUnavailable):
+        select_kernel_backend("gdn_fla", strict=True)
+
+
+def test_kernel_registry_recognizes_fla_aliases():
+    for alias in ("gdn_fla", "fla_gdn", "vllm_fla", "flash_linear_attention"):
+        status = select_kernel_backend(alias)
+        assert status.requested == "gdn_fla"
+        assert status.selected == "pure_jax"
+        assert "gdn_recurrent_decode_step" in status.provided_kernels
+        assert not status.external_kernels_enabled
 
 
 def test_gpu_runtime_backend_keeps_auto_kernel_backend_on_pure_jax(monkeypatch):
@@ -73,6 +88,14 @@ def test_gpu_runtime_backend_keeps_auto_kernel_backend_on_pure_jax(monkeypatch):
 
 def test_gpu_runtime_backend_rejects_explicit_unaccepted_external_backend(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_KERNEL_BACKEND", "flashinfer")
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+
+    with pytest.raises(KernelBackendUnavailable):
+        select_backend("gpu")
+
+
+def test_gpu_runtime_backend_rejects_explicit_unaccepted_gdn_fla(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_KERNEL_BACKEND", "gdn_fla")
     monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
 
     with pytest.raises(KernelBackendUnavailable):

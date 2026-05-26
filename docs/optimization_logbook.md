@@ -4135,3 +4135,21 @@ JAX_PLATFORMS=cuda ... pytest -q \
   exact-token goal gate. The large gap is primarily TTFT/serving-batch behavior
   on the vLLM-style random prompt lane, so future kernel work should continue to
   report this lane separately from the frozen long-prefill correctness gate.
+
+### Entry 104 - GDN FLA Backend Registry Scaffolding
+
+- change accepted: added `gdn_fla` plus `fla_gdn`, `vllm_fla`, and
+  `flash_linear_attention` aliases to the optional kernel backend registry.
+  These names advertise the planned vLLM/Flash Linear Attention-shaped GDN
+  production route while still falling back to pure JAX until an implementation
+  passes acceptance gates.
+- validation:
+
+```text
+.venv/bin/python -m pytest -q tests/test_kernel_registry.py
+```
+
+- result: `8 passed`.
+- decision: keep `gdn_fla` unimplemented and default-off. The local CUDA GDN
+  probes remain diagnostics; this registry change only prevents the plan's
+  intended backend name from being an unknown request.

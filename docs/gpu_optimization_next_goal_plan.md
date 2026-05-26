@@ -909,6 +909,11 @@ previous Pallas regressions, it should not be the first production path for GDN.
   same-head and GVA q/k repetition cases. It is an ABI/toolchain step only; it
   is not routed into serving, is not the planned production route, and makes no
   speed claim.
+- The optional backend registry now recognizes `gdn_fla` and aliases
+  `fla_gdn`, `vllm_fla`, and `flash_linear_attention`. These requests resolve
+  to the pure-JAX fallback until a vLLM/FLA-shaped kernel path is implemented
+  and accepted. This keeps the planned production route explicit while leaving
+  local CUDA GDN probes as diagnostics.
 
 ### Acceptance Gate
 
@@ -1399,6 +1404,9 @@ Commit 8:
   `benchmark_long_decode_top5.py`~~
 - ~~Fix the standalone GDN prefill benchmark/probes to generate and reconstruct
   native V,K state, including non-square K/V smoke coverage.~~
+- ~~Add `gdn_fla`/vLLM-FLA aliases to the optional backend registry so the
+  planned GDN production route is explicit and still falls back to pure JAX
+  until accepted.~~ Validation: `tests/test_kernel_registry.py` `8 passed`.
 - Compare a revised segmented prefill candidate against Entry 045 chunk-32
   baseline after it beats the full-shape GDN microbenchmark gate
 
