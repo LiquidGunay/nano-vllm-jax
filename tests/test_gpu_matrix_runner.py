@@ -17,6 +17,7 @@ from benchmarks.run_gpu_matrix import (
     _acceptance_failures,
     _aggregate_repeats,
     _benchmark_acceptance_summary,
+    _comparison_summary,
     _configured_workload_reference,
     _cuda_device_preflight,
     _goal_target_failure,
@@ -430,6 +431,43 @@ def test_benchmark_acceptance_summary_requires_plan_evidence():
     assert acceptance["speed_claim_ready"]
     assert acceptance["target_vllm_ratio_met"]
     assert acceptance["missing_profile_counters"] == []
+
+
+def test_comparison_summary_reports_gap_to_target():
+    comparison = _comparison_summary(
+        {
+            "tokens_per_second_median": 78.0,
+            "ttft_ms_p50_median": 580.0,
+            "itl_ms_p50_median": 15.0,
+        },
+        {
+            "performance": {
+                "tokens_per_second": 116.0,
+                "ttft_ms_p50": 440.0,
+                "itl_ms_p50": 5.0,
+            }
+        },
+        "stored",
+    )
+
+    assert comparison["jax_over_vllm_throughput"] == pytest.approx(78.0 / 116.0)
+    assert comparison["target_tokens_per_second"] == pytest.approx(87.0)
+    assert comparison["tokens_per_second_gap_to_target"] == pytest.approx(9.0)
+    assert comparison["required_jax_speedup_to_target"] == pytest.approx(87.0 / 78.0)
+    assert comparison["ttft_ms_p50_delta_vs_vllm"] == 140.0
+    assert comparison["itl_ms_p50_delta_vs_vllm"] == 10.0
+
+
+def test_comparison_summary_clamps_negative_gap_after_target_met():
+    comparison = _comparison_summary(
+        {"tokens_per_second_median": 100.0},
+        {"performance": {"tokens_per_second": 116.0}},
+        "stored",
+    )
+
+    assert comparison["target_tokens_per_second"] == pytest.approx(87.0)
+    assert comparison["tokens_per_second_gap_to_target"] == 0.0
+    assert comparison["required_jax_speedup_to_target"] == 1.0
 
 
 def test_benchmark_acceptance_summary_rejects_incomplete_evidence():

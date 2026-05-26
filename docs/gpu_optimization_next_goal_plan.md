@@ -273,6 +273,11 @@ end-to-end throughput.
   exits nonzero unless that specific long heterogeneous non-speculative target
   is present, correctness-gated, profile-covered, and at/above the target
   throughput ratio.
+- Comparison rows now include the concrete throughput target and remaining gap:
+  `target_tokens_per_second`, `tokens_per_second_gap_to_target`, and
+  `required_jax_speedup_to_target`. On the stored one-repeat long-prefill slice,
+  the target is about `87.28 tok/s`, leaving the default path about
+  `9.26 tok/s` short before repeat/profile/correctness gates are considered.
 - `--require-stored-references` can be used before benchmark launch to fail
   fast when selected workloads/configs lack stored JAX or vLLM references.
 - Focused tests also verify that all GPU matrix configs have valid stored JAX

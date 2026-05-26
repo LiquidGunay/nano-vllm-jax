@@ -690,10 +690,25 @@ def _comparison_summary(
     vllm_tps = vllm_performance.get("tokens_per_second")
     vllm_ttft = vllm_performance.get("ttft_ms_p50")
     vllm_itl = vllm_performance.get("itl_ms_p50")
+    target_tps = (float(vllm_tps) * TARGET_VLLM_RATIO) if vllm_tps else None
+    gap_tps = (
+        max(0.0, float(target_tps) - float(jax_tps))
+        if target_tps is not None and jax_tps is not None
+        else None
+    )
+    required_speedup = (
+        max(1.0, float(target_tps) / float(jax_tps))
+        if target_tps is not None and jax_tps
+        else None
+    )
     return {
         "jax_tokens_per_second_median": jax_tps,
         "vllm_tokens_per_second": vllm_tps,
         "jax_over_vllm_throughput": (jax_tps / vllm_tps) if jax_tps and vllm_tps else None,
+        "target_vllm_ratio": TARGET_VLLM_RATIO,
+        "target_tokens_per_second": target_tps,
+        "tokens_per_second_gap_to_target": gap_tps,
+        "required_jax_speedup_to_target": required_speedup,
         "ttft_ms_p50_delta_vs_vllm": (jax_ttft - vllm_ttft) if jax_ttft is not None and vllm_ttft is not None else None,
         "itl_ms_p50_delta_vs_vllm": (jax_itl - vllm_itl) if jax_itl is not None and vllm_itl is not None else None,
         "vllm_reference_source": vllm_source,

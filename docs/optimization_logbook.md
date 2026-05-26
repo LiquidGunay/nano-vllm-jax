@@ -3313,3 +3313,40 @@ Decision:
 - Keep this gate. It prevents a passing matrix on a different workload/config
   from being mistaken for evidence that the thread's final long-heterogeneous
   target has been met.
+
+## Entry 086 - Matrix Target Gap Fields
+
+- change accepted: `benchmarks/run_gpu_matrix.py` now includes target-gap fields
+  in every JAX/vLLM comparison:
+  `target_tokens_per_second`, `tokens_per_second_gap_to_target`, and
+  `required_jax_speedup_to_target`.
+- motivation: the final target gate says pass/fail, but the next optimization
+  turn needs the remaining speed gap in the summary itself. For the stored
+  one-repeat long-prefill slice, vLLM was `116.37 tok/s`, so the `0.75x` target
+  is about `87.28 tok/s`; the default JAX row at `78.02 tok/s` is about
+  `9.26 tok/s` short before repeat/profile/correctness gates are considered.
+- focused tests:
+
+```text
+.venv/bin/python -m pytest tests/test_gpu_matrix_runner.py -q
+```
+
+- result: `25 passed`.
+- dry-run verification:
+
+```text
+.venv/bin/python benchmarks/run_gpu_matrix.py \
+  --configs gpu_paged_default --workloads long_prefill_512_2048 \
+  --repeats 2 --dry-run --no-live-vllm \
+  --output-json /mountpoint/.exp/tmp/gpu_matrix_target_gap_dry_run.json
+```
+
+- result: the dry-run summary includes `target_tokens_per_second=87.279...`
+  from the stored vLLM reference. JAX gap fields remain `null` in dry-run mode
+  because there are no real JAX performance rows, which is the intended
+  behavior.
+
+Decision:
+
+- Keep these fields as reporting-only evidence. They do not relax exact-token,
+  repeat, latency, profile, or final target gates.
