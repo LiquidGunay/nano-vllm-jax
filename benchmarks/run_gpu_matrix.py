@@ -121,6 +121,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-live-vllm", dest="live_vllm", action="store_false", default=True)
     parser.add_argument(
+        "--require-speed-claim-ready",
+        action="store_true",
+        help=(
+            "After writing the summary, exit nonzero unless every selected "
+            "workload/config is speed-claim-ready and meets the target vLLM ratio."
+        ),
+    )
+    parser.add_argument(
         "--skip-gpu-preflight",
         action="store_true",
         help="Skip the CUDA device availability check before launching real benchmark subprocesses.",
@@ -690,6 +698,31 @@ def _benchmark_acceptance_summary(
     }
 
 
+def _acceptance_failures(summary: dict[str, Any]) -> list[str]:
+    failures: list[str] = []
+    for workload_name in summary.get("workloads") or []:
+        workload_acceptance = (summary.get("acceptance") or {}).get(workload_name) or {}
+        for config_name in summary.get("configs") or []:
+            acceptance = workload_acceptance.get(config_name) or {}
+            checks = acceptance.get("checks") or {}
+            failed_checks = sorted(key for key, value in checks.items() if not value)
+            parts: list[str] = []
+            if failed_checks:
+                parts.append("failed checks: " + ",".join(failed_checks))
+            if not acceptance.get("speed_claim_ready"):
+                parts.append("speed_claim_ready=false")
+            if not acceptance.get("target_vllm_ratio_met"):
+                parts.append(
+                    f"target_vllm_ratio_met=false target={acceptance.get('target_vllm_ratio')}"
+                )
+            missing_profile_counters = acceptance.get("missing_profile_counters") or []
+            if missing_profile_counters:
+                parts.append(f"missing_profile_counters={len(missing_profile_counters)}")
+            if parts:
+                failures.append(f"{workload_name}/{config_name}: " + "; ".join(parts))
+    return failures
+
+
 def main() -> None:
     args = parse_args()
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
@@ -838,6 +871,10 @@ def main() -> None:
     _validate_summary_shape(summary, _load_json(CONFIG_DIR / "gpu_matrix_summary_schema.json"))
     output_json.write_text(json.dumps(_json_safe(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(output_json)
+    if args.require_speed_claim_ready:
+        failures = _acceptance_failures(summary)
+        if failures:
+            raise SystemExit("GPU matrix acceptance failed:\n- " + "\n- ".join(failures))
 
 
 if __name__ == "__main__":

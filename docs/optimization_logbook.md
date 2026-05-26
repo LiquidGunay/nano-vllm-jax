@@ -3183,6 +3183,10 @@ Decision:
 - writer validation: the runner validates required top-level, matrix/repeat,
   aggregate, and acceptance keys before writing a matrix summary. This is a
   lightweight in-repo shape check and does not add a `jsonschema` dependency.
+- enforcement flag: `--require-speed-claim-ready` writes the matrix summary and
+  then exits nonzero if any selected workload/config is not speed-claim-ready or
+  misses the `0.75x` vLLM target. This gives the final benchmark command a
+  machine-checkable pass/fail condition.
 - config-reference guard: focused tests now verify that every GPU matrix config
   has valid stored JAX and vLLM references for `hetero8` and
   `long_prefill_512_2048`.
@@ -3195,7 +3199,7 @@ Decision:
 .venv/bin/python -m pytest tests/test_gpu_matrix_runner.py -q
 ```
 
-- result: `16 passed`.
+- result: `18 passed`.
 - dry-run verification:
 
 ```text
@@ -3212,6 +3216,9 @@ Decision:
   metrics exist. The summary explicitly lists all missing profile buckets for
   each dry-run repeat, reports missing latency and first-forward evidence, and
   the writer accepted the validated summary shape.
+- enforcement verification: the same dry-run with
+  `--require-speed-claim-ready` wrote its summary and exited nonzero with the
+  missing checks for `long_prefill_512_2048/gpu_paged_default`.
 
 Decision:
 

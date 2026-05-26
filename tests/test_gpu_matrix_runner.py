@@ -14,6 +14,7 @@ from benchmarks.run_gpu_matrix import (
     PROFILE_NEEDLES,
     REPO_ROOT,
     WORKLOADS,
+    _acceptance_failures,
     _aggregate_repeats,
     _benchmark_acceptance_summary,
     _configured_workload_reference,
@@ -454,3 +455,58 @@ def test_benchmark_acceptance_summary_requires_all_profile_counters():
         f"repeat1:{PROFILE_NEEDLES[-1]}",
         f"repeat2:{PROFILE_NEEDLES[-1]}",
     ]
+
+
+def test_acceptance_failures_reports_missing_evidence_and_target():
+    summary = {
+        "workloads": ["long_prefill_512_2048"],
+        "configs": ["gpu_paged_fast_optin"],
+        "acceptance": {
+            "long_prefill_512_2048": {
+                "gpu_paged_fast_optin": {
+                    "checks": {
+                        "minimum_repeats": True,
+                        "correctness_checked": False,
+                        "exact_generated_token_match": False,
+                    },
+                    "speed_claim_ready": False,
+                    "target_vllm_ratio": 0.75,
+                    "target_vllm_ratio_met": False,
+                    "missing_profile_counters": ["repeat1:gather"],
+                }
+            }
+        },
+    }
+
+    failures = _acceptance_failures(summary)
+
+    assert failures == [
+        "long_prefill_512_2048/gpu_paged_fast_optin: "
+        "failed checks: correctness_checked,exact_generated_token_match; "
+        "speed_claim_ready=false; target_vllm_ratio_met=false target=0.75; "
+        "missing_profile_counters=1"
+    ]
+
+
+def test_acceptance_failures_empty_when_ready_and_target_met():
+    summary = {
+        "workloads": ["long_prefill_512_2048"],
+        "configs": ["gpu_paged_fast_optin"],
+        "acceptance": {
+            "long_prefill_512_2048": {
+                "gpu_paged_fast_optin": {
+                    "checks": {
+                        "minimum_repeats": True,
+                        "correctness_checked": True,
+                        "exact_generated_token_match": True,
+                    },
+                    "speed_claim_ready": True,
+                    "target_vllm_ratio": 0.75,
+                    "target_vllm_ratio_met": True,
+                    "missing_profile_counters": [],
+                }
+            }
+        },
+    }
+
+    assert _acceptance_failures(summary) == []
