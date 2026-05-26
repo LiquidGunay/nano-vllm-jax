@@ -331,6 +331,12 @@ end-to-end throughput.
   defaults for matrix runs: workload overrides, `--reference-json`, warmup,
   profile, `JAX_PLATFORMS=cuda`, and cache/temp roots under the configured
   `/mountpoint` runtime root.
+- The matrix runner now selects the JAX subprocess interpreter explicitly with
+  `--jax-python` or `NANO_VLLM_JAX_PYTHON`, records it in the summary, and
+  checks package visibility with `importlib.util.find_spec("jax")` before real
+  runs. This avoids accidentally launching live GPU benchmarks with the base
+  shell Python when that interpreter has no JAX installed; the preflight does
+  not import JAX or select a CPU backend.
 
 ## Phase 2 - Kernel Roadmap
 

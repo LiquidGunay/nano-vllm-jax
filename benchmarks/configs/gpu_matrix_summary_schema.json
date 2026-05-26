@@ -12,6 +12,7 @@
     "workloads",
     "required_metrics",
     "goal_target",
+    "jax_python",
     "jax_default_references",
     "matrix",
     "vllm_references",
@@ -70,6 +71,21 @@
         "target_vllm_ratio",
         "description"
       ]
+    },
+    "jax_python": {
+      "type": "object",
+      "required": [
+        "path",
+        "available"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "available": {
+          "type": "boolean"
+        }
+      }
     },
     "jax_default_references": {
       "type": "object"

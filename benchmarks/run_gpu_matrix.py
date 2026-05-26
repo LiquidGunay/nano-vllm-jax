@@ -25,6 +25,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = REPO_ROOT / "benchmarks" / "configs"
 RESULTS_DIR = REPO_ROOT / "results"
 DEFAULT_CONFIGS = ("gpu_paged_default", "gpu_paged_fast_optin", "gpu_mtp_diagnostics")
+DEFAULT_JAX_PYTHON = Path(
+    os.environ.get(
+        "NANO_VLLM_JAX_PYTHON",
+        "/mountpoint/.exp/.venv/bin/python"
+        if Path("/mountpoint/.exp/.venv/bin/python").exists()
+        else sys.executable,
+    )
+)
 DEFAULT_VLLM_PYTHON = Path("/mountpoint/.exp/vllm-venv/bin/python")
 MIN_ACCEPTANCE_REPEATS = 2
 TARGET_VLLM_RATIO = 0.75
@@ -168,6 +176,15 @@ def parse_args() -> argparse.Namespace:
         "--vllm-python",
         default=str(DEFAULT_VLLM_PYTHON if DEFAULT_VLLM_PYTHON.exists() else Path(sys.executable)),
     )
+    parser.add_argument(
+        "--jax-python",
+        default=str(DEFAULT_JAX_PYTHON),
+        help=(
+            "Python interpreter for JAX benchmark subprocesses. Defaults to "
+            "NANO_VLLM_JAX_PYTHON, then /mountpoint/.exp/.venv/bin/python if present, "
+            "then the current interpreter."
+        ),
+    )
     parser.add_argument("--continue-on-error", action="store_true")
     return parser.parse_args()
 
@@ -227,6 +244,10 @@ def _validate_summary_shape(summary: dict[str, Any], schema: dict[str, Any]) -> 
     )
     if not isinstance(summary.get("jax_default_references"), dict):
         raise ValueError("summary.jax_default_references must be an object")
+    jax_python = summary.get("jax_python")
+    if not isinstance(jax_python, dict):
+        raise ValueError("summary.jax_python must be an object")
+    _validate_required_keys(jax_python, ["path", "available"], "summary.jax_python")
 
     matrix_required = ["config", "repeats", "aggregate"]
     repeat_required = ["repeat", "artifact", "reference_json", "reference_source", "run", "metrics"]
@@ -402,13 +423,14 @@ def _jax_command(
     output_json: Path,
     reference_json: Path | None,
     run_label: str,
+    jax_python: Path,
 ) -> list[str]:
     args = _effective_jax_args(config, workload)
     args["output_json"] = str(output_json)
     args["run_label"] = run_label
     if reference_json is not None:
         args["reference_json"] = str(reference_json)
-    command = [sys.executable, str(REPO_ROOT / config["benchmark_script"])]
+    command = [str(jax_python), str(REPO_ROOT / config["benchmark_script"])]
     for key, value in args.items():
         _append_cli_arg(command, key, value)
     return command
@@ -734,6 +756,29 @@ def _vllm_available(vllm_python: Path) -> bool:
     return completed.returncode == 0
 
 
+def _jax_available(jax_python: Path, *, runner: Any = subprocess.run) -> bool:
+    """Check for the JAX package without importing JAX or selecting a backend."""
+
+    if jax_python == Path(sys.executable):
+        return importlib.util.find_spec("jax") is not None
+    if not jax_python.exists():
+        return False
+    command = [
+        str(jax_python),
+        "-c",
+        "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('jax') else 1)",
+    ]
+    completed = runner(
+        command,
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
 def _comparison_summary(
     aggregate: dict[str, Any],
     vllm_metrics: dict[str, Any] | None,
@@ -905,6 +950,15 @@ def main() -> None:
                 "device visibility before rerunning, or pass "
                 "--skip-gpu-preflight only for controlled failure diagnostics."
             )
+    jax_python = Path(args.jax_python)
+    jax_is_available = _jax_available(jax_python)
+    if not args.dry_run and not jax_is_available:
+        raise SystemExit(
+            "JAX Python preflight failed: "
+            f"{jax_python} does not have the jax package visible. Pass "
+            "--jax-python /path/to/python or set NANO_VLLM_JAX_PYTHON. "
+            "The check uses importlib.util.find_spec and does not import JAX."
+        )
     vllm_python = Path(args.vllm_python)
     vllm_is_available = _vllm_available(vllm_python)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -948,6 +1002,10 @@ def main() -> None:
             "target_vllm_ratio": TARGET_VLLM_RATIO,
             "description": FINAL_TARGET_DESCRIPTION,
         },
+        "jax_python": {
+            "path": str(jax_python),
+            "available": bool(jax_is_available),
+        },
         "jax_default_references": {},
         "matrix": {},
         "vllm_references": {},
@@ -977,6 +1035,7 @@ def main() -> None:
                 generated_default_reference,
                 None,
                 f"gpu_matrix_jax_default_reference_{workload_name}_{timestamp}",
+                jax_python,
             )
             default_result = _run_command(
                 default_command,
@@ -1051,7 +1110,14 @@ def main() -> None:
                     allow_unverified_generated_default=bool(args.dry_run),
                 )
                 run_label = f"gpu_matrix_{workload_name}_{config_name}_r{repeat_index + 1}_{timestamp}"
-                command = _jax_command(config, workload, output_path, reference_path, run_label)
+                command = _jax_command(
+                    config,
+                    workload,
+                    output_path,
+                    reference_path,
+                    run_label,
+                    jax_python,
+                )
                 env = _runtime_env(config.get("env", {}))
                 result = _run_command(command, env, dry_run=args.dry_run)
                 metrics = _metric_summary(output_path) if output_path.exists() else None

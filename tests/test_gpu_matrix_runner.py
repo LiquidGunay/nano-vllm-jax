@@ -24,6 +24,7 @@ from benchmarks.run_gpu_matrix import (
     _should_capture_live_jax_default_reference,
     _reference_for,
     _find_local_vllm_reference,
+    _jax_available,
     _jax_command,
     _runtime_env,
     _selected_matrix_names,
@@ -61,6 +62,7 @@ def _minimal_schema():
             "workloads",
             "required_metrics",
             "goal_target",
+            "jax_python",
             "jax_default_references",
             "matrix",
             "vllm_references",
@@ -86,6 +88,10 @@ def _minimal_summary():
             "config": "gpu_paged_default",
             "target_vllm_ratio": 0.75,
             "description": "test target",
+        },
+        "jax_python": {
+            "path": sys.executable,
+            "available": False,
         },
         "jax_default_references": {"hetero8": {"source": "stored"}},
         "matrix": {
@@ -172,6 +178,14 @@ def test_validate_summary_shape_rejects_incomplete_goal_target():
         _validate_summary_shape(summary, _minimal_schema())
 
 
+def test_validate_summary_shape_rejects_missing_jax_python():
+    summary = _minimal_summary()
+    del summary["jax_python"]
+
+    with pytest.raises(ValueError, match="jax_python"):
+        _validate_summary_shape(summary, _minimal_schema())
+
+
 def test_aggregate_repeats_requires_exact_full_length_match():
     aggregate = _aggregate_repeats(
         [
@@ -235,6 +249,22 @@ def test_cuda_device_preflight_rejects_missing_gpu(tmp_path):
 
     assert not ok
     assert "NVIDIA-SMI has failed" in detail
+
+
+def test_jax_available_uses_selected_python_without_importing_jax(tmp_path):
+    jax_python = tmp_path / "python"
+    jax_python.touch()
+
+    def fake_runner(command, **kwargs):
+        assert command[0] == str(jax_python)
+        assert "find_spec('jax')" in command[2]
+        return SimpleNamespace(returncode=0, stdout="")
+
+    assert _jax_available(jax_python, runner=fake_runner)
+
+
+def test_jax_available_rejects_missing_selected_python(tmp_path):
+    assert not _jax_available(tmp_path / "missing-python")
 
 
 def test_selected_matrix_names_goal_target_only_overrides_matrix_selection():
@@ -435,9 +465,10 @@ def test_jax_command_applies_workload_overrides_and_reference(tmp_path):
         output_json,
         reference_json,
         "matrix_label",
+        Path("/tmp/jax-python"),
     )
 
-    assert command[0] == sys.executable
+    assert command[0] == "/tmp/jax-python"
     assert command[1].endswith("benchmarks/benchmark_jax_server_trace.py")
     assert _flag_value(command, "--input-lens") == "512,1024,1536,2048"
     assert _flag_value(command, "--output-len") == "16"
