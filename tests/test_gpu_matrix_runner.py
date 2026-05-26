@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from benchmarks.run_gpu_matrix import (
     WORKLOADS,
     _aggregate_repeats,
+    _benchmark_acceptance_summary,
     _configured_workload_reference,
     _cuda_device_preflight,
     _reference_for,
@@ -147,3 +148,66 @@ def test_reference_for_uses_live_default_when_no_stored_reference(tmp_path):
 
     assert selected == generated
     assert source == "live_jax_default"
+
+
+def test_benchmark_acceptance_summary_requires_plan_evidence():
+    repeats = [
+        {
+            "metrics": {
+                "profile": {
+                    "PjRtCApiLoadedExecutable::Execute": {
+                        "total_ms": 1.0,
+                        "count": 1,
+                    }
+                }
+            }
+        },
+        {
+            "metrics": {
+                "profile": {
+                    "PjRtCApiLoadedExecutable::Execute": {
+                        "total_ms": 2.0,
+                        "count": 1,
+                    }
+                }
+            }
+        },
+    ]
+    aggregate = {
+        "repeat_count": 2,
+        "tokens_per_second_median": 90.0,
+        "all_correctness_checked": True,
+        "all_exact_generated_token_match": True,
+    }
+    comparison = {"jax_over_vllm_throughput": 0.9}
+    vllm_metrics = {"performance": {"tokens_per_second": 100.0}}
+
+    acceptance = _benchmark_acceptance_summary(
+        repeats,
+        aggregate,
+        comparison,
+        vllm_metrics,
+    )
+
+    assert all(acceptance["checks"].values())
+    assert acceptance["speed_claim_ready"]
+    assert acceptance["target_vllm_ratio_met"]
+
+
+def test_benchmark_acceptance_summary_rejects_incomplete_evidence():
+    acceptance = _benchmark_acceptance_summary(
+        [{"metrics": None}],
+        {
+            "repeat_count": 1,
+            "tokens_per_second_median": None,
+            "all_correctness_checked": False,
+            "all_exact_generated_token_match": False,
+        },
+        {"jax_over_vllm_throughput": None},
+        None,
+    )
+
+    assert not acceptance["speed_claim_ready"]
+    assert not acceptance["target_vllm_ratio_met"]
+    assert not acceptance["checks"]["minimum_repeats"]
+    assert not acceptance["checks"]["profile_counters_present"]

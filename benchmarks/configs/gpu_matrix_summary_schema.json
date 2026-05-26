@@ -13,7 +13,8 @@
     "required_metrics",
     "matrix",
     "vllm_references",
-    "comparisons"
+    "comparisons",
+    "acceptance"
   ],
   "properties": {
     "schema_version": {
@@ -108,6 +109,9 @@
       "type": "object"
     },
     "comparisons": {
+      "type": "object"
+    },
+    "acceptance": {
       "type": "object"
     }
   }

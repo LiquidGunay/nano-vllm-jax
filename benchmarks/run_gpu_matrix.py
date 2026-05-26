@@ -26,6 +26,8 @@ CONFIG_DIR = REPO_ROOT / "benchmarks" / "configs"
 RESULTS_DIR = REPO_ROOT / "results"
 DEFAULT_CONFIGS = ("gpu_paged_default", "gpu_paged_fast_optin", "gpu_mtp_diagnostics")
 DEFAULT_VLLM_PYTHON = Path("/mountpoint/.exp/vllm-venv/bin/python")
+MIN_ACCEPTANCE_REPEATS = 2
+TARGET_VLLM_RATIO = 0.75
 PROFILE_NEEDLES = (
     "PjRtCApiLoadedExecutable::Execute",
     "command_buffer::execute",
@@ -541,6 +543,46 @@ def _comparison_summary(
     }
 
 
+def _has_profile_counters(repeats: list[dict[str, Any]]) -> bool:
+    for row in repeats:
+        metrics = row.get("metrics") or {}
+        profile = metrics.get("profile") or {}
+        for bucket in profile.values():
+            if bucket.get("total_ms") is not None and bucket.get("count") is not None:
+                return True
+    return False
+
+
+def _benchmark_acceptance_summary(
+    repeats: list[dict[str, Any]],
+    aggregate: dict[str, Any],
+    comparison: dict[str, Any],
+    vllm_metrics: dict[str, Any] | None,
+) -> dict[str, Any]:
+    vllm_performance = (vllm_metrics or {}).get("performance") or {}
+    jax_ratio = comparison.get("jax_over_vllm_throughput")
+    checks = {
+        "minimum_repeats": int(aggregate.get("repeat_count") or 0) >= MIN_ACCEPTANCE_REPEATS,
+        "correctness_checked": bool(aggregate.get("all_correctness_checked")),
+        "exact_generated_token_match": bool(aggregate.get("all_exact_generated_token_match")),
+        "jax_performance_present": aggregate.get("tokens_per_second_median") is not None,
+        "vllm_reference_present": vllm_performance.get("tokens_per_second") is not None,
+        "profile_counters_present": _has_profile_counters(repeats),
+    }
+    speed_claim_ready = all(checks.values())
+    return {
+        "checks": checks,
+        "speed_claim_ready": speed_claim_ready,
+        "target_vllm_ratio": TARGET_VLLM_RATIO,
+        "target_vllm_ratio_met": bool(jax_ratio is not None and jax_ratio >= TARGET_VLLM_RATIO),
+        "notes": (
+            "profile bucket movement still needs human explanation in the logbook"
+            if speed_claim_ready
+            else "not enough evidence for a performance claim"
+        ),
+    }
+
+
 def main() -> None:
     args = parse_args()
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
@@ -592,12 +634,14 @@ def main() -> None:
         "matrix": {},
         "vllm_references": {},
         "comparisons": {},
+        "acceptance": {},
     }
 
     for workload_name, workload in workloads.items():
         generated_default_reference: Path | None = None
         summary["matrix"][workload_name] = {}
         summary["comparisons"][workload_name] = {}
+        summary["acceptance"][workload_name] = {}
         vllm_config = configs.get("gpu_paged_default") or next(iter(configs.values()))
         vllm_reference = _find_local_vllm_reference(vllm_config, workload, reference_dir)
         if vllm_reference is None and args.live_vllm and bool(vllm_config.get("allow_live_vllm_if_reference_missing", True)):
@@ -670,10 +714,18 @@ def main() -> None:
                 "repeats": config_repeats,
                 "aggregate": _aggregate_repeats(config_repeats),
             }
-            summary["comparisons"][workload_name][config_name] = _comparison_summary(
+            vllm_metrics = (summary["vllm_references"].get(workload_name) or {}).get("metrics")
+            comparison = _comparison_summary(
                 summary["matrix"][workload_name][config_name]["aggregate"],
-                (summary["vllm_references"].get(workload_name) or {}).get("metrics"),
+                vllm_metrics,
                 (summary["vllm_references"].get(workload_name) or {}).get("source", "none"),
+            )
+            summary["comparisons"][workload_name][config_name] = comparison
+            summary["acceptance"][workload_name][config_name] = _benchmark_acceptance_summary(
+                config_repeats,
+                summary["matrix"][workload_name][config_name]["aggregate"],
+                comparison,
+                vllm_metrics,
             )
 
     output_json.write_text(json.dumps(_json_safe(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")

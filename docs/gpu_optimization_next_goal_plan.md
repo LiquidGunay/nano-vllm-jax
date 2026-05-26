@@ -250,6 +250,10 @@ end-to-end throughput.
   stored JAX references from repeat one instead of leaving the default
   long-prefill baseline unchecked. Stored references are preferred over
   generated same-run defaults so exact-token gates use stable baselines.
+- Matrix summaries now include an `acceptance` section that makes the plan's
+  speed-claim evidence check explicit: minimum repeats, exact correctness,
+  JAX/vLLM performance presence, profile counters, and the `0.75x` vLLM target.
+  Human explanation of profile bucket movement still belongs in the logbook.
 
 ## Phase 2 - Kernel Roadmap
 

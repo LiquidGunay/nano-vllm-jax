@@ -3167,3 +3167,40 @@ Decision:
 - Keep the workload-specific reference maps. The next GPU-visible two-repeat
   matrix can now satisfy the exact-token comparison setup from repeat one for
   both tracked workloads without rerunning vLLM.
+
+## Entry 083 - Matrix Summary Acceptance Gate
+
+- change accepted: `benchmarks/run_gpu_matrix.py` now writes an `acceptance`
+  section for each workload/config pair. It checks whether the summary has at
+  least two repeats, exact generated-token correctness, JAX performance metrics,
+  a vLLM throughput reference, profile counters, and whether the JAX/vLLM
+  throughput ratio reaches the `0.75x` target.
+- schema update: `benchmarks/configs/gpu_matrix_summary_schema.json` now
+  requires the `acceptance` top-level key for new matrix summaries.
+- focused tests:
+
+```text
+.venv/bin/python -m pytest tests/test_gpu_matrix_runner.py -q
+```
+
+- result: `10 passed`.
+- dry-run verification:
+
+```text
+.venv/bin/python benchmarks/run_gpu_matrix.py \
+  --configs gpu_paged_default,gpu_paged_fast_optin \
+  --workloads hetero8,long_prefill_512_2048 --repeats 2 \
+  --dry-run --no-live-vllm \
+  --output-json /mountpoint/.exp/tmp/gpu_matrix_acceptance_dry_run.json
+```
+
+- result: the dry-run summary includes `acceptance`. As expected for a dry run,
+  `minimum_repeats` and stored vLLM reference checks can pass, but
+  `speed_claim_ready=false` because no JAX performance, correctness, or profile
+  metrics exist.
+
+Decision:
+
+- Keep the acceptance gate. It does not replace logbook judgment, but it makes
+  missing benchmark evidence explicit before a run can be used for a speed
+  claim.
