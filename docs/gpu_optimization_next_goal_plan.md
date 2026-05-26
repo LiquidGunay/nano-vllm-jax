@@ -30,6 +30,38 @@ optimization work starts.
    JAX default references. `--require-stored-references` remains an explicit
    opt-in gate when live fallback is not acceptable.
 
+## Next Goal Handoff
+
+Use this file as the main goal contract. The first goal slice should stay
+documentation/configuration-first:
+
+1. Keep the docs plus benchmark config JSONs as the first deliverable.
+2. Treat `gpu_paged_default` as the fastest accepted non-MTP default, not the
+   most conservative historical baseline.
+3. Keep FlashInfer, `jax-tvm-ffi`, and local CUDA kernels as optional
+   dependencies behind backend flags with pure-JAX fallbacks.
+4. Prefer stored local artifacts for JAX and vLLM comparisons. If a selected
+   workload has no stored local artifact, run the missing comparison live when a
+   GPU and dependency stack are available, then store that artifact for future
+   comparisons.
+5. Do not start MTP speed work until the non-speculative long heterogeneous
+   target is speed-claim-ready and reaches at least `0.75x` vLLM.
+
+Current GDN status: serving GDN is still expressed as JAX and lowered by XLA to
+GPU work; there is no accepted hand-owned GDN kernel in the default path.
+The GDN bottleneck is profile-backed by XLA/PjRt trace buckets and integrated
+benchmark deltas, especially the accepted chunk-size-32 movement and later
+row/chunk regressions. It is not yet proven by a separate standalone HLO-only
+audit. The next GDN kernel attempt should use Qwen 3 Next vLLM and Flash Linear
+Attention as implementation references.
+
+If paged-layout kernels remain hard to integrate cleanly, insert a smaller
+kernel-integration probe before more complicated paging work. GEMM-shaped or
+simple fused kernels may be used to prove optional dependency loading, ABI
+registration, profiling, fallback behavior, and correctness gates, but they
+should not be promoted as speed work unless the integrated server benchmark
+improves.
+
 ## Context
 
 The current validated GPU baseline is the JAX paged serving path for
