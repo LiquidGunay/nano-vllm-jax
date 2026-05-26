@@ -91,6 +91,10 @@ paged_decode_attention_gqa_nhd(
 - current ABI status: a pure-JAX FP32 NHD reference and focused parity tests now
   define the decode-attention contract a future CUDA/custom-call path must
   satisfy before it can be routed into serving.
+- current CUDA status: a local FP32 CUDA/JAX FFI implementation satisfies the
+  focused ABI parity gate, including the Qwen3.5-0.8B full-attention
+  `8q/2kv/head_dim=256` shape. It remains default-off and unrouted until the
+  backend-level opt-in and integrated exact-token/performance gates pass.
 
 ## P1.1 - `gdn_recurrent_decode_step`
 

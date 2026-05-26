@@ -18,9 +18,13 @@ import jax.numpy as jnp
 from nanovllm_jax.kernels.flashinfer_ffi import (
     kv_append_paged_nhd_reference,
 )
+from nanovllm_jax.kernels.paged_attention import (
+    paged_decode_attention_gqa_nhd_reference,
+)
 from nanovllm_jax.kernels.registry import backend_status
 
 _TARGET_KV_APPEND = "nanovllm_jax_fp32_kv_append_paged_nhd"
+_TARGET_PAGED_DECODE = "nanovllm_jax_fp32_paged_decode_attention_gqa_nhd"
 _REGISTER_LOCK = threading.Lock()
 _REGISTERED = False
 _LOADED_LIBS: list[ctypes.CDLL] = []
@@ -170,9 +174,16 @@ def _register_kv_append_target() -> None:
         library_path = build_cuda_fp32_kernels()
         library = ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
         handler = library.NanoVllmJaxFp32KvAppend
+        decode_handler = library.NanoVllmJaxFp32PagedDecodeAttention
         jax.ffi.register_ffi_target(
             _TARGET_KV_APPEND,
             jax.ffi.pycapsule(handler),
+            platform="gpu",
+            api_version=1,
+        )
+        jax.ffi.register_ffi_target(
+            _TARGET_PAGED_DECODE,
+            jax.ffi.pycapsule(decode_handler),
             platform="gpu",
             api_version=1,
         )
@@ -398,3 +409,103 @@ def kv_append_paged_nhd_fp32_from_metadata(
 
 def kv_append_paged_nhd_fp32_reference(*args: Any, **kwargs: Any):
     return kv_append_paged_nhd_reference(*args, **kwargs)
+
+
+def _validate_fp32_paged_decode_inputs(
+    q: jnp.ndarray,
+    k_cache: jnp.ndarray,
+    v_cache: jnp.ndarray,
+    kv_indptr: jnp.ndarray,
+    kv_indices: jnp.ndarray,
+    kv_last_page_len: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    softmax_scale: jnp.ndarray,
+) -> None:
+    if q.dtype != jnp.float32:
+        raise ValueError("q must be float32")
+    if k_cache.dtype != jnp.float32 or v_cache.dtype != jnp.float32:
+        raise ValueError("k_cache and v_cache must be float32")
+    if q.ndim != 3:
+        raise ValueError("q must have shape [batch, num_q_heads, head_dim]")
+    if k_cache.shape != v_cache.shape:
+        raise ValueError("k_cache and v_cache must have the same shape")
+    if k_cache.ndim != 4:
+        raise ValueError(
+            "k_cache must have NHD shape "
+            "[num_pages, page_size, num_kv_heads, head_dim]"
+        )
+    if q.shape[-1] != k_cache.shape[-1]:
+        raise ValueError("q and cache head_dim must match")
+    if q.shape[1] % k_cache.shape[2] != 0:
+        raise ValueError("num_q_heads must be divisible by num_kv_heads")
+    batch = q.shape[0]
+    if kv_indptr.shape != (batch + 1,):
+        raise ValueError("kv_indptr must have shape [batch + 1]")
+    for name, value in (
+        ("kv_indptr", kv_indptr),
+        ("kv_indices", kv_indices),
+        ("kv_last_page_len", kv_last_page_len),
+        ("seq_lens", seq_lens),
+    ):
+        if value.dtype != jnp.int32:
+            raise ValueError(f"{name} must have dtype int32")
+        if value.ndim != 1:
+            raise ValueError(f"{name} must be rank-1")
+    if kv_last_page_len.shape != (batch,) or seq_lens.shape != (batch,):
+        raise ValueError("kv_last_page_len and seq_lens must have shape [batch]")
+    if kv_indices.shape[0] % batch != 0:
+        raise ValueError("kv_indices must be dense by batch for this prototype")
+    if softmax_scale.dtype != jnp.float32 or softmax_scale.shape != ():
+        raise ValueError("softmax_scale must be a float32 scalar")
+
+
+def paged_decode_attention_gqa_nhd_fp32(
+    q: Any,
+    k_cache: Any,
+    v_cache: Any,
+    kv_indptr: Any,
+    kv_indices: Any,
+    kv_last_page_len: Any,
+    seq_lens: Any,
+    softmax_scale: float,
+) -> jnp.ndarray:
+    """Decode attention over an FP32 NHD paged cache using local CUDA FFI."""
+
+    q = _as_jax_array("q", q)
+    k_cache = _as_jax_array("k_cache", k_cache)
+    v_cache = _as_jax_array("v_cache", v_cache)
+    kv_indptr = _as_jax_array("kv_indptr", kv_indptr)
+    kv_indices = _as_jax_array("kv_indices", kv_indices)
+    kv_last_page_len = _as_jax_array("kv_last_page_len", kv_last_page_len)
+    seq_lens = _as_jax_array("seq_lens", seq_lens)
+    softmax_scale_array = jnp.asarray(softmax_scale, dtype=jnp.float32)
+    _validate_fp32_paged_decode_inputs(
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        seq_lens,
+        softmax_scale_array,
+    )
+    _register_kv_append_target()
+    call = jax.ffi.ffi_call(
+        _TARGET_PAGED_DECODE,
+        jax.ShapeDtypeStruct(q.shape, q.dtype),
+        has_side_effect=False,
+    )
+    return call(
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        seq_lens,
+        softmax_scale_array,
+    )
+
+
+def paged_decode_attention_gqa_nhd_fp32_reference(*args: Any, **kwargs: Any):
+    return paged_decode_attention_gqa_nhd_reference(*args, **kwargs)

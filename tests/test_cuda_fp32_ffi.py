@@ -13,12 +13,20 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+jax.config.update("jax_default_matmul_precision", "highest")
+
 from nanovllm_jax.backends import PureJAXBackend
 from nanovllm_jax.kernels.cuda_fp32_ffi import (
     build_cuda_fp32_kernels,
     kv_append_paged_nhd_fp32,
+    paged_decode_attention_gqa_nhd_fp32,
 )
 from nanovllm_jax.kernels.flashinfer_ffi import kv_append_paged_nhd_reference
+from nanovllm_jax.kernels.paged_attention import (
+    dense_block_tables_to_kv_indptr,
+    kv_last_page_len_from_seq_lens,
+    paged_decode_attention_gqa_nhd_reference,
+)
 from nanovllm_jax.kv_cache import (
     AttentionMetadata,
     KVCacheStorage,
@@ -168,3 +176,98 @@ def test_backend_cuda_fp32_kv_append_opt_in_matches_canonical_update(monkeypatch
 
     np.testing.assert_array_equal(np.asarray(actual.k_cache), np.asarray(expected_k))
     np.testing.assert_array_equal(np.asarray(actual.v_cache), np.asarray(expected_v))
+
+
+@pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.parametrize(
+    ("page_size", "max_pages_per_sequence", "num_q_heads", "num_kv_heads", "head_dim"),
+    [
+        (4, 3, 4, 2, 8),
+        (16, 2, 8, 2, 256),
+    ],
+)
+def test_paged_decode_attention_gqa_nhd_fp32_cuda_matches_reference(
+    monkeypatch,
+    page_size,
+    max_pages_per_sequence,
+    num_q_heads,
+    num_kv_heads,
+    head_dim,
+):
+    monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
+    batch = 2
+    num_pages = max_pages_per_sequence * batch + 1
+    seq_lens = jnp.array(
+        [page_size + 1, max_pages_per_sequence * page_size - 1],
+        dtype=jnp.int32,
+    )
+    block_tables = jnp.array(
+        [
+            [num_pages - 1, 1, 2][:max_pages_per_sequence],
+            [0, 3, 4][:max_pages_per_sequence],
+        ],
+        dtype=jnp.int32,
+    )
+    k_cache = jnp.linspace(
+        -0.3,
+        0.4,
+        num_pages * page_size * num_kv_heads * head_dim,
+        dtype=jnp.float32,
+    ).reshape(num_pages, page_size, num_kv_heads, head_dim)
+    v_cache = jnp.linspace(
+        0.2,
+        0.9,
+        num_pages * page_size * num_kv_heads * head_dim,
+        dtype=jnp.float32,
+    ).reshape(num_pages, page_size, num_kv_heads, head_dim)
+    q = jnp.linspace(
+        -0.5,
+        0.5,
+        batch * num_q_heads * head_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_q_heads, head_dim)
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(block_tables)
+    kv_last_page_len = kv_last_page_len_from_seq_lens(seq_lens, page_size)
+    scale = float(1.0 / np.sqrt(head_dim))
+
+    expected = paged_decode_attention_gqa_nhd_reference(
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        seq_lens,
+        scale,
+        max_pages_per_sequence=max_pages_per_sequence,
+    )
+    actual = jax.jit(
+        lambda query, key_cache, value_cache, indptr, indices, last_page_len, lens: (
+            paged_decode_attention_gqa_nhd_fp32(
+                query,
+                key_cache,
+                value_cache,
+                indptr,
+                indices,
+                last_page_len,
+                lens,
+                scale,
+            )
+        )
+    )(
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        seq_lens,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual),
+        np.asarray(expected),
+        rtol=2e-5,
+        atol=2e-5,
+    )

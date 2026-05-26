@@ -2630,3 +2630,40 @@ Decision:
 - Keep the local CUDA/JAX FFI code as a toolchain and ABI smoke proof. It proves that repo-owned FP32 CUDA custom calls can be built, registered, called from JAX, and validated without changing the BF16-weights/FP32-activation contract.
 - Do not promote `NANO_VLLM_JAX_CUDA_FP32_KV_APPEND=1` to `gpu_paged_default` or `gpu_paged_fast_optin`.
 - The next KV/attention attempt should either pair append with an attention/layout consumer that removes downstream overhead, or move directly to a decode-attention or GDN kernel with an integrated profile target. A standalone cache-write custom call is not enough.
+
+## Entry 072 - FP32 CUDA Paged Decode Attention Focused ABI Validation
+
+- change tested: a local CUDA/JAX FFI `paged_decode_attention_gqa_nhd` prototype
+  for FP32 NHD paged decode attention. The kernel is one CUDA block per
+  `(batch, q_head)`, reads NHD paged K/V cache using CSR-style page metadata,
+  performs FP32 score/softmax/value accumulation, and returns
+  `[batch, num_q_heads, head_dim]`.
+- correctness mode: focused reference and CUDA tests run with
+  `jax_default_matmul_precision=highest`, matching the long decode top-5
+  correctness harness.
+- focused CUDA tests: direct decode attention parity passed for a small GQA
+  shape and for the Qwen3.5-0.8B full-attention shape
+  `page_size=16`, `num_q_heads=8`, `num_kv_heads=2`, `head_dim=256`.
+- broader focused suite:
+
+```text
+JAX_PLATFORMS=cuda ... pytest \
+  tests/test_cuda_fp32_ffi.py \
+  tests/test_paged_attention_abi.py \
+  tests/test_kernel_registry.py \
+  tests/test_kv_cache.py::test_paged_attention_non_identity_blocks \
+  tests/test_kv_cache.py::test_paged_attention_grouped_gqa_matches_repeat_reference \
+  tests/test_backend_boundaries.py::test_pure_jax_decode_attention_matches_dense_reference_non_contiguous_blocks -q
+```
+
+- result: `16 passed`.
+
+Decision:
+
+- Accept this as a focused ABI/toolchain milestone only.
+- Do not claim a serving speedup yet. The kernel is not routed through
+  `PureJAXBackend.attention`, has not run exact generated-token parity, and has
+  not run the integrated hetero8 benchmark/profile gate.
+- Next step is an explicit backend opt-in for full-attention single-token
+  decode only, then exact-token parity and integrated performance comparison
+  against Entry 045.

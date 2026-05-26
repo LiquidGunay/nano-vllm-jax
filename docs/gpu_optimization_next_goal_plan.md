@@ -401,6 +401,12 @@ paged_decode_attention_gqa_nhd(
   `paged_decode_attention_gqa_nhd`, with focused parity tests against the
   current decode attention path. This is an ABI/correctness target for a future
   CUDA custom-call, not an accepted performance kernel.
+- A local FP32 CUDA/JAX FFI implementation now exists for the same ABI. It
+  passes focused CUDA parity against the pure-JAX reference, including the
+  model's full-attention `8q/2kv/head_dim=256` shape, under the same
+  `jax_default_matmul_precision=highest` correctness mode used by the long
+  decode top-5 harness. It is not routed into serving yet and has no integrated
+  performance claim.
 
 ## P1.1 - `gdn_recurrent_decode_step`
 
@@ -777,7 +783,9 @@ Commit 6:
   current FP32 activation/KV-cache contract.
 - ~~Add pure-JAX FP32 `paged_decode_attention_gqa_nhd` ABI reference~~
 - ~~Add focused parity tests against the current decode path~~
-- Add FP32-capable CUDA/custom-call decode implementation behind an opt-in
+- ~~Add FP32-capable CUDA/custom-call decode implementation with focused CUDA
+  parity tests~~
+- Route FP32-capable CUDA/custom-call decode implementation behind an opt-in
   backend
 - Route only full-attention decode layers after focused and integrated gates
   pass
