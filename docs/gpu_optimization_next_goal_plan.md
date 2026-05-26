@@ -435,6 +435,26 @@ end-to-end throughput.
   vllm_random_longprefill --repeats 2` validates command construction, summary
   schema, the opt-in workload metadata, and live JAX default reference planning
   for sidecar correctness comparison.
+- Post-sidecar goal-target verification:
+  `results/gpu_matrix_20260526_135134.json` and
+  `results/gpu_matrix_20260526_135134.md`. The no-kernel default remains
+  speed-claim-ready with exact generated-token parity, but still misses the
+  final target: `85.21 tok/s`, `0.732x` vLLM, target `87.28 tok/s`, gap
+  `2.07 tok/s`, required JAX speedup `1.024x`. The run confirms the benchmark
+  harness change did not itself close the remaining gap.
+- Accepted benchmark trace text-materialization cleanup:
+  `results/gpu_matrix_20260526_135552.json` and
+  `results/gpu_matrix_20260526_135552.md`. The trace benchmark now disables
+  per-token and final text detokenization inside the timed `generate_with_trace`
+  path while preserving token IDs and default engine text behavior for normal
+  callers. The two-repeat goal-target matrix stays speed-claim-ready and exact,
+  improving to `86.26 tok/s`, `0.741x` vLLM. The final `0.75x` target is still
+  not met: target `87.28 tok/s`, gap `1.02 tok/s`, required JAX speedup
+  `1.012x`.
+- Rejected local micro-probe: switching the block-manager first-free allocation
+  path to `popleft()` and skipping non-speculative MTP admission bookkeeping did
+  not beat the text-cleanup run in the integrated goal-target matrix, so those
+  changes were not kept.
 
 ## Phase 2 - Kernel Roadmap
 

@@ -300,12 +300,12 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     nhd_cache = getattr(engine.model_runner, "full_attention_nhd_cache", None)
     if args.warmup:
         warmup_params = _build_sampling_params([], min(2, args.output_len))
-        engine.generate_with_trace(prompts, sampling_params=warmup_params)
+        engine.generate_with_trace(prompts, sampling_params=warmup_params, include_text=False)
 
     sampling_params = _build_sampling_params(output_lengths, args.output_len)
     recorder.start_jax_profile(enabled=args.profile)
     started = time.perf_counter()
-    trace = engine.generate_with_trace(prompts, sampling_params=sampling_params)
+    trace = engine.generate_with_trace(prompts, sampling_params=sampling_params, include_text=False)
     elapsed = time.perf_counter() - started
     recorder.stop_jax_profile()
     profile_counters = _profile_counters(recorder.profile_path) if args.profile else None

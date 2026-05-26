@@ -280,6 +280,8 @@ class LLMEngine:
         self,
         prompts: List[Union[str, List[int]]],
         sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
+        *,
+        include_text: bool = True,
     ):
         """Yield token events as requests make progress through the scheduler."""
         if sampling_params is None:
@@ -320,13 +322,12 @@ class LLMEngine:
                 if len(completion) > previous_length:
                     for offset, token_id in enumerate(completion[previous_length:]):
                         completion_index = previous_length + offset
-                        yield {
+                        token_event = {
                             "event": "token",
                             "seq_id": seq.seq_id,
                             "request_index": request_index,
                             "completion_index": completion_index,
                             "token_id": int(token_id),
-                            "text": self._detokenize([int(token_id)]),
                             "elapsed_seconds": step_end - stream_start,
                             "step_seconds": step_end - step_start,
                             "step_start_seconds": step_start - stream_start,
@@ -334,6 +335,9 @@ class LLMEngine:
                             "scheduler_step_tokens": int(abs(num_tokens)),
                             "scheduler_step_is_decode": bool(num_tokens < 0),
                         }
+                        if include_text:
+                            token_event["text"] = self._detokenize([int(token_id)])
+                        yield token_event
                     seen_completion_lengths[seq.seq_id] = len(completion)
                 if seq.is_finished and seq.seq_id not in emitted_finish:
                     emitted_finish.add(seq.seq_id)
@@ -351,7 +355,7 @@ class LLMEngine:
             "results": [
                 {
                     "request_index": index,
-                    "text": self._detokenize(seq.completion_token_ids),
+                    "text": self._detokenize(seq.completion_token_ids) if include_text else "",
                     "token_ids": [int(token) for token in seq.completion_token_ids],
                 }
                 for index, seq in enumerate(seqs)
@@ -362,11 +366,17 @@ class LLMEngine:
         self,
         prompts: List[Union[str, List[int]]],
         sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
+        *,
+        include_text: bool = True,
     ) -> dict:
         """Generate requests and return server-side per-token timing events."""
         events = []
         results = []
-        for event in self.iter_generate(prompts, sampling_params=sampling_params):
+        for event in self.iter_generate(
+            prompts,
+            sampling_params=sampling_params,
+            include_text=include_text,
+        ):
             events.append(event)
             if event.get("event") == "done":
                 results = event.get("results", [])
