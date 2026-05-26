@@ -2597,3 +2597,36 @@ Decision:
 - Keep the FFI wrapper and BF16-focused tests as ABI documentation only. They prove the JAX FFI aliasing and page-table contract, but they are not an accepted optimization.
 - Add a Python-side dtype guard so `NANO_VLLM_JAX_FLASHINFER_KV_APPEND=1` fails clearly for FP32 cache tensors before launching the FFI.
 - Do not cast the cache to BF16 to make this route work. That would change the activation/KV-cache dtype contract and must be a separate explicit decision.
+
+## Entry 071 - Rejected Standalone FP32 CUDA KV Append Routing
+
+- run id: `20260526-091731-2242430-cuda_fp32_kv_append_hetero8_64_512x32`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_cuda_fp32_kv_append.json`
+- benchmark script: `benchmarks/benchmark_jax_server_trace.py`
+- profile directory: `/mountpoint/.exp/profiles/20260526-091731-2242430-cuda_fp32_kv_append_hetero8_64_512x32`
+- change tested: a local CUDA/JAX FFI `NANO_VLLM_JAX_CUDA_FP32_KV_APPEND=1` route updates each canonical full-attention layer cache slice through a FP32 NHD append kernel. The kernel builds its shared object under `/mountpoint/.exp/.cache/nano-vllm-jax/cuda_fp32`, uses an `sm_86` cubin build to avoid PTX JIT issues on the A10G baseline, and keeps the pure-JAX path as the default.
+- focused CUDA tests: the direct FP32 NHD append FFI matched the pure-JAX NHD append reference for the model's full-attention `head_dim=256`. The backend-level opt-in test matched canonical `update_kv_cache` with padded scheduled tokens by passing a rectangular valid mask into the CUDA kernel.
+- full CUDA run: `JAX_PLATFORMS=cuda`, A10G, model `Qwen/Qwen3.5-0.8B`, BF16 weights, FP32 runtime dtype/KV cache, accepted compact prefill/materialized-LM-head flags, hetero8 lengths `64,128,192,256,320,384,448,512`, output length `32`, Entry 045 scheduler envelope, stored reference `results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json`.
+- correctness: exact generated-token match for all 8 rows against Entry 045.
+- timing: `193.62 tok/s`, TTFT p50 `309.39 ms`, ITL p50 `31.43 ms`, ITL p95 `38.51 ms`. This is `0.526x` of Entry 045 throughput and `0.224x` of the tracked vLLM async baseline.
+
+Profile counters:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `forward_step_token_ids_jit` | `502.18 ms / 22` | decode step regressed heavily |
+| `PjRtCApiLoadedExecutable::Execute` | `121.05 ms / 181` | lower count than baseline profile slices, but worse wall timing |
+| `command_buffer::execute` | `45.35 ms / 1155` | not enough movement to offset FFI/routing overhead |
+| `command_buffer::update` | `15.78 ms / 260` | additional update work remains visible |
+| `gather` | `13.73 ms / 386` | not a useful integrated win |
+| `transpose` | `25.22 ms / 372` | improved in isolation, but end-to-end regressed |
+| `MemcpyD2D` | `17.82 ms / 847` | not the dominant regression |
+| `array.py:325 tolist` | `358.84 ms / 21` | host sync attribution still large |
+| `np.asarray(jax.Array)` | `358.69 ms / 21` | same host sync attribution |
+
+Decision:
+
+- Reject standalone FP32 CUDA KV append routing as a serving optimization. It passes the dtype and exact-token gates, but fails the integrated performance gate by a wide margin.
+- Keep the local CUDA/JAX FFI code as a toolchain and ABI smoke proof. It proves that repo-owned FP32 CUDA custom calls can be built, registered, called from JAX, and validated without changing the BF16-weights/FP32-activation contract.
+- Do not promote `NANO_VLLM_JAX_CUDA_FP32_KV_APPEND=1` to `gpu_paged_default` or `gpu_paged_fast_optin`.
+- The next KV/attention attempt should either pair append with an attention/layout consumer that removes downstream overhead, or move directly to a decode-attention or GDN kernel with an integrated profile target. A standalone cache-write custom call is not enough.

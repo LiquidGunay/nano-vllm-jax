@@ -49,9 +49,10 @@ XLA_FFI_Error* CheckCallFrame(XLA_FFI_CallFrame* call_frame) {
     return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
                        "fp32 kv append only supports execute stage");
   }
-  if (call_frame->args.size != 9 || call_frame->rets.size != 2) {
+  if ((call_frame->args.size != 9 && call_frame->args.size != 10) ||
+      call_frame->rets.size != 2) {
     return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
-                       "fp32 kv append expects 9 arguments and 2 results");
+                       "fp32 kv append expects 9 or 10 arguments and 2 results");
   }
   for (int64_t i = 0; i < call_frame->args.size; ++i) {
     if (!IsBufferArg(call_frame, i)) {
@@ -75,6 +76,8 @@ XLA_FFI_Error* CheckCallFrame(XLA_FFI_CallFrame* call_frame) {
   const XLA_FFI_Buffer* kv_indices = ArgBuffer(call_frame, 6);
   const XLA_FFI_Buffer* kv_indptr = ArgBuffer(call_frame, 7);
   const XLA_FFI_Buffer* kv_last_page_len = ArgBuffer(call_frame, 8);
+  const XLA_FFI_Buffer* valid_mask =
+      call_frame->args.size == 10 ? ArgBuffer(call_frame, 9) : nullptr;
   const XLA_FFI_Buffer* k_out = RetBuffer(call_frame, 0);
   const XLA_FFI_Buffer* v_out = RetBuffer(call_frame, 1);
 
@@ -95,6 +98,11 @@ XLA_FFI_Error* CheckCallFrame(XLA_FFI_CallFrame* call_frame) {
       !HasTypeAndRank(kv_last_page_len, XLA_FFI_DataType_S32, 1)) {
     return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
                        "page metadata buffers must be int32 rank-1 buffers");
+  }
+  if (valid_mask != nullptr &&
+      !HasTypeAndRank(valid_mask, XLA_FFI_DataType_S32, 1)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "valid_mask must be an int32 rank-1 buffer");
   }
   if (append_key->dims[0] != append_value->dims[0] ||
       append_key->dims[1] != append_value->dims[1] ||
@@ -119,6 +127,10 @@ XLA_FFI_Error* CheckCallFrame(XLA_FFI_CallFrame* call_frame) {
       positions->dims[0] != append_key->dims[0]) {
     return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
                        "batch_indices and positions must have nnz length");
+  }
+  if (valid_mask != nullptr && valid_mask->dims[0] != append_key->dims[0]) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "valid_mask must have nnz length");
   }
   return nullptr;
 }
@@ -147,6 +159,7 @@ __global__ void Fp32KvAppendKernel(
     float* v_cache,
     const int32_t* kv_indices,
     const int32_t* kv_indptr,
+    const int32_t* valid_mask,
     int64_t nnz_tokens,
     int64_t page_size,
     int64_t num_kv_heads,
@@ -159,6 +172,9 @@ __global__ void Fp32KvAppendKernel(
   }
 
   int64_t token = linear / elements_per_token;
+  if (valid_mask != nullptr && valid_mask[token] == 0) {
+    return;
+  }
   int64_t head_offset = linear - token * elements_per_token;
   int64_t kv_head = head_offset / head_dim;
   int64_t dim = head_offset - kv_head * head_dim;
@@ -208,6 +224,8 @@ extern "C" XLA_FFI_Error* NanoVllmJaxFp32KvAppend(
   XLA_FFI_Buffer* v_out = RetBuffer(call_frame, 1);
   const XLA_FFI_Buffer* kv_indices = ArgBuffer(call_frame, 6);
   const XLA_FFI_Buffer* kv_indptr = ArgBuffer(call_frame, 7);
+  const XLA_FFI_Buffer* valid_mask =
+      call_frame->args.size == 10 ? ArgBuffer(call_frame, 9) : nullptr;
 
   int64_t nnz_tokens = append_key->dims[0];
   int64_t page_size = k_out->dims[1];
@@ -229,6 +247,7 @@ extern "C" XLA_FFI_Error* NanoVllmJaxFp32KvAppend(
       static_cast<float*>(v_out->data),
       static_cast<const int32_t*>(kv_indices->data),
       static_cast<const int32_t*>(kv_indptr->data),
+      valid_mask == nullptr ? nullptr : static_cast<const int32_t*>(valid_mask->data),
       nnz_tokens,
       page_size,
       num_kv_heads,

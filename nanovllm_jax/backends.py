@@ -37,6 +37,7 @@ from nanovllm_jax.kv_cache import (
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
 _NHD_FULL_ATTN_CACHE_ENV = "NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE"
 _FLASHINFER_KV_APPEND_ENV = "NANO_VLLM_JAX_FLASHINFER_KV_APPEND"
+_CUDA_FP32_KV_APPEND_ENV = "NANO_VLLM_JAX_CUDA_FP32_KV_APPEND"
 
 
 class InferenceBackend(Protocol):
@@ -218,6 +219,33 @@ class PureJAXBackend:
         cache: KVCacheStorage,
         metadata: AttentionMetadata,
     ) -> KVCacheStorage:
+        if os.environ.get(_CUDA_FP32_KV_APPEND_ENV, "0") in _TRUE_ENV_VALUES:
+            if os.environ.get(_FLASHINFER_KV_APPEND_ENV, "0") in _TRUE_ENV_VALUES:
+                raise ValueError(
+                    "Set only one KV append backend: CUDA FP32 or FlashInfer"
+                )
+            if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
+                raise ValueError(
+                    "CUDA FP32 KV append requires cache shape "
+                    "[num_layers, num_pages, page_size, num_kv_heads, head_dim]"
+                )
+            from nanovllm_jax.kernels.cuda_fp32_ffi import (
+                kv_append_paged_nhd_fp32_from_metadata,
+            )
+
+            k_cache_layer, v_cache_layer = kv_append_paged_nhd_fp32_from_metadata(
+                k,
+                v,
+                cache.k_cache[layer_id],
+                cache.v_cache[layer_id],
+                metadata,
+                page_size=int(cache.k_cache.shape[2]),
+            )
+            return KVCacheStorage(
+                cache.k_cache.at[layer_id].set(k_cache_layer),
+                cache.v_cache.at[layer_id].set(v_cache_layer),
+            )
+
         if os.environ.get(_FLASHINFER_KV_APPEND_ENV, "0") in _TRUE_ENV_VALUES:
             if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
                 raise ValueError(

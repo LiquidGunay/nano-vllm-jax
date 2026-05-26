@@ -13,11 +13,18 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from nanovllm_jax.backends import PureJAXBackend
 from nanovllm_jax.kernels.cuda_fp32_ffi import (
     build_cuda_fp32_kernels,
     kv_append_paged_nhd_fp32,
 )
 from nanovllm_jax.kernels.flashinfer_ffi import kv_append_paged_nhd_reference
+from nanovllm_jax.kv_cache import (
+    AttentionMetadata,
+    KVCacheStorage,
+    compute_slot_mapping,
+    update_kv_cache,
+)
 
 
 def _has_cuda_backend() -> bool:
@@ -92,3 +99,72 @@ def test_kv_append_paged_nhd_fp32_cuda_matches_reference(monkeypatch):
 
     np.testing.assert_array_equal(np.asarray(actual_k), np.asarray(expected_k))
     np.testing.assert_array_equal(np.asarray(actual_v), np.asarray(expected_v))
+
+
+@pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_backend_cuda_fp32_kv_append_opt_in_matches_canonical_update(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
+    monkeypatch.setenv("NANO_VLLM_JAX_CUDA_FP32_KV_APPEND", "1")
+
+    page_size = 4
+    head_dim = 256
+    layer_id = 1
+    k = jnp.arange(2 * 4 * 2 * head_dim, dtype=jnp.float32).reshape(
+        2, 4, 2, head_dim
+    )
+    v = k + 1000.0
+    k_cache = jnp.full((3, 6, page_size, 2, head_dim), -1.0, dtype=jnp.float32)
+    v_cache = jnp.full((3, 6, page_size, 2, head_dim), -2.0, dtype=jnp.float32)
+    positions = jnp.array(
+        [
+            [0, 1, 2, 0],
+            [4, 5, 0, 0],
+        ],
+        dtype=jnp.int32,
+    )
+    block_tables = jnp.array(
+        [
+            [2, 0, 1],
+            [3, 5, 4],
+        ],
+        dtype=jnp.int32,
+    )
+    query_start_loc = jnp.array([0, 3, 5], dtype=jnp.int32)
+    seq_lens = jnp.array([3, 6], dtype=jnp.int32)
+    metadata = AttentionMetadata(
+        slot_mapping=compute_slot_mapping(
+            positions=positions,
+            block_table=block_tables,
+            block_size=page_size,
+            is_prefill=True,
+        ),
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        num_prefill_tokens=5,
+        num_decode_tokens=0,
+        positions=positions,
+    )
+    query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+    valid_mask = jnp.arange(positions.shape[1])[None, :] < query_lens[:, None]
+    expected_k, expected_v = update_kv_cache(
+        k_cache,
+        v_cache,
+        metadata.slot_mapping,
+        k,
+        v,
+        layer_idx=layer_id,
+        valid_mask=valid_mask,
+    )
+
+    actual = PureJAXBackend().write_kv(
+        layer_id=layer_id,
+        k=k,
+        v=v,
+        cache=KVCacheStorage(k_cache, v_cache),
+        metadata=metadata,
+    )
+
+    np.testing.assert_array_equal(np.asarray(actual.k_cache), np.asarray(expected_k))
+    np.testing.assert_array_equal(np.asarray(actual.v_cache), np.asarray(expected_v))

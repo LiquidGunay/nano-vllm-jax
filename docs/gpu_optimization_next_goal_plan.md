@@ -332,6 +332,12 @@ scratch.
   aliasing contract, and passes a focused CUDA parity test against the pure-JAX
   NHD append reference. This proves the FP32 custom-call toolchain but is not
   routed into serving or accepted as a speed path yet.
+- Routing that local FP32 append kernel through `write_kv` behind
+  `NANO_VLLM_JAX_CUDA_FP32_KV_APPEND=1` preserved exact generated-token
+  correctness on hetero8, but regressed throughput to `193.62 tok/s` and ITL
+  p50 to `31.43 ms`. Keep the kernel as a toolchain smoke proof; do not promote
+  standalone append routing without a paired attention/layout consumer or
+  integrated profile evidence that removes the added overhead.
 - This is not exact-token/integrated-benchmark accepted and is not a default
   backend.
 
@@ -762,6 +768,8 @@ Interim ABI validation:
 - ~~Add focused parity test against the canonical `update_kv_cache` path~~
 - ~~Add local CUDA/JAX FFI FP32 `kv_append_paged_nhd` smoke kernel~~
 - ~~Add focused CUDA parity test against the pure-JAX NHD append reference~~
+- ~~Route local FP32 append through `write_kv` behind an opt-in flag~~
+- ~~Run live integrated attempt and record rejection of standalone append routing~~
 
 Commit 6:
 

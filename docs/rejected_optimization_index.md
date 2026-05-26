@@ -52,6 +52,7 @@ but lost integrated correctness or performance.
 | [067](optimization_logbook.md#entry-067---rejected-rectangular-local-math-split-reconstruction) | Rectangular local-math split reconstruction | No | Local math `~1e-6`, final state failed | Reject | Rectangular shape did not fix split-boundary drift. |
 | [069](optimization_logbook.md#entry-069---rejected-one-piece-gdn-pallas-vblock64-compile-gate) | One-piece GDN Pallas vblock64 compile gate | Reduced shape yes; full hetero8 did not compile in time | Full shape spent `>10 min` compiling with no artifact | Reject as serving candidate | One-piece parity surface needs a compile-manageable backend design. |
 | [070](optimization_logbook.md#entry-070---rejected-flashinfer-kv-append-under-fp32-cache-contract) | FlashInfer KV append under FP32 cache contract | No full server artifact | Failed during warmup before timing; FlashInfer append dispatcher does not support FP32 cache tensors | Reject under current dtype contract | Do not cast KV cache to BF16 just to use an external kernel; use a FP32-capable kernel or make a separate dtype-policy decision. |
+| [071](optimization_logbook.md#entry-071---rejected-standalone-fp32-cuda-kv-append-routing) | Standalone FP32 CUDA KV append routing | Yes | `193.62 tok/s`, `0.526x` Entry 045; ITL p50 `31.43 ms` | Reject as serving optimization | Repo-owned FP32 FFI works, but a standalone cache-write custom call regresses without a paired attention/layout consumer. |
 
 ## MTP Status
 

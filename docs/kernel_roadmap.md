@@ -53,8 +53,9 @@ kv_append_paged_nhd(
   an explicit dtype-policy change.
 - current FP32 status: a local CUDA/JAX FFI append smoke kernel now preserves
   the FP32 cache contract and matches the NHD reference in a focused CUDA test.
-  It remains an unrouted prototype until exact-token and integrated benchmark
-  gates pass.
+  Routed standalone append preserved exact hetero8 generated tokens, but
+  regressed integrated throughput to `193.62 tok/s`; keep it as a toolchain
+  smoke proof, not a serving candidate.
 
 ## P0.2 - `paged_decode_attention_gqa_nhd`
 

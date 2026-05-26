@@ -197,6 +197,7 @@ def _validate_fp32_kv_append_inputs(
     kv_indices: jnp.ndarray,
     kv_indptr: jnp.ndarray,
     kv_last_page_len: jnp.ndarray,
+    valid_mask: jnp.ndarray | None = None,
 ) -> None:
     if append_key.dtype != jnp.float32 or append_value.dtype != jnp.float32:
         raise ValueError("append_key and append_value must be float32")
@@ -236,6 +237,73 @@ def _validate_fp32_kv_append_inputs(
         )
     if kv_indices.ndim != 1 or kv_indptr.ndim != 1 or kv_last_page_len.ndim != 1:
         raise ValueError("page metadata tensors must be rank-1")
+    if valid_mask is not None:
+        if valid_mask.dtype != jnp.int32:
+            raise ValueError("valid_mask must have dtype int32")
+        if valid_mask.shape != (nnz_tokens,):
+            raise ValueError("valid_mask must have shape [nnz_tokens]")
+
+
+def _kv_append_paged_nhd_fp32_call(
+    append_key: Any,
+    append_value: Any,
+    batch_indices: Any,
+    positions: Any,
+    k_cache: Any,
+    v_cache: Any,
+    kv_indices: Any,
+    kv_indptr: Any,
+    kv_last_page_len: Any,
+    valid_mask: Any | None = None,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    append_key = _as_jax_array("append_key", append_key)
+    append_value = _as_jax_array("append_value", append_value)
+    batch_indices = _as_jax_array("batch_indices", batch_indices)
+    positions = _as_jax_array("positions", positions)
+    k_cache = _as_jax_array("k_cache", k_cache)
+    v_cache = _as_jax_array("v_cache", v_cache)
+    kv_indices = _as_jax_array("kv_indices", kv_indices)
+    kv_indptr = _as_jax_array("kv_indptr", kv_indptr)
+    kv_last_page_len = _as_jax_array("kv_last_page_len", kv_last_page_len)
+    valid_mask = (
+        None if valid_mask is None else _as_jax_array("valid_mask", valid_mask)
+    )
+    _validate_fp32_kv_append_inputs(
+        append_key,
+        append_value,
+        batch_indices,
+        positions,
+        k_cache,
+        v_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+        valid_mask,
+    )
+    _register_kv_append_target()
+    call = jax.ffi.ffi_call(
+        _TARGET_KV_APPEND,
+        (
+            jax.ShapeDtypeStruct(k_cache.shape, k_cache.dtype),
+            jax.ShapeDtypeStruct(v_cache.shape, v_cache.dtype),
+        ),
+        has_side_effect=True,
+        input_output_aliases={4: 0, 5: 1},
+    )
+    args = (
+        append_key,
+        append_value,
+        batch_indices,
+        positions,
+        k_cache,
+        v_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+    )
+    if valid_mask is not None:
+        args = (*args, valid_mask)
+    return call(*args)
 
 
 def kv_append_paged_nhd_fp32(
@@ -251,16 +319,7 @@ def kv_append_paged_nhd_fp32(
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Append FP32 K/V into an NHD paged cache using a local CUDA FFI kernel."""
 
-    append_key = _as_jax_array("append_key", append_key)
-    append_value = _as_jax_array("append_value", append_value)
-    batch_indices = _as_jax_array("batch_indices", batch_indices)
-    positions = _as_jax_array("positions", positions)
-    k_cache = _as_jax_array("k_cache", k_cache)
-    v_cache = _as_jax_array("v_cache", v_cache)
-    kv_indices = _as_jax_array("kv_indices", kv_indices)
-    kv_indptr = _as_jax_array("kv_indptr", kv_indptr)
-    kv_last_page_len = _as_jax_array("kv_last_page_len", kv_last_page_len)
-    _validate_fp32_kv_append_inputs(
+    return _kv_append_paged_nhd_fp32_call(
         append_key,
         append_value,
         batch_indices,
@@ -271,26 +330,69 @@ def kv_append_paged_nhd_fp32(
         kv_indptr,
         kv_last_page_len,
     )
-    _register_kv_append_target()
-    call = jax.ffi.ffi_call(
-        _TARGET_KV_APPEND,
-        (
-            jax.ShapeDtypeStruct(k_cache.shape, k_cache.dtype),
-            jax.ShapeDtypeStruct(v_cache.shape, v_cache.dtype),
-        ),
-        has_side_effect=True,
-        input_output_aliases={4: 0, 5: 1},
+
+
+def _static_int(value: Any, name: str) -> int:
+    try:
+        return int(value)
+    except Exception as exc:
+        raise ValueError(f"{name} must be a static Python integer") from exc
+
+
+def _kv_last_page_len(seq_lens: jnp.ndarray, page_size: int) -> jnp.ndarray:
+    seq_lens = seq_lens.astype(jnp.int32)
+    return jnp.where(
+        seq_lens > 0,
+        ((seq_lens - 1) % jnp.asarray(page_size, dtype=jnp.int32)) + 1,
+        0,
+    ).astype(jnp.int32)
+
+
+def kv_append_paged_nhd_fp32_from_metadata(
+    k: jnp.ndarray,
+    v: jnp.ndarray,
+    k_cache_layer: jnp.ndarray,
+    v_cache_layer: jnp.ndarray,
+    metadata: Any,
+    *,
+    page_size: int,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Append rectangular scheduled FP32 K/V tensors using ragged metadata."""
+
+    if metadata.positions is None:
+        raise ValueError("metadata.positions is required for CUDA FP32 KV append")
+
+    num_tokens = _static_int(k.shape[0] * k.shape[1], "scheduled token count")
+    if num_tokens == 0:
+        return k_cache_layer, v_cache_layer
+
+    batch, query_len = k.shape[:2]
+    query_lens = jnp.diff(metadata.query_start_loc).astype(jnp.int32)
+    valid_mask = jnp.arange(query_len, dtype=jnp.int32)[None, :] < query_lens[:, None]
+    row_idx = jnp.repeat(jnp.arange(batch, dtype=jnp.int32), query_len)
+    col_idx = jnp.tile(jnp.arange(query_len, dtype=jnp.int32), batch)
+    append_key = k[row_idx, col_idx]
+    append_value = v[row_idx, col_idx]
+    batch_indices = row_idx.astype(jnp.int32)
+    positions = metadata.positions[row_idx, col_idx].astype(jnp.int32)
+    max_pages_per_sequence = metadata.block_tables.shape[1]
+    kv_indices = metadata.block_tables.reshape(-1).astype(jnp.int32)
+    kv_indptr = (
+        jnp.arange(batch + 1, dtype=jnp.int32)
+        * jnp.asarray(max_pages_per_sequence, dtype=jnp.int32)
     )
-    return call(
+    kv_last_page_len = _kv_last_page_len(metadata.seq_lens, page_size)
+    return _kv_append_paged_nhd_fp32_call(
         append_key,
         append_value,
         batch_indices,
         positions,
-        k_cache,
-        v_cache,
+        k_cache_layer,
+        v_cache_layer,
         kv_indices,
         kv_indptr,
         kv_last_page_len,
+        valid_mask.reshape(-1).astype(jnp.int32),
     )
 
 
