@@ -1790,3 +1790,41 @@ Decision:
 - Reject and revert prepacked MLP gate/up compact prefill. The intended compact CUTLASS bucket did move in the right direction, but the larger packed parameter leaf and altered compiled plan increased device execution, command-buffer update time, and host synchronization enough to lose badly end to end.
 - Do not add persistent packed MLP gate/up weights for serving in this form. Any future compact projection fusion should avoid duplicating large weight leaves and should verify that `PjRt Execute`, `command_buffer::update`, and host sync stay flat before considering the compact GEMM win meaningful.
 - Next model-side candidates remain HLO-guided attention/KV layout or a lower-level compact projection kernel that does not expand the model parameter tree.
+
+## Entry 051 - Rejected GPU Flat KV Cache Layout
+
+- run id: `20260526-031933-2100265-jax_hetero8_64_512x32_gpu_flat_kv_cache`
+- benchmark artifact: `results/qwen08_jax_server_trace_hetero8_64_512x32_gpu_flat_kv_cache.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-031933-2100265-jax_hetero8_64_512x32_gpu_flat_kv_cache`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-031933-2100265-jax_hetero8_64_512x32_gpu_flat_kv_cache/plugins/profile/2026_05_26_03_20_25/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-031933-2100265-jax_hetero8_64_512x32_gpu_flat_kv_cache/plugins/profile/2026_05_26_03_20_25/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- HLO probe artifact: `/mountpoint/.exp/tmp/hlo/flat_vs_block_kv_hlo_summary.json`
+- change tested: a temporary `NANO_VLLM_JAX_GPU_FLAT_KV_CACHE=1` path made the GPU backend allocate full-attention KV as `[layers, slots, kv_heads, head_dim]` instead of `[layers, blocks, block_size, kv_heads, head_dim]`. The existing `update_kv_cache`, `paged_attention_prefill`, and `paged_attention_decode` functions already support this flat rank-4 layout, so the experiment tested whether removing block-to-flat reshapes at the backend boundary helped without changing attention math. The source change was reverted after profiling.
+- HLO precheck: lowering `paged_attention_prefill`, `paged_attention_decode`, and `update_kv_cache` for Entry 045 shapes showed unchanged prefill/decode attention structure (`gather`, `transpose`, and `dot` counts tied), but the KV write lowering dropped from `22` to `16` reshape mentions for the flat layout.
+- focused CUDA checks: with `NANO_VLLM_JAX_GPU_FLAT_KV_CACHE=1`, `tests/test_backend_boundaries.py::test_gpu_flat_kv_cache_matches_block_layout`, `tests/test_backend_boundaries.py::test_bucketed_prefill_last_logits_match_exact_prefill`, `tests/test_backend_boundaries.py::test_executor_jit_matches_eager_cached_decode`, `tests/test_backend_boundaries.py::test_ragged_prefill_and_padded_multiseq_decode_match_dense_recompute`, and `tests/test_lm_head_helpers.py` passed under `JAX_PLATFORMS=cuda` (`7 passed`).
+- correctness: exact generated-token match for all 8 rows against the Entry 045 chunk-32 reference.
+- JAX timing: `251.63 tok/s`, TTFT p50 `529.98 ms`, ITL p50 `15.56 ms`, ITL p95 `16.45 ms`.
+- delta vs Entry 045 chunk-32 default repeat: `0.684x` total tok/s, TTFT p50 `1.828x`, ITL p50 `1.184x`, ITL p95 `1.210x`.
+
+Top trace ranges, total inclusive time:
+
+| range | Entry 045 ms | flat KV ms | note |
+| --- | ---: | ---: | --- |
+| `generate_with_trace` | 696.03 | 1017.36 | overall much slower |
+| `_run_main_and_sample` | 572.99 | 891.14 | runner hot path much slower |
+| `forward_step_token_ids_jit` | 122.13 | 141.39 | compiled token-id path slower |
+| `PjRtCApiLoadedExecutable::Execute` | 138.32 over 252 calls | 154.75 over 252 calls | same dispatch count, heavier device execution |
+| `jit_compiled:XLA GPU module` | 94.20 | 105.15 | module time regressed |
+| `command_buffer::execute` | 40.34 over 1143 calls | 42.04 over 1143 calls | same count, slightly heavier execution |
+| `command_buffer::update` | 27.13 over 248 calls | 31.15 over 248 calls | heavier updates |
+| `gather` | 11.97 | 12.83 | worse |
+| `transpose` | 63.11 | 63.26 | unchanged |
+| `wrapped_concatenate` | 36.50 over 576 calls | 36.47 over 576 calls | unchanged |
+| `MemcpyD2D` | 24.69 over 1231 calls | 24.64 over 1232 calls | unchanged |
+| `array.py:325 tolist` | 437.58 | 735.23 | host sync attribution much worse |
+| `np.asarray(jax.Array)` | 437.35 | 734.95 | host sync attribution much worse |
+
+Decision:
+
+- Reject and revert GPU flat KV cache allocation. The HLO write-side simplification was real but too small; the integrated server trace regressed device execution, command-buffer updates, gather time, and host synchronization.
+- Do not pursue flat rank-4 KV layout as a standalone optimization. A future backend-owned KV layout should only be revisited when paired with a real attention kernel that consumes the new physical layout directly; reshaping the existing pure-JAX paged attention boundary is insufficient.
