@@ -29,11 +29,12 @@ optimization work starts.
    vLLM for missing vLLM references and live `gpu_paged_default` for missing
    JAX default references. `--require-stored-references` remains an explicit
    opt-in gate when live fallback is not acceptable.
-8. Parity targets are staged. The active no-kernel target remains
-   `gpu_paged_default >= 0.75x` vLLM on the long heterogeneous vLLM-style
-   benchmark. Once that gate is met without custom kernels, the kernel phase
-   should target at least `0.9x` vLLM on the same benchmark discipline before
-   MTP speed work is considered.
+8. Parity targets are staged. The no-kernel `gpu_paged_default >= 0.75x` vLLM
+   gate on the long heterogeneous vLLM-style benchmark is now met by the
+   accepted 2026-05-26 goal-target artifact. The next active serving target is
+   a correctness-gated kernel-backed path at `>=0.9x` vLLM on the same
+   benchmark discipline. MTP speed work remains out of scope until the
+   non-speculative kernel path meets that bar.
 9. The existing `long_prefill_512_2048` workload is a valid exact-token,
    shape-synthetic gate, but it is not enough for an external vLLM-style
    workload claim. Add a sidecar lane that follows vLLM benchmark conventions:
@@ -56,12 +57,12 @@ documentation/configuration-first:
    workload has no stored local artifact, run the missing comparison live when a
    GPU and dependency stack are available, then store that artifact for future
    comparisons.
-5. Do not start MTP speed work until the non-speculative long heterogeneous
-   target is speed-claim-ready and reaches at least `0.75x` vLLM.
-6. After the no-kernel target reaches `0.75x` vLLM on the vLLM-style benchmark,
-   raise the active kernel-phase goal to `0.9x` vLLM. The `0.9x` target should
-   apply only to correctness-gated kernel-backed serving paths, not to MTP
-   speculative decoding.
+5. Treat the no-kernel long heterogeneous `0.75x` vLLM target as achieved by
+   `results/gpu_matrix_20260526_141130.json`: two repeats, exact generated-token
+   parity, full profile-counter coverage, and `0.764x` vLLM.
+6. The active kernel-phase goal is now `0.9x` vLLM. The `0.9x` target applies
+   only to correctness-gated kernel-backed non-speculative serving paths, not to
+   MTP speculative decoding.
 7. Before treating `0.75x` or `0.9x` as an externally comparable vLLM-benchmark
    claim, run the new vLLM-style diverse sidecar as well as the existing
    exact-token long-prefill gate. The current repeated-seed prompt suite remains
@@ -455,6 +456,26 @@ end-to-end throughput.
   path to `popleft()` and skipping non-speculative MTP admission bookkeeping did
   not beat the text-cleanup run in the integrated goal-target matrix, so those
   changes were not kept.
+- Rejected local workload-envelope probe: adding a `1536` prefill bucket was
+  exact but slower (`85.29 tok/s`) and was not kept.
+- Local envelope probe result: lowering only `max_blocks_per_seq` to `129` was
+  exact but marginal (`86.43 tok/s`). The accepted form pairs
+  `max_blocks_per_seq=129` with `num_kvcache_blocks=384`, which better matches
+  the long-target request envelope while preserving correctness.
+- Accepted no-kernel `0.75x` target closure:
+  `results/gpu_matrix_20260526_141130.json` and
+  `results/gpu_matrix_20260526_141130.md`. The change keeps the benchmark trace
+  text-materialization cleanup, adds a direct-row hybrid-state fast path for the
+  common static-slot case, and tightens the long-target KV/block-table envelope
+  to `num_kvcache_blocks=384` and `max_blocks_per_seq=129`. The two-repeat
+  goal-target matrix is speed-claim-ready with exact generated-token parity,
+  JAX median `88.91 tok/s`, vLLM `116.37 tok/s`, and JAX/vLLM `0.764x`, clearing
+  the `0.75x` gate.
+- Updated parity ladder: the no-kernel/non-speculative default has now cleared
+  the staged `0.75x` gate. The next active target is `0.9x` vLLM for
+  correctness-gated kernel-backed non-speculative serving on the same
+  long-prefill/vLLM-style benchmark discipline. MTP remains diagnostic-only
+  until that kernel target is met or explicitly reprioritized.
 
 ## Phase 2 - Kernel Roadmap
 

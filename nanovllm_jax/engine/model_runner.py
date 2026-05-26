@@ -1405,6 +1405,19 @@ class CanonicalModelRunner:
             if batch.seq_ids_host is not None
             else [int(seq_id) for seq_id in batch.seq_ids.tolist()]
         )
+        if (
+            self._hybrid_state_table.conv_state is not None
+            and self._hybrid_state_table.recurrent_state is not None
+            and len(seq_ids) == self._hybrid_state_table.conv_state.shape[0]
+        ):
+            direct_slots = True
+            for row, seq_id in enumerate(seq_ids):
+                if seq_id < 0 or self._hybrid_slots.get(int(seq_id)) != row:
+                    direct_slots = False
+                    break
+            if direct_slots:
+                batch.hybrid_slot_ids_host = tuple(range(len(seq_ids)))
+                return self._hybrid_state_table
         slot_allocations = [
             self._assign_hybrid_slot(int(seq_id), preferred_slot=row)
             for row, seq_id in enumerate(seq_ids)

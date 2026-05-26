@@ -3573,3 +3573,103 @@ Decision:
 - Keep the scheduler metadata handoff change as the current accepted default.
 - Continue looking for a small non-speculative host-sync or compiled-execution
   win before starting MTP speed work.
+
+## Entry 091 - Accepted Long-Prefill Target Closure
+
+- change accepted: the long-target workload envelope now uses
+  `num_kvcache_blocks=384` and `max_blocks_per_seq=129`, and
+  `CanonicalModelRunner._batch_hybrid_state` returns the existing hybrid-state
+  table directly when sequence ids already map one-to-one onto static hybrid
+  rows. The pure-JAX correctness backend remains selected; no custom kernels or
+  MTP are enabled.
+- motivation: Entry 090 left only a `1.30 tok/s` gap to the staged `0.75x` vLLM
+  target. The accepted envelope is sufficient for
+  `[512,1024,1536,2048] x 16` with 16-token KV blocks and avoids excess cache /
+  metadata work in the goal-target run. The hybrid-state fast path removes a
+  redundant gather/allocation path in the common static-slot case.
+- rejected probes before acceptance:
+  - adding a `1536` prefill bucket was exact but slower (`85.29 tok/s`), so it
+    was not kept.
+  - reducing only `max_blocks_per_seq` to `129` was exact but marginal
+    (`86.43 tok/s`), so it was only kept when paired with the lower KV block
+    count.
+  - switching the block-manager first-free path to `popleft()` and skipping
+    non-speculative MTP admission bookkeeping did not beat Entry 090 and was not
+    kept.
+- command:
+
+```text
+.venv/bin/python benchmarks/run_gpu_matrix.py \
+  --goal-target-only --repeats 2 --no-live-vllm \
+  --require-stored-references --require-goal-target-ready \
+  --jax-python /mountpoint/.exp/nano-vllm-jax/.venv/bin/python
+```
+
+- artifact: `results/gpu_matrix_20260526_141130.json`
+- report: `results/gpu_matrix_20260526_141130.md`
+- run directory: `results/gpu_matrix_runs/20260526_141130`
+- repeat artifacts:
+  - `results/gpu_matrix_runs/20260526_141130/long_prefill_512_2048_gpu_paged_default_repeat1.json`
+  - `results/gpu_matrix_runs/20260526_141130/long_prefill_512_2048_gpu_paged_default_repeat2.json`
+
+Goal-target result:
+
+| workload/config | repeats | exact tokens | speed-claim-ready | JAX tok/s median | vLLM tok/s | JAX/vLLM | target tok/s | gap |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `long_prefill_512_2048/gpu_paged_default` | 2 | yes | yes | `88.91` | `116.37` | `0.764x` | `87.28` | `0.00 tok/s` |
+
+Repeat details:
+
+| repeat | tok/s | TTFT p50 | ITL p50 | ITL p95 | first `forward_step_token_ids_jit` |
+|---:|---:|---:|---:|---:|---:|
+| 1 | `87.02` | `533.83 ms` | `11.85 ms` | `29.10 ms` | `225.70 ms` |
+| 2 | `90.81` | `536.43 ms` | `11.21 ms` | `11.81 ms` | `225.76 ms` |
+
+Profile movement versus the stored Entry 080 long-prefill JAX reference:
+
+| bucket | current | reference | delta | note |
+|---|---:|---:|---:|---|
+| `np.asarray(jax.Array)` | `394.91 ms / 16` | `427.55 ms / 16` | `-32.64 ms` | host-sync label lower with same count |
+| `array.py:325 tolist` | `395.04 ms / 16` | `427.68 ms / 16` | `-32.64 ms` | mirrors the host-sync attribution drop |
+| `PjRtCApiLoadedExecutable::Execute` | `273.53 ms / 44` | `289.24 ms / 140` | `-15.71 ms / -96` | keeps the reduced executable-launch class from Entry 090 |
+| `MemcpyD2D` | `18.51 ms / 463` | `30.39 ms / 655` | `-11.88 ms / -192` | tighter envelope reduces device copy traffic |
+| `forward_step_token_ids_jit` | `276.27 ms / 16` | `280.56 ms / 16` | `-4.28 ms` | decode step slightly lower |
+| `command_buffer::execute` | `225.93 ms / 1936` | `229.21 ms / 1936` | `-3.28 ms` | same command count, lower time |
+| `transpose` | `45.06 ms / 312` | `47.30 ms / 312` | `-2.24 ms` | same count, lower time |
+| `command_buffer::update` | `10.68 ms / 180` | `10.46 ms / 195` | `+0.22 ms / -15` | fewer updates, slightly higher total |
+
+Validation:
+
+```text
+.venv/bin/python -m py_compile \
+  benchmarks/run_gpu_matrix.py \
+  nanovllm_jax/engine/model_runner.py
+
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest -q \
+  tests/test_gpu_matrix_runner.py \
+  tests/test_gpu_matrix_summary_report.py
+```
+
+- result: `43 passed`.
+
+Interpretation:
+
+- This closes the staged no-kernel/non-speculative target. The accepted default
+  is speed-claim-ready for the exact-token long-prefill gate and reaches
+  `0.764x` of the stored vLLM reference without custom kernels.
+- The remaining gap is no longer a reason to keep doing small source-level JAX
+  cleanup before kernel work. The next active target is `0.9x` vLLM for a
+  correctness-gated kernel-backed non-speculative path on the same benchmark
+  discipline.
+- MTP remains diagnostic-only. It should not be optimized for speed until the
+  non-speculative kernel path meets the staged kernel target or the goal is
+  explicitly changed.
+
+Decision:
+
+- Keep this as the current accepted no-kernel default for the long heterogeneous
+  target.
+- Move the next performance target to the kernel roadmap: paged KV append,
+  paged decode attention, then GDN decode/prefill, with exact-token and profile
+  gates unchanged.

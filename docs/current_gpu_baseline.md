@@ -52,15 +52,35 @@ optimization plan in `docs/gpu_optimization_next_goal_plan.md`.
   `results/qwen08_vllm_async_delta_baseline_hetero8_64_512x32.json`
 - vLLM async throughput: `864.18 tok/s`
 - JAX/vLLM throughput ratio: `0.426x`
-- target ratio for this plan: `>=0.75x` on long heterogeneous mixed-shape
-  requests before moving to MTP speed work
-- staged kernel target: after the no-kernel default reaches `>=0.75x` vLLM on
-  the vLLM-style benchmark, correctness-gated kernel-backed serving should
-  target `>=0.9x` vLLM before MTP speed work is promoted
+- no-kernel target status: achieved on the long heterogeneous mixed-shape
+  goal-target artifact below
+- active staged kernel target: correctness-gated kernel-backed non-speculative
+  serving should target `>=0.9x` vLLM before MTP speed work is promoted
 - benchmark caveat: the existing long-prefill target is an exact-token
   shape-synthetic gate based on repeated tokenized seed prompts. A vLLM-style
   random/custom-manifest sidecar should be run before making broader benchmark
   comparability claims.
+
+## Current Long-Prefill Goal Target
+
+- artifact: `results/gpu_matrix_20260526_141130.json`
+- report: `results/gpu_matrix_20260526_141130.md`
+- benchmark: `long_prefill_512_2048/gpu_paged_default`
+- benchmark shape: input lengths `[512,1024,1536,2048]`, output length `16`
+- repeats: `2`
+- exact generated-token parity: yes
+- speed-claim-ready: yes
+- JAX throughput median: `88.91 tok/s`
+- vLLM stored reference: `116.37 tok/s`
+- JAX/vLLM throughput ratio: `0.764x`
+- no-kernel target: `0.75x` vLLM, met
+- accepted long-target scheduler envelope:
+  - `num_kvcache_blocks=384`
+  - `max_blocks_per_seq=129`
+
+The next default-path target is no longer another no-kernel `0.75x` closure. It
+is `>=0.9x` vLLM for a correctness-gated kernel-backed non-speculative serving
+path, while MTP remains diagnostic-only.
 
 ## Enabled Accepted Fast Flags
 
