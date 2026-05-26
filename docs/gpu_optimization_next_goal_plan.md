@@ -273,6 +273,11 @@ end-to-end throughput.
   exits nonzero unless that specific long heterogeneous non-speculative target
   is present, correctness-gated, profile-covered, and at/above the target
   throughput ratio.
+- `--goal-target-only` selects exactly `long_prefill_512_2048/gpu_paged_default`
+  regardless of the generic `--configs`/`--workloads` defaults. The intended
+  final non-speculative benchmark command should combine it with
+  `--require-goal-target-ready` and, when stable local references are required,
+  `--require-stored-references`.
 - Comparison rows now include the concrete throughput target and remaining gap:
   `target_tokens_per_second`, `tokens_per_second_gap_to_target`, and
   `required_jax_speedup_to_target`. On the stored one-repeat long-prefill slice,

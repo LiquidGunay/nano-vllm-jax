@@ -127,6 +127,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-live-vllm", dest="live_vllm", action="store_false", default=True)
     parser.add_argument(
+        "--goal-target-only",
+        action="store_true",
+        help=(
+            "Run only the final non-speculative goal target "
+            f"{FINAL_TARGET_WORKLOAD}/{FINAL_TARGET_CONFIG}."
+        ),
+    )
+    parser.add_argument(
         "--require-speed-claim-ready",
         action="store_true",
         help=(
@@ -166,6 +174,12 @@ def parse_args() -> argparse.Namespace:
 
 def _parse_names(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _selected_matrix_names(args: argparse.Namespace) -> tuple[list[str], list[str]]:
+    if args.goal_target_only:
+        return [FINAL_TARGET_CONFIG], [FINAL_TARGET_WORKLOAD]
+    return _parse_names(args.configs), _parse_names(args.workloads)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -853,8 +867,7 @@ def main() -> None:
     vllm_is_available = _vllm_available(vllm_python)
     run_dir.mkdir(parents=True, exist_ok=True)
     output_json.parent.mkdir(parents=True, exist_ok=True)
-    selected_configs = _parse_names(args.configs)
-    selected_workloads = _parse_names(args.workloads)
+    selected_configs, selected_workloads = _selected_matrix_names(args)
     configs = {name: _load_json(CONFIG_DIR / f"{name}.json") for name in selected_configs}
     workloads = {name: WORKLOADS[name] for name in selected_workloads}
     reference_dir = run_dir / "references"

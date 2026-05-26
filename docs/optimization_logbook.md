@@ -3350,3 +3350,40 @@ Decision:
 
 - Keep these fields as reporting-only evidence. They do not relax exact-token,
   repeat, latency, profile, or final target gates.
+
+## Entry 087 - Goal Target Matrix Selector
+
+- change accepted: `benchmarks/run_gpu_matrix.py --goal-target-only` now selects
+  exactly `long_prefill_512_2048/gpu_paged_default`, ignoring the generic
+  multi-config/multi-workload defaults.
+- motivation: the final benchmark for this thread is not the full exploratory
+  matrix. It is the non-speculative default server on the long heterogeneous
+  mixed-shape workload. This selector makes the eventual GPU command harder to
+  mis-target.
+- focused tests:
+
+```text
+.venv/bin/python -m pytest tests/test_gpu_matrix_runner.py -q
+```
+
+- result: `27 passed`.
+- dry-run verification:
+
+```text
+.venv/bin/python benchmarks/run_gpu_matrix.py \
+  --goal-target-only \
+  --configs gpu_paged_default,gpu_mtp_diagnostics \
+  --workloads hetero8,decode_heavy_128x128 \
+  --repeats 2 --dry-run --no-live-vllm \
+  --output-json /mountpoint/.exp/tmp/gpu_matrix_goal_target_only_dry_run.json
+```
+
+- result: the summary narrowed to `configs=["gpu_paged_default"]` and
+  `workloads=["long_prefill_512_2048"]`, and still used the stored long-prefill
+  vLLM reference for the target throughput.
+
+Decision:
+
+- Use `--goal-target-only --require-goal-target-ready` for the final
+  non-speculative target run. Add `--require-stored-references` when the run
+  should fail instead of generating live references.

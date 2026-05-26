@@ -25,6 +25,7 @@ from benchmarks.run_gpu_matrix import (
     _find_local_vllm_reference,
     _jax_command,
     _runtime_env,
+    _selected_matrix_names,
     _stored_reference_gaps,
     _validate_summary_shape,
 )
@@ -231,6 +232,32 @@ def test_cuda_device_preflight_rejects_missing_gpu(tmp_path):
 
     assert not ok
     assert "NVIDIA-SMI has failed" in detail
+
+
+def test_selected_matrix_names_goal_target_only_overrides_matrix_selection():
+    args = SimpleNamespace(
+        goal_target_only=True,
+        configs="gpu_paged_default,gpu_mtp_diagnostics",
+        workloads="hetero8,decode_heavy_128x128",
+    )
+
+    configs, workloads = _selected_matrix_names(args)
+
+    assert configs == ["gpu_paged_default"]
+    assert workloads == ["long_prefill_512_2048"]
+
+
+def test_selected_matrix_names_uses_requested_matrix_without_goal_target_only():
+    args = SimpleNamespace(
+        goal_target_only=False,
+        configs="gpu_paged_fast_optin,gpu_mtp_diagnostics",
+        workloads="hetero8,long_prefill_512_2048",
+    )
+
+    configs, workloads = _selected_matrix_names(args)
+
+    assert configs == ["gpu_paged_fast_optin", "gpu_mtp_diagnostics"]
+    assert workloads == ["hetero8", "long_prefill_512_2048"]
 
 
 def test_configured_workload_reference_uses_workload_mapping(tmp_path):
