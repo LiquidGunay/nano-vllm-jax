@@ -2112,3 +2112,41 @@ Decision:
 - Reject and revert the triangular-solve GDN recurrence. The profile proves that replacing the row scan can reduce standalone kernel time, but the numerical state drift violates the current correctness bar before real-weight/server routing.
 - Do not expose this as an optional server or benchmark variant yet. If triangular solve is reconsidered, it needs a stronger correctness plan first, including real-weight layerwise parity, long-decode top-5 logits, and exact generated-token checks.
 - Continue with Kierkegaard's recommendation: the next viable speed path is a backend-owned segmented/lowered GDN prefill candidate that preserves the current padded chunk32 outputs/final states within `1e-5` and beats p50 `6.477 ms` without command-buffer/kernel-count growth.
+
+## Entry 059 - Rejected Pallas GDN Chunk Recurrence
+
+- run id: `20260526-045422-2149962-gdn_prefill_kernel_pallas_recurrence_hetero8_64_512x32`
+- benchmark artifact: `results/gdn_prefill_kernel_pallas_recurrence_hetero8_64_512x32.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-045422-2149962-gdn_prefill_kernel_pallas_recurrence_hetero8_64_512x32`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-045422-2149962-gdn_prefill_kernel_pallas_recurrence_hetero8_64_512x32/plugins/profile/2026_05_26_04_54_29/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-045422-2149962-gdn_prefill_kernel_pallas_recurrence_hetero8_64_512x32/plugins/profile/2026_05_26_04_54_29/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Parfit confirmed the environment supports Pallas/Triton on A10G (`jax.experimental.pallas.triton`, Triton `3.6.0`) for kernels that avoid unsupported primitives, but warned not to promote this recurrence experiment because it fails the same correctness class as Entry 058. It recommended the next attempt be a microbenchmark-only Pallas/Triton segmented GDN prefill variant over active row chunks, and explicitly deferred standalone `triton.jit` and JAX FFI/custom-call because those add host dispatch or build-system complexity before Pallas is exhausted.
+- change tested: a temporary microbenchmark-only Pallas/Triton kernel replaced only the chunk-local GDN row recurrence while preserving the rest of the current padded chunk32 computation. The first direct-row-slice kernel failed lowering with `Unimplemented primitive in Pallas GPU lowering: slice`; the mask/select rewrite lowered successfully. An `einsum` spelling inside Pallas also failed lowering, so the profiled run used explicit elementwise multiply plus sum. The source hook was reverted after profiling.
+- smoke check: a tiny CUDA no-profile run (`B=2,H=2,T=64,K=V=16,chunk=16,lengths=32,64`) lowered and ran. It matched the current chunked path within `valid_output_max_abs=1.341e-07` and `state_max_abs=5.960e-07`.
+- full CUDA run: `JAX_PLATFORMS=cuda`, A10G, JAX `0.10.0`, FP32 activations/state, chunk size `32`, lengths `64,128,192,256,320,384,448,512`, `5` warmups, `20` measured repeats per variant.
+- timing: current padded chunk32 in the same run had p50 `6.476 ms`, mean `6.486 ms`, p95 `6.544 ms`; the Pallas recurrence candidate had p50 `5.684 ms`, mean `5.691 ms`, p95 `5.732 ms`. This is about a `1.14x` p50 speedup in the standalone GDN gate.
+- correctness: reject despite speed. The candidate missed the Entry 057 standalone gate with `valid_output_max_abs=1.907e-05` and `state_max_abs=2.136e-04` versus the current padded chunk32 reference.
+
+Top profile counters from the mixed two-variant trace:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `gdn_prefill/current_jax_chunk32_padded` | `222.06 ms / 25` | about `8.88 ms` per current call including warmup/profile overhead |
+| `gdn_prefill/pallas_recurrence_chunk32_padded` | `143.96 ms / 25` | about `5.76 ms` per candidate call including warmup/profile overhead |
+| `gdn_chunk_attn_recurrence` | `1.07 ms / 25` | Pallas custom-call range itself was small; surrounding compiled graph still dominates |
+| `PjRtCApiLoadedExecutable::Execute` | `111.81 ms / 50` | mixed current+candidate calls, about `2.24 ms` per profiled call |
+| `command_buffer::execute` | `28.15 ms / 1650` | mixed current+candidate, `33.0` calls per profiled call |
+| `command_buffer::update` | `2.51 ms / 144` | mixed current+candidate, `2.88` calls per profiled call |
+| `input_reduce_fusion` | `14.64 ms / 775` | same total count as current-only baseline across the mixed trace |
+| `loop_dynamic_update_slice_fusion` | `9.97 ms / 1575` | lower than duplicating current twice, but correctness failed |
+| `loop_multiply_fusion` | `45.65 ms / 850` | unchanged recurrence-family count per mixed call |
+| `MemcpyD2D` | `11.17 ms / 1725` | mixed copy baseline |
+| `while` | `42.59 ms / 75` | mixed loop baseline |
+| `fusion` | `171.36 ms / 11675` | broad mixed fusion baseline |
+| `transpose` | `32.96 ms / 1250` | mixed layout baseline |
+
+Decision:
+
+- Reject and revert the Pallas chunk recurrence. It confirms Pallas/Triton can reduce this part of the standalone GDN profile on A10G, but it still changes FP32 accumulation enough to miss the output and final-state gates.
+- Do not route this through `KernelBackendPlaceholder.gated_delta_prefill` or keep it as an exposed variant. The current exact padded chunk32 source path remains the only accepted GDN prefill implementation.
+- Next viable Pallas work should not replace only mathematically equivalent reductions. It should target the actual segmented active-chunk problem while preserving the current outputs/final states within `1e-5`; otherwise move to JAX FFI/custom-call only with a clear build plan and the same standalone gate.

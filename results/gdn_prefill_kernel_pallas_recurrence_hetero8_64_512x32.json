@@ -1,0 +1,254 @@
+{
+  "comparisons": {
+    "current_jax_chunk32_padded_vs_current_jax_chunk32_padded": {
+      "output_max_abs": 0.0,
+      "output_mse": 0.0,
+      "state_max_abs": 0.0,
+      "state_mse": 0.0,
+      "valid_output_max_abs": 0.0,
+      "valid_output_mse": 0.0
+    },
+    "pallas_recurrence_chunk32_padded_vs_current_jax_chunk32_padded": {
+      "output_max_abs": 1.9073486328125e-05,
+      "output_mse": 4.045628408829143e-15,
+      "state_max_abs": 0.000213623046875,
+      "state_mse": 9.0414559519858e-12,
+      "valid_output_max_abs": 1.9073486328125e-05,
+      "valid_output_mse": 7.192228752936781e-15
+    }
+  },
+  "decision": {
+    "correctness_gate_ok": false,
+    "promote_to_server_routing": false,
+    "reason": "pallas_recurrence_chunk32_padded was faster but rejected because valid_output_max_abs=1.907e-05 and state_max_abs=2.136e-04 missed the standalone correctness gate"
+  },
+  "historical_negative_controls": [
+    "Entry053 static row-chunk ragged GDN prefill",
+    "Entry056 static chunk-major GDN prefill"
+  ],
+  "pallas_feasibility": {
+    "attempted": true,
+    "custom_call_count": 25,
+    "error": null,
+    "lowering_ok": true
+  },
+  "profile_counters": {
+    "profiled_iterations": 50,
+    "ranges": {
+      "MemcpyD2D": {
+        "count": 1725,
+        "count_per_iter": 34.5,
+        "ms_per_iter": 0.22330326000000053,
+        "total_ms": 11.165163000000026
+      },
+      "PjRtCApiLoadedExecutable::Execute": {
+        "count": 50,
+        "count_per_iter": 1.0,
+        "ms_per_iter": 2.2361959200000006,
+        "total_ms": 111.80979600000002
+      },
+      "Thunks::Initialize": {
+        "count": 50,
+        "count_per_iter": 1.0,
+        "ms_per_iter": 1.11334118,
+        "total_ms": 55.667058999999995
+      },
+      "command_buffer::execute": {
+        "count": 1650,
+        "count_per_iter": 33.0,
+        "ms_per_iter": 0.5630772400000003,
+        "total_ms": 28.15386200000001
+      },
+      "command_buffer::update": {
+        "count": 144,
+        "count_per_iter": 2.88,
+        "ms_per_iter": 0.05011220000000001,
+        "total_ms": 2.5056100000000003
+      },
+      "fusion": {
+        "count": 11675,
+        "count_per_iter": 233.5,
+        "ms_per_iter": 3.427131259999976,
+        "total_ms": 171.3565629999988
+      },
+      "gdn_chunk_attn_recurrence": {
+        "count": 25,
+        "count_per_iter": 0.5,
+        "ms_per_iter": 0.021430339999999996,
+        "total_ms": 1.0715169999999998
+      },
+      "gdn_prefill/current_jax_chunk32_padded": {
+        "count": 25,
+        "count_per_iter": 0.5,
+        "ms_per_iter": 4.441188480000001,
+        "total_ms": 222.05942400000006
+      },
+      "gdn_prefill/pallas_recurrence_chunk32_padded": {
+        "count": 25,
+        "count_per_iter": 0.5,
+        "ms_per_iter": 2.87910816,
+        "total_ms": 143.955408
+      },
+      "input_reduce_fusion": {
+        "count": 775,
+        "count_per_iter": 15.5,
+        "ms_per_iter": 0.2928979599999998,
+        "total_ms": 14.644897999999989
+      },
+      "loop_dynamic_update_slice_fusion": {
+        "count": 1575,
+        "count_per_iter": 31.5,
+        "ms_per_iter": 0.19943565999999924,
+        "total_ms": 9.971782999999961
+      },
+      "loop_multiply_fusion": {
+        "count": 850,
+        "count_per_iter": 17.0,
+        "ms_per_iter": 0.91309738,
+        "total_ms": 45.654869
+      },
+      "transpose": {
+        "count": 1250,
+        "count_per_iter": 25.0,
+        "ms_per_iter": 0.6591180800000015,
+        "total_ms": 32.955904000000075
+      },
+      "while": {
+        "count": 75,
+        "count_per_iter": 1.5,
+        "ms_per_iter": 0.8518588,
+        "total_ms": 42.59294
+      }
+    },
+    "trace_json_gz": "/mountpoint/.exp/profiles/20260526-045422-2149962-gdn_prefill_kernel_pallas_recurrence_hetero8_64_512x32/plugins/profile/2026_05_26_04_54_29/INDCS0291.atrapa.deloitte.com.trace.json.gz"
+  },
+  "run": {
+    "issues": [],
+    "profile_enabled": true,
+    "profile_error": null,
+    "profile_path": "/mountpoint/.exp/profiles/20260526-045422-2149962-gdn_prefill_kernel_pallas_recurrence_hetero8_64_512x32",
+    "profile_started": false,
+    "run_id": "20260526-045422-2149962-gdn_prefill_kernel_pallas_recurrence_hetero8_64_512x32",
+    "run_label": "gdn_prefill_kernel_pallas_recurrence_hetero8_64_512x32",
+    "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+  },
+  "run_config": {
+    "active_chunks": 72,
+    "batch_size": 8,
+    "chunk_size": 32,
+    "device": "cuda:0",
+    "device_kind": "NVIDIA A10G",
+    "devices": [
+      "cuda:0"
+    ],
+    "dtype_contract": "fp32 activations/state, output cast follows current jax_chunk_gated_delta_rule",
+    "git_head": "e2b94c7",
+    "jax_backend": "gpu",
+    "jax_version": "0.10.0",
+    "key_dim": 128,
+    "lengths": [
+      64,
+      128,
+      192,
+      256,
+      320,
+      384,
+      448,
+      512
+    ],
+    "num_heads": 16,
+    "platform": "gpu",
+    "rectangular_tokens": 4096,
+    "repeats": 20,
+    "seed": 1234,
+    "seq_len": 512,
+    "total_chunks": 128,
+    "true_tokens": 2304,
+    "value_dim": 128,
+    "variants": [
+      "current_jax_chunk32_padded",
+      "pallas_recurrence_chunk32_padded"
+    ],
+    "warmups": 5
+  },
+  "variants": {
+    "current_jax_chunk32_padded": {
+      "compile_seconds": 0.21143821498844773,
+      "max_ms": 6.583509035408497,
+      "mean_ms": 6.48632695665583,
+      "min_ms": 6.451356923207641,
+      "p50_ms": 6.475741975009441,
+      "p95_ms": 6.543532089563087,
+      "rectangular_tokens_per_second": 631482.1974549035,
+      "repeat_ms": [
+        6.468326901085675,
+        6.464837002567947,
+        6.51068810839206,
+        6.469676969572902,
+        6.492957938462496,
+        6.474956986494362,
+        6.47652696352452,
+        6.462217075750232,
+        6.491567939519882,
+        6.468786974437535,
+        6.461437093093991,
+        6.506568053737283,
+        6.4795269863680005,
+        6.487218081019819,
+        6.464687059633434,
+        6.502247997559607,
+        6.4680170034989715,
+        6.583509035408497,
+        6.541428039781749,
+        6.451356923207641
+      ],
+      "true_tokens_per_second": 355208.7360683832,
+      "warmup_ms": [
+        66.2430829834193,
+        6.578139029443264,
+        6.469066953286529,
+        6.467006984166801,
+        6.478087976574898
+      ]
+    },
+    "pallas_recurrence_chunk32_padded": {
+      "compile_seconds": 2.2439112410647795,
+      "max_ms": 5.73538092430681,
+      "mean_ms": 5.690522940130904,
+      "min_ms": 5.645410041324794,
+      "p50_ms": 5.6837950251065195,
+      "p95_ms": 5.731751985149458,
+      "rectangular_tokens_per_second": 719793.249775701,
+      "repeat_ms": [
+        5.693299928680062,
+        5.662480019964278,
+        5.677081062458456,
+        5.699019995518029,
+        5.73538092430681,
+        5.681390990503132,
+        5.731560988351703,
+        5.729131982661784,
+        5.6920499773696065,
+        5.664029042236507,
+        5.684379953891039,
+        5.681390990503132,
+        5.6826400104910135,
+        5.721710971556604,
+        5.673929932527244,
+        5.677339970134199,
+        5.699040950275958,
+        5.683210096322,
+        5.645410041324794,
+        5.695980973541737
+      ],
+      "true_tokens_per_second": 404883.70299883175,
+      "warmup_ms": [
+        7.3452049400657415,
+        5.7525819865986705,
+        5.649620085023344,
+        5.6529800640419126,
+        5.660408991388977
+      ]
+    }
+  }
+}
