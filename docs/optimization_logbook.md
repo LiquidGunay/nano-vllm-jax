@@ -2076,3 +2076,39 @@ Decision:
 
 - Accept the standalone GDN prefill microbenchmark scaffold. It does not improve serving speed by itself, but it closes the measurement gap identified by Entries 053, 056, and the xhigh audits: backend-owned GDN candidates now have a narrow, reproducible CUDA gate before any model/server routing.
 - Future backend candidates must be added as explicit variants in `benchmark_gdn_prefill_kernel.py` and beat the current p50 `6.477 ms` without worsening command-buffer/module-like counters or correctness deltas. Only then should the candidate be threaded through `KernelBackendPlaceholder.gated_delta_prefill` and tested in the full hetero8 server path.
+
+## Entry 058 - Rejected GDN Triangular-Solve Recurrence
+
+- run id: `20260526-044522-2145908-gdn_prefill_kernel_triangular_hetero8_64_512x32`
+- benchmark artifact: `results/gdn_prefill_kernel_triangular_hetero8_64_512x32.json`
+- profile directory: `/mountpoint/.exp/profiles/20260526-044522-2145908-gdn_prefill_kernel_triangular_hetero8_64_512x32`
+- Perfetto trace: `/mountpoint/.exp/profiles/20260526-044522-2145908-gdn_prefill_kernel_triangular_hetero8_64_512x32/plugins/profile/2026_05_26_04_45_29/INDCS0291.atrapa.deloitte.com.trace.json.gz`
+- TensorBoard xplane: `/mountpoint/.exp/profiles/20260526-044522-2145908-gdn_prefill_kernel_triangular_hetero8_64_512x32/plugins/profile/2026_05_26_04_45_29/INDCS0291.atrapa.deloitte.com.xplane.pb`
+- subagent audit: Kierkegaard ranked GDN prefill as the best next target, decode kernels and LM-head/source-level token-id work as lower-confidence, and attention/KV layout as too risky without a backend kernel that owns write/layout/attention together. The recommended next experiment remains a backend-owned segmented/lowered chunk32 GDN prefill path that consumes lengths or a valid-chunk mask inside the operation and processes only the `72` active chunks, not another JAX-side segmented scan.
+- change tested: a temporary microbenchmark-only variant replaced the chunk-local HF row recurrence with a batched triangular solve for `(I - A)^-1`, where `A` is the strictly lower intra-chunk attention correction matrix. This was not routed through the server path and the source hook was reverted after profiling.
+- full CUDA run: `JAX_PLATFORMS=cuda`, A10G, JAX `0.10.0`, FP32 activations/state, chunk size `32`, lengths `64,128,192,256,320,384,448,512`, `5` warmups, `20` measured repeats per variant.
+- timing: current padded chunk32 in the same run had p50 `6.506 ms`, mean `6.591 ms`, p95 `6.702 ms`; the triangular-solve candidate had p50 `5.799 ms`, mean `5.809 ms`, p95 `5.883 ms`. That is a real standalone speed win, about `1.12x` by p50.
+- correctness: reject despite speed. The candidate missed the Entry 057 standalone gate with `valid_output_max_abs=1.335e-05` and `state_max_abs=2.441e-04` versus the current padded chunk32 reference. Given the earlier real-weight drift standard, a single-layer final-state delta above `1e-4` is not acceptable without much stronger long-decode/logit evidence, so it should not be promoted.
+
+Top profile counters from the mixed two-variant trace:
+
+| range | total ms / count | note |
+| --- | ---: | --- |
+| `gdn_prefill/current_jax_chunk32_padded` | `231.92 ms / 25` | profile annotation about `9.28 ms` per current call including warmup/profile overhead |
+| `gdn_prefill/triangular_solve_chunk32_padded` | `159.40 ms / 25` | about `6.38 ms` per candidate call including warmup/profile overhead |
+| `PjRtCApiLoadedExecutable::Execute` | `137.86 ms / 50` | mixed current+candidate calls, about `2.76 ms` per profiled call |
+| `command_buffer::execute` | `30.26 ms / 1675` | mixed current+candidate, `33.5` calls per profiled call |
+| `command_buffer::update` | `3.02 ms / 168` | mixed current+candidate, `3.36` calls per profiled call |
+| `input_reduce_fusion` | `14.65 ms / 775` | same total count as current-only baseline across the mixed trace |
+| `loop_dynamic_update_slice_fusion` | `10.23 ms / 1575` | lower than duplicating current twice, but correctness failed |
+| `loop_multiply_fusion` | `45.70 ms / 850` | unchanged recurrence-family count per mixed call |
+| `MemcpyD2D` | `12.62 ms / 1775` | mixed copy baseline |
+| `while` | `45.37 ms / 75` | mixed loop baseline |
+| `fusion` | `173.76 ms / 11750` | broad mixed fusion baseline |
+| `transpose` | `34.42 ms / 1325` | mixed layout baseline |
+
+Decision:
+
+- Reject and revert the triangular-solve GDN recurrence. The profile proves that replacing the row scan can reduce standalone kernel time, but the numerical state drift violates the current correctness bar before real-weight/server routing.
+- Do not expose this as an optional server or benchmark variant yet. If triangular solve is reconsidered, it needs a stronger correctness plan first, including real-weight layerwise parity, long-decode top-5 logits, and exact generated-token checks.
+- Continue with Kierkegaard's recommendation: the next viable speed path is a backend-owned segmented/lowered GDN prefill candidate that preserves the current padded chunk32 outputs/final states within `1e-5` and beats p50 `6.477 ms` without command-buffer/kernel-count growth.
