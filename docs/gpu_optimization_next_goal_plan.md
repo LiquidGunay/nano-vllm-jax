@@ -819,6 +819,13 @@ previous Pallas regressions, it should not be the first production path for GDN.
   recurrent rule while preserving the local canonical state layout
   `[B,HV,K,V]`. CUDA-gated focused tests cover same-head, GVA q/k repetition,
   and k-last state roundtrip; they are skipped in CPU-only/no-JAX environments.
+- External GDN reference audit confirms this packed decode boundary is the next
+  smallest viable non-design-changing target. vLLM/FLA's natural Qwen GDN state
+  layout is k-last/V-first `[*,HV,V,K]`, and the vLLM/FLA prefill path is
+  BF16-activation oriented. Do not switch persistent state layout, prefill
+  activation dtype, or scheduler state-slot semantics without an explicit user
+  design decision. The next local implementation target should be an opt-in
+  FP32 packed GDN decode core that preserves nano's `[B,HV,K,V]` state.
 
 ### Acceptance Gate
 
@@ -1231,6 +1238,8 @@ Commit 7:
 - ~~First isolated tests~~
 - ~~Add vLLM-style packed GDN decode ABI reference while preserving local
   `[B,H,K,V]` state layout~~
+- ~~Audit vLLM/FLA GDN references and record that packed decode with local
+  state is the smallest non-design-changing next target~~
 - ~~Route through `gated_delta_decode` behind an opt-in flag~~
 - ~~Run integrated decode benchmark and record rejection of standalone GDN
   decode routing~~

@@ -141,6 +141,10 @@ gdn_recurrent_decode_step(
   first integrated hetero8 run preserved exact tokens while regressing
   throughput/ITL. Keep this route default-off as a diagnostic; do not treat a
   standalone width-1 recurrence custom call as an accepted serving kernel.
+- external-audit status: vLLM/FLA Qwen GDN uses k-last/V-first recurrent state
+  and BF16-oriented prefill activations. The next non-design-changing target is
+  a packed FP32 decode core that borrows vLLM's `mixed_qkv + a/b/A_log/dt_bias`
+  boundary while preserving nano's local `[B,H,K,V]` persistent state.
 
 ## P1.2 - `gdn_segmented_prefill_chunk32`
 

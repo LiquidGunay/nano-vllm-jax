@@ -3925,3 +3925,19 @@ JAX_PLATFORMS=cuda \
 - decision: keep the `2e-5` bound. This evidence does not authorize the packed
   segmented GDN override path; it either needs a candidate that passes the bound
   or an explicit threshold decision.
+
+### Entry 096 - External GDN reference audit
+
+- audit source: subagent review of vLLM Qwen GDN and Flash Linear Attention
+  Gated DeltaNet references.
+- finding: vLLM's Qwen GDN path naturally uses k-last/V-first recurrent state
+  (`[*,HV,V,K]`) and a state-slot/index model, while nano's serving state is
+  `[B,H,K,V]`.
+- dtype finding: the vLLM/FLA prefill path is BF16-activation oriented even when
+  state math/cache can be FP32. That does not match the current BF16
+  weights/FP32 activation contract.
+- decision: do not silently adopt vLLM/FLA state layout, BF16 prefill
+  activations, or state-slot scheduler semantics. The next non-design-changing
+  GDN target is an opt-in FP32 packed decode core that borrows vLLM's packed
+  `mixed_qkv + a/b/A_log/dt_bias` boundary while preserving nano's local
+  `[B,H,K,V]` persistent state.
