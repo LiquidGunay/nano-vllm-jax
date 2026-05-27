@@ -4830,3 +4830,33 @@ NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1 JAX_PLATFORMS=cuda ... .venv/bin/python bench
 - result: `py_compile` passed; focused elevated GPU test passed `4 passed`;
   integrated target run completed, was exact, and produced the fastest local
   default-off marker so far.
+
+### Entry 128 - Rejected Stacked Device-Token Materialization
+
+- change tested: grouped the default-off device-token-carry vector references
+  by shape and stacked each group before the final `device_get`, trying to
+  reduce final host materialization fanout further than Entry 127.
+- artifact:
+  `results/gpu_matrix_20260527_device_token_carry_stacked_ref_target.json`
+- report:
+  `results/gpu_matrix_20260527_device_token_carry_stacked_ref_target.md`
+- result: exact generated-token parity over two elevated GPU repeats, but the
+  run regressed to `91.94 tok/s`, `0.790x` vLLM, compared with Entry 127 at
+  `95.14 tok/s`, `0.818x` vLLM.
+- profile movement: `np.asarray(jax.Array)` fell to about `1.04 ms`, but
+  `forward_step_token_ids_jit` rose to about `297.44 ms` and
+  `command_buffer::execute` rose to about `251.67 ms`. The lower visible
+  materialization bucket did not improve integrated throughput.
+- decision: reject and do not keep the stacked materialization code. The
+  Entry 127 tuple materializer remains the fastest default-off token-carry
+  marker. Further work should return to the model/kernel path, not final token
+  readback reshaping.
+- validation:
+
+```text
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest tests/test_device_token_carry.py -q
+NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1 JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/run_gpu_matrix.py --goal-target-only --configs gpu_paged_default --repeats 2 --output-json results/gpu_matrix_20260527_device_token_carry_stacked_ref_target.json --require-stored-references --jax-python /mountpoint/.exp/nano-vllm-jax/.venv/bin/python
+```
+
+- result: focused elevated GPU test passed `4 passed`; integrated target run
+  completed and was exact but slower.

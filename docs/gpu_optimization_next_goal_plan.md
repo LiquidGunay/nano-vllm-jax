@@ -204,7 +204,10 @@ Current tracked records:
   server path. The vector-ref materializer reduces the prior device-carry
   `PjRt Execute` count from `255` to `59` and `MemcpyD2D` count from `749` to
   `493`, but the route remains below the `0.9x` gate and not speed-claim-ready
-  under the current profile-counter policy.
+  under the current profile-counter policy. A stacked final materialization
+  follow-up regressed to `91.94 tok/s`, so keep the Entry 127 tuple
+  materializer as the current marker and return optimization effort to
+  model/kernel boundaries.
 - Current default-off GDN post-conv reference boundary:
   `results/gpu_matrix_20260527_gdn_post_conv_reference_target.json`, `90.15
   tok/s`, `0.775x` the stored vLLM reference, exact generated-token parity on
