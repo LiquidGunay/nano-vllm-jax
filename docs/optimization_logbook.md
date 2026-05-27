@@ -4398,3 +4398,28 @@ JAX_PLATFORMS=cuda ... pytest -q \
 ```
 
 - result: `2 passed`; `py_compile` passed.
+
+### Entry 116 - Scoped-Profile Goal Target Revalidation
+
+- experiment: reran the non-speculative long-prefill goal target after Entry
+  114/115 so the matrix artifact and Markdown report include scoped GPU/CPU top
+  profile events. The run used stored JAX/vLLM references and elevated GPU
+  access.
+- artifact: `results/gpu_matrix_20260527_scoped_profile_target.json`
+- report: `results/gpu_matrix_20260527_scoped_profile_target.md`
+- result: speed-claim-ready with exact generated-token parity over both
+  repeats. JAX reached `90.81 tok/s`; stored vLLM is `116.37 tok/s`; JAX/vLLM is
+  `0.780x`. The active `0.9x` target requires `104.74 tok/s`, leaving a
+  `13.93 tok/s` gap.
+- latency: `TTFT p50 533.69 ms`, `ITL p50 11.36 ms`, `ITL p95 12.25 ms`.
+- scheduler diagnostics: one prefill step, 15 decode steps, max 4 active rows,
+  about `0.53 s` prefill-step time and `0.17 s` decode-step time.
+- scoped profile evidence: both repeats report the top GPU events as GEMM/CUTLASS
+  work. Repeat 1 starts with `gemm_fusion_dot_general_744` at `57.45 ms` over
+  48 calls, then a CUTLASS kernel at `36.89 ms` over 30 calls, then
+  `gemm_fusion_dot_general_729` at `36.58 ms` over 18 calls. Repeat 2 is
+  effectively identical.
+- decision: keep this as the current scoped-profile target artifact. It verifies
+  the benchmark/reporting path and reinforces that the default path remains
+  below `0.9x`; it does not justify moving to MTP or accepting a decode-only
+  kernel as sufficient by itself.

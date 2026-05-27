@@ -157,6 +157,12 @@ Current tracked records:
   `0.781x` the stored vLLM reference, exact generated-token parity over two
   repeats, speed-claim-ready, but still below the active `0.9x` gate. The gap is
   `13.86 tok/s`, or about `1.153x` required JAX speedup.
+- Current scoped-profile long-prefill revalidation:
+  `results/gpu_matrix_20260527_scoped_profile_target.json`, `90.81 tok/s`,
+  `0.780x` the stored vLLM reference, exact generated-token parity over two
+  repeats, speed-claim-ready, and still below the active `0.9x` gate. This is
+  the first target artifact whose matrix report includes scoped GPU/CPU top
+  profile events.
 - vLLM-style random long-prefill sidecar, one repeat, not speed-claim-ready:
   `results/gpu_matrix_20260526_vllm_random_longprefill_r1.json`,
   `84.45 tok/s`, live vLLM `354.24 tok/s`, `0.238x` vLLM, exact generated-token
@@ -635,6 +641,16 @@ end-to-end throughput.
   JAX `90.87 tok/s`, stored vLLM `116.37 tok/s`, and JAX/vLLM `0.781x`. This is
   useful baseline evidence but not goal completion; the active `0.9x` target
   still requires `104.74 tok/s`, leaving a `13.86 tok/s` gap.
+- Scoped-profile goal-target revalidation:
+  `results/gpu_matrix_20260527_scoped_profile_target.json` and
+  `results/gpu_matrix_20260527_scoped_profile_target.md`. The default non-
+  speculative path remains speed-claim-ready and exact over two repeats, with
+  JAX `90.81 tok/s`, stored vLLM `116.37 tok/s`, JAX/vLLM `0.780x`, target
+  `104.74 tok/s`, and gap `13.93 tok/s`. Scheduler diagnostics remain one
+  prefill step plus 15 decode steps; the scoped report shows the top GPU events
+  are GEMM/CUTLASS buckets, led by `gemm_fusion_dot_general_744` at about
+  `57.45 ms` per repeat. This artifact verifies the new scoped profile-event
+  reporting path and does not change the current speed target status.
 - Current raw GPU trace summary:
   `results/profile_trace_20260527_current_goal_target_gpu.json` and
   `results/profile_trace_20260527_current_goal_target_gpu.md`. Across both
