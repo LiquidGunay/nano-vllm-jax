@@ -473,6 +473,10 @@ end-to-end throughput.
   ranges and top raw events directly in benchmark artifacts. Matrix summaries
   preserve those fields per repeat, so future speed claims can cite the
   artifact without rerunning a separate trace parser.
+- `benchmarks/summarize_gpu_matrix.py` renders the scoped GPU/CPU top events
+  when a matrix artifact contains them. Older matrix JSONs predate this field
+  and will omit the section; new profiled runs should expose it in the default
+  Markdown report.
 - `benchmarks/run_gpu_matrix.py` now writes that Markdown report by default next
   to the summary JSON, or to `--report-md` when supplied. `--no-report-md`
   keeps report generation opt-out for controlled runs.

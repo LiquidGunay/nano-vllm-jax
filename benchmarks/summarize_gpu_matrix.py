@@ -14,6 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("summary_json", help="Path to results/gpu_matrix_<timestamp>.json")
     parser.add_argument("--output-md", default="", help="Optional path to write the Markdown report")
     parser.add_argument("--top-profile-deltas", type=int, default=8)
+    parser.add_argument("--top-scoped-events", type=int, default=5)
     return parser.parse_args()
 
 
@@ -161,6 +162,38 @@ def _scheduler_rows(summary: dict[str, Any]) -> list[list[str]]:
     return rows
 
 
+def _scoped_profile_event_rows(
+    summary: dict[str, Any],
+    *,
+    scopes: tuple[str, ...] = ("gpu", "cpu"),
+    limit: int = 5,
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    max_events = max(0, int(limit))
+    if max_events == 0:
+        return rows
+    for workload in summary.get("workloads") or []:
+        for config in summary.get("configs") or []:
+            matrix_row = ((summary.get("matrix") or {}).get(workload) or {}).get(config) or {}
+            for repeat in matrix_row.get("repeats") or []:
+                metrics = repeat.get("metrics") or {}
+                scoped_events = metrics.get("profile_scoped_top_events_by_total_ms") or {}
+                for scope in scopes:
+                    for event in (scoped_events.get(scope) or [])[:max_events]:
+                        rows.append(
+                            [
+                                str(workload),
+                                str(config),
+                                _fmt(repeat.get("repeat")),
+                                str(scope),
+                                str(event.get("name")),
+                                _fmt(event.get("total_ms"), suffix=" ms"),
+                                _fmt(event.get("count")),
+                            ]
+                        )
+    return rows
+
+
 def _markdown_table(headers: list[str], rows: list[list[str]]) -> list[str]:
     if not rows:
         return ["No rows."]
@@ -200,7 +233,12 @@ def _logbook_template(summary: dict[str, Any], *, top_profile_deltas: int) -> li
     return lines
 
 
-def render_markdown(summary: dict[str, Any], *, top_profile_deltas: int = 8) -> str:
+def render_markdown(
+    summary: dict[str, Any],
+    *,
+    top_profile_deltas: int = 8,
+    top_scoped_events: int = 5,
+) -> str:
     workload, config, goal_comparison, goal_acceptance = _goal_target_row(summary)
     target_ratio = (summary.get("goal_target") or {}).get("target_vllm_ratio")
     lines = [
@@ -276,6 +314,24 @@ def render_markdown(summary: dict[str, Any], *, top_profile_deltas: int = 8) -> 
             )
         )
 
+    scoped_event_rows = _scoped_profile_event_rows(summary, limit=top_scoped_events)
+    if scoped_event_rows:
+        lines.extend(["", "## Top Scoped Profile Events", ""])
+        lines.extend(
+            _markdown_table(
+                [
+                    "workload",
+                    "config",
+                    "repeat",
+                    "scope",
+                    "event",
+                    "total",
+                    "count",
+                ],
+                scoped_event_rows,
+            )
+        )
+
     failures = acceptance_failures(summary)
     lines.extend(["", "## Acceptance Failures", ""])
     if failures:
@@ -318,7 +374,11 @@ def render_markdown(summary: dict[str, Any], *, top_profile_deltas: int = 8) -> 
 def main() -> None:
     args = parse_args()
     summary = _load_json(Path(args.summary_json))
-    report = render_markdown(summary, top_profile_deltas=args.top_profile_deltas)
+    report = render_markdown(
+        summary,
+        top_profile_deltas=args.top_profile_deltas,
+        top_scoped_events=args.top_scoped_events,
+    )
     if args.output_md:
         output_path = Path(args.output_md)
         output_path.parent.mkdir(parents=True, exist_ok=True)

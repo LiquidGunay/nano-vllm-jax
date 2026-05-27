@@ -4380,3 +4380,21 @@ JAX_PLATFORMS=cuda ... pytest -q \
 ```
 
 - result: `47 passed`; `py_compile` passed.
+
+### Entry 115 - Scoped Events In Matrix Markdown Reports
+
+- change accepted: `benchmarks/summarize_gpu_matrix.py` now renders a compact
+  `Top Scoped Profile Events` section when per-repeat matrix metrics include
+  `profile_scoped_top_events_by_total_ms`.
+- scope: this affects future reports generated from new profiled matrix
+  artifacts. Existing matrix summaries from before Entry 114 do not contain the
+  scoped fields, so they omit the section unless regenerated from new benchmark
+  artifacts.
+- validation:
+
+```text
+.venv/bin/python -m pytest -q tests/test_gpu_matrix_summary_report.py
+.venv/bin/python -m py_compile benchmarks/summarize_gpu_matrix.py tests/test_gpu_matrix_summary_report.py
+```
+
+- result: `2 passed`; `py_compile` passed.

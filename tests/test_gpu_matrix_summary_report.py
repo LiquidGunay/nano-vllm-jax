@@ -77,7 +77,35 @@ def _summary():
                             "prefill_step_seconds_total": 2.4,
                             "decode_step_seconds_total": 0.8,
                         }
-                    }
+                    },
+                    "repeats": [
+                        {
+                            "repeat": 1,
+                            "metrics": {
+                                "profile_scoped_top_events_by_total_ms": {
+                                    "gpu": [
+                                        {
+                                            "name": "gemm_fusion_dot",
+                                            "total_ms": 25.0,
+                                            "count": 3,
+                                        },
+                                        {
+                                            "name": "MemcpyD2D",
+                                            "total_ms": 5.0,
+                                            "count": 2,
+                                        },
+                                    ],
+                                    "cpu": [
+                                        {
+                                            "name": "forward_step_token_ids_jit",
+                                            "total_ms": 30.0,
+                                            "count": 1,
+                                        }
+                                    ],
+                                }
+                            },
+                        }
+                    ],
                 }
             }
         },
@@ -109,6 +137,9 @@ def test_render_markdown_includes_goal_matrix_and_sorted_profile_deltas():
     assert "| long_prefill_512_2048 | gpu_paged_default | yes | yes | 105.00 |" in report
     assert "## Scheduler Diagnostics" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | 4 | 60 | 4 | 8192 | 2.40 s | 0.80 s |" in report
+    assert "## Top Scoped Profile Events" in report
+    assert "| long_prefill_512_2048 | gpu_paged_default | 1 | gpu | gemm_fusion_dot | 25.00 ms | 3 |" in report
+    assert "| long_prefill_512_2048 | gpu_paged_default | 1 | cpu | forward_step_token_ids_jit | 30.00 ms | 1 |" in report
     assert "## Acceptance Failures\n\nNone." in report
     assert "## Logbook Entry Template" in report
     assert "- profile movement to explain:" in report
