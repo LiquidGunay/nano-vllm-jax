@@ -5165,3 +5165,24 @@ JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m
   nano-vLLM-JAX path still requires FP32 activation/state correctness; BF16
   q/k/v remains a default-off diagnostic unless it passes the long-decode
   token/logit gates.
+
+### Entry 139 - FLA Varlen Chunk Metadata Contract
+
+- change accepted: added `prepare_gdn_fla_chunk_metadata`, a JAX-side helper
+  for the future FLA chunk-body port. It builds active chunk indices
+  `[sequence_index, chunk_index_in_sequence]` and per-row `chunk_offsets` from
+  `cu_seqlens` and `chunk_size`.
+- decision: this is a port prerequisite, not a serving speed claim. The helper
+  intentionally preserves original row ids when bucket padding creates
+  zero-length rows; vLLM's upstream helper assumes rows are pre-filtered and can
+  compress row identity in that case.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_segmented_reference.py
+JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py -k 'chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'
+```
+
+- result: focused CUDA selection passed `3 passed`. The tests cover ragged
+  `cu_seqlens=[0,0,5,37,74,138]`, all-empty rows, expected active chunk rows,
+  per-row chunk offsets, and the existing segmented-reference parity check.

@@ -15,6 +15,7 @@ jax.config.update("jax_default_matmul_precision", "highest")
 from nanovllm_jax.kernels.gdn_fla import (
     gdn_segmented_prefill_chunk32_reference,
     pack_padded_gdn_inputs,
+    prepare_gdn_fla_chunk_metadata,
     unpack_segmented_gdn_output,
 )
 from nanovllm_jax.model import jax_chunk_gated_delta_rule
@@ -25,6 +26,49 @@ def _has_cuda_backend() -> bool:
         return bool(jax.devices("gpu"))
     except Exception:
         return False
+
+
+def test_prepare_gdn_fla_chunk_metadata_preserves_zero_rows():
+    cu_seqlens = jnp.array([0, 0, 5, 37, 74, 138], dtype=jnp.int32)
+
+    chunk_indices, chunk_offsets = prepare_gdn_fla_chunk_metadata(
+        cu_seqlens,
+        chunk_size=32,
+    )
+
+    np.testing.assert_array_equal(
+        np.asarray(chunk_indices),
+        np.asarray(
+            [
+                [1, 0],
+                [2, 0],
+                [3, 0],
+                [3, 1],
+                [4, 0],
+                [4, 1],
+            ],
+            dtype=np.int32,
+        ),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(chunk_offsets),
+        np.asarray([0, 0, 1, 2, 4, 6], dtype=np.int32),
+    )
+
+
+def test_prepare_gdn_fla_chunk_metadata_empty_batch_rows():
+    cu_seqlens = jnp.array([0, 0, 0, 0], dtype=jnp.int32)
+
+    chunk_indices, chunk_offsets = prepare_gdn_fla_chunk_metadata(
+        cu_seqlens,
+        chunk_size=64,
+    )
+
+    assert np.asarray(chunk_indices).shape == (0, 2)
+    np.testing.assert_array_equal(
+        np.asarray(chunk_offsets),
+        np.asarray([0, 0, 0, 0], dtype=np.int32),
+    )
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")

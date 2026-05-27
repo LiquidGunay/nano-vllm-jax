@@ -196,6 +196,11 @@ the upstream-style `[nnz,H,D] + cu_seqlens` ABI, and
 `gdn_fla_prefill_varlen_reference` round-trips through the segmented reference
 and unpacks to `[B,T,H,V]`. This gives a focused boundary for a future
 FLA-schedule port without forcing hot-path K,V/V,K state adapters.
+The FLA varlen chunk metadata helper now exists as well:
+`prepare_gdn_fla_chunk_metadata` emits active chunk indices and per-row chunk
+offsets for the future FLA chunk-body port. It deliberately preserves original
+row ids across zero-length padded rows, unlike the upstream helper's
+pre-filtered-row assumption.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -1891,6 +1896,11 @@ Commit 8:
   `chunk_fwd_o`. Keep Torch autograd/runtime wrappers out of the JAX port.
   Preserve FP32 gate/beta/state. BF16 q/k/v remains an opt-in diagnostic unless
   it passes the long-decode top-logit gates.
+- ~~Add the FLA varlen chunk metadata helper for `chunk_indices` and
+  `chunk_offsets`, preserving original row ids when bucket padding creates
+  zero-length rows.~~ Validation: elevated CUDA focused selection
+  `tests/test_gdn_segmented_reference.py -k 'chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'`
+  passed `3 passed`.
 - ~~Add a vLLM `fused_post_conv_prep`-inspired CUDA FP32 prep-only
   implementation behind `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_fp32`.~~
   Validation: elevated CUDA focused suite passed `18 passed`; one-repeat

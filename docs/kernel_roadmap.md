@@ -298,6 +298,12 @@ gdn_segmented_prefill_chunk32(
   vLLM/FLA-style prefill. The focused CUDA test verifies empty rows, ragged
   lengths `[0,5,17,32]`, `cu_seqlens=[0,0,5,22,54]`, packed tensor shapes, and
   parity with the rectangular prepared FP32 reference.
+- chunk-metadata status: `prepare_gdn_fla_chunk_metadata` now defines the
+  future FLA chunk-body metadata contract: active chunk rows
+  `[sequence_index, chunk_index_in_sequence]` plus per-row `chunk_offsets`.
+  It preserves original sequence indices when padded rows have zero length, so
+  future kernels can read `cu_seqlens` and state rows without silently
+  compressing batch-row identity.
 - SM86 port note: on the current A10G host, vLLM's Hopper/TMA branches are not
   active. The local target should therefore mirror the non-TMA FLA path first.
   Preserve FP32 gate/beta/state; vLLM rejects FP32 q/k/v in its Torch wrapper,

@@ -407,6 +407,49 @@ def cu_seqlens_from_seq_lens(seq_lens: Any) -> jnp.ndarray:
     return jnp.asarray(offsets, dtype=jnp.int32)
 
 
+def prepare_gdn_fla_chunk_metadata(
+    cu_seqlens: Any,
+    chunk_size: int,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Build FLA-style varlen chunk indices and per-row chunk offsets.
+
+    `chunk_indices` has rows `[sequence_index, chunk_index_in_sequence]`, one
+    per active chunk. `chunk_offsets` has shape `[batch + 1]` and maps original
+    sequence rows to their first active chunk. Unlike the upstream helper, this
+    preserves original row ids when bucket padding introduces zero-length rows.
+    """
+
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    offsets = np.asarray(jax.device_get(cu_seqlens), dtype=np.int64).reshape(-1)
+    if len(offsets) == 0 or offsets[0] != 0:
+        raise ValueError("cu_seqlens must start with 0")
+    if np.any(offsets[1:] < offsets[:-1]):
+        raise ValueError("cu_seqlens must be non-decreasing")
+
+    lengths = offsets[1:] - offsets[:-1]
+    chunks_per_row = (lengths + int(chunk_size) - 1) // int(chunk_size)
+    chunk_offsets = np.concatenate(
+        [np.zeros((1,), dtype=np.int32), np.cumsum(chunks_per_row, dtype=np.int32)]
+    )
+    if int(chunk_offsets[-1]) == 0:
+        chunk_indices = np.zeros((0, 2), dtype=np.int32)
+    else:
+        rows = np.repeat(np.arange(len(lengths), dtype=np.int32), chunks_per_row)
+        chunks = np.concatenate(
+            [
+                np.arange(int(num_chunks), dtype=np.int32)
+                for num_chunks in chunks_per_row
+                if int(num_chunks) > 0
+            ]
+        )
+        chunk_indices = np.stack([rows, chunks], axis=1).astype(np.int32)
+    return (
+        jnp.asarray(chunk_indices, dtype=jnp.int32),
+        jnp.asarray(chunk_offsets, dtype=jnp.int32),
+    )
+
+
 def pack_padded_gdn_inputs(
     query: jnp.ndarray,
     key: jnp.ndarray,
