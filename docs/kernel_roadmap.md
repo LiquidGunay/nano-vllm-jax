@@ -309,6 +309,11 @@ gdn_segmented_prefill_chunk32(
   gates. It covers forward and reverse cumsum, resets accumulation at every
   active chunk row, and uses `prepare_gdn_fla_chunk_metadata` so future kernels
   can match vLLM semantics without assuming padded rows were pre-filtered.
+- chunk-scaled-dot-KKT status:
+  `gdn_fla_chunk_scaled_dot_kkt_packed_reference` defines the next scalar FLA
+  math-stage reference over packed `[nnz,Hg,K]` keys and `[nnz,H]` beta/gate
+  tensors. It covers strict-lower masking, optional `exp(g_i - g_j)` decay
+  scaling, and grouped output-head to key-head mapping.
 - SM86 port note: on the current A10G host, vLLM's Hopper/TMA branches are not
   active. The local target should therefore mirror the non-TMA FLA path first.
   Preserve FP32 gate/beta/state; vLLM rejects FP32 q/k/v in its Torch wrapper,

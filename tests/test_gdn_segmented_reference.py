@@ -14,6 +14,7 @@ jax.config.update("jax_default_matmul_precision", "highest")
 
 from nanovllm_jax.kernels.gdn_fla import (
     gdn_fla_chunk_local_cumsum_packed_reference,
+    gdn_fla_chunk_scaled_dot_kkt_packed_reference,
     gdn_segmented_prefill_chunk32_reference,
     pack_padded_gdn_inputs,
     prepare_gdn_fla_chunk_metadata,
@@ -111,6 +112,46 @@ def test_gdn_fla_chunk_local_cumsum_packed_reference_resets_per_chunk():
         rtol=0,
         atol=0,
     )
+
+
+def test_gdn_fla_chunk_scaled_dot_kkt_packed_reference_matches_formula():
+    cu_seqlens = jnp.array([0, 0, 5, 13], dtype=jnp.int32)
+    key = jnp.arange(13 * 2 * 3, dtype=jnp.float32).reshape(13, 2, 3) * 0.02
+    beta = (
+        jnp.arange(13 * 4, dtype=jnp.float32).reshape(13, 4) * 0.01 + 0.25
+    )
+    gate = jnp.linspace(-0.5, 0.5, 13 * 4, dtype=jnp.float32).reshape(13, 4)
+    chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=4)
+
+    actual = gdn_fla_chunk_scaled_dot_kkt_packed_reference(
+        key,
+        beta,
+        gate,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+    )
+
+    expected = np.zeros((13, 4, 4), dtype=np.float32)
+    key_np = np.asarray(key)
+    beta_np = np.asarray(beta)
+    gate_np = np.asarray(gate)
+    offsets = [0, 0, 5, 13]
+    for row in range(len(offsets) - 1):
+        for start in range(offsets[row], offsets[row + 1], 4):
+            end = min(offsets[row + 1], start + 4)
+            length = end - start
+            lower = np.tril(np.ones((length, length), dtype=np.float32), k=-1)
+            for head in range(4):
+                key_head = head // 2
+                chunk_key = key_np[start:end, key_head, :].astype(np.float32)
+                chunk_beta = beta_np[start:end, head].astype(np.float32)
+                matrix = (chunk_key * chunk_beta[:, None]) @ chunk_key.T
+                chunk_gate = gate_np[start:end, head].astype(np.float32)
+                matrix *= np.exp(chunk_gate[:, None] - chunk_gate[None, :])
+                expected[start:end, head, :length] = matrix * lower
+
+    np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")

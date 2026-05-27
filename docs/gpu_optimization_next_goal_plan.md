@@ -206,6 +206,11 @@ The first scalar FLA math-stage reference is now explicit:
 `chunk_local_cumsum` semantics over packed `[nnz,H]` gates, including per-chunk
 reset behavior and reverse cumulative sums. It is a correctness reference for a
 future kernel stage, not a serving speed path.
+The second scalar FLA math-stage reference is also explicit:
+`gdn_fla_chunk_scaled_dot_kkt_packed_reference` implements the strict-lower
+`beta * K * K^T` chunk matrix over packed varlen keys, including optional
+`exp(g_i - g_j)` scaling and output-head to key-head grouping. This locks down
+the next port/fork stage before `solve_tril`.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -1911,6 +1916,11 @@ Commit 8:
   focused selection
   `tests/test_gdn_segmented_reference.py -k 'chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'`
   passed `4 passed`.
+- ~~Add scalar FLA chunk-scaled-dot-KKT packed reference over `[nnz,Hg,K]` keys
+  and `[nnz,H]` beta/gate tensors, including strict-lower masking and
+  grouped-head tests.~~ Validation: elevated CUDA focused selection
+  `tests/test_gdn_segmented_reference.py -k 'chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'`
+  passed `5 passed`.
 - ~~Add a vLLM `fused_post_conv_prep`-inspired CUDA FP32 prep-only
   implementation behind `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_fp32`.~~
   Validation: elevated CUDA focused suite passed `18 passed`; one-repeat

@@ -5207,3 +5207,25 @@ JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m
 - result: static checks passed and the focused elevated CUDA selection passed
   `4 passed`. The new test covers ragged `cu_seqlens=[0,0,5,22]`, chunk size
   `8`, forward cumsum, reverse cumsum, and reset at row/chunk boundaries.
+
+### Entry 141 - FLA Chunk-Scaled-Dot-KKT Reference
+
+- change accepted: added `gdn_fla_chunk_scaled_dot_kkt_packed_reference`, a
+  JAX-side reference for vLLM/FLA's `chunk_scaled_dot_kkt_fwd` stage over packed
+  varlen tensors.
+- decision: this is the next correctness scaffold for the future FLA chunk-body
+  port. It records the strict-lower matrix convention, optional
+  `exp(g_i - g_j)` scaling from local gate cumsums, and grouped value-head to
+  key-head behavior before any lowered implementation is added.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_segmented_reference.py
+git diff --check
+JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py -k 'chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'
+```
+
+- result: static checks passed and the focused elevated CUDA selection passed
+  `5 passed`. The new test covers ragged `cu_seqlens=[0,0,5,13]`, chunk size
+  `4`, grouped output heads over two key heads, strict-lower masking, and gate
+  difference scaling.
