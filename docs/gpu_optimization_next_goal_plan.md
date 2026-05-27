@@ -54,6 +54,11 @@ optimization work starts.
     the V,K layout migration. The default dtype contract remains BF16 checkpoint
     weights with FP32 activation/state math until a separate BF16-prefill
     experiment passes the full correctness and speed gates.
+12. A broad BF16 activation diagnostic is not a shortcut to the target: it
+    reached `108.76 tok/s` (`0.935x` the stored vLLM reference) but failed
+    exact generated-token parity on the `1536`-token row at the first generated
+    token. Any BF16 lane must therefore stay default-off and narrower than a
+    whole-model dtype change until it passes full token/logit gates.
 
 ## Next Goal Handoff
 
@@ -126,6 +131,12 @@ prefill through `backend.gated_delta_prefill_post_conv` while preserving the
 pure-JAX FP32/V,K correctness path. The next real GDN step is to replace work
 behind that same post-conv boundary with a vLLM/FLA-derived fast implementation,
 not to add another model-call-site rewrite.
+The latest external-kernel audit narrowed this further: vLLM FLA post-conv prep
+emits q/k/v in the input activation dtype, vLLM FLA chunk explicitly rejects
+FP32 q/k/v, and FlashInfer GDN prefill accepts BF16/FP16 q/k/v with FP32
+g/beta/state. Preserving the default contract requires a FP32 port/fork of the
+FLA chunk schedule behind the existing post-conv boundary. A FlashInfer BF16
+prefill experiment is allowed only as a separate diagnostic lane.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -234,6 +245,12 @@ Current tracked records:
   top GPU event is `Fp32GdnPrefillChunk32Kernel<64>` at about `500.69 ms`
   across 18 launches, and TTFT regresses badly. Do not pursue this local chunk
   body further as the production GDN prefill path.
+- Current rejected broad BF16 activation diagnostic:
+  `results/qwen08_jax_bf16_activation_longprefill_probe.json`, `108.76 tok/s`,
+  `0.935x` the stored vLLM reference, but not correct: the `len_1536` row
+  diverged at generated token `0` (`279` vs reference `1719`). This confirms
+  that BF16 activations may expose enough speed for upstream kernels, but a
+  whole-model dtype change violates the current correctness gate.
 - Current vLLM-inspired random-token manifest sidecar:
   `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
   `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
@@ -792,6 +809,14 @@ end-to-end throughput.
   dataset run. `vllm_random` stored-reference matching now requires both a
   prompt-manifest path and SHA so older/random-only metadata cannot be mistaken
   for shared-token evidence.
+- Profile dashboard status: `tools/profile_dashboard.py` is the visual
+  leaderboard for matrix/profile artifacts. Direct Perfetto iframe embedding is
+  not the plan because the official UI is designed around HTTPS trace URLs or
+  opening `ui.perfetto.dev` and passing trace bytes with `postMessage`; browser
+  origin and popup rules make iframe/local embedding fragile. Keep in-dashboard
+  charts for summary comparison, use the `Load in Perfetto` handoff for local
+  `*.trace.json.gz` files, and keep raw trace download/open-file as the
+  fallback.
 
 ## Phase 2 - Kernel Roadmap
 

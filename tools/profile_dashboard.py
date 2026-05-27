@@ -755,13 +755,15 @@ async function openPerfettoWithTrace(tracePath) {
     const sendTrace = () => {
       if (sent) return;
       sent = true;
-      perfettoWindow.postMessage({
+      const message = {
         perfetto: {
           buffer,
           title,
-          fileName: tracePath.split('/').pop() || 'trace.json.gz'
+          fileName: tracePath.split('/').pop() || 'trace.json.gz',
+          url: window.location.href
         }
-      }, 'https://ui.perfetto.dev');
+      };
+      perfettoWindow.postMessage(message, 'https://ui.perfetto.dev', [buffer]);
       if (button) button.textContent = 'Loaded in Perfetto';
     };
     const listener = (event) => {

@@ -4860,3 +4860,37 @@ NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1 JAX_PLATFORMS=cuda ... .venv/bin/python bench
 
 - result: focused elevated GPU test passed `4 passed`; integrated target run
   completed and was exact but slower.
+
+### Entry 129 - Rejected Broad BF16 Activation Diagnostic
+
+- experiment: ran the existing long-prefill server path with
+  `--dtype bfloat16 --weight-dtype bfloat16` against the stored FP32-activation
+  long-prefill reference. This was a diagnostic for the BF16 external-kernel
+  lane, not a proposed default-contract change.
+- artifact: `results/qwen08_jax_bf16_activation_longprefill_probe.json`
+- result: fast but incorrect. Throughput reached `108.76 tok/s`, which is
+  `0.935x` the stored vLLM reference of `116.37 tok/s`, but exact-token parity
+  failed on the `len_1536` row at generated token `0` (`279` vs reference
+  `1719`). The other three rows matched exactly.
+- profile movement: versus the FP32 accepted/scoped default, BF16 activation
+  math substantially reduces visible `transpose` (`8.44 ms` vs about `45 ms`),
+  `MemcpyD2D` (`10.54 ms` vs about `18-30 ms` depending artifact), and
+  `command_buffer::execute` (`170.93 ms` vs about `223-229 ms`), but correctness
+  failure blocks any speed claim.
+- external-kernel audit: installed vLLM FLA chunk prefill rejects FP32 q/k/v
+  and says to use BF16; FlashInfer GDN prefill likewise expects BF16/FP16
+  q/k/v with FP32 g/beta/state. Direct upstream reuse is therefore only viable
+  in a separate BF16-prefill diagnostic lane. Preserving the default contract
+  still requires a FP32 port/fork of the FLA chunk schedule behind the existing
+  post-conv boundary.
+- decision: reject broad BF16 activations for promotion. Keep the default
+  contract as BF16 checkpoint weights with FP32 activation/state math. If BF16
+  is revisited, scope it narrowly to GDN prefill behind an explicit opt-in flag
+  and require full token/logit guardrails before any benchmark claim.
+- validation:
+
+```text
+JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/benchmark_jax_server_trace.py --model Qwen/Qwen3.5-0.8B --backend gpu --dtype bfloat16 --weight-dtype bfloat16 --jax-execution jit --input-lens 512,1024,1536,2048 --output-len 16 --prompt-suite mixed --num-speculative-tokens 0 --max-kv-cache-mb 3072 --num-kvcache-blocks 384 --max-num-seqs 4 --max-num-batched-tokens 8192 --prefill-buckets 512,1024,2048 --batch-size-buckets 1,2,4 --max-blocks-per-seq 129 --top-k 5 --warmup --profile --prompt-source tokenized_seed_repeat --seed 0 --output-json results/qwen08_jax_bf16_activation_longprefill_probe.json --run-label qwen08_jax_bf16_activation_longprefill_probe --reference-json results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json
+```
+
+- result: elevated GPU run completed, but correctness failed.
