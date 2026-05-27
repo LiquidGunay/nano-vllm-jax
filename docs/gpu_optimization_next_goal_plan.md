@@ -547,9 +547,12 @@ end-to-end throughput.
   `num_prompts`, `seed`, prompt manifest path/hash, request throughput,
   output-token throughput, and total-token throughput.~~ The opt-in
   `vllm_random_longprefill` matrix workload now wires a deterministic
-  vLLM-random-style prompt source with 128 prompts, input length centered at
+  vLLM-inspired random-token manifest with 128 prompts, input length centered at
   1280 with range ratio 0.6, fixed output length 16, and `sidecar_only`
-  acceptance scope. This does not replace the exact-token
+  acceptance scope. This local generator is not upstream
+  `vllm bench --dataset-name random` semantics; comparability comes from the
+  shared prompt-token JSONL manifest and matching manifest SHA. This does not
+  replace the exact-token
   `long_prefill_512_2048/gpu_paged_default` gate.
 - Sidecar harness verification: `py_compile` passes for the touched benchmark
   scripts; `tests/test_gpu_matrix_runner.py` and
@@ -679,6 +682,15 @@ end-to-end throughput.
   sequences plus 480 decode steps, so this remains evidence for a static-shape
   concurrency/TTFT gap separate from the frozen exact-token long-prefill goal
   gate.
+- Prompt provenance is now explicit in matrix metrics and Markdown reports:
+  future matrix summaries preserve the artifact `run_config` prompt source,
+  dataset, seed, random length settings, and prompt-manifest SHA. Reports show a
+  `Prompt Provenance` table with current-vs-vLLM manifest hashes, so the
+  vLLM-random sidecar can prove when JAX and vLLM used the same token IDs. This
+  lane remains local-harness `vllm_random`, not an upstream `vllm bench`
+  dataset run. `vllm_random` stored-reference matching now requires both a
+  prompt-manifest path and SHA so older/random-only metadata cannot be mistaken
+  for shared-token evidence.
 
 ## Phase 2 - Kernel Roadmap
 

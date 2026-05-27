@@ -4491,3 +4491,34 @@ JAX_PLATFORMS=cuda ... pytest -q \
   It does not change the main frozen exact-token goal target and should not be
   used as evidence that a narrow kernel swap alone will close the vLLM-random
   gap. The sidecar remains dominated by static-shape concurrency and TTFT.
+
+### Entry 120 - Prompt Provenance In Matrix Reports
+
+- change accepted: matrix metric summaries now preserve prompt metadata from
+  benchmark artifact `run_config`: prompt source, dataset, input/output shape,
+  seed, random range settings, manifest path, and manifest SHA. Markdown reports
+  render these fields in a `Prompt Provenance` table and show whether the
+  current JAX run and vLLM reference have matching manifest hashes.
+  `vllm_random` stored-reference matching now also requires both manifest path
+  and manifest SHA.
+- artifact update: regenerated
+  `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json` from its
+  already-written repeat/reference artifacts and regenerated
+  `results/gpu_matrix_20260527_vllm_random_longprefill_r2.md`. The report now
+  shows `vllm_random`, dataset `random`, 128 prompts, seed `0`, random input
+  `1280`, random output `16`, range ratio `{"input":0.6,"output":0.0}`, and
+  matching current/vLLM manifest prefix `9f98c47fe18b`.
+- interpretation: this avoids overstating benchmark comparability. The sidecar
+  proves JAX and vLLM used identical generated token IDs for the local
+  vLLM-inspired random-token manifest harness, but it is still not upstream
+  `vllm bench --dataset-name random` semantics, an upstream `vllm bench` run, or
+  a ShareGPT/BurstGPT dataset claim.
+- validation:
+
+```text
+.venv/bin/python -m pytest -q tests/test_gpu_matrix_runner.py tests/test_gpu_matrix_summary_report.py
+.venv/bin/python -m py_compile benchmarks/run_gpu_matrix.py benchmarks/summarize_gpu_matrix.py tests/test_gpu_matrix_runner.py tests/test_gpu_matrix_summary_report.py
+.venv/bin/python -m json.tool results/gpu_matrix_20260527_vllm_random_longprefill_r2.json
+```
+
+- result: `48 passed`; `py_compile` passed; JSON validation passed.

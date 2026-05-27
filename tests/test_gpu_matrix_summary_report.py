@@ -80,6 +80,15 @@ def _summary():
         "matrix": {
             "long_prefill_512_2048": {
                 "gpu_paged_default": {
+                    "workload": {
+                        "prompt_source": "vllm_random",
+                        "dataset_name": "random",
+                        "num_prompts": 128,
+                        "seed": 7,
+                        "random_input_len": 1280,
+                        "random_output_len": 16,
+                        "random_range_ratio": '{"input":0.6,"output":0.0}',
+                    },
                     "aggregate": {
                         "scheduler_diagnostics_median": {
                             "available": True,
@@ -109,6 +118,16 @@ def _summary():
                         {
                             "repeat": 1,
                             "metrics": {
+                                "prompt": {
+                                    "prompt_source": "vllm_random",
+                                    "dataset_name": "random",
+                                    "num_prompts": 128,
+                                    "seed": 7,
+                                    "random_input_len": 1280,
+                                    "random_output_len": 16,
+                                    "random_range_ratio": {"input": 0.6, "output": 0.0},
+                                    "prompt_manifest_sha256": "abcdef1234567890",
+                                },
                                 "profile_scoped_top_events_by_total_ms": {
                                     "gpu": [
                                         {
@@ -133,6 +152,22 @@ def _summary():
                             },
                         }
                     ],
+                }
+            }
+        },
+        "vllm_references": {
+            "long_prefill_512_2048": {
+                "metrics": {
+                    "prompt": {
+                        "prompt_source": "vllm_random",
+                        "dataset_name": "random",
+                        "num_prompts": 128,
+                        "seed": 7,
+                        "random_input_len": 1280,
+                        "random_output_len": 16,
+                        "random_range_ratio": {"input": 0.6, "output": 0.0},
+                        "prompt_manifest_sha256": "abcdef1234567890",
+                    }
                 }
             }
         },
@@ -164,6 +199,8 @@ def test_render_markdown_includes_goal_matrix_and_sorted_profile_deltas():
     assert "| long_prefill_512_2048 | gpu_paged_default | yes | yes | 105.00 |" in report
     assert "## Scheduler Diagnostics" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | 4 | 60 | 4 | 8192 | 2.40 s | 0.80 s |" in report
+    assert "## Prompt Provenance" in report
+    assert "| long_prefill_512_2048 | gpu_paged_default | vllm_random | random | 128 | 7 | 1280 | 16 | {\"input\":0.6,\"output\":0.0} | abcdef123456 | abcdef123456 | yes |" in report
     assert "## Scoped Profile Range Medians" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | cpu | forward_step_token_ids_jit | 30.00 ms | 1.0 |" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | gpu | gemm_fusion | 25.00 ms | 3.0 |" in report

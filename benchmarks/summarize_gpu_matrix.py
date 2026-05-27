@@ -38,6 +38,19 @@ def _fmt_ratio(value: Any) -> str:
     return _fmt(value, suffix="x", digits=3)
 
 
+def _fmt_hash(value: Any) -> str:
+    if not value:
+        return "-"
+    text = str(value)
+    return text[:12] if len(text) > 12 else text
+
+
+def _fmt_prompt_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return _fmt(value)
+
+
 def _median(values: list[float]) -> float | None:
     clean = sorted(value for value in values if value is not None)
     if not clean:
@@ -195,6 +208,56 @@ def _scheduler_rows(summary: dict[str, Any]) -> list[list[str]]:
                     _fmt(scheduler.get("max_step_tokens"), digits=1),
                     _fmt(scheduler.get("prefill_step_seconds_total"), suffix=" s"),
                     _fmt(scheduler.get("decode_step_seconds_total"), suffix=" s"),
+                ]
+            )
+    return rows
+
+
+def _first_repeat_prompt(matrix_row: dict[str, Any]) -> dict[str, Any]:
+    for repeat in matrix_row.get("repeats") or []:
+        metrics = repeat.get("metrics") or {}
+        prompt = metrics.get("prompt") or {}
+        if prompt:
+            return prompt
+    return {}
+
+
+def _prompt_provenance_rows(summary: dict[str, Any]) -> list[list[str]]:
+    rows = []
+    for workload in summary.get("workloads") or []:
+        vllm_metrics = ((summary.get("vllm_references") or {}).get(workload) or {}).get("metrics") or {}
+        vllm_prompt = vllm_metrics.get("prompt") or {}
+        for config in summary.get("configs") or []:
+            matrix_row = ((summary.get("matrix") or {}).get(workload) or {}).get(config) or {}
+            configured = matrix_row.get("workload") or {}
+            current_prompt = _first_repeat_prompt(matrix_row)
+            source = current_prompt.get("prompt_source") or configured.get("prompt_source")
+            dataset = current_prompt.get("dataset_name") or configured.get("dataset_name")
+            num_prompts = current_prompt.get("num_prompts") or configured.get("num_prompts")
+            seed = current_prompt.get("seed")
+            if seed is None:
+                seed = configured.get("seed")
+            current_manifest = current_prompt.get("prompt_manifest_sha256")
+            vllm_manifest = vllm_prompt.get("prompt_manifest_sha256")
+            manifest_match = (
+                current_manifest == vllm_manifest
+                if current_manifest and vllm_manifest
+                else None
+            )
+            rows.append(
+                [
+                    str(workload),
+                    str(config),
+                    _fmt(source),
+                    _fmt(dataset),
+                    _fmt(num_prompts),
+                    _fmt(seed),
+                    _fmt(current_prompt.get("random_input_len") or configured.get("random_input_len")),
+                    _fmt(current_prompt.get("random_output_len") or configured.get("random_output_len")),
+                    _fmt_prompt_value(current_prompt.get("random_range_ratio") or configured.get("random_range_ratio")),
+                    _fmt_hash(current_manifest),
+                    _fmt_hash(vllm_manifest),
+                    _fmt(manifest_match),
                 ]
             )
     return rows
@@ -405,6 +468,29 @@ def render_markdown(
                     "decode step s",
                 ],
                 scheduler_rows,
+            )
+        )
+
+    prompt_rows = _prompt_provenance_rows(summary)
+    if prompt_rows:
+        lines.extend(["", "## Prompt Provenance", ""])
+        lines.extend(
+            _markdown_table(
+                [
+                    "workload",
+                    "config",
+                    "source",
+                    "dataset",
+                    "prompts",
+                    "seed",
+                    "random input",
+                    "random output",
+                    "range ratio",
+                    "current manifest",
+                    "vLLM manifest",
+                    "manifest match",
+                ],
+                prompt_rows,
             )
         )
 

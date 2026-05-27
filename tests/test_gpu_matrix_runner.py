@@ -634,6 +634,17 @@ def test_metric_summary_preserves_scoped_profile_events(tmp_path):
     artifact.write_text(
         json.dumps(
             {
+                "run_config": {
+                    "prompt_source": "vllm_random",
+                    "dataset_name": "random",
+                    "num_prompts": 16,
+                    "seed": 0,
+                    "random_input_len": 1280,
+                    "random_output_len": 16,
+                    "random_range_ratio": {"input": 0.6, "output": 0.0},
+                    "prompt_manifest_jsonl": "prompts.jsonl",
+                    "prompt_manifest_sha256": "abcdef",
+                },
                 "performance": {
                     "tokens_per_second": 10.0,
                     "ttft_ms_p50": 1.0,
@@ -680,6 +691,21 @@ def test_metric_summary_preserves_scoped_profile_events(tmp_path):
 
     metrics = _metric_summary(artifact)
 
+    assert metrics["prompt"] == {
+        "prompt_source": "vllm_random",
+        "prompt_suite": None,
+        "dataset_name": "random",
+        "input_lens": None,
+        "output_len": None,
+        "output_lengths": None,
+        "num_prompts": 16,
+        "seed": 0,
+        "random_input_len": 1280,
+        "random_output_len": 16,
+        "random_range_ratio": {"input": 0.6, "output": 0.0},
+        "prompt_manifest_jsonl": "prompts.jsonl",
+        "prompt_manifest_sha256": "abcdef",
+    }
     assert metrics["profile_trace_json_gz"] == "/tmp/trace.json.gz"
     assert metrics["profile_scoped_ranges"]["gpu"]["gemm_fusion"] == {
         "total_ms": 4.0,
@@ -758,6 +784,8 @@ def test_artifact_matches_vllm_random_sidecar_metadata(tmp_path):
                     "random_input_len": 1280,
                     "random_output_len": 16,
                     "random_range_ratio": {"input": 0.6, "output": 0.0},
+                    "prompt_manifest_jsonl": "prompts.jsonl",
+                    "prompt_manifest_sha256": "abcdef",
                 }
             }
         ),
@@ -765,6 +793,29 @@ def test_artifact_matches_vllm_random_sidecar_metadata(tmp_path):
     )
 
     assert _artifact_matches_workload(artifact, workload)
+
+
+def test_artifact_matches_rejects_vllm_random_without_prompt_manifest(tmp_path):
+    workload = WORKLOADS["vllm_random_longprefill_smoke"]
+    artifact = tmp_path / "random.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "run_config": {
+                    "prompt_source": "vllm_random",
+                    "dataset_name": "random",
+                    "num_prompts": 16,
+                    "seed": 0,
+                    "random_input_len": 1280,
+                    "random_output_len": 16,
+                    "random_range_ratio": {"input": 0.6, "output": 0.0},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert not _artifact_matches_workload(artifact, workload)
 
 
 def test_prepare_vllm_random_prompts_writes_hashed_manifest(tmp_path):

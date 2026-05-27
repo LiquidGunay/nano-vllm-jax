@@ -30,6 +30,12 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | vllm_random_longprefill | gpu_paged_default | 32.0 | 480.0 | 4.0 | 7267.0 | 17.74 s | 6.30 s |
 
+## Prompt Provenance
+
+| workload | config | source | dataset | prompts | seed | random input | random output | range ratio | current manifest | vLLM manifest | manifest match |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| vllm_random_longprefill | gpu_paged_default | vllm_random | random | 128 | 0 | 1280 | 16 | {"input":0.6,"output":0.0} | 9f98c47fe18b | 9f98c47fe18b | yes |
+
 ## Scoped Profile Range Medians
 
 | workload | config | scope | bucket | median total | median count |

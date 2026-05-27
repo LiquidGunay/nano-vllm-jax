@@ -676,6 +676,7 @@ def _metric_summary(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"artifact": str(path), "exists": False}
     artifact = _load_json(path)
+    run_config = artifact.get("run_config") or {}
     performance = artifact.get("performance") or {}
     correctness = artifact.get("correctness") or {}
     counters = artifact.get("profile_counters") or {}
@@ -690,6 +691,21 @@ def _metric_summary(path: Path) -> dict[str, Any]:
     return {
         "artifact": str(path),
         "exists": True,
+        "prompt": {
+            "prompt_source": run_config.get("prompt_source", "tokenized_seed_repeat"),
+            "prompt_suite": run_config.get("prompt_suite"),
+            "dataset_name": run_config.get("dataset_name"),
+            "input_lens": run_config.get("input_lens"),
+            "output_len": run_config.get("output_len"),
+            "output_lengths": run_config.get("output_lengths"),
+            "num_prompts": run_config.get("num_prompts"),
+            "seed": run_config.get("seed"),
+            "random_input_len": run_config.get("random_input_len"),
+            "random_output_len": run_config.get("random_output_len"),
+            "random_range_ratio": run_config.get("random_range_ratio"),
+            "prompt_manifest_jsonl": run_config.get("prompt_manifest_jsonl"),
+            "prompt_manifest_sha256": run_config.get("prompt_manifest_sha256"),
+        },
         "performance": {
             "tokens_per_second": performance.get("tokens_per_second"),
             "request_throughput": performance.get("request_throughput"),
@@ -845,6 +861,8 @@ def _artifact_matches_workload(path: Path, workload: Workload) -> bool:
     if prompt_source != workload.prompt_source:
         return False
     if workload.prompt_source == "vllm_random":
+        if not run_config.get("prompt_manifest_jsonl") or not run_config.get("prompt_manifest_sha256"):
+            return False
         if run_config.get("dataset_name") != (workload.dataset_name or "random"):
             return False
         if int(run_config.get("num_prompts") or 0) != int(workload.num_prompts or 0):
