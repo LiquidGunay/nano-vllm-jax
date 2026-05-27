@@ -318,6 +318,10 @@ gdn_segmented_prefill_chunk32(
   FLA triangular-solve stage over packed `[nnz,H,BT]` matrices. It computes
   `(I + A)^-1` per active ragged chunk and leaves columns outside each partial
   chunk zero, matching the shape contract expected before `recompute_w_u_fwd`.
+- recompute-w/u status: `gdn_fla_recompute_w_u_packed_reference` defines the
+  next FLA chunk-body stage over packed varlen tensors. It applies the solved
+  chunk matrix to beta-weighted values for `u` and to
+  `beta * exp(g_cumsum)` weighted grouped keys for `w`.
 - SM86 port note: on the current A10G host, vLLM's Hopper/TMA branches are not
   active. The local target should therefore mirror the non-TMA FLA path first.
   Preserve FP32 gate/beta/state; vLLM rejects FP32 q/k/v in its Torch wrapper,

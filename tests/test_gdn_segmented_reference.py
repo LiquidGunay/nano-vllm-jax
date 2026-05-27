@@ -15,6 +15,7 @@ jax.config.update("jax_default_matmul_precision", "highest")
 from nanovllm_jax.kernels.gdn_fla import (
     gdn_fla_chunk_local_cumsum_packed_reference,
     gdn_fla_chunk_scaled_dot_kkt_packed_reference,
+    gdn_fla_recompute_w_u_packed_reference,
     gdn_fla_solve_tril_packed_reference,
     gdn_segmented_prefill_chunk32_reference,
     pack_padded_gdn_inputs,
@@ -190,6 +191,71 @@ def test_gdn_fla_solve_tril_packed_reference_inverts_i_plus_a_per_chunk():
                 expected[start:end, head, :length] = inverse
 
     np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-5, atol=1e-6)
+
+
+def test_gdn_fla_recompute_w_u_packed_reference_matches_formula():
+    cu_seqlens = jnp.array([0, 0, 5, 13], dtype=jnp.int32)
+    chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=4)
+    key = jnp.arange(13 * 2 * 3, dtype=jnp.float32).reshape(13, 2, 3) * 0.01
+    value = jnp.arange(13 * 4 * 5, dtype=jnp.float32).reshape(13, 4, 5) * 0.02
+    beta = jnp.linspace(0.2, 0.7, 13 * 4, dtype=jnp.float32).reshape(13, 4)
+    gate = jnp.linspace(-0.25, 0.25, 13 * 4, dtype=jnp.float32).reshape(13, 4)
+    attention_matrix = gdn_fla_chunk_scaled_dot_kkt_packed_reference(
+        key,
+        beta,
+        gate,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+    )
+    attention_inverse = gdn_fla_solve_tril_packed_reference(
+        attention_matrix,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+    )
+
+    actual_w, actual_u = gdn_fla_recompute_w_u_packed_reference(
+        key,
+        value,
+        beta,
+        gate,
+        attention_inverse,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+    )
+
+    expected_w = np.zeros((13, 4, 3), dtype=np.float32)
+    expected_u = np.zeros((13, 4, 5), dtype=np.float32)
+    key_np = np.asarray(key)
+    value_np = np.asarray(value)
+    beta_np = np.asarray(beta)
+    gate_np = np.asarray(gate)
+    inverse_np = np.asarray(attention_inverse)
+    offsets = [0, 0, 5, 13]
+    for row in range(len(offsets) - 1):
+        for start in range(offsets[row], offsets[row + 1], 4):
+            end = min(offsets[row + 1], start + 4)
+            length = end - start
+            for head in range(4):
+                key_head = head // 2
+                matrix = inverse_np[start:end, head, :length].astype(np.float32)
+                chunk_beta = beta_np[start:end, head].astype(np.float32)
+                chunk_gate = gate_np[start:end, head].astype(np.float32)
+                chunk_value = value_np[start:end, head, :].astype(np.float32)
+                chunk_key = key_np[start:end, key_head, :].astype(np.float32)
+                expected_u[start:end, head, :] = matrix @ (
+                    chunk_value * chunk_beta[:, None]
+                )
+                expected_w[start:end, head, :] = matrix @ (
+                    chunk_key
+                    * chunk_beta[:, None]
+                    * np.exp(chunk_gate)[:, None]
+                )
+
+    np.testing.assert_allclose(np.asarray(actual_w), expected_w, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(actual_u), expected_u, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")

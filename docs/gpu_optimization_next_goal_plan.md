@@ -216,6 +216,11 @@ The third scalar FLA math-stage reference is now explicit:
 `(I + A)^-1` solve over packed varlen `[nnz,H,BT]` matrices, preserving padded
 zero columns outside each ragged chunk. This locks down the triangular solve
 stage before `recompute_w_u_fwd`.
+The fourth FLA math-stage reference is now explicit:
+`gdn_fla_recompute_w_u_packed_reference` implements vLLM/FLA's
+`recompute_w_u_fwd` semantics over packed varlen tensors, producing `w` and
+`u` from the solved chunk matrix, beta, local gate cumsums, grouped keys, and
+values.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -1931,6 +1936,11 @@ Commit 8:
   Validation: elevated CUDA focused selection
   `tests/test_gdn_segmented_reference.py -k 'solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'`
   passed `6 passed`.
+- ~~Add FLA recompute-w/u packed reference over `[nnz,H,D]` values and grouped
+  `[nnz,Hg,K]` keys, including gate-exp scaling and grouped-head tests.~~
+  Validation: elevated CUDA focused selection
+  `tests/test_gdn_segmented_reference.py -k 'recompute_w_u or solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'`
+  passed `7 passed`.
 - ~~Add a vLLM `fused_post_conv_prep`-inspired CUDA FP32 prep-only
   implementation behind `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_fp32`.~~
   Validation: elevated CUDA focused suite passed `18 passed`; one-repeat

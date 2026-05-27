@@ -5253,3 +5253,26 @@ JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m
   `6 passed`. The new test covers ragged `cu_seqlens=[0,0,5,13]`, chunk size
   `4`, strict-lower input from the packed KKT reference, ragged partial chunks,
   and NumPy `(I + A)^-1` parity.
+
+### Entry 143 - FLA Recompute W/U Reference
+
+- change accepted: added `gdn_fla_recompute_w_u_packed_reference`, a JAX-side
+  reference for vLLM/FLA's `recompute_w_u_fwd` stage over packed varlen tensors.
+- decision: this is the next correctness scaffold in the FLA chunk-body port.
+  It locks down how the solved chunk matrix is applied to beta-weighted values
+  for `u` and to `beta * exp(g_cumsum)` weighted grouped keys for `w`, before
+  porting `chunk_gated_delta_rule_fwd_h`.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_segmented_reference.py
+git diff --check
+.venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py -k 'recompute_w_u or solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata'
+JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py -k 'recompute_w_u or solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'
+```
+
+- result: static checks passed, the local focused selection passed
+  `6 passed, 1 deselected`, and the elevated CUDA focused selection passed
+  `7 passed`. The new test covers ragged `cu_seqlens=[0,0,5,13]`, chunk size
+  `4`, grouped output heads over two key heads, gate-exp scaling for `w`, and
+  beta-weighted value projection for `u`.

@@ -609,6 +609,86 @@ def gdn_fla_solve_tril_packed_reference(
     return output
 
 
+def gdn_fla_recompute_w_u_packed_reference(
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    beta: jnp.ndarray,
+    gate_cumsum: jnp.ndarray,
+    attention_inverse: jnp.ndarray,
+    cu_seqlens: Any,
+    *,
+    chunk_size: int,
+    chunk_indices: Any | None = None,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Reference for FLA `recompute_w_u_fwd` over packed varlen tensors."""
+
+    if key.ndim != 3:
+        raise ValueError("key must have shape [nnz_tokens, key_heads, key_dim]")
+    if value.ndim != 3:
+        raise ValueError("value must have shape [nnz_tokens, output_heads, value_dim]")
+    if beta.ndim != 2:
+        raise ValueError("beta must have shape [nnz_tokens, output_heads]")
+    if gate_cumsum.shape != beta.shape:
+        raise ValueError("gate_cumsum must have the same shape as beta")
+    if attention_inverse.ndim != 3:
+        raise ValueError(
+            "attention_inverse must have shape [nnz_tokens, output_heads, chunk_size]"
+        )
+    if key.shape[0] != value.shape[0] or key.shape[0] != beta.shape[0]:
+        raise ValueError("key, value, and beta token counts must match")
+    if value.shape[:2] != beta.shape:
+        raise ValueError("value and beta must agree on token and output heads")
+    if attention_inverse.shape != (key.shape[0], beta.shape[1], chunk_size):
+        raise ValueError("attention_inverse shape must match [tokens, output_heads, chunk_size]")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    key_heads = key.shape[1]
+    output_heads = beta.shape[1]
+    if output_heads < key_heads or output_heads % key_heads != 0:
+        raise ValueError("output_heads must be a multiple of key_heads")
+
+    offsets = np.asarray(jax.device_get(cu_seqlens), dtype=np.int64).reshape(-1)
+    if len(offsets) == 0 or offsets[0] != 0:
+        raise ValueError("cu_seqlens must start with 0")
+    if np.any(offsets[1:] < offsets[:-1]):
+        raise ValueError("cu_seqlens must be non-decreasing")
+    if int(offsets[-1]) != key.shape[0]:
+        raise ValueError("last cu_seqlens entry must equal token count")
+    if chunk_indices is None:
+        chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size)
+    chunk_index_values = np.asarray(jax.device_get(chunk_indices), dtype=np.int64)
+    if chunk_index_values.ndim != 2 or chunk_index_values.shape[1] != 2:
+        raise ValueError("chunk_indices must have shape [num_chunks, 2]")
+
+    head_group = output_heads // key_heads
+    w = jnp.zeros((key.shape[0], output_heads, key.shape[-1]), dtype=jnp.float32)
+    u = jnp.zeros(value.shape, dtype=jnp.float32)
+    for row, chunk in chunk_index_values:
+        if row < 0 or row + 1 >= len(offsets):
+            raise ValueError("chunk_indices row is out of range")
+        chunk_start = int(offsets[row]) + int(chunk) * int(chunk_size)
+        chunk_end = min(int(offsets[row + 1]), chunk_start + int(chunk_size))
+        if chunk_start < int(offsets[row]) or chunk_start >= int(offsets[row + 1]):
+            raise ValueError("chunk_indices chunk is out of range for row")
+        length = chunk_end - chunk_start
+        for head in range(output_heads):
+            key_head = head // head_group
+            matrix = attention_inverse[chunk_start:chunk_end, head, :length].astype(
+                jnp.float32
+            )
+            chunk_beta = beta[chunk_start:chunk_end, head].astype(jnp.float32)
+            chunk_gate = gate_cumsum[chunk_start:chunk_end, head].astype(jnp.float32)
+            chunk_value = value[chunk_start:chunk_end, head, :].astype(jnp.float32)
+            chunk_key = key[chunk_start:chunk_end, key_head, :].astype(jnp.float32)
+            u_chunk = matrix @ (chunk_value * chunk_beta[:, None])
+            w_chunk = matrix @ (
+                chunk_key * chunk_beta[:, None] * jnp.exp(chunk_gate)[:, None]
+            )
+            u = u.at[chunk_start:chunk_end, head, :].set(u_chunk)
+            w = w.at[chunk_start:chunk_end, head, :].set(w_chunk)
+    return w, u
+
+
 def pack_padded_gdn_inputs(
     query: jnp.ndarray,
     key: jnp.ndarray,
