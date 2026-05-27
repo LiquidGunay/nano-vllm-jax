@@ -304,6 +304,11 @@ gdn_segmented_prefill_chunk32(
   It preserves original sequence indices when padded rows have zero length, so
   future kernels can read `cu_seqlens` and state rows without silently
   compressing batch-row identity.
+- chunk-local-cumsum status: `gdn_fla_chunk_local_cumsum_packed_reference`
+  defines the first scalar FLA math-stage reference over packed `[nnz,H]`
+  gates. It covers forward and reverse cumsum, resets accumulation at every
+  active chunk row, and uses `prepare_gdn_fla_chunk_metadata` so future kernels
+  can match vLLM semantics without assuming padded rows were pre-filtered.
 - SM86 port note: on the current A10G host, vLLM's Hopper/TMA branches are not
   active. The local target should therefore mirror the non-TMA FLA path first.
   Preserve FP32 gate/beta/state; vLLM rejects FP32 q/k/v in its Torch wrapper,

@@ -450,6 +450,53 @@ def prepare_gdn_fla_chunk_metadata(
     )
 
 
+def gdn_fla_chunk_local_cumsum_packed_reference(
+    gate: jnp.ndarray,
+    cu_seqlens: Any,
+    *,
+    chunk_size: int,
+    chunk_indices: Any | None = None,
+    reverse: bool = False,
+) -> jnp.ndarray:
+    """Reference for FLA scalar `chunk_local_cumsum` over packed `[nnz,H]` gate."""
+
+    if gate.ndim != 2:
+        raise ValueError("gate must have shape [nnz_tokens, heads]")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    offsets = np.asarray(jax.device_get(cu_seqlens), dtype=np.int64).reshape(-1)
+    if len(offsets) == 0 or offsets[0] != 0:
+        raise ValueError("cu_seqlens must start with 0")
+    if np.any(offsets[1:] < offsets[:-1]):
+        raise ValueError("cu_seqlens must be non-decreasing")
+    if int(offsets[-1]) != gate.shape[0]:
+        raise ValueError("last cu_seqlens entry must equal gate token count")
+    if chunk_indices is None:
+        chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size)
+    chunk_index_values = np.asarray(jax.device_get(chunk_indices), dtype=np.int64)
+    if chunk_index_values.ndim != 2 or chunk_index_values.shape[1] != 2:
+        raise ValueError("chunk_indices must have shape [num_chunks, 2]")
+
+    output = jnp.zeros(gate.shape, dtype=jnp.float32)
+    for row, chunk in chunk_index_values:
+        if row < 0 or row + 1 >= len(offsets):
+            raise ValueError("chunk_indices row is out of range")
+        chunk_start = int(offsets[row]) + int(chunk) * int(chunk_size)
+        chunk_end = min(int(offsets[row + 1]), chunk_start + int(chunk_size))
+        if chunk_start < int(offsets[row]) or chunk_start >= int(offsets[row + 1]):
+            raise ValueError("chunk_indices chunk is out of range for row")
+        chunk_gate = gate[chunk_start:chunk_end].astype(jnp.float32)
+        if reverse:
+            chunk_cumsum = jnp.flip(
+                jnp.cumsum(jnp.flip(chunk_gate, axis=0), axis=0),
+                axis=0,
+            )
+        else:
+            chunk_cumsum = jnp.cumsum(chunk_gate, axis=0)
+        output = output.at[chunk_start:chunk_end].set(chunk_cumsum)
+    return output
+
+
 def pack_padded_gdn_inputs(
     query: jnp.ndarray,
     key: jnp.ndarray,

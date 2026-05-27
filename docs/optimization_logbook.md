@@ -5186,3 +5186,24 @@ JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m
 - result: focused CUDA selection passed `3 passed`. The tests cover ragged
   `cu_seqlens=[0,0,5,37,74,138]`, all-empty rows, expected active chunk rows,
   per-row chunk offsets, and the existing segmented-reference parity check.
+
+### Entry 140 - FLA Chunk-Local Cumsum Reference
+
+- change accepted: added `gdn_fla_chunk_local_cumsum_packed_reference`, a
+  JAX-side reference for vLLM/FLA's scalar `chunk_local_cumsum` stage over
+  packed `[nnz,H]` gate tensors.
+- decision: this is a correctness scaffold for the future FLA chunk-body port,
+  not a serving speed claim. It locks down per-chunk reset behavior, reverse
+  cumsum semantics, and use of the local `chunk_indices` contract before any
+  lowered implementation replaces the reference.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_segmented_reference.py
+git diff --check
+JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py -k 'chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'
+```
+
+- result: static checks passed and the focused elevated CUDA selection passed
+  `4 passed`. The new test covers ragged `cu_seqlens=[0,0,5,22]`, chunk size
+  `8`, forward cumsum, reverse cumsum, and reset at row/chunk boundaries.

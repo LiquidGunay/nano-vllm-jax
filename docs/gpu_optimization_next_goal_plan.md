@@ -201,6 +201,11 @@ The FLA varlen chunk metadata helper now exists as well:
 offsets for the future FLA chunk-body port. It deliberately preserves original
 row ids across zero-length padded rows, unlike the upstream helper's
 pre-filtered-row assumption.
+The first scalar FLA math-stage reference is now explicit:
+`gdn_fla_chunk_local_cumsum_packed_reference` implements vLLM's scalar
+`chunk_local_cumsum` semantics over packed `[nnz,H]` gates, including per-chunk
+reset behavior and reverse cumulative sums. It is a correctness reference for a
+future kernel stage, not a serving speed path.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -1901,6 +1906,11 @@ Commit 8:
   zero-length rows.~~ Validation: elevated CUDA focused selection
   `tests/test_gdn_segmented_reference.py -k 'chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'`
   passed `3 passed`.
+- ~~Add scalar FLA chunk-local cumsum packed reference over `[nnz,H]` gates,
+  including reverse mode and chunk-reset tests.~~ Validation: elevated CUDA
+  focused selection
+  `tests/test_gdn_segmented_reference.py -k 'chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'`
+  passed `4 passed`.
 - ~~Add a vLLM `fused_post_conv_prep`-inspired CUDA FP32 prep-only
   implementation behind `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_fp32`.~~
   Validation: elevated CUDA focused suite passed `18 passed`; one-repeat
