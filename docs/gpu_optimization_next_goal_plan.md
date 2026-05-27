@@ -230,6 +230,10 @@ The final scalar FLA chunk-body reference is now explicit:
 `gdn_fla_chunk_fwd_o_packed_reference` implements vLLM/FLA's `chunk_fwd_o`
 output stage over packed varlen tensors, combining query-to-prior-state output
 with causal intra-chunk attention over ungated `v_new`.
+The composed FLA packed-body reference is now explicit too:
+`gdn_fla_chunk_gated_delta_rule_packed_reference` runs the full audited FLA
+stage order over packed ragged tensors and matches the existing segmented JAX
+reference on a ragged normalized-Q/K parity test.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -1962,6 +1966,12 @@ Commit 8:
   Validation: elevated CUDA focused selection
   `tests/test_gdn_segmented_reference.py -k 'chunk_fwd_o or chunk_delta_h or recompute_w_u or solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'`
   passed `9 passed`.
+- ~~Add composed FLA chunk-gated-delta packed reference that runs
+  `chunk_local_cumsum`, KKT, solve-tril, recompute-w/u, chunk-delta-h, and
+  chunk-fwd-o in vLLM order and compares against the segmented JAX
+  reference.~~ Validation: elevated CUDA focused selection
+  `tests/test_gdn_segmented_reference.py -k 'chunk_gated_delta_rule_packed or chunk_fwd_o or chunk_delta_h or recompute_w_u or solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'`
+  passed `10 passed`.
 - ~~Add a vLLM `fused_post_conv_prep`-inspired CUDA FP32 prep-only
   implementation behind `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_fp32`.~~
   Validation: elevated CUDA focused suite passed `18 passed`; one-repeat

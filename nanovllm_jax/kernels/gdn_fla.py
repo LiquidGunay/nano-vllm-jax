@@ -894,6 +894,113 @@ def gdn_fla_chunk_fwd_o_packed_reference(
     return output
 
 
+def gdn_fla_chunk_gated_delta_rule_packed_reference(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    gate: jnp.ndarray,
+    beta: jnp.ndarray,
+    cu_seqlens: Any,
+    initial_state: jnp.ndarray,
+    *,
+    chunk_size: int,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Reference for the full FLA `chunk_gated_delta_rule` packed body."""
+
+    if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+        raise ValueError("query, key, and value must have shape [nnz_tokens, heads, dim]")
+    if query.shape != key.shape:
+        raise ValueError("query and key shapes must match")
+    if value.shape[:2] != query.shape[:2]:
+        raise ValueError("value must match query [tokens, heads]")
+    if gate.shape != query.shape[:2] or beta.shape != query.shape[:2]:
+        raise ValueError("gate and beta must have shape [tokens, heads]")
+    offsets = np.asarray(jax.device_get(cu_seqlens), dtype=np.int64).reshape(-1)
+    if len(offsets) == 0 or offsets[0] != 0:
+        raise ValueError("cu_seqlens must start with 0")
+    if np.any(offsets[1:] < offsets[:-1]):
+        raise ValueError("cu_seqlens must be non-decreasing")
+    if int(offsets[-1]) != query.shape[0]:
+        raise ValueError("last cu_seqlens entry must equal token count")
+    if initial_state.shape[:2] != (len(offsets) - 1, query.shape[1]):
+        raise ValueError("initial_state batch/head dimensions must match cu_seqlens/query")
+
+    if use_qk_l2norm_in_kernel:
+        from nanovllm_jax.layers import l2norm
+
+        query = l2norm(query.astype(jnp.float32), axis=-1, eps=1e-6)
+        key = l2norm(key.astype(jnp.float32), axis=-1, eps=1e-6)
+    else:
+        query = query.astype(jnp.float32)
+        key = key.astype(jnp.float32)
+    value = value.astype(jnp.float32)
+    gate = gate.astype(jnp.float32)
+    beta = beta.astype(jnp.float32)
+
+    chunk_indices, chunk_offsets = prepare_gdn_fla_chunk_metadata(
+        cu_seqlens,
+        chunk_size,
+    )
+    gate_cumsum = gdn_fla_chunk_local_cumsum_packed_reference(
+        gate,
+        cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+    )
+    attention_matrix = gdn_fla_chunk_scaled_dot_kkt_packed_reference(
+        key,
+        beta,
+        gate_cumsum,
+        cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+    )
+    attention_inverse = gdn_fla_solve_tril_packed_reference(
+        attention_matrix,
+        cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+    )
+    w, u = gdn_fla_recompute_w_u_packed_reference(
+        key,
+        value,
+        beta,
+        gate_cumsum,
+        attention_inverse,
+        cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+    )
+    h, v_new, final_state = gdn_fla_chunk_delta_h_packed_reference(
+        key,
+        w,
+        u,
+        gate_cumsum,
+        cu_seqlens,
+        initial_state,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        output_final_state=True,
+        save_new_value=True,
+    )
+    if v_new is None or final_state is None:
+        raise AssertionError("chunk delta reference must return v_new and final_state")
+    output = gdn_fla_chunk_fwd_o_packed_reference(
+        query,
+        key,
+        v_new,
+        h,
+        gate_cumsum,
+        cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+        scale=float(query.shape[-1] ** -0.5),
+    )
+    return output, final_state
+
+
 def pack_padded_gdn_inputs(
     query: jnp.ndarray,
     key: jnp.ndarray,

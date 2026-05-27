@@ -331,6 +331,11 @@ gdn_segmented_prefill_chunk32(
   FLA chunk-body output stage. It combines query-to-prior-state output with
   causal intra-chunk attention over ungated `v_new`, with optional gate scaling
   and grouped output-head to key-head mapping.
+- composed chunk-body status:
+  `gdn_fla_chunk_gated_delta_rule_packed_reference` now defines the full packed
+  FLA prefill body by composing the audited vLLM stages in order. This is the
+  single correctness boundary a lowered FLA-derived implementation should
+  replace.
 - SM86 port note: on the current A10G host, vLLM's Hopper/TMA branches are not
   active. The local target should therefore mirror the non-TMA FLA path first.
   Preserve FP32 gate/beta/state; vLLM rejects FP32 q/k/v in its Torch wrapper,

@@ -15,6 +15,7 @@ jax.config.update("jax_default_matmul_precision", "highest")
 from nanovllm_jax.kernels.gdn_fla import (
     gdn_fla_chunk_delta_h_packed_reference,
     gdn_fla_chunk_fwd_o_packed_reference,
+    gdn_fla_chunk_gated_delta_rule_packed_reference,
     gdn_fla_chunk_local_cumsum_packed_reference,
     gdn_fla_chunk_scaled_dot_kkt_packed_reference,
     gdn_fla_recompute_w_u_packed_reference,
@@ -449,6 +450,101 @@ def test_gdn_fla_chunk_fwd_o_packed_reference_matches_formula():
             ) * 0.7
 
     np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-5, atol=1e-6)
+
+
+def test_gdn_fla_chunk_gated_delta_rule_packed_reference_matches_segmented(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1")
+
+    batch = 4
+    num_heads = 3
+    seq_len = 9
+    key_dim = 5
+    value_dim = 4
+    lengths = jnp.array([0, 3, 7, 9], dtype=jnp.int32)
+    valid = jnp.arange(seq_len, dtype=jnp.int32)[None, :] < lengths[:, None]
+    keys = jax.random.split(jax.random.PRNGKey(20260527), 6)
+    query = jax.random.normal(
+        keys[0],
+        (batch, num_heads, seq_len, key_dim),
+        dtype=jnp.float32,
+    )
+    key = jax.random.normal(
+        keys[1],
+        (batch, num_heads, seq_len, key_dim),
+        dtype=jnp.float32,
+    )
+    value = jax.random.normal(
+        keys[2],
+        (batch, num_heads, seq_len, value_dim),
+        dtype=jnp.float32,
+    )
+    gate = jax.random.normal(
+        keys[3],
+        (batch, num_heads, seq_len),
+        dtype=jnp.float32,
+    ) * 0.05
+    beta = jax.random.uniform(
+        keys[4],
+        (batch, num_heads, seq_len),
+        dtype=jnp.float32,
+        minval=0.05,
+        maxval=0.95,
+    )
+    initial_state = jax.random.normal(
+        keys[5],
+        (batch, num_heads, value_dim, key_dim),
+        dtype=jnp.float32,
+    ) * 0.01
+
+    query = jnp.where(valid[:, None, :, None], query, 0.0)
+    key = jnp.where(valid[:, None, :, None], key, 0.0)
+    value = jnp.where(valid[:, None, :, None], value, 0.0)
+    gate = jnp.where(valid[:, None, :], gate, 0.0)
+    beta = jnp.where(valid[:, None, :], beta, 0.0)
+    (
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_gate,
+        packed_beta,
+        cu_seqlens,
+    ) = pack_padded_gdn_inputs(query, key, value, gate, beta, lengths)
+
+    actual_out, actual_state = gdn_fla_chunk_gated_delta_rule_packed_reference(
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_gate,
+        packed_beta,
+        cu_seqlens,
+        initial_state,
+        chunk_size=4,
+        use_qk_l2norm_in_kernel=True,
+    )
+    expected_out, expected_state = gdn_segmented_prefill_chunk32_reference(
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_beta,
+        packed_gate,
+        cu_seqlens,
+        initial_state,
+        chunk_size=4,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_out),
+        np.asarray(expected_out),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
+        rtol=2e-5,
+        atol=2e-5,
+    )
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")

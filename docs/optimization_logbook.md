@@ -5326,3 +5326,30 @@ JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m
   output heads over two key heads, gate scaling for state and intra-chunk terms,
   causal inclusive masking, explicit output scaling, and composition with the
   previous packed FLA reference stages.
+
+### Entry 146 - Composed FLA Chunk-Gated-Delta Reference
+
+- change accepted: added `gdn_fla_chunk_gated_delta_rule_packed_reference`, a
+  composed JAX-side reference for the full vLLM/FLA prefill chunk body over
+  packed varlen tensors.
+- decision: this gives future lowered implementations one correctness boundary
+  to replace. It runs the audited FLA stage order directly:
+  `chunk_local_cumsum`, `chunk_scaled_dot_kkt`, `solve_tril`, `recompute_w_u`,
+  `chunk_gated_delta_rule_fwd_h`, and `chunk_fwd_o`, while preserving ragged
+  `cu_seqlens`, `chunk_indices`, `chunk_offsets`, grouped heads, FP32
+  gate/beta/state math, and optional Q/K L2 normalization.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_segmented_reference.py
+git diff --check
+.venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py -k 'chunk_gated_delta_rule_packed or chunk_fwd_o or chunk_delta_h or recompute_w_u or solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata'
+JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py -k 'chunk_gated_delta_rule_packed or chunk_fwd_o or chunk_delta_h or recompute_w_u or solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'
+```
+
+- result: static checks passed, the local focused selection passed
+  `9 passed, 1 deselected`, and the elevated CUDA focused selection passed
+  `10 passed`. The new test compares the composed FLA packed body to the
+  existing segmented JAX reference on ragged lengths `[0,3,7,9]`, chunk size
+  `4`, Q/K L2 normalization enabled, grouped state/output shapes, and final
+  state parity.
