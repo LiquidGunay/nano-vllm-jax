@@ -142,7 +142,10 @@ emits q/k/v in the input activation dtype, vLLM FLA chunk explicitly rejects
 FP32 q/k/v, and FlashInfer GDN prefill accepts BF16/FP16 q/k/v with FP32
 g/beta/state. Preserving the default contract requires a FP32 port/fork of the
 FLA chunk schedule behind the existing post-conv boundary. A FlashInfer BF16
-prefill experiment is allowed only as a separate diagnostic lane.
+prefill experiment is allowed only as a separate diagnostic lane. The current
+GPU host is NVIDIA A10G / SM86, while FlashInfer GDN prefill requires SM90 or
+SM100, so direct FlashInfer GDN prefill is blocked locally even before the dtype
+contract question.
 The post-conv reference now exposes an explicit FLA-shaped FP32 prep helper:
 `prepare_gdn_post_conv_prefill_fla_inputs_from_decay` returns query/key/value in
 `[B,T,H,D]`, gate/beta in `[B,T,H]`, and row lengths, with optional q/k L2
@@ -292,6 +295,13 @@ Current tracked records:
   `results/qwen08_jax_bf16_prefillact_long_decode_top5_compare_20260527.json`
   failed promotion: top-1 exact `500/500`, ordered top-5 `498/500`, top-5 set
   `499/500`, and `max_hf_topk_id_logit_diff=0.010448455810546875`.
+- Current external GDN kernel feasibility probe:
+  `results/external_gdn_kernel_probe_20260527_sm86.json` records installed
+  FlashInfer `0.6.11.post3`, `jax-tvm-ffi 0.1.3`, torch `2.12.0`, Triton
+  `3.7.0`, GPU `NVIDIA A10G` with compute capability `8.6`, and all expected
+  local vLLM/FLA source paths present. It marks direct FlashInfer GDN prefill
+  blocked by the SM90/SM100 requirement; use vLLM/FLA as a port/fork reference
+  behind the existing post-conv or packed-decode ABI.
 - Current vLLM-inspired random-token manifest sidecar:
   `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
   `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
@@ -1717,6 +1727,11 @@ Commit 7c - Optional BF16 GDN prefill activation experiment:
   win before any future BF16 external-kernel promotion.
 - If the BF16 path only helps an external-kernel microbenchmark but fails the
   full-model gates, keep it rejected/default-off.
+- ~~Add a reproducible external GDN kernel feasibility probe for the local host
+  and record the FlashInfer/vLLM/FLA constraints.~~ Validation:
+  `benchmarks/probe_external_gdn_kernels.py --run-smoke` wrote
+  `results/external_gdn_kernel_probe_20260527_sm86.json`, showing A10G SM86 and
+  direct FlashInfer GDN prefill blocked by the SM90/SM100 requirement.
 
 Commit 8:
 

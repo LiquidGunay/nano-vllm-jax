@@ -5061,3 +5061,26 @@ NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32 NANO_VLLM_JAX_GDN
 - result: focused post-conv suite passed `9 passed`; neighboring
   GDN/kernel-registry suite passed `24 passed`; integrated route was exact for
   16 generated tokens; long-decode top-5 guardrail failed as described above.
+
+### Entry 135 - External GDN Kernel Feasibility Probe
+
+- change accepted: added `benchmarks/probe_external_gdn_kernels.py`, a small
+  host probe that records GPU capability, installed optional package versions,
+  FlashInfer GDN prefill requirements, and local vLLM/FLA source-path
+  availability. This is a decision artifact, not a benchmark.
+- artifact: `results/external_gdn_kernel_probe_20260527_sm86.json`
+- result: elevated GPU-visible probe reports `NVIDIA A10G`, compute capability
+  `8.6`, FlashInfer `0.6.11.post3`, `jax-tvm-ffi 0.1.3`, torch `2.12.0`, and
+  Triton `3.7.0`. All expected vLLM/FLA source paths are present under
+  `/mountpoint/.exp/vllm-venv`.
+- decision: direct FlashInfer GDN prefill is blocked on this host because the
+  installed FlashInfer GDN kernel requires SM90/SM100 and BF16/FP16 q/k/v. The
+  next local GDN implementation path should keep using vLLM/FLA as a port/fork
+  reference behind the existing post-conv or packed-decode ABI, not pursue
+  direct FlashInfer GDN prefill on SM86.
+- validation:
+
+```text
+.venv/bin/python -m py_compile benchmarks/probe_external_gdn_kernels.py
+.venv/bin/python benchmarks/probe_external_gdn_kernels.py --run-smoke --output-json results/external_gdn_kernel_probe_20260527_sm86.json
+```
