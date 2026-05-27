@@ -314,6 +314,10 @@ gdn_segmented_prefill_chunk32(
   math-stage reference over packed `[nnz,Hg,K]` keys and `[nnz,H]` beta/gate
   tensors. It covers strict-lower masking, optional `exp(g_i - g_j)` decay
   scaling, and grouped output-head to key-head mapping.
+- solve-tril status: `gdn_fla_solve_tril_packed_reference` defines the scalar
+  FLA triangular-solve stage over packed `[nnz,H,BT]` matrices. It computes
+  `(I + A)^-1` per active ragged chunk and leaves columns outside each partial
+  chunk zero, matching the shape contract expected before `recompute_w_u_fwd`.
 - SM86 port note: on the current A10G host, vLLM's Hopper/TMA branches are not
   active. The local target should therefore mirror the non-TMA FLA path first.
   Preserve FP32 gate/beta/state; vLLM rejects FP32 q/k/v in its Torch wrapper,

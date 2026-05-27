@@ -562,6 +562,53 @@ def gdn_fla_chunk_scaled_dot_kkt_packed_reference(
     return output
 
 
+def gdn_fla_solve_tril_packed_reference(
+    attention_matrix: jnp.ndarray,
+    cu_seqlens: Any,
+    *,
+    chunk_size: int,
+    chunk_indices: Any | None = None,
+) -> jnp.ndarray:
+    """Reference for FLA `solve_tril` over packed varlen chunk matrices."""
+
+    if attention_matrix.ndim != 3:
+        raise ValueError("attention_matrix must have shape [nnz_tokens, heads, chunk_size]")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if attention_matrix.shape[-1] != chunk_size:
+        raise ValueError("attention_matrix last dimension must equal chunk_size")
+    offsets = np.asarray(jax.device_get(cu_seqlens), dtype=np.int64).reshape(-1)
+    if len(offsets) == 0 or offsets[0] != 0:
+        raise ValueError("cu_seqlens must start with 0")
+    if np.any(offsets[1:] < offsets[:-1]):
+        raise ValueError("cu_seqlens must be non-decreasing")
+    if int(offsets[-1]) != attention_matrix.shape[0]:
+        raise ValueError("last cu_seqlens entry must equal token count")
+    if chunk_indices is None:
+        chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size)
+    chunk_index_values = np.asarray(jax.device_get(chunk_indices), dtype=np.int64)
+    if chunk_index_values.ndim != 2 or chunk_index_values.shape[1] != 2:
+        raise ValueError("chunk_indices must have shape [num_chunks, 2]")
+
+    output = jnp.zeros(attention_matrix.shape, dtype=jnp.float32)
+    for row, chunk in chunk_index_values:
+        if row < 0 or row + 1 >= len(offsets):
+            raise ValueError("chunk_indices row is out of range")
+        chunk_start = int(offsets[row]) + int(chunk) * int(chunk_size)
+        chunk_end = min(int(offsets[row + 1]), chunk_start + int(chunk_size))
+        if chunk_start < int(offsets[row]) or chunk_start >= int(offsets[row + 1]):
+            raise ValueError("chunk_indices chunk is out of range for row")
+        length = chunk_end - chunk_start
+        identity = jnp.eye(length, dtype=jnp.float32)
+        for head in range(attention_matrix.shape[1]):
+            matrix = attention_matrix[chunk_start:chunk_end, head, :length].astype(
+                jnp.float32
+            )
+            inverse = jnp.linalg.inv(identity + matrix)
+            output = output.at[chunk_start:chunk_end, head, :length].set(inverse)
+    return output
+
+
 def pack_padded_gdn_inputs(
     query: jnp.ndarray,
     key: jnp.ndarray,

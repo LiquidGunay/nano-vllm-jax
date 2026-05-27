@@ -15,6 +15,7 @@ jax.config.update("jax_default_matmul_precision", "highest")
 from nanovllm_jax.kernels.gdn_fla import (
     gdn_fla_chunk_local_cumsum_packed_reference,
     gdn_fla_chunk_scaled_dot_kkt_packed_reference,
+    gdn_fla_solve_tril_packed_reference,
     gdn_segmented_prefill_chunk32_reference,
     pack_padded_gdn_inputs,
     prepare_gdn_fla_chunk_metadata,
@@ -152,6 +153,43 @@ def test_gdn_fla_chunk_scaled_dot_kkt_packed_reference_matches_formula():
                 expected[start:end, head, :length] = matrix * lower
 
     np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-6, atol=1e-6)
+
+
+def test_gdn_fla_solve_tril_packed_reference_inverts_i_plus_a_per_chunk():
+    cu_seqlens = jnp.array([0, 0, 5, 13], dtype=jnp.int32)
+    chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=4)
+    key = jnp.arange(13 * 2 * 3, dtype=jnp.float32).reshape(13, 2, 3) * 0.01
+    beta = jnp.ones((13, 4), dtype=jnp.float32) * 0.2
+    attention_matrix = gdn_fla_chunk_scaled_dot_kkt_packed_reference(
+        key,
+        beta,
+        None,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+    )
+
+    actual = gdn_fla_solve_tril_packed_reference(
+        attention_matrix,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+    )
+
+    expected = np.zeros((13, 4, 4), dtype=np.float32)
+    attention_np = np.asarray(attention_matrix)
+    offsets = [0, 0, 5, 13]
+    for row in range(len(offsets) - 1):
+        for start in range(offsets[row], offsets[row + 1], 4):
+            end = min(offsets[row + 1], start + 4)
+            length = end - start
+            identity = np.eye(length, dtype=np.float32)
+            for head in range(4):
+                matrix = attention_np[start:end, head, :length].astype(np.float32)
+                inverse = np.linalg.inv(identity + matrix)
+                expected[start:end, head, :length] = inverse
+
+    np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")

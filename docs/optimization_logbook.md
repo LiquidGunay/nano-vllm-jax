@@ -5229,3 +5229,27 @@ JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m
   `5 passed`. The new test covers ragged `cu_seqlens=[0,0,5,13]`, chunk size
   `4`, grouped output heads over two key heads, strict-lower masking, and gate
   difference scaling.
+
+### Entry 142 - FLA Solve-Tril Reference
+
+- change accepted: added `gdn_fla_solve_tril_packed_reference`, a JAX-side
+  reference for vLLM/FLA's `solve_tril` stage over packed varlen chunk
+  matrices.
+- decision: this is the third scalar correctness scaffold for the future FLA
+  chunk-body port. It records the per-active-chunk `(I + A)^-1` convention and
+  keeps padded columns outside ragged partial chunks zero before the
+  `recompute_w_u_fwd` stage is ported.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_segmented_reference.py
+git diff --check
+.venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py -k 'solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata'
+JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py -k 'solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'
+```
+
+- result: static checks passed, the local focused selection passed
+  `5 passed, 1 deselected`, and the elevated CUDA focused selection passed
+  `6 passed`. The new test covers ragged `cu_seqlens=[0,0,5,13]`, chunk size
+  `4`, strict-lower input from the packed KKT reference, ragged partial chunks,
+  and NumPy `(I + A)^-1` parity.
