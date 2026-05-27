@@ -136,6 +136,34 @@ def _profile_delta_rows(comparison: dict[str, Any], *, limit: int) -> list[list[
     return [row for _, row in rows[: max(0, int(limit))]]
 
 
+def _profile_scoped_delta_rows(comparison: dict[str, Any], *, limit: int) -> list[list[str]]:
+    deltas = comparison.get("profile_scoped_delta_vs_jax_reference") or {}
+    rows = []
+    for scope, scope_deltas in deltas.items():
+        for name, bucket in (scope_deltas or {}).items():
+            delta = bucket.get("total_ms_delta")
+            if delta is None:
+                continue
+            rows.append(
+                (
+                    abs(float(delta)),
+                    [
+                        str(scope),
+                        str(name),
+                        _fmt(bucket.get("current_total_ms_median"), suffix=" ms"),
+                        _fmt(bucket.get("reference_total_ms"), suffix=" ms"),
+                        _fmt(delta, suffix=" ms"),
+                        _fmt_ratio(bucket.get("total_ms_ratio")),
+                        _fmt(bucket.get("current_count_median"), digits=1),
+                        _fmt(bucket.get("reference_count"), digits=1),
+                        _fmt(bucket.get("count_delta"), digits=1),
+                    ],
+                )
+            )
+    rows.sort(key=lambda item: item[0], reverse=True)
+    return [row for _, row in rows[: max(0, int(limit))]]
+
+
 def _profile_delta_bullets(comparison: dict[str, Any], *, limit: int) -> list[str]:
     rows = _profile_delta_rows(comparison, limit=limit)
     if not rows:
@@ -450,6 +478,36 @@ def render_markdown(
             lines.append("")
     if not any_profile_rows:
         lines.append("No profile deltas available.")
+
+    lines.extend(["", "## Scoped Profile Deltas Vs JAX Reference", ""])
+    any_scoped_profile_rows = False
+    for workload_name in summary.get("workloads") or []:
+        for config_name in summary.get("configs") or []:
+            comparison = ((summary.get("comparisons") or {}).get(workload_name) or {}).get(config_name) or {}
+            rows = _profile_scoped_delta_rows(comparison, limit=top_profile_deltas)
+            if not rows:
+                continue
+            any_scoped_profile_rows = True
+            lines.extend([f"### `{workload_name}/{config_name}`", ""])
+            lines.extend(
+                _markdown_table(
+                    [
+                        "scope",
+                        "bucket",
+                        "current",
+                        "reference",
+                        "delta",
+                        "ratio",
+                        "current count",
+                        "reference count",
+                        "count delta",
+                    ],
+                    rows,
+                )
+            )
+            lines.append("")
+    if not any_scoped_profile_rows:
+        lines.append("No scoped profile deltas available.")
     lines.extend(["", *_logbook_template(summary, top_profile_deltas=top_profile_deltas)])
     return "\n".join(lines).rstrip() + "\n"
 

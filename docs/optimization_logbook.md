@@ -4443,3 +4443,24 @@ JAX_PLATFORMS=cuda ... pytest -q \
 ```
 
 - result: `47 passed`; `py_compile` passed.
+
+### Entry 118 - Scoped Profile Deltas When References Support Them
+
+- change accepted: matrix comparison summaries now compute
+  `profile_scoped_delta_vs_jax_reference` for GPU/CPU scoped ranges when both
+  the current aggregate and selected JAX reference contain scoped profile
+  fields. `benchmarks/summarize_gpu_matrix.py` renders those deltas in
+  `Scoped Profile Deltas Vs JAX Reference`.
+- current artifact note: regenerated
+  `results/gpu_matrix_20260527_scoped_profile_target.md`. The selected JAX
+  reference predates scoped fields, so the report correctly says no scoped
+  profile deltas are available while still showing scoped range medians and top
+  events for the current run.
+- validation:
+
+```text
+.venv/bin/python -m pytest -q tests/test_gpu_matrix_runner.py tests/test_gpu_matrix_summary_report.py
+.venv/bin/python -m py_compile benchmarks/run_gpu_matrix.py benchmarks/summarize_gpu_matrix.py tests/test_gpu_matrix_runner.py tests/test_gpu_matrix_summary_report.py
+```
+
+- result: `47 passed`; `py_compile` passed.

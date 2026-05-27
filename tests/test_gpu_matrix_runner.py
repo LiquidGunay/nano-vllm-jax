@@ -878,6 +878,14 @@ def test_comparison_summary_reports_gap_to_target():
                     "count_median": 3.0,
                 }
             },
+            "profile_scoped_range_medians": {
+                "gpu": {
+                    PROFILE_NEEDLES[0]: {
+                        "total_ms_median": 8.0,
+                        "count_median": 4.0,
+                    }
+                }
+            },
         },
         {
             "performance": {
@@ -897,6 +905,14 @@ def test_comparison_summary_reports_gap_to_target():
                 PROFILE_NEEDLES[0]: {
                     "total_ms": 10.0,
                     "count": 2,
+                }
+            },
+            "profile_scoped_ranges": {
+                "gpu": {
+                    PROFILE_NEEDLES[0]: {
+                        "total_ms": 5.0,
+                        "count": 1,
+                    }
                 }
             },
         },
@@ -921,6 +937,10 @@ def test_comparison_summary_reports_gap_to_target():
     assert profile_delta["total_ms_delta"] == 2.0
     assert profile_delta["total_ms_ratio"] == pytest.approx(1.2)
     assert profile_delta["count_delta"] == 1.0
+    scoped_delta = comparison["profile_scoped_delta_vs_jax_reference"]["gpu"][PROFILE_NEEDLES[0]]
+    assert scoped_delta["total_ms_delta"] == 3.0
+    assert scoped_delta["total_ms_ratio"] == pytest.approx(1.6)
+    assert scoped_delta["count_delta"] == 3.0
 
 
 def test_comparison_summary_clamps_negative_gap_after_target_met():

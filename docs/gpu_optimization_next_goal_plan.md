@@ -487,6 +487,10 @@ end-to-end throughput.
   repeats, and the Markdown report can fall back to per-repeat scoped ranges for
   older artifacts. This gives future speed claims a stable scoped median table
   plus per-repeat top-event detail.
+- Matrix comparisons now compute scoped GPU/CPU profile deltas versus the JAX
+  reference when both artifacts contain scoped profile fields. If the selected
+  reference predates scoped fields, reports explicitly say scoped deltas are
+  unavailable instead of implying no movement.
 - `benchmarks/run_gpu_matrix.py` now writes that Markdown report by default next
   to the summary JSON, or to `--report-md` when supplied. `--no-report-md`
   keeps report generation opt-out for controlled runs.

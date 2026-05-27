@@ -10,6 +10,9 @@
   libraries as GPU commands. Run those outside the sandbox with elevated access
   as well, even when the command itself looks like a normal unit-test or
   benchmark invocation.
+- Default to elevated access for any benchmark, profiling, server, model-load,
+  or performance-measurement command that may touch the GPU runtime. If unsure
+  whether a command will initialize GPU/JAX/vLLM/CUDA state, run it elevated.
 - Keep benchmark/model/cache/temp paths rooted under `/mountpoint/.exp`.
 - Keep JAX GPU runs GPU-only with `JAX_PLATFORMS=cuda`; do not fall back to CPU
   for correctness or benchmark runs.

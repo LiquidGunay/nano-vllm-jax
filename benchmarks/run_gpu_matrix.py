@@ -1089,6 +1089,36 @@ def _profile_delta_vs_reference(
     return result
 
 
+def _profile_scoped_delta_vs_reference(
+    aggregate: dict[str, Any],
+    jax_reference_metrics: dict[str, Any] | None,
+) -> dict[str, dict[str, dict[str, float | None]]]:
+    current_scoped = aggregate.get("profile_scoped_range_medians") or {}
+    reference_scoped = (jax_reference_metrics or {}).get("profile_scoped_ranges") or {}
+    result: dict[str, dict[str, dict[str, float | None]]] = {}
+    for scope in ("gpu", "cpu"):
+        result[scope] = {}
+        current_scope = current_scoped.get(scope) or {}
+        reference_scope = reference_scoped.get(scope) or {}
+        for needle in PROFILE_NEEDLES:
+            current_bucket = current_scope.get(needle) or {}
+            reference_bucket = reference_scope.get(needle) or {}
+            current_total = current_bucket.get("total_ms_median")
+            reference_total = reference_bucket.get("total_ms")
+            current_count = current_bucket.get("count_median")
+            reference_count = reference_bucket.get("count")
+            result[scope][needle] = {
+                "current_total_ms_median": current_total,
+                "reference_total_ms": reference_total,
+                "total_ms_delta": _delta_or_none(current_total, reference_total),
+                "total_ms_ratio": _ratio_or_none(current_total, reference_total),
+                "current_count_median": current_count,
+                "reference_count": reference_count,
+                "count_delta": _delta_or_none(current_count, reference_count),
+            }
+    return result
+
+
 def _comparison_summary(
     aggregate: dict[str, Any],
     vllm_metrics: dict[str, Any] | None,
@@ -1148,6 +1178,10 @@ def _comparison_summary(
         "ttft_ms_p50_delta_vs_jax_reference": _delta_or_none(jax_ttft, reference_ttft),
         "itl_ms_p50_delta_vs_jax_reference": _delta_or_none(jax_itl, reference_itl),
         "profile_delta_vs_jax_reference": _profile_delta_vs_reference(
+            aggregate,
+            jax_reference_metrics,
+        ),
+        "profile_scoped_delta_vs_jax_reference": _profile_scoped_delta_vs_reference(
             aggregate,
             jax_reference_metrics,
         ),

@@ -88,6 +88,10 @@
 | command_buffer::update | 8.85 ms | 10.46 ms | -1.62 ms | 0.845x | 181.0 | 195 | -14.0 |
 
 
+## Scoped Profile Deltas Vs JAX Reference
+
+No scoped profile deltas available.
+
 ## Logbook Entry Template
 
 Copy this into `docs/optimization_logbook.md` after replacing the interpretation and decision text.

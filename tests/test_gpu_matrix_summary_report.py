@@ -61,6 +61,19 @@ def _summary():
                             "count_delta": -3.0,
                         },
                     },
+                    "profile_scoped_delta_vs_jax_reference": {
+                        "gpu": {
+                            "gemm_fusion": {
+                                "current_total_ms_median": 25.0,
+                                "reference_total_ms": 20.0,
+                                "total_ms_delta": 5.0,
+                                "total_ms_ratio": 1.25,
+                                "current_count_median": 3.0,
+                                "reference_count": 2,
+                                "count_delta": 1.0,
+                            }
+                        }
+                    },
                 }
             }
         },
@@ -157,6 +170,8 @@ def test_render_markdown_includes_goal_matrix_and_sorted_profile_deltas():
     assert "## Top Scoped Profile Events" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | 1 | gpu | gemm_fusion_dot | 25.00 ms | 3 |" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | 1 | cpu | forward_step_token_ids_jit | 30.00 ms | 1 |" in report
+    assert "## Scoped Profile Deltas Vs JAX Reference" in report
+    assert "| gpu | gemm_fusion | 25.00 ms | 20.00 ms | 5.00 ms | 1.250x | 3.0 | 2 | 1.0 |" in report
     assert "## Acceptance Failures\n\nNone." in report
     assert "## Logbook Entry Template" in report
     assert "- profile movement to explain:" in report
