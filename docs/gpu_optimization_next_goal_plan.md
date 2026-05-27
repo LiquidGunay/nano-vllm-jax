@@ -30,14 +30,14 @@ optimization work starts.
    JAX default references. `--require-stored-references` remains an explicit
    opt-in gate when live fallback is not acceptable.
 8. Parity targets are staged. The no-kernel `gpu_paged_default >= 0.75x` vLLM
-   gate on the long heterogeneous vLLM-style benchmark is now met by the
+   gate on the long heterogeneous exact-token benchmark is now met by the
    accepted 2026-05-26 goal-target artifact. The next active serving target is
    a correctness-gated kernel-backed path at `>=0.9x` vLLM on the same
    benchmark discipline. MTP speed work remains out of scope until the
    non-speculative kernel path meets that bar.
 9. The existing `long_prefill_512_2048` workload is a valid exact-token,
-   shape-synthetic gate, but it is not enough for an external vLLM-style
-   workload claim. Add a sidecar lane that follows vLLM benchmark conventions:
+   shape-synthetic gate, but it is not enough for an external vLLM benchmark
+   workload claim. Add a sidecar lane that records vLLM-comparable metadata:
    random/custom-manifest prompts, larger `num_prompts`, explicit seed,
    prompt-manifest hash, output-token throughput, total-token throughput, and
    request throughput. ShareGPT-style serving should be a separate comparability
@@ -78,7 +78,7 @@ documentation/configuration-first:
    only to correctness-gated kernel-backed non-speculative serving paths, not to
    MTP speculative decoding.
 7. Before treating `0.75x` or `0.9x` as an externally comparable vLLM-benchmark
-   claim, run the new vLLM-style diverse sidecar as well as the existing
+   claim, run a diverse prompt-manifest sidecar as well as the existing
    exact-token long-prefill gate. The current repeated-seed prompt suite remains
    useful for regression control because it freezes token IDs and shapes.
 8. Treat V,K as the next GDN layout target. The first implementation slice
@@ -163,7 +163,7 @@ Current tracked records:
   repeats, speed-claim-ready, and still below the active `0.9x` gate. This is
   the first target artifact whose matrix report includes scoped GPU/CPU top
   profile events.
-- Current vLLM-style random long-prefill sidecar:
+- Current vLLM-inspired random-token manifest sidecar:
   `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
   `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
   match over two repeats, and speed-claim-ready in the matrix sense. This
@@ -531,9 +531,9 @@ end-to-end throughput.
   prompts to force exact input lengths. Keep this harness for deterministic
   correctness and shape comparisons, but label it as `tokenized_seed_repeat` or
   `shape_synthetic`.
-- Add a vLLM-convention sidecar benchmark lane before making broader throughput
-  claims. The first sidecar should use either vLLM random sampling semantics or
-  a shared custom JSONL manifest such as one row per request with
+- Add a vLLM-comparable sidecar benchmark lane before making broader throughput
+  claims. The first sidecar should use either upstream vLLM random sampling
+  semantics or a shared custom JSONL manifest such as one row per request with
   `request_id`, `prompt_token_ids`, `prompt_len`, and `output_len`. Artifacts
   should record `prompt_source`, `dataset_name`, `num_prompts`, `seed`,
   `prompt_manifest_jsonl`, `prompt_manifest_sha256`, `total_input_tokens`,
@@ -599,7 +599,7 @@ end-to-end throughput.
 - Updated parity ladder: the no-kernel/non-speculative default has now cleared
   the staged `0.75x` gate. The next active target is `0.9x` vLLM for
   correctness-gated kernel-backed non-speculative serving on the same
-  long-prefill/vLLM-style benchmark discipline. MTP remains diagnostic-only
+  long-prefill exact-token benchmark discipline. MTP remains diagnostic-only
   until that kernel target is met or explicitly reprioritized.
 - Sidecar smoke validation:
   `results/gpu_matrix_20260526_143600.json` and

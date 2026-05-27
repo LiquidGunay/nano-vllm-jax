@@ -4113,9 +4113,9 @@ JAX_PLATFORMS=cuda ... pytest -q \
   target the segmented/nnz boundary or a backend design that preserves the
   current padded chunk32 accumulation contract.
 
-### Entry 103 - vLLM-Style Random Long-Prefill Sidecar
+### Entry 103 - vLLM-Inspired Random-Token Sidecar
 
-- experiment: ran the new vLLM-style random long-prefill sidecar with 128
+- experiment: ran the new vLLM-inspired random-token long-prefill sidecar with 128
   prompts, random input length centered at `1280`, range ratio `0.6`, output
   length `16`, `max_num_seqs=4`, and one repeat. The run used
   `gpu_paged_default`; no CUDA GDN probe flag was enabled.
@@ -4134,8 +4134,9 @@ JAX_PLATFORMS=cuda ... pytest -q \
   `tolist`/`np.asarray` attribution worsened by about `43.9 ms`.
 - decision: record this as a sidecar comparability data point, not as the main
   exact-token goal gate. The large gap is primarily TTFT/serving-batch behavior
-  on the vLLM-style random prompt lane, so future kernel work should continue to
-  report this lane separately from the frozen long-prefill correctness gate.
+  on the local shared-token random prompt lane, so future kernel work should
+  continue to report this lane separately from the frozen long-prefill
+  correctness gate.
 
 ### Entry 104 - GDN FLA Backend Registry Scaffolding
 

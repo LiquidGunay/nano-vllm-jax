@@ -57,9 +57,9 @@ optimization plan in `docs/gpu_optimization_next_goal_plan.md`.
 - active staged kernel target: correctness-gated kernel-backed non-speculative
   serving should target `>=0.9x` vLLM before MTP speed work is promoted
 - benchmark caveat: the existing long-prefill target is an exact-token
-  shape-synthetic gate based on repeated tokenized seed prompts. A vLLM-style
-  random/custom-manifest sidecar should be run before making broader benchmark
-  comparability claims.
+  shape-synthetic gate based on repeated tokenized seed prompts. A shared
+  token-manifest sidecar, or an upstream `vllm bench` dataset run, should be
+  used before making broader benchmark comparability claims.
 
 ## Current Long-Prefill Goal Target
 
