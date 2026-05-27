@@ -199,7 +199,17 @@ gdn_recurrent_decode_step(
   plus `chunk_gated_delta_rule` is `1.45 ms` p50 with FP32 gate/beta/state and
   V,K state `[N,HV,V,K]`. Packed BF16 decode is `0.11-0.16 ms` p50 for batches
   `1,4,8,16`. This is a porting target, not a serving promotion: it still
-  requires a JAX-facing path plus exact-token and long-logit gates.
+  requires a JAX-facing path plus exact-token and long-logit gates. The same
+  artifact includes independent recurrent reference checks: packed decode
+  matches BF16 output exactly and FP32 state within `1.19e-7`; ragged prefill
+  `[17,64,65]` has BF16 output max abs `4.88e-4` and final-state max abs
+  `4.45e-3`.
+- direct-reuse audit status: direct vLLM Torch/Triton reuse from JAX is not a
+  low-risk path in the current environment. There is no `jax_triton` package in
+  the repo venv, the vLLM venv lacks JAX/`jax_tvm_ffi`, vLLM's GDN kernels are
+  exposed through Torch/Triton wrappers rather than a stable non-Torch ABI, and
+  the available JAX DLPack/host-callback surface is not enough for a JIT-safe
+  framework bridge. Port/fork the FLA schedule behind the JAX-facing boundary.
 
 ## P1.2 - `gdn_segmented_prefill_chunk32`
 

@@ -5097,17 +5097,28 @@ NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32 NANO_VLLM_JAX_GDN
   The model-shaped varlen prefill uses BF16 q/k/v with FP32 gate/beta/state and
   V,K recurrent state `[N,HV,V,K]`. For lengths `[512,1024,1536,2048]`
   (`5120` total tokens), `fused_post_conv_prep` p50 is `0.40 ms`,
-  `chunk_gated_delta_rule` p50 is `1.23 ms`, and combined prep+chunk p50 is
-  `1.45 ms`. Packed decode p50 is `0.117 ms` at batch 1, `0.115 ms` at batch 4,
-  `0.118 ms` at batch 8, and `0.156 ms` at batch 16.
+  `chunk_gated_delta_rule` p50 is `1.31 ms`, and combined prep+chunk p50 is
+  `1.45 ms`. Packed decode p50 is `0.116 ms` at batch 1, `0.116 ms` at batch 4,
+  `0.119 ms` at batch 8, and `0.161 ms` at batch 16.
+- reference check: the probe also compares vLLM/FLA outputs to an independent
+  Torch recurrent reference. Packed decode matches BF16 output exactly and FP32
+  state within `1.19e-7` max abs. Ragged prefill lengths `[17,64,65]` match to
+  BF16 output max abs `4.88e-4`; final FP32 state max abs is `4.45e-3`.
 - decision: use the upstream FLA schedule as the next real GDN port/fork
   target. The numbers are far better than the rejected local FP32 chunk-body
   attempts, but they do not change the default dtype contract. A JAX-facing path
   still has to pass exact generated-token parity and long-decode top-logit gates
   before BF16 GDN activations can be promoted.
+- direct-reuse audit: a sidecar audit found that directly calling vLLM's
+  Torch/Triton GDN kernels from inside JAX is not a low-risk path on this stack:
+  `jax_triton` is absent from the repo venv, the vLLM venv lacks
+  JAX/`jax_tvm_ffi`, vLLM exposes Torch/Triton wrappers rather than a stable
+  non-Torch ABI, and this JAX build does not provide a simple JIT-safe DLPack
+  export/host-callback bridge. Treat vLLM/FLA as the golden reference and
+  port/fork the schedule behind the existing JAX-facing GDN boundaries.
 - validation:
 
 ```text
 .venv/bin/python -m py_compile benchmarks/probe_vllm_fla_gdn.py
-/mountpoint/.exp/vllm-venv/bin/python benchmarks/probe_vllm_fla_gdn.py --warmups 3 --repeats 10 --output-json results/vllm_fla_gdn_probe_20260527_sm86.json
+/mountpoint/.exp/vllm-venv/bin/python benchmarks/probe_vllm_fla_gdn.py --warmups 2 --repeats 5 --output-json results/vllm_fla_gdn_probe_20260527_sm86.json
 ```
