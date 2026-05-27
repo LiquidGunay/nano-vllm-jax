@@ -225,6 +225,14 @@ def test_aggregate_repeats_requires_exact_full_length_match():
                             "count": 2,
                         }
                     },
+                    "profile_scoped_ranges": {
+                        "gpu": {
+                            PROFILE_NEEDLES[0]: {
+                                "total_ms": 4.0,
+                                "count": 1,
+                            }
+                        }
+                    },
                     "correctness": {
                         "checked": True,
                         "ok": True,
@@ -245,6 +253,10 @@ def test_aggregate_repeats_requires_exact_full_length_match():
     assert aggregate["profile_medians"][PROFILE_NEEDLES[0]] == {
         "total_ms_median": 5.0,
         "count_median": 2.0,
+    }
+    assert aggregate["profile_scoped_range_medians"]["gpu"][PROFILE_NEEDLES[0]] == {
+        "total_ms_median": 4.0,
+        "count_median": 1.0,
     }
 
 

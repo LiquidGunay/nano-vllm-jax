@@ -4423,3 +4423,23 @@ JAX_PLATFORMS=cuda ... pytest -q \
   the benchmark/reporting path and reinforces that the default path remains
   below `0.9x`; it does not justify moving to MTP or accepting a decode-only
   kernel as sufficient by itself.
+
+### Entry 117 - Scoped Profile Range Medians In Matrix Reports
+
+- change accepted: `benchmarks/run_gpu_matrix.py` now aggregates scoped GPU/CPU
+  profile range medians across repeats, and `benchmarks/summarize_gpu_matrix.py`
+  renders them in `Scoped Profile Range Medians`. The renderer also falls back
+  to per-repeat scoped ranges for older matrix JSONs that predate the aggregate
+  field.
+- artifact update: regenerated
+  `results/gpu_matrix_20260527_scoped_profile_target.md` from the existing
+  scoped-profile target JSON. The report now shows scoped range medians before
+  the per-repeat top scoped events.
+- validation:
+
+```text
+.venv/bin/python -m pytest -q tests/test_gpu_matrix_runner.py tests/test_gpu_matrix_summary_report.py
+.venv/bin/python -m py_compile benchmarks/run_gpu_matrix.py benchmarks/summarize_gpu_matrix.py tests/test_gpu_matrix_runner.py tests/test_gpu_matrix_summary_report.py
+```
+
+- result: `47 passed`; `py_compile` passed.

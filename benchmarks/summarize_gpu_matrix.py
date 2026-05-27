@@ -38,6 +38,16 @@ def _fmt_ratio(value: Any) -> str:
     return _fmt(value, suffix="x", digits=3)
 
 
+def _median(values: list[float]) -> float | None:
+    clean = sorted(value for value in values if value is not None)
+    if not clean:
+        return None
+    middle = len(clean) // 2
+    if len(clean) % 2:
+        return float(clean[middle])
+    return float((clean[middle - 1] + clean[middle]) / 2.0)
+
+
 def _goal_target_row(summary: dict[str, Any]) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
     target = summary.get("goal_target") or {}
     workload = str(target.get("workload") or "")
@@ -194,6 +204,62 @@ def _scoped_profile_event_rows(
     return rows
 
 
+def _scoped_profile_range_rows(
+    summary: dict[str, Any],
+    *,
+    scopes: tuple[str, ...] = ("gpu", "cpu"),
+    limit: int = 8,
+) -> list[list[str]]:
+    rows: list[tuple[float, list[str]]] = []
+    for workload in summary.get("workloads") or []:
+        for config in summary.get("configs") or []:
+            matrix_row = ((summary.get("matrix") or {}).get(workload) or {}).get(config) or {}
+            scoped_medians = (matrix_row.get("aggregate") or {}).get("profile_scoped_range_medians") or {}
+            if not scoped_medians:
+                scoped_medians = {}
+                for scope in scopes:
+                    buckets: dict[str, dict[str, list[float]]] = {}
+                    for repeat in matrix_row.get("repeats") or []:
+                        metrics = repeat.get("metrics") or {}
+                        scoped_ranges = metrics.get("profile_scoped_ranges") or {}
+                        for bucket, values in (scoped_ranges.get(scope) or {}).items():
+                            bucket_values = buckets.setdefault(
+                                str(bucket),
+                                {"total_ms": [], "count": []},
+                            )
+                            if values.get("total_ms") is not None:
+                                bucket_values["total_ms"].append(float(values["total_ms"]))
+                            if values.get("count") is not None:
+                                bucket_values["count"].append(float(values["count"]))
+                    scoped_medians[scope] = {
+                        bucket: {
+                            "total_ms_median": _median(values["total_ms"]),
+                            "count_median": _median(values["count"]),
+                        }
+                        for bucket, values in buckets.items()
+                    }
+            for scope in scopes:
+                for bucket, values in (scoped_medians.get(scope) or {}).items():
+                    total = values.get("total_ms_median")
+                    if total is None:
+                        continue
+                    rows.append(
+                        (
+                            float(total),
+                            [
+                                str(workload),
+                                str(config),
+                                str(scope),
+                                str(bucket),
+                                _fmt(total, suffix=" ms"),
+                                _fmt(values.get("count_median"), digits=1),
+                            ],
+                        )
+                    )
+    rows.sort(key=lambda item: item[0], reverse=True)
+    return [row for _, row in rows[: max(0, int(limit))]]
+
+
 def _markdown_table(headers: list[str], rows: list[list[str]]) -> list[str]:
     if not rows:
         return ["No rows."]
@@ -311,6 +377,23 @@ def render_markdown(
                     "decode step s",
                 ],
                 scheduler_rows,
+            )
+        )
+
+    scoped_range_rows = _scoped_profile_range_rows(summary, limit=top_profile_deltas)
+    if scoped_range_rows:
+        lines.extend(["", "## Scoped Profile Range Medians", ""])
+        lines.extend(
+            _markdown_table(
+                [
+                    "workload",
+                    "config",
+                    "scope",
+                    "bucket",
+                    "median total",
+                    "median count",
+                ],
+                scoped_range_rows,
             )
         )
 

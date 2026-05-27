@@ -30,6 +30,19 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | long_prefill_512_2048 | gpu_paged_default | 1.0 | 15.0 | 4.0 | 5120.0 | 0.53 s | 0.17 s |
 
+## Scoped Profile Range Medians
+
+| workload | config | scope | bucket | median total | median count |
+| --- | --- | --- | --- | --- | --- |
+| long_prefill_512_2048 | gpu_paged_default | cpu | generate_with_trace | 704.78 ms | 1.0 |
+| long_prefill_512_2048 | gpu_paged_default | cpu | _run_main_and_sample | 678.91 ms | 16.0 |
+| long_prefill_512_2048 | gpu_paged_default | gpu | fusion | 507.03 ms | 23935.0 |
+| long_prefill_512_2048 | gpu_paged_default | cpu | array.py:325 tolist | 397.54 ms | 16.0 |
+| long_prefill_512_2048 | gpu_paged_default | cpu | np.asarray(jax.Array) | 397.42 ms | 16.0 |
+| long_prefill_512_2048 | gpu_paged_default | cpu | forward_step_token_ids_jit | 270.34 ms | 16.0 |
+| long_prefill_512_2048 | gpu_paged_default | cpu | PjRtCApiLoadedExecutable::Execute | 268.43 ms | 44.0 |
+| long_prefill_512_2048 | gpu_paged_default | cpu | jit_compiled:XLA GPU module | 252.87 ms | 16.0 |
+
 ## Top Scoped Profile Events
 
 | workload | config | repeat | scope | event | total | count |

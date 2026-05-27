@@ -758,6 +758,25 @@ def _aggregate_repeats(repeats: list[dict[str, Any]]) -> dict[str, Any]:
             "total_ms_median": _median(total_values),
             "count_median": _median(count_values),
         }
+    scoped_range_medians = {}
+    for scope in ("gpu", "cpu"):
+        scoped_range_medians[scope] = {}
+        for needle in PROFILE_NEEDLES:
+            total_values = []
+            count_values = []
+            for row in metric_rows:
+                bucket = (
+                    ((row.get("profile_scoped_ranges") or {}).get(scope) or {}).get(needle)
+                    or {}
+                )
+                if bucket.get("total_ms") is not None:
+                    total_values.append(bucket.get("total_ms"))
+                if bucket.get("count") is not None:
+                    count_values.append(bucket.get("count"))
+            scoped_range_medians[scope][needle] = {
+                "total_ms_median": _median(total_values),
+                "count_median": _median(count_values),
+            }
     scheduler_keys = (
         "step_count",
         "prefill_step_count",
@@ -800,6 +819,7 @@ def _aggregate_repeats(repeats: list[dict[str, Any]]) -> dict[str, Any]:
             [row.get("first_forward_step_token_ids_jit_ms") for row in metric_rows]
         ),
         "profile_medians": profile_medians,
+        "profile_scoped_range_medians": scoped_range_medians,
         "scheduler_diagnostics_median": scheduler_medians,
         "all_correct": all(bool(row.get("ok")) for row in correctness_rows),
         "all_exact_generated_token_match": all(

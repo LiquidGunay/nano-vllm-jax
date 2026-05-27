@@ -483,6 +483,10 @@ end-to-end throughput.
   when a matrix artifact contains them. Older matrix JSONs predate this field
   and will omit the section; new profiled runs should expose it in the default
   Markdown report.
+- Matrix aggregation now computes scoped GPU/CPU profile-range medians across
+  repeats, and the Markdown report can fall back to per-repeat scoped ranges for
+  older artifacts. This gives future speed claims a stable scoped median table
+  plus per-repeat top-event detail.
 - `benchmarks/run_gpu_matrix.py` now writes that Markdown report by default next
   to the summary JSON, or to `--report-md` when supplied. `--no-report-md`
   keeps report generation opt-out for controlled runs.

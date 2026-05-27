@@ -76,7 +76,21 @@ def _summary():
                             "max_step_tokens": 8192,
                             "prefill_step_seconds_total": 2.4,
                             "decode_step_seconds_total": 0.8,
-                        }
+                        },
+                        "profile_scoped_range_medians": {
+                            "gpu": {
+                                "gemm_fusion": {
+                                    "total_ms_median": 25.0,
+                                    "count_median": 3.0,
+                                }
+                            },
+                            "cpu": {
+                                "forward_step_token_ids_jit": {
+                                    "total_ms_median": 30.0,
+                                    "count_median": 1.0,
+                                }
+                            },
+                        },
                     },
                     "repeats": [
                         {
@@ -137,6 +151,9 @@ def test_render_markdown_includes_goal_matrix_and_sorted_profile_deltas():
     assert "| long_prefill_512_2048 | gpu_paged_default | yes | yes | 105.00 |" in report
     assert "## Scheduler Diagnostics" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | 4 | 60 | 4 | 8192 | 2.40 s | 0.80 s |" in report
+    assert "## Scoped Profile Range Medians" in report
+    assert "| long_prefill_512_2048 | gpu_paged_default | cpu | forward_step_token_ids_jit | 30.00 ms | 1.0 |" in report
+    assert "| long_prefill_512_2048 | gpu_paged_default | gpu | gemm_fusion | 25.00 ms | 3.0 |" in report
     assert "## Top Scoped Profile Events" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | 1 | gpu | gemm_fusion_dot | 25.00 ms | 3 |" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | 1 | cpu | forward_step_token_ids_jit | 30.00 ms | 1 |" in report
@@ -162,3 +179,23 @@ def test_acceptance_failures_reports_failed_checks_and_missing_profiles():
         f"speed_claim_ready=false; target_vllm_ratio_met=false target={TARGET_VLLM_RATIO}; "
         "missing_profile_counters=1"
     ]
+
+
+def test_render_markdown_falls_back_to_repeat_scoped_range_medians():
+    summary = _summary()
+    aggregate = summary["matrix"]["long_prefill_512_2048"]["gpu_paged_default"]["aggregate"]
+    del aggregate["profile_scoped_range_medians"]
+    repeat = summary["matrix"]["long_prefill_512_2048"]["gpu_paged_default"]["repeats"][0]
+    repeat["metrics"]["profile_scoped_ranges"] = {
+        "gpu": {
+            "gemm_fusion": {
+                "total_ms": 25.0,
+                "count": 3,
+            }
+        }
+    }
+
+    report = render_markdown(summary)
+
+    assert "## Scoped Profile Range Medians" in report
+    assert "| long_prefill_512_2048 | gpu_paged_default | gpu | gemm_fusion | 25.00 ms | 3.0 |" in report
