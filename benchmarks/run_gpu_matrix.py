@@ -678,6 +678,7 @@ def _metric_summary(path: Path) -> dict[str, Any]:
     artifact = _load_json(path)
     performance = artifact.get("performance") or {}
     correctness = artifact.get("correctness") or {}
+    counters = artifact.get("profile_counters") or {}
     ranges = _counter_ranges(artifact)
     profile = {
         key: {
@@ -718,7 +719,11 @@ def _metric_summary(path: Path) -> dict[str, Any]:
             "forward_step_token_ids_jit",
         ),
         "scheduler_diagnostics": _scheduler_diagnostics(artifact),
-        "profile_trace_json_gz": (artifact.get("profile_counters") or {}).get("trace_json_gz"),
+        "profile_trace_json_gz": counters.get("trace_json_gz"),
+        "profile_scoped_ranges": counters.get("scoped_ranges") or {},
+        "profile_scoped_top_events_by_total_ms": (
+            counters.get("scoped_top_events_by_total_ms") or {}
+        ),
         "run": artifact.get("run"),
         "speculative": artifact.get("speculative"),
         "mtp_admission": artifact.get("mtp_admission"),

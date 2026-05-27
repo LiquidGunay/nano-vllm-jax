@@ -31,6 +31,7 @@ from benchmarks.run_gpu_matrix import (
     _find_local_vllm_reference,
     _jax_available,
     _jax_command,
+    _metric_summary,
     _runtime_env,
     _scheduler_diagnostics,
     _selected_matrix_names,
@@ -614,6 +615,67 @@ def test_reference_metrics_for_comparison_uses_first_existing_reference(tmp_path
         "total_ms": 5.0,
         "count": 1,
     }
+
+
+def test_metric_summary_preserves_scoped_profile_events(tmp_path):
+    artifact = tmp_path / "artifact.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "performance": {
+                    "tokens_per_second": 10.0,
+                    "ttft_ms_p50": 1.0,
+                    "ttft_ms_p95": 1.5,
+                    "itl_ms_p50": 2.0,
+                    "itl_ms_p95": 2.5,
+                },
+                "correctness": {
+                    "checked": True,
+                    "ok": True,
+                    "full_length_ok": True,
+                },
+                "profile_counters": {
+                    "trace_json_gz": "/tmp/trace.json.gz",
+                    "ranges": {
+                        PROFILE_NEEDLES[0]: {
+                            "total_ms": 5.0,
+                            "count": 2,
+                        }
+                    },
+                    "scoped_ranges": {
+                        "gpu": {
+                            "gemm_fusion": {
+                                "total_ms": 4.0,
+                                "count": 1,
+                            }
+                        }
+                    },
+                    "scoped_top_events_by_total_ms": {
+                        "gpu": [
+                            {
+                                "name": "gemm_fusion_dot",
+                                "total_ms": 4.0,
+                                "count": 1,
+                            }
+                        ]
+                    },
+                },
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    metrics = _metric_summary(artifact)
+
+    assert metrics["profile_trace_json_gz"] == "/tmp/trace.json.gz"
+    assert metrics["profile_scoped_ranges"]["gpu"]["gemm_fusion"] == {
+        "total_ms": 4.0,
+        "count": 1,
+    }
+    assert metrics["profile_scoped_top_events_by_total_ms"]["gpu"][0]["name"] == (
+        "gemm_fusion_dot"
+    )
 
 
 def _flag_value(command, flag):

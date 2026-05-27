@@ -6,6 +6,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from benchmarks.summarize_profile_trace import render_markdown, summarize_trace
+from benchmarks.benchmark_jax_server_trace import _profile_counters
 
 
 def _write_trace(path, events):
@@ -79,3 +80,51 @@ def test_render_markdown_includes_pattern_and_top_event_rows(tmp_path):
     assert "`input_reduce`" in markdown
     assert "`input_reduce_fusion`" in markdown
     assert "1.25" in markdown
+
+
+def test_jax_trace_profile_counters_include_scoped_gpu_cpu_rows(tmp_path):
+    profile_dir = tmp_path / "plugins" / "profile" / "run"
+    profile_dir.mkdir(parents=True)
+    trace = profile_dir / "host.trace.json.gz"
+    _write_trace(
+        trace,
+        [
+            {
+                "ph": "M",
+                "pid": 1,
+                "name": "process_name",
+                "args": {"name": "/device:GPU:0"},
+            },
+            {
+                "ph": "M",
+                "pid": 2,
+                "name": "process_name",
+                "args": {"name": "/host:CPU"},
+            },
+            {"ph": "X", "pid": 1, "name": "gemm_fusion_dot", "dur": 4000},
+            {"ph": "X", "pid": 1, "name": "MemcpyD2D", "dur": 1000},
+            {
+                "ph": "X",
+                "pid": 2,
+                "name": "$model_executor.py:501 forward_step_token_ids_jit",
+                "dur": 9000,
+            },
+        ],
+    )
+
+    counters = _profile_counters(tmp_path)
+
+    assert counters["ranges"]["gemm_fusion"] == {"total_ms": 4.0, "count": 1}
+    assert counters["scoped_ranges"]["gpu"]["gemm_fusion"] == {
+        "total_ms": 4.0,
+        "count": 1,
+    }
+    assert counters["scoped_ranges"]["cpu"]["forward_step_token_ids_jit"] == {
+        "total_ms": 9.0,
+        "count": 1,
+    }
+    assert counters["scoped_top_events_by_total_ms"]["gpu"][0]["name"] == "gemm_fusion_dot"
+    assert (
+        counters["scoped_top_events_by_total_ms"]["cpu"][0]["name"]
+        == "$model_executor.py:501 forward_step_token_ids_jit"
+    )

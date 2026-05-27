@@ -4,12 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import json
 import os
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +16,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from benchmarks.benchmark_vllm_qwen35 import compare_reference, prepare_prompt_rows
+from benchmarks.summarize_profile_trace import summarize_trace
 from run_tracking import RunRecorder
 from runtime_paths import configure_compilation_cache, configure_flashinfer_cache, configure_xla_flags
 
@@ -170,6 +169,8 @@ def _profile_counters(profile_path: Path) -> dict[str, Any]:
             "trace_json_gz": None,
             "ranges": {},
             "top_events_by_total_ms": [],
+            "scoped_ranges": {},
+            "scoped_top_events_by_total_ms": {},
         }
     trace_path = traces[-1]
     needles = [
@@ -200,55 +201,46 @@ def _profile_counters(profile_path: Path) -> dict[str, Any]:
         "fusion",
         "while",
     ]
-    range_totals: dict[str, list[float | int]] = defaultdict(lambda: [0.0, 0])
-    event_totals: dict[str, list[float | int]] = defaultdict(lambda: [0.0, 0])
     try:
-        with gzip.open(trace_path, "rt", encoding="utf-8") as handle:
-            events = json.load(handle).get("traceEvents", [])
+        all_summary = summarize_trace(
+            trace_path,
+            scope="all",
+            top_events=40,
+            patterns=needles,
+        )
+        gpu_summary = summarize_trace(
+            trace_path,
+            scope="gpu",
+            top_events=40,
+            patterns=needles,
+        )
+        cpu_summary = summarize_trace(
+            trace_path,
+            scope="cpu",
+            top_events=40,
+            patterns=needles,
+        )
     except Exception as exc:
         return {
             "trace_json_gz": str(trace_path),
             "error": f"{type(exc).__name__}: {exc}",
             "ranges": {},
             "top_events_by_total_ms": [],
+            "scoped_ranges": {},
+            "scoped_top_events_by_total_ms": {},
         }
-
-    for event in events:
-        duration = event.get("dur")
-        if duration is None:
-            continue
-        name = str(event.get("name", ""))
-        duration_ms = float(duration) / 1000.0
-        event_totals[name][0] += duration_ms
-        event_totals[name][1] += 1
-        for needle in needles:
-            if needle in name:
-                range_totals[needle][0] += duration_ms
-                range_totals[needle][1] += 1
-
-    top_events = sorted(
-        (
-            {
-                "name": name,
-                "total_ms": float(total),
-                "count": int(count),
-            }
-            for name, (total, count) in event_totals.items()
-            if total > 0
-        ),
-        key=lambda row: row["total_ms"],
-        reverse=True,
-    )[:40]
     return {
         "trace_json_gz": str(trace_path),
-        "ranges": {
-            needle: {
-                "total_ms": float(total),
-                "count": int(count),
-            }
-            for needle, (total, count) in sorted(range_totals.items())
+        "ranges": all_summary["patterns"],
+        "scoped_ranges": {
+            "gpu": gpu_summary["patterns"],
+            "cpu": cpu_summary["patterns"],
         },
-        "top_events_by_total_ms": top_events,
+        "top_events_by_total_ms": all_summary["top_events_by_total_ms"],
+        "scoped_top_events_by_total_ms": {
+            "gpu": gpu_summary["top_events_by_total_ms"],
+            "cpu": cpu_summary["top_events_by_total_ms"],
+        },
     }
 
 

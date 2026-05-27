@@ -4358,3 +4358,25 @@ JAX_PLATFORMS=cuda ... pytest -q \
 ```
 
 - result: `2 passed`; `py_compile` passed.
+
+### Entry 114 - Scoped Raw Trace Events In Benchmark Artifacts
+
+- change accepted: `benchmarks/benchmark_jax_server_trace.py` now records
+  `scoped_ranges` and `scoped_top_events_by_total_ms` for GPU and CPU trace
+  scopes in each benchmark artifact. `benchmarks/run_gpu_matrix.py` preserves
+  those fields in per-repeat matrix metrics.
+- motivation: future performance claims need raw GPU/CPU event evidence without
+  hand-parsing Perfetto traces or running a separate summarizer after every
+  matrix run.
+- stored-profile smoke: running `_profile_counters` on the current-goal repeat
+  1 profile reports GPU `gemm_fusion={'total_ms': 243.57338599999844,
+  'count': 6424}` and top GPU event `gemm_fusion_dot_general_744` at
+  `57.457908 ms`.
+- validation:
+
+```text
+.venv/bin/python -m pytest -q tests/test_profile_trace_summary.py tests/test_gpu_matrix_runner.py
+.venv/bin/python -m py_compile benchmarks/benchmark_jax_server_trace.py benchmarks/run_gpu_matrix.py benchmarks/summarize_profile_trace.py tests/test_profile_trace_summary.py tests/test_gpu_matrix_runner.py
+```
+
+- result: `47 passed`; `py_compile` passed.
