@@ -163,15 +163,15 @@ Current tracked records:
   repeats, speed-claim-ready, and still below the active `0.9x` gate. This is
   the first target artifact whose matrix report includes scoped GPU/CPU top
   profile events.
-- vLLM-style random long-prefill sidecar, one repeat, not speed-claim-ready:
-  `results/gpu_matrix_20260526_vllm_random_longprefill_r1.json`,
-  `84.45 tok/s`, live vLLM `354.24 tok/s`, `0.238x` vLLM, exact generated-token
-  match against the stored JAX default reference. This sidecar is a broader
-  comparability lane, not the frozen exact-token goal gate. Scheduler
-  diagnostics show 32 prefill waves at max 4 active sequences, 480 decode
-  steps, about `17.81 s` total prefill-step time, and about `6.28 s` total
-  decode-step time, so the sidecar gap is heavily TTFT/static-concurrency
-  driven.
+- Current vLLM-style random long-prefill sidecar:
+  `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
+  `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
+  match over two repeats, and speed-claim-ready in the matrix sense. This
+  sidecar is a broader comparability lane, not the frozen exact-token goal gate.
+  Scheduler diagnostics show 32 prefill waves at max 4 active sequences, 480
+  decode steps, about `17.74 s` total prefill-step time, and about `6.30 s`
+  total decode-step time, so the sidecar gap is heavily
+  TTFT/static-concurrency driven.
 - Active target: fastest accepted kernel-backed non-speculative serving at
   `>=0.9x` vLLM on the same benchmark discipline, with MTP remaining
   diagnostic-only.
@@ -668,6 +668,17 @@ end-to-end throughput.
   `wrapped_concatenate` about `17.4 ms`. This supports the current caution:
   packed GDN decode is the smallest FP32 vLLM/FLA-shaped kernel boundary, but
   the stored traces do not prove it can close the full `0.9x` gap alone.
+- Full vLLM-random sidecar revalidation:
+  `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json` and
+  `results/gpu_matrix_20260527_vllm_random_longprefill_r2.md`. The 128-prompt
+  sidecar is now two-repeat and exact against a live JAX default reference, with
+  JAX `84.60 tok/s`, live vLLM `353.91 tok/s`, and JAX/vLLM `0.239x`. It is
+  speed-claim-ready in the matrix sense but not close to vLLM. TTFT p50 is
+  `12385.99 ms` for JAX versus `2953.88 ms` for vLLM, while JAX ITL p50 is
+  `13.39 ms`. Scheduler diagnostics again show 32 prefill waves at max 4 active
+  sequences plus 480 decode steps, so this remains evidence for a static-shape
+  concurrency/TTFT gap separate from the frozen exact-token long-prefill goal
+  gate.
 
 ## Phase 2 - Kernel Roadmap
 

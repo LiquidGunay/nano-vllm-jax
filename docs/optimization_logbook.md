@@ -4464,3 +4464,30 @@ JAX_PLATFORMS=cuda ... pytest -q \
 ```
 
 - result: `47 passed`; `py_compile` passed.
+
+### Entry 119 - Two-Repeat Full vLLM-Random Sidecar
+
+- experiment: reran the full 128-prompt `vllm_random_longprefill` sidecar with
+  `gpu_paged_default`, two repeats, elevated GPU access, live JAX default
+  reference capture, and live vLLM reference capture.
+- artifact: `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`
+- report: `results/gpu_matrix_20260527_vllm_random_longprefill_r2.md`
+- result: speed-claim-ready in the matrix sense and exact against the live JAX
+  default reference, but still far from vLLM. JAX median throughput is
+  `84.60 tok/s`; live vLLM is `353.91 tok/s`; JAX/vLLM is `0.239x`.
+- latency and scheduler evidence: JAX `TTFT p50 12385.99 ms`, `TTFT p95
+  23244.28 ms`, `ITL p50 13.39 ms`, and `ITL p95 14.16 ms`. The JAX scheduler
+  again reports 32 prefill waves, 480 decode steps, max 4 active prefill
+  sequences, about `17.74 s` total prefill-step time, and about `6.30 s` total
+  decode-step time.
+- scoped profile evidence: the current sidecar report now has scoped deltas
+  against the live JAX default reference. The largest CPU scoped deltas are
+  `np.asarray(jax.Array)` +`35.28 ms`, `array.py:325 tolist` +`35.02 ms`,
+  `PjRtCApiLoadedExecutable::Execute` -`31.84 ms`, and
+  `forward_step_token_ids_jit` -`31.15 ms`. GPU scoped deltas are effectively
+  flat for the required buckets, with `transpose` -`0.13 ms`, `MemcpyD2D`
+  +`0.02 ms`, and `gather` +`0.01 ms`.
+- decision: keep this as the current broad vLLM-style comparability artifact.
+  It does not change the main frozen exact-token goal target and should not be
+  used as evidence that a narrow kernel swap alone will close the vLLM-random
+  gap. The sidecar remains dominated by static-shape concurrency and TTFT.
