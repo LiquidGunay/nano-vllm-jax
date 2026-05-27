@@ -136,6 +136,11 @@ Current tracked records:
   migration:
   `results/gpu_matrix_20260526_vk_layout.json`, `90.65 tok/s`, `0.779x` the
   stored vLLM reference, exact generated-token parity over two repeats.
+- Current long-prefill elevated revalidation:
+  `results/gpu_matrix_20260527_current_goal_target.json`, `90.87 tok/s`,
+  `0.781x` the stored vLLM reference, exact generated-token parity over two
+  repeats, speed-claim-ready, but still below the active `0.9x` gate. The gap is
+  `13.86 tok/s`, or about `1.153x` required JAX speedup.
 - vLLM-style random long-prefill sidecar, one repeat, not speed-claim-ready:
   `results/gpu_matrix_20260526_vllm_random_longprefill_r1.json`,
   `84.45 tok/s`, live vLLM `354.24 tok/s`, `0.238x` vLLM, exact generated-token
@@ -595,6 +600,13 @@ end-to-end throughput.
   and worse `gather`/`PjRt Execute` profile buckets. Do not keep split
   prefill/decode physical batch buckets as a default path without a new profile
   reason and a sidecar throughput win.
+- Current elevated goal-target revalidation:
+  `results/gpu_matrix_20260527_current_goal_target.json` and
+  `results/gpu_matrix_20260527_current_goal_target.md`. The default non-
+  speculative path remains speed-claim-ready and exact over two repeats, with
+  JAX `90.87 tok/s`, stored vLLM `116.37 tok/s`, and JAX/vLLM `0.781x`. This is
+  useful baseline evidence but not goal completion; the active `0.9x` target
+  still requires `104.74 tok/s`, leaving a `13.86 tok/s` gap.
 
 ## Phase 2 - Kernel Roadmap
 

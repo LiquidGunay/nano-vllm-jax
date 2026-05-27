@@ -1,0 +1,872 @@
+{
+  "acceptance": {
+    "long_prefill_512_2048": {
+      "gpu_paged_default": {
+        "checks": {
+          "correctness_checked": true,
+          "exact_generated_token_match": true,
+          "first_forward_step_present": true,
+          "jax_latency_present": true,
+          "jax_performance_present": true,
+          "minimum_repeats": true,
+          "profile_counters_present": true,
+          "runs_succeeded": true,
+          "vllm_reference_present": true
+        },
+        "missing_profile_counters": [],
+        "notes": "profile bucket movement still needs human explanation in the logbook",
+        "speed_claim_ready": true,
+        "target_vllm_ratio": 0.9,
+        "target_vllm_ratio_met": false
+      }
+    }
+  },
+  "comparisons": {
+    "long_prefill_512_2048": {
+      "gpu_paged_default": {
+        "itl_ms_p50_delta_vs_jax_reference": -4.5891329646110535,
+        "itl_ms_p50_delta_vs_vllm": 6.196577451191843,
+        "jax_output_token_throughput_median": 90.87115209144352,
+        "jax_over_jax_reference_throughput": 1.164737900856377,
+        "jax_over_vllm_throughput": 0.7808634997565973,
+        "jax_over_vllm_total_token_throughput": null,
+        "jax_reference_artifact": "results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json",
+        "jax_reference_source": "stored_jax_default",
+        "jax_reference_tokens_per_second": 78.01854135993192,
+        "jax_request_throughput_median": 5.67944700571522,
+        "jax_tokens_per_second_median": 90.87115209144352,
+        "jax_total_token_throughput_median": 7360.563319406926,
+        "profile_delta_vs_jax_reference": {
+          "MemcpyD2D": {
+            "count_delta": -192.0,
+            "current_count_median": 463.0,
+            "current_total_ms_median": 18.4450305,
+            "reference_count": 655,
+            "reference_total_ms": 30.386535000000045,
+            "total_ms_delta": -11.941504500000043,
+            "total_ms_ratio": 0.6070132872997851
+          },
+          "PjRtCApiLoadedExecutable::Execute": {
+            "count_delta": -96.0,
+            "current_count_median": 44.0,
+            "current_total_ms_median": 266.7382275,
+            "reference_count": 140,
+            "reference_total_ms": 289.23642499999994,
+            "total_ms_delta": -22.498197499999947,
+            "total_ms_ratio": 0.9222151999009117
+          },
+          "array.py:325 tolist": {
+            "count_delta": 0.0,
+            "current_count_median": 16.0,
+            "current_total_ms_median": 397.92761449999995,
+            "reference_count": 16,
+            "reference_total_ms": 427.682049,
+            "total_ms_delta": -29.75443450000006,
+            "total_ms_ratio": 0.9304286102968983
+          },
+          "command_buffer::execute": {
+            "count_delta": 0.0,
+            "current_count_median": 1936.0,
+            "current_total_ms_median": 223.45903099999987,
+            "reference_count": 1936,
+            "reference_total_ms": 229.21146399999972,
+            "total_ms_delta": -5.752432999999854,
+            "total_ms_ratio": 0.9749033800508343
+          },
+          "command_buffer::update": {
+            "count_delta": -12.0,
+            "current_count_median": 183.0,
+            "current_total_ms_median": 8.594146999999996,
+            "reference_count": 195,
+            "reference_total_ms": 10.46268999999999,
+            "total_ms_delta": -1.8685429999999936,
+            "total_ms_ratio": 0.8214089302081974
+          },
+          "forward_step_token_ids_jit": {
+            "count_delta": 0.0,
+            "current_count_median": 16.0,
+            "current_total_ms_median": 268.755679,
+            "reference_count": 16,
+            "reference_total_ms": 280.556299,
+            "total_ms_delta": -11.800620000000038,
+            "total_ms_ratio": 0.9579384956172379
+          },
+          "gather": {
+            "count_delta": 0.0,
+            "current_count_median": 103.0,
+            "current_total_ms_median": 14.569346500000009,
+            "reference_count": 103,
+            "reference_total_ms": 14.554820999999997,
+            "total_ms_delta": 0.01452550000001196,
+            "total_ms_ratio": 1.0009979854784894
+          },
+          "np.asarray(jax.Array)": {
+            "count_delta": 0.0,
+            "current_count_median": 16.0,
+            "current_total_ms_median": 397.7850030000001,
+            "reference_count": 16,
+            "reference_total_ms": 427.5529470000001,
+            "total_ms_delta": -29.767944,
+            "total_ms_ratio": 0.9303760055710715
+          },
+          "transpose": {
+            "count_delta": 0.0,
+            "current_count_median": 312.0,
+            "current_total_ms_median": 45.06651049999999,
+            "reference_count": 312,
+            "reference_total_ms": 47.299072999999986,
+            "total_ms_delta": -2.232562499999993,
+            "total_ms_ratio": 0.9527990220865429
+          }
+        },
+        "required_jax_speedup_to_target": 1.1525701998883784,
+        "target_tokens_per_second": 104.73538193012229,
+        "target_vllm_ratio": 0.9,
+        "tokens_per_second_delta_vs_jax_reference": 12.852610731511604,
+        "tokens_per_second_gap_to_target": 13.864229838678767,
+        "ttft_ms_p50_delta_vs_jax_reference": -48.826494021341205,
+        "ttft_ms_p50_delta_vs_vllm": 94.8626984609291,
+        "vllm_output_token_throughput": null,
+        "vllm_reference_source": "stored",
+        "vllm_request_throughput": null,
+        "vllm_tokens_per_second": 116.37264658902475,
+        "vllm_total_token_throughput": null
+      }
+    }
+  },
+  "configs": [
+    "gpu_paged_default"
+  ],
+  "created_at_utc": "20260527_035342",
+  "dry_run": false,
+  "goal_target": {
+    "config": "gpu_paged_default",
+    "description": "non-speculative Qwen/Qwen3.5-0.8B server on long heterogeneous mixed-shape requests must be speed-claim-ready and reach at least 0.9x vLLM throughput",
+    "target_vllm_ratio": 0.9,
+    "workload": "long_prefill_512_2048"
+  },
+  "jax_default_references": {
+    "long_prefill_512_2048": {
+      "artifact": null,
+      "metrics": null,
+      "missing_selected_config_references": [],
+      "run": null,
+      "source": "stored"
+    }
+  },
+  "jax_python": {
+    "available": true,
+    "path": "/mountpoint/.exp/nano-vllm-jax/.venv/bin/python"
+  },
+  "matrix": {
+    "long_prefill_512_2048": {
+      "gpu_paged_default": {
+        "aggregate": {
+          "all_correct": true,
+          "all_correctness_checked": true,
+          "all_exact_generated_token_match": true,
+          "first_forward_step_token_ids_jit_ms_median": 225.5698535,
+          "itl_ms_p50_median": 11.23271498363465,
+          "itl_ms_p95_median": 12.136743986047804,
+          "output_token_throughput_median": 90.87115209144352,
+          "profile_medians": {
+            "MemcpyD2D": {
+              "count_median": 463.0,
+              "total_ms_median": 18.4450305
+            },
+            "PjRtCApiLoadedExecutable::Execute": {
+              "count_median": 44.0,
+              "total_ms_median": 266.7382275
+            },
+            "array.py:325 tolist": {
+              "count_median": 16.0,
+              "total_ms_median": 397.92761449999995
+            },
+            "command_buffer::execute": {
+              "count_median": 1936.0,
+              "total_ms_median": 223.45903099999987
+            },
+            "command_buffer::update": {
+              "count_median": 183.0,
+              "total_ms_median": 8.594146999999996
+            },
+            "forward_step_token_ids_jit": {
+              "count_median": 16.0,
+              "total_ms_median": 268.755679
+            },
+            "gather": {
+              "count_median": 103.0,
+              "total_ms_median": 14.569346500000009
+            },
+            "np.asarray(jax.Array)": {
+              "count_median": 16.0,
+              "total_ms_median": 397.7850030000001
+            },
+            "transpose": {
+              "count_median": 312.0,
+              "total_ms_median": 45.06651049999999
+            }
+          },
+          "repeat_count": 2,
+          "request_throughput_median": 5.67944700571522,
+          "scheduler_diagnostics_median": {
+            "available": true,
+            "decode_step_count": 15.0,
+            "decode_step_seconds_total": 0.16908161947503686,
+            "max_decode_step_sequences": 4.0,
+            "max_prefill_step_sequences": 4.0,
+            "max_step_sequences": 4.0,
+            "max_step_tokens": 5120.0,
+            "prefill_step_count": 1.0,
+            "prefill_step_seconds_total": 0.5344837654847652,
+            "step_count": 16.0,
+            "total_step_seconds": 0.703565384959802
+          },
+          "tokens_per_second_median": 90.87115209144352,
+          "total_input_tokens_median": 5120.0,
+          "total_output_tokens_median": 64.0,
+          "total_token_throughput_median": 7360.563319406926,
+          "ttft_ms_p50_median": 534.4877509633079,
+          "ttft_ms_p95_median": 534.4877509633079
+        },
+        "config": {
+          "args": {
+            "backend": "gpu",
+            "batch_size_buckets": "1,2,4",
+            "dtype": "float32",
+            "input_lens": "512,1024,1536,2048",
+            "jax_execution": "jit",
+            "max_blocks_per_seq": 129,
+            "max_kv_cache_mb": 3072,
+            "max_num_batched_tokens": 8192,
+            "max_num_seqs": 4,
+            "model": "Qwen/Qwen3.5-0.8B",
+            "num_kvcache_blocks": 384,
+            "num_speculative_tokens": 0,
+            "output_len": 16,
+            "prefill_buckets": "512,1024,2048",
+            "profile": true,
+            "prompt_source": "tokenized_seed_repeat",
+            "prompt_suite": "mixed",
+            "seed": 0,
+            "top_k": 5,
+            "warmup": true,
+            "weight_dtype": "bfloat16"
+          },
+          "description": "Fastest accepted non-MTP JAX CUDA serving baseline. No FFI/custom kernels.",
+          "env": {
+            "JAX_PLATFORMS": "cuda",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_MLP": "1",
+            "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH": "1",
+            "NANO_VLLM_JAX_KERNEL_BACKEND": "pure_jax",
+            "NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD": "1"
+          }
+        },
+        "repeats": [
+          {
+            "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260527_035342/long_prefill_512_2048_gpu_paged_default_repeat1.json",
+            "metrics": {
+              "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260527_035342/long_prefill_512_2048_gpu_paged_default_repeat1.json",
+              "correctness": {
+                "checked": true,
+                "exact_generated_token_match": true,
+                "full_length_ok": true,
+                "ok": true,
+                "rows": [
+                  {
+                    "checked": true,
+                    "comparison_length": 16,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 16,
+                    "generated_prefix_match": true,
+                    "name": "len_512",
+                    "reference_first_step_topk": [],
+                    "reference_length": 16,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 16,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 16,
+                    "generated_prefix_match": true,
+                    "name": "len_1024",
+                    "reference_first_step_topk": [],
+                    "reference_length": 16,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 16,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 16,
+                    "generated_prefix_match": true,
+                    "name": "len_1536",
+                    "reference_first_step_topk": [],
+                    "reference_length": 16,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 16,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 16,
+                    "generated_prefix_match": true,
+                    "name": "len_2048",
+                    "reference_first_step_topk": [],
+                    "reference_length": 16,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  }
+                ]
+              },
+              "exists": true,
+              "first_forward_step_token_ids_jit_ms": 225.543153,
+              "mtp_admission": {
+                "active_bucket": null,
+                "buckets": [],
+                "confidence_min_accept_rate": 0.75,
+                "enabled": false,
+                "probe_steps": 2
+              },
+              "performance": {
+                "generated_tokens": 64,
+                "itl_ms_p50": 11.220799991860986,
+                "itl_ms_p95": 12.221310986205935,
+                "output_token_throughput": 90.76189446238716,
+                "request_throughput": 5.672618403899198,
+                "seconds": 0.7051417379407212,
+                "tokens_per_second": 90.76189446238716,
+                "total_input_tokens": 5120,
+                "total_output_tokens": 64,
+                "total_token_throughput": 7351.71345145336,
+                "ttft_ms_p50": 534.7274519735947,
+                "ttft_ms_p95": 534.7274519735947
+              },
+              "profile": {
+                "MemcpyD2D": {
+                  "count": 463,
+                  "total_ms": 18.477017000000007
+                },
+                "PjRtCApiLoadedExecutable::Execute": {
+                  "count": 44,
+                  "total_ms": 266.60552
+                },
+                "array.py:325 tolist": {
+                  "count": 16,
+                  "total_ms": 398.0300809999999
+                },
+                "command_buffer::execute": {
+                  "count": 1936,
+                  "total_ms": 223.3592759999998
+                },
+                "command_buffer::update": {
+                  "count": 183,
+                  "total_ms": 8.610501999999997
+                },
+                "forward_step_token_ids_jit": {
+                  "count": 16,
+                  "total_ms": 268.973769
+                },
+                "gather": {
+                  "count": 103,
+                  "total_ms": 14.46649300000001
+                },
+                "np.asarray(jax.Array)": {
+                  "count": 16,
+                  "total_ms": 397.9134300000001
+                },
+                "transpose": {
+                  "count": 312,
+                  "total_ms": 45.07645999999997
+                }
+              },
+              "profile_trace_json_gz": "/mountpoint/.exp/profiles/20260527-035343-2539001-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260527_035342/plugins/profile/2026_05_27_03_54_07/INDCS0291.atrapa.deloitte.com.trace.json.gz",
+              "run": {
+                "issues": [],
+                "profile_enabled": true,
+                "profile_error": null,
+                "profile_path": "/mountpoint/.exp/profiles/20260527-035343-2539001-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260527_035342",
+                "profile_started": false,
+                "run_id": "20260527-035343-2539001-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260527_035342",
+                "run_label": "gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260527_035342",
+                "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+              },
+              "scheduler_diagnostics": {
+                "available": true,
+                "decode_step_count": 15,
+                "decode_step_seconds_total": 0.16968333313707262,
+                "max_decode_step_sequences": 4,
+                "max_prefill_step_sequences": 4,
+                "max_step_sequences": 4,
+                "max_step_tokens": 5120,
+                "prefill_step_count": 1,
+                "prefill_step_seconds_total": 0.5347231619525701,
+                "step_count": 16,
+                "total_step_seconds": 0.7044064950896427
+              },
+              "speculative": {
+                "acceptance_rate": 0.0,
+                "bonus_tokens": 0,
+                "debug_events": [],
+                "draft_position_accepted": [],
+                "draft_position_proposed": [],
+                "drafts_accepted": 0,
+                "drafts_proposed": 0,
+                "drafts_rejected": 0,
+                "enabled": false,
+                "fallback_gated_no_spec_steps": 0,
+                "fallback_partial_rows": 0,
+                "fallback_seeded_main_steps": 0,
+                "fallback_steps": 0
+              }
+            },
+            "reference_json": "results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json",
+            "reference_source": "stored_jax_default",
+            "repeat": 1,
+            "run": {
+              "command": [
+                "/mountpoint/.exp/nano-vllm-jax/.venv/bin/python",
+                "/mountpoint/.exp/nano-vllm-jax/benchmarks/benchmark_jax_server_trace.py",
+                "--model",
+                "Qwen/Qwen3.5-0.8B",
+                "--backend",
+                "gpu",
+                "--dtype",
+                "float32",
+                "--weight-dtype",
+                "bfloat16",
+                "--jax-execution",
+                "jit",
+                "--input-lens",
+                "512,1024,1536,2048",
+                "--output-len",
+                "16",
+                "--prompt-suite",
+                "mixed",
+                "--num-speculative-tokens",
+                "0",
+                "--max-kv-cache-mb",
+                "3072",
+                "--num-kvcache-blocks",
+                "384",
+                "--max-num-seqs",
+                "4",
+                "--max-num-batched-tokens",
+                "8192",
+                "--prefill-buckets",
+                "512,1024,2048",
+                "--batch-size-buckets",
+                "1,2,4",
+                "--max-blocks-per-seq",
+                "129",
+                "--top-k",
+                "5",
+                "--warmup",
+                "--profile",
+                "--prompt-source",
+                "tokenized_seed_repeat",
+                "--seed",
+                "0",
+                "--output-json",
+                "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260527_035342/long_prefill_512_2048_gpu_paged_default_repeat1.json",
+                "--run-label",
+                "gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260527_035342",
+                "--reference-json",
+                "results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json"
+              ],
+              "elapsed_seconds": 27.31361330591608,
+              "output_tail": "Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\nLoading pretrained weights from Qwen/Qwen3.5-0.8B...\nLoading weights for Qwen/Qwen3.5-0.8B...\nResolving Qwen/Qwen3.5-0.8B from Hugging Face cache...\n\nFetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]\nFetching 9 files: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 9/9 [00:00<00:00, 25855.30it/s]\nUsing snapshot: /mountpoint/.exp/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17\nConverting weights...\nMaterializing tied LM head as a separate [hidden, vocab] weight...\n\u2713 Loaded weights: 24 layers\n\u2713 Using pretrained weights\n",
+              "returncode": 0,
+              "status": "ok"
+            }
+          },
+          {
+            "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260527_035342/long_prefill_512_2048_gpu_paged_default_repeat2.json",
+            "metrics": {
+              "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260527_035342/long_prefill_512_2048_gpu_paged_default_repeat2.json",
+              "correctness": {
+                "checked": true,
+                "exact_generated_token_match": true,
+                "full_length_ok": true,
+                "ok": true,
+                "rows": [
+                  {
+                    "checked": true,
+                    "comparison_length": 16,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 16,
+                    "generated_prefix_match": true,
+                    "name": "len_512",
+                    "reference_first_step_topk": [],
+                    "reference_length": 16,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 16,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 16,
+                    "generated_prefix_match": true,
+                    "name": "len_1024",
+                    "reference_first_step_topk": [],
+                    "reference_length": 16,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 16,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 16,
+                    "generated_prefix_match": true,
+                    "name": "len_1536",
+                    "reference_first_step_topk": [],
+                    "reference_length": 16,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 16,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 16,
+                    "generated_prefix_match": true,
+                    "name": "len_2048",
+                    "reference_first_step_topk": [],
+                    "reference_length": 16,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  }
+                ]
+              },
+              "exists": true,
+              "first_forward_step_token_ids_jit_ms": 225.596554,
+              "mtp_admission": {
+                "active_bucket": null,
+                "buckets": [],
+                "confidence_min_accept_rate": 0.75,
+                "enabled": false,
+                "probe_steps": 2
+              },
+              "performance": {
+                "generated_tokens": 64,
+                "itl_ms_p50": 11.244629975408316,
+                "itl_ms_p95": 12.052176985889673,
+                "output_token_throughput": 90.98040972049989,
+                "request_throughput": 5.686275607531243,
+                "seconds": 0.7034481400623918,
+                "tokens_per_second": 90.98040972049989,
+                "total_input_tokens": 5120,
+                "total_output_tokens": 64,
+                "total_token_throughput": 7369.413187360492,
+                "ttft_ms_p50": 534.2480499530211,
+                "ttft_ms_p95": 534.2480499530211
+              },
+              "profile": {
+                "MemcpyD2D": {
+                  "count": 463,
+                  "total_ms": 18.413043999999992
+                },
+                "PjRtCApiLoadedExecutable::Execute": {
+                  "count": 44,
+                  "total_ms": 266.8709349999999
+                },
+                "array.py:325 tolist": {
+                  "count": 16,
+                  "total_ms": 397.825148
+                },
+                "command_buffer::execute": {
+                  "count": 1936,
+                  "total_ms": 223.5587859999999
+                },
+                "command_buffer::update": {
+                  "count": 183,
+                  "total_ms": 8.577791999999997
+                },
+                "forward_step_token_ids_jit": {
+                  "count": 16,
+                  "total_ms": 268.537589
+                },
+                "gather": {
+                  "count": 103,
+                  "total_ms": 14.672200000000007
+                },
+                "np.asarray(jax.Array)": {
+                  "count": 16,
+                  "total_ms": 397.65657600000003
+                },
+                "transpose": {
+                  "count": 312,
+                  "total_ms": 45.05656100000001
+                }
+              },
+              "profile_trace_json_gz": "/mountpoint/.exp/profiles/20260527-035410-2539077-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r2_20260527_035342/plugins/profile/2026_05_27_03_54_35/INDCS0291.atrapa.deloitte.com.trace.json.gz",
+              "run": {
+                "issues": [],
+                "profile_enabled": true,
+                "profile_error": null,
+                "profile_path": "/mountpoint/.exp/profiles/20260527-035410-2539077-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r2_20260527_035342",
+                "profile_started": false,
+                "run_id": "20260527-035410-2539077-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r2_20260527_035342",
+                "run_label": "gpu_matrix_long_prefill_512_2048_gpu_paged_default_r2_20260527_035342",
+                "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+              },
+              "scheduler_diagnostics": {
+                "available": true,
+                "decode_step_count": 15,
+                "decode_step_seconds_total": 0.1684799058130011,
+                "max_decode_step_sequences": 4,
+                "max_prefill_step_sequences": 4,
+                "max_step_sequences": 4,
+                "max_step_tokens": 5120,
+                "prefill_step_count": 1,
+                "prefill_step_seconds_total": 0.5342443690169603,
+                "step_count": 16,
+                "total_step_seconds": 0.7027242748299614
+              },
+              "speculative": {
+                "acceptance_rate": 0.0,
+                "bonus_tokens": 0,
+                "debug_events": [],
+                "draft_position_accepted": [],
+                "draft_position_proposed": [],
+                "drafts_accepted": 0,
+                "drafts_proposed": 0,
+                "drafts_rejected": 0,
+                "enabled": false,
+                "fallback_gated_no_spec_steps": 0,
+                "fallback_partial_rows": 0,
+                "fallback_seeded_main_steps": 0,
+                "fallback_steps": 0
+              }
+            },
+            "reference_json": "results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json",
+            "reference_source": "stored_jax_default",
+            "repeat": 2,
+            "run": {
+              "command": [
+                "/mountpoint/.exp/nano-vllm-jax/.venv/bin/python",
+                "/mountpoint/.exp/nano-vllm-jax/benchmarks/benchmark_jax_server_trace.py",
+                "--model",
+                "Qwen/Qwen3.5-0.8B",
+                "--backend",
+                "gpu",
+                "--dtype",
+                "float32",
+                "--weight-dtype",
+                "bfloat16",
+                "--jax-execution",
+                "jit",
+                "--input-lens",
+                "512,1024,1536,2048",
+                "--output-len",
+                "16",
+                "--prompt-suite",
+                "mixed",
+                "--num-speculative-tokens",
+                "0",
+                "--max-kv-cache-mb",
+                "3072",
+                "--num-kvcache-blocks",
+                "384",
+                "--max-num-seqs",
+                "4",
+                "--max-num-batched-tokens",
+                "8192",
+                "--prefill-buckets",
+                "512,1024,2048",
+                "--batch-size-buckets",
+                "1,2,4",
+                "--max-blocks-per-seq",
+                "129",
+                "--top-k",
+                "5",
+                "--warmup",
+                "--profile",
+                "--prompt-source",
+                "tokenized_seed_repeat",
+                "--seed",
+                "0",
+                "--output-json",
+                "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260527_035342/long_prefill_512_2048_gpu_paged_default_repeat2.json",
+                "--run-label",
+                "gpu_matrix_long_prefill_512_2048_gpu_paged_default_r2_20260527_035342",
+                "--reference-json",
+                "results/gpu_matrix_runs/20260526_104818/long_prefill_512_2048_gpu_paged_default_repeat1.json"
+              ],
+              "elapsed_seconds": 27.757972972933203,
+              "output_tail": "Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\nLoading pretrained weights from Qwen/Qwen3.5-0.8B...\nLoading weights for Qwen/Qwen3.5-0.8B...\nResolving Qwen/Qwen3.5-0.8B from Hugging Face cache...\n\nFetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]\nFetching 9 files: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 9/9 [00:00<00:00, 152828.89it/s]\nUsing snapshot: /mountpoint/.exp/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17\nConverting weights...\nMaterializing tied LM head as a separate [hidden, vocab] weight...\n\u2713 Loaded weights: 24 layers\n\u2713 Using pretrained weights\n",
+              "returncode": 0,
+              "status": "ok"
+            }
+          }
+        ],
+        "workload": {
+          "acceptance_scope": "speed_claim",
+          "dataset_name": null,
+          "num_prompts": null,
+          "prompt_source": "tokenized_seed_repeat",
+          "random_input_len": null,
+          "random_output_len": null,
+          "random_range_ratio": null,
+          "seed": 0
+        }
+      }
+    }
+  },
+  "output_json": "results/gpu_matrix_20260527_current_goal_target.json",
+  "repeats": 2,
+  "report_md": "results/gpu_matrix_20260527_current_goal_target.md",
+  "required_metrics": [
+    "total tok/s",
+    "request throughput",
+    "output-token throughput",
+    "total-token throughput",
+    "TTFT p50/p95",
+    "ITL p50/p95",
+    "exact generated-token match vs baseline",
+    "PjRt Execute total/count",
+    "command_buffer::execute total/count",
+    "command_buffer::update total/count",
+    "forward_step_token_ids_jit total/count",
+    "first forward_step_token_ids_jit",
+    "gather total",
+    "transpose total",
+    "MemcpyD2D total",
+    "tolist / np.asarray sync attribution"
+  ],
+  "run_dir": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260527_035342",
+  "schema_version": 1,
+  "vllm_references": {
+    "long_prefill_512_2048": {
+      "artifact": "results/gpu_matrix_runs/20260526_104818/references/vllm_long_prefill_512_2048.json",
+      "metrics": {
+        "artifact": "results/gpu_matrix_runs/20260526_104818/references/vllm_long_prefill_512_2048.json",
+        "correctness": {
+          "checked": false,
+          "exact_generated_token_match": false,
+          "full_length_ok": null,
+          "ok": true,
+          "rows": null
+        },
+        "exists": true,
+        "first_forward_step_token_ids_jit_ms": null,
+        "mtp_admission": null,
+        "performance": {
+          "generated_tokens": 64,
+          "itl_ms_p50": 5.036137532442808,
+          "itl_ms_p95": 19.74672873038793,
+          "output_token_throughput": null,
+          "request_throughput": null,
+          "seconds": 0.5499574159039184,
+          "tokens_per_second": 116.37264658902475,
+          "total_input_tokens": null,
+          "total_output_tokens": null,
+          "total_token_throughput": null,
+          "ttft_ms_p50": 439.6250525023788,
+          "ttft_ms_p95": 474.71485659480095
+        },
+        "profile": {
+          "MemcpyD2D": {
+            "count": null,
+            "total_ms": null
+          },
+          "PjRtCApiLoadedExecutable::Execute": {
+            "count": null,
+            "total_ms": null
+          },
+          "array.py:325 tolist": {
+            "count": null,
+            "total_ms": null
+          },
+          "command_buffer::execute": {
+            "count": null,
+            "total_ms": null
+          },
+          "command_buffer::update": {
+            "count": null,
+            "total_ms": null
+          },
+          "forward_step_token_ids_jit": {
+            "count": null,
+            "total_ms": null
+          },
+          "gather": {
+            "count": null,
+            "total_ms": null
+          },
+          "np.asarray(jax.Array)": {
+            "count": null,
+            "total_ms": null
+          },
+          "transpose": {
+            "count": null,
+            "total_ms": null
+          }
+        },
+        "profile_trace_json_gz": null,
+        "run": {
+          "issues": [],
+          "profile_enabled": false,
+          "profile_error": null,
+          "profile_path": "/mountpoint/.exp/profiles/20260526-104818-2277954-gpu_matrix_vllm_long_prefill_512_2048_20260526_104818",
+          "profile_started": false,
+          "run_id": "20260526-104818-2277954-gpu_matrix_vllm_long_prefill_512_2048_20260526_104818",
+          "run_label": "gpu_matrix_vllm_long_prefill_512_2048_20260526_104818",
+          "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+        },
+        "scheduler_diagnostics": {
+          "available": false,
+          "decode_step_count": 0,
+          "prefill_step_count": 0,
+          "step_count": 0
+        },
+        "speculative": null
+      },
+      "source": "stored"
+    }
+  },
+  "workloads": [
+    "long_prefill_512_2048"
+  ]
+}

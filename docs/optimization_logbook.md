@@ -4230,3 +4230,26 @@ JAX_PLATFORMS=cuda ... pytest -q \
   decode step count alone is not enough; larger decode physical buckets must
   win integrated sidecar throughput before becoming part of the default server
   policy.
+
+### Entry 108 - Current Elevated Goal-Target Revalidation
+
+- experiment: reran the current default non-speculative long-prefill goal target
+  with elevated GPU access, stored JAX/vLLM references, and two repeats.
+- artifact: `results/gpu_matrix_20260527_current_goal_target.json`
+- report: `results/gpu_matrix_20260527_current_goal_target.md`
+- result: speed-claim-ready with exact generated-token parity over both
+  repeats. JAX reached `90.87 tok/s`; stored vLLM is `116.37 tok/s`; JAX/vLLM is
+  `0.781x`. The active `0.9x` target requires `104.74 tok/s`, leaving a
+  `13.86 tok/s` gap and about `1.153x` required JAX speedup.
+- latency: `TTFT p50 534.49 ms`, `ITL p50 11.23 ms`, `ITL p95 12.14 ms`.
+- scheduler diagnostics: one prefill step, 15 decode steps, max 4 active rows,
+  about `0.53 s` prefill-step time and `0.17 s` decode-step time.
+- profile movement vs the stored JAX default reference: `np.asarray(jax.Array)`
+  and `array.py:325 tolist` attribution improved by about `29.8 ms`, `PjRt
+  Execute` improved by about `22.5 ms`, `forward_step_token_ids_jit` improved
+  by about `11.8 ms`, and `MemcpyD2D` improved by about `11.9 ms`.
+- decision: keep this as the current default baseline evidence. It does not
+  close the `0.9x` target, and no further scheduler-only shape change should be
+  accepted without an integrated throughput win. The next meaningful step
+  requires choosing an external-kernel direction: an opt-in BF16 GDN prefill
+  activation experiment, or a FP32-capable vLLM/FLA-shaped GDN path.
