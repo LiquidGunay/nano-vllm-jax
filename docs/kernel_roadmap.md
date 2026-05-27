@@ -210,6 +210,11 @@ gdn_recurrent_decode_step(
   exposed through Torch/Triton wrappers rather than a stable non-Torch ABI, and
   the available JAX DLPack/host-callback surface is not enough for a JIT-safe
   framework bridge. Port/fork the FLA schedule behind the JAX-facing boundary.
+- varlen contract status: the JAX-side prepared-layout FLA prefill boundary now
+  accepts q/k/v `[B,T,H,D]`, gate/beta `[B,T,H]`, and `seq_lens [B]`, packs the
+  valid tokens into upstream-style `[nnz,H,D] + cu_seqlens`, runs the segmented
+  FP32 reference, and unpacks output to `[B,T,H,V]`. This is an ABI scaffold for
+  a future FLA-schedule port, not a serving speed claim.
 
 ## P1.2 - `gdn_segmented_prefill_chunk32`
 
@@ -280,6 +285,12 @@ gdn_segmented_prefill_chunk32(
   direct FlashInfer GDN prefill is not runnable on this host. Direct reuse
   therefore needs a BF16-prefill design decision on supported hardware or a
   FP32-capable vLLM/FLA-derived port for this machine.
+- prepared-varlen status: `pack_prepared_gdn_prefill_inputs`,
+  `unpack_prepared_gdn_prefill_output`, and
+  `gdn_fla_prefill_varlen_reference` define the next port/fork seam for
+  vLLM/FLA-style prefill. The focused CUDA test verifies empty rows, ragged
+  lengths `[0,5,17,32]`, `cu_seqlens=[0,0,5,22,54]`, packed tensor shapes, and
+  parity with the rectangular prepared FP32 reference.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 

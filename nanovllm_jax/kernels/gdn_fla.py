@@ -467,6 +467,120 @@ def pack_padded_gdn_inputs(
     )
 
 
+def pack_prepared_gdn_prefill_inputs(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    gate: jnp.ndarray,
+    beta: jnp.ndarray,
+    seq_lens: Any,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Pack FLA-layout `[B,T,H,D]` prefill tensors into `[nnz,H,D]` ABI tensors."""
+
+    lengths = _seq_lens_to_tuple(seq_lens)
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("query, key, and value must have shape [batch, time, heads, dim]")
+    if gate.ndim != 3 or beta.ndim != 3:
+        raise ValueError("gate and beta must have shape [batch, time, heads]")
+    batch, seq_len, num_heads, key_dim = query.shape
+    value_dim = value.shape[-1]
+    if len(lengths) != batch:
+        raise ValueError("seq_lens must have one entry per batch row")
+    if key.shape != query.shape:
+        raise ValueError("query and key shapes must match")
+    if value.shape[:3] != query.shape[:3]:
+        raise ValueError("value must match query [batch, time, heads]")
+    if gate.shape != query.shape[:3] or beta.shape != query.shape[:3]:
+        raise ValueError("gate and beta must have shape [batch, time, heads]")
+    if any(length > seq_len for length in lengths):
+        raise ValueError("seq_lens entries must be <= padded sequence length")
+
+    q_parts = []
+    k_parts = []
+    v_parts = []
+    gate_parts = []
+    beta_parts = []
+    for row, length in enumerate(lengths):
+        if length == 0:
+            continue
+        q_parts.append(query[row, :length])
+        k_parts.append(key[row, :length])
+        v_parts.append(value[row, :length])
+        gate_parts.append(gate[row, :length])
+        beta_parts.append(beta[row, :length])
+
+    if q_parts:
+        packed_query = jnp.concatenate(q_parts, axis=0)
+        packed_key = jnp.concatenate(k_parts, axis=0)
+        packed_value = jnp.concatenate(v_parts, axis=0)
+        packed_gate = jnp.concatenate(gate_parts, axis=0)
+        packed_beta = jnp.concatenate(beta_parts, axis=0)
+    else:
+        packed_query = jnp.zeros((0, num_heads, key_dim), dtype=query.dtype)
+        packed_key = jnp.zeros((0, num_heads, key_dim), dtype=key.dtype)
+        packed_value = jnp.zeros((0, num_heads, value_dim), dtype=value.dtype)
+        packed_gate = jnp.zeros((0, num_heads), dtype=gate.dtype)
+        packed_beta = jnp.zeros((0, num_heads), dtype=beta.dtype)
+    return (
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_gate,
+        packed_beta,
+        cu_seqlens_from_seq_lens(lengths),
+    )
+
+
+def unpack_prepared_gdn_prefill_output(
+    packed_output: jnp.ndarray,
+    cu_seqlens: Any,
+    max_seq_len: int,
+) -> jnp.ndarray:
+    """Unpack `[nnz,H,V]` segmented output into FLA layout `[B,T,H,V]`."""
+
+    legacy = unpack_segmented_gdn_output(packed_output, cu_seqlens, max_seq_len)
+    return jnp.transpose(legacy, (0, 2, 1, 3))
+
+
+def gdn_fla_prefill_varlen_reference(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    gate: jnp.ndarray,
+    beta: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    initial_state: jnp.ndarray,
+    *,
+    chunk_size: int = 64,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Pure-JAX reference for vLLM/FLA varlen prefill tensors.
+
+    Inputs stay in the upstream-facing FLA layout: q/k/v `[B,T,H,D]`,
+    gate/beta `[B,T,H]`, `seq_lens [B]`, and V,K state `[B,H,V,K]`. The
+    reference packs valid tokens into `[nnz,H,D]`, calls the segmented ABI
+    reference, then unpacks the valid outputs back to `[B,T,H,V]`.
+    """
+
+    packed_query, packed_key, packed_value, packed_gate, packed_beta, cu_seqlens = (
+        pack_prepared_gdn_prefill_inputs(query, key, value, gate, beta, seq_lens)
+    )
+    packed_output, final_state = gdn_segmented_prefill_chunk32_reference(
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_beta,
+        packed_gate,
+        cu_seqlens,
+        initial_state,
+        chunk_size=chunk_size,
+        use_qk_l2norm_in_kernel=False,
+    )
+    return (
+        unpack_prepared_gdn_prefill_output(packed_output, cu_seqlens, query.shape[1]),
+        final_state,
+    )
+
+
 def unpack_segmented_gdn_output(
     packed_output: jnp.ndarray,
     cu_seqlens: Any,

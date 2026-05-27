@@ -15,8 +15,11 @@ from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.kernels.cuda_fp32_ffi import gdn_post_conv_prep_fp32
 from nanovllm_jax.kernels.gdn_fla import (
     gdn_fla_prefill_chunk32_fp32_reference,
+    gdn_fla_prefill_varlen_reference,
     gdn_post_conv_prefill_reference_from_decay,
+    pack_prepared_gdn_prefill_inputs,
     prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
+    unpack_prepared_gdn_prefill_output,
 )
 from nanovllm_jax.kv_cache import HybridLayerState
 from nanovllm_jax.layers import l2norm
@@ -412,6 +415,97 @@ def test_prepared_fla_chunk32_reference_masks_padded_rows():
     np.testing.assert_allclose(
         np.asarray(dirty_state),
         np.asarray(clean_state),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_prepared_fla_varlen_reference_matches_rectangular_reference(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1")
+
+    batch = 4
+    seq_len = 32
+    num_heads = 3
+    key_dim = 8
+    value_dim = 8
+    lengths = jnp.array([0, 5, 17, 32], dtype=jnp.int32)
+    keys = jax.random.split(jax.random.PRNGKey(20260531), 6)
+    query = jax.random.normal(keys[0], (batch, seq_len, num_heads, key_dim), dtype=jnp.float32)
+    key = jax.random.normal(keys[1], (batch, seq_len, num_heads, key_dim), dtype=jnp.float32)
+    value = jax.random.normal(keys[2], (batch, seq_len, num_heads, value_dim), dtype=jnp.float32)
+    gate = jax.random.normal(keys[3], (batch, seq_len, num_heads), dtype=jnp.float32) * 0.1
+    beta = jax.random.uniform(keys[4], (batch, seq_len, num_heads), dtype=jnp.float32)
+    initial_state = jax.random.normal(
+        keys[5],
+        (batch, num_heads, value_dim, key_dim),
+        dtype=jnp.float32,
+    ) * 0.01
+
+    valid = jnp.arange(seq_len, dtype=jnp.int32)[None, :] < lengths[:, None]
+    query = jnp.where(valid[:, :, None, None], query, 0.0)
+    key = jnp.where(valid[:, :, None, None], key, 0.0)
+    value = jnp.where(valid[:, :, None, None], value, 0.0)
+    gate = jnp.where(valid[:, :, None], gate, 0.0)
+    beta = jnp.where(valid[:, :, None], beta, 0.0)
+
+    (
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_gate,
+        packed_beta,
+        cu_seqlens,
+    ) = pack_prepared_gdn_prefill_inputs(query, key, value, gate, beta, lengths)
+    assert np.asarray(cu_seqlens).tolist() == [0, 0, 5, 22, 54]
+    assert np.asarray(packed_query).shape == (54, num_heads, key_dim)
+    assert np.asarray(packed_key).shape == (54, num_heads, key_dim)
+    assert np.asarray(packed_value).shape == (54, num_heads, value_dim)
+    assert np.asarray(packed_gate).shape == (54, num_heads)
+    assert np.asarray(packed_beta).shape == (54, num_heads)
+
+    expected_out, expected_state = gdn_fla_prefill_chunk32_fp32_reference(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        lengths,
+        initial_state,
+        chunk_size=8,
+    )
+    actual_out, actual_state = gdn_fla_prefill_varlen_reference(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        lengths,
+        initial_state,
+        chunk_size=8,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_out),
+        np.asarray(expected_out),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+
+    unpacked = unpack_prepared_gdn_prefill_output(
+        packed_value,
+        cu_seqlens,
+        seq_len,
+    )
+    np.testing.assert_allclose(
+        np.asarray(unpacked),
+        np.asarray(jnp.where(valid[:, :, None, None], value, 0.0)),
         rtol=0,
         atol=0,
     )

@@ -179,6 +179,12 @@ The prepared-body reference is also explicit:
 gate/beta, row lengths, and state in the future fast-body layout, masks padded
 tokens from `seq_lens`, then falls back to the current chunk rule. This is the
 correctness target for the next FP32 CUDA/FLA-derived chunk body.
+The JAX-side FLA varlen contract is now explicit too:
+`pack_prepared_gdn_prefill_inputs` converts prepared `[B,T,H,D]` tensors into
+the upstream-style `[nnz,H,D] + cu_seqlens` ABI, and
+`gdn_fla_prefill_varlen_reference` round-trips through the segmented reference
+and unpacks to `[B,T,H,V]`. This gives a focused boundary for a future
+FLA-schedule port without forcing hot-path K,V/V,K state adapters.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -1849,6 +1855,11 @@ Commit 8:
   `tests/test_gdn_post_conv_prefill_reference.py
   tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py
   tests/test_kernel_registry.py` passed `21 passed`.
+- ~~Add the prepared-layout varlen packing/reference contract for vLLM/FLA
+  prefill: `[B,T,H,D] -> [nnz,H,D] + cu_seqlens -> [B,T,H,V]`.~~ Validation:
+  elevated CUDA focused selection
+  `tests/test_gdn_post_conv_prefill_reference.py -k 'varlen or prepared_fla_chunk32_reference_matches_post_conv_reference or masks_padded_rows'`
+  passed `3 passed, 7 deselected`.
 - ~~Route `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32`
   through the model/server path using the prepared-body reference.~~
   Validation: elevated CUDA focused suite passed `22 passed`; one-repeat

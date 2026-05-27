@@ -5122,3 +5122,26 @@ NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32 NANO_VLLM_JAX_GDN
 .venv/bin/python -m py_compile benchmarks/probe_vllm_fla_gdn.py
 /mountpoint/.exp/vllm-venv/bin/python benchmarks/probe_vllm_fla_gdn.py --warmups 2 --repeats 5 --output-json results/vllm_fla_gdn_probe_20260527_sm86.json
 ```
+
+### Entry 137 - Prepared GDN FLA Varlen Reference Contract
+
+- change accepted: added a JAX-side prepared-layout varlen GDN prefill
+  contract in `nanovllm_jax/kernels/gdn_fla.py`. The new helpers pack
+  prepared q/k/v `[B,T,H,D]` plus gate/beta `[B,T,H]` into the upstream
+  vLLM/FLA-style `[nnz,H,D] + cu_seqlens` ABI, run the existing segmented FP32
+  reference, and unpack output back to `[B,T,H,V]`.
+- decision: this is an ABI scaffold for a future vLLM/FLA-schedule port/fork,
+  not a serving speed claim and not a dtype-contract change. It keeps the
+  pure-JAX FP32/V,K reference as the correctness target while making the next
+  kernel boundary explicit.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m pytest -q tests/test_gdn_post_conv_prefill_reference.py -k 'varlen or prepared_fla_chunk32_reference_matches_post_conv_reference or masks_padded_rows'
+```
+
+- result: focused CUDA selection passed `3 passed, 7 deselected`. The new test
+  covers ragged lengths `[0,5,17,32]`, `cu_seqlens=[0,0,5,22,54]`, packed
+  q/k/v/gate/beta shapes, parity with the rectangular prepared FP32 reference,
+  and unpacking back to the prepared FLA layout.
