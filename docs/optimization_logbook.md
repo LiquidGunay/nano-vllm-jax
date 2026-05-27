@@ -5145,3 +5145,23 @@ JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m
   covers ragged lengths `[0,5,17,32]`, `cu_seqlens=[0,0,5,22,54]`, packed
   q/k/v/gate/beta shapes, parity with the rectangular prepared FP32 reference,
   and unpacking back to the prepared FLA layout.
+
+### Entry 138 - vLLM FLA Prefill Port Surface Audit
+
+- change accepted: recorded the sidecar audit of vLLM's Qwen3.5/GatedDeltaNet
+  prefill implementation in the source-of-truth plan and kernel roadmap. This
+  is implementation scoping, not a benchmark result.
+- result: the useful vLLM/FLA prefill path is `fused_post_conv_prep` followed
+  by `chunk_gated_delta_rule`. The chunk body decomposes into
+  `chunk_local_cumsum`, `chunk_scaled_dot_kkt_fwd`, `solve_tril`,
+  `recompute_w_u_fwd`, `chunk_gated_delta_rule_fwd_h`, and `chunk_fwd_o`, with
+  `prepare_chunk_indices`/`prepare_chunk_offsets` for varlen chunk metadata.
+- decision: port/fork the math kernels behind the existing JAX-facing
+  prepared-layout boundary. Do not import Torch autograd wrappers,
+  `input_guard`, vLLM forward context, or vLLM autotune/runtime plumbing into
+  the first JAX path. On A10G/SM86, target the non-Hopper/non-TMA branch first.
+- dtype note: vLLM's Torch wrapper rejects FP32 q/k/v for
+  `chunk_gated_delta_rule`, while gate/beta/state are FP32-oriented. The default
+  nano-vLLM-JAX path still requires FP32 activation/state correctness; BF16
+  q/k/v remains a default-off diagnostic unless it passes the long-decode
+  token/logit gates.

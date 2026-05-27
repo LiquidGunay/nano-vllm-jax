@@ -169,6 +169,17 @@ stable non-Torch ABI, and this JAX build does not expose an easy JIT-safe DLPack
 export path. Treat vLLM/FLA as a golden-reference implementation and port/fork
 the needed schedule behind the existing JAX-facing post-conv or packed-decode
 boundary.
+The concrete vLLM/FLA prefill port surface is now identified. After
+`fused_post_conv_prep`, vLLM's `chunk_gated_delta_rule` runs a deterministic FLA
+pipeline: local cumulative decay, scaled dot KKT, triangular solve, WY
+recompute, state/chunk update, and output materialization. The relevant source
+functions are `chunk_local_cumsum`, `chunk_scaled_dot_kkt_fwd`, `solve_tril`,
+`recompute_w_u_fwd`, `chunk_gated_delta_rule_fwd_h`, and `chunk_fwd_o`, plus
+`prepare_chunk_indices` and `prepare_chunk_offsets` for varlen chunk metadata.
+These math kernels are the preferred port/fork surface. Do not port Torch
+autograd wrappers, `input_guard`, vLLM runtime context, or autotune/env plumbing
+as part of the first JAX path. On A10G/SM86, vLLM uses the non-TMA path; the
+same route is the local target.
 The post-conv reference now exposes an explicit FLA-shaped FP32 prep helper:
 `prepare_gdn_post_conv_prefill_fla_inputs_from_decay` returns query/key/value in
 `[B,T,H,D]`, gate/beta in `[B,T,H]`, and row lengths, with optional q/k L2
@@ -1874,6 +1885,12 @@ Commit 8:
   boundary. The first fast attempt should either fuse post-conv prep into
   chunked prefill or call a FLA-shaped kernel without adding hot-path
   K,V/V,K transposes or per-layer layout conversions.
+- Use the audited vLLM FLA pipeline as the implementation decomposition:
+  `fused_post_conv_prep`, `chunk_local_cumsum`, `chunk_scaled_dot_kkt_fwd`,
+  `solve_tril`, `recompute_w_u_fwd`, `chunk_gated_delta_rule_fwd_h`, and
+  `chunk_fwd_o`. Keep Torch autograd/runtime wrappers out of the JAX port.
+  Preserve FP32 gate/beta/state. BF16 q/k/v remains an opt-in diagnostic unless
+  it passes the long-decode top-logit gates.
 - ~~Add a vLLM `fused_post_conv_prep`-inspired CUDA FP32 prep-only
   implementation behind `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_fp32`.~~
   Validation: elevated CUDA focused suite passed `18 passed`; one-repeat

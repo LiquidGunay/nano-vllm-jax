@@ -215,6 +215,13 @@ gdn_recurrent_decode_step(
   valid tokens into upstream-style `[nnz,H,D] + cu_seqlens`, runs the segmented
   FP32 reference, and unpacks output to `[B,T,H,V]`. This is an ABI scaffold for
   a future FLA-schedule port, not a serving speed claim.
+- port-map status: the vLLM prefill implementation decomposes into
+  `fused_post_conv_prep`, then `chunk_local_cumsum`,
+  `chunk_scaled_dot_kkt_fwd`, `solve_tril`, `recompute_w_u_fwd`,
+  `chunk_gated_delta_rule_fwd_h`, and `chunk_fwd_o`. These math kernels plus
+  `prepare_chunk_indices`/`prepare_chunk_offsets` are the port/fork surface.
+  Do not port Torch autograd wrappers, `input_guard`, vLLM forward context, or
+  global autotune/runtime plumbing into the first JAX path.
 
 ## P1.2 - `gdn_segmented_prefill_chunk32`
 
@@ -291,6 +298,11 @@ gdn_segmented_prefill_chunk32(
   vLLM/FLA-style prefill. The focused CUDA test verifies empty rows, ragged
   lengths `[0,5,17,32]`, `cu_seqlens=[0,0,5,22,54]`, packed tensor shapes, and
   parity with the rectangular prepared FP32 reference.
+- SM86 port note: on the current A10G host, vLLM's Hopper/TMA branches are not
+  active. The local target should therefore mirror the non-TMA FLA path first.
+  Preserve FP32 gate/beta/state; vLLM rejects FP32 q/k/v in its Torch wrapper,
+  so a FP32 JAX port must intentionally own that dtype contract rather than
+  calling the upstream wrapper directly.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
 
