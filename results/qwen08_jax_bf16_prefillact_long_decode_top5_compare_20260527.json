@@ -1,0 +1,131 @@
+{
+  "elapsed_seconds": 11.595106191933155,
+  "first_ordered_top5_mismatches": [
+    {
+      "hf_top_id_logit_max_abs_diff": 0.0014324188232421875,
+      "hf_top_ids": [
+        12140,
+        14955,
+        3725,
+        41262,
+        35990
+      ],
+      "hf_top_values": [
+        18.272424697875977,
+        17.438737869262695,
+        16.8868350982666,
+        16.00638198852539,
+        15.764307022094727
+      ],
+      "jax_top_ids": [
+        12140,
+        14955,
+        3725,
+        41262,
+        3364
+      ],
+      "jax_top_values": [
+        18.27385711669922,
+        17.43878173828125,
+        16.888195037841797,
+        16.004995346069336,
+        15.764211654663086
+      ],
+      "prefix_len": 119,
+      "ranked_logit_max_abs_diff": 0.0014324188232421875,
+      "same_top5_set": false,
+      "step": 109
+    },
+    {
+      "hf_top_id_logit_max_abs_diff": 0.0016326904296875,
+      "hf_top_ids": [
+        4487,
+        1083,
+        1472,
+        11784,
+        494
+      ],
+      "hf_top_values": [
+        25.390079498291016,
+        23.543439865112305,
+        21.956144332885742,
+        21.608007431030273,
+        21.607616424560547
+      ],
+      "jax_top_ids": [
+        4487,
+        1083,
+        1472,
+        494,
+        11784
+      ],
+      "jax_top_values": [
+        25.391225814819336,
+        23.543773651123047,
+        21.95777702331543,
+        21.607563018798828,
+        21.607486724853516
+      ],
+      "prefix_len": 141,
+      "ranked_logit_max_abs_diff": 0.0016326904296875,
+      "same_top5_set": true,
+      "step": 131
+    }
+  ],
+  "first_top1_mismatches": [],
+  "first_top5_set_mismatches": [
+    {
+      "hf_top_ids": [
+        12140,
+        14955,
+        3725,
+        41262,
+        35990
+      ],
+      "jax_top_ids": [
+        12140,
+        14955,
+        3725,
+        41262,
+        3364
+      ],
+      "prefix_len": 119,
+      "step": 109
+    }
+  ],
+  "gdn_kernel_flags": {
+    "prefill_act_dtype": "bf16",
+    "prefill_post_conv_impl": "reference_fla_chunk32"
+  },
+  "git_head": "f8080d6",
+  "guardrail": {
+    "exact_generated_token_match": true,
+    "max_hf_topk_id_logit_diff_lte": 2e-05,
+    "max_hf_topk_id_logit_diff_within_gate": false,
+    "ordered_top5_exact_match": false,
+    "ordered_top5_exact_matches_required": 500,
+    "passes_required_gate": false,
+    "top1_exact_match": true,
+    "top1_exact_matches_required": 500,
+    "top5_set_exact_match": false,
+    "top5_set_exact_matches_required": 500
+  },
+  "hf_reference": "results/qwen08_hf_bf16w_fp32act_long_decode_top5_500.npz",
+  "jax_activation_dtype": "float32",
+  "jax_backend": "gpu",
+  "jax_version": "0.10.1",
+  "jax_weight_dtype": "bfloat16",
+  "max_hf_topk_id_logit_diff": 0.010448455810546875,
+  "max_ranked_topk_logit_diff": 0.010448455810546875,
+  "max_top1_abs_logit_diff_when_id_matches": 0.0029277801513671875,
+  "model": "Qwen/Qwen3.5-0.8B",
+  "ordered_top5_exact_matches": 498,
+  "ordered_top5_mismatches": 2,
+  "prompt": "The future of artificial intelligence is poised to revolutionize",
+  "steps_checked": 500,
+  "top1_exact_matches": 500,
+  "top1_mismatches": 0,
+  "top5_set_exact_matches": 499,
+  "top5_set_mismatches": 1,
+  "top_k": 5
+}

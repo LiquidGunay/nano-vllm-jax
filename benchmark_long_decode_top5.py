@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -350,6 +351,16 @@ def compare_jax_to_hf(args: argparse.Namespace) -> None:
         "jax_activation_dtype": "float32",
         "jax_backend": jax.default_backend(),
         "jax_version": jax.__version__,
+        "gdn_kernel_flags": {
+            "prefill_post_conv_impl": os.environ.get(
+                "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
+                "off",
+            ),
+            "prefill_act_dtype": os.environ.get(
+                "NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE",
+                "fp32",
+            ),
+        },
         "git_head": _git_head(),
         "hf_reference": str(reference_path),
         "guardrail": {

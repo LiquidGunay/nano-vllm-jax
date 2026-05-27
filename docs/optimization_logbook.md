@@ -5016,3 +5016,48 @@ NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_fla_chunk32_fp32 JAX_PLATFORMS=cud
   `8 passed, 7 deselected`; full CUDA FFI file passed `15 passed`; focused
   CUDA/GDN regression suite passed `38 passed`; integrated route was exact but
   slower.
+
+### Entry 134 - Rejected Narrow BF16 GDN Prefill Activations
+
+- experiment: added `NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16` for the
+  prepared FLA-shaped post-conv prefill route. The flag is default-off and only
+  affects `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32`.
+  It casts prepared q/k/v and the core output to BF16 while keeping gate, beta,
+  and recurrent state in FP32. Decode activation math remains on the existing
+  FP32 path.
+- vLLM alignment: the local vLLM audit shows the Qwen3.5/Qwen3-Next GDN
+  prefill kernels are BF16/FP16-oriented for q/k/v, while gate/beta and
+  recurrent state are FP32-oriented in the useful FlashInfer/FLA boundary. This
+  route is therefore a correctness scaffold for that dtype split, not a true
+  external-kernel speed path.
+- artifact:
+  `results/gpu_matrix_20260527_gdn_prefill_bf16act_reference_target.json`
+- report:
+  `results/gpu_matrix_20260527_gdn_prefill_bf16act_reference_target.md`
+- long-decode guardrail:
+  `results/qwen08_jax_bf16_prefillact_long_decode_top5_compare_20260527.json`
+- result: the one-repeat integrated long-prefill benchmark kept exact
+  generated-token parity for 16 generated tokens and reached `89.74 tok/s`,
+  `0.771x` the stored vLLM reference and `1.150x` the configured JAX reference.
+  This is not speed-claim-ready because it has only one repeat and remains below
+  the active `0.9x` vLLM target.
+- correctness failure: the 500-token top-5 guardrail failed promotion. Top-1
+  token parity stayed exact at `500/500`, but ordered top-5 parity was
+  `498/500`, top-5 set parity was `499/500`, and
+  `max_hf_topk_id_logit_diff=0.010448455810546875`, far above the required
+  `2e-5` gate.
+- decision: reject for promotion. Keep the flag default-off as evidence and as a
+  scaffold for a future true FlashInfer/FLA BF16-input kernel experiment, but do
+  not change the default dtype contract.
+- validation:
+
+```text
+.venv/bin/python -m py_compile benchmark_long_decode_top5.py nanovllm_jax/backends.py nanovllm_jax/kernels/gdn_fla.py benchmarks/benchmark_jax_server_trace.py tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_prefill_reference.py
+NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32 NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16 JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/run_gpu_matrix.py --goal-target-only --repeats 1 --no-live-vllm --require-stored-references --output-json results/gpu_matrix_20260527_gdn_prefill_bf16act_reference_target.json
+NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32 NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16 JAX_PLATFORMS=cuda ... .venv/bin/python benchmark_long_decode_top5.py --max-new-tokens 500 --compare-json results/qwen08_jax_bf16_prefillact_long_decode_top5_compare_20260527.json
+```
+
+- result: focused post-conv suite passed `9 passed`; neighboring
+  GDN/kernel-registry suite passed `24 passed`; integrated route was exact for
+  16 generated tokens; long-decode top-5 guardrail failed as described above.

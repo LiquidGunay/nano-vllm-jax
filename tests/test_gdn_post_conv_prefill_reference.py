@@ -262,6 +262,95 @@ def test_prepared_fla_chunk32_reference_matches_post_conv_reference():
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_backend_prepared_fla_bf16_prefill_activations_match_manual_cast(monkeypatch):
+    batch = 2
+    seq_len = 8
+    num_key_heads = 1
+    num_value_heads = 2
+    key_dim = 4
+    value_dim = 4
+    conv_dim = 2 * num_key_heads * key_dim + num_value_heads * value_dim
+    keys = jax.random.split(jax.random.PRNGKey(20260530), 6)
+    conv_out = jax.random.normal(keys[0], (batch, seq_len, conv_dim), dtype=jnp.float32)
+    a = jax.random.normal(keys[1], (batch, seq_len, num_value_heads), dtype=jnp.float32)
+    b = jax.random.normal(keys[2], (batch, seq_len, num_value_heads), dtype=jnp.float32)
+    decay = jnp.linspace(0.8, 1.2, num_value_heads, dtype=jnp.float32)
+    dt_bias = jnp.linspace(-0.1, 0.2, num_value_heads, dtype=jnp.float32)
+    valid_mask = jnp.array(
+        [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1, 1]],
+        dtype=jnp.int32,
+    )
+    initial_state = jax.random.normal(
+        keys[3],
+        (batch, num_value_heads, value_dim, key_dim),
+        dtype=jnp.float32,
+    ) * 0.01
+
+    query, key, value, gate, beta, seq_lens = (
+        prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
+            conv_out,
+            a,
+            b,
+            decay,
+            dt_bias,
+            valid_mask,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
+            key_head_dim=key_dim,
+            value_head_dim=value_dim,
+            normalize_qk=True,
+        )
+    )
+    expected_out, expected_state = gdn_fla_prefill_chunk32_fp32_reference(
+        query.astype(jnp.bfloat16),
+        key.astype(jnp.bfloat16),
+        value.astype(jnp.bfloat16),
+        gate.astype(jnp.float32),
+        beta.astype(jnp.float32),
+        seq_lens,
+        initial_state.astype(jnp.float32),
+        chunk_size=8,
+    )
+    expected_out = expected_out.astype(jnp.bfloat16)
+
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
+        "reference_fla_chunk32",
+    )
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE", "bf16")
+    actual_out, actual_state = PureJAXBackend().gated_delta_prefill_post_conv(
+        conv_out,
+        a,
+        b,
+        decay,
+        dt_bias,
+        valid_mask,
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        key_head_dim=key_dim,
+        value_head_dim=value_dim,
+        chunk_size=8,
+        initial_state=initial_state,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    assert actual_out.dtype == jnp.bfloat16
+    assert actual_state.dtype == jnp.float32
+    np.testing.assert_allclose(
+        np.asarray(actual_out.transpose(0, 2, 1, 3), dtype=np.float32),
+        np.asarray(expected_out, dtype=np.float32),
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 def test_prepared_fla_chunk32_reference_masks_padded_rows():
     batch = 2
     seq_len = 8

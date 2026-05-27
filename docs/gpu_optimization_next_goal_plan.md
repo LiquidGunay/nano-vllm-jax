@@ -59,6 +59,12 @@ optimization work starts.
     exact generated-token parity on the `1536`-token row at the first generated
     token. Any BF16 lane must therefore stay default-off and narrower than a
     whole-model dtype change until it passes full token/logit gates.
+13. The narrow vLLM-style BF16 GDN prefill activation diagnostic is also not
+    promotable yet. It keeps gate/beta/state FP32 and only casts prepared GDN
+    prefill q/k/v plus core output to BF16, but the 500-token top-5 guardrail
+    fails (`498/500` ordered top-5, `499/500` top-5 set,
+    `max_hf_topk_id_logit_diff=0.010448455810546875`). Keep this path
+    default-off unless a true external BF16-input kernel passes the full gates.
 
 ## Next Goal Handoff
 
@@ -276,6 +282,16 @@ Current tracked records:
   event is `Fp32GdnPrefillChunk32Kernel<32, true>` at about `452.44 ms` across
   18 launches. This is rejected for promotion; a direct layout-adapted port of
   the old local chunk body is still not the right GDN prefill kernel schedule.
+- Current rejected narrow BF16 GDN prefill activation diagnostic:
+  `results/gpu_matrix_20260527_gdn_prefill_bf16act_reference_target.json`,
+  `89.74 tok/s`, `0.771x` the stored vLLM reference, exact generated-token
+  parity on the one-repeat integrated route, and
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32` with
+  `NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16`. The 500-token top-5 guardrail
+  artifact
+  `results/qwen08_jax_bf16_prefillact_long_decode_top5_compare_20260527.json`
+  failed promotion: top-1 exact `500/500`, ordered top-5 `498/500`, top-5 set
+  `499/500`, and `max_hf_topk_id_logit_diff=0.010448455810546875`.
 - Current vLLM-inspired random-token manifest sidecar:
   `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
   `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
@@ -1683,17 +1699,22 @@ Commit 7c - Optional BF16 GDN prefill activation experiment:
 
 - Defer this until after the V,K FP32 path has a stable correctness and speed
   baseline. Do not make BF16 prefill part of the default migration.
-- Add `NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16` or equivalent opt-in flag.
-- Limit the first experiment to GDN prefill activations; keep recurrent state
+- ~~Add `NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16` or equivalent opt-in flag.~~
+- ~~Limit the first experiment to GDN prefill activations; keep recurrent state
   and decode activation math FP32 unless a separate decision changes that
-  contract.
-- Compare against the V,K FP32-prefill baseline, not against the old K,V layout.
+  contract.~~
+- ~~Compare against the V,K FP32-prefill baseline, not against the old K,V
+  layout.~~
 - Treat FLA/FlashInfer BF16 prefill as an integration/performance hypothesis:
   useful only if it reduces integrated TTFT or throughput bottlenecks after
   full-model gates, not merely because the external kernel prefers BF16 inputs.
+- ~~Run an integrated one-repeat goal-target diagnostic and long-decode top-5
+  guardrail for the first narrow BF16 reference lane.~~ Result: default-off path
+  was exact for the one-repeat integrated 16-token benchmark but failed the
+  long-decode top-5/logit gate, so it is rejected for promotion.
 - Require layer/state drift checks, cached prefill plus long-decode top-5/logit
   guardrails, exact generated-token parity, and an integrated TTFT/throughput
-  win before promotion.
+  win before any future BF16 external-kernel promotion.
 - If the BF16 path only helps an external-kernel microbenchmark but fails the
   full-model gates, keep it rejected/default-off.
 

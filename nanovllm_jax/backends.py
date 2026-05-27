@@ -42,6 +42,7 @@ _CUDA_FP32_DECODE_ATTN_ENV = "NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"
 _CUDA_FP32_GDN_DECODE_ENV = "NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE"
 _GDN_PACKED_DECODE_IMPL_ENV = "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL"
 _GDN_PREFILL_POST_CONV_IMPL_ENV = "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL"
+_GDN_PREFILL_ACT_DTYPE_ENV = "NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE"
 _OFF_ENV_VALUES = {"", "0", "false", "no", "off", "none", "False"}
 
 
@@ -102,6 +103,33 @@ def _gdn_prefill_post_conv_impl() -> str:
 
 def gdn_prefill_post_conv_enabled() -> bool:
     return _gdn_prefill_post_conv_impl() != "off"
+
+
+def _gdn_prefill_activation_dtype() -> str:
+    value = os.environ.get(_GDN_PREFILL_ACT_DTYPE_ENV, "fp32").strip()
+    normalized = value.lower()
+    if normalized in _OFF_ENV_VALUES or normalized in {"fp32", "float32"}:
+        return "fp32"
+    if normalized in {"bf16", "bfloat16"}:
+        return "bf16"
+    raise ValueError(
+        f"Unknown {_GDN_PREFILL_ACT_DTYPE_ENV}={value!r}; expected fp32 or bf16"
+    )
+
+
+def _cast_gdn_prefill_activations(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    act_dtype = _gdn_prefill_activation_dtype()
+    if act_dtype == "bf16":
+        return (
+            query.astype(jnp.bfloat16),
+            key.astype(jnp.bfloat16),
+            value.astype(jnp.bfloat16),
+        )
+    return query, key, value
 
 
 class InferenceBackend(Protocol):
@@ -565,16 +593,19 @@ class PureJAXBackend:
                     normalize_qk=use_qk_l2norm_in_kernel,
                 )
             )
+            query, key, value = _cast_gdn_prefill_activations(query, key, value)
             output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
                 query,
                 key,
                 value,
-                gate,
-                beta,
+                gate.astype(jnp.float32),
+                beta.astype(jnp.float32),
                 seq_lens,
                 initial_state.astype(jnp.float32),
                 chunk_size=chunk_size,
             )
+            if _gdn_prefill_activation_dtype() == "bf16":
+                output = output.astype(jnp.bfloat16)
             return output.transpose(0, 2, 1, 3), final_state
 
         if impl == "cuda_fla_chunk32_fp32":

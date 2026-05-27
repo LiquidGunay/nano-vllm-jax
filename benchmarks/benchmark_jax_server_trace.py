@@ -350,6 +350,10 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                     "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
                     "off",
                 ),
+                "prefill_act_dtype": os.environ.get(
+                    "NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE",
+                    "fp32",
+                ),
             },
             "jax_execution": args.jax_execution,
             "linear_chunk_size": int(engine.config.linear_chunk_size),
