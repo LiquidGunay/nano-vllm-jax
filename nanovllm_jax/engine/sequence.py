@@ -23,6 +23,14 @@ class SamplingParams:
     top_k: int = -1
 
 
+@dataclass(frozen=True)
+class DeviceTokenRef:
+    """Deferred reference to one row in a device-resident token vector."""
+
+    tokens: Any
+    row: int
+
+
 class Sequence:
     """Represents a sequence being generated."""
     
@@ -131,19 +139,64 @@ class Sequence:
 
     def materialize_device_tokens(self):
         """Resolve deferred device token IDs into the Python token list."""
-        if not self._device_token_slots:
+        self.materialize_device_tokens_for_sequences([self])
+
+    @staticmethod
+    def materialize_device_tokens_for_sequences(seqs: List["Sequence"]):
+        """Resolve deferred device token IDs for multiple sequences in one sync."""
+        entries: List[tuple["Sequence", int]] = []
+        scalar_entries: List[int] = []
+        scalar_arrays = []
+        vector_entries: List[tuple[int, int, int]] = []
+        vector_arrays = []
+        vector_slots: dict[int, int] = {}
+        for seq in seqs:
+            for index, token in seq._device_token_slots:
+                entries.append((seq, index))
+                entry_index = len(entries) - 1
+                if isinstance(token, DeviceTokenRef):
+                    vector_id = id(token.tokens)
+                    vector_slot = vector_slots.get(vector_id)
+                    if vector_slot is None:
+                        vector_slot = len(vector_arrays)
+                        vector_slots[vector_id] = vector_slot
+                        vector_arrays.append(token.tokens)
+                    vector_entries.append((entry_index, vector_slot, int(token.row)))
+                else:
+                    scalar_entries.append(entry_index)
+                    scalar_arrays.append(token)
+        if not scalar_arrays and not vector_arrays:
             return
+
         import jax
         import jax.numpy as jnp
 
-        arrays = [jnp.asarray(token, dtype=jnp.int32).reshape(()) for _, token in self._device_token_slots]
-        values = [int(value) for value in jax.device_get(jnp.stack(arrays)).tolist()]
-        for (index, _), value in zip(self._device_token_slots, values):
-            self.token_ids[index] = value
-        self.last_token = self.token_ids[-1]
-        self.last_token_device = None
-        self._device_token_slots.clear()
-        self._device_token_indices.clear()
+        values_by_entry: dict[int, int] = {}
+        if scalar_arrays:
+            scalar_arrays = [jnp.asarray(token, dtype=jnp.int32).reshape(()) for token in scalar_arrays]
+            scalar_values = jax.device_get(jnp.stack(scalar_arrays)).tolist()
+            for entry_index, value in zip(scalar_entries, scalar_values):
+                values_by_entry[entry_index] = int(value)
+        if vector_arrays:
+            vector_arrays = [jnp.asarray(tokens, dtype=jnp.int32).reshape(-1) for tokens in vector_arrays]
+            vector_values = jax.device_get(tuple(vector_arrays))
+            for entry_index, vector_slot, row in vector_entries:
+                values_by_entry[entry_index] = int(vector_values[vector_slot][row])
+
+        touched: List["Sequence"] = []
+        seen: set[int] = set()
+        for entry_index, (seq, index) in enumerate(entries):
+            value = values_by_entry[entry_index]
+            seq.token_ids[index] = value
+            seq_id = id(seq)
+            if seq_id not in seen:
+                touched.append(seq)
+                seen.add(seq_id)
+        for seq in touched:
+            seq.last_token = seq.token_ids[-1]
+            seq.last_token_device = None
+            seq._device_token_slots.clear()
+            seq._device_token_indices.clear()
 
     def get_absolute_positions(self) -> List[int]:
         """Get absolute positions for all tokens in sequence."""

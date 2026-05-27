@@ -477,6 +477,7 @@ class LLMEngine:
                         }
                     )
 
+        Sequence.materialize_device_tokens_for_sequences(seqs)
         results = [
             {
                 "request_index": index,

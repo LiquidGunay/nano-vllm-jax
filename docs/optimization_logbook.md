@@ -4789,3 +4789,44 @@ NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_prefill_fp32 JAX_PLATFORMS=cu
 ```
 
 - result: integrated one-repeat route completed and was exact but much slower.
+
+### Entry 127 - Device-Token Vector-Ref Fastest-Run Marker
+
+- change tested: refined the default-off `NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1`
+  path so deferred completion tokens keep a reference to the whole device token
+  vector plus row index, rather than storing one JAX scalar slice per row. The
+  deferred trace path now materializes all pending tokens for all sequences in
+  one helper before building final results.
+- reference path: normal streaming generation and ordinary
+  `Sequence.materialize_device_tokens()` behavior remain intact. The new
+  `DeviceTokenRef` is used only when the opt-in device-carry path is active.
+- artifact:
+  `results/gpu_matrix_20260527_device_token_carry_vector_ref_target.json`
+- report:
+  `results/gpu_matrix_20260527_device_token_carry_vector_ref_target.md`
+- result: exact generated-token parity over two elevated GPU repeats. The
+  fastest local long-prefill marker improves from the previous device-carry
+  `93.01 tok/s`, `0.799x` vLLM to `95.14 tok/s`, `0.818x` vLLM. It still misses
+  the active `0.9x` target of `104.74 tok/s`, leaving a `9.59 tok/s` gap.
+- profile movement: versus the previous device-carry marker, `PjRt Execute`
+  count drops from `255` to `59`, total `PjRt Execute` drops from about
+  `360.71 ms` to `307.17 ms`, and total `MemcpyD2D` drops from about
+  `45.77 ms` to `18.62 ms`. This confirms the scalar-slice materialization was
+  a real sync/transfer tax. `forward_step_token_ids_jit` and
+  `command_buffer::execute` grow, so the integrated gain is useful but
+  insufficient.
+- decision: keep the vector-ref device-carry path as the current fastest
+  default-off/offline marker, but do not promote it to `gpu_paged_default`.
+  It is not streaming-equivalent, remains below `0.9x` vLLM, and is not
+  speed-claim-ready under the current profile-counter gate.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/engine/sequence.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/llm_engine.py tests/test_device_token_carry.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest tests/test_device_token_carry.py -q
+NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1 JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/run_gpu_matrix.py --goal-target-only --configs gpu_paged_default --repeats 2 --output-json results/gpu_matrix_20260527_device_token_carry_vector_ref_target.json --require-stored-references --jax-python /mountpoint/.exp/nano-vllm-jax/.venv/bin/python
+```
+
+- result: `py_compile` passed; focused elevated GPU test passed `4 passed`;
+  integrated target run completed, was exact, and produced the fastest local
+  default-off marker so far.

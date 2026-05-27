@@ -9,7 +9,7 @@ import numpy as np
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.engine.scheduled_batch import ScheduledBatch
-from nanovllm_jax.engine.sequence import Sequence, SequenceStatus, SamplingParams
+from nanovllm_jax.engine.sequence import DeviceTokenRef, Sequence, SequenceStatus, SamplingParams
 from nanovllm_jax.engine.block_manager import BlockManager
 
 
@@ -25,7 +25,7 @@ def _device_token_carry_enabled() -> bool:
 
 
 def _is_device_token(value) -> bool:
-    return hasattr(value, "dtype") and hasattr(value, "shape")
+    return isinstance(value, DeviceTokenRef) or (hasattr(value, "dtype") and hasattr(value, "shape"))
 
 
 class Scheduler:

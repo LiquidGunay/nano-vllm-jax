@@ -12,7 +12,7 @@ from dataclasses import replace
 from nanovllm_jax.backends import select_backend
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.model import ModelParams, full_attention_block, gated_deltanet_block, transformer_block, forward as model_forward
-from nanovllm_jax.engine.sequence import Sequence
+from nanovllm_jax.engine.sequence import DeviceTokenRef, Sequence
 from nanovllm_jax.kv_cache import (
     KVCacheState, 
     KVCacheSpec,
@@ -2036,7 +2036,7 @@ class CanonicalModelRunner:
                 )
                 if carry_device_tokens:
                     token_by_row = {
-                        row: token_ids[index]
+                        row: DeviceTokenRef(tokens=token_ids, row=index)
                         for index, row in enumerate(active_rows)
                     }
                 else:

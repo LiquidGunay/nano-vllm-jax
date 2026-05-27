@@ -195,13 +195,16 @@ Current tracked records:
   `run_config.serving_fastpath_flags.greedy_decode_burst_steps = 16` and remains
   default-off. The one-repeat burst-2 probe was even slower at `5.57 tok/s`.
 - Current fastest default-off device-token-carry target:
-  `results/gpu_matrix_20260527_device_token_carry_vector_target.json`, `93.01
-  tok/s`, `0.799x` the stored vLLM reference, exact generated-token parity over
-  two repeats, and `NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1`. This is a fastest-run
-  marker only, not the accepted baseline: it defers token materialization until
-  the end of greedy `ignore_eos` generation, so per-token streaming TTFT/ITL
-  measurements are no longer equivalent to the default server path. It also
-  adds extra `PjRt Execute`/`MemcpyD2D` work and remains below the `0.9x` gate.
+  `results/gpu_matrix_20260527_device_token_carry_vector_ref_target.json`,
+  `95.14 tok/s`, `0.818x` the stored vLLM reference, exact generated-token
+  parity over two repeats, and `NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1`. This is a
+  fastest-run marker only, not the accepted baseline: it defers token
+  materialization until the end of greedy `ignore_eos` generation, so per-token
+  streaming TTFT/ITL measurements are no longer equivalent to the default
+  server path. The vector-ref materializer reduces the prior device-carry
+  `PjRt Execute` count from `255` to `59` and `MemcpyD2D` count from `749` to
+  `493`, but the route remains below the `0.9x` gate and not speed-claim-ready
+  under the current profile-counter policy.
 - Current default-off GDN post-conv reference boundary:
   `results/gpu_matrix_20260527_gdn_post_conv_reference_target.json`, `90.15
   tok/s`, `0.775x` the stored vLLM reference, exact generated-token parity on
@@ -746,15 +749,16 @@ end-to-end throughput.
   at `5.57 tok/s`. This rejects source-level full-model decode scans as the
   host-sync solution.
 - Device-token-carry fastest-run marker:
-  `results/gpu_matrix_20260527_device_token_carry_vector_target.json` and
-  `results/gpu_matrix_20260527_device_token_carry_vector_target.md`. The opt-in
-  `NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1` route keeps greedy token vectors on
-  device between scheduled decode calls and materializes token IDs after
-  fixed-length `ignore_eos` generation. It is exact over two repeats and raises
-  the local long-prefill target to `93.01 tok/s`, `0.799x` vLLM, but it is not
-  an accepted default because it changes streaming timing semantics, is not
-  speed-claim-ready under the current profile-counter gate, and still leaves an
-  `11.72 tok/s` gap to the `0.9x` target.
+  `results/gpu_matrix_20260527_device_token_carry_vector_ref_target.json` and
+  `results/gpu_matrix_20260527_device_token_carry_vector_ref_target.md`. The
+  opt-in `NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1` route keeps greedy token vectors
+  on device between scheduled decode calls, now stores deferred completion
+  tokens as vector references instead of per-row scalar slices, and materializes
+  token IDs after fixed-length `ignore_eos` generation. It is exact over two
+  repeats and raises the local long-prefill target to `95.14 tok/s`, `0.818x`
+  vLLM, but it is not an accepted default because it changes streaming timing
+  semantics, is not speed-claim-ready under the current profile-counter gate,
+  and still leaves a `9.59 tok/s` gap to the `0.9x` target.
 - Current raw GPU trace summary:
   `results/profile_trace_20260527_current_goal_target_gpu.json` and
   `results/profile_trace_20260527_current_goal_target_gpu.md`. Across both
