@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from nanovllm_jax.backends import PureJAXBackend
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.kernels.cuda_fp32_ffi import gdn_post_conv_prep_fp32
 from nanovllm_jax.kernels.gdn_fla import (
@@ -324,6 +325,87 @@ def test_prepared_fla_chunk32_reference_masks_padded_rows():
         np.asarray(clean_state),
         rtol=0,
         atol=0,
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_backend_cuda_prepared_fla_chunk32_matches_reference(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
+
+    batch = 2
+    seq_len = 32
+    num_key_heads = 2
+    num_value_heads = 2
+    key_dim = 32
+    value_dim = 32
+    conv_dim = 2 * num_key_heads * key_dim + num_value_heads * value_dim
+    keys = jax.random.split(jax.random.PRNGKey(20260529), 5)
+    conv_out = jax.random.normal(keys[0], (batch, seq_len, conv_dim), dtype=jnp.float32)
+    a = jax.random.normal(keys[1], (batch, seq_len, num_value_heads), dtype=jnp.float32)
+    b = jax.random.normal(keys[2], (batch, seq_len, num_value_heads), dtype=jnp.float32)
+    decay = jnp.linspace(0.8, 1.2, num_value_heads, dtype=jnp.float32)
+    dt_bias = jnp.linspace(-0.1, 0.2, num_value_heads, dtype=jnp.float32)
+    valid_mask = jnp.arange(seq_len, dtype=jnp.int32)[None, :] < jnp.array(
+        [19, 32],
+        dtype=jnp.int32,
+    )[:, None]
+    initial_state = jax.random.normal(
+        keys[3],
+        (batch, num_value_heads, value_dim, key_dim),
+        dtype=jnp.float32,
+    ) * 0.01
+    backend = PureJAXBackend()
+
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
+        "reference_fla_chunk32",
+    )
+    expected_out, expected_state = backend.gated_delta_prefill_post_conv(
+        conv_out,
+        a,
+        b,
+        decay,
+        dt_bias,
+        valid_mask,
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        key_head_dim=key_dim,
+        value_head_dim=value_dim,
+        chunk_size=32,
+        initial_state=initial_state,
+        use_qk_l2norm_in_kernel=True,
+    )
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
+        "cuda_fla_chunk32_fp32",
+    )
+    actual_out, actual_state = backend.gated_delta_prefill_post_conv(
+        conv_out,
+        a,
+        b,
+        decay,
+        dt_bias,
+        valid_mask,
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        key_head_dim=key_dim,
+        value_head_dim=value_dim,
+        chunk_size=32,
+        initial_state=initial_state,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_out),
+        np.asarray(expected_out),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
+        rtol=2e-5,
+        atol=2e-5,
     )
 
 

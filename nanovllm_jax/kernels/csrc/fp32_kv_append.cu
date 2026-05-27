@@ -492,6 +492,104 @@ XLA_FFI_Error* CheckGdnPrefillCallFrame(XLA_FFI_CallFrame* call_frame) {
   return nullptr;
 }
 
+XLA_FFI_Error* CheckGdnPrefillPreparedCallFrame(XLA_FFI_CallFrame* call_frame) {
+  const XLA_FFI_Api* api = call_frame->api;
+  if (call_frame->stage != XLA_FFI_ExecutionStage_EXECUTE) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "prepared fp32 GDN prefill only supports execute stage");
+  }
+  if (call_frame->args.size != 7 || call_frame->rets.size != 2) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "prepared fp32 GDN prefill expects 7 arguments and 2 results");
+  }
+  for (int64_t i = 0; i < call_frame->args.size; ++i) {
+    if (!IsBufferArg(call_frame, i)) {
+      return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                         "all prepared fp32 GDN prefill arguments must be buffers");
+    }
+  }
+  for (int64_t i = 0; i < call_frame->rets.size; ++i) {
+    if (!IsBufferRet(call_frame, i)) {
+      return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                         "all prepared fp32 GDN prefill results must be buffers");
+    }
+  }
+
+  const XLA_FFI_Buffer* query = ArgBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* key = ArgBuffer(call_frame, 1);
+  const XLA_FFI_Buffer* value = ArgBuffer(call_frame, 2);
+  const XLA_FFI_Buffer* g = ArgBuffer(call_frame, 3);
+  const XLA_FFI_Buffer* beta = ArgBuffer(call_frame, 4);
+  const XLA_FFI_Buffer* seq_lens = ArgBuffer(call_frame, 5);
+  const XLA_FFI_Buffer* state = ArgBuffer(call_frame, 6);
+  const XLA_FFI_Buffer* out = RetBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* new_state = RetBuffer(call_frame, 1);
+
+  if (!HasTypeAndRank(query, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(key, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(value, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(out, XLA_FFI_DataType_F32, 4)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "prepared query/key/value/output must be FP32 rank-4 buffers");
+  }
+  if (!HasTypeAndRank(g, XLA_FFI_DataType_F32, 3) ||
+      !HasTypeAndRank(beta, XLA_FFI_DataType_F32, 3)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "prepared g and beta must be FP32 rank-3 buffers");
+  }
+  if (!HasTypeAndRank(seq_lens, XLA_FFI_DataType_S32, 1)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "prepared seq_lens must be an int32 rank-1 buffer");
+  }
+  if (!HasTypeAndRank(state, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(new_state, XLA_FFI_DataType_F32, 4)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "prepared state and new_state must be FP32 rank-4 buffers");
+  }
+
+  int64_t batch = query->dims[0];
+  int64_t seq_len = query->dims[1];
+  int64_t num_heads = query->dims[2];
+  int64_t key_dim = query->dims[3];
+  int64_t value_dim = value->dims[3];
+  if (key->dims[0] != batch || value->dims[0] != batch ||
+      state->dims[0] != batch || seq_lens->dims[0] != batch ||
+      key->dims[1] != seq_len || value->dims[1] != seq_len ||
+      key->dims[2] != num_heads || value->dims[2] != num_heads ||
+      key->dims[3] != key_dim) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "prepared GDN prefill q/k/v batch/time/head dimensions must match");
+  }
+  if (g->dims[0] != batch || beta->dims[0] != batch ||
+      g->dims[1] != seq_len || beta->dims[1] != seq_len ||
+      g->dims[2] != num_heads || beta->dims[2] != num_heads) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "prepared g/beta dimensions must match query");
+  }
+  if (seq_len % 32 != 0 || value_dim % 32 != 0) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "prepared GDN prefill requires time and value_dim divisible by 32");
+  }
+  if (state->dims[1] != num_heads ||
+      state->dims[2] != value_dim ||
+      state->dims[3] != key_dim) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "prepared state must have shape [B,H,V,K]");
+  }
+  if (out->dims[0] != batch || out->dims[1] != seq_len ||
+      out->dims[2] != num_heads || out->dims[3] != value_dim) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "prepared output shape must match value");
+  }
+  for (int i = 0; i < 4; ++i) {
+    if (new_state->dims[i] != state->dims[i]) {
+      return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                         "prepared state output shape must match state input");
+    }
+  }
+  return nullptr;
+}
+
 XLA_FFI_Error* CheckGdnPostConvPrepCallFrame(XLA_FFI_CallFrame* call_frame) {
   const XLA_FFI_Api* api = call_frame->api;
   if (call_frame->stage != XLA_FFI_ExecutionStage_EXECUTE) {
@@ -1057,7 +1155,35 @@ __global__ void Fp32GdnPackedDecodeKernel(
   }
 }
 
-template <int kBlockV>
+template <bool kPreparedLayout>
+__device__ __forceinline__ int64_t GdnFeatureOffset(
+    int64_t batch_idx,
+    int64_t head,
+    int64_t token,
+    int64_t dim,
+    int64_t num_heads,
+    int64_t seq_len,
+    int64_t feature_dim) {
+  if constexpr (kPreparedLayout) {
+    return ((batch_idx * seq_len + token) * num_heads + head) * feature_dim + dim;
+  }
+  return ((batch_idx * num_heads + head) * seq_len + token) * feature_dim + dim;
+}
+
+template <bool kPreparedLayout>
+__device__ __forceinline__ int64_t GdnGateOffset(
+    int64_t batch_idx,
+    int64_t head,
+    int64_t token,
+    int64_t num_heads,
+    int64_t seq_len) {
+  if constexpr (kPreparedLayout) {
+    return (batch_idx * seq_len + token) * num_heads + head;
+  }
+  return (batch_idx * num_heads + head) * seq_len + token;
+}
+
+template <int kBlockV, bool kPreparedLayout>
 __global__ void Fp32GdnPrefillChunk32Kernel(
     const float* query,
     const float* key,
@@ -1089,15 +1215,21 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
   int64_t value_start = value_block * kBlockV;
   int tid = threadIdx.x;
 
-  int64_t q_base = ((batch_idx * num_heads + head) * seq_len) * key_dim;
-  int64_t v_base = ((batch_idx * num_heads + head) * seq_len) * value_dim;
-  int64_t gate_base = (batch_idx * num_heads + head) * seq_len;
   int64_t state_base = ((batch_idx * num_heads + head) * value_dim) * key_dim;
+  float query_scale =
+      kPreparedLayout ? rsqrtf(static_cast<float>(key_dim)) : 1.0f;
 
   for (int64_t linear = tid; linear < seq_len * kBlockV; linear += blockDim.x) {
     int64_t token = linear / kBlockV;
     int64_t v_offset = linear - token * kBlockV;
-    out[v_base + token * value_dim + value_start + v_offset] = 0.0f;
+    out[GdnFeatureOffset<kPreparedLayout>(
+        batch_idx,
+        head,
+        token,
+        value_start + v_offset,
+        num_heads,
+        seq_len,
+        value_dim)] = 0.0f;
   }
   for (int64_t linear = tid; linear < key_dim * kBlockV; linear += blockDim.x) {
     int64_t k_offset = linear / kBlockV;
@@ -1123,7 +1255,8 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
     if (tid == 0) {
       float running = 0.0f;
       for (int i = 0; i < active_tokens; ++i) {
-        running += g[gate_base + start + i];
+        running += g[GdnGateOffset<kPreparedLayout>(
+            batch_idx, head, start + i, num_heads, seq_len)];
         g_cumsum[i] = running;
       }
       for (int i = active_tokens; i < kChunk; ++i) {
@@ -1138,9 +1271,12 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
       float value_ij = 0.0f;
       if (i < active_tokens && j < i) {
         float dot = 0.0f;
-        float beta_i = beta[gate_base + start + i];
-        int64_t key_i_base = q_base + (start + i) * key_dim;
-        int64_t key_j_base = q_base + (start + j) * key_dim;
+        float beta_i = beta[GdnGateOffset<kPreparedLayout>(
+            batch_idx, head, start + i, num_heads, seq_len)];
+        int64_t key_i_base = GdnFeatureOffset<kPreparedLayout>(
+            batch_idx, head, start + i, 0, num_heads, seq_len, key_dim);
+        int64_t key_j_base = GdnFeatureOffset<kPreparedLayout>(
+            batch_idx, head, start + j, 0, num_heads, seq_len, key_dim);
         for (int64_t k_offset = 0; k_offset < key_dim; ++k_offset) {
           dot += key[key_i_base + k_offset] * beta_i *
                  key[key_j_base + k_offset];
@@ -1181,8 +1317,17 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
       float acc = 0.0f;
       for (int t = 0; t <= i; ++t) {
         float attn = (i == t) ? 1.0f : local_attn[i * kChunk + t];
-        acc += attn * value[v_base + (start + t) * value_dim + value_start + v_offset] *
-               beta[gate_base + start + t];
+        acc += attn *
+               value[GdnFeatureOffset<kPreparedLayout>(
+                   batch_idx,
+                   head,
+                   start + t,
+                   value_start + v_offset,
+                   num_heads,
+                   seq_len,
+                   value_dim)] *
+               beta[GdnGateOffset<kPreparedLayout>(
+                   batch_idx, head, start + t, num_heads, seq_len)];
       }
       value_work[i * kBlockV + v_offset] = acc;
     }
@@ -1192,8 +1337,18 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
       float acc = 0.0f;
       for (int t = 0; t <= i; ++t) {
         float attn = (i == t) ? 1.0f : local_attn[i * kChunk + t];
-        acc += attn * key[q_base + (start + t) * key_dim + k_offset] *
-               beta[gate_base + start + t] * expf(g_cumsum[t]);
+        acc += attn *
+               key[GdnFeatureOffset<kPreparedLayout>(
+                   batch_idx,
+                   head,
+                   start + t,
+                   k_offset,
+                   num_heads,
+                   seq_len,
+                   key_dim)] *
+               beta[GdnGateOffset<kPreparedLayout>(
+                   batch_idx, head, start + t, num_heads, seq_len)] *
+               expf(g_cumsum[t]);
       }
       k_cumdecay[i * key_dim + k_offset] = acc;
     }
@@ -1202,10 +1357,13 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
       int j = idx - i * active_tokens;
       float acc = 0.0f;
       if (j <= i) {
-        int64_t q_i_base = q_base + (start + i) * key_dim;
-        int64_t k_j_base = q_base + (start + j) * key_dim;
+        int64_t q_i_base = GdnFeatureOffset<kPreparedLayout>(
+            batch_idx, head, start + i, 0, num_heads, seq_len, key_dim);
+        int64_t k_j_base = GdnFeatureOffset<kPreparedLayout>(
+            batch_idx, head, start + j, 0, num_heads, seq_len, key_dim);
         for (int64_t k_offset = 0; k_offset < key_dim; ++k_offset) {
-          acc += query[q_i_base + k_offset] * key[k_j_base + k_offset];
+          acc += query[q_i_base + k_offset] * query_scale *
+                 key[k_j_base + k_offset];
         }
         acc *= expf(g_cumsum[i] - g_cumsum[j]);
       }
@@ -1230,7 +1388,15 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
       int v_offset = idx - i * kBlockV;
       float attn_inter = 0.0f;
       for (int64_t k_offset = 0; k_offset < key_dim; ++k_offset) {
-        attn_inter += query[q_base + (start + i) * key_dim + k_offset] *
+        attn_inter += query[GdnFeatureOffset<kPreparedLayout>(
+                          batch_idx,
+                          head,
+                          start + i,
+                          k_offset,
+                          num_heads,
+                          seq_len,
+                          key_dim)] *
+                      query_scale *
                       expf(g_cumsum[i]) *
                       state_tile[k_offset * kBlockV + v_offset];
       }
@@ -1239,7 +1405,14 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
         attn_v_new += query_attn[i * kChunk + j] *
                       value_work[j * kBlockV + v_offset];
       }
-      out[v_base + (start + i) * value_dim + value_start + v_offset] =
+      out[GdnFeatureOffset<kPreparedLayout>(
+          batch_idx,
+          head,
+          start + i,
+          value_start + v_offset,
+          num_heads,
+          seq_len,
+          value_dim)] =
           attn_inter + attn_v_new;
     }
     __syncthreads();
@@ -1252,7 +1425,14 @@ __global__ void Fp32GdnPrefillChunk32Kernel(
       float state_update = 0.0f;
       for (int i = 0; i < active_tokens; ++i) {
         state_update +=
-            key[q_base + (start + i) * key_dim + k_offset] *
+            key[GdnFeatureOffset<kPreparedLayout>(
+                batch_idx,
+                head,
+                start + i,
+                k_offset,
+                num_heads,
+                seq_len,
+                key_dim)] *
             expf(g_last - g_cumsum[i]) *
             value_work[i * kBlockV + v_offset];
       }
@@ -1664,7 +1844,7 @@ extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPrefillChunk32(
       key_dim * kBlockV;      // state_tile
   size_t shared_bytes = shared_floats * sizeof(float);
 
-  Fp32GdnPrefillChunk32Kernel<kBlockV><<<grid, threads, shared_bytes, stream>>>(
+  Fp32GdnPrefillChunk32Kernel<kBlockV, false><<<grid, threads, shared_bytes, stream>>>(
       static_cast<const float*>(query->data),
       static_cast<const float*>(key->data),
       static_cast<const float*>(value->data),
@@ -1745,7 +1925,7 @@ extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPrefillChunk32V64(
   size_t shared_bytes = shared_floats * sizeof(float);
 
   cudaError_t attr_error = cudaFuncSetAttribute(
-      Fp32GdnPrefillChunk32Kernel<kBlockV>,
+      Fp32GdnPrefillChunk32Kernel<kBlockV, false>,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
       static_cast<int>(shared_bytes));
   if (attr_error != cudaSuccess) {
@@ -1753,7 +1933,83 @@ extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPrefillChunk32V64(
                        cudaGetErrorString(attr_error));
   }
 
-  Fp32GdnPrefillChunk32Kernel<kBlockV><<<grid, threads, shared_bytes, stream>>>(
+  Fp32GdnPrefillChunk32Kernel<kBlockV, false><<<grid, threads, shared_bytes, stream>>>(
+      static_cast<const float*>(query->data),
+      static_cast<const float*>(key->data),
+      static_cast<const float*>(value->data),
+      static_cast<const float*>(g->data),
+      static_cast<const float*>(beta->data),
+      static_cast<const int32_t*>(seq_lens->data),
+      static_cast<const float*>(state->data),
+      static_cast<float*>(out->data),
+      static_cast<float*>(new_state->data),
+      batch,
+      num_heads,
+      seq_len,
+      key_dim,
+      value_dim);
+  cudaError_t launch_error = cudaGetLastError();
+  if (launch_error != cudaSuccess) {
+    return CreateError(api, XLA_FFI_Error_Code_INTERNAL,
+                       cudaGetErrorString(launch_error));
+  }
+  return nullptr;
+}
+
+extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPrefillChunk32Prepared(
+    XLA_FFI_CallFrame* call_frame) {
+  MaybeSetMetadata(call_frame);
+  if (call_frame->extension_start != nullptr) {
+    return nullptr;
+  }
+
+  if (XLA_FFI_Error* error = CheckGdnPrefillPreparedCallFrame(call_frame)) {
+    return error;
+  }
+
+  const XLA_FFI_Api* api = call_frame->api;
+  XLA_FFI_Stream_Get_Args stream_args;
+  stream_args.struct_size = XLA_FFI_Stream_Get_Args_STRUCT_SIZE;
+  stream_args.extension_start = nullptr;
+  stream_args.ctx = call_frame->ctx;
+  stream_args.stream = nullptr;
+  if (XLA_FFI_Error* error = api->XLA_FFI_Stream_Get(&stream_args)) {
+    return error;
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_args.stream);
+
+  const XLA_FFI_Buffer* query = ArgBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* key = ArgBuffer(call_frame, 1);
+  const XLA_FFI_Buffer* value = ArgBuffer(call_frame, 2);
+  const XLA_FFI_Buffer* g = ArgBuffer(call_frame, 3);
+  const XLA_FFI_Buffer* beta = ArgBuffer(call_frame, 4);
+  const XLA_FFI_Buffer* seq_lens = ArgBuffer(call_frame, 5);
+  const XLA_FFI_Buffer* state = ArgBuffer(call_frame, 6);
+  XLA_FFI_Buffer* out = RetBuffer(call_frame, 0);
+  XLA_FFI_Buffer* new_state = RetBuffer(call_frame, 1);
+
+  int64_t batch = query->dims[0];
+  int64_t seq_len = query->dims[1];
+  int64_t num_heads = query->dims[2];
+  int64_t key_dim = query->dims[3];
+  int64_t value_dim = value->dims[3];
+  constexpr int kChunk = 32;
+  constexpr int kBlockV = 32;
+  int threads = 256;
+  dim3 grid(
+      static_cast<unsigned int>(batch),
+      static_cast<unsigned int>(num_heads),
+      static_cast<unsigned int>(value_dim / kBlockV));
+  size_t shared_floats =
+      kChunk * kChunk +       // local_attn
+      kChunk * kChunk +       // query_attn
+      kChunk +                // g_cumsum
+      kChunk * kBlockV +      // value_work
+      kChunk * key_dim +      // k_cumdecay
+      key_dim * kBlockV;      // state_tile
+  size_t shared_bytes = shared_floats * sizeof(float);
+
+  Fp32GdnPrefillChunk32Kernel<kBlockV, true><<<grid, threads, shared_bytes, stream>>>(
       static_cast<const float*>(query->data),
       static_cast<const float*>(key->data),
       static_cast<const float*>(value->data),

@@ -20,6 +20,7 @@ from nanovllm_jax.kernels.cuda_fp32_ffi import (
     build_cuda_fp32_kernels,
     gdn_packed_decode_step_fp32,
     gdn_packed_decode_step_fp32_reference,
+    gdn_prefill_chunk32_prepared_fp32,
     gdn_prefill_chunk32_normalized_fp32,
     gdn_prefill_chunk32_v64_normalized_fp32,
     gdn_recurrent_decode_step_fp32,
@@ -27,6 +28,7 @@ from nanovllm_jax.kernels.cuda_fp32_ffi import (
     kv_append_paged_nhd_fp32,
     paged_decode_attention_gqa_nhd_fp32,
 )
+from nanovllm_jax.kernels.gdn_fla import gdn_fla_prefill_chunk32_fp32_reference
 from nanovllm_jax.layers import l2norm
 from nanovllm_jax.model import jax_chunk_gated_delta_rule
 from nanovllm_jax.kernels.flashinfer_ffi import kv_append_paged_nhd_reference
@@ -534,6 +536,91 @@ def test_gdn_prefill_chunk32_normalized_fp32_cuda_matches_chunk_reference(
         key_norm,
         value,
         g,
+        beta,
+        lengths,
+        state,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_out),
+        np.asarray(expected_out),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+
+
+@pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_gdn_prefill_chunk32_prepared_fp32_cuda_matches_fla_reference(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
+    monkeypatch.setenv("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1")
+
+    batch = 2
+    seq_len = 64
+    num_heads = 2
+    key_dim = 32
+    value_dim = 32
+    lengths = jnp.array([37, 64], dtype=jnp.int32)
+
+    query = jnp.linspace(
+        -0.5,
+        0.5,
+        batch * seq_len * num_heads * key_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, seq_len, num_heads, key_dim)
+    key = jnp.linspace(
+        0.4,
+        -0.4,
+        batch * seq_len * num_heads * key_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, seq_len, num_heads, key_dim)
+    value = jnp.linspace(
+        -0.2,
+        0.3,
+        batch * seq_len * num_heads * value_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, seq_len, num_heads, value_dim)
+    gate = jnp.linspace(
+        -0.08,
+        -0.02,
+        batch * seq_len * num_heads,
+        dtype=jnp.float32,
+    ).reshape(batch, seq_len, num_heads)
+    beta = jnp.linspace(
+        0.2,
+        0.8,
+        batch * seq_len * num_heads,
+        dtype=jnp.float32,
+    ).reshape(batch, seq_len, num_heads)
+    state = jnp.linspace(
+        -0.03,
+        0.04,
+        batch * num_heads * value_dim * key_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_heads, value_dim, key_dim)
+
+    query_norm = l2norm(query, axis=-1, eps=1e-6)
+    key_norm = l2norm(key, axis=-1, eps=1e-6)
+    expected_out, expected_state = gdn_fla_prefill_chunk32_fp32_reference(
+        query_norm,
+        key_norm,
+        value,
+        gate,
+        beta,
+        lengths,
+        state,
+    )
+    actual_out, actual_state = jax.jit(gdn_prefill_chunk32_prepared_fp32)(
+        query_norm,
+        key_norm,
+        value,
+        gate,
         beta,
         lengths,
         state,

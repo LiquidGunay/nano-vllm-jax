@@ -4974,3 +4974,45 @@ NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32 JAX_PLATFORMS=cud
 
 - result: focused CUDA post-conv suite passed `7 passed`; neighboring GDN
   reference suite passed `22 passed`; integrated one-repeat route was exact.
+
+### Entry 133 - Rejected Prepared FLA CUDA Chunk32 Route
+
+- experiment: added a default-off prepared-layout FP32 CUDA FFI target,
+  `gdn_prefill_chunk32_prepared_fp32`, and routed it through
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_fla_chunk32_fp32`. The kernel
+  consumes q/k/v `[B,T,H,D]`, gate/beta `[B,T,H]`, row lengths `[B]`, and V,K
+  state `[B,H,V,K]`, applies query scaling internally, and returns output in
+  `[B,T,H,V]`.
+- artifact:
+  `results/gpu_matrix_20260527_gdn_post_conv_cuda_fla_chunk32_target.json`
+- report:
+  `results/gpu_matrix_20260527_gdn_post_conv_cuda_fla_chunk32_target.md`
+- result: correct but much slower. The one-repeat integrated long-prefill route
+  kept exact generated-token parity, but throughput fell to `63.82 tok/s`,
+  `0.548x` the stored vLLM reference and `0.818x` the configured JAX reference.
+  This is not speed-claim-ready because it has only one repeat.
+- profile movement: command-buffer/PJRT buckets shrink because the custom call
+  collapses many XLA operations, but the replacement kernel itself dominates:
+  `Fp32GdnPrefillChunk32Kernel<32, true>` takes about `452.44 ms` across 18
+  launches. Host-visible `np.asarray`/`tolist` expands to about `912 ms`, so the
+  integrated route is slower despite lower `command_buffer::execute`.
+- decision: reject for promotion. Keep the target default-off as an ABI and FFI
+  diagnostic, but do not pursue a direct layout-adapted version of the old local
+  chunk body as the serving GDN prefill solution. The next GDN prefill attempt
+  must port the FLA chunk schedule more faithfully or otherwise reduce the
+  per-layer chunk body cost, not just change indexing/layout.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/backends.py nanovllm_jax/kernels/cuda_fp32_ffi.py tests/test_cuda_fp32_ffi.py tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_cuda_fp32_ffi.py::test_gdn_prefill_chunk32_prepared_fp32_cuda_matches_fla_reference
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_cuda_fp32_ffi.py -k 'gdn_prefill or gdn_recurrent or gdn_packed'
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_cuda_fp32_ffi.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_cuda_fp32_ffi.py tests/test_gdn_post_conv_prefill_reference.py tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py tests/test_kernel_registry.py
+NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_fla_chunk32_fp32 JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/run_gpu_matrix.py --goal-target-only --repeats 1 --no-live-vllm --require-stored-references --output-json results/gpu_matrix_20260527_gdn_post_conv_cuda_fla_chunk32_target.json
+```
+
+- result: new prepared CUDA unit test passed; GDN CUDA subset passed
+  `8 passed, 7 deselected`; full CUDA FFI file passed `15 passed`; focused
+  CUDA/GDN regression suite passed `38 passed`; integrated route was exact but
+  slower.

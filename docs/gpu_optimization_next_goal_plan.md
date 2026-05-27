@@ -268,6 +268,14 @@ Current tracked records:
   `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32`. This is not
   speed-claim-ready and is below the accepted/scoped default, but it proves the
   prepared-body FLA ABI can be exercised through the server path.
+- Current rejected prepared-FLA CUDA chunk32 route:
+  `results/gpu_matrix_20260527_gdn_post_conv_cuda_fla_chunk32_target.json`,
+  `63.82 tok/s`, `0.548x` the stored vLLM reference, exact generated-token
+  parity on the one-repeat integrated route, and
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_fla_chunk32_fp32`. The top GPU
+  event is `Fp32GdnPrefillChunk32Kernel<32, true>` at about `452.44 ms` across
+  18 launches. This is rejected for promotion; a direct layout-adapted port of
+  the old local chunk body is still not the right GDN prefill kernel schedule.
 - Current vLLM-inspired random-token manifest sidecar:
   `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
   `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
@@ -1754,6 +1762,12 @@ Commit 8:
   through the model/server path using the prepared-body reference.~~
   Validation: elevated CUDA focused suite passed `22 passed`; one-repeat
   integrated long-prefill route was exact at `89.37 tok/s`, `0.768x` vLLM.
+- ~~Add a default-off prepared-layout FP32 CUDA FFI target
+  `gdn_prefill_chunk32_prepared_fp32` and route it through
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_fla_chunk32_fp32`.~~
+  Validation: elevated CUDA focused suite passed `38 passed`; one-repeat
+  integrated long-prefill route was exact but slow at `63.82 tok/s`,
+  `0.548x` vLLM. Reject this old-body layout adaptation for promotion.
 - Add the fast vLLM/FLA-derived implementation behind the same post-conv
   boundary. The first fast attempt should either fuse post-conv prep into
   chunked prefill or call a FLA-shaped kernel without adding hot-path

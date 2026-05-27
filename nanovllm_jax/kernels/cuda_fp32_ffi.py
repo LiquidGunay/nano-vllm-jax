@@ -30,6 +30,7 @@ _TARGET_GDN_PACKED_DECODE = "nanovllm_jax_fp32_gdn_packed_decode"
 _TARGET_GDN_POST_CONV_PREP = "nanovllm_jax_fp32_gdn_post_conv_prep"
 _TARGET_GDN_PREFILL = "nanovllm_jax_fp32_gdn_prefill_chunk32"
 _TARGET_GDN_PREFILL_V64 = "nanovllm_jax_fp32_gdn_prefill_chunk32_v64"
+_TARGET_GDN_PREFILL_PREPARED = "nanovllm_jax_fp32_gdn_prefill_chunk32_prepared"
 _REGISTER_LOCK = threading.Lock()
 _REGISTERED = False
 _LOADED_LIBS: list[ctypes.CDLL] = []
@@ -185,6 +186,7 @@ def _register_kv_append_target() -> None:
         gdn_post_conv_prep_handler = library.NanoVllmJaxFp32GdnPostConvPrep
         gdn_prefill_handler = library.NanoVllmJaxFp32GdnPrefillChunk32
         gdn_prefill_v64_handler = library.NanoVllmJaxFp32GdnPrefillChunk32V64
+        gdn_prefill_prepared_handler = library.NanoVllmJaxFp32GdnPrefillChunk32Prepared
         jax.ffi.register_ffi_target(
             _TARGET_KV_APPEND,
             jax.ffi.pycapsule(handler),
@@ -224,6 +226,12 @@ def _register_kv_append_target() -> None:
         jax.ffi.register_ffi_target(
             _TARGET_GDN_PREFILL_V64,
             jax.ffi.pycapsule(gdn_prefill_v64_handler),
+            platform="gpu",
+            api_version=1,
+        )
+        jax.ffi.register_ffi_target(
+            _TARGET_GDN_PREFILL_PREPARED,
+            jax.ffi.pycapsule(gdn_prefill_prepared_handler),
             platform="gpu",
             api_version=1,
         )
@@ -969,3 +977,90 @@ def gdn_prefill_chunk32_v64_normalized_fp32(
         seq_lens,
         state,
     )
+
+
+def _validate_fp32_gdn_prefill_prepared_inputs(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    g: jnp.ndarray,
+    beta: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    state: jnp.ndarray,
+) -> None:
+    for name, value_array, rank in (
+        ("query", query, 4),
+        ("key", key, 4),
+        ("value", value, 4),
+        ("g", g, 3),
+        ("beta", beta, 3),
+        ("state", state, 4),
+    ):
+        if value_array.dtype != jnp.float32:
+            raise ValueError(f"{name} must be float32")
+        if value_array.ndim != rank:
+            raise ValueError(f"{name} must be rank-{rank}")
+    if seq_lens.dtype != jnp.int32:
+        raise ValueError("seq_lens must be int32")
+    if seq_lens.ndim != 1:
+        raise ValueError("seq_lens must be rank-1")
+    if query.shape != key.shape:
+        raise ValueError("query and key must have matching shape")
+    if value.shape[:3] != query.shape[:3]:
+        raise ValueError("value must have matching [batch, time, heads]")
+    if g.shape != query.shape[:3] or beta.shape != query.shape[:3]:
+        raise ValueError("g and beta must have shape [batch, time, heads]")
+    batch, seq_len, num_heads, key_dim = query.shape
+    value_dim = value.shape[3]
+    if seq_lens.shape != (batch,):
+        raise ValueError("seq_lens must have shape [batch]")
+    if seq_len % 32 != 0:
+        raise ValueError("prepared FP32 GDN prefill requires time divisible by 32")
+    if value_dim % 32 != 0:
+        raise ValueError("prepared FP32 GDN prefill requires value_dim divisible by 32")
+    if state.shape != (batch, num_heads, value_dim, key_dim):
+        raise ValueError("state must have shape [batch, heads, value_dim, key_dim]")
+
+
+def gdn_prefill_chunk32_prepared_fp32(
+    query: Any,
+    key: Any,
+    value: Any,
+    g: Any,
+    beta: Any,
+    seq_lens: Any,
+    state: Any,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Chunk-32 GDN prefill for prepared FLA-layout FP32 tensors.
+
+    Inputs use q/k/v `[B,T,H,D]`, gate/beta `[B,T,H]`, and state `[B,H,V,K]`.
+    Query/key are L2-normalized but not attention-scaled; this prepared body
+    applies `1/sqrt(key_dim)` exactly once to match the JAX reference.
+    """
+
+    query = _as_jax_array("query", query)
+    key = _as_jax_array("key", key)
+    value = _as_jax_array("value", value)
+    g = _as_jax_array("g", g)
+    beta = _as_jax_array("beta", beta)
+    seq_lens = _as_jax_array("seq_lens", seq_lens)
+    state = _as_jax_array("state", state)
+    _validate_fp32_gdn_prefill_prepared_inputs(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        seq_lens,
+        state,
+    )
+    _register_kv_append_target()
+    call = jax.ffi.ffi_call(
+        _TARGET_GDN_PREFILL_PREPARED,
+        (
+            jax.ShapeDtypeStruct(value.shape, value.dtype),
+            jax.ShapeDtypeStruct(state.shape, state.dtype),
+        ),
+        has_side_effect=False,
+    )
+    return call(query, key, value, g, beta, seq_lens, state)
