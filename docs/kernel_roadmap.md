@@ -125,6 +125,10 @@ paged_decode_attention_gqa_nhd(
   half/BF16 oriented. Use vLLM's packed decode kernel shape as the first
   port/fork target, then revisit segmented prefill after packed decode passes
   strict parity.
+- route decision: before implementation, explicitly choose Pallas, a production
+  vLLM/FLA-shaped CUDA/JAX FFI port, or pausing GDN in favor of
+  FlashInfer/full-attention work. Do not treat the historical local CUDA probes
+  as this decision.
 - JAX-facing ABI:
 
 ```python

@@ -4317,3 +4317,19 @@ JAX_PLATFORMS=cuda ... pytest -q \
 - decision: make packed decode the first real vLLM/FLA-shaped GDN kernel
   boundary. Do not start with segmented prefill or fused projection+GDN, and do
   not promote the historical local CUDA probes as the production route.
+
+### Entry 112 - Packed GDN Kernel Route Decision Checkpoint
+
+- current target evidence: `results/gpu_matrix_20260527_current_goal_target.json`
+  remains the latest elevated, speed-claim-ready long-prefill target artifact.
+  It is exact over two repeats at `90.87 tok/s`; the stored vLLM reference is
+  `116.37 tok/s`, the `0.9x` target is `104.74 tok/s`, and the remaining gap is
+  `13.86 tok/s`.
+- scheduler context: the same artifact reports one prefill step at about
+  `0.53 s` and 15 decode steps totaling about `0.17 s`. This does not prove
+  packed GDN decode alone can close the gap, but it is the smallest
+  vLLM/FLA-shaped FP32 kernel boundary currently available without changing the
+  default dtype contract.
+- decision needed: choose Pallas, a production vLLM/FLA-shaped CUDA/JAX FFI
+  port, or pausing GDN to return to FlashInfer/full-attention work. Do not route
+  a new GDN serving kernel until that design choice is explicit.

@@ -116,6 +116,17 @@ FlashInfer GDN kernels are half/BF16 oriented. Keep the next real GDN step to a
 FP32-capable vLLM/FLA-shaped packed decode port/fork against the `gdn_fla`
 reference boundary before attempting segmented prefill or fused projection+GDN.
 
+Immediate kernel decision checkpoint: the latest elevated long-prefill target
+artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
+speed-claim-ready and exact at `90.87 tok/s`, while the stored vLLM reference is
+`116.37 tok/s`; the active `0.9x` target is `104.74 tok/s`, leaving a
+`13.86 tok/s` gap. Scheduler diagnostics show one prefill step at about
+`0.53 s` and 15 decode steps totaling about `0.17 s`. The next packed-GDN
+decode implementation route is a design decision, not a cleanup: choose one of
+Pallas, a production vLLM/FLA-shaped CUDA/JAX FFI port, or pausing GDN to return
+to FlashInfer/full-attention work. Do not route a new GDN kernel into serving
+until that decision is explicit and the focused parity gates pass.
+
 ## Baseline And Best-Run Tracking
 
 Keep two records for each tracked workload:
