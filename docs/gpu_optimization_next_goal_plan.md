@@ -142,6 +142,11 @@ The post-conv reference now exposes an explicit FLA-shaped FP32 prep helper:
 `[B,T,H,D]`, gate/beta in `[B,T,H]`, and row lengths, with optional q/k L2
 normalization. The existing reference path still transposes into the current
 chunk body, so this is an ABI scaffold rather than a speed claim.
+The prepared-body reference is also explicit:
+`gdn_fla_prefill_chunk32_fp32_reference` consumes normalized q/k, value,
+gate/beta, row lengths, and state in the future fast-body layout, masks padded
+tokens from `seq_lens`, then falls back to the current chunk rule. This is the
+correctness target for the next FP32 CUDA/FLA-derived chunk body.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -1731,6 +1736,13 @@ Commit 8:
   `tests/test_gdn_post_conv_prefill_reference.py
   tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py
   tests/test_kernel_registry.py` passed `19 passed`.
+- ~~Add the rectangular prepared-body FP32 reference
+  `gdn_fla_prefill_chunk32_fp32_reference` for q/k/v `[B,T,H,D]`, gate/beta
+  `[B,T,H]`, `seq_lens [B]`, and state `[B,H,V,K]`.~~ Validation: elevated
+  CUDA focused suite
+  `tests/test_gdn_post_conv_prefill_reference.py
+  tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py
+  tests/test_kernel_registry.py` passed `21 passed`.
 - Add the fast vLLM/FLA-derived implementation behind the same post-conv
   boundary. The first fast attempt should either fuse post-conv prep into
   chunked prefill or call a FLA-shaped kernel without adding hot-path

@@ -4917,3 +4917,27 @@ JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_pr
 
 - result: elevated CUDA focused suite passed `4 passed`; neighboring GDN
   reference suite passed `19 passed`.
+
+### Entry 131 - Prepared FLA Chunk32 FP32 Reference
+
+- change accepted: added `gdn_fla_prefill_chunk32_fp32_reference`, the pure-JAX
+  reference for the next GDN prefill fast body. It consumes the prepared
+  rectangular FLA layout q/k/v `[B,T,H,D]`, gate/beta `[B,T,H]`, row lengths
+  `[B]`, and V,K state `[B,H,V,K]`. The helper masks padded positions from
+  `seq_lens`, transposes only inside the fallback reference, calls the existing
+  chunk rule with q/k normalization disabled, and returns output in
+  `[B,T,H,V]`.
+- motivation: this freezes the smallest FP32-preserving chunk-body ABI before
+  writing or porting a CUDA implementation. It avoids the previously rejected
+  packed/rowwise serving reference, which changed FP32 accumulation enough to
+  miss the state gate.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_prefill_reference.py tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py tests/test_kernel_registry.py
+```
+
+- result: focused CUDA post-conv suite passed `6 passed`; neighboring GDN
+  reference suite passed `21 passed`.

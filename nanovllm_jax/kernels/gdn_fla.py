@@ -271,6 +271,68 @@ def prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
     return query, key, value, gate, beta, seq_lens
 
 
+def gdn_fla_prefill_chunk32_fp32_reference(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    gate: jnp.ndarray,
+    beta: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    initial_state: jnp.ndarray,
+    *,
+    chunk_size: int = 32,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Pure-JAX reference for the prepared FLA-layout FP32 chunk body.
+
+    Inputs are rectangular and already in the future-kernel layout:
+    q/k/v `[B,T,H,D]`, gate/beta `[B,T,H]`, and state `[B,H,V,K]`. Query/key
+    normalization, if desired, is owned by the prep helper; this body only
+    applies the chunk rule's query scale once.
+    """
+
+    from nanovllm_jax.model import jax_chunk_gated_delta_rule
+
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("query, key, and value must have shape [batch, time, heads, dim]")
+    if gate.ndim != 3 or beta.ndim != 3:
+        raise ValueError("gate and beta must have shape [batch, time, heads]")
+    if key.shape != query.shape:
+        raise ValueError("query and key shapes must match")
+    if value.shape[:3] != query.shape[:3]:
+        raise ValueError("value must match query [batch, time, heads]")
+
+    batch, seq_len, num_heads, key_dim = query.shape
+    value_dim = value.shape[-1]
+    if gate.shape != (batch, seq_len, num_heads):
+        raise ValueError("gate must have shape [batch, time, heads]")
+    if beta.shape != (batch, seq_len, num_heads):
+        raise ValueError("beta must have shape [batch, time, heads]")
+    if seq_lens.shape != (batch,):
+        raise ValueError("seq_lens must have shape [batch]")
+    if initial_state.shape != (batch, num_heads, value_dim, key_dim):
+        raise ValueError("initial_state must have shape [batch, heads, value_dim, key_dim]")
+
+    valid = jnp.arange(seq_len, dtype=jnp.int32)[None, :] < seq_lens.astype(jnp.int32)[:, None]
+    query = jnp.where(valid[:, :, None, None], query.astype(jnp.float32), 0.0)
+    key = jnp.where(valid[:, :, None, None], key.astype(jnp.float32), 0.0)
+    value = jnp.where(valid[:, :, None, None], value.astype(jnp.float32), 0.0)
+    gate = jnp.where(valid[:, :, None], gate.astype(jnp.float32), 0.0)
+    beta = jnp.where(valid[:, :, None], beta.astype(jnp.float32), 0.0)
+
+    output, final_state = jax_chunk_gated_delta_rule(
+        query.transpose(0, 2, 1, 3),
+        key.transpose(0, 2, 1, 3),
+        value.transpose(0, 2, 1, 3),
+        gate.transpose(0, 2, 1),
+        beta.transpose(0, 2, 1),
+        chunk_size=chunk_size,
+        initial_state=initial_state.astype(jnp.float32),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=False,
+    )
+    return output.transpose(0, 2, 1, 3), final_state
+
+
 def gdn_post_conv_prefill_reference_from_decay(
     conv_out: jnp.ndarray,
     a: jnp.ndarray,
