@@ -221,6 +221,11 @@ The fourth FLA math-stage reference is now explicit:
 `recompute_w_u_fwd` semantics over packed varlen tensors, producing `w` and
 `u` from the solved chunk matrix, beta, local gate cumsums, grouped keys, and
 values.
+The fifth FLA math-stage reference is now explicit:
+`gdn_fla_chunk_delta_h_packed_reference` implements vLLM/FLA's
+`chunk_gated_delta_rule_fwd_h` state/value update over packed varlen tensors.
+It uses `chunk_offsets` for per-sequence chunk traversal, stores `v_new` before
+gate rescaling, and applies gate-rescaled deltas to the FP32 recurrent state.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -1941,6 +1946,12 @@ Commit 8:
   Validation: elevated CUDA focused selection
   `tests/test_gdn_segmented_reference.py -k 'recompute_w_u or solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'`
   passed `7 passed`.
+- ~~Add FLA chunk-delta-h packed reference for `chunk_gated_delta_rule_fwd_h`,
+  including `chunk_offsets`, prior-state `h`, ungated `v_new`, gate-rescaled
+  state updates, and final-state tests.~~ Validation: elevated CUDA focused
+  selection
+  `tests/test_gdn_segmented_reference.py -k 'chunk_delta_h or recompute_w_u or solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'`
+  passed `8 passed`.
 - ~~Add a vLLM `fused_post_conv_prep`-inspired CUDA FP32 prep-only
   implementation behind `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_fp32`.~~
   Validation: elevated CUDA focused suite passed `18 passed`; one-repeat

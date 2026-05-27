@@ -5276,3 +5276,27 @@ JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m
   `7 passed`. The new test covers ragged `cu_seqlens=[0,0,5,13]`, chunk size
   `4`, grouped output heads over two key heads, gate-exp scaling for `w`, and
   beta-weighted value projection for `u`.
+
+### Entry 144 - FLA Chunk-Delta-H Reference
+
+- change accepted: added `gdn_fla_chunk_delta_h_packed_reference`, a JAX-side
+  reference for vLLM/FLA's `chunk_gated_delta_rule_fwd_h` state/value update
+  stage over packed varlen tensors.
+- decision: this locks down the stage that differs from the preceding FLA
+  chunk-body kernels: varlen traversal uses `chunk_offsets`, not
+  `chunk_indices`, to walk chunks for each original sequence row. The reference
+  records that `h` stores the prior chunk state, `v_new` stores the ungated
+  delta, and only the recurrent state update uses gate-rescaled deltas.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_segmented_reference.py
+git diff --check
+JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py -k 'chunk_delta_h or recompute_w_u or solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'
+```
+
+- result: static checks passed and the elevated CUDA focused selection passed
+  `8 passed`. The new test covers ragged `cu_seqlens=[0,0,5,13]`,
+  `chunk_offsets=[0,0,2,4]`, prior-state `h`, ungated `v_new`, gate-rescaled
+  state updates, grouped output heads over two key heads, and final-state
+  parity including the zero-length row.

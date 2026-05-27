@@ -13,6 +13,7 @@ import pytest
 jax.config.update("jax_default_matmul_precision", "highest")
 
 from nanovllm_jax.kernels.gdn_fla import (
+    gdn_fla_chunk_delta_h_packed_reference,
     gdn_fla_chunk_local_cumsum_packed_reference,
     gdn_fla_chunk_scaled_dot_kkt_packed_reference,
     gdn_fla_recompute_w_u_packed_reference,
@@ -256,6 +257,104 @@ def test_gdn_fla_recompute_w_u_packed_reference_matches_formula():
 
     np.testing.assert_allclose(np.asarray(actual_w), expected_w, rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(np.asarray(actual_u), expected_u, rtol=1e-5, atol=1e-6)
+
+
+def test_gdn_fla_chunk_delta_h_packed_reference_matches_formula():
+    cu_seqlens = jnp.array([0, 0, 5, 13], dtype=jnp.int32)
+    chunk_indices, chunk_offsets = prepare_gdn_fla_chunk_metadata(
+        cu_seqlens,
+        chunk_size=4,
+    )
+    key = jnp.arange(13 * 2 * 3, dtype=jnp.float32).reshape(13, 2, 3) * 0.01
+    value = jnp.arange(13 * 4 * 5, dtype=jnp.float32).reshape(13, 4, 5) * 0.02
+    beta = jnp.linspace(0.2, 0.7, 13 * 4, dtype=jnp.float32).reshape(13, 4)
+    gate = jnp.linspace(-0.25, 0.25, 13 * 4, dtype=jnp.float32).reshape(13, 4)
+    initial_state = (
+        jnp.arange(3 * 4 * 5 * 3, dtype=jnp.float32).reshape(3, 4, 5, 3) * 0.001
+    )
+    attention_matrix = gdn_fla_chunk_scaled_dot_kkt_packed_reference(
+        key,
+        beta,
+        gate,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+    )
+    attention_inverse = gdn_fla_solve_tril_packed_reference(
+        attention_matrix,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+    )
+    w, u = gdn_fla_recompute_w_u_packed_reference(
+        key,
+        value,
+        beta,
+        gate,
+        attention_inverse,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+    )
+
+    actual_h, actual_v_new, actual_final = gdn_fla_chunk_delta_h_packed_reference(
+        key,
+        w,
+        u,
+        gate,
+        cu_seqlens,
+        initial_state,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+    )
+
+    expected_h = np.zeros((4, 4, 5, 3), dtype=np.float32)
+    expected_v_new = np.zeros((13, 4, 5), dtype=np.float32)
+    expected_final = np.asarray(initial_state).astype(np.float32).copy()
+    key_np = np.asarray(key)
+    w_np = np.asarray(w)
+    u_np = np.asarray(u)
+    gate_np = np.asarray(gate)
+    offsets = [0, 0, 5, 13]
+    chunk_offset_values = [0, 0, 2, 4]
+    for row in range(len(offsets) - 1):
+        row_state = expected_final[row].copy()
+        for chunk in range(chunk_offset_values[row + 1] - chunk_offset_values[row]):
+            flat_chunk = chunk_offset_values[row] + chunk
+            start = offsets[row] + chunk * 4
+            end = min(offsets[row + 1], start + 4)
+            for head in range(4):
+                key_head = head // 2
+                head_state = row_state[head]
+                expected_h[flat_chunk, head] = head_state
+                delta = (
+                    u_np[start:end, head, :]
+                    - w_np[start:end, head, :] @ head_state.T
+                )
+                expected_v_new[start:end, head, :] = delta
+                chunk_gate = gate_np[start:end, head].astype(np.float32)
+                last_gate = chunk_gate[-1]
+                update_delta = delta * np.exp(last_gate - chunk_gate)[:, None]
+                row_state[head] = (
+                    head_state * np.exp(last_gate)
+                    + update_delta.T @ key_np[start:end, key_head, :]
+                )
+        expected_final[row] = row_state
+
+    np.testing.assert_allclose(np.asarray(actual_h), expected_h, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(actual_v_new),
+        expected_v_new,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_final),
+        expected_final,
+        rtol=1e-5,
+        atol=1e-6,
+    )
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")

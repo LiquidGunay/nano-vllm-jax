@@ -689,6 +689,124 @@ def gdn_fla_recompute_w_u_packed_reference(
     return w, u
 
 
+def gdn_fla_chunk_delta_h_packed_reference(
+    key: jnp.ndarray,
+    w: jnp.ndarray,
+    u: jnp.ndarray,
+    gate_cumsum: jnp.ndarray | None,
+    cu_seqlens: Any,
+    initial_state: jnp.ndarray | None,
+    *,
+    chunk_size: int,
+    chunk_indices: Any | None = None,
+    chunk_offsets: Any | None = None,
+    output_final_state: bool = True,
+    save_new_value: bool = True,
+) -> tuple[jnp.ndarray, jnp.ndarray | None, jnp.ndarray | None]:
+    """Reference for FLA `chunk_gated_delta_rule_fwd_h` over packed varlen tensors."""
+
+    if key.ndim != 3:
+        raise ValueError("key must have shape [nnz_tokens, key_heads, key_dim]")
+    if w.ndim != 3:
+        raise ValueError("w must have shape [nnz_tokens, output_heads, key_dim]")
+    if u.ndim != 3:
+        raise ValueError("u must have shape [nnz_tokens, output_heads, value_dim]")
+    if key.shape[0] != w.shape[0] or key.shape[0] != u.shape[0]:
+        raise ValueError("key, w, and u token counts must match")
+    if w.shape[:2] != u.shape[:2]:
+        raise ValueError("w and u must agree on token and output heads")
+    if w.shape[-1] != key.shape[-1]:
+        raise ValueError("w key dimension must match key")
+    if gate_cumsum is not None and gate_cumsum.shape != w.shape[:2]:
+        raise ValueError("gate_cumsum must have shape [nnz_tokens, output_heads]")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    key_heads = key.shape[1]
+    output_heads = w.shape[1]
+    key_dim = key.shape[-1]
+    value_dim = u.shape[-1]
+    if output_heads < key_heads or output_heads % key_heads != 0:
+        raise ValueError("output_heads must be a multiple of key_heads")
+
+    offsets = np.asarray(jax.device_get(cu_seqlens), dtype=np.int64).reshape(-1)
+    if len(offsets) == 0 or offsets[0] != 0:
+        raise ValueError("cu_seqlens must start with 0")
+    if np.any(offsets[1:] < offsets[:-1]):
+        raise ValueError("cu_seqlens must be non-decreasing")
+    if int(offsets[-1]) != key.shape[0]:
+        raise ValueError("last cu_seqlens entry must equal token count")
+    if chunk_indices is None or chunk_offsets is None:
+        prepared_indices, prepared_offsets = prepare_gdn_fla_chunk_metadata(
+            cu_seqlens,
+            chunk_size,
+        )
+        if chunk_indices is None:
+            chunk_indices = prepared_indices
+        if chunk_offsets is None:
+            chunk_offsets = prepared_offsets
+    chunk_index_values = np.asarray(jax.device_get(chunk_indices), dtype=np.int64)
+    chunk_offset_values = np.asarray(jax.device_get(chunk_offsets), dtype=np.int64).reshape(-1)
+    if chunk_index_values.ndim != 2 or chunk_index_values.shape[1] != 2:
+        raise ValueError("chunk_indices must have shape [num_chunks, 2]")
+    if chunk_offset_values.shape != (len(offsets),):
+        raise ValueError("chunk_offsets must have shape [batch + 1]")
+    if int(chunk_offset_values[-1]) != len(chunk_index_values):
+        raise ValueError("last chunk_offsets entry must equal number of chunks")
+
+    batch = len(offsets) - 1
+    if initial_state is None:
+        state = jnp.zeros((batch, output_heads, value_dim, key_dim), dtype=jnp.float32)
+    else:
+        if initial_state.shape != (batch, output_heads, value_dim, key_dim):
+            raise ValueError("initial_state must have shape [batch, output_heads, value_dim, key_dim]")
+        state = initial_state.astype(jnp.float32)
+
+    head_group = output_heads // key_heads
+    h = jnp.zeros((len(chunk_index_values), output_heads, value_dim, key_dim), dtype=jnp.float32)
+    v_new = (
+        jnp.zeros((key.shape[0], output_heads, value_dim), dtype=jnp.float32)
+        if save_new_value
+        else None
+    )
+    for row in range(batch):
+        row_state = state[row]
+        row_start = int(offsets[row])
+        row_end = int(offsets[row + 1])
+        for chunk in range(int(chunk_offset_values[row + 1] - chunk_offset_values[row])):
+            flat_chunk = int(chunk_offset_values[row]) + chunk
+            if tuple(chunk_index_values[flat_chunk]) != (row, chunk):
+                raise ValueError("chunk_indices and chunk_offsets disagree")
+            chunk_start = row_start + chunk * int(chunk_size)
+            chunk_end = min(row_end, chunk_start + int(chunk_size))
+            if chunk_start < row_start or chunk_start >= row_end:
+                raise ValueError("chunk_offsets imply an out-of-range chunk")
+            length = chunk_end - chunk_start
+            for head in range(output_heads):
+                key_head = head // head_group
+                head_state = row_state[head]
+                h = h.at[flat_chunk, head].set(head_state)
+                chunk_w = w[chunk_start:chunk_end, head, :].astype(jnp.float32)
+                chunk_u = u[chunk_start:chunk_end, head, :].astype(jnp.float32)
+                delta = chunk_u - chunk_w @ head_state.T
+                if v_new is not None:
+                    v_new = v_new.at[chunk_start:chunk_end, head, :].set(delta)
+                update_delta = delta
+                if gate_cumsum is not None:
+                    chunk_gate = gate_cumsum[chunk_start:chunk_end, head].astype(
+                        jnp.float32
+                    )
+                    last_gate = chunk_gate[length - 1]
+                    update_delta = delta * jnp.exp(last_gate - chunk_gate)[:, None]
+                    head_state = head_state * jnp.exp(last_gate)
+                chunk_key = key[chunk_start:chunk_end, key_head, :].astype(jnp.float32)
+                head_state = head_state + update_delta.T @ chunk_key
+                row_state = row_state.at[head].set(head_state)
+        state = state.at[row].set(row_state)
+
+    final_state = state if output_final_state else None
+    return h, v_new, final_state
+
+
 def pack_padded_gdn_inputs(
     query: jnp.ndarray,
     key: jnp.ndarray,

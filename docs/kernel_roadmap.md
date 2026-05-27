@@ -322,6 +322,11 @@ gdn_segmented_prefill_chunk32(
   next FLA chunk-body stage over packed varlen tensors. It applies the solved
   chunk matrix to beta-weighted values for `u` and to
   `beta * exp(g_cumsum)` weighted grouped keys for `w`.
+- chunk-delta-h status: `gdn_fla_chunk_delta_h_packed_reference` defines the
+  FLA recurrent state/value update stage. It uses `chunk_offsets` rather than
+  `chunk_indices` for per-sequence chunk traversal, stores prior chunk states
+  in `h`, stores ungated `v_new`, and applies gate-rescaled deltas to the FP32
+  final state.
 - SM86 port note: on the current A10G host, vLLM's Hopper/TMA branches are not
   active. The local target should therefore mirror the non-TMA FLA path first.
   Preserve FP32 gate/beta/state; vLLM rejects FP32 q/k/v in its Torch wrapper,
