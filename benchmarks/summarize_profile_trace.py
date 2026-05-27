@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("trace_json_gz", nargs="+", help="Path(s) to *.trace.json.gz")
     parser.add_argument("--scope", choices=("all", "gpu", "cpu"), default="all")
     parser.add_argument("--top-events", type=int, default=30)
+    parser.add_argument("--top-hlo-ops", type=int, default=20)
     parser.add_argument(
         "--pattern",
         action="append",
@@ -81,11 +82,29 @@ def _event_rows(totals: dict[str, list[float | int]], limit: int) -> list[dict[s
     return rows[: max(0, int(limit))]
 
 
+def _hlo_rows(totals: dict[tuple[str, str, str], list[Any]], limit: int) -> list[dict[str, Any]]:
+    rows = [
+        {
+            "hlo_module": module,
+            "hlo_op": hlo_op,
+            "event": event_name,
+            "total_ms": float(total),
+            "count": int(count),
+            "kernel_details": str(kernel_details or ""),
+        }
+        for (module, hlo_op, event_name), (total, count, kernel_details) in totals.items()
+        if float(total) > 0.0
+    ]
+    rows.sort(key=lambda row: row["total_ms"], reverse=True)
+    return rows[: max(0, int(limit))]
+
+
 def summarize_trace(
     path: Path,
     *,
     scope: str = "all",
     top_events: int = 30,
+    top_hlo_ops: int = 20,
     patterns: Iterable[str] = DEFAULT_PATTERNS,
 ) -> dict[str, Any]:
     trace = _read_trace(path)
@@ -93,6 +112,7 @@ def summarize_trace(
     process_names = _process_names(events)
     event_totals: dict[str, list[float | int]] = defaultdict(lambda: [0.0, 0])
     pattern_totals: dict[str, list[float | int]] = defaultdict(lambda: [0.0, 0])
+    hlo_totals: dict[tuple[str, str, str], list[Any]] = defaultdict(lambda: [0.0, 0, ""])
     pattern_list = tuple(dict.fromkeys(str(pattern) for pattern in patterns if str(pattern)))
 
     for event in events:
@@ -103,6 +123,15 @@ def summarize_trace(
         duration_ms = float(duration) / 1000.0
         event_totals[name][0] += duration_ms
         event_totals[name][1] += 1
+        args = event.get("args") or {}
+        hlo_op = str(args.get("hlo_op") or "")
+        if hlo_op:
+            hlo_module = str(args.get("hlo_module") or "")
+            hlo_key = (hlo_module, hlo_op, name)
+            hlo_totals[hlo_key][0] += duration_ms
+            hlo_totals[hlo_key][1] += 1
+            if not hlo_totals[hlo_key][2]:
+                hlo_totals[hlo_key][2] = str(args.get("kernel_details") or "")
         for pattern in pattern_list:
             if pattern in name:
                 pattern_totals[pattern][0] += duration_ms
@@ -112,6 +141,7 @@ def summarize_trace(
         "trace_json_gz": str(path),
         "scope": scope,
         "top_events_by_total_ms": _event_rows(event_totals, top_events),
+        "top_hlo_ops_by_total_ms": _hlo_rows(hlo_totals, top_hlo_ops),
         "patterns": {
             pattern: {
                 "total_ms": float(total),
@@ -150,6 +180,23 @@ def render_markdown(summary: dict[str, Any]) -> str:
                 lines.append(f"| `{row['name']}` | {row['total_ms']:.2f} | {row['count']} |")
         else:
             lines.append("No event rows.")
+        lines.extend(["", "### Top HLO Ops", ""])
+        hlo_rows = trace.get("top_hlo_ops_by_total_ms") or []
+        if hlo_rows:
+            lines.extend(
+                [
+                    "| HLO module | HLO op | event | total ms | count | kernel details |",
+                    "| --- | --- | --- | ---: | ---: | --- |",
+                ]
+            )
+            for row in hlo_rows:
+                details = str(row.get("kernel_details") or "")
+                lines.append(
+                    f"| `{row['hlo_module']}` | `{row['hlo_op']}` | `{row['event']}` | "
+                    f"{row['total_ms']:.2f} | {row['count']} | `{details}` |"
+                )
+        else:
+            lines.append("No HLO rows.")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -163,6 +210,7 @@ def main() -> None:
                 Path(path),
                 scope=args.scope,
                 top_events=args.top_events,
+                top_hlo_ops=args.top_hlo_ops,
                 patterns=patterns,
             )
             for path in args.trace_json_gz

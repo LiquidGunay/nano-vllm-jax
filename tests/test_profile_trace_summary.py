@@ -82,6 +82,81 @@ def test_render_markdown_includes_pattern_and_top_event_rows(tmp_path):
     assert "1.25" in markdown
 
 
+def test_summarize_trace_reports_top_hlo_ops(tmp_path):
+    trace = tmp_path / "trace.json.gz"
+    _write_trace(
+        trace,
+        [
+            {
+                "ph": "M",
+                "pid": 1,
+                "name": "process_name",
+                "args": {"name": "/device:GPU:0"},
+            },
+            {
+                "ph": "X",
+                "pid": 1,
+                "name": "gemm_fusion_dot_general_744",
+                "dur": 2000,
+                "args": {
+                    "hlo_module": "jit_compiled",
+                    "hlo_op": "gemm_fusion_dot_general.744",
+                    "kernel_details": "regs:226 occ_pct:16.6667",
+                },
+            },
+            {
+                "ph": "X",
+                "pid": 1,
+                "name": "gemm_fusion_dot_general_744",
+                "dur": 3000,
+                "args": {
+                    "hlo_module": "jit_compiled",
+                    "hlo_op": "gemm_fusion_dot_general.744",
+                    "kernel_details": "regs:226 occ_pct:16.6667",
+                },
+            },
+            {
+                "ph": "X",
+                "pid": 1,
+                "name": "MemcpyD2D",
+                "dur": 1000,
+                "args": {"hlo_module": "jit_copy", "hlo_op": "copy.1"},
+            },
+        ],
+    )
+
+    summary = summarize_trace(
+        trace,
+        scope="gpu",
+        top_events=5,
+        top_hlo_ops=2,
+        patterns=("gemm_fusion",),
+    )
+
+    assert summary["top_hlo_ops_by_total_ms"] == [
+        {
+            "hlo_module": "jit_compiled",
+            "hlo_op": "gemm_fusion_dot_general.744",
+            "event": "gemm_fusion_dot_general_744",
+            "total_ms": 5.0,
+            "count": 2,
+            "kernel_details": "regs:226 occ_pct:16.6667",
+        },
+        {
+            "hlo_module": "jit_copy",
+            "hlo_op": "copy.1",
+            "event": "MemcpyD2D",
+            "total_ms": 1.0,
+            "count": 1,
+            "kernel_details": "",
+        },
+    ]
+    markdown = render_markdown({"traces": [summary]})
+    assert "### Top HLO Ops" in markdown
+    assert "`gemm_fusion_dot_general.744`" in markdown
+    assert "`regs:226 occ_pct:16.6667`" in markdown
+
+
 def test_jax_trace_profile_counters_include_scoped_gpu_cpu_rows(tmp_path):
     profile_dir = tmp_path / "plugins" / "profile" / "run"
     profile_dir.mkdir(parents=True)

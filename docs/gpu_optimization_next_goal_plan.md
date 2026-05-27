@@ -541,8 +541,9 @@ end-to-end throughput.
   the required logbook explanation without hand-reading the raw JSON.
 - `benchmarks/summarize_profile_trace.py` renders a raw Chrome/Perfetto trace
   event summary when the matrix-level buckets are too coarse. Use it to inspect
-  top GPU/CPU/all-scope events and selected substring totals without hand-
-  parsing `*.trace.json.gz`.
+  top GPU/CPU/all-scope events, selected substring totals, and trace-provided
+  `hlo_module`/`hlo_op`/kernel-detail rows without hand-parsing
+  `*.trace.json.gz`.
 - `benchmarks/benchmark_jax_server_trace.py` now records scoped GPU/CPU profile
   ranges and top raw events directly in benchmark artifacts. Matrix summaries
   preserve those fields per repeat, so future speed claims can cite the

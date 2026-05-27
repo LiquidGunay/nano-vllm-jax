@@ -128,6 +128,193 @@
           "name": "loop_transpose_fusion_50",
           "total_ms": 7.517716999999999,
           "count": 17
+        },
+        {
+          "name": "input_reduce_fusion_19",
+          "total_ms": 6.48079,
+          "count": 6
+        },
+        {
+          "name": "input_reduce_fusion_25",
+          "total_ms": 6.3648869999999995,
+          "count": 6
+        },
+        {
+          "name": "gemm_fusion_dot_374",
+          "total_ms": 6.213116000000007,
+          "count": 360
+        },
+        {
+          "name": "loop_add_fusion_74",
+          "total_ms": 5.622874,
+          "count": 21
+        },
+        {
+          "name": "triton_softmax_227",
+          "total_ms": 5.409656999999898,
+          "count": 288
+        }
+      ],
+      "top_hlo_ops_by_total_ms": [
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_486",
+          "event": "gemm_fusion_dot_234",
+          "total_ms": 15.251754000000002,
+          "count": 15,
+          "kernel_details": "regs:56 static_shared:0 dynamic_shared:36864 grid:1940,1,1 block:128,1,1 occ_pct:16.6667"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "loop_broadcast_fusion.2",
+          "event": "loop_broadcast_fusion_2",
+          "total_ms": 7.952917,
+          "count": 1,
+          "kernel_details": "regs:24 static_shared:0 dynamic_shared:0 grid:98304,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_1",
+          "event": "memcpy128",
+          "total_ms": 5.056284,
+          "count": 30,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:1728,1,1 block:256,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_690",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 4.615546,
+          "count": 2,
+          "kernel_details": "regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_916",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 4.611898,
+          "count": 2,
+          "kernel_details": "regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_1141",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 4.6095299999999995,
+          "count": 2,
+          "kernel_details": "regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_464",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 4.604505,
+          "count": 2,
+          "kernel_details": "regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_236",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 4.592345,
+          "count": 2,
+          "kernel_details": "regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_1359",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 4.587482,
+          "count": 2,
+          "kernel_details": "regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_1",
+          "event": "wrapped_concatenate",
+          "total_ms": 2.909884,
+          "count": 45,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_80",
+          "event": "wrapped_concatenate",
+          "total_ms": 2.892414000000001,
+          "count": 45,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_243",
+          "event": "wrapped_concatenate",
+          "total_ms": 2.8907119999999984,
+          "count": 45,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_405",
+          "event": "wrapped_concatenate",
+          "total_ms": 2.8883170000000002,
+          "count": 45,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_324",
+          "event": "wrapped_concatenate",
+          "total_ms": 2.8881229999999993,
+          "count": 45,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_162",
+          "event": "wrapped_concatenate",
+          "total_ms": 2.8879960000000002,
+          "count": 45,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_657",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)",
+          "total_ms": 2.804477,
+          "count": 2,
+          "kernel_details": "regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_883",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)",
+          "total_ms": 2.804348,
+          "count": 2,
+          "kernel_details": "regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_1334",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)",
+          "total_ms": 2.803227,
+          "count": 2,
+          "kernel_details": "regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_1109",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)",
+          "total_ms": 2.8015309999999998,
+          "count": 2,
+          "kernel_details": "regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_197",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)",
+          "total_ms": 2.795452,
+          "count": 2,
+          "kernel_details": "regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667"
         }
       ],
       "patterns": {
@@ -297,6 +484,193 @@
           "name": "loop_transpose_fusion_50",
           "total_ms": 7.508379999999999,
           "count": 17
+        },
+        {
+          "name": "input_reduce_fusion_19",
+          "total_ms": 6.4812769999999995,
+          "count": 6
+        },
+        {
+          "name": "input_reduce_fusion_25",
+          "total_ms": 6.370461000000001,
+          "count": 6
+        },
+        {
+          "name": "gemm_fusion_dot_374",
+          "total_ms": 6.209311000000004,
+          "count": 360
+        },
+        {
+          "name": "loop_add_fusion_74",
+          "total_ms": 5.618717,
+          "count": 21
+        },
+        {
+          "name": "triton_softmax_227",
+          "total_ms": 5.407905999999898,
+          "count": 288
+        }
+      ],
+      "top_hlo_ops_by_total_ms": [
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_486",
+          "event": "gemm_fusion_dot_234",
+          "total_ms": 15.243318,
+          "count": 15,
+          "kernel_details": "regs:56 static_shared:0 dynamic_shared:36864 grid:1940,1,1 block:128,1,1 occ_pct:16.6667"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "loop_broadcast_fusion.2",
+          "event": "loop_broadcast_fusion_2",
+          "total_ms": 7.961596999999999,
+          "count": 1,
+          "kernel_details": "regs:24 static_shared:0 dynamic_shared:0 grid:98304,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_1",
+          "event": "memcpy128",
+          "total_ms": 5.058841,
+          "count": 30,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:1728,1,1 block:256,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_1141",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 4.607613,
+          "count": 2,
+          "kernel_details": "regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_690",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 4.599742,
+          "count": 2,
+          "kernel_details": "regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_236",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 4.599645,
+          "count": 2,
+          "kernel_details": "regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_464",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 4.597854,
+          "count": 2,
+          "kernel_details": "regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_916",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 4.592573,
+          "count": 2,
+          "kernel_details": "regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_1359",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 4.585470000000001,
+          "count": 2,
+          "kernel_details": "regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_1",
+          "event": "wrapped_concatenate",
+          "total_ms": 2.9072940000000007,
+          "count": 45,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_80",
+          "event": "wrapped_concatenate",
+          "total_ms": 2.8920979999999994,
+          "count": 45,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_162",
+          "event": "wrapped_concatenate",
+          "total_ms": 2.891648,
+          "count": 45,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_324",
+          "event": "wrapped_concatenate",
+          "total_ms": 2.890019,
+          "count": 45,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_405",
+          "event": "wrapped_concatenate",
+          "total_ms": 2.887906000000001,
+          "count": 45,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_243",
+          "event": "wrapped_concatenate",
+          "total_ms": 2.886426000000001,
+          "count": 45,
+          "kernel_details": "regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_431",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)",
+          "total_ms": 2.807423,
+          "count": 2,
+          "kernel_details": "regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_1109",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)",
+          "total_ms": 2.8040629999999998,
+          "count": 2,
+          "kernel_details": "regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_197",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)",
+          "total_ms": 2.79744,
+          "count": 2,
+          "kernel_details": "regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_883",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)",
+          "total_ms": 2.793375,
+          "count": 2,
+          "kernel_details": "regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667"
+        },
+        {
+          "hlo_module": "jit_compiled",
+          "hlo_op": "command_buffer_657",
+          "event": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)",
+          "total_ms": 2.79155,
+          "count": 2,
+          "kernel_details": "regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667"
         }
       ],
       "patterns": {

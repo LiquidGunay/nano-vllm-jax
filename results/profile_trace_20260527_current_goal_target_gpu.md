@@ -47,6 +47,36 @@
 | `loop_broadcast_fusion_2` | 7.95 | 1 |
 | `fusion_2634` | 7.67 | 18 |
 | `loop_transpose_fusion_50` | 7.52 | 17 |
+| `input_reduce_fusion_19` | 6.48 | 6 |
+| `input_reduce_fusion_25` | 6.36 | 6 |
+| `gemm_fusion_dot_374` | 6.21 | 360 |
+| `loop_add_fusion_74` | 5.62 | 21 |
+| `triton_softmax_227` | 5.41 | 288 |
+
+### Top HLO Ops
+
+| HLO module | HLO op | event | total ms | count | kernel details |
+| --- | --- | --- | ---: | ---: | --- |
+| `jit_compiled` | `command_buffer_486` | `gemm_fusion_dot_234` | 15.25 | 15 | `regs:56 static_shared:0 dynamic_shared:36864 grid:1940,1,1 block:128,1,1 occ_pct:16.6667` |
+| `jit_compiled` | `loop_broadcast_fusion.2` | `loop_broadcast_fusion_2` | 7.95 | 1 | `regs:24 static_shared:0 dynamic_shared:0 grid:98304,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_1` | `memcpy128` | 5.06 | 30 | `regs:16 static_shared:0 dynamic_shared:0 grid:1728,1,1 block:256,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_690` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)` | 4.62 | 2 | `regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333` |
+| `jit_compiled` | `command_buffer_916` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)` | 4.61 | 2 | `regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333` |
+| `jit_compiled` | `command_buffer_1141` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)` | 4.61 | 2 | `regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333` |
+| `jit_compiled` | `command_buffer_464` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)` | 4.60 | 2 | `regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333` |
+| `jit_compiled` | `command_buffer_236` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)` | 4.59 | 2 | `regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333` |
+| `jit_compiled` | `command_buffer_1359` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)` | 4.59 | 2 | `regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333` |
+| `jit_compiled` | `command_buffer_1` | `wrapped_concatenate` | 2.91 | 45 | `regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_80` | `wrapped_concatenate` | 2.89 | 45 | `regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_243` | `wrapped_concatenate` | 2.89 | 45 | `regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_405` | `wrapped_concatenate` | 2.89 | 45 | `regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_324` | `wrapped_concatenate` | 2.89 | 45 | `regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_162` | `wrapped_concatenate` | 2.89 | 45 | `regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_657` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)` | 2.80 | 2 | `regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667` |
+| `jit_compiled` | `command_buffer_883` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)` | 2.80 | 2 | `regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667` |
+| `jit_compiled` | `command_buffer_1334` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)` | 2.80 | 2 | `regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667` |
+| `jit_compiled` | `command_buffer_1109` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)` | 2.80 | 2 | `regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667` |
+| `jit_compiled` | `command_buffer_197` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)` | 2.80 | 2 | `regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667` |
 
 ## `/mountpoint/.exp/profiles/20260527-035410-2539077-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r2_20260527_035342/plugins/profile/2026_05_27_03_54_35/INDCS0291.atrapa.deloitte.com.trace.json.gz`
 
@@ -95,3 +125,33 @@
 | `loop_broadcast_fusion_2` | 7.96 | 1 |
 | `fusion_2634` | 7.64 | 18 |
 | `loop_transpose_fusion_50` | 7.51 | 17 |
+| `input_reduce_fusion_19` | 6.48 | 6 |
+| `input_reduce_fusion_25` | 6.37 | 6 |
+| `gemm_fusion_dot_374` | 6.21 | 360 |
+| `loop_add_fusion_74` | 5.62 | 21 |
+| `triton_softmax_227` | 5.41 | 288 |
+
+### Top HLO Ops
+
+| HLO module | HLO op | event | total ms | count | kernel details |
+| --- | --- | --- | ---: | ---: | --- |
+| `jit_compiled` | `command_buffer_486` | `gemm_fusion_dot_234` | 15.24 | 15 | `regs:56 static_shared:0 dynamic_shared:36864 grid:1940,1,1 block:128,1,1 occ_pct:16.6667` |
+| `jit_compiled` | `loop_broadcast_fusion.2` | `loop_broadcast_fusion_2` | 7.96 | 1 | `regs:24 static_shared:0 dynamic_shared:0 grid:98304,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_1` | `memcpy128` | 5.06 | 30 | `regs:16 static_shared:0 dynamic_shared:0 grid:1728,1,1 block:256,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_1141` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)` | 4.61 | 2 | `regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333` |
+| `jit_compiled` | `command_buffer_690` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)` | 4.60 | 2 | `regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333` |
+| `jit_compiled` | `command_buffer_236` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)` | 4.60 | 2 | `regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333` |
+| `jit_compiled` | `command_buffer_464` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)` | 4.60 | 2 | `regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333` |
+| `jit_compiled` | `command_buffer_916` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)` | 4.59 | 2 | `regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333` |
+| `jit_compiled` | `command_buffer_1359` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)` | 4.59 | 2 | `regs:218 static_shared:0 dynamic_shared:81920 grid:264,4,8 block:128,1,1 occ_pct:8.33333` |
+| `jit_compiled` | `command_buffer_1` | `wrapped_concatenate` | 2.91 | 45 | `regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_80` | `wrapped_concatenate` | 2.89 | 45 | `regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_162` | `wrapped_concatenate` | 2.89 | 45 | `regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_324` | `wrapped_concatenate` | 2.89 | 45 | `regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_405` | `wrapped_concatenate` | 2.89 | 45 | `regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_243` | `wrapped_concatenate` | 2.89 | 45 | `regs:16 static_shared:0 dynamic_shared:0 grid:12288,1,1 block:128,1,1 occ_pct:100` |
+| `jit_compiled` | `command_buffer_431` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)` | 2.81 | 2 | `regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667` |
+| `jit_compiled` | `command_buffer_1109` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)` | 2.80 | 2 | `regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667` |
+| `jit_compiled` | `command_buffer_197` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)` | 2.80 | 2 | `regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667` |
+| `jit_compiled` | `command_buffer_883` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)` | 2.79 | 2 | `regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667` |
+| `jit_compiled` | `command_buffer_657` | `void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)` | 2.79 | 2 | `regs:224 static_shared:0 dynamic_shared:73728 grid:160,1,1 block:256,1,1 occ_pct:16.6667` |
