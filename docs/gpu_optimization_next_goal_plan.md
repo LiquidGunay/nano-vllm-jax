@@ -146,6 +146,16 @@ prefill experiment is allowed only as a separate diagnostic lane. The current
 GPU host is NVIDIA A10G / SM86, while FlashInfer GDN prefill requires SM90 or
 SM100, so direct FlashInfer GDN prefill is blocked locally even before the dtype
 contract question.
+A Torch-side vLLM/FLA microprobe now confirms the vendored FLA kernels are
+runnable on this SM86 host. On the model-shaped varlen prefill
+`[512,1024,1536,2048]` (`5120` total tokens), vLLM's BF16
+`fused_post_conv_prep + chunk_gated_delta_rule` takes `1.45 ms` p50 per GDN
+body, with FP32 gate/beta/state and V,K state `[N,HV,V,K]`. Packed BF16 decode
+takes about `0.11-0.16 ms` p50 for batch sizes `1,4,8,16`. This is a porting
+decision artifact, not a correctness or serving speed claim: the default
+contract remains FP32 activation/state math until a JAX-facing path passes the
+token/logit gates. The evidence says the next useful implementation should
+port/fork the FLA schedule, not keep adapting the old local FP32 chunk body.
 The post-conv reference now exposes an explicit FLA-shaped FP32 prep helper:
 `prepare_gdn_post_conv_prefill_fla_inputs_from_decay` returns query/key/value in
 `[B,T,H,D]`, gate/beta in `[B,T,H]`, and row lengths, with optional q/k L2
@@ -302,6 +312,17 @@ Current tracked records:
   local vLLM/FLA source paths present. It marks direct FlashInfer GDN prefill
   blocked by the SM90/SM100 requirement; use vLLM/FLA as a port/fork reference
   behind the existing post-conv or packed-decode ABI.
+- Current vLLM/FLA Torch-side GDN microprobe:
+  `results/vllm_fla_gdn_probe_20260527_sm86.json` records vLLM `0.21.0`, torch
+  `2.11.0+cu130`, Triton `3.6.0`, and GPU `NVIDIA A10G` with compute
+  capability `8.6`. It is not a JAX serving speed claim. It shows the actual
+  vLLM BF16 FLA prefill body is fast on SM86: `prep_only` p50 `0.40 ms`,
+  `chunk_only` p50 `1.23 ms`, and combined prep+chunk p50 `1.45 ms` for
+  `[512,1024,1536,2048]` (`5120` total tokens), with FP32 gate/beta/state and
+  V,K state. Packed decode p50 is `0.117 ms` at batch 1, `0.115 ms` at batch 4,
+  `0.118 ms` at batch 8, and `0.156 ms` at batch 16. This supports a real
+  FLA-schedule port/fork or JAX-facing external-kernel route; it does not
+  promote BF16 activations by itself.
 - Current vLLM-inspired random-token manifest sidecar:
   `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
   `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
@@ -1732,6 +1753,13 @@ Commit 7c - Optional BF16 GDN prefill activation experiment:
   `benchmarks/probe_external_gdn_kernels.py --run-smoke` wrote
   `results/external_gdn_kernel_probe_20260527_sm86.json`, showing A10G SM86 and
   direct FlashInfer GDN prefill blocked by the SM90/SM100 requirement.
+- ~~Add a Torch-side vLLM/FLA GDN microprobe on SM86 to verify the real upstream
+  kernels run and to record their model-shaped BF16 timing before porting.~~
+  Validation:
+  `benchmarks/probe_vllm_fla_gdn.py --warmups 3 --repeats 10` wrote
+  `results/vllm_fla_gdn_probe_20260527_sm86.json`; vLLM FLA prefill
+  prep+chunk p50 was `1.45 ms` for `5120` total tokens and packed decode p50
+  was `0.11-0.16 ms` for batch sizes `1,4,8,16`.
 
 Commit 8:
 

@@ -193,6 +193,13 @@ gdn_recurrent_decode_step(
   integrated goal target passed. The integrated result is `90.65 tok/s`,
   `0.779x` vLLM, so this is an accepted correctness/layout migration, not the
   final `0.9x` speed target.
+- vLLM/FLA timing probe status: `results/vllm_fla_gdn_probe_20260527_sm86.json`
+  confirms the vendored vLLM BF16 FLA kernels run on A10G/SM86. For the
+  model-shaped varlen prefill `[512,1024,1536,2048]`, `fused_post_conv_prep`
+  plus `chunk_gated_delta_rule` is `1.45 ms` p50 with FP32 gate/beta/state and
+  V,K state `[N,HV,V,K]`. Packed BF16 decode is `0.11-0.16 ms` p50 for batches
+  `1,4,8,16`. This is a porting target, not a serving promotion: it still
+  requires a JAX-facing path plus exact-token and long-logit gates.
 
 ## P1.2 - `gdn_segmented_prefill_chunk32`
 

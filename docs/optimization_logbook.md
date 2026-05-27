@@ -5084,3 +5084,30 @@ NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32 NANO_VLLM_JAX_GDN
 .venv/bin/python -m py_compile benchmarks/probe_external_gdn_kernels.py
 .venv/bin/python benchmarks/probe_external_gdn_kernels.py --run-smoke --output-json results/external_gdn_kernel_probe_20260527_sm86.json
 ```
+
+### Entry 136 - vLLM/FLA GDN Kernel Timing Probe
+
+- change accepted: added `benchmarks/probe_vllm_fla_gdn.py`, a Torch-side
+  probe that directly exercises the vLLM vendored Flash Linear Attention GDN
+  kernels on the current host. This is a porting decision artifact, not a JAX
+  serving speed claim.
+- artifact: `results/vllm_fla_gdn_probe_20260527_sm86.json`
+- result: elevated GPU-visible probe reports vLLM `0.21.0`, torch
+  `2.11.0+cu130`, Triton `3.6.0`, and `NVIDIA A10G` compute capability `8.6`.
+  The model-shaped varlen prefill uses BF16 q/k/v with FP32 gate/beta/state and
+  V,K recurrent state `[N,HV,V,K]`. For lengths `[512,1024,1536,2048]`
+  (`5120` total tokens), `fused_post_conv_prep` p50 is `0.40 ms`,
+  `chunk_gated_delta_rule` p50 is `1.23 ms`, and combined prep+chunk p50 is
+  `1.45 ms`. Packed decode p50 is `0.117 ms` at batch 1, `0.115 ms` at batch 4,
+  `0.118 ms` at batch 8, and `0.156 ms` at batch 16.
+- decision: use the upstream FLA schedule as the next real GDN port/fork
+  target. The numbers are far better than the rejected local FP32 chunk-body
+  attempts, but they do not change the default dtype contract. A JAX-facing path
+  still has to pass exact generated-token parity and long-decode top-logit gates
+  before BF16 GDN activations can be promoted.
+- validation:
+
+```text
+.venv/bin/python -m py_compile benchmarks/probe_vllm_fla_gdn.py
+/mountpoint/.exp/vllm-venv/bin/python benchmarks/probe_vllm_fla_gdn.py --warmups 3 --repeats 10 --output-json results/vllm_fla_gdn_probe_20260527_sm86.json
+```

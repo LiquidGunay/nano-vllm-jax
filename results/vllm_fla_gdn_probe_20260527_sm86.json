@@ -1,0 +1,256 @@
+{
+  "created_at_unix": 1779878584.5684493,
+  "decode": [
+    {
+      "kind": "packed_decode",
+      "output": {
+        "dtype": "torch.bfloat16",
+        "shape": [
+          1,
+          1,
+          16,
+          128
+        ],
+        "state_dtype": "torch.float32",
+        "state_shape": [
+          2,
+          16,
+          128,
+          128
+        ]
+      },
+      "shape": {
+        "batch": 1,
+        "key_dim": 128,
+        "num_key_heads": 16,
+        "num_value_heads": 16,
+        "qkv_dim": 6144,
+        "qkv_dtype": "torch.bfloat16",
+        "state_dtype": "torch.float32",
+        "state_layout": "[slots,HV,V,K]",
+        "value_dim": 128
+      },
+      "timing": {
+        "count": 10,
+        "max_ms": 0.15564799308776855,
+        "mean_ms": 0.12082560062408447,
+        "min_ms": 0.11264000087976456,
+        "p50_ms": 0.11724800243973732,
+        "p95_ms": 0.14090239480137823
+      }
+    },
+    {
+      "kind": "packed_decode",
+      "output": {
+        "dtype": "torch.bfloat16",
+        "shape": [
+          4,
+          1,
+          16,
+          128
+        ],
+        "state_dtype": "torch.float32",
+        "state_shape": [
+          5,
+          16,
+          128,
+          128
+        ]
+      },
+      "shape": {
+        "batch": 4,
+        "key_dim": 128,
+        "num_key_heads": 16,
+        "num_value_heads": 16,
+        "qkv_dim": 6144,
+        "qkv_dtype": "torch.bfloat16",
+        "state_dtype": "torch.float32",
+        "state_layout": "[slots,HV,V,K]",
+        "value_dim": 128
+      },
+      "timing": {
+        "count": 10,
+        "max_ms": 0.1454080045223236,
+        "mean_ms": 0.11929920092225074,
+        "min_ms": 0.11161600053310394,
+        "p50_ms": 0.11468800157308578,
+        "p95_ms": 0.1421824000775814
+      }
+    },
+    {
+      "kind": "packed_decode",
+      "output": {
+        "dtype": "torch.bfloat16",
+        "shape": [
+          8,
+          1,
+          16,
+          128
+        ],
+        "state_dtype": "torch.float32",
+        "state_shape": [
+          9,
+          16,
+          128,
+          128
+        ]
+      },
+      "shape": {
+        "batch": 8,
+        "key_dim": 128,
+        "num_key_heads": 16,
+        "num_value_heads": 16,
+        "qkv_dim": 6144,
+        "qkv_dtype": "torch.bfloat16",
+        "state_dtype": "torch.float32",
+        "state_layout": "[slots,HV,V,K]",
+        "value_dim": 128
+      },
+      "timing": {
+        "count": 10,
+        "max_ms": 0.23654399812221527,
+        "mean_ms": 0.13240320086479188,
+        "min_ms": 0.1157120019197464,
+        "p50_ms": 0.11827200278639793,
+        "p95_ms": 0.19046399593353258
+      }
+    },
+    {
+      "kind": "packed_decode",
+      "output": {
+        "dtype": "torch.bfloat16",
+        "shape": [
+          16,
+          1,
+          16,
+          128
+        ],
+        "state_dtype": "torch.float32",
+        "state_shape": [
+          17,
+          16,
+          128,
+          128
+        ]
+      },
+      "shape": {
+        "batch": 16,
+        "key_dim": 128,
+        "num_key_heads": 16,
+        "num_value_heads": 16,
+        "qkv_dim": 6144,
+        "qkv_dtype": "torch.bfloat16",
+        "state_dtype": "torch.float32",
+        "state_layout": "[slots,HV,V,K]",
+        "value_dim": 128
+      },
+      "timing": {
+        "count": 10,
+        "max_ms": 0.16179199516773224,
+        "mean_ms": 0.15687039643526077,
+        "min_ms": 0.15462400019168854,
+        "p50_ms": 0.15612799674272537,
+        "p95_ms": 0.16040959805250166
+      }
+    }
+  ],
+  "device": {
+    "compute_capability": [
+      8,
+      6
+    ],
+    "cuda_available": true,
+    "current_device": 0,
+    "device_count": 1,
+    "name": "NVIDIA A10G",
+    "torch_version": "2.11.0+cu130",
+    "total_memory_bytes": 23684841472
+  },
+  "errors": [],
+  "prefill": {
+    "chunk_only": {
+      "count": 10,
+      "max_ms": 1.299456000328064,
+      "mean_ms": 1.2456959724426269,
+      "min_ms": 1.2175359725952148,
+      "p50_ms": 1.2339199781417847,
+      "p95_ms": 1.2893183767795562
+    },
+    "kind": "prefill",
+    "output": {
+      "chunk_output_dtype": "torch.bfloat16",
+      "dtype": "torch.bfloat16",
+      "final_state_dtype": "torch.float32",
+      "final_state_shape": [
+        4,
+        16,
+        128,
+        128
+      ],
+      "prep_gate_dtype": "torch.float32",
+      "prep_q_dtype": "torch.bfloat16",
+      "shape": [
+        1,
+        5120,
+        16,
+        128
+      ]
+    },
+    "prep_and_chunk": {
+      "count": 10,
+      "max_ms": 1.4786560535430908,
+      "mean_ms": 1.4582783937454225,
+      "min_ms": 1.4479360580444336,
+      "p50_ms": 1.454591989517212,
+      "p95_ms": 1.4731264114379883
+    },
+    "prep_only": {
+      "count": 10,
+      "max_ms": 0.419840008020401,
+      "mean_ms": 0.40059199929237366,
+      "min_ms": 0.3901439905166626,
+      "p50_ms": 0.3963039964437485,
+      "p95_ms": 0.41937920451164246
+    },
+    "shape": {
+      "cu_seqlens_dtype": "torch.int32",
+      "gate_beta_dtype": "torch.float32",
+      "key_dim": 128,
+      "lengths": [
+        512,
+        1024,
+        1536,
+        2048
+      ],
+      "num_key_heads": 16,
+      "num_value_heads": 16,
+      "qkv_dim": 6144,
+      "qkv_dtype": "torch.bfloat16",
+      "state_dtype": "torch.float32",
+      "state_layout": "[N,HV,V,K]",
+      "total_tokens": 5120,
+      "value_dim": 128
+    }
+  },
+  "purpose": "Torch-side vLLM/FLA GDN kernel porting probe, not a JAX serving speed claim.",
+  "runtime_paths": {
+    "FLASHINFER_CUBIN_DIR": "/mountpoint/.exp/.cache/flashinfer/cubins",
+    "FLASHINFER_WORKSPACE_BASE": "/mountpoint/.exp",
+    "TMPDIR": "/mountpoint/.exp/tmp",
+    "TORCHINDUCTOR_CACHE_DIR": "/mountpoint/.exp/.cache/torchinductor",
+    "TRITON_CACHE_DIR": "/mountpoint/.exp/.cache/triton",
+    "VLLM_CACHE_ROOT": "/mountpoint/.exp/.cache/vllm",
+    "VLLM_RPC_BASE_PATH": "/mountpoint/.exp/tmp/vllm-rpc",
+    "XDG_CACHE_HOME": "/mountpoint/.exp/.cache"
+  },
+  "versions": {
+    "torch": "2.11.0+cu130",
+    "triton": "3.6.0",
+    "vllm": "0.21.0"
+  },
+  "vllm_fla_contract": {
+    "decode": "fused_recurrent_gated_delta_rule_packed_decode consumes mixed_qkv [B,2*H*K+HV*V] bf16, a/b [B,HV], state [slots,HV,V,K] fp32.",
+    "fla_chunk_size": 64,
+    "prefill": "fused_post_conv_prep(conv_output [L,2*H*K+HV*V] bf16, a/b [L,HV]) -> q/k/v [L,H,D] bf16, g/beta [L,HV] fp32; chunk_gated_delta_rule consumes [1,L,H,D] with cu_seqlens int32."
+  }
+}
