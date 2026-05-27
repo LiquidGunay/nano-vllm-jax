@@ -1,0 +1,342 @@
+{
+  "traces": [
+    {
+      "trace_json_gz": "/mountpoint/.exp/profiles/20260527-035343-2539001-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r1_20260527_035342/plugins/profile/2026_05_27_03_54_07/INDCS0291.atrapa.deloitte.com.trace.json.gz",
+      "scope": "gpu",
+      "top_events_by_total_ms": [
+        {
+          "name": "gemm_fusion_dot_general_744",
+          "total_ms": 57.457908,
+          "count": 48
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)",
+          "total_ms": 36.914991,
+          "count": 30
+        },
+        {
+          "name": "gemm_fusion_dot_general_729",
+          "total_ms": 36.595628,
+          "count": 18
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 27.621305999999997,
+          "count": 12
+        },
+        {
+          "name": "gemm_fusion_dot_2",
+          "total_ms": 26.042426999999996,
+          "count": 24
+        },
+        {
+          "name": "loop_add_fusion_18",
+          "total_ms": 25.290280000000042,
+          "count": 1152
+        },
+        {
+          "name": "loop_multiply_transpose_fusion_17",
+          "total_ms": 21.759396,
+          "count": 18
+        },
+        {
+          "name": "input_reduce_fusion",
+          "total_ms": 21.193739000000004,
+          "count": 573
+        },
+        {
+          "name": "loop_dynamic_slice_multiply_subtract_fusion",
+          "total_ms": 18.068678000000023,
+          "count": 1152
+        },
+        {
+          "name": "wrapped_concatenate",
+          "total_ms": 17.391750000000005,
+          "count": 288
+        },
+        {
+          "name": "MemcpyD2D",
+          "total_ms": 15.905992999999999,
+          "count": 259
+        },
+        {
+          "name": "gemm_fusion_dot_234",
+          "total_ms": 15.251754000000002,
+          "count": 15
+        },
+        {
+          "name": "gemm_fusion_dot_210",
+          "total_ms": 14.13107900000001,
+          "count": 1152
+        },
+        {
+          "name": "loop_divide_fusion_5",
+          "total_ms": 13.504884000000006,
+          "count": 96
+        },
+        {
+          "name": "gemm_fusion_dot_general_731",
+          "total_ms": 12.058929999999998,
+          "count": 18
+        },
+        {
+          "name": "gemm_fusion_dot_211",
+          "total_ms": 11.849025999999997,
+          "count": 1152
+        },
+        {
+          "name": "gemm_fusion_dot_286",
+          "total_ms": 11.772300999999999,
+          "count": 360
+        },
+        {
+          "name": "gemm_fusion_dot_285",
+          "total_ms": 11.263574000000002,
+          "count": 270
+        },
+        {
+          "name": "gemm_fusion_dot_283",
+          "total_ms": 11.122703000000001,
+          "count": 36
+        },
+        {
+          "name": "loop_multiply_fusion_47",
+          "total_ms": 10.857484000000001,
+          "count": 24
+        },
+        {
+          "name": "input_concatenate_fusion",
+          "total_ms": 10.479000999999991,
+          "count": 1242
+        },
+        {
+          "name": "input_scatter_fusion_59",
+          "total_ms": 9.331222000000002,
+          "count": 18
+        },
+        {
+          "name": "loop_broadcast_fusion_2",
+          "total_ms": 7.952917,
+          "count": 1
+        },
+        {
+          "name": "fusion_2634",
+          "total_ms": 7.665173000000001,
+          "count": 18
+        },
+        {
+          "name": "loop_transpose_fusion_50",
+          "total_ms": 7.517716999999999,
+          "count": 17
+        }
+      ],
+      "patterns": {
+        "MemcpyD2D": {
+          "total_ms": 15.905992999999999,
+          "count": 259
+        },
+        "cutlass": {
+          "total_ms": 64.53629699999999,
+          "count": 42
+        },
+        "gather": {
+          "total_ms": 4.661171000000003,
+          "count": 81
+        },
+        "gemm_fusion": {
+          "total_ms": 243.57338599999844,
+          "count": 6424
+        },
+        "input_reduce_fusion": {
+          "total_ms": 34.66065999999989,
+          "count": 797
+        },
+        "loop_dynamic_slice": {
+          "total_ms": 18.068678000000023,
+          "count": 1152
+        },
+        "loop_dynamic_update_slice": {
+          "total_ms": 12.065108000000066,
+          "count": 2286
+        },
+        "transpose": {
+          "total_ms": 45.07645999999997,
+          "count": 312
+        },
+        "wrapped_concatenate": {
+          "total_ms": 17.391750000000005,
+          "count": 288
+        }
+      }
+    },
+    {
+      "trace_json_gz": "/mountpoint/.exp/profiles/20260527-035410-2539077-gpu_matrix_long_prefill_512_2048_gpu_paged_default_r2_20260527_035342/plugins/profile/2026_05_27_03_54_35/INDCS0291.atrapa.deloitte.com.trace.json.gz",
+      "scope": "gpu",
+      "top_events_by_total_ms": [
+        {
+          "name": "gemm_fusion_dot_general_744",
+          "total_ms": 57.45418099999998,
+          "count": 48
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4>(cutlass_80_tensorop_s1688gemm_128x256_16x3_nn_align4::Params)",
+          "total_ms": 36.900081,
+          "count": 30
+        },
+        {
+          "name": "gemm_fusion_dot_general_729",
+          "total_ms": 36.588144,
+          "count": 18
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4>(cutlass_80_tensorop_s1688gemm_256x64_16x4_nn_align4::Params)",
+          "total_ms": 27.582897000000003,
+          "count": 12
+        },
+        {
+          "name": "gemm_fusion_dot_2",
+          "total_ms": 26.04581,
+          "count": 24
+        },
+        {
+          "name": "loop_add_fusion_18",
+          "total_ms": 25.301054999999987,
+          "count": 1152
+        },
+        {
+          "name": "loop_multiply_transpose_fusion_17",
+          "total_ms": 21.747382,
+          "count": 18
+        },
+        {
+          "name": "input_reduce_fusion",
+          "total_ms": 21.193051999999955,
+          "count": 573
+        },
+        {
+          "name": "loop_dynamic_slice_multiply_subtract_fusion",
+          "total_ms": 18.072908000000055,
+          "count": 1152
+        },
+        {
+          "name": "wrapped_concatenate",
+          "total_ms": 17.38988599999999,
+          "count": 288
+        },
+        {
+          "name": "MemcpyD2D",
+          "total_ms": 15.891425000000002,
+          "count": 259
+        },
+        {
+          "name": "gemm_fusion_dot_234",
+          "total_ms": 15.243318,
+          "count": 15
+        },
+        {
+          "name": "gemm_fusion_dot_210",
+          "total_ms": 14.134718000000015,
+          "count": 1152
+        },
+        {
+          "name": "loop_divide_fusion_5",
+          "total_ms": 13.544349999999998,
+          "count": 96
+        },
+        {
+          "name": "gemm_fusion_dot_general_731",
+          "total_ms": 12.063036,
+          "count": 18
+        },
+        {
+          "name": "gemm_fusion_dot_211",
+          "total_ms": 11.852904,
+          "count": 1152
+        },
+        {
+          "name": "gemm_fusion_dot_286",
+          "total_ms": 11.774931000000004,
+          "count": 360
+        },
+        {
+          "name": "gemm_fusion_dot_285",
+          "total_ms": 11.272540999999997,
+          "count": 270
+        },
+        {
+          "name": "gemm_fusion_dot_283",
+          "total_ms": 11.122362,
+          "count": 36
+        },
+        {
+          "name": "loop_multiply_fusion_47",
+          "total_ms": 10.854937999999999,
+          "count": 24
+        },
+        {
+          "name": "input_concatenate_fusion",
+          "total_ms": 10.472734000000004,
+          "count": 1242
+        },
+        {
+          "name": "input_scatter_fusion_59",
+          "total_ms": 9.329500000000001,
+          "count": 18
+        },
+        {
+          "name": "loop_broadcast_fusion_2",
+          "total_ms": 7.961596999999999,
+          "count": 1
+        },
+        {
+          "name": "fusion_2634",
+          "total_ms": 7.644570999999999,
+          "count": 18
+        },
+        {
+          "name": "loop_transpose_fusion_50",
+          "total_ms": 7.508379999999999,
+          "count": 17
+        }
+      ],
+      "patterns": {
+        "MemcpyD2D": {
+          "total_ms": 15.891425000000002,
+          "count": 259
+        },
+        "cutlass": {
+          "total_ms": 64.48297799999999,
+          "count": 42
+        },
+        "gather": {
+          "total_ms": 4.666686000000003,
+          "count": 81
+        },
+        "gemm_fusion": {
+          "total_ms": 243.58395199999762,
+          "count": 6424
+        },
+        "input_reduce_fusion": {
+          "total_ms": 34.66423999999988,
+          "count": 797
+        },
+        "loop_dynamic_slice": {
+          "total_ms": 18.072908000000055,
+          "count": 1152
+        },
+        "loop_dynamic_update_slice": {
+          "total_ms": 12.074371000000072,
+          "count": 2286
+        },
+        "transpose": {
+          "total_ms": 45.05656100000001,
+          "count": 312
+        },
+        "wrapped_concatenate": {
+          "total_ms": 17.38988599999999,
+          "count": 288
+        }
+      }
+    }
+  ]
+}

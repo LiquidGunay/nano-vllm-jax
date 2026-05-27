@@ -4333,3 +4333,28 @@ JAX_PLATFORMS=cuda ... pytest -q \
 - decision needed: choose Pallas, a production vLLM/FLA-shaped CUDA/JAX FFI
   port, or pausing GDN to return to FlashInfer/full-attention work. Do not route
   a new GDN serving kernel until that design choice is explicit.
+
+### Entry 113 - Current Goal Raw GPU Trace Summary
+
+- change accepted: added `benchmarks/summarize_profile_trace.py`, a small
+  Chrome/Perfetto trace summarizer for top raw event names and substring
+  totals. This is analysis tooling only and does not change serving behavior.
+- artifact: `results/profile_trace_20260527_current_goal_target_gpu.json`
+- report: `results/profile_trace_20260527_current_goal_target_gpu.md`
+- evidence: on both current-goal repeats, GPU-scope time is dominated by
+  GEMM/fusion work. Repeat 1 reports `gemm_fusion=243.57 ms`,
+  `cutlass=64.54 ms`, `transpose=45.08 ms`, `input_reduce_fusion=34.66 ms`,
+  `loop_dynamic_slice=18.07 ms`, `wrapped_concatenate=17.39 ms`, and
+  `MemcpyD2D=15.91 ms`; repeat 2 is effectively identical.
+- interpretation: this supports the caution in Entry 112. Packed GDN decode is
+  still the smallest FP32 vLLM/FLA-shaped implementation boundary, but the raw
+  GPU trace does not prove a decode-only kernel can close the full `0.9x` gap.
+  Prefill/GEMM/fusion-heavy work remains a major part of the target profile.
+- validation:
+
+```text
+.venv/bin/python -m pytest -q tests/test_profile_trace_summary.py
+.venv/bin/python -m py_compile benchmarks/summarize_profile_trace.py tests/test_profile_trace_summary.py
+```
+
+- result: `2 passed`; `py_compile` passed.

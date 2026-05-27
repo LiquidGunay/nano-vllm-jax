@@ -465,6 +465,10 @@ end-to-end throughput.
   and JAX/reference throughput rows, and the largest profile-bucket deltas
   versus the selected JAX reference. Use it after real GPU matrix runs to seed
   the required logbook explanation without hand-reading the raw JSON.
+- `benchmarks/summarize_profile_trace.py` renders a raw Chrome/Perfetto trace
+  event summary when the matrix-level buckets are too coarse. Use it to inspect
+  top GPU/CPU/all-scope events and selected substring totals without hand-
+  parsing `*.trace.json.gz`.
 - `benchmarks/run_gpu_matrix.py` now writes that Markdown report by default next
   to the summary JSON, or to `--report-md` when supplied. `--no-report-md`
   keeps report generation opt-out for controlled runs.
@@ -623,6 +627,15 @@ end-to-end throughput.
   JAX `90.87 tok/s`, stored vLLM `116.37 tok/s`, and JAX/vLLM `0.781x`. This is
   useful baseline evidence but not goal completion; the active `0.9x` target
   still requires `104.74 tok/s`, leaving a `13.86 tok/s` gap.
+- Current raw GPU trace summary:
+  `results/profile_trace_20260527_current_goal_target_gpu.json` and
+  `results/profile_trace_20260527_current_goal_target_gpu.md`. Across both
+  repeats, the GPU-scope profile is dominated by GEMM/fusion work:
+  `gemm_fusion` about `243.6 ms`, `cutlass` about `64.5 ms`, `transpose` about
+  `45.1 ms`, `input_reduce_fusion` about `34.7 ms`, and
+  `wrapped_concatenate` about `17.4 ms`. This supports the current caution:
+  packed GDN decode is the smallest FP32 vLLM/FLA-shaped kernel boundary, but
+  the stored traces do not prove it can close the full `0.9x` gap alone.
 
 ## Phase 2 - Kernel Roadmap
 
