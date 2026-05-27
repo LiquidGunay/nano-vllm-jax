@@ -27,6 +27,7 @@ _TARGET_KV_APPEND = "nanovllm_jax_fp32_kv_append_paged_nhd"
 _TARGET_PAGED_DECODE = "nanovllm_jax_fp32_paged_decode_attention_gqa_nhd"
 _TARGET_GDN_DECODE = "nanovllm_jax_fp32_gdn_recurrent_decode"
 _TARGET_GDN_PACKED_DECODE = "nanovllm_jax_fp32_gdn_packed_decode"
+_TARGET_GDN_POST_CONV_PREP = "nanovllm_jax_fp32_gdn_post_conv_prep"
 _TARGET_GDN_PREFILL = "nanovllm_jax_fp32_gdn_prefill_chunk32"
 _TARGET_GDN_PREFILL_V64 = "nanovllm_jax_fp32_gdn_prefill_chunk32_v64"
 _REGISTER_LOCK = threading.Lock()
@@ -181,6 +182,7 @@ def _register_kv_append_target() -> None:
         decode_handler = library.NanoVllmJaxFp32PagedDecodeAttention
         gdn_decode_handler = library.NanoVllmJaxFp32GdnRecurrentDecode
         gdn_packed_decode_handler = library.NanoVllmJaxFp32GdnPackedDecode
+        gdn_post_conv_prep_handler = library.NanoVllmJaxFp32GdnPostConvPrep
         gdn_prefill_handler = library.NanoVllmJaxFp32GdnPrefillChunk32
         gdn_prefill_v64_handler = library.NanoVllmJaxFp32GdnPrefillChunk32V64
         jax.ffi.register_ffi_target(
@@ -204,6 +206,12 @@ def _register_kv_append_target() -> None:
         jax.ffi.register_ffi_target(
             _TARGET_GDN_PACKED_DECODE,
             jax.ffi.pycapsule(gdn_packed_decode_handler),
+            platform="gpu",
+            api_version=1,
+        )
+        jax.ffi.register_ffi_target(
+            _TARGET_GDN_POST_CONV_PREP,
+            jax.ffi.pycapsule(gdn_post_conv_prep_handler),
             platform="gpu",
             api_version=1,
         )
@@ -706,6 +714,121 @@ def gdn_packed_decode_step_fp32_reference(*args: Any, **kwargs: Any):
     from nanovllm_jax.kernels.gdn_fla import gdn_packed_decode_reference_local_state
 
     return gdn_packed_decode_reference_local_state(*args, **kwargs)
+
+
+def _validate_fp32_gdn_post_conv_prep_inputs(
+    conv_out: jnp.ndarray,
+    a: jnp.ndarray,
+    b: jnp.ndarray,
+    decay: jnp.ndarray,
+    dt_bias: jnp.ndarray,
+    valid_mask: jnp.ndarray,
+    *,
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+) -> None:
+    for name, value_array, rank in (
+        ("conv_out", conv_out, 3),
+        ("a", a, 3),
+        ("b", b, 3),
+    ):
+        if value_array.dtype != jnp.float32:
+            raise ValueError(f"{name} must be float32")
+        if value_array.ndim != rank:
+            raise ValueError(f"{name} must be rank-{rank}")
+    for name, value_array in (("decay", decay), ("dt_bias", dt_bias)):
+        if value_array.dtype != jnp.float32:
+            raise ValueError(f"{name} must be float32")
+        if value_array.ndim != 1:
+            raise ValueError(f"{name} must be rank-1")
+    if valid_mask.dtype != jnp.int32:
+        raise ValueError("valid_mask must be int32")
+    if valid_mask.ndim != 2:
+        raise ValueError("valid_mask must be rank-2")
+    if num_key_heads <= 0 or num_value_heads <= 0:
+        raise ValueError("head counts must be positive")
+    if key_head_dim <= 0 or value_head_dim <= 0:
+        raise ValueError("head dimensions must be positive")
+    if num_value_heads % num_key_heads != 0:
+        raise ValueError("num_value_heads must be divisible by num_key_heads")
+
+    batch, seq_len, conv_dim = conv_out.shape
+    expected_conv_dim = (
+        2 * num_key_heads * key_head_dim
+        + num_value_heads * value_head_dim
+    )
+    if conv_dim != expected_conv_dim:
+        raise ValueError(
+            f"conv_out last dimension must be {expected_conv_dim}, got {conv_dim}"
+        )
+    if a.shape != (batch, seq_len, num_value_heads):
+        raise ValueError("a must have shape [batch, time, value_heads]")
+    if b.shape != (batch, seq_len, num_value_heads):
+        raise ValueError("b must have shape [batch, time, value_heads]")
+    if decay.shape != (num_value_heads,) or dt_bias.shape != (num_value_heads,):
+        raise ValueError("decay and dt_bias must have shape [value_heads]")
+    if valid_mask.shape != (batch, seq_len):
+        raise ValueError("valid_mask must have shape [batch, time]")
+
+
+def gdn_post_conv_prep_fp32(
+    conv_out: Any,
+    a: Any,
+    b: Any,
+    decay: Any,
+    dt_bias: Any,
+    valid_mask: Any,
+    *,
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """vLLM/FLA-style GDN post-conv prep as a local FP32 CUDA FFI kernel.
+
+    The kernel owns split, q/k L2 norm, valid-token masking, GVA repeat, V copy,
+    gate construction, and beta construction. Query/key are returned normalized
+    but not attention-scaled; the existing chunked reference still applies
+    `1/sqrt(key_dim)`.
+    """
+
+    conv_out = _as_jax_array("conv_out", conv_out)
+    a = _as_jax_array("a", a)
+    b = _as_jax_array("b", b)
+    decay = _as_jax_array("decay", decay)
+    dt_bias = _as_jax_array("dt_bias", dt_bias)
+    valid_mask = _as_jax_array("valid_mask", valid_mask)
+    _validate_fp32_gdn_post_conv_prep_inputs(
+        conv_out,
+        a,
+        b,
+        decay,
+        dt_bias,
+        valid_mask,
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        key_head_dim=key_head_dim,
+        value_head_dim=value_head_dim,
+    )
+    _register_kv_append_target()
+    batch, seq_len, _ = conv_out.shape
+    query_shape = (batch, num_value_heads, seq_len, key_head_dim)
+    value_shape = (batch, num_value_heads, seq_len, value_head_dim)
+    gate_shape = (batch, num_value_heads, seq_len)
+    call = jax.ffi.ffi_call(
+        _TARGET_GDN_POST_CONV_PREP,
+        (
+            jax.ShapeDtypeStruct(query_shape, jnp.float32),
+            jax.ShapeDtypeStruct(query_shape, jnp.float32),
+            jax.ShapeDtypeStruct(value_shape, jnp.float32),
+            jax.ShapeDtypeStruct(gate_shape, jnp.float32),
+            jax.ShapeDtypeStruct(gate_shape, jnp.float32),
+        ),
+        has_side_effect=False,
+    )
+    return call(conv_out, a, b, decay, dt_bias, valid_mask)
 
 
 def _validate_fp32_gdn_prefill_inputs(

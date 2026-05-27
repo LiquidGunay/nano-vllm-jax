@@ -492,6 +492,101 @@ XLA_FFI_Error* CheckGdnPrefillCallFrame(XLA_FFI_CallFrame* call_frame) {
   return nullptr;
 }
 
+XLA_FFI_Error* CheckGdnPostConvPrepCallFrame(XLA_FFI_CallFrame* call_frame) {
+  const XLA_FFI_Api* api = call_frame->api;
+  if (call_frame->stage != XLA_FFI_ExecutionStage_EXECUTE) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "fp32 GDN post-conv prep only supports execute stage");
+  }
+  if (call_frame->args.size != 6 || call_frame->rets.size != 5) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "fp32 GDN post-conv prep expects 6 arguments and 5 results");
+  }
+  for (int64_t i = 0; i < call_frame->args.size; ++i) {
+    if (!IsBufferArg(call_frame, i)) {
+      return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                         "all fp32 GDN post-conv prep arguments must be buffers");
+    }
+  }
+  for (int64_t i = 0; i < call_frame->rets.size; ++i) {
+    if (!IsBufferRet(call_frame, i)) {
+      return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                         "all fp32 GDN post-conv prep results must be buffers");
+    }
+  }
+
+  const XLA_FFI_Buffer* conv_out = ArgBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* a = ArgBuffer(call_frame, 1);
+  const XLA_FFI_Buffer* b = ArgBuffer(call_frame, 2);
+  const XLA_FFI_Buffer* decay = ArgBuffer(call_frame, 3);
+  const XLA_FFI_Buffer* dt_bias = ArgBuffer(call_frame, 4);
+  const XLA_FFI_Buffer* valid_mask = ArgBuffer(call_frame, 5);
+  const XLA_FFI_Buffer* query = RetBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* key = RetBuffer(call_frame, 1);
+  const XLA_FFI_Buffer* value = RetBuffer(call_frame, 2);
+  const XLA_FFI_Buffer* gate = RetBuffer(call_frame, 3);
+  const XLA_FFI_Buffer* beta = RetBuffer(call_frame, 4);
+
+  if (!HasTypeAndRank(conv_out, XLA_FFI_DataType_F32, 3) ||
+      !HasTypeAndRank(a, XLA_FFI_DataType_F32, 3) ||
+      !HasTypeAndRank(b, XLA_FFI_DataType_F32, 3) ||
+      !HasTypeAndRank(query, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(key, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(value, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(gate, XLA_FFI_DataType_F32, 3) ||
+      !HasTypeAndRank(beta, XLA_FFI_DataType_F32, 3)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "GDN post-conv prep tensors must be FP32 with expected ranks");
+  }
+  if (!HasTypeAndRank(decay, XLA_FFI_DataType_F32, 1) ||
+      !HasTypeAndRank(dt_bias, XLA_FFI_DataType_F32, 1)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "decay and dt_bias must be FP32 rank-1 buffers");
+  }
+  if (!HasTypeAndRank(valid_mask, XLA_FFI_DataType_S32, 2)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "valid_mask must be int32 rank-2");
+  }
+
+  int64_t batch = conv_out->dims[0];
+  int64_t seq_len = conv_out->dims[1];
+  int64_t conv_dim = conv_out->dims[2];
+  int64_t num_value_heads = query->dims[1];
+  int64_t key_dim = query->dims[3];
+  int64_t value_dim = value->dims[3];
+  int64_t value_part = num_value_heads * value_dim;
+  int64_t qk_part = conv_dim - value_part;
+  if (qk_part <= 0 || qk_part % (2 * key_dim) != 0) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "conv_out has invalid Q/K dimensions");
+  }
+  int64_t num_key_heads = qk_part / (2 * key_dim);
+  if (num_key_heads <= 0 || num_value_heads % num_key_heads != 0) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "value heads must be divisible by key heads");
+  }
+  if (a->dims[0] != batch || b->dims[0] != batch ||
+      a->dims[1] != seq_len || b->dims[1] != seq_len ||
+      a->dims[2] != num_value_heads || b->dims[2] != num_value_heads ||
+      decay->dims[0] != num_value_heads || dt_bias->dims[0] != num_value_heads ||
+      valid_mask->dims[0] != batch || valid_mask->dims[1] != seq_len) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "GDN post-conv prep input metadata shapes must match outputs");
+  }
+  if (key->dims[0] != batch || value->dims[0] != batch ||
+      gate->dims[0] != batch || beta->dims[0] != batch ||
+      query->dims[0] != batch ||
+      key->dims[1] != num_value_heads || value->dims[1] != num_value_heads ||
+      gate->dims[1] != num_value_heads || beta->dims[1] != num_value_heads ||
+      query->dims[2] != seq_len || key->dims[2] != seq_len ||
+      value->dims[2] != seq_len || gate->dims[2] != seq_len ||
+      beta->dims[2] != seq_len || key->dims[3] != key_dim) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "GDN post-conv prep output shapes must match");
+  }
+  return nullptr;
+}
+
 void MaybeSetMetadata(XLA_FFI_CallFrame* call_frame) {
   XLA_FFI_Extension_Base* extension = call_frame->extension_start;
   if (extension == nullptr ||
@@ -757,6 +852,107 @@ __global__ void Fp32GdnRecurrentDecodeKernel(
 
 __device__ inline float SoftplusF32(float x) {
   return x > 20.0f ? x : log1pf(expf(x));
+}
+
+__device__ inline float SigmoidF32(float x) {
+  if (x >= 0.0f) {
+    float z = expf(-x);
+    return 1.0f / (1.0f + z);
+  }
+  float z = expf(x);
+  return z / (1.0f + z);
+}
+
+__global__ void Fp32GdnPostConvPrepKernel(
+    const float* conv_out,
+    const float* a,
+    const float* b,
+    const float* decay,
+    const float* dt_bias,
+    const int32_t* valid_mask,
+    float* query,
+    float* key,
+    float* value,
+    float* gate,
+    float* beta,
+    int64_t batch,
+    int64_t seq_len,
+    int64_t conv_dim,
+    int64_t num_key_heads,
+    int64_t num_value_heads,
+    int64_t key_dim,
+    int64_t value_dim) {
+  extern __shared__ float shared[];
+  float* reduce_q = shared;
+  float* reduce_k = reduce_q + blockDim.x;
+
+  int64_t batch_idx = blockIdx.x;
+  int64_t token = blockIdx.y;
+  int64_t value_head = blockIdx.z;
+  int64_t repeat = num_value_heads / num_key_heads;
+  int64_t key_head = value_head / repeat;
+  int tid = threadIdx.x;
+
+  int64_t token_base = (batch_idx * seq_len + token) * conv_dim;
+  int64_t query_base = token_base + key_head * key_dim;
+  int64_t key_base = token_base + num_key_heads * key_dim + key_head * key_dim;
+  int64_t value_base =
+      token_base + 2 * num_key_heads * key_dim + value_head * value_dim;
+  int64_t out_q_base =
+      ((batch_idx * num_value_heads + value_head) * seq_len + token) * key_dim;
+  int64_t out_v_base =
+      ((batch_idx * num_value_heads + value_head) * seq_len + token) * value_dim;
+  int64_t gate_base = (batch_idx * num_value_heads + value_head) * seq_len + token;
+  int valid = valid_mask[batch_idx * seq_len + token] != 0;
+
+  float local_q_sum = 0.0f;
+  float local_k_sum = 0.0f;
+  if (valid) {
+    for (int64_t dim = tid; dim < key_dim; dim += blockDim.x) {
+      float q_value = conv_out[query_base + dim];
+      float k_value = conv_out[key_base + dim];
+      local_q_sum += q_value * q_value;
+      local_k_sum += k_value * k_value;
+    }
+  }
+  reduce_q[tid] = local_q_sum;
+  reduce_k[tid] = local_k_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce_q[tid] += reduce_q[tid + stride];
+      reduce_k[tid] += reduce_k[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  float q_inv_norm = rsqrtf(reduce_q[0] + 1.0e-6f);
+  float k_inv_norm = rsqrtf(reduce_k[0] + 1.0e-6f);
+  for (int64_t dim = tid; dim < key_dim; dim += blockDim.x) {
+    float q_value = valid ? conv_out[query_base + dim] * q_inv_norm : 0.0f;
+    float k_value = valid ? conv_out[key_base + dim] * k_inv_norm : 0.0f;
+    query[out_q_base + dim] = q_value;
+    key[out_q_base + dim] = k_value;
+  }
+
+  for (int64_t dim = tid; dim < value_dim; dim += blockDim.x) {
+    value[out_v_base + dim] = valid ? conv_out[value_base + dim] : 0.0f;
+  }
+
+  if (tid == 0) {
+    int64_t in_gate_base = (batch_idx * seq_len + token) * num_value_heads + value_head;
+    if (valid) {
+      float gate_raw =
+          -decay[value_head] *
+          SoftplusF32(a[in_gate_base] + dt_bias[value_head]);
+      gate[gate_base] = gate_raw;
+      beta[gate_base] = SigmoidF32(b[in_gate_base]);
+    } else {
+      gate[gate_base] = 0.0f;
+      beta[gate_base] = 0.0f;
+    }
+  }
 }
 
 __global__ void Fp32GdnPackedDecodeKernel(
@@ -1332,6 +1528,81 @@ extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPackedDecode(
       key_dim,
       value_dim,
       packed_dim);
+  cudaError_t launch_error = cudaGetLastError();
+  if (launch_error != cudaSuccess) {
+    return CreateError(api, XLA_FFI_Error_Code_INTERNAL,
+                       cudaGetErrorString(launch_error));
+  }
+  return nullptr;
+}
+
+extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPostConvPrep(
+    XLA_FFI_CallFrame* call_frame) {
+  MaybeSetMetadata(call_frame);
+  if (call_frame->extension_start != nullptr) {
+    return nullptr;
+  }
+
+  if (XLA_FFI_Error* error = CheckGdnPostConvPrepCallFrame(call_frame)) {
+    return error;
+  }
+
+  const XLA_FFI_Api* api = call_frame->api;
+  XLA_FFI_Stream_Get_Args stream_args;
+  stream_args.struct_size = XLA_FFI_Stream_Get_Args_STRUCT_SIZE;
+  stream_args.extension_start = nullptr;
+  stream_args.ctx = call_frame->ctx;
+  stream_args.stream = nullptr;
+  if (XLA_FFI_Error* error = api->XLA_FFI_Stream_Get(&stream_args)) {
+    return error;
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_args.stream);
+
+  const XLA_FFI_Buffer* conv_out = ArgBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* a = ArgBuffer(call_frame, 1);
+  const XLA_FFI_Buffer* b = ArgBuffer(call_frame, 2);
+  const XLA_FFI_Buffer* decay = ArgBuffer(call_frame, 3);
+  const XLA_FFI_Buffer* dt_bias = ArgBuffer(call_frame, 4);
+  const XLA_FFI_Buffer* valid_mask = ArgBuffer(call_frame, 5);
+  XLA_FFI_Buffer* query = RetBuffer(call_frame, 0);
+  XLA_FFI_Buffer* key = RetBuffer(call_frame, 1);
+  XLA_FFI_Buffer* value = RetBuffer(call_frame, 2);
+  XLA_FFI_Buffer* gate = RetBuffer(call_frame, 3);
+  XLA_FFI_Buffer* beta = RetBuffer(call_frame, 4);
+
+  int64_t batch = conv_out->dims[0];
+  int64_t seq_len = conv_out->dims[1];
+  int64_t conv_dim = conv_out->dims[2];
+  int64_t num_value_heads = query->dims[1];
+  int64_t key_dim = query->dims[3];
+  int64_t value_dim = value->dims[3];
+  int64_t num_key_heads = (conv_dim - num_value_heads * value_dim) / (2 * key_dim);
+
+  int threads = 256;
+  dim3 grid(
+      static_cast<unsigned int>(batch),
+      static_cast<unsigned int>(seq_len),
+      static_cast<unsigned int>(num_value_heads));
+  size_t shared_bytes = 2 * threads * sizeof(float);
+  Fp32GdnPostConvPrepKernel<<<grid, threads, shared_bytes, stream>>>(
+      static_cast<const float*>(conv_out->data),
+      static_cast<const float*>(a->data),
+      static_cast<const float*>(b->data),
+      static_cast<const float*>(decay->data),
+      static_cast<const float*>(dt_bias->data),
+      static_cast<const int32_t*>(valid_mask->data),
+      static_cast<float*>(query->data),
+      static_cast<float*>(key->data),
+      static_cast<float*>(value->data),
+      static_cast<float*>(gate->data),
+      static_cast<float*>(beta->data),
+      batch,
+      seq_len,
+      conv_dim,
+      num_key_heads,
+      num_value_heads,
+      key_dim,
+      value_dim);
   cudaError_t launch_error = cudaGetLastError();
   if (launch_error != cudaSuccess) {
     return CreateError(api, XLA_FFI_Error_Code_INTERNAL,

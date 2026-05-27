@@ -75,9 +75,18 @@ def _gdn_prefill_post_conv_impl() -> str:
         return "off"
     if normalized in {"reference", "jax", "pure_jax"}:
         return "reference"
+    if normalized in {"cuda_prep", "cuda_prep_fp32", "fused_prep_fp32"}:
+        return "cuda_prep_fp32"
+    if normalized in {
+        "cuda_prep_prefill",
+        "cuda_prep_prefill_fp32",
+        "cuda_prefill_fp32",
+        "fast",
+    }:
+        return "cuda_prep_prefill_fp32"
     raise ValueError(
         f"Unknown {_GDN_PREFILL_POST_CONV_IMPL_ENV}={value!r}; "
-        "expected off or reference"
+        "expected off, reference, cuda_prep_fp32, or cuda_prep_prefill_fp32"
     )
 
 
@@ -513,6 +522,82 @@ class PureJAXBackend:
                 chunk_size=chunk_size,
                 initial_state=initial_state,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+
+        if impl in {"cuda_prep_fp32", "cuda_prep_prefill_fp32"}:
+            if not use_qk_l2norm_in_kernel:
+                raise ValueError("CUDA FP32 post-conv prep requires q/k l2norm")
+            from nanovllm_jax.kernels.cuda_fp32_ffi import (
+                gdn_post_conv_prep_fp32,
+            )
+            from nanovllm_jax.model import jax_chunk_gated_delta_rule
+
+            if valid_token_mask is None:
+                valid_mask_i32 = jnp.ones(conv_out.shape[:2], dtype=jnp.int32)
+            else:
+                valid_mask_i32 = valid_token_mask.astype(jnp.int32)
+            query, key, value, gate, beta = gdn_post_conv_prep_fp32(
+                conv_out.astype(jnp.float32),
+                a.astype(jnp.float32),
+                b.astype(jnp.float32),
+                decay.astype(jnp.float32),
+                dt_bias.astype(jnp.float32),
+                valid_mask_i32,
+                num_key_heads=num_key_heads,
+                num_value_heads=num_value_heads,
+                key_head_dim=key_head_dim,
+                value_head_dim=value_head_dim,
+            )
+            if impl == "cuda_prep_prefill_fp32":
+                if initial_state is None:
+                    initial_state = jnp.zeros(
+                        (
+                            conv_out.shape[0],
+                            num_value_heads,
+                            value_head_dim,
+                            key_head_dim,
+                        ),
+                        dtype=jnp.float32,
+                    )
+                seq_lens = valid_mask_i32.sum(axis=1).astype(jnp.int32)
+                if query.shape[2] % 32 == 0 and value_head_dim % 32 == 0:
+                    from nanovllm_jax.kernels.cuda_fp32_ffi import (
+                        gdn_prefill_chunk32_normalized_fp32,
+                        gdn_prefill_chunk32_v64_normalized_fp32,
+                    )
+
+                    query_scaled = query * (
+                        1.0 / jnp.sqrt(jnp.asarray(key_head_dim, dtype=jnp.float32))
+                    )
+                    if value_head_dim % 64 == 0:
+                        return gdn_prefill_chunk32_v64_normalized_fp32(
+                            query_scaled,
+                            key,
+                            value,
+                            gate,
+                            beta,
+                            seq_lens,
+                            initial_state.astype(jnp.float32),
+                        )
+                    return gdn_prefill_chunk32_normalized_fp32(
+                        query_scaled,
+                        key,
+                        value,
+                        gate,
+                        beta,
+                        seq_lens,
+                        initial_state.astype(jnp.float32),
+                    )
+            return jax_chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                gate,
+                beta,
+                chunk_size=chunk_size,
+                initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=False,
             )
 
         raise AssertionError(f"Unhandled GDN post-conv prefill implementation {impl!r}")

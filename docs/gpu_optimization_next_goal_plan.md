@@ -210,6 +210,24 @@ Current tracked records:
   speed-claim-ready because it has only one repeat and is below the `0.9x`
   target. It is an accepted boundary/correctness scaffold for the next
   vLLM/FLA-derived post-conv fast implementation.
+- Current rejected GDN CUDA post-conv prep target:
+  `results/gpu_matrix_20260527_gdn_post_conv_cuda_prep_target.json`, `87.80
+  tok/s`, `0.755x` the stored vLLM reference, exact generated-token parity on
+  the one-repeat integrated route, and
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_fp32`. The vLLM-inspired
+  prep-only CUDA FFI reduces transpose and D2D profile buckets but adds command
+  buffer work and loses integrated throughput, so it remains a rejected
+  default-off diagnostic. The next candidate must also replace the chunked GDN
+  prefill body behind the same boundary before it can plausibly help TTFT.
+- Current rejected GDN CUDA post-conv prep+chunk target:
+  `results/gpu_matrix_20260527_gdn_post_conv_cuda_prep_prefill_target.json`,
+  `60.46 tok/s`, `0.520x` the stored vLLM reference, exact generated-token
+  parity on the one-repeat integrated route, and
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_prefill_fp32`. This route
+  proves the existing local FP32 chunk32/V64 body is not serving-viable: the
+  top GPU event is `Fp32GdnPrefillChunk32Kernel<64>` at about `500.69 ms`
+  across 18 launches, and TTFT regresses badly. Do not pursue this local chunk
+  body further as the production GDN prefill path.
 - Current vLLM-inspired random-token manifest sidecar:
   `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
   `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
@@ -1672,6 +1690,20 @@ Commit 8:
   boundary. The first fast attempt should either fuse post-conv prep into
   chunked prefill or call a FLA-shaped kernel without adding hot-path
   K,V/V,K transposes or per-layer layout conversions.
+- ~~Add a vLLM `fused_post_conv_prep`-inspired CUDA FP32 prep-only
+  implementation behind `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_fp32`.~~
+  Validation: elevated CUDA focused suite passed `18 passed`; one-repeat
+  integrated long-prefill route was exact but slower at `87.80 tok/s`,
+  `0.755x` vLLM, so this is rejected for promotion.
+- Add a guarded prep+chunk32 implementation behind the same boundary, using the
+  local FP32/V,K chunk32 or V64 path only when shape guards pass, and compare it
+  against the post-conv reference boundary before any promotion.
+- ~~Add a guarded prep+chunk32 implementation behind the same boundary using
+  local FP32/V,K chunk32 or V64 when shape guards pass.~~ Validation:
+  one-repeat integrated long-prefill route was exact but much slower at
+  `60.46 tok/s`, `0.520x` vLLM, dominated by
+  `Fp32GdnPrefillChunk32Kernel<64>` at about `500.69 ms`; reject this local
+  chunk body for serving.
 - Compare a revised segmented prefill candidate against Entry 045 chunk-32
   baseline after it beats the full-shape GDN microbenchmark gate
 

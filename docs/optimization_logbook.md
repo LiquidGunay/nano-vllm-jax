@@ -4716,3 +4716,76 @@ NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference JAX_PLATFORMS=cuda ... .venv/
 - result: `py_compile` passed; focused elevated CUDA test passed `1 passed`;
   adjacent elevated CUDA GDN/kernel suite passed `16 passed`; integrated
   one-repeat route completed and was exact.
+
+### Entry 125 - Rejected GDN CUDA Post-Conv Prep-Only Route
+
+- change tested: added
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_fp32`, a vLLM
+  `fused_post_conv_prep`-inspired CUDA/JAX FFI route behind the existing
+  post-conv prefill boundary. The kernel emits FP32 q/k/v/g/beta in the local
+  `[B,H,T,D]` / `[B,H,T]` layout, preserves native `[B,H,V,K]` state, and then
+  calls the existing pure-JAX chunked prefill body.
+- reference: the default-off `reference` implementation from Entry 124 remains
+  the correctness oracle.
+- focused validation: direct CUDA prep output matches the JAX prep for masked
+  GVA inputs, and a model-routed masked prefill test matches the default path.
+- artifact: `results/gpu_matrix_20260527_gdn_post_conv_cuda_prep_target.json`
+- report: `results/gpu_matrix_20260527_gdn_post_conv_cuda_prep_target.md`
+- result: exact generated-token parity on the integrated route, but slower than
+  the accepted/scoped default and the post-conv reference route. JAX reached
+  `87.80 tok/s`, `0.755x` vLLM, leaving a `16.93 tok/s` gap to the active
+  `0.9x` target.
+- profile movement: the prep kernel reduces the visible `transpose` bucket from
+  the older reference `47.30 ms` to `15.22 ms` and `MemcpyD2D` from `30.39 ms`
+  to `13.42 ms`, but `command_buffer::execute` rises to `234.51 ms` with
+  `18` extra executions and end-to-end throughput regresses. This confirms that
+  replacing only post-conv prep is too narrow.
+- decision: reject `cuda_prep_fp32` for default/fast-opt-in promotion and keep
+  it default-off as a diagnostic. The next GDN candidate must replace the
+  chunked prefill body behind the same boundary, with a fallback to Entry 124's
+  reference path.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/backends.py nanovllm_jax/kernels/cuda_fp32_ffi.py tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_prefill_reference.py tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py tests/test_kernel_registry.py
+NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_fp32 JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/run_gpu_matrix.py --goal-target-only --repeats 1 --no-live-vllm --require-stored-references --output-json results/gpu_matrix_20260527_gdn_post_conv_cuda_prep_target.json
+```
+
+- result: `py_compile` passed; focused elevated CUDA test passed `3 passed`;
+  adjacent elevated CUDA GDN/kernel suite passed `18 passed`; integrated
+  one-repeat route completed and was exact but slower.
+
+### Entry 126 - Rejected GDN CUDA Post-Conv Prep Plus Local Chunk Route
+
+- change tested: added
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_prefill_fp32`, which uses
+  the new CUDA FP32 post-conv prep from Entry 125, scales query by
+  `1/sqrt(K)`, derives row lengths from the valid-token mask, and calls the
+  existing local FP32 chunk32/V64 GDN prefill FFI when shape guards pass. It
+  falls back to the JAX chunk body when guards do not pass.
+- artifact: `results/gpu_matrix_20260527_gdn_post_conv_cuda_prep_prefill_target.json`
+- report: `results/gpu_matrix_20260527_gdn_post_conv_cuda_prep_prefill_target.md`
+- result: exact generated-token parity on the integrated route, but far slower
+  than the accepted/scoped default. JAX reached `60.46 tok/s`, `0.520x` vLLM,
+  leaving a `44.28 tok/s` gap to the active `0.9x` target.
+- profile movement: the existing local chunk body dominates the GPU profile:
+  `Fp32GdnPrefillChunk32Kernel<64>` takes about `500.69 ms` across `18`
+  launches. Named host buckets such as `PjRt Execute` and
+  `command_buffer::execute` shrink only because the expensive custom kernel
+  work is now hidden behind later synchronization; `array.py:325 tolist` and
+  `np.asarray(jax.Array)` grow to about `966 ms`.
+- decision: reject `cuda_prep_prefill_fp32` for default/fast-opt-in promotion.
+  Keep it default-off as evidence, but do not pursue the existing local FP32
+  chunk32/V64 body as the production prefill implementation. A future GDN
+  prefill kernel needs a different structure, closer to the vLLM/FLA chunk
+  schedule or a true fused post-conv+chunk kernel, while preserving FP32 math or
+  explicitly entering the separate BF16-prefill experiment lane.
+- validation:
+
+```text
+NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=cuda_prep_prefill_fp32 JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/run_gpu_matrix.py --goal-target-only --repeats 1 --no-live-vllm --require-stored-references --output-json results/gpu_matrix_20260527_gdn_post_conv_cuda_prep_prefill_target.json
+```
+
+- result: integrated one-repeat route completed and was exact but much slower.
