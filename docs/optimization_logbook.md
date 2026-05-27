@@ -4941,3 +4941,36 @@ JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_pr
 
 - result: focused CUDA post-conv suite passed `6 passed`; neighboring GDN
   reference suite passed `21 passed`.
+
+### Entry 132 - Prepared FLA Chunk Reference Server Route
+
+- change accepted: added `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=
+  reference_fla_chunk32`, a default-off route that prepares q/k/v/gate/beta in
+  FLA layout, calls `gdn_fla_prefill_chunk32_fp32_reference`, then transposes
+  output back to the model's `[B,H,T,V]` layout. This is the exact server
+  route a future FP32 CUDA/FLA-derived chunk body should replace.
+- artifact:
+  `results/gpu_matrix_20260527_gdn_post_conv_reference_fla_chunk32_target.json`
+- report:
+  `results/gpu_matrix_20260527_gdn_post_conv_reference_fla_chunk32_target.md`
+- result: one-repeat integrated long-prefill route completed with exact
+  generated-token parity. Throughput was `89.37 tok/s`, `0.768x` the stored
+  vLLM reference, below the current accepted/scoped default and far below the
+  active `0.9x` target. This is not speed-claim-ready because it has only one
+  repeat.
+- profile movement: versus the configured JAX reference, visible transpose
+  dropped to `15.36 ms` from `47.30 ms`, `PjRtCApiLoadedExecutable::Execute`
+  count dropped from `140` to `44`, and `MemcpyD2D` dropped to `18.39 ms` from
+  `30.39 ms`; however, this route still leaves a `15.37 tok/s` gap to the
+  active target and is not a promoted speed path.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/backends.py nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_prefill_reference.py tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py tests/test_kernel_registry.py
+NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32 JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/run_gpu_matrix.py --goal-target-only --repeats 1 --no-live-vllm --require-stored-references --output-json results/gpu_matrix_20260527_gdn_post_conv_reference_fla_chunk32_target.json
+```
+
+- result: focused CUDA post-conv suite passed `7 passed`; neighboring GDN
+  reference suite passed `22 passed`; integrated one-repeat route was exact.

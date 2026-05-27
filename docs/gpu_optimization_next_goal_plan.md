@@ -261,6 +261,13 @@ Current tracked records:
   diverged at generated token `0` (`279` vs reference `1719`). This confirms
   that BF16 activations may expose enough speed for upstream kernels, but a
   whole-model dtype change violates the current correctness gate.
+- Current default-off prepared-FLA GDN prefill reference route:
+  `results/gpu_matrix_20260527_gdn_post_conv_reference_fla_chunk32_target.json`,
+  `89.37 tok/s`, `0.768x` the stored vLLM reference, exact generated-token
+  parity on the one-repeat integrated route, and
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32`. This is not
+  speed-claim-ready and is below the accepted/scoped default, but it proves the
+  prepared-body FLA ABI can be exercised through the server path.
 - Current vLLM-inspired random-token manifest sidecar:
   `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
   `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
@@ -1743,6 +1750,10 @@ Commit 8:
   `tests/test_gdn_post_conv_prefill_reference.py
   tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py
   tests/test_kernel_registry.py` passed `21 passed`.
+- ~~Route `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference_fla_chunk32`
+  through the model/server path using the prepared-body reference.~~
+  Validation: elevated CUDA focused suite passed `22 passed`; one-repeat
+  integrated long-prefill route was exact at `89.37 tok/s`, `0.768x` vLLM.
 - Add the fast vLLM/FLA-derived implementation behind the same post-conv
   boundary. The first fast attempt should either fuse post-conv prep into
   chunked prefill or call a FLA-shaped kernel without adding hot-path

@@ -75,6 +75,8 @@ def _gdn_prefill_post_conv_impl() -> str:
         return "off"
     if normalized in {"reference", "jax", "pure_jax"}:
         return "reference"
+    if normalized in {"reference_fla", "reference_fla_chunk32", "fla_reference"}:
+        return "reference_fla_chunk32"
     if normalized in {"cuda_prep", "cuda_prep_fp32", "fused_prep_fp32"}:
         return "cuda_prep_fp32"
     if normalized in {
@@ -86,7 +88,8 @@ def _gdn_prefill_post_conv_impl() -> str:
         return "cuda_prep_prefill_fp32"
     raise ValueError(
         f"Unknown {_GDN_PREFILL_POST_CONV_IMPL_ENV}={value!r}; "
-        "expected off, reference, cuda_prep_fp32, or cuda_prep_prefill_fp32"
+        "expected off, reference, reference_fla_chunk32, cuda_prep_fp32, "
+        "or cuda_prep_prefill_fp32"
     )
 
 
@@ -523,6 +526,49 @@ class PureJAXBackend:
                 initial_state=initial_state,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
+
+        if impl == "reference_fla_chunk32":
+            from nanovllm_jax.kernels.gdn_fla import (
+                gdn_fla_prefill_chunk32_fp32_reference,
+                prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
+            )
+
+            if initial_state is None:
+                initial_state = jnp.zeros(
+                    (
+                        conv_out.shape[0],
+                        num_value_heads,
+                        value_head_dim,
+                        key_head_dim,
+                    ),
+                    dtype=jnp.float32,
+                )
+            query, key, value, gate, beta, seq_lens = (
+                prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
+                    conv_out,
+                    a,
+                    b,
+                    decay,
+                    dt_bias,
+                    valid_token_mask,
+                    num_key_heads=num_key_heads,
+                    num_value_heads=num_value_heads,
+                    key_head_dim=key_head_dim,
+                    value_head_dim=value_head_dim,
+                    normalize_qk=use_qk_l2norm_in_kernel,
+                )
+            )
+            output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
+                query,
+                key,
+                value,
+                gate,
+                beta,
+                seq_lens,
+                initial_state.astype(jnp.float32),
+                chunk_size=chunk_size,
+            )
+            return output.transpose(0, 2, 1, 3), final_state
 
         if impl in {"cuda_prep_fp32", "cuda_prep_prefill_fp32"}:
             if not use_qk_l2norm_in_kernel:
