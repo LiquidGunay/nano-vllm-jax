@@ -4523,3 +4523,55 @@ JAX_PLATFORMS=cuda ... pytest -q \
 ```
 
 - result: `48 passed`; `py_compile` passed; JSON validation passed.
+
+### Entry 121 - Packed GDN Decode Backend Boundary Routed Default-Off
+
+- change accepted: added an experimental width-1 cached-decode GDN route behind
+  `NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL`. The model now passes post-convolution
+  packed `mixed_qkv`, raw `a/b`, local loaded `A=exp(A_log)`, `dt_bias`, and
+  native `[B,HV,V,K]` recurrent state through `backend.gated_delta_packed_decode`
+  when the flag is set and no prefix-state path is requested.
+- reference implementation: `gdn_fla.gdn_packed_decode_reference_from_decay`
+  accepts local `A` weights and calls the same pure-JAX recurrent rule as the
+  default path. This is the correctness oracle for the model-routed boundary.
+- fastest implementation: `NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL=cuda_fp32`
+  calls the local CUDA/JAX FFI packed core `gdn_packed_decode_step_fp32` after
+  the backend converts local `A` back to `A_log`. The explicit `reference`
+  implementation uses the same backend API.
+- default policy: the flag defaults to `off`, so `gpu_paged_default` is
+  unchanged. This entry is an implementation boundary and focused correctness
+  step only; it makes no throughput claim until an integrated exact-token
+  matrix/server benchmark passes.
+- artifact metadata: `benchmarks/benchmark_jax_server_trace.py` now records
+  `run_config.gdn_kernel_flags`, including the legacy local recurrent decode
+  flag and the packed decode implementation selected for the run.
+- integrated experiment: ran the long-prefill goal target with
+  `NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL=cuda_fp32`, elevated GPU access, stored
+  references, and two repeats.
+- artifact: `results/gpu_matrix_20260527_gdn_packed_cuda_fp32_target.json`
+- report: `results/gpu_matrix_20260527_gdn_packed_cuda_fp32_target.md`
+- result: speed-claim-ready and exact generated-token parity, but below both
+  the active target and the current fastest accepted default. JAX reached
+  `88.41 tok/s`, `0.760x` vLLM, versus the scoped current default target at
+  `90.81 tok/s`, `0.780x` vLLM. The `0.9x` target requires `104.74 tok/s`, so
+  the packed CUDA route leaves a `16.33 tok/s` gap.
+- profile movement: versus the older configured JAX reference, the run reduces
+  `PjRt Execute` count by `96` and `MemcpyD2D` count by `192`, and lowers the
+  named profile buckets, but integrated throughput still regresses versus the
+  current accepted/scoped target. Scheduler diagnostics show prefill at about
+  `0.54 s` and decode at about `0.19 s`, worse than the current scoped target's
+  roughly `0.53 s` prefill and `0.17 s` decode.
+- decision: keep the packed boundary and both implementations as default-off
+  tools, but reject `cuda_fp32` packed GDN decode for default/fast-opt-in
+  promotion. The next GDN win likely needs a coarser boundary that removes more
+  surrounding work, not only the recurrent core custom call.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/backends.py nanovllm_jax/model.py nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_packed_decode_reference.py tests/test_cuda_fp32_ffi.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_packed_decode_reference.py tests/test_cuda_fp32_ffi.py -k packed_decode
+NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL=cuda_fp32 JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/run_gpu_matrix.py --goal-target-only --repeats 2 --no-live-vllm --require-stored-references --output-json results/gpu_matrix_20260527_gdn_packed_cuda_fp32_target.json
+```
+
+- result: `py_compile` passed; elevated CUDA focused selection passed
+  `9 passed, 11 deselected`; integrated matrix run completed successfully.

@@ -6,7 +6,11 @@ import jax.numpy as jnp
 from jax import nn, lax
 from typing import Tuple, Optional, List, Dict
 from dataclasses import dataclass, replace
-from nanovllm_jax.backends import InferenceBackend, select_backend
+from nanovllm_jax.backends import (
+    InferenceBackend,
+    gdn_packed_decode_enabled,
+    select_backend,
+)
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.layers import rms_norm, apply_rope, repeat_kv, causal_mask, get_activation, l2norm, causal_conv1d_update
 from nanovllm_jax.kv_cache import AttentionMetadata, HybridLayerState, KVCacheState, init_linear_attention_states
@@ -884,77 +888,96 @@ def gated_deltanet_block(
             conv_out_steps = conv_out_t[None, ...]
             prefix_layer_conv_state = None
         conv_out = conv_out_steps.transpose(1, 0, 2, 3).reshape(batch, seq_len, conv_dim)
-        
-        # 2. Split q, k, v
-        query = conv_out[:, :, :key_dim].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
-        key = conv_out[:, :, key_dim:key_dim*2].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
-        value = conv_out[:, :, key_dim*2:].reshape(batch, seq_len, config.linear_num_value_heads, config.linear_value_head_dim)
-        
-        # 3. Compute gates
-        beta = nn.sigmoid(b)  # [B, 1, H_v]
-        g = -params["A"] * nn.softplus(a + params["dt_bias"])  # [B, 1, H_v]
-        
-        # 4. Repeat for GQA
-        if v_heads_per_k > 1:
-            query = jnp.repeat(query, v_heads_per_k, axis=2)
-            key = jnp.repeat(key, v_heads_per_k, axis=2)
-        
-        # 5. Transpose to [B, H, T, D] format.
-        query = query.transpose(0, 2, 1, 3)  # [B, H, T, D_k]
-        key = key.transpose(0, 2, 1, 3)  # [B, H, T, D_k]
-        value = value.transpose(0, 2, 1, 3)  # [B, H, T, D_v]
-        g = g.transpose(0, 2, 1)  # [B, H, T]
-        beta = beta.transpose(0, 2, 1)  # [B, H, T]
-        
-        # 6. Recurrent update
+
         # recurrent_state shape: [batch, num_layers, num_heads, v_dim, k_dim]
         # Extract recurrent state for this layer: [batch, num_heads, v_dim, k_dim]
         # linear_layer_idx computed above
         initial_recurrent = hybrid_state.recurrent_state[:, linear_layer_idx] if hybrid_state.recurrent_state is not None else None
 
-        use_recurrent_decode_scan = return_prefix_state or seq_len > 1
-        if return_prefix_state:
-            core_attn_out, new_recurrent_state_single, recurrent_state_steps = jax_recurrent_gated_delta_rule(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                initial_state=initial_recurrent,
+        use_packed_decode = (
+            gdn_packed_decode_enabled()
+            and seq_len == 1
+            and not return_prefix_state
+            and not return_first_prefix_state
+            and initial_recurrent is not None
+        )
+        if use_packed_decode:
+            core_attn_out, new_recurrent_state_single = backend.gated_delta_packed_decode(
+                conv_out[:, 0, :].astype(jnp.float32),
+                a[:, 0, :].astype(jnp.float32),
+                b[:, 0, :].astype(jnp.float32),
+                params["A"].astype(jnp.float32),
+                params["dt_bias"].astype(jnp.float32),
+                initial_recurrent.astype(jnp.float32),
                 use_qk_l2norm_in_kernel=True,
-                return_state_sequence=return_prefix_state,
-            )
-            prefix_recurrent_state_single = recurrent_state_steps
-        elif return_first_prefix_state:
-            core_attn_out, new_recurrent_state_single, prefix_recurrent_state_single = jax_recurrent_gated_delta_rule(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                initial_state=initial_recurrent,
-                use_qk_l2norm_in_kernel=True,
-                return_first_state=True,
-            )
-        elif use_recurrent_decode_scan:
-            core_attn_out, new_recurrent_state_single = jax_recurrent_gated_delta_rule(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                initial_state=initial_recurrent,
-                use_qk_l2norm_in_kernel=True,
-                return_state_sequence=False,
             )
             prefix_recurrent_state_single = None
         else:
-            core_attn_out, new_recurrent_state_single = backend.gated_delta_decode(
-                query, key, value, g, beta,
-                initial_state=initial_recurrent,
-                use_qk_l2norm_in_kernel=True,
-            )
-            prefix_recurrent_state_single = None
+            # 2. Split q, k, v
+            query = conv_out[:, :, :key_dim].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
+            key = conv_out[:, :, key_dim:key_dim*2].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
+            value = conv_out[:, :, key_dim*2:].reshape(batch, seq_len, config.linear_num_value_heads, config.linear_value_head_dim)
+
+            # 3. Compute gates
+            beta = nn.sigmoid(b)  # [B, 1, H_v]
+            g = -params["A"] * nn.softplus(a + params["dt_bias"])  # [B, 1, H_v]
+
+            # 4. Repeat for GQA
+            if v_heads_per_k > 1:
+                query = jnp.repeat(query, v_heads_per_k, axis=2)
+                key = jnp.repeat(key, v_heads_per_k, axis=2)
+
+            # 5. Transpose to [B, H, T, D] format.
+            query = query.transpose(0, 2, 1, 3)  # [B, H, T, D_k]
+            key = key.transpose(0, 2, 1, 3)  # [B, H, T, D_k]
+            value = value.transpose(0, 2, 1, 3)  # [B, H, T, D_v]
+            g = g.transpose(0, 2, 1)  # [B, H, T]
+            beta = beta.transpose(0, 2, 1)  # [B, H, T]
+
+            # 6. Recurrent update
+            use_recurrent_decode_scan = return_prefix_state or seq_len > 1
+            if return_prefix_state:
+                core_attn_out, new_recurrent_state_single, recurrent_state_steps = jax_recurrent_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    initial_state=initial_recurrent,
+                    use_qk_l2norm_in_kernel=True,
+                    return_state_sequence=return_prefix_state,
+                )
+                prefix_recurrent_state_single = recurrent_state_steps
+            elif return_first_prefix_state:
+                core_attn_out, new_recurrent_state_single, prefix_recurrent_state_single = jax_recurrent_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    initial_state=initial_recurrent,
+                    use_qk_l2norm_in_kernel=True,
+                    return_first_state=True,
+                )
+            elif use_recurrent_decode_scan:
+                core_attn_out, new_recurrent_state_single = jax_recurrent_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    initial_state=initial_recurrent,
+                    use_qk_l2norm_in_kernel=True,
+                    return_state_sequence=False,
+                )
+                prefix_recurrent_state_single = None
+            else:
+                core_attn_out, new_recurrent_state_single = backend.gated_delta_decode(
+                    query, key, value, g, beta,
+                    initial_state=initial_recurrent,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                prefix_recurrent_state_single = None
         # new_recurrent_state_single has shape [batch, num_heads, v_dim, k_dim]
         if valid_token_mask is not None:
             row_valid = (valid_token_mask.astype(jnp.int32).sum(axis=1) > 0)

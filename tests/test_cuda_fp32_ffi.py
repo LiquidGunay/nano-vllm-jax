@@ -703,3 +703,83 @@ def test_gdn_packed_decode_step_fp32_matches_reference(
         rtol=3e-5,
         atol=3e-5,
     )
+
+
+@pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_backend_gdn_packed_decode_reference_and_cuda_match(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
+
+    batch = 2
+    num_q_heads = 2
+    num_value_heads = 4
+    key_dim = 16
+    value_dim = 16
+    packed_dim = 2 * num_q_heads * key_dim + num_value_heads * value_dim
+    mixed_qkv = jnp.linspace(
+        -0.5,
+        0.5,
+        batch * packed_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, packed_dim)
+    a = jnp.linspace(-0.3, 0.2, batch * num_value_heads, dtype=jnp.float32).reshape(
+        batch,
+        num_value_heads,
+    )
+    b = jnp.linspace(-1.0, 1.0, batch * num_value_heads, dtype=jnp.float32).reshape(
+        batch,
+        num_value_heads,
+    )
+    a_log = jnp.linspace(-0.2, 0.1, num_value_heads, dtype=jnp.float32)
+    dt_bias = jnp.linspace(0.05, 0.2, num_value_heads, dtype=jnp.float32)
+    decay = jnp.exp(a_log)
+    state = jnp.linspace(
+        -0.03,
+        0.04,
+        batch * num_value_heads * value_dim * key_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_value_heads, value_dim, key_dim)
+
+    expected_out, expected_state = gdn_packed_decode_step_fp32_reference(
+        mixed_qkv,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state,
+    )
+
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", "reference")
+    ref_out, ref_state = PureJAXBackend().gated_delta_packed_decode(
+        mixed_qkv,
+        a,
+        b,
+        decay,
+        dt_bias,
+        state,
+        use_qk_l2norm_in_kernel=True,
+    )
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", "cuda_fp32")
+    actual_out, actual_state = PureJAXBackend().gated_delta_packed_decode(
+        mixed_qkv,
+        a,
+        b,
+        decay,
+        dt_bias,
+        state,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    for out, recurrent_state in ((ref_out, ref_state), (actual_out, actual_state)):
+        np.testing.assert_allclose(
+            np.asarray(out),
+            np.asarray(expected_out),
+            rtol=3e-5,
+            atol=3e-5,
+        )
+        np.testing.assert_allclose(
+            np.asarray(recurrent_state),
+            np.asarray(expected_state),
+            rtol=3e-5,
+            atol=3e-5,
+        )

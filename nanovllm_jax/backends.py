@@ -40,6 +40,29 @@ _FLASHINFER_KV_APPEND_ENV = "NANO_VLLM_JAX_FLASHINFER_KV_APPEND"
 _CUDA_FP32_KV_APPEND_ENV = "NANO_VLLM_JAX_CUDA_FP32_KV_APPEND"
 _CUDA_FP32_DECODE_ATTN_ENV = "NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"
 _CUDA_FP32_GDN_DECODE_ENV = "NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE"
+_GDN_PACKED_DECODE_IMPL_ENV = "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL"
+_OFF_ENV_VALUES = {"", "0", "false", "no", "off", "none", "False"}
+
+
+def _gdn_packed_decode_impl() -> str:
+    value = os.environ.get(_GDN_PACKED_DECODE_IMPL_ENV, "off").strip()
+    if value in _TRUE_ENV_VALUES:
+        return "cuda_fp32"
+    normalized = value.lower()
+    if normalized in _OFF_ENV_VALUES:
+        return "off"
+    if normalized in {"reference", "jax", "pure_jax"}:
+        return "reference"
+    if normalized in {"cuda", "cuda_fp32", "fast"}:
+        return "cuda_fp32"
+    raise ValueError(
+        f"Unknown {_GDN_PACKED_DECODE_IMPL_ENV}={value!r}; "
+        "expected off, reference, or cuda_fp32"
+    )
+
+
+def gdn_packed_decode_enabled() -> bool:
+    return _gdn_packed_decode_impl() != "off"
 
 
 class InferenceBackend(Protocol):
@@ -116,6 +139,18 @@ class InferenceBackend(Protocol):
         g: jnp.ndarray,
         beta: jnp.ndarray,
         initial_state: jnp.ndarray | None,
+        use_qk_l2norm_in_kernel: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        ...
+
+    def gated_delta_packed_decode(
+        self,
+        mixed_qkv: jnp.ndarray,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        initial_state: jnp.ndarray,
         use_qk_l2norm_in_kernel: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         ...
@@ -444,6 +479,65 @@ class PureJAXBackend:
             initial_state=initial_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
+
+    def gated_delta_packed_decode(
+        self,
+        mixed_qkv: jnp.ndarray,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        initial_state: jnp.ndarray,
+        use_qk_l2norm_in_kernel: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        impl = _gdn_packed_decode_impl()
+        if impl == "off":
+            raise RuntimeError(
+                f"{_GDN_PACKED_DECODE_IMPL_ENV} is off; use gated_delta_decode"
+            )
+
+        if impl == "reference":
+            from nanovllm_jax.kernels.gdn_fla import (
+                gdn_packed_decode_reference_from_decay,
+            )
+
+            return gdn_packed_decode_reference_from_decay(
+                mixed_qkv,
+                a,
+                b,
+                decay,
+                dt_bias,
+                initial_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+
+        if impl == "cuda_fp32":
+            if not use_qk_l2norm_in_kernel:
+                raise ValueError("CUDA FP32 packed GDN decode requires q/k l2norm")
+            for name, value_array in (
+                ("mixed_qkv", mixed_qkv),
+                ("a", a),
+                ("b", b),
+                ("decay", decay),
+                ("dt_bias", dt_bias),
+                ("initial_state", initial_state),
+            ):
+                if value_array.dtype != jnp.float32:
+                    raise ValueError(f"{name} must be float32 for CUDA packed GDN decode")
+            from nanovllm_jax.kernels.cuda_fp32_ffi import (
+                gdn_packed_decode_step_fp32,
+            )
+
+            return gdn_packed_decode_step_fp32(
+                mixed_qkv,
+                a,
+                b,
+                jnp.log(decay),
+                dt_bias,
+                initial_state,
+            )
+
+        raise AssertionError(f"Unhandled packed GDN decode implementation {impl!r}")
 
 
 class KernelBackendPlaceholder(PureJAXBackend):

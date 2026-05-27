@@ -340,6 +340,13 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 "cuda_fp32_kv_append": _env_flag("NANO_VLLM_JAX_CUDA_FP32_KV_APPEND"),
                 "cuda_fp32_decode_attention": _env_flag("NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"),
             },
+            "gdn_kernel_flags": {
+                "cuda_fp32_gdn_decode": _env_flag("NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE"),
+                "packed_decode_impl": os.environ.get(
+                    "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
+                    "off",
+                ),
+            },
             "jax_execution": args.jax_execution,
             "linear_chunk_size": int(engine.config.linear_chunk_size),
             "num_speculative_tokens": args.num_speculative_tokens,

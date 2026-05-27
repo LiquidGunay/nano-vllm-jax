@@ -125,10 +125,10 @@ paged_decode_attention_gqa_nhd(
   half/BF16 oriented. Use vLLM's packed decode kernel shape as the first
   port/fork target, then revisit segmented prefill after packed decode passes
   strict parity.
-- route decision: before implementation, explicitly choose Pallas, a production
-  vLLM/FLA-shaped CUDA/JAX FFI port, or pausing GDN in favor of
-  FlashInfer/full-attention work. Do not treat the historical local CUDA probes
-  as this decision.
+- route decision: the first selected slice is a vLLM/FLA-shaped packed decode
+  boundary with two implementations under one backend switch: pure-JAX
+  `reference` and local CUDA/JAX FFI `cuda_fp32`. Keep it default-off until an
+  integrated exact-token benchmark proves a speed win.
 - JAX-facing ABI:
 
 ```python
@@ -169,19 +169,23 @@ gdn_recurrent_decode_step(
   established.
 - packed-core status: `gdn_packed_decode_step_fp32` implements that boundary as
   a local CUDA/JAX FFI target and passes focused CUDA parity for same-head and
-  GVA q/k repetition shapes using native V,K state. It is still not a serving
-  route, speed claim, or planned production route. The next GDN implementation
-  should be vLLM/FLA-shaped and should borrow their kernel structure rather than
-  promoting this local probe.
+  GVA q/k repetition shapes using native V,K state. The model can now route
+  width-1 cached decode through
+  `NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL=reference|cuda_fp32`. This is still
+  experimental and default-off. The first integrated long-prefill target run
+  with `cuda_fp32` was exact and speed-claim-ready but regressed to
+  `88.41 tok/s`, `0.760x` vLLM, versus the current accepted/scoped default at
+  `90.81 tok/s`, `0.780x` vLLM. Keep it as a tool, not a promoted path.
 - backend-selection status: the registry recognizes `gdn_fla` plus
   `fla_gdn`, `vllm_fla`, and `flash_linear_attention` aliases. They are
   intentionally unimplemented and fall back to pure JAX until a vLLM/FLA-shaped
   GDN path passes the correctness and benchmark gates.
 - ABI-reference status: `nanovllm_jax/kernels/gdn_fla.py` owns the FP32
   packed-decode reference boundary for `mixed_qkv + a/b/A_log/dt_bias` with
-  native `[B,HV,V,K]` state. It also owns the planned segmented prefill
+  native `[B,HV,V,K]` state. It also exposes a local-decay variant that accepts
+  loaded `A=exp(A_log)` weights, and owns the planned segmented prefill
   `[nnz,H,D] + cu_seqlens` pack/reference/unpack helpers. This keeps the planned
-  FLA/vLLM contract separate from local CUDA diagnostic probes.
+  FLA/vLLM contract separate from implementation-specific fast paths.
 - V,K migration status: the pure-JAX fallback now consumes and returns V,K GDN
   state directly, and the local recurrent/packed CUDA decode probes now accept
   V,K without Python-side K,V transposes. Focused CUDA tests, CUDA FFI tests, MTP

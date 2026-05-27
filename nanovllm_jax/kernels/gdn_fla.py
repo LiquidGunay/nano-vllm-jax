@@ -103,6 +103,37 @@ def gdn_packed_decode_reference_local_state(
     serving recurrent-state contract `[B,H,V,K]`.
     """
 
+    if a_log.ndim != 1:
+        raise ValueError("a_log must have shape [value_heads]")
+    return gdn_packed_decode_reference_from_decay(
+        mixed_qkv,
+        a,
+        b,
+        jnp.exp(a_log.astype(jnp.float32)),
+        dt_bias,
+        state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+
+
+def gdn_packed_decode_reference_from_decay(
+    mixed_qkv: jnp.ndarray,
+    a: jnp.ndarray,
+    b: jnp.ndarray,
+    decay: jnp.ndarray,
+    dt_bias: jnp.ndarray,
+    state: jnp.ndarray,
+    *,
+    use_qk_l2norm_in_kernel: bool = True,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Pure-JAX packed GDN decode reference using local positive decay `A`.
+
+    Local loaded weights store `A = exp(A_log)` to preserve the established
+    FP32 activation contract. Production-shaped decode call sites can use this
+    helper without adding a hot-path parameter-layout dependency on checkpoint
+    naming.
+    """
+
     from nanovllm_jax.model import jax_recurrent_gated_delta_rule
 
     if state.ndim != 4:
@@ -112,8 +143,8 @@ def gdn_packed_decode_reference_local_state(
         raise ValueError("mixed_qkv batch must match state batch")
     if a.shape != (batch, num_value_heads) or b.shape != (batch, num_value_heads):
         raise ValueError("a and b must have shape [batch, value_heads]")
-    if a_log.shape != (num_value_heads,) or dt_bias.shape != (num_value_heads,):
-        raise ValueError("a_log and dt_bias must have shape [value_heads]")
+    if decay.shape != (num_value_heads,) or dt_bias.shape != (num_value_heads,):
+        raise ValueError("decay and dt_bias must have shape [value_heads]")
 
     qk_dim = mixed_qkv.shape[1] - num_value_heads * value_dim
     if qk_dim <= 0 or qk_dim % (2 * key_dim) != 0:
@@ -131,7 +162,7 @@ def gdn_packed_decode_reference_local_state(
         query = jnp.repeat(query, repeat, axis=1)
         key = jnp.repeat(key, repeat, axis=1)
 
-    gate = -jnp.exp(a_log[None, :]) * jax.nn.softplus(a.astype(jnp.float32) + dt_bias[None, :])
+    gate = -decay.astype(jnp.float32)[None, :] * jax.nn.softplus(a.astype(jnp.float32) + dt_bias[None, :])
     beta = jax.nn.sigmoid(b).astype(jnp.float32)
     output, new_state = jax_recurrent_gated_delta_rule(
         query,

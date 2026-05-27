@@ -64,9 +64,12 @@ documentation/configuration-first:
 2. Treat `gpu_paged_default` as the fastest accepted non-MTP default, not the
    most conservative historical baseline.
 3. Keep FlashInfer, `jax-tvm-ffi`, and FLA/vLLM-derived external kernels as
-   optional dependencies behind backend flags with pure-JAX fallbacks. Do not
-   use, route, or extend the current local CUDA probes as the next optimization
-   path unless the user explicitly reopens that direction.
+   optional dependencies behind backend flags with pure-JAX fallbacks. The
+   latest implementation decision explicitly allows invasive kernel work as
+   long as each slice keeps one reference implementation and one fastest
+   implementation. Local CUDA/JAX FFI may therefore be used as an opt-in fast
+   implementation for a production-shaped boundary, but it must remain
+   default-off until integrated correctness and speed gates pass.
 4. Prefer stored local artifacts for JAX and vLLM comparisons. If a selected
    workload has no stored local artifact, run the missing comparison live when a
    GPU and dependency stack are available, then store that artifact for future
@@ -92,10 +95,12 @@ documentation/configuration-first:
    `NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE=bf16`. This is a speed experiment for
    external-kernel compatibility, not a correctness-contract change for the
    default path.
-10. Do not use the current local CUDA GDN probes as the next optimization path.
-    They are historical ABI/correctness evidence only. The next real kernel
-    route should use FlashInfer for paged KV/attention and vLLM/Flash Linear
-    Attention references for GDN, with pure-JAX fallbacks.
+10. Do not promote the historical standalone local CUDA GDN probes as the
+    serving default. A local CUDA/JAX FFI implementation is acceptable only when
+    it sits behind the same vLLM/FLA-shaped boundary as the pure-JAX reference,
+    with the fast path selected explicitly by backend flag. The next real kernel
+    route should still use FlashInfer for paged KV/attention and vLLM/Flash
+    Linear Attention references for GDN.
 11. Run GPU, benchmark, profiling, vLLM, CUDA, NVIDIA, and model-serving
     commands outside the sandbox with elevated access. The sandbox can miss
     `/dev/nvidia*` and report false GPU communication failures. Keep all
@@ -116,16 +121,17 @@ FlashInfer GDN kernels are half/BF16 oriented. Keep the next real GDN step to a
 FP32-capable vLLM/FLA-shaped packed decode port/fork against the `gdn_fla`
 reference boundary before attempting segmented prefill or fused projection+GDN.
 
-Immediate kernel decision checkpoint: the latest elevated long-prefill target
-artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
+Immediate kernel implementation checkpoint: the latest elevated long-prefill
+target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
 speed-claim-ready and exact at `90.87 tok/s`, while the stored vLLM reference is
 `116.37 tok/s`; the active `0.9x` target is `104.74 tok/s`, leaving a
 `13.86 tok/s` gap. Scheduler diagnostics show one prefill step at about
-`0.53 s` and 15 decode steps totaling about `0.17 s`. The next packed-GDN
-decode implementation route is a design decision, not a cleanup: choose one of
-Pallas, a production vLLM/FLA-shaped CUDA/JAX FFI port, or pausing GDN to return
-to FlashInfer/full-attention work. Do not route a new GDN kernel into serving
-until that decision is explicit and the focused parity gates pass.
+`0.53 s` and 15 decode steps totaling about `0.17 s`. The packed-GDN decode
+route now has a selected first slice: `NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL`
+routes width-1 cached decode through a vLLM-shaped packed boundary with
+`reference` and `cuda_fp32` implementations. This is still experimental and
+default-off; the next step is an integrated exact-token benchmark before any
+default promotion or speed claim.
 
 ## Baseline And Best-Run Tracking
 
@@ -163,6 +169,12 @@ Current tracked records:
   repeats, speed-claim-ready, and still below the active `0.9x` gate. This is
   the first target artifact whose matrix report includes scoped GPU/CPU top
   profile events.
+- Current rejected packed-GDN CUDA FP32 target:
+  `results/gpu_matrix_20260527_gdn_packed_cuda_fp32_target.json`, `88.41
+  tok/s`, `0.760x` the stored vLLM reference, exact generated-token parity over
+  two repeats, speed-claim-ready, but slower than the current accepted/scoped
+  default. It records `run_config.gdn_kernel_flags.packed_decode_impl =
+  cuda_fp32` and remains default-off.
 - Current vLLM-inspired random-token manifest sidecar:
   `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
   `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
@@ -662,6 +674,14 @@ end-to-end throughput.
   are GEMM/CUTLASS buckets, led by `gemm_fusion_dot_general_744` at about
   `57.45 ms` per repeat. This artifact verifies the new scoped profile-event
   reporting path and does not change the current speed target status.
+- Packed-GDN CUDA FP32 target rejection:
+  `results/gpu_matrix_20260527_gdn_packed_cuda_fp32_target.json` and
+  `results/gpu_matrix_20260527_gdn_packed_cuda_fp32_target.md`. The opt-in
+  `NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL=cuda_fp32` route is exact over two
+  repeats and speed-claim-ready, but reaches only `88.41 tok/s`, `0.760x` vLLM,
+  with a `16.33 tok/s` target gap. It reduces some named profile buckets versus
+  the older configured JAX reference but regresses against the current
+  accepted/scoped default, so it stays default-off.
 - Current raw GPU trace summary:
   `results/profile_trace_20260527_current_goal_target_gpu.json` and
   `results/profile_trace_20260527_current_goal_target_gpu.md`. Across both
@@ -1019,8 +1039,9 @@ previous Pallas regressions, it should not be the first production path for GDN.
   `gdn_packed_decode_reference_local_state`. It accepts packed
   `mixed_qkv [B, 2*H*K + HV*V]` plus raw `a/b/A_log/dt_bias`, computes the
   same gate/beta transform as vLLM's packed decode path, and calls the V,K
-  recurrent rule with `[B,HV,V,K]` state. This is a reference artifact and ABI
-  contract, not a serving route or speed path.
+  recurrent rule with `[B,HV,V,K]` state. The companion
+  `gdn_packed_decode_reference_from_decay` accepts local loaded `A=exp(A_log)`
+  weights so model call sites do not depend on checkpoint naming.
 - External GDN reference audit confirms vLLM/FLA's natural Qwen GDN state layout
   is k-last/V-first `[*,HV,V,K]`, and the vLLM/FLA prefill path is
   BF16-activation oriented. The explicit decision is to switch persistent GDN
@@ -1035,9 +1056,16 @@ previous Pallas regressions, it should not be the first production path for GDN.
   `gdn_packed_decode_step_fp32`. It accepts vLLM-style
   `mixed_qkv + a/b/A_log/dt_bias`, consumes native `[B,HV,V,K]` state,
   and passes focused CUDA parity against the pure-JAX packed reference for both
-  same-head and GVA q/k repetition cases. It is an ABI/toolchain step only; it
-  is not routed into serving, is not the planned production route, and makes no
-  speed claim.
+  same-head and GVA q/k repetition cases.
+- The model now has an experimental width-1 cached-decode packed GDN route
+  selected by `NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL`. `reference` calls the
+  pure-JAX packed reference from local `A` weights; `cuda_fp32` calls the local
+  CUDA/JAX FFI packed core after converting `A` to `A_log` inside the backend.
+  The default remains off. The first integrated long-prefill target run with
+  `cuda_fp32` was exact and speed-claim-ready but slower than the current
+  accepted/scoped default: `88.41 tok/s`, `0.760x` vLLM, versus `90.81 tok/s`,
+  `0.780x` vLLM. Keep the route as an implementation tool, not a promoted
+  serving path.
 - The optional backend registry now recognizes `gdn_fla` and aliases
   `fla_gdn`, `vllm_fla`, and `flash_linear_attention`. These requests resolve
   to the pure-JAX fallback until a vLLM/FLA-shaped kernel path is implemented
@@ -1563,6 +1591,12 @@ Commit 8:
 - ~~Audit the installed vLLM/FLA and FlashInfer GDN routes for direct FP32 reuse
   vs port/fork requirements.~~ Result: direct reuse is blocked for the FP32
   activation contract; packed decode is the smallest next port/fork boundary.
+- ~~Route width-1 cached GDN decode through the vLLM-shaped packed boundary
+  behind `NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL`, with `reference` and
+  `cuda_fp32` implementations.~~ Validation: elevated
+  `JAX_PLATFORMS=cuda` focused selection
+  `tests/test_gdn_packed_decode_reference.py tests/test_cuda_fp32_ffi.py -k
+  packed_decode` passed `9 passed, 11 deselected`.
 - Compare a revised segmented prefill candidate against Entry 045 chunk-32
   baseline after it beats the full-shape GDN microbenchmark gate
 
