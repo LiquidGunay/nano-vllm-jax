@@ -119,10 +119,13 @@ The current external-GDN audit says direct reuse is not a drop-in FP32 route:
 the installed vLLM/FLA prefill path rejects FP32 activation tensors, and
 FlashInfer GDN kernels are half/BF16 oriented. The packed decode port/fork
 against the `gdn_fla` reference boundary was implemented and rejected for
-promotion, so the next real GDN step should be a coarser post-conv prefill
-boundary: split `conv_out`, compute q/k norm, beta/gate, layout-pack tensors,
-and call the existing chunk/reference path first, then replace the chunk body
-only after the boundary is correctness-gated.
+promotion. The first coarser post-conv prefill reference boundary now exists:
+`NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference` routes split, gate
+construction, valid-token masking, GQA repeat, layout packing, and chunked
+prefill through `backend.gated_delta_prefill_post_conv` while preserving the
+pure-JAX FP32/V,K correctness path. The next real GDN step is to replace work
+behind that same post-conv boundary with a vLLM/FLA-derived fast implementation,
+not to add another model-call-site rewrite.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -199,6 +202,14 @@ Current tracked records:
   the end of greedy `ignore_eos` generation, so per-token streaming TTFT/ITL
   measurements are no longer equivalent to the default server path. It also
   adds extra `PjRt Execute`/`MemcpyD2D` work and remains below the `0.9x` gate.
+- Current default-off GDN post-conv reference boundary:
+  `results/gpu_matrix_20260527_gdn_post_conv_reference_target.json`, `90.15
+  tok/s`, `0.775x` the stored vLLM reference, exact generated-token parity on
+  the one-repeat integrated route, and
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference`. This is not
+  speed-claim-ready because it has only one repeat and is below the `0.9x`
+  target. It is an accepted boundary/correctness scaffold for the next
+  vLLM/FLA-derived post-conv fast implementation.
 - Current vLLM-inspired random-token manifest sidecar:
   `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
   `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
@@ -1648,6 +1659,19 @@ Commit 8:
   `JAX_PLATFORMS=cuda` focused selection
   `tests/test_gdn_packed_decode_reference.py tests/test_cuda_fp32_ffi.py -k
   packed_decode` passed `9 passed, 11 deselected`.
+- ~~Add a default-off GDN post-conv prefill reference boundary behind
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference`, routing split,
+  beta/gate construction, valid-token masking, GQA repeat, layout packing, and
+  chunked prefill through `backend.gated_delta_prefill_post_conv`.~~
+  Validation: elevated CUDA focused suite
+  `tests/test_gdn_post_conv_prefill_reference.py
+  tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py
+  tests/test_kernel_registry.py` passed `16 passed`; one-repeat integrated
+  long-prefill route was exact at `90.15 tok/s`, `0.775x` vLLM.
+- Add the fast vLLM/FLA-derived implementation behind the same post-conv
+  boundary. The first fast attempt should either fuse post-conv prep into
+  chunked prefill or call a FLA-shaped kernel without adding hot-path
+  K,V/V,K transposes or per-layer layout conversions.
 - Compare a revised segmented prefill candidate against Entry 045 chunk-32
   baseline after it beats the full-shape GDN microbenchmark gate
 

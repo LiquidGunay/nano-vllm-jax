@@ -176,6 +176,112 @@ def gdn_packed_decode_reference_from_decay(
     return output, new_state
 
 
+def gdn_post_conv_prefill_reference_from_decay(
+    conv_out: jnp.ndarray,
+    a: jnp.ndarray,
+    b: jnp.ndarray,
+    decay: jnp.ndarray,
+    dt_bias: jnp.ndarray,
+    valid_token_mask: jnp.ndarray | None,
+    *,
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    chunk_size: int,
+    initial_state: jnp.ndarray | None,
+    use_qk_l2norm_in_kernel: bool = True,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Pure-JAX reference for the GDN post-convolution prefill boundary.
+
+    This mirrors vLLM/FLA's useful `fused_post_conv_prep` boundary while keeping
+    the current FP32 math contract and native local state layout `[B,H,V,K]`.
+    It owns split, gate construction, valid-token masking, GQA repeat, layout
+    packing, and the final call into the existing chunked reference.
+    """
+
+    from nanovllm_jax.model import jax_chunk_gated_delta_rule
+
+    if conv_out.ndim != 3:
+        raise ValueError("conv_out must have shape [batch, time, conv_dim]")
+    if a.ndim != 3 or b.ndim != 3:
+        raise ValueError("a and b must have shape [batch, time, value_heads]")
+    if num_key_heads <= 0 or num_value_heads <= 0:
+        raise ValueError("head counts must be positive")
+    if key_head_dim <= 0 or value_head_dim <= 0:
+        raise ValueError("head dimensions must be positive")
+    if num_value_heads % num_key_heads != 0:
+        raise ValueError("num_value_heads must be divisible by num_key_heads")
+
+    batch, seq_len, conv_dim = conv_out.shape
+    key_dim = num_key_heads * key_head_dim
+    value_dim = num_value_heads * value_head_dim
+    expected_conv_dim = 2 * key_dim + value_dim
+    if conv_dim != expected_conv_dim:
+        raise ValueError(
+            f"conv_out last dimension must be {expected_conv_dim}, got {conv_dim}"
+        )
+    if a.shape != (batch, seq_len, num_value_heads):
+        raise ValueError("a must have shape [batch, time, value_heads]")
+    if b.shape != (batch, seq_len, num_value_heads):
+        raise ValueError("b must have shape [batch, time, value_heads]")
+    if decay.shape != (num_value_heads,) or dt_bias.shape != (num_value_heads,):
+        raise ValueError("decay and dt_bias must have shape [value_heads]")
+    if valid_token_mask is not None and valid_token_mask.shape != (batch, seq_len):
+        raise ValueError("valid_token_mask must have shape [batch, time]")
+
+    query = conv_out[:, :, :key_dim].reshape(
+        batch,
+        seq_len,
+        num_key_heads,
+        key_head_dim,
+    )
+    key = conv_out[:, :, key_dim : key_dim * 2].reshape(
+        batch,
+        seq_len,
+        num_key_heads,
+        key_head_dim,
+    )
+    value = conv_out[:, :, key_dim * 2 :].reshape(
+        batch,
+        seq_len,
+        num_value_heads,
+        value_head_dim,
+    )
+    beta = jax.nn.sigmoid(b)
+    gate = -decay * jax.nn.softplus(a + dt_bias)
+
+    if valid_token_mask is not None:
+        valid = valid_token_mask.astype(jnp.bool_)
+        query = jnp.where(valid[:, :, None, None], query, 0.0)
+        key = jnp.where(valid[:, :, None, None], key, 0.0)
+        value = jnp.where(valid[:, :, None, None], value, 0.0)
+        beta = jnp.where(valid[:, :, None], beta, 0.0)
+        gate = jnp.where(valid[:, :, None], gate, 0.0)
+
+    heads_per_key = num_value_heads // num_key_heads
+    if heads_per_key > 1:
+        query = jnp.repeat(query, heads_per_key, axis=2)
+        key = jnp.repeat(key, heads_per_key, axis=2)
+
+    query = query.transpose(0, 2, 1, 3)
+    key = key.transpose(0, 2, 1, 3)
+    value = value.transpose(0, 2, 1, 3)
+    gate = gate.transpose(0, 2, 1)
+    beta = beta.transpose(0, 2, 1)
+    return jax_chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        chunk_size=chunk_size,
+        initial_state=initial_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+
+
 def _seq_lens_to_tuple(seq_lens: Any) -> tuple[int, ...]:
     values = np.asarray(jax.device_get(seq_lens), dtype=np.int64).reshape(-1)
     if np.any(values < 0):

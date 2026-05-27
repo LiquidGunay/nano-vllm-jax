@@ -4667,3 +4667,52 @@ NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1 JAX_PLATFORMS=cuda ... .venv/bin/python bench
 
 - result: `py_compile` passed; smoke parity matched the reference token list;
   integrated matrix run completed and was exact.
+
+### Entry 124 - GDN Post-Conv Prefill Reference Boundary
+
+- change accepted: added a default-off
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference` route for longer GDN
+  prefill. The model now passes post-convolution `conv_out`, raw `a/b`, local
+  loaded `A=exp(A_log)`, `dt_bias`, valid-token mask, head metadata, chunk size,
+  and native `[B,HV,V,K]` recurrent state through
+  `backend.gated_delta_prefill_post_conv`.
+- reference implementation:
+  `gdn_fla.gdn_post_conv_prefill_reference_from_decay` owns the vLLM/FLA-shaped
+  post-conv prep boundary: split Q/K/V from `conv_out`, construct beta/gate,
+  apply valid-token masking, repeat Q/K for GQA, transpose into local
+  `[B,H,T,D]` layout, and call the existing pure-JAX chunked reference. This
+  preserves the current BF16-weight/FP32-activation correctness contract.
+- default policy: the flag defaults to `off`, so `gpu_paged_default` is
+  unchanged. This is a boundary and correctness scaffold, not a throughput
+  promotion.
+- artifact metadata: `benchmarks/benchmark_jax_server_trace.py` now records
+  `run_config.gdn_kernel_flags.prefill_post_conv_impl`, so dashboard/profile
+  views can distinguish the reference post-conv route from the default path.
+- integrated experiment: ran one elevated GPU long-prefill goal-target repeat
+  with stored references.
+- artifact: `results/gpu_matrix_20260527_gdn_post_conv_reference_target.json`
+- report: `results/gpu_matrix_20260527_gdn_post_conv_reference_target.md`
+- result: exact generated-token parity on the integrated route. JAX reached
+  `90.15 tok/s`, `0.775x` vLLM, versus the active `0.9x` target of
+  `104.74 tok/s`; this leaves a `14.59 tok/s` gap. The run is not
+  speed-claim-ready because it has only one repeat and misses the target.
+- profile movement: versus the older configured JAX reference, named buckets
+  improve (`PjRt Execute` count `44` vs `140`, `MemcpyD2D` count `463` vs
+  `655`, and `array.py:325 tolist` about `396.37 ms` vs `427.68 ms`), but this
+  is not a valid speedup claim against the current accepted/scoped default.
+- decision: keep the post-conv reference boundary as the next GDN fast-kernel
+  landing point. The next implementation should replace work behind this same
+  backend method with a vLLM/FLA-derived fast path, without adding hot-path
+  K,V/V,K adapters or per-layer layout conversions.
+- validation:
+
+```text
+.venv/bin/python -m py_compile benchmarks/benchmark_jax_server_trace.py nanovllm_jax/backends.py nanovllm_jax/kernels/gdn_fla.py nanovllm_jax/model.py tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_prefill_reference.py tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py tests/test_kernel_registry.py
+NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=reference JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/run_gpu_matrix.py --goal-target-only --repeats 1 --no-live-vllm --require-stored-references --output-json results/gpu_matrix_20260527_gdn_post_conv_reference_target.json
+```
+
+- result: `py_compile` passed; focused elevated CUDA test passed `1 passed`;
+  adjacent elevated CUDA GDN/kernel suite passed `16 passed`; integrated
+  one-repeat route completed and was exact.

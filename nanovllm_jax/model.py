@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from nanovllm_jax.backends import (
     InferenceBackend,
     gdn_packed_decode_enabled,
+    gdn_prefill_post_conv_enabled,
     select_backend,
 )
 from nanovllm_jax.config import Qwen3_5Config
@@ -1072,75 +1073,98 @@ def gated_deltanet_block(
             )
         conv_out = conv_out.transpose(0, 2, 1)  # [B, T, D]
         
-        query = conv_out[:, :, :key_dim].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
-        key = conv_out[:, :, key_dim:key_dim*2].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
-        value = conv_out[:, :, key_dim*2:].reshape(batch, seq_len, config.linear_num_value_heads, config.linear_value_head_dim)
-        
-        beta = nn.sigmoid(b)
-        g = -params["A"] * nn.softplus(a + params["dt_bias"])
-
-        if valid_token_mask is not None:
-            valid = valid_token_mask.astype(jnp.bool_)
-            query = jnp.where(valid[:, :, None, None], query, 0.0)
-            key = jnp.where(valid[:, :, None, None], key, 0.0)
-            value = jnp.where(valid[:, :, None, None], value, 0.0)
-            beta = jnp.where(valid[:, :, None], beta, 0.0)
-            g = jnp.where(valid[:, :, None], g, 0.0)
-        
-        if v_heads_per_k > 1:
-            query = jnp.repeat(query, v_heads_per_k, axis=2)
-            key = jnp.repeat(key, v_heads_per_k, axis=2)
-        
-        # Transpose to [B, H, T, D] format for chunk_gated_delta_rule
-        query = query.transpose(0, 2, 1, 3)
-        key = key.transpose(0, 2, 1, 3)
-        value = value.transpose(0, 2, 1, 3)
-        g = g.transpose(0, 2, 1)
-        beta = beta.transpose(0, 2, 1)
-        
         initial_recurrent = (
             hybrid_state.recurrent_state[:, linear_layer_idx]
             if use_cached_prefill
             else None
         )
         prefix_recurrent_state_single = None
-        if use_recurrent_prefill:
-            # Small cached suffixes can use the recurrent path directly and remain
-            # aligned with iterative decode.
-            if return_prefix_state and use_cached_prefill:
-                core_attn_out, final_state, recurrent_state_steps = jax_recurrent_gated_delta_rule(
-                    query,
-                    key,
-                    value,
-                    g,
-                    beta,
-                    initial_state=initial_recurrent,
-                    use_qk_l2norm_in_kernel=True,
-                    return_state_sequence=True,
-                )
-                prefix_recurrent_state_single = recurrent_state_steps
-            else:
-                core_attn_out, final_state = backend.gated_delta_decode(
-                    query,
-                    key,
-                    value,
-                    g,
-                    beta,
-                    initial_state=initial_recurrent,
-                    use_qk_l2norm_in_kernel=True,
-                )
-        else:
-            # Longer prefill chunks use chunked prefill to amortize work.
-            core_attn_out, final_state = backend.gated_delta_prefill(
-                query,
-                key,
-                value,
-                g,
-                beta,
+        use_post_conv_prefill = (
+            gdn_prefill_post_conv_enabled()
+            and not use_recurrent_prefill
+            and not return_prefix_state
+            and not return_first_prefix_state
+        )
+        if use_post_conv_prefill:
+            core_attn_out, final_state = backend.gated_delta_prefill_post_conv(
+                conv_out,
+                a,
+                b,
+                params["A"],
+                params["dt_bias"],
+                valid_token_mask,
+                num_key_heads=config.linear_num_key_heads,
+                num_value_heads=config.linear_num_value_heads,
+                key_head_dim=config.linear_key_head_dim,
+                value_head_dim=config.linear_value_head_dim,
                 chunk_size=config.linear_chunk_size,
                 initial_state=initial_recurrent,
                 use_qk_l2norm_in_kernel=True,
             )
+        else:
+            query = conv_out[:, :, :key_dim].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
+            key = conv_out[:, :, key_dim:key_dim*2].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
+            value = conv_out[:, :, key_dim*2:].reshape(batch, seq_len, config.linear_num_value_heads, config.linear_value_head_dim)
+
+            beta = nn.sigmoid(b)
+            g = -params["A"] * nn.softplus(a + params["dt_bias"])
+
+            if valid_token_mask is not None:
+                valid = valid_token_mask.astype(jnp.bool_)
+                query = jnp.where(valid[:, :, None, None], query, 0.0)
+                key = jnp.where(valid[:, :, None, None], key, 0.0)
+                value = jnp.where(valid[:, :, None, None], value, 0.0)
+                beta = jnp.where(valid[:, :, None], beta, 0.0)
+                g = jnp.where(valid[:, :, None], g, 0.0)
+
+            if v_heads_per_k > 1:
+                query = jnp.repeat(query, v_heads_per_k, axis=2)
+                key = jnp.repeat(key, v_heads_per_k, axis=2)
+
+            # Transpose to [B, H, T, D] format for chunk_gated_delta_rule
+            query = query.transpose(0, 2, 1, 3)
+            key = key.transpose(0, 2, 1, 3)
+            value = value.transpose(0, 2, 1, 3)
+            g = g.transpose(0, 2, 1)
+            beta = beta.transpose(0, 2, 1)
+
+            if use_recurrent_prefill:
+                # Small cached suffixes can use the recurrent path directly and remain
+                # aligned with iterative decode.
+                if return_prefix_state and use_cached_prefill:
+                    core_attn_out, final_state, recurrent_state_steps = jax_recurrent_gated_delta_rule(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        initial_state=initial_recurrent,
+                        use_qk_l2norm_in_kernel=True,
+                        return_state_sequence=True,
+                    )
+                    prefix_recurrent_state_single = recurrent_state_steps
+                else:
+                    core_attn_out, final_state = backend.gated_delta_decode(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        initial_state=initial_recurrent,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+            else:
+                # Longer prefill chunks use chunked prefill to amortize work.
+                core_attn_out, final_state = backend.gated_delta_prefill(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    chunk_size=config.linear_chunk_size,
+                    initial_state=initial_recurrent,
+                    use_qk_l2norm_in_kernel=True,
+                )
         
         # Save final state to cache for decode mode
         if (

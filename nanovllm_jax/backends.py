@@ -41,6 +41,7 @@ _CUDA_FP32_KV_APPEND_ENV = "NANO_VLLM_JAX_CUDA_FP32_KV_APPEND"
 _CUDA_FP32_DECODE_ATTN_ENV = "NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"
 _CUDA_FP32_GDN_DECODE_ENV = "NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE"
 _GDN_PACKED_DECODE_IMPL_ENV = "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL"
+_GDN_PREFILL_POST_CONV_IMPL_ENV = "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL"
 _OFF_ENV_VALUES = {"", "0", "false", "no", "off", "none", "False"}
 
 
@@ -63,6 +64,25 @@ def _gdn_packed_decode_impl() -> str:
 
 def gdn_packed_decode_enabled() -> bool:
     return _gdn_packed_decode_impl() != "off"
+
+
+def _gdn_prefill_post_conv_impl() -> str:
+    value = os.environ.get(_GDN_PREFILL_POST_CONV_IMPL_ENV, "off").strip()
+    if value in _TRUE_ENV_VALUES:
+        return "reference"
+    normalized = value.lower()
+    if normalized in _OFF_ENV_VALUES:
+        return "off"
+    if normalized in {"reference", "jax", "pure_jax"}:
+        return "reference"
+    raise ValueError(
+        f"Unknown {_GDN_PREFILL_POST_CONV_IMPL_ENV}={value!r}; "
+        "expected off or reference"
+    )
+
+
+def gdn_prefill_post_conv_enabled() -> bool:
+    return _gdn_prefill_post_conv_impl() != "off"
 
 
 class InferenceBackend(Protocol):
@@ -125,6 +145,25 @@ class InferenceBackend(Protocol):
         value: jnp.ndarray,
         g: jnp.ndarray,
         beta: jnp.ndarray,
+        chunk_size: int,
+        initial_state: jnp.ndarray | None,
+        use_qk_l2norm_in_kernel: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        ...
+
+    def gated_delta_prefill_post_conv(
+        self,
+        conv_out: jnp.ndarray,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        valid_token_mask: jnp.ndarray | None,
+        *,
+        num_key_heads: int,
+        num_value_heads: int,
+        key_head_dim: int,
+        value_head_dim: int,
         chunk_size: int,
         initial_state: jnp.ndarray | None,
         use_qk_l2norm_in_kernel: bool,
@@ -432,6 +471,51 @@ class PureJAXBackend:
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             output_final_state=True,
         )
+
+    def gated_delta_prefill_post_conv(
+        self,
+        conv_out: jnp.ndarray,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        valid_token_mask: jnp.ndarray | None,
+        *,
+        num_key_heads: int,
+        num_value_heads: int,
+        key_head_dim: int,
+        value_head_dim: int,
+        chunk_size: int,
+        initial_state: jnp.ndarray | None,
+        use_qk_l2norm_in_kernel: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        impl = _gdn_prefill_post_conv_impl()
+        if impl == "off":
+            raise RuntimeError(
+                f"{_GDN_PREFILL_POST_CONV_IMPL_ENV} is off; use gated_delta_prefill"
+            )
+        if impl == "reference":
+            from nanovllm_jax.kernels.gdn_fla import (
+                gdn_post_conv_prefill_reference_from_decay,
+            )
+
+            return gdn_post_conv_prefill_reference_from_decay(
+                conv_out,
+                a,
+                b,
+                decay,
+                dt_bias,
+                valid_token_mask,
+                num_key_heads=num_key_heads,
+                num_value_heads=num_value_heads,
+                key_head_dim=key_head_dim,
+                value_head_dim=value_head_dim,
+                chunk_size=chunk_size,
+                initial_state=initial_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+
+        raise AssertionError(f"Unhandled GDN post-conv prefill implementation {impl!r}")
 
     def gated_delta_decode(
         self,

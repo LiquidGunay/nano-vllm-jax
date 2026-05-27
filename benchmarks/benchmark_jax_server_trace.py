@@ -346,6 +346,10 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                     "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
                     "off",
                 ),
+                "prefill_post_conv_impl": os.environ.get(
+                    "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
+                    "off",
+                ),
             },
             "jax_execution": args.jax_execution,
             "linear_chunk_size": int(engine.config.linear_chunk_size),
