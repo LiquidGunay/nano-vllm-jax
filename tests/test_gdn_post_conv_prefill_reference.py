@@ -12,6 +12,9 @@ import pytest
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.kernels.cuda_fp32_ffi import gdn_post_conv_prep_fp32
+from nanovllm_jax.kernels.gdn_fla import (
+    prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
+)
 from nanovllm_jax.kv_cache import HybridLayerState
 from nanovllm_jax.layers import l2norm
 from nanovllm_jax.model import gated_deltanet_block, init_transformer_block
@@ -45,6 +48,133 @@ def _small_gdn_config() -> Qwen3_5Config:
         layer_types=("linear_attention",),
         linear_attn_layers=(0,),
         dtype="float32",
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_post_conv_fla_input_prep_matches_manual_reference():
+    batch = 2
+    seq_len = 5
+    num_key_heads = 2
+    num_value_heads = 4
+    key_dim = 4
+    value_dim = 6
+    conv_dim = 2 * num_key_heads * key_dim + num_value_heads * value_dim
+    conv_out = jnp.linspace(
+        -0.5,
+        0.7,
+        batch * seq_len * conv_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, seq_len, conv_dim)
+    a = jnp.linspace(
+        -0.3,
+        0.4,
+        batch * seq_len * num_value_heads,
+        dtype=jnp.float32,
+    ).reshape(batch, seq_len, num_value_heads)
+    b = jnp.linspace(
+        -0.8,
+        0.9,
+        batch * seq_len * num_value_heads,
+        dtype=jnp.float32,
+    ).reshape(batch, seq_len, num_value_heads)
+    decay = jnp.linspace(0.8, 1.2, num_value_heads, dtype=jnp.float32)
+    dt_bias = jnp.linspace(-0.1, 0.2, num_value_heads, dtype=jnp.float32)
+    valid_mask = jnp.array(
+        [[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]],
+        dtype=jnp.int32,
+    )
+
+    key_total = num_key_heads * key_dim
+    query = conv_out[:, :, :key_total].reshape(
+        batch,
+        seq_len,
+        num_key_heads,
+        key_dim,
+    )
+    key = conv_out[:, :, key_total : key_total * 2].reshape(
+        batch,
+        seq_len,
+        num_key_heads,
+        key_dim,
+    )
+    value = conv_out[:, :, key_total * 2 :].reshape(
+        batch,
+        seq_len,
+        num_value_heads,
+        value_dim,
+    )
+    gate = -decay * jax.nn.softplus(a + dt_bias)
+    beta = jax.nn.sigmoid(b)
+    valid = valid_mask.astype(jnp.bool_)
+    query = jnp.where(valid[:, :, None, None], query, 0.0)
+    key = jnp.where(valid[:, :, None, None], key, 0.0)
+    value = jnp.where(valid[:, :, None, None], value, 0.0)
+    gate = jnp.where(valid[:, :, None], gate, 0.0)
+    beta = jnp.where(valid[:, :, None], beta, 0.0)
+    repeat = num_value_heads // num_key_heads
+    expected_query = jnp.repeat(query, repeat, axis=2)
+    expected_key = jnp.repeat(key, repeat, axis=2)
+    expected_seq_lens = valid_mask.sum(axis=1).astype(jnp.int32)
+
+    actual = prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
+        conv_out,
+        a,
+        b,
+        decay,
+        dt_bias,
+        valid_mask,
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        key_head_dim=key_dim,
+        value_head_dim=value_dim,
+        normalize_qk=False,
+    )
+    (
+        actual_query,
+        actual_key,
+        actual_value,
+        actual_gate,
+        actual_beta,
+        actual_seq_lens,
+    ) = actual
+
+    assert actual_query.shape == (batch, seq_len, num_value_heads, key_dim)
+    assert actual_key.shape == (batch, seq_len, num_value_heads, key_dim)
+    assert actual_value.shape == (batch, seq_len, num_value_heads, value_dim)
+    np.testing.assert_allclose(np.asarray(actual_query), np.asarray(expected_query))
+    np.testing.assert_allclose(np.asarray(actual_key), np.asarray(expected_key))
+    np.testing.assert_allclose(np.asarray(actual_value), np.asarray(value))
+    np.testing.assert_allclose(np.asarray(actual_gate), np.asarray(gate))
+    np.testing.assert_allclose(np.asarray(actual_beta), np.asarray(beta))
+    np.testing.assert_array_equal(np.asarray(actual_seq_lens), np.asarray(expected_seq_lens))
+
+    normalized_query, normalized_key, *_ = (
+        prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
+            conv_out,
+            a,
+            b,
+            decay,
+            dt_bias,
+            valid_mask,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
+            key_head_dim=key_dim,
+            value_head_dim=value_dim,
+            normalize_qk=True,
+        )
+    )
+    np.testing.assert_allclose(
+        np.asarray(normalized_query),
+        np.asarray(l2norm(expected_query.astype(jnp.float32), axis=-1, eps=1e-6)),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(normalized_key),
+        np.asarray(l2norm(expected_key.astype(jnp.float32), axis=-1, eps=1e-6)),
+        rtol=2e-5,
+        atol=2e-5,
     )
 
 

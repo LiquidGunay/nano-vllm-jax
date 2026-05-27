@@ -137,6 +137,11 @@ FP32 q/k/v, and FlashInfer GDN prefill accepts BF16/FP16 q/k/v with FP32
 g/beta/state. Preserving the default contract requires a FP32 port/fork of the
 FLA chunk schedule behind the existing post-conv boundary. A FlashInfer BF16
 prefill experiment is allowed only as a separate diagnostic lane.
+The post-conv reference now exposes an explicit FLA-shaped FP32 prep helper:
+`prepare_gdn_post_conv_prefill_fla_inputs_from_decay` returns query/key/value in
+`[B,T,H,D]`, gate/beta in `[B,T,H]`, and row lengths, with optional q/k L2
+normalization. The existing reference path still transposes into the current
+chunk body, so this is an ABI scaffold rather than a speed claim.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -1719,6 +1724,13 @@ Commit 8:
   tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py
   tests/test_kernel_registry.py` passed `16 passed`; one-repeat integrated
   long-prefill route was exact at `90.15 tok/s`, `0.775x` vLLM.
+- ~~Factor the post-conv prefill prep into an explicit FLA-shaped helper
+  returning `[B,T,H,D]` q/k/v, `[B,T,H]` gate/beta, and row lengths while
+  preserving the existing reference fallback behavior.~~ Validation: elevated
+  CUDA focused suite
+  `tests/test_gdn_post_conv_prefill_reference.py
+  tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py
+  tests/test_kernel_registry.py` passed `19 passed`.
 - Add the fast vLLM/FLA-derived implementation behind the same post-conv
   boundary. The first fast attempt should either fuse post-conv prep into
   chunked prefill or call a FLA-shaped kernel without adding hot-path

@@ -4894,3 +4894,26 @@ JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/benchmark_jax_server_trace.py
 ```
 
 - result: elevated GPU run completed, but correctness failed.
+
+### Entry 130 - GDN Post-Conv FLA-Shaped Prep ABI
+
+- change accepted: factored post-conv GDN prefill preparation into
+  `prepare_gdn_post_conv_prefill_fla_inputs_from_decay`. The helper returns the
+  future-kernel ABI directly: q/k/v in `[B,T,H,D]`, gate/beta in `[B,T,H]`, and
+  per-row sequence lengths, with optional q/k L2 normalization. The existing
+  reference path still transposes those tensors into the current chunked JAX
+  fallback, so model behavior is unchanged.
+- motivation: the next FP32-preserving GDN prefill work should replace the body
+  behind the post-conv boundary, not add another model call-site rewrite. A
+  stable FLA-shaped prep helper lets a future vLLM/FLA-derived kernel consume
+  natural post-conv layout while keeping the pure-JAX correctness reference.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_prefill_reference.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_gdn_post_conv_prefill_reference.py tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py tests/test_kernel_registry.py
+```
+
+- result: elevated CUDA focused suite passed `4 passed`; neighboring GDN
+  reference suite passed `19 passed`.

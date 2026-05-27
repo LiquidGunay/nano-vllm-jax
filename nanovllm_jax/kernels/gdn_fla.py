@@ -176,7 +176,7 @@ def gdn_packed_decode_reference_from_decay(
     return output, new_state
 
 
-def gdn_post_conv_prefill_reference_from_decay(
+def prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
     conv_out: jnp.ndarray,
     a: jnp.ndarray,
     b: jnp.ndarray,
@@ -188,19 +188,14 @@ def gdn_post_conv_prefill_reference_from_decay(
     num_value_heads: int,
     key_head_dim: int,
     value_head_dim: int,
-    chunk_size: int,
-    initial_state: jnp.ndarray | None,
-    use_qk_l2norm_in_kernel: bool = True,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Pure-JAX reference for the GDN post-convolution prefill boundary.
+    normalize_qk: bool = False,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Prepare post-conv GDN prefill tensors in FLA `[B,T,H,D]` layout.
 
-    This mirrors vLLM/FLA's useful `fused_post_conv_prep` boundary while keeping
-    the current FP32 math contract and native local state layout `[B,H,V,K]`.
-    It owns split, gate construction, valid-token masking, GQA repeat, layout
-    packing, and the final call into the existing chunked reference.
+    The returned query/key tensors have value-head count after GQA repeat. This
+    is the stable ABI for a future vLLM/FLA-derived FP32 fast body; callers can
+    transpose to the legacy local `[B,H,T,D]` chunk reference as a fallback.
     """
-
-    from nanovllm_jax.model import jax_chunk_gated_delta_rule
 
     if conv_out.ndim != 3:
         raise ValueError("conv_out must have shape [batch, time, conv_dim]")
@@ -251,19 +246,70 @@ def gdn_post_conv_prefill_reference_from_decay(
     beta = jax.nn.sigmoid(b)
     gate = -decay * jax.nn.softplus(a + dt_bias)
 
-    if valid_token_mask is not None:
+    if valid_token_mask is None:
+        seq_lens = jnp.full((batch,), seq_len, dtype=jnp.int32)
+    else:
         valid = valid_token_mask.astype(jnp.bool_)
         query = jnp.where(valid[:, :, None, None], query, 0.0)
         key = jnp.where(valid[:, :, None, None], key, 0.0)
         value = jnp.where(valid[:, :, None, None], value, 0.0)
         beta = jnp.where(valid[:, :, None], beta, 0.0)
         gate = jnp.where(valid[:, :, None], gate, 0.0)
+        seq_lens = valid.astype(jnp.int32).sum(axis=1)
 
     heads_per_key = num_value_heads // num_key_heads
     if heads_per_key > 1:
         query = jnp.repeat(query, heads_per_key, axis=2)
         key = jnp.repeat(key, heads_per_key, axis=2)
 
+    if normalize_qk:
+        from nanovllm_jax.layers import l2norm
+
+        query = l2norm(query.astype(jnp.float32), axis=-1, eps=1e-6)
+        key = l2norm(key.astype(jnp.float32), axis=-1, eps=1e-6)
+
+    return query, key, value, gate, beta, seq_lens
+
+
+def gdn_post_conv_prefill_reference_from_decay(
+    conv_out: jnp.ndarray,
+    a: jnp.ndarray,
+    b: jnp.ndarray,
+    decay: jnp.ndarray,
+    dt_bias: jnp.ndarray,
+    valid_token_mask: jnp.ndarray | None,
+    *,
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    chunk_size: int,
+    initial_state: jnp.ndarray | None,
+    use_qk_l2norm_in_kernel: bool = True,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Pure-JAX reference for the GDN post-convolution prefill boundary.
+
+    This mirrors vLLM/FLA's useful `fused_post_conv_prep` boundary while keeping
+    the current FP32 math contract and native local state layout `[B,H,V,K]`.
+    It owns split, gate construction, valid-token masking, GQA repeat, layout
+    packing, and the final call into the existing chunked reference.
+    """
+
+    from nanovllm_jax.model import jax_chunk_gated_delta_rule
+
+    query, key, value, gate, beta, _ = prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
+        conv_out,
+        a,
+        b,
+        decay,
+        dt_bias,
+        valid_token_mask,
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        key_head_dim=key_head_dim,
+        value_head_dim=value_head_dim,
+        normalize_qk=False,
+    )
     query = query.transpose(0, 2, 1, 3)
     key = key.transpose(0, 2, 1, 3)
     value = value.transpose(0, 2, 1, 3)
