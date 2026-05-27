@@ -1,0 +1,303 @@
+{
+  "correctness": {
+    "checked": false,
+    "ok": true
+  },
+  "events": [
+    {
+      "completion_index": 0,
+      "elapsed_seconds": 0.029912690981291234,
+      "event": "token",
+      "request_index": 0,
+      "scheduler_step_is_decode": false,
+      "scheduler_step_tokens": 96,
+      "seq_id": 2,
+      "step_end_seconds": 0.029912690981291234,
+      "step_seconds": 0.029911550926044583,
+      "step_start_seconds": 1.1400552466511726e-06,
+      "token_id": 2438
+    },
+    {
+      "completion_index": 0,
+      "elapsed_seconds": 0.029912690981291234,
+      "event": "token",
+      "request_index": 1,
+      "scheduler_step_is_decode": false,
+      "scheduler_step_tokens": 96,
+      "seq_id": 3,
+      "step_end_seconds": 0.029912690981291234,
+      "step_seconds": 0.029911550926044583,
+      "step_start_seconds": 1.1400552466511726e-06,
+      "token_id": 16
+    },
+    {
+      "completion_index": 1,
+      "elapsed_seconds": 0.03790225205011666,
+      "event": "token",
+      "request_index": 0,
+      "scheduler_step_is_decode": true,
+      "scheduler_step_tokens": 2,
+      "seq_id": 2,
+      "step_end_seconds": 0.03790225205011666,
+      "step_seconds": 0.007976121036335826,
+      "step_start_seconds": 0.029926131013780832,
+      "token_id": 2438
+    },
+    {
+      "completion_index": 1,
+      "elapsed_seconds": 0.03790225205011666,
+      "event": "token",
+      "request_index": 1,
+      "scheduler_step_is_decode": true,
+      "scheduler_step_tokens": 2,
+      "seq_id": 3,
+      "step_end_seconds": 0.03790225205011666,
+      "step_seconds": 0.007976121036335826,
+      "step_start_seconds": 0.029926131013780832,
+      "token_id": 220
+    },
+    {
+      "completion_index": 2,
+      "elapsed_seconds": 0.045199608081020415,
+      "event": "token",
+      "request_index": 0,
+      "scheduler_step_is_decode": true,
+      "scheduler_step_tokens": 2,
+      "seq_id": 2,
+      "step_end_seconds": 0.045199608081020415,
+      "step_seconds": 0.007288646069355309,
+      "step_start_seconds": 0.037910962011665106,
+      "token_id": 2438
+    },
+    {
+      "completion_index": 2,
+      "elapsed_seconds": 0.045199608081020415,
+      "event": "token",
+      "request_index": 1,
+      "scheduler_step_is_decode": true,
+      "scheduler_step_tokens": 2,
+      "seq_id": 3,
+      "step_end_seconds": 0.045199608081020415,
+      "step_seconds": 0.007288646069355309,
+      "step_start_seconds": 0.037910962011665106,
+      "token_id": 16
+    },
+    {
+      "completion_index": 3,
+      "elapsed_seconds": 0.05242479301523417,
+      "event": "token",
+      "request_index": 0,
+      "scheduler_step_is_decode": true,
+      "scheduler_step_tokens": 2,
+      "seq_id": 2,
+      "step_end_seconds": 0.05242479301523417,
+      "step_seconds": 0.007216533995233476,
+      "step_start_seconds": 0.045208259020000696,
+      "token_id": 2438
+    },
+    {
+      "completion_tokens": 4,
+      "elapsed_seconds": 0.05242479301523417,
+      "event": "finished",
+      "request_index": 0,
+      "seq_id": 2
+    },
+    {
+      "completion_index": 3,
+      "elapsed_seconds": 0.05242479301523417,
+      "event": "token",
+      "request_index": 1,
+      "scheduler_step_is_decode": true,
+      "scheduler_step_tokens": 2,
+      "seq_id": 3,
+      "step_end_seconds": 0.05242479301523417,
+      "step_seconds": 0.007216533995233476,
+      "step_start_seconds": 0.045208259020000696,
+      "token_id": 220
+    },
+    {
+      "completion_tokens": 4,
+      "elapsed_seconds": 0.05242479301523417,
+      "event": "finished",
+      "request_index": 1,
+      "seq_id": 3
+    },
+    {
+      "elapsed_seconds": 0.05243431299459189,
+      "event": "done",
+      "results": [
+        {
+          "request_index": 0,
+          "text": "",
+          "token_ids": [
+            2438,
+            2438,
+            2438,
+            2438
+          ]
+        },
+        {
+          "request_index": 1,
+          "text": "",
+          "token_ids": [
+            16,
+            220,
+            16,
+            220
+          ]
+        }
+      ]
+    }
+  ],
+  "mtp_admission": {
+    "active_bucket": null,
+    "buckets": [],
+    "confidence_min_accept_rate": 0.75,
+    "enabled": false,
+    "probe_steps": 2
+  },
+  "performance": {
+    "generated_tokens": 8,
+    "itl_ms_mean": 7.504034011314313,
+    "itl_ms_p50": 7.297356030903757,
+    "itl_ms_p95": 7.989561068825424,
+    "itl_source": "jax_server_step_trace",
+    "output_token_throughput": 152.42641011373433,
+    "request_count": 2,
+    "request_throughput": 38.106602528433584,
+    "seconds": 0.052484343061223626,
+    "tokens_per_second": 152.42641011373433,
+    "total_input_tokens": 96,
+    "total_output_tokens": 8,
+    "total_token_throughput": 1981.5433314785464,
+    "ttft_ms_mean": 29.912690981291234,
+    "ttft_ms_p50": 29.912690981291234,
+    "ttft_ms_p95": 29.912690981291234
+  },
+  "profile_counters": null,
+  "rows": [
+    {
+      "generated_token_ids": [
+        2438,
+        2438,
+        2438,
+        2438
+      ],
+      "generated_tokens": 4,
+      "name": "len_32",
+      "output_len": 4,
+      "prompt_length": 32,
+      "topk_logprobs_by_step": []
+    },
+    {
+      "generated_token_ids": [
+        16,
+        220,
+        16,
+        220
+      ],
+      "generated_tokens": 4,
+      "name": "len_64",
+      "output_len": 4,
+      "prompt_length": 64,
+      "topk_logprobs_by_step": []
+    }
+  ],
+  "run": {
+    "issues": [],
+    "profile_enabled": false,
+    "profile_error": null,
+    "profile_path": "/mountpoint/.exp/profiles/20260527-064144-2588420-jax_server_trace",
+    "profile_started": false,
+    "run_id": "20260527-064144-2588420-jax_server_trace",
+    "run_label": "jax_server_trace",
+    "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+  },
+  "run_config": {
+    "backend": "gpu",
+    "dataset_name": "tokenized_seed_repeat",
+    "dtype": "float32",
+    "full_attention_kernel_flags": {
+      "cuda_fp32_decode_attention": false,
+      "cuda_fp32_kv_append": false,
+      "flashinfer_kv_append": false,
+      "nhd_full_attention_kv_cache": false
+    },
+    "gdn_kernel_flags": {
+      "cuda_fp32_gdn_decode": false,
+      "packed_decode_impl": "off"
+    },
+    "greedy_token_fastpath": true,
+    "input_lens": [
+      32,
+      64
+    ],
+    "jax_execution": "jit",
+    "kernel_backend": {
+      "available": true,
+      "external_kernels_enabled": false,
+      "fallback": null,
+      "implemented": true,
+      "missing_modules": [],
+      "provided_kernels": [],
+      "reason": "pure-JAX correctness backend selected",
+      "requested": "pure_jax",
+      "selected": "pure_jax"
+    },
+    "kernel_backend_external_call_counts": {},
+    "kernel_backend_external_enabled": false,
+    "kernel_backend_fallback_counts": {},
+    "kernel_backend_requested": "pure_jax",
+    "kernel_backend_resolved": "pure_jax",
+    "kernel_backend_unavailable_reason": "pure-JAX correctness backend selected",
+    "linear_chunk_size": 32,
+    "model": "Qwen/Qwen3.5-0.8B",
+    "nhd_full_attention_kv_cache_enabled": false,
+    "nhd_full_attention_kv_cache_shape": null,
+    "nhd_full_attention_layers": null,
+    "num_prompts": 2,
+    "num_speculative_tokens": 0,
+    "output_len": 4,
+    "output_lengths": [
+      4,
+      4
+    ],
+    "prompt_manifest_jsonl": null,
+    "prompt_manifest_sha256": null,
+    "prompt_source": "tokenized_seed_repeat",
+    "prompt_suite": "mixed",
+    "random_input_len": 1280,
+    "random_output_len": 16,
+    "random_range_ratio": {
+      "input": 0.0,
+      "output": 0.0
+    },
+    "seed": 0,
+    "serving_fastpath_flags": {
+      "compact_prefill_full_attn_proj": true,
+      "compact_prefill_gdn_z": true,
+      "compact_prefill_in_proj_qkv": true,
+      "compact_prefill_mlp": true,
+      "device_token_carry": false,
+      "greedy_decode_burst_steps": "1",
+      "greedy_token_fastpath": true,
+      "materialize_tied_lm_head": true
+    },
+    "weight_dtype": "bfloat16"
+  },
+  "speculative": {
+    "acceptance_rate": 0.0,
+    "bonus_tokens": 0,
+    "debug_events": [],
+    "draft_position_accepted": [],
+    "draft_position_proposed": [],
+    "drafts_accepted": 0,
+    "drafts_proposed": 0,
+    "drafts_rejected": 0,
+    "enabled": false,
+    "fallback_gated_no_spec_steps": 0,
+    "fallback_partial_rows": 0,
+    "fallback_seeded_main_steps": 0,
+    "fallback_steps": 0
+  }
+}

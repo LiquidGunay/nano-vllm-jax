@@ -4,7 +4,7 @@ from copy import copy
 from enum import Enum, auto
 from itertools import count
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional
 
 
 class SequenceStatus(Enum):
@@ -42,6 +42,9 @@ class Sequence:
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
+        self.last_token_device: Any | None = None
+        self._device_token_slots: List[tuple[int, Any]] = []
+        self._device_token_indices: set[int] = set()
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
@@ -78,7 +81,17 @@ class Sequence:
 
     @property
     def completion_token_ids(self):
+        self.materialize_device_tokens()
         return self.token_ids[self.num_prompt_tokens:]
+
+    @property
+    def has_unmaterialized_device_tokens(self) -> bool:
+        return bool(self._device_token_slots)
+
+    def block_has_unmaterialized_device_tokens(self, block_idx: int) -> bool:
+        start = block_idx * self.block_size
+        end = (block_idx + 1) * self.block_size
+        return any(start <= index < end for index in self._device_token_indices)
 
     @property
     def num_cached_blocks(self):
@@ -103,7 +116,34 @@ class Sequence:
         """Append a generated token."""
         self.token_ids.append(token_id)
         self.last_token = token_id
+        self.last_token_device = None
         self.num_tokens += 1
+
+    def append_token_device(self, token_id: Any):
+        """Append a generated token that is still resident on device."""
+        index = len(self.token_ids)
+        self.token_ids.append(0)
+        self.last_token = 0
+        self.last_token_device = token_id
+        self._device_token_slots.append((index, token_id))
+        self._device_token_indices.add(index)
+        self.num_tokens += 1
+
+    def materialize_device_tokens(self):
+        """Resolve deferred device token IDs into the Python token list."""
+        if not self._device_token_slots:
+            return
+        import jax
+        import jax.numpy as jnp
+
+        arrays = [jnp.asarray(token, dtype=jnp.int32).reshape(()) for _, token in self._device_token_slots]
+        values = [int(value) for value in jax.device_get(jnp.stack(arrays)).tolist()]
+        for (index, _), value in zip(self._device_token_slots, values):
+            self.token_ids[index] = value
+        self.last_token = self.token_ids[-1]
+        self.last_token_device = None
+        self._device_token_slots.clear()
+        self._device_token_indices.clear()
 
     def get_absolute_positions(self) -> List[int]:
         """Get absolute positions for all tokens in sequence."""

@@ -1,6 +1,7 @@
 """LLM Engine for Qwen 3.5 JAX with continuous batching."""
 
 import atexit
+import os
 from time import perf_counter
 from typing import List, Dict, Optional, Union
 from tqdm.auto import tqdm
@@ -19,6 +20,13 @@ try:
     HAS_TRANSFORMERS = True
 except ImportError:
     HAS_TRANSFORMERS = False
+
+
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
+
+
+def _device_token_carry_enabled() -> bool:
+    return os.environ.get("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "0") in _TRUE_ENV_VALUES
 
 
 class LLMEngine:
@@ -370,6 +378,12 @@ class LLMEngine:
         include_text: bool = True,
     ) -> dict:
         """Generate requests and return server-side per-token timing events."""
+        if _device_token_carry_enabled():
+            return self._generate_with_trace_deferred_tokens(
+                prompts,
+                sampling_params=sampling_params,
+                include_text=include_text,
+            )
         events = []
         results = []
         for event in self.iter_generate(
@@ -380,6 +394,118 @@ class LLMEngine:
             events.append(event)
             if event.get("event") == "done":
                 results = event.get("results", [])
+        return {
+            "results": results,
+            "events": events,
+        }
+
+    def _generate_with_trace_deferred_tokens(
+        self,
+        prompts: List[Union[str, List[int]]],
+        sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
+        *,
+        include_text: bool = True,
+    ) -> dict:
+        """Trace greedy device-token-carry runs without per-step token readback."""
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+        elif len(sampling_params) != len(prompts):
+            raise ValueError("sampling_params length must match prompts length")
+
+        request_inputs: List[List[int]] = []
+        for prompt in prompts:
+            token_ids = self._tokenize(prompt) if isinstance(prompt, str) else list(prompt)
+            if not token_ids:
+                raise ValueError("prompt must contain at least one token")
+            request_inputs.append(token_ids)
+
+        for sp in sampling_params:
+            if sp.max_tokens <= 0:
+                raise ValueError("max_tokens must be positive")
+            if sp.temperature < 0:
+                raise ValueError("temperature must be non-negative")
+            if sp.temperature != 0 or not sp.ignore_eos:
+                raise ValueError(
+                    "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY requires greedy sampling "
+                    "with ignore_eos=True"
+                )
+
+        seqs = [self.add_request(prompt, sp) for prompt, sp in zip(request_inputs, sampling_params)]
+        seq_to_request = {seq.seq_id: index for index, seq in enumerate(seqs)}
+        seen_completion_lengths = {seq.seq_id: 0 for seq in seqs}
+        emitted_finish = set()
+        stream_start = perf_counter()
+        events = []
+
+        while not self.is_finished():
+            step_start = perf_counter()
+            _, num_tokens = self.step()
+            step_end = perf_counter()
+            for seq in seqs:
+                request_index = seq_to_request[seq.seq_id]
+                previous_length = seen_completion_lengths[seq.seq_id]
+                current_length = seq.num_completion_tokens
+                if current_length > previous_length:
+                    for completion_index in range(previous_length, current_length):
+                        token_event = {
+                            "event": "token",
+                            "seq_id": seq.seq_id,
+                            "request_index": request_index,
+                            "completion_index": completion_index,
+                            "token_id": None,
+                            "elapsed_seconds": step_end - stream_start,
+                            "step_seconds": step_end - step_start,
+                            "step_start_seconds": step_start - stream_start,
+                            "step_end_seconds": step_end - stream_start,
+                            "scheduler_step_tokens": int(abs(num_tokens)),
+                            "scheduler_step_is_decode": bool(num_tokens < 0),
+                        }
+                        events.append(token_event)
+                    seen_completion_lengths[seq.seq_id] = current_length
+                if seq.is_finished and seq.seq_id not in emitted_finish:
+                    emitted_finish.add(seq.seq_id)
+                    events.append(
+                        {
+                            "event": "finished",
+                            "seq_id": seq.seq_id,
+                            "request_index": request_index,
+                            "elapsed_seconds": step_end - stream_start,
+                            "completion_tokens": seq.num_completion_tokens,
+                        }
+                    )
+
+        results = [
+            {
+                "request_index": index,
+                "text": self._detokenize(seq.completion_token_ids) if include_text else "",
+                "token_ids": [int(token) for token in seq.completion_token_ids],
+            }
+            for index, seq in enumerate(seqs)
+        ]
+        tokens_by_request = {
+            int(result["request_index"]): list(result["token_ids"])
+            for result in results
+        }
+        for event in events:
+            if event.get("event") != "token":
+                continue
+            request_tokens = tokens_by_request.get(int(event["request_index"]), [])
+            completion_index = int(event["completion_index"])
+            if completion_index < len(request_tokens):
+                token_id = int(request_tokens[completion_index])
+                event["token_id"] = token_id
+                if include_text:
+                    event["text"] = self._detokenize([token_id])
+        events.append(
+            {
+                "event": "done",
+                "elapsed_seconds": perf_counter() - stream_start,
+                "results": results,
+            }
+        )
         return {
             "results": results,
             "events": events,

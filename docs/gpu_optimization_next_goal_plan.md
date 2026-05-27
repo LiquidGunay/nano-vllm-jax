@@ -117,9 +117,12 @@ move serving state to V,K `[B,L,HV,V,K]` and adapt the pure-JAX fallback to that
 layout, rather than preserving `[B,L,HV,K,V]` as the long-term ABI.
 The current external-GDN audit says direct reuse is not a drop-in FP32 route:
 the installed vLLM/FLA prefill path rejects FP32 activation tensors, and
-FlashInfer GDN kernels are half/BF16 oriented. Keep the next real GDN step to a
-FP32-capable vLLM/FLA-shaped packed decode port/fork against the `gdn_fla`
-reference boundary before attempting segmented prefill or fused projection+GDN.
+FlashInfer GDN kernels are half/BF16 oriented. The packed decode port/fork
+against the `gdn_fla` reference boundary was implemented and rejected for
+promotion, so the next real GDN step should be a coarser post-conv prefill
+boundary: split `conv_out`, compute q/k norm, beta/gate, layout-pack tensors,
+and call the existing chunk/reference path first, then replace the chunk body
+only after the boundary is correctness-gated.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -133,8 +136,12 @@ routes width-1 cached decode through a vLLM-shaped packed boundary with
 benchmark rejected that path for promotion. A separate greedy decode-burst
 experiment also rejected a device-side multi-token decode loop: it reduced
 token readback count but lowered the full-model scan poorly and regressed
-throughput badly. The next step should return to coarser model/kernel
-boundaries, not larger source-level JAX decode loops.
+throughput badly. A narrower `NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1` experiment
+kept token IDs on device between greedy decode steps and is exact, with the
+current fastest local target throughput at `93.01 tok/s` (`0.799x` vLLM), but
+it changes streaming TTFT/ITL semantics and is still below the active target,
+so it remains default-off. The next step should return to coarser GDN
+post-conv/kernel boundaries, not larger source-level JAX decode loops.
 
 ## Baseline And Best-Run Tracking
 
@@ -184,6 +191,14 @@ Current tracked records:
   repeats, but not speed-claim-ready and far slower than default. It records
   `run_config.serving_fastpath_flags.greedy_decode_burst_steps = 16` and remains
   default-off. The one-repeat burst-2 probe was even slower at `5.57 tok/s`.
+- Current fastest default-off device-token-carry target:
+  `results/gpu_matrix_20260527_device_token_carry_vector_target.json`, `93.01
+  tok/s`, `0.799x` the stored vLLM reference, exact generated-token parity over
+  two repeats, and `NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1`. This is a fastest-run
+  marker only, not the accepted baseline: it defers token materialization until
+  the end of greedy `ignore_eos` generation, so per-token streaming TTFT/ITL
+  measurements are no longer equivalent to the default server path. It also
+  adds extra `PjRt Execute`/`MemcpyD2D` work and remains below the `0.9x` gate.
 - Current vLLM-inspired random-token manifest sidecar:
   `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
   `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
@@ -701,6 +716,16 @@ end-to-end throughput.
   required profile counters are missing. A one-repeat burst-2 probe was worse
   at `5.57 tok/s`. This rejects source-level full-model decode scans as the
   host-sync solution.
+- Device-token-carry fastest-run marker:
+  `results/gpu_matrix_20260527_device_token_carry_vector_target.json` and
+  `results/gpu_matrix_20260527_device_token_carry_vector_target.md`. The opt-in
+  `NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1` route keeps greedy token vectors on
+  device between scheduled decode calls and materializes token IDs after
+  fixed-length `ignore_eos` generation. It is exact over two repeats and raises
+  the local long-prefill target to `93.01 tok/s`, `0.799x` vLLM, but it is not
+  an accepted default because it changes streaming timing semantics, is not
+  speed-claim-ready under the current profile-counter gate, and still leaves an
+  `11.72 tok/s` gap to the `0.9x` target.
 - Current raw GPU trace summary:
   `results/profile_trace_20260527_current_goal_target_gpu.json` and
   `results/profile_trace_20260527_current_goal_target_gpu.md`. Across both
@@ -1299,8 +1324,12 @@ paged_prefill_attention_gqa_nhd(
   loop or similar scheduler dependency change; the first opt-in greedy
   decode-burst attempt proved this is not enough if implemented as a source-level
   JAX scan around the full model. It stayed exact and reduced readback count, but
-  lowered into a much slower graph. Do not continue this path without a backend-
-  owned loop/kernel boundary or a different scheduler design.
+  lowered into a much slower graph. A follow-up device-token-carry route that
+  keeps one-token greedy outputs on device between scheduler steps is exact and
+  modestly faster for offline fixed-length throughput, but it defers token
+  materialization and therefore is not equivalent to the streaming server timing
+  contract. Do not continue host-sync work as the primary path without a
+  backend-owned loop/kernel boundary or a deliberate offline-throughput API.
 
 ## P2.2 - `qk_norm_rope_kv_append_fused`
 

@@ -221,7 +221,8 @@ class BlockManager:
         if current_required_blocks > len(block_table):
             # Just crossed block boundary - allocate new block
             last_block = self.blocks[block_table[-1]]
-            assert last_block.hash != -1
+            if last_block.hash == -1 and not getattr(seq, "has_unmaterialized_device_tokens", False):
+                raise AssertionError("completed block hash was not recorded")
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
@@ -229,13 +230,14 @@ class BlockManager:
         if len(seq) % self.block_size == 0:
             # Completed a block - update its hash
             block_idx = len(seq) // self.block_size - 1
-            block = self.blocks[block_table[block_idx]]
-            if block.hash == -1:
-                token_ids = self._block_tokens(seq, block_idx)
-                prefix = self.blocks[block_table[block_idx - 1]].hash if block_idx > 0 else -1
-                h = self.compute_hash(token_ids, prefix)
-                block.update(h, token_ids)
-                self.hash_to_block_id[h] = block.block_id
+            if not seq.block_has_unmaterialized_device_tokens(block_idx):
+                block = self.blocks[block_table[block_idx]]
+                if block.hash == -1:
+                    token_ids = self._block_tokens(seq, block_idx)
+                    prefix = self.blocks[block_table[block_idx - 1]].hash if block_idx > 0 else -1
+                    h = self.compute_hash(token_ids, prefix)
+                    block.update(h, token_ids)
+                    self.hash_to_block_id[h] = block.block_id
 
         target_tokens = len(seq) + max(0, int(num_slots) - 1)
         required_blocks = (target_tokens + self.block_size - 1) // self.block_size
@@ -255,6 +257,8 @@ class BlockManager:
         if len(seq) % self.block_size != 0:
             return
         block_idx = len(seq) // self.block_size - 1
+        if seq.block_has_unmaterialized_device_tokens(block_idx):
+            return
         block_id = seq.block_table[block_idx]
         block = self.blocks[block_id]
         if block.hash != -1:

@@ -17,6 +17,17 @@ def _device_int32_arrays(*values):
     return jax.device_put(tuple(np.asarray(value, dtype=np.int32) for value in values))
 
 
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
+
+
+def _device_token_carry_enabled() -> bool:
+    return os.environ.get("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "0") in _TRUE_ENV_VALUES
+
+
+def _is_device_token(value) -> bool:
+    return hasattr(value, "dtype") and hasattr(value, "shape")
+
+
 class Scheduler:
     """Scheduler for continuous batching.
     
@@ -825,6 +836,7 @@ class Scheduler:
             prefill_chunk_lengths = [0] * len(seqs)
         if len(prefill_chunk_lengths) != len(seqs):
             raise ValueError("prefill_chunk_lengths must align with scheduled sequences")
+        use_device_carry = _device_token_carry_enabled()
         
         for seq, generated, prefill_chunk_len in zip(seqs, token_ids, prefill_chunk_lengths):
             is_prefill_chunk = prefill_chunk_len > 0
@@ -835,7 +847,19 @@ class Scheduler:
             finished = False
 
             for idx, token_id in enumerate(generated_tokens):
-                seq.append_token(int(token_id))
+                device_token = (
+                    use_device_carry
+                    and _is_device_token(token_id)
+                    and seq.temperature == 0
+                    and seq.ignore_eos
+                )
+                if device_token:
+                    seq.append_token_device(token_id)
+                    is_eos = False
+                else:
+                    token_id = int(token_id)
+                    seq.append_token(token_id)
+                    is_eos = (token_id == self.eos)
                 self.last_num_generated_tokens += 1
 
                 if idx < len(generated_tokens) - 1:
@@ -845,7 +869,6 @@ class Scheduler:
                 # emit the first completion token, so it must participate in
                 # max-token/EOS termination. Use >= to avoid leaking requests
                 # if a path emits more than one token in a step.
-                is_eos = (token_id == self.eos)
                 is_max_tokens = (seq.num_completion_tokens >= seq.max_tokens)
 
                 if (not seq.ignore_eos and is_eos) or is_max_tokens:

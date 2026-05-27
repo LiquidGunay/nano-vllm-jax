@@ -24,6 +24,12 @@ from nanovllm_jax.kv_cache import (
 from nanovllm_jax.mtp.mtp_layer import MTPParams, mtp_forward
 from nanovllm_jax.mtp.speculative import generate_draft_tokens, verify_draft_tokens, apply_acceptance
 
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
+
+
+def _device_token_carry_enabled() -> bool:
+    return os.environ.get("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "0") in _TRUE_ENV_VALUES
+
 
 class _LegacyModelRunner:
     """Runs JAX model with paged KV cache.
@@ -993,6 +999,8 @@ class CanonicalModelRunner:
         self._mtp1_seeded_chain: Dict[int, int] = {}
         self._mtp1_draft_debug: Dict[int, Dict[str, Any]] = {}
         self._mtp1_debug_events: List[Dict[str, Any]] = []
+        self._device_token_carry_seq_ids: tuple[int, ...] | None = None
+        self._device_token_carry_tokens: jnp.ndarray | None = None
         self.reset_speculative_stats()
         self._warmup_compiled = False
 
@@ -1146,6 +1154,56 @@ class CanonicalModelRunner:
             if slot is not None:
                 self._free_hybrid_slots.append(slot)
             self._mtp1_drafts.pop(seq_id, None)
+        if (
+            self._device_token_carry_seq_ids is not None
+            and any(seq_id in self._device_token_carry_seq_ids for seq_id in seq_ids)
+        ):
+            self._clear_device_token_carry()
+
+    def _clear_device_token_carry(self) -> None:
+        self._device_token_carry_seq_ids = None
+        self._device_token_carry_tokens = None
+
+    def _maybe_apply_device_token_carry(self, batch: ScheduledBatch) -> ScheduledBatch:
+        if (
+            not _device_token_carry_enabled()
+            or batch.is_prefill
+            or self._device_token_carry_seq_ids is None
+            or self._device_token_carry_tokens is None
+            or batch.seq_ids_host is None
+            or batch.tokens.shape[1] != 1
+            or tuple(int(seq_id) for seq_id in batch.seq_ids_host) != self._device_token_carry_seq_ids
+            or self._device_token_carry_tokens.shape[0] != batch.tokens.shape[0]
+        ):
+            return batch
+        return replace(batch, tokens=self._device_token_carry_tokens[:, None])
+
+    def _record_device_token_carry(
+        self,
+        batch: ScheduledBatch,
+        token_ids: jnp.ndarray,
+        *,
+        active_rows: list[int],
+        prefill_final_flags: list[bool],
+        seqs: List[Sequence],
+    ) -> None:
+        if (
+            not _device_token_carry_enabled()
+            or batch.seq_ids_host is None
+            or not active_rows
+            or any(seqs[row].temperature != 0 or not seqs[row].ignore_eos for row in active_rows)
+            or (
+                batch.is_prefill
+                and any(
+                    row >= len(prefill_final_flags) or not prefill_final_flags[row]
+                    for row in active_rows
+                )
+            )
+        ):
+            self._clear_device_token_carry()
+            return
+        self._device_token_carry_seq_ids = tuple(int(seq_id) for seq_id in batch.seq_ids_host)
+        self._device_token_carry_tokens = token_ids.astype(jnp.int32)
 
     def _build_scheduled_batch(self, seqs: List[Sequence], is_prefill: bool) -> ScheduledBatch:
         query_tokens: List[List[int]] = []
@@ -1833,13 +1891,14 @@ class CanonicalModelRunner:
                 )
             return jax.tree_util.tree_map(_replay_copy, value)
 
-        hybrid_state = self._batch_hybrid_state(batch)
         if batch.is_prefill:
             prefill_final_flags = list(batch.prefill_final_flags)[: len(seqs)]
             if len(prefill_final_flags) < len(seqs):
                 prefill_final_flags.extend([True] * (len(seqs) - len(prefill_final_flags)))
         else:
             prefill_final_flags = [True] * len(seqs)
+        batch = self._maybe_apply_device_token_carry(batch)
+        hybrid_state = self._batch_hybrid_state(batch)
 
         return_hidden_for_seed = bool(seed_mtp1)
         use_greedy_token_fastpath = self._can_use_greedy_token_fastpath(
@@ -1930,6 +1989,16 @@ class CanonicalModelRunner:
             for row, query_len in enumerate(query_lens)
             if query_len > 0 and seq_ids_host[row] >= 0
         ]
+        if use_greedy_token_fastpath and decode_burst_steps <= 1:
+            self._record_device_token_carry(
+                batch,
+                output.activations,
+                active_rows=active_rows,
+                prefill_final_flags=prefill_final_flags,
+                seqs=seqs,
+            )
+        else:
+            self._clear_device_token_carry()
         if batch.is_prefill and last_logits is not None:
             prefill_logits_by_seq = getattr(self, "_last_prefill_logits_by_seq", None)
             if prefill_logits_by_seq is None:
@@ -1939,7 +2008,7 @@ class CanonicalModelRunner:
                 if row in active_rows and row < len(prefill_final_flags) and prefill_final_flags[row]:
                     prefill_logits_by_seq[int(seq.seq_id)] = last_logits[row]
 
-        token_by_row: dict[int, int] = {}
+        token_by_row: dict[int, Any] = {}
         token_list_by_row: dict[int, list[int]] = {}
         if active_rows:
             if decode_burst_steps > 1:
@@ -1960,10 +2029,21 @@ class CanonicalModelRunner:
                 temperatures = jnp.array([seqs[row].temperature for row in active_rows], dtype=jnp.float32)
                 token_ids = self._sample_fn(last_logits[active_idx], temperatures)
             if decode_burst_steps <= 1:
-                token_by_row = {
-                    row: int(token_id)
-                    for row, token_id in zip(active_rows, token_ids.tolist())
-                }
+                carry_device_tokens = (
+                    use_greedy_token_fastpath
+                    and _device_token_carry_enabled()
+                    and all(seqs[row].ignore_eos for row in active_rows)
+                )
+                if carry_device_tokens:
+                    token_by_row = {
+                        row: token_ids[index]
+                        for index, row in enumerate(active_rows)
+                    }
+                else:
+                    token_by_row = {
+                        row: int(token_id)
+                        for row, token_id in zip(active_rows, token_ids.tolist())
+                    }
 
         outputs: List[int | List[int]] = []
         for row, seq in enumerate(seqs):

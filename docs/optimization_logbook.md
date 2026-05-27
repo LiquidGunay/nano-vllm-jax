@@ -4618,3 +4618,52 @@ NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS=2 JAX_PLATFORMS=cuda ... .venv/bin/pytho
 
 - result: `py_compile` passed; focused elevated CUDA tests passed
   `2 passed, 43 deselected`; both integrated probes completed and were exact.
+
+### Entry 123 - Device Token Carry Fastest-Run Marker
+
+- change tested: added an opt-in `NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1` path for
+  greedy `ignore_eos` serving. The reference/default path still materializes
+  token IDs after every scheduler step. The opt-in path keeps the greedy token
+  vector on device between one-token decode calls and materializes generated
+  token IDs only after the fixed-length request completes.
+- reference implementation: ordinary `forward_step_token_ids_jit` plus Python
+  token readback remains unchanged when the flag is off.
+- fastest implementation: the runner records the whole device token vector for
+  the previous physical batch and reuses it as the next decode batch's token
+  input when the `seq_ids_host` tuple is unchanged. Per-sequence `Sequence`
+  objects keep deferred token scalars only for final correctness/reporting.
+- smoke validation: `results/qwen08_device_token_carry_vector_smoke.json`
+  matched `results/qwen08_device_token_carry_smoke_reference.json` exactly for
+  generated tokens on the small `[32,64] x 4` CUDA smoke.
+- rejected naive variant: `results/gpu_matrix_20260527_device_token_carry_target.json`
+  used per-step scalar stack/scatter in the scheduler. It stayed exact but
+  regressed to `89.35 tok/s`, `0.768x` vLLM, with `PjRt Execute` count rising
+  to about `375`.
+- target artifact: `results/gpu_matrix_20260527_device_token_carry_vector_target.json`
+- target report: `results/gpu_matrix_20260527_device_token_carry_vector_target.md`
+- target result: exact generated-token parity over two repeats and the fastest
+  local long-prefill target observed so far at `93.01 tok/s`, `0.799x` vLLM.
+  This is still below the `0.9x` target of `104.74 tok/s`, leaving an
+  `11.72 tok/s` gap.
+- profile movement: `np.asarray(jax.Array)` drops from the older JAX reference
+  `427.55 ms` / count `16` to `0.58 ms` / count `4`, but `PjRt Execute` rises
+  to `360.71 ms` / count `255` and `MemcpyD2D` rises to `45.77 ms` / count
+  `749`. `forward_step_token_ids_jit` is roughly flat/slightly better at
+  `273.08 ms` vs `280.56 ms`.
+- decision: keep this as a default-off fastest-run marker and host-sync
+  diagnostic, but do not promote it to accepted default. It changes streaming
+  timing semantics because tokens are not materialized until request end, is not
+  speed-claim-ready under the current profile-counter gate, and does not reach
+  the `0.9x` target. The next primary speed work should follow the subagent
+  recommendation: a coarser GDN post-conv prefill boundary inspired by vLLM's
+  `fused_post_conv_prep`, not more host-token scheduling work.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/engine/sequence.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/block_manager.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/llm_engine.py benchmarks/benchmark_jax_server_trace.py
+NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1 JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/benchmark_jax_server_trace.py --input-lens 32,64 --output-len 4 --no-profile --output-json results/qwen08_device_token_carry_vector_smoke.json
+NANO_VLLM_JAX_DEVICE_TOKEN_CARRY=1 JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/run_gpu_matrix.py --goal-target-only --repeats 2 --no-live-vllm --require-stored-references --output-json results/gpu_matrix_20260527_device_token_carry_vector_target.json
+```
+
+- result: `py_compile` passed; smoke parity matched the reference token list;
+  integrated matrix run completed and was exact.

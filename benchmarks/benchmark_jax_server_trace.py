@@ -359,6 +359,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 "compact_prefill_gdn_z": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z"),
                 "compact_prefill_full_attn_proj": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ"),
                 "compact_prefill_mlp": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_MLP"),
+                "device_token_carry": _env_flag("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY"),
                 "greedy_decode_burst_steps": os.environ.get(
                     "NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS",
                     "1",
