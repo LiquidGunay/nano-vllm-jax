@@ -703,7 +703,7 @@ def gdn_packed_decode_step_fp32(
 
 
 def gdn_packed_decode_step_fp32_reference(*args: Any, **kwargs: Any):
-    from nanovllm_jax.kernels.cuda_gdn import gdn_packed_decode_reference_local_state
+    from nanovllm_jax.kernels.gdn_fla import gdn_packed_decode_reference_local_state
 
     return gdn_packed_decode_reference_local_state(*args, **kwargs)
 

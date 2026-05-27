@@ -4253,3 +4253,27 @@ JAX_PLATFORMS=cuda ... pytest -q \
   accepted without an integrated throughput win. The next meaningful step
   requires choosing an external-kernel direction: an opt-in BF16 GDN prefill
   activation experiment, or a FP32-capable vLLM/FLA-shaped GDN path.
+
+### Entry 109 - Neutral GDN FLA Packed Decode ABI Reference
+
+- change accepted: added `nanovllm_jax.kernels.gdn_fla` as the neutral home for
+  the planned vLLM/Flash Linear Attention-shaped GDN boundary. The module owns
+  the FP32 packed decode reference for
+  `mixed_qkv + a/b/A_log/dt_bias -> output, state` with native `[B,HV,V,K]`
+  recurrent state, plus fallback-only availability wrappers. No serving route
+  changed and no external kernel was enabled.
+- cleanup: focused packed-decode tests now import the pure-JAX reference from
+  `gdn_fla`, and the local CUDA FP32 diagnostic wrapper uses the same reference
+  for parity. This separates the planned production ABI from the rejected local
+  CUDA probe path.
+- validation:
+
+```text
+.venv/bin/python -m pytest -q tests/test_gdn_packed_decode_reference.py tests/test_kernel_registry.py
+```
+
+- result: `12 passed`.
+- decision: keep this as a non-speed ABI step toward the FP32-capable
+  vLLM/FLA-shaped GDN path. It does not affect the `0.9x` throughput gate; the
+  next real implementation still needs either a FP32-capable FLA-shaped kernel
+  port or an explicitly approved BF16-prefill experiment.

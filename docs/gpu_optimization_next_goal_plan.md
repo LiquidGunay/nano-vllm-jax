@@ -930,13 +930,13 @@ previous Pallas regressions, it should not be the first production path for GDN.
   accepted V,K baseline of `90.65 tok/s`. Keep it default-off as a diagnostic
   route; do not promote it to default, fast opt-in, or the next kernel
   implementation path.
-- A pure-JAX vLLM-style packed decode reference currently exists in
-  `nanovllm_jax/kernels/cuda_gdn.py` as
+- A pure-JAX vLLM-style packed decode reference exists in the neutral planned
+  backend module `nanovllm_jax/kernels/gdn_fla.py` as
   `gdn_packed_decode_reference_local_state`. It accepts packed
   `mixed_qkv [B, 2*H*K + HV*V]` plus raw `a/b/A_log/dt_bias`, computes the
   same gate/beta transform as vLLM's packed decode path, and calls the V,K
-  recurrent rule with `[B,HV,V,K]` state. This is a reference artifact, not the
-  final target serving ABI.
+  recurrent rule with `[B,HV,V,K]` state. This is a reference artifact and ABI
+  contract, not a serving route or speed path.
 - External GDN reference audit confirms vLLM/FLA's natural Qwen GDN state layout
   is k-last/V-first `[*,HV,V,K]`, and the vLLM/FLA prefill path is
   BF16-activation oriented. The explicit decision is to switch persistent GDN
@@ -954,6 +954,10 @@ previous Pallas regressions, it should not be the first production path for GDN.
   to the pure-JAX fallback until a vLLM/FLA-shaped kernel path is implemented
   and accepted. This keeps the planned production route explicit while leaving
   local CUDA GDN probes as diagnostics.
+- The `gdn_fla` module now owns the FP32 packed decode ABI reference and
+  fallback-only availability wrapper. Focused tests confirm it remains
+  unimplemented/default-off and that the packed decode reference matches the
+  current recurrent rule.
 
 ### Acceptance Gate
 
@@ -1453,6 +1457,10 @@ Commit 8:
 - ~~Add `gdn_fla`/vLLM-FLA aliases to the optional backend registry so the
   planned GDN production route is explicit and still falls back to pure JAX
   until accepted.~~ Validation: `tests/test_kernel_registry.py` `8 passed`.
+- ~~Add neutral `nanovllm_jax.kernels.gdn_fla` FP32 packed-decode ABI reference
+  so the planned vLLM/FLA contract is separate from local CUDA diagnostics.~~
+  Validation: `tests/test_gdn_packed_decode_reference.py`
+  `tests/test_kernel_registry.py` `12 passed`.
 - Compare a revised segmented prefill candidate against Entry 045 chunk-32
   baseline after it beats the full-shape GDN microbenchmark gate
 

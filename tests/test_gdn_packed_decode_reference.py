@@ -15,12 +15,15 @@ except ModuleNotFoundError:
     jax = None
     jnp = None
 else:
-    from nanovllm_jax.kernels.cuda_gdn import (
+    from nanovllm_jax.kernels.gdn_fla import (
+        availability,
         gdn_packed_decode_reference_local_state,
+        gdn_recurrent_decode_step,
         k_last_gdn_state_to_local,
         local_gdn_state_to_k_last,
         split_packed_gdn_decode_mixed_qkv,
     )
+    from nanovllm_jax.kernels.registry import KernelBackendUnavailable
     from nanovllm_jax.model import jax_recurrent_gated_delta_rule
 
 pytestmark = pytest.mark.skipif(
@@ -36,6 +39,16 @@ def _has_cuda_backend() -> bool:
         return bool(jax.devices("gpu"))
     except Exception:
         return False
+
+
+def test_gdn_fla_reference_module_is_fallback_only():
+    status = availability()
+
+    assert status.requested == "gdn_fla"
+    assert status.selected == "pure_jax"
+    assert not status.external_kernels_enabled
+    with pytest.raises(KernelBackendUnavailable):
+        gdn_recurrent_decode_step(None)
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")

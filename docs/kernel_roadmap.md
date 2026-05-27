@@ -168,6 +168,10 @@ gdn_recurrent_decode_step(
   `fla_gdn`, `vllm_fla`, and `flash_linear_attention` aliases. They are
   intentionally unimplemented and fall back to pure JAX until a vLLM/FLA-shaped
   GDN path passes the correctness and benchmark gates.
+- ABI-reference status: `nanovllm_jax/kernels/gdn_fla.py` owns the FP32
+  packed-decode reference boundary for `mixed_qkv + a/b/A_log/dt_bias` with
+  native `[B,HV,V,K]` state. This keeps the planned FLA/vLLM contract separate
+  from local CUDA diagnostic probes.
 - V,K migration status: the pure-JAX fallback now consumes and returns V,K GDN
   state directly, and the local recurrent/packed CUDA decode probes now accept
   V,K without Python-side K,V transposes. Focused CUDA tests, CUDA FFI tests, MTP
