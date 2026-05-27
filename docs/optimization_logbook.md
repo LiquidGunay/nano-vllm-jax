@@ -4208,3 +4208,25 @@ JAX_PLATFORMS=cuda ... pytest -q \
   so the next design work should address compact/ragged prefill scheduling or
   external kernel integration boundaries before assuming a narrow local probe
   will close the gap.
+
+### Entry 107 - Rejected Split Prefill/Decode Batch Buckets
+
+- experiment: tried a scheduler/static-shape split where sidecar prefill stayed
+  capped at the existing 4-row bucket while decode could use an 8-row bucket.
+  The goal was to avoid the previous `[8, 2048]` prefill OOM while cutting the
+  number of random-sidecar decode steps.
+- artifact: `results/gpu_matrix_20260527_split_decode8_smoke.json`
+- report: `results/gpu_matrix_20260527_split_decode8_smoke.md`
+- validation: the run completed with elevated GPU access and exact generated-
+  token match against its live JAX default reference, but it used only one
+  repeat and was a sidecar smoke, not a speed claim.
+- result: JAX output throughput regressed to `68.25 tok/s`, live vLLM was
+  `299.56 tok/s`, and JAX/vLLM was `0.228x`. The change reduced decode steps
+  from the prior smoke's 60 to 45 and reached max decode step sequences of 8,
+  but prefill took about `2.48 s`, decode took about `1.26 s`, `ITL p50`
+  worsened to `27.74 ms`, and `gather` plus `PjRt Execute` profile buckets
+  increased versus the live JAX reference.
+- decision: reject and revert the split-bucket scheduler path. Reducing Python
+  decode step count alone is not enough; larger decode physical buckets must
+  win integrated sidecar throughput before becoming part of the default server
+  policy.

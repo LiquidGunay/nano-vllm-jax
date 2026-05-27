@@ -96,6 +96,10 @@ documentation/configuration-first:
     They are historical ABI/correctness evidence only. The next real kernel
     route should use FlashInfer for paged KV/attention and vLLM/Flash Linear
     Attention references for GDN, with pure-JAX fallbacks.
+11. Run GPU, benchmark, profiling, vLLM, CUDA, NVIDIA, and model-serving
+    commands outside the sandbox with elevated access. The sandbox can miss
+    `/dev/nvidia*` and report false GPU communication failures. Keep all
+    benchmark/model/cache/temp paths under `/mountpoint/.exp`.
 
 Current GDN status: serving GDN is still expressed as JAX and lowered by XLA to
 GPU work; there is no accepted hand-owned GDN kernel in the default path.
@@ -582,6 +586,15 @@ end-to-end throughput.
   about `10.05 GiB`, `10.66 GiB`, and `12.57 GiB`; no result JSONs were
   produced. Treat this as evidence for a static-shape concurrency/TTFT problem
   before assuming a narrow kernel swap will close the vLLM-random sidecar gap.
+- Rejected split prefill/decode batch-bucket scheduler experiment:
+  `results/gpu_matrix_20260527_split_decode8_smoke.json` and
+  `results/gpu_matrix_20260527_split_decode8_smoke.md`. The attempt capped
+  prefill at 4 active rows while allowing decode to use an 8-row batch. It
+  reduced sidecar smoke decode steps from 60 to 45 but regressed integrated
+  output throughput to `68.25 tok/s`, `0.228x` vLLM, with `ITL p50 27.74 ms`
+  and worse `gather`/`PjRt Execute` profile buckets. Do not keep split
+  prefill/decode physical batch buckets as a default path without a new profile
+  reason and a sidecar throughput win.
 
 ## Phase 2 - Kernel Roadmap
 
