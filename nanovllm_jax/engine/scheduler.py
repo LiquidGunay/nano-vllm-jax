@@ -42,6 +42,10 @@ class Scheduler:
         )
         self.decode_lookahead_tokens = max(1, 1 + int(getattr(config, "num_speculative_tokens", 0) or 0))
         self.num_speculative_tokens = max(0, int(getattr(config, "num_speculative_tokens", 0) or 0))
+        self.greedy_decode_burst_steps = max(
+            1,
+            int(os.environ.get("NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS", "1") or "1"),
+        )
         self.mtp_min_accept_rate = float(
             os.environ.get(
                 "NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE",
@@ -229,6 +233,7 @@ class Scheduler:
             )
         
         # Phase 2: Decode - schedule running sequences
+        decode_step_counts: List[int] = []
         running_candidates = 0
         running_budget = len(self.running)
         while self.running and num_seqs < self.max_num_seqs and running_candidates < running_budget:
@@ -247,10 +252,18 @@ class Scheduler:
             )
             seq.mtp_admitted = mtp_admitted
             seq.mtp_admission_reason = self.mtp_admission_reason if mtp_admitted else "scheduler_gate"
+            remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
             lookahead_tokens = min(
                 1 + (self.num_speculative_tokens if mtp_admitted else 0),
-                max(1, seq.max_tokens - seq.num_completion_tokens),
+                remaining_tokens,
             )
+            if (
+                self.num_speculative_tokens == 0
+                and self.greedy_decode_burst_steps > 1
+                and seq.temperature == 0
+                and seq.ignore_eos
+            ):
+                lookahead_tokens = min(self.greedy_decode_burst_steps, remaining_tokens)
             while not self.block_manager.can_append_slots(seq, lookahead_tokens):
                 if self.running:
                     # Preempt a running sequence
@@ -263,12 +276,18 @@ class Scheduler:
                 # Can append - schedule for decode
                 num_seqs += 1
                 self.block_manager.may_append_slots(seq, lookahead_tokens)
+                decode_step_counts.append(int(lookahead_tokens))
                 scheduled_seqs.append(seq)
         
         if not scheduled_seqs:
             raise RuntimeError("No sequence can be scheduled; KV cache capacity is exhausted")
         self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, self.build_scheduled_batch(scheduled_seqs, is_prefill=False)
+        decode_step_count = min(decode_step_counts) if decode_step_counts else 1
+        return scheduled_seqs, self.build_scheduled_batch(
+            scheduled_seqs,
+            is_prefill=False,
+            decode_step_count=decode_step_count,
+        )
 
     def build_scheduled_batch(
         self,
@@ -279,6 +298,7 @@ class Scheduler:
         batch_size_bucket: int | None = None,
         max_blocks_per_seq: int | None = None,
         prefill_chunk_lens: List[int] | None = None,
+        decode_step_count: int = 1,
     ) -> ScheduledBatch:
         """Build the canonical engine batch contract for one step."""
         query_tokens: List[List[int]] = []
@@ -391,6 +411,7 @@ class Scheduler:
             seq_ids_host=seq_ids_host,
             query_lens_host=query_lens_host,
             seq_lens_host=seq_lens_host,
+            decode_step_count_host=1 if is_prefill else max(1, int(decode_step_count)),
         )
 
     @staticmethod

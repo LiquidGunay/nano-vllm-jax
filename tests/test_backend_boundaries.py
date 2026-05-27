@@ -1556,6 +1556,117 @@ def test_executor_jit_matches_eager_cached_decode():
     )
 
 
+def test_executor_greedy_decode_burst_matches_iterative_token_path():
+    config = _tiny_full_attention_config()
+    params = init_params(jax.random.PRNGKey(22), config)
+    executor = ModelExecutor(config, params, backend="pure_jax")
+    spec = KVCacheSpec(
+        num_layers=config.num_hidden_layers,
+        num_blocks=config.num_kvcache_blocks,
+        block_size=config.block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        dtype=config.get_dtype(),
+        max_kv_cache_bytes=config.max_kv_cache_bytes,
+    )
+    empty_hybrid = HybridLayerState(
+        conv_state=jnp.zeros((1, 0, 1, 1)),
+        recurrent_state=jnp.zeros((1, 0, 1, 1, 1)),
+    )
+    prompt_batch = _scheduled_batch(
+        tokens=[1, 2, 3],
+        positions=[0, 1, 2],
+        block_tables=[0, 1, 2],
+        seq_lens=3,
+        is_prefill=True,
+    )
+
+    ref_prompt = executor.forward_step_token_ids_jit(
+        prompt_batch,
+        cache_storage=executor.backend.allocate_kv_cache(
+            spec,
+            max_seqs=1,
+            max_blocks_per_seq=3,
+        ),
+        hybrid_state=empty_hybrid,
+    )
+    burst_prompt = executor.forward_step_token_ids_jit(
+        prompt_batch,
+        cache_storage=executor.backend.allocate_kv_cache(
+            spec,
+            max_seqs=1,
+            max_blocks_per_seq=3,
+        ),
+        hybrid_state=empty_hybrid,
+    )
+
+    def decode_batch(tokens, positions, seq_lens, *, decode_steps=1):
+        return ScheduledBatch(
+            tokens=tokens,
+            positions=positions,
+            seq_ids=jnp.array([0], dtype=jnp.int32),
+            query_start_loc=jnp.array([0, 1], dtype=jnp.int32),
+            is_prefill=False,
+            num_prefill_tokens=0,
+            num_decode_tokens=1,
+            block_tables=jnp.array([[0, 1, 2]], dtype=jnp.int32),
+            seq_lens=seq_lens,
+            seq_ids_host=(0,),
+            query_lens_host=(1,),
+            seq_lens_host=(int(np.asarray(seq_lens)[0]),),
+            decode_step_count_host=decode_steps,
+        )
+
+    ref_cache = ref_prompt.cache_storage
+    ref_hybrid = ref_prompt.hybrid_state
+    ref_tokens_in = ref_prompt.activations[:, None]
+    ref_positions = jnp.array([[3]], dtype=jnp.int32)
+    ref_seq_lens = jnp.array([4], dtype=jnp.int32)
+    ref_generated = []
+    for _ in range(3):
+        ref_out = executor.forward_step_token_ids_jit(
+            decode_batch(ref_tokens_in, ref_positions, ref_seq_lens),
+            cache_storage=ref_cache,
+            hybrid_state=ref_hybrid,
+        )
+        ref_generated.append(ref_out.activations)
+        ref_tokens_in = ref_out.activations[:, None]
+        ref_positions = ref_positions + 1
+        ref_seq_lens = ref_seq_lens + 1
+        ref_cache = ref_out.cache_storage
+        ref_hybrid = ref_out.hybrid_state
+    ref_generated = jnp.stack(ref_generated, axis=1)
+
+    burst_out = executor.forward_greedy_decode_burst_jit(
+        decode_batch(
+            burst_prompt.activations[:, None],
+            jnp.array([[3]], dtype=jnp.int32),
+            jnp.array([4], dtype=jnp.int32),
+            decode_steps=3,
+        ),
+        cache_storage=burst_prompt.cache_storage,
+        hybrid_state=burst_prompt.hybrid_state,
+        decode_steps=3,
+    )
+
+    np.testing.assert_array_equal(
+        np.asarray(burst_out.activations),
+        np.asarray(ref_generated),
+    )
+    np.testing.assert_allclose(
+        np.asarray(burst_out.cache_storage.k_cache),
+        np.asarray(ref_cache.k_cache),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(burst_out.cache_storage.v_cache),
+        np.asarray(ref_cache.v_cache),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
 def test_executor_mtp1_greedy_step_jit_matches_separate_path():
     config = _tiny_full_attention_config()
     params = init_params(jax.random.PRNGKey(12), config)

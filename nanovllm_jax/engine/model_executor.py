@@ -644,6 +644,194 @@ class ModelExecutor:
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
         )
 
+    def forward_greedy_decode_burst_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state: HybridLayerState,
+        decode_steps: int,
+    ) -> ExecutorOutput:
+        """Run several greedy decode steps inside one compiled graph.
+
+        The final emitted token is intentionally not written to the KV/GDN
+        state, matching the normal server contract: a generated token is cached
+        only when it becomes the next scheduled decode input.
+        """
+        if batch.is_prefill:
+            raise ValueError("forward_greedy_decode_burst_jit requires a decode batch")
+        if decode_steps < 1:
+            raise ValueError("decode_steps must be positive")
+        if hybrid_state.conv_state is None or hybrid_state.recurrent_state is None:
+            raise ValueError("forward_greedy_decode_burst_jit requires initialized hybrid_state")
+        self._log_step("forward_greedy_decode_burst_jit", batch, return_hidden=True, last_logits_only=False)
+        self._validate_batch_contract(batch)
+
+        key = (
+            "token-ids-burst",
+            int(decode_steps),
+            tuple(batch.tokens.shape),
+            tuple(batch.positions.shape),
+            tuple(batch.block_tables.shape),
+        )
+        if key not in self._jit_cache:
+            static_decode_steps = int(decode_steps)
+
+            def compiled(
+                params_leaves,
+                tokens,
+                positions,
+                query_start_loc,
+                block_tables,
+                seq_lens,
+                k_cache,
+                v_cache,
+                conv_state,
+                recurrent_state,
+            ):
+                params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
+                query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                active = query_lens > 0
+                num_query_tokens = query_start_loc[-1].astype(jnp.int32)
+
+                def step(carry, _):
+                    (
+                        step_tokens,
+                        step_positions,
+                        step_seq_lens,
+                        step_k_cache,
+                        step_v_cache,
+                        step_conv_state,
+                        step_recurrent_state,
+                    ) = carry
+                    step_batch = ScheduledBatch(
+                        tokens=step_tokens,
+                        positions=step_positions,
+                        seq_ids=jnp.where(
+                            active,
+                            jnp.arange(step_tokens.shape[0], dtype=jnp.int32),
+                            jnp.full((step_tokens.shape[0],), -1, dtype=jnp.int32),
+                        ),
+                        query_start_loc=query_start_loc,
+                        is_prefill=False,
+                        num_prefill_tokens=0,
+                        num_decode_tokens=num_query_tokens,
+                        block_tables=block_tables,
+                        seq_lens=step_seq_lens,
+                    )
+                    attention_metadata = self.backend.build_attention_metadata(
+                        positions=step_batch.positions,
+                        block_tables=step_batch.block_tables,
+                        seq_lens=step_batch.seq_lens,
+                        block_size=self.config.block_size,
+                        is_prefill=False,
+                        query_start_loc=step_batch.query_start_loc,
+                        num_prefill_tokens=0,
+                        num_decode_tokens=step_batch.num_decode_tokens,
+                    )
+                    kv_state = KVCacheState(
+                        k_cache=step_k_cache,
+                        v_cache=step_v_cache,
+                        block_table=step_batch.block_tables,
+                        kv_lens=step_batch.seq_lens,
+                        slot_mapping=attention_metadata.slot_mapping,
+                    )
+                    hidden, updated_kv_state, updated_hybrid_state = model_forward_step(
+                        step_batch.tokens,
+                        params,
+                        self.config,
+                        positions=step_batch.positions,
+                        kv_cache_state=kv_state,
+                        attention_metadata=attention_metadata,
+                        hybrid_state=HybridLayerState(step_conv_state, step_recurrent_state),
+                        is_prefill=False,
+                        return_hidden=True,
+                        return_hidden_with_logits=False,
+                        last_logits_only=False,
+                        backend=self.backend,
+                    )
+                    token_ids, _, _ = lm_head_token_ids_and_topk(
+                        hidden[:, :1, :],
+                        params,
+                        self.config,
+                        hidden_is_normed=False,
+                        is_prefill=False,
+                        top_k=0,
+                    )
+                    token_ids = token_ids[:, 0].astype(jnp.int32)
+                    next_tokens = token_ids[:, None]
+                    next_positions = step_positions + active[:, None].astype(step_positions.dtype)
+                    next_seq_lens = jnp.where(active, step_seq_lens + 1, step_seq_lens)
+                    return (
+                        next_tokens,
+                        next_positions,
+                        next_seq_lens,
+                        updated_kv_state.k_cache,
+                        updated_kv_state.v_cache,
+                        updated_hybrid_state.conv_state,
+                        updated_hybrid_state.recurrent_state,
+                    ), token_ids
+
+                initial = (
+                    tokens,
+                    positions,
+                    seq_lens,
+                    k_cache,
+                    v_cache,
+                    conv_state,
+                    recurrent_state,
+                )
+                final, token_ids_by_step = jax.lax.scan(
+                    step,
+                    initial,
+                    jnp.arange(static_decode_steps, dtype=jnp.int32),
+                )
+                (
+                    _tokens,
+                    _positions,
+                    _seq_lens,
+                    final_k_cache,
+                    final_v_cache,
+                    final_conv_state,
+                    final_recurrent_state,
+                ) = final
+                return (
+                    token_ids_by_step.transpose(1, 0),
+                    final_k_cache,
+                    final_v_cache,
+                    final_conv_state,
+                    final_recurrent_state,
+                )
+
+            self._jit_cache[key] = jax.jit(
+                compiled,
+                donate_argnums=(6, 7),
+            )
+
+        token_ids, k_cache, v_cache, conv_state, recurrent_state = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self._params_leaves,
+                batch.tokens,
+                batch.positions,
+                batch.query_start_loc,
+                batch.block_tables,
+                batch.seq_lens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state.conv_state,
+                hybrid_state.recurrent_state,
+            ),
+            "forward_step_token_ids_jit:decode_burst",
+        )
+        return ExecutorOutput(
+            activations=token_ids,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            attention_metadata=None,
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+        )
+
     def mtp1_greedy_step_jit(
         self,
         batch: ScheduledBatch,

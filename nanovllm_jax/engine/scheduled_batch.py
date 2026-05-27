@@ -30,6 +30,7 @@ class ScheduledBatch:
     query_lens_host: tuple[int, ...] | None = None
     seq_lens_host: tuple[int, ...] | None = None
     hybrid_slot_ids_host: tuple[int, ...] | None = None
+    decode_step_count_host: int = 1
 
     @property
     def batch_size(self) -> int:

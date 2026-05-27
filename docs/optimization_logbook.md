@@ -4575,3 +4575,46 @@ NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL=cuda_fp32 JAX_PLATFORMS=cuda ... .venv/bin/
 
 - result: `py_compile` passed; elevated CUDA focused selection passed
   `9 passed, 11 deselected`; integrated matrix run completed successfully.
+
+### Entry 122 - Rejected Greedy Decode Burst
+
+- change tested: added an opt-in
+  `NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS` path that reserves multiple decode
+  slots, runs several sequential greedy decode steps inside one JIT via
+  `forward_greedy_decode_burst_jit`, and returns a `[batch, steps]` token table
+  so Python reads token IDs once instead of once per token. The normal
+  one-token `forward_step_token_ids_jit` path remains the reference/default.
+- focused validation: the new executor burst path matches iterative
+  `forward_step_token_ids_jit` token IDs and final KV cache on a tiny
+  full-attention model.
+- target artifact: `results/gpu_matrix_20260527_decode_burst_target.json`
+- target report: `results/gpu_matrix_20260527_decode_burst_target.md`
+- target result: exact generated-token parity over two repeats, but not
+  speed-claim-ready and far slower than default. With
+  `NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS=16`, JAX reached only `17.46 tok/s`,
+  `0.150x` vLLM. The scheduler collapsed to one decode step, but that step took
+  about `3.13 s`.
+- smaller-width probe: `results/gpu_matrix_20260527_decode_burst2_probe.json`
+  used one repeat with burst width 2. It stayed exact but was worse:
+  `5.57 tok/s`, `0.048x` vLLM, with about `10.95 s` total decode-step time.
+- profile movement: token readback count did move as intended
+  (`array.py:325 tolist` and `np.asarray(jax.Array)` count `1` instead of
+  `16`), but the full-model scan introduced much more gather/transpose work and
+  enormous `PjitFunction(compiled)` / traceback overhead. This confirms the
+  readback bucket was mostly synchronizing prior work and that a source-level
+  full-model decode scan is not the right dependency-structure change.
+- decision: keep the path default-off as a diagnostic for now, reject it for
+  default/fast-opt-in promotion, and do not pursue larger source-level decode
+  bursts. A future multi-token serving loop would need a backend-owned loop or
+  different scheduler/kernel boundary.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/engine/scheduled_batch.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py benchmarks/benchmark_jax_server_trace.py tests/test_backend_boundaries.py
+JAX_PLATFORMS=cuda ... .venv/bin/python -m pytest -q tests/test_backend_boundaries.py -k 'greedy_decode_burst or executor_jit_matches_eager_cached_decode'
+NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS=16 JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/run_gpu_matrix.py --goal-target-only --repeats 2 --no-live-vllm --require-stored-references --output-json results/gpu_matrix_20260527_decode_burst_target.json
+NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS=2 JAX_PLATFORMS=cuda ... .venv/bin/python benchmarks/run_gpu_matrix.py --goal-target-only --repeats 1 --no-live-vllm --require-stored-references --output-json results/gpu_matrix_20260527_decode_burst2_probe.json
+```
+
+- result: `py_compile` passed; focused elevated CUDA tests passed
+  `2 passed, 43 deselected`; both integrated probes completed and were exact.

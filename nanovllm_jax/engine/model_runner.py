@@ -1570,6 +1570,35 @@ class CanonicalModelRunner:
                 return False
         return hasattr(self.executor, "forward_step_token_ids_jit")
 
+    def _greedy_decode_burst_steps(self, seqs: List[Sequence], batch: ScheduledBatch) -> int:
+        if batch.is_prefill:
+            return 1
+        if os.environ.get("NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS", "1") in {
+            "",
+            "0",
+            "1",
+            "false",
+            "no",
+            "off",
+            "False",
+        }:
+            return 1
+        if not hasattr(self.executor, "forward_greedy_decode_burst_jit"):
+            return 1
+        if getattr(batch, "decode_step_count_host", 1) <= 1:
+            return 1
+        if batch.query_lens_host is not None:
+            active_query_lens = list(batch.query_lens_host[: len(seqs)])
+            if any(int(length) != 1 for length in active_query_lens):
+                return 1
+        for seq in seqs:
+            if seq.temperature != 0 or not seq.ignore_eos:
+                return 1
+        remaining = [seq.max_tokens - seq.num_completion_tokens for seq in seqs]
+        if not remaining or min(remaining) <= 1:
+            return 1
+        return max(1, min(int(getattr(batch, "decode_step_count_host", 1)), min(remaining)))
+
     def _mtp1_verifier_step_fn(self):
         if getattr(self, "execution", "eager") in {"decode-jit", "jit"}:
             return self.executor.forward_step_jit
@@ -1818,7 +1847,19 @@ class CanonicalModelRunner:
             batch,
             seed_mtp1=return_hidden_for_seed,
         )
-        if use_greedy_token_fastpath:
+        decode_burst_steps = (
+            self._greedy_decode_burst_steps(seqs, batch)
+            if use_greedy_token_fastpath
+            else 1
+        )
+        if decode_burst_steps > 1:
+            output = self.executor.forward_greedy_decode_burst_jit(
+                batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=hybrid_state,
+                decode_steps=decode_burst_steps,
+            )
+        elif use_greedy_token_fastpath:
             output = self.executor.forward_step_token_ids_jit(
                 batch,
                 cache_storage=self.cache_storage,
@@ -1835,14 +1876,38 @@ class CanonicalModelRunner:
             )
         self.cache_storage = output.cache_storage
         self._store_batch_hybrid_state(batch, output.hybrid_state)
+        snapshot_batch = batch
+        if decode_burst_steps > 1:
+            active = batch.active_decode_rows
+            processed_seq_lens = jnp.where(
+                active,
+                batch.seq_lens + jnp.asarray(decode_burst_steps - 1, dtype=batch.seq_lens.dtype),
+                batch.seq_lens,
+            )
+            seq_lens_host = None
+            if batch.seq_lens_host is not None and batch.query_lens_host is not None:
+                seq_lens_host = tuple(
+                    int(length) + (decode_burst_steps - 1)
+                    if idx < len(seqs) and int(batch.query_lens_host[idx]) > 0
+                    else int(length)
+                    for idx, length in enumerate(batch.seq_lens_host)
+                )
+            snapshot_batch = replace(
+                batch,
+                seq_lens=processed_seq_lens,
+                seq_lens_host=seq_lens_host,
+            )
         if os.environ.get("NANO_VLLM_JAX_REFRESH_KV_SNAPSHOT", "0") in {"1", "true", "yes", "on", "True"}:
-            self._refresh_kv_snapshot(batch, output.hybrid_state)
+            self._refresh_kv_snapshot(snapshot_batch, output.hybrid_state)
         else:
-            self._record_kv_snapshot(batch, output.hybrid_state)
+            self._record_kv_snapshot(snapshot_batch, output.hybrid_state)
 
         last_hidden = None
         seed_hidden = None
-        if use_greedy_token_fastpath:
+        if decode_burst_steps > 1:
+            token_ids_all = output.activations[: len(seqs), :decode_burst_steps]
+            last_logits = None
+        elif use_greedy_token_fastpath:
             token_ids_all = output.activations[: len(seqs)]
             last_logits = None
         elif return_hidden_for_seed:
@@ -1875,8 +1940,17 @@ class CanonicalModelRunner:
                     prefill_logits_by_seq[int(seq.seq_id)] = last_logits[row]
 
         token_by_row: dict[int, int] = {}
+        token_list_by_row: dict[int, list[int]] = {}
         if active_rows:
-            if use_greedy_token_fastpath:
+            if decode_burst_steps > 1:
+                token_rows = token_ids_all
+                if active_rows != list(range(len(seqs))):
+                    token_rows = token_rows[jnp.array(active_rows, dtype=jnp.int32)]
+                token_list_by_row = {
+                    row: [int(token_id) for token_id in token_row]
+                    for row, token_row in zip(active_rows, token_rows.tolist())
+                }
+            elif use_greedy_token_fastpath:
                 if active_rows == list(range(len(seqs))):
                     token_ids = token_ids_all
                 else:
@@ -1885,24 +1959,26 @@ class CanonicalModelRunner:
                 active_idx = jnp.array(active_rows, dtype=jnp.int32)
                 temperatures = jnp.array([seqs[row].temperature for row in active_rows], dtype=jnp.float32)
                 token_ids = self._sample_fn(last_logits[active_idx], temperatures)
-            token_by_row = {
-                row: int(token_id)
-                for row, token_id in zip(active_rows, token_ids.tolist())
-            }
+            if decode_burst_steps <= 1:
+                token_by_row = {
+                    row: int(token_id)
+                    for row, token_id in zip(active_rows, token_ids.tolist())
+                }
 
         outputs: List[int | List[int]] = []
         for row, seq in enumerate(seqs):
-            if row not in token_by_row:
+            if row not in token_by_row and row not in token_list_by_row:
                 outputs.append([])
                 continue
-            token_id = token_by_row[row]
             if batch.is_prefill and not prefill_final_flags[row]:
                 outputs.append([])
                 continue
 
-            outputs.append(token_id)
+            emitted = token_list_by_row[row] if row in token_list_by_row else token_by_row[row]
+            outputs.append(emitted)
 
             if seed_hidden is not None:
+                token_id = emitted[0] if isinstance(emitted, list) else emitted
                 self._seed_mtp1_drafts([seq], seed_hidden[row : row + 1], [token_id])
 
         return outputs

@@ -129,9 +129,12 @@ speed-claim-ready and exact at `90.87 tok/s`, while the stored vLLM reference is
 `0.53 s` and 15 decode steps totaling about `0.17 s`. The packed-GDN decode
 route now has a selected first slice: `NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL`
 routes width-1 cached decode through a vLLM-shaped packed boundary with
-`reference` and `cuda_fp32` implementations. This is still experimental and
-default-off; the next step is an integrated exact-token benchmark before any
-default promotion or speed claim.
+`reference` and `cuda_fp32` implementations. The integrated exact-token
+benchmark rejected that path for promotion. A separate greedy decode-burst
+experiment also rejected a device-side multi-token decode loop: it reduced
+token readback count but lowered the full-model scan poorly and regressed
+throughput badly. The next step should return to coarser model/kernel
+boundaries, not larger source-level JAX decode loops.
 
 ## Baseline And Best-Run Tracking
 
@@ -175,6 +178,12 @@ Current tracked records:
   two repeats, speed-claim-ready, but slower than the current accepted/scoped
   default. It records `run_config.gdn_kernel_flags.packed_decode_impl =
   cuda_fp32` and remains default-off.
+- Current rejected greedy decode-burst target:
+  `results/gpu_matrix_20260527_decode_burst_target.json`, `17.46 tok/s`,
+  `0.150x` the stored vLLM reference, exact generated-token parity over two
+  repeats, but not speed-claim-ready and far slower than default. It records
+  `run_config.serving_fastpath_flags.greedy_decode_burst_steps = 16` and remains
+  default-off. The one-repeat burst-2 probe was even slower at `5.57 tok/s`.
 - Current vLLM-inspired random-token manifest sidecar:
   `results/gpu_matrix_20260527_vllm_random_longprefill_r2.json`,
   `84.60 tok/s`, live vLLM `353.91 tok/s`, `0.239x` vLLM, exact generated-token
@@ -682,6 +691,16 @@ end-to-end throughput.
   with a `16.33 tok/s` target gap. It reduces some named profile buckets versus
   the older configured JAX reference but regresses against the current
   accepted/scoped default, so it stays default-off.
+- Greedy decode-burst rejection:
+  `results/gpu_matrix_20260527_decode_burst_target.json` and
+  `results/gpu_matrix_20260527_decode_burst_target.md`. The opt-in
+  `NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS=16` route is exact over two repeats,
+  reduces token readback counts from 16 to 1, and runs only one decode scheduler
+  step, but throughput collapses to `17.46 tok/s`, `0.150x` vLLM. The decode
+  step takes about `3.13 s`, `gather` and `transpose` counts rise sharply, and
+  required profile counters are missing. A one-repeat burst-2 probe was worse
+  at `5.57 tok/s`. This rejects source-level full-model decode scans as the
+  host-sync solution.
 - Current raw GPU trace summary:
   `results/profile_trace_20260527_current_goal_target_gpu.json` and
   `results/profile_trace_20260527_current_goal_target_gpu.md`. Across both
@@ -1277,8 +1296,11 @@ paged_prefill_attention_gqa_nhd(
   token-id result. A follow-up subagent audit found no smaller local cleanup
   likely to reduce sync count without changing scheduler semantics. Reducing the
   sync count further likely requires a device-side multi-token greedy decode
-  loop or similar scheduler dependency change; ask for approval before starting
-  that design.
+  loop or similar scheduler dependency change; the first opt-in greedy
+  decode-burst attempt proved this is not enough if implemented as a source-level
+  JAX scan around the full model. It stayed exact and reduced readback count, but
+  lowered into a much slower graph. Do not continue this path without a backend-
+  owned loop/kernel boundary or a different scheduler design.
 
 ## P2.2 - `qk_norm_rope_kv_append_fused`
 
