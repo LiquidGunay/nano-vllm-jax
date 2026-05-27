@@ -38,7 +38,7 @@ from nanovllm_jax.kernels.cuda_fp32_ffi import (
     gdn_prefill_chunk32_normalized_fp32,
     gdn_prefill_chunk32_v64_normalized_fp32,
 )
-from nanovllm_jax.kernels.cuda_gdn import (
+from nanovllm_jax.kernels.gdn_fla import (
     gdn_segmented_prefill_chunk32_reference,
     pack_padded_gdn_inputs,
     unpack_segmented_gdn_output,

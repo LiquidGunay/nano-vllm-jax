@@ -10,7 +10,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from nanovllm_jax.kernels.cuda_gdn import (
+jax.config.update("jax_default_matmul_precision", "highest")
+
+from nanovllm_jax.kernels.gdn_fla import (
     gdn_segmented_prefill_chunk32_reference,
     pack_padded_gdn_inputs,
     unpack_segmented_gdn_output,

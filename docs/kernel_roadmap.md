@@ -120,6 +120,11 @@ paged_decode_attention_gqa_nhd(
   GDN decode remains a major model-specific target.
 - proposed source/reference implementation: Qwen 3 Next vLLM GDN path and Flash
   Linear Attention Gated DeltaNet kernels.
+- implementation note: direct reuse is not a drop-in FP32 path. The installed
+  vLLM/FLA prefill path rejects FP32 activations, and FlashInfer GDN kernels are
+  half/BF16 oriented. Use vLLM's packed decode kernel shape as the first
+  port/fork target, then revisit segmented prefill after packed decode passes
+  strict parity.
 - JAX-facing ABI:
 
 ```python
@@ -170,8 +175,9 @@ gdn_recurrent_decode_step(
   GDN path passes the correctness and benchmark gates.
 - ABI-reference status: `nanovllm_jax/kernels/gdn_fla.py` owns the FP32
   packed-decode reference boundary for `mixed_qkv + a/b/A_log/dt_bias` with
-  native `[B,HV,V,K]` state. This keeps the planned FLA/vLLM contract separate
-  from local CUDA diagnostic probes.
+  native `[B,HV,V,K]` state. It also owns the planned segmented prefill
+  `[nnz,H,D] + cu_seqlens` pack/reference/unpack helpers. This keeps the planned
+  FLA/vLLM contract separate from local CUDA diagnostic probes.
 - V,K migration status: the pure-JAX fallback now consumes and returns V,K GDN
   state directly, and the local recurrent/packed CUDA decode probes now accept
   V,K without Python-side K,V transposes. Focused CUDA tests, CUDA FFI tests, MTP

@@ -4277,3 +4277,43 @@ JAX_PLATFORMS=cuda ... pytest -q \
   vLLM/FLA-shaped GDN path. It does not affect the `0.9x` throughput gate; the
   next real implementation still needs either a FP32-capable FLA-shaped kernel
   port or an explicitly approved BF16-prefill experiment.
+
+### Entry 110 - Neutral GDN FLA Segmented Prefill ABI Reference
+
+- change accepted: extended `nanovllm_jax.kernels.gdn_fla` to own the planned
+  segmented GDN prefill ABI reference and pack/unpack helpers:
+  `[B,H,T,D] + seq_lens -> [nnz,H,D] + cu_seqlens -> [B,H,T,V]`. Existing
+  focused tests and the standalone GDN prefill benchmark now import this
+  planned FLA/vLLM-shaped contract from `gdn_fla` instead of from the local CUDA
+  diagnostic module.
+- scope: no serving route changed, no dtype changed, and no external kernel was
+  enabled. The old `cuda_gdn` helpers remain available for compatibility, but
+  new planned-backend references should live in `gdn_fla`.
+- validation:
+
+```text
+.venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py tests/test_kernel_registry.py
+.venv/bin/python -m py_compile benchmarks/benchmark_gdn_prefill_kernel.py nanovllm_jax/kernels/gdn_fla.py
+```
+
+- result: `13 passed`; `py_compile` passed.
+- decision: keep this as another non-speed ABI cleanup toward a FP32-capable
+  vLLM/FLA-shaped GDN path. It does not change the `0.9x` target status; the
+  next implementation step still needs a real FP32 kernel strategy or explicit
+  approval for BF16 prefill activation experiments.
+
+### Entry 111 - External GDN FP32 Reuse Audit
+
+- audit result: direct reuse of installed vLLM/FLA or FlashInfer GDN kernels is
+  not a drop-in route for the current BF16-weight/FP32-activation contract.
+  vLLM/FLA prefill rejects FP32 activation tensors, FlashInfer GDN prefill is
+  half/BF16 and SM90/SM100 oriented, and FlashInfer GDN decode is not a direct
+  FP32 activation route.
+- useful reference: vLLM's packed decode GDN kernel shape remains the best next
+  implementation target. It performs FP32 loads/math internally and matches the
+  repo's neutral packed-QKV boundary, but it is a Torch/vLLM Triton op tied to
+  vLLM state indexing, so nano-vLLM-JAX needs a port/fork or wrapper rather
+  than direct reuse.
+- decision: make packed decode the first real vLLM/FLA-shaped GDN kernel
+  boundary. Do not start with segmented prefill or fused projection+GDN, and do
+  not promote the historical local CUDA probes as the production route.

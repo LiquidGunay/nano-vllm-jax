@@ -110,6 +110,11 @@ audit. The next GDN kernel attempt should use Qwen 3 Next vLLM and Flash Linear
 Attention as implementation references. The GDN state-layout decision is now to
 move serving state to V,K `[B,L,HV,V,K]` and adapt the pure-JAX fallback to that
 layout, rather than preserving `[B,L,HV,K,V]` as the long-term ABI.
+The current external-GDN audit says direct reuse is not a drop-in FP32 route:
+the installed vLLM/FLA prefill path rejects FP32 activation tensors, and
+FlashInfer GDN kernels are half/BF16 oriented. Keep the next real GDN step to a
+FP32-capable vLLM/FLA-shaped packed decode port/fork against the `gdn_fla`
+reference boundary before attempting segmented prefill or fused projection+GDN.
 
 ## Baseline And Best-Run Tracking
 
@@ -942,6 +947,11 @@ previous Pallas regressions, it should not be the first production path for GDN.
   BF16-activation oriented. The explicit decision is to switch persistent GDN
   state layout to V,K while preserving the repo's BF16-weight/FP32-activation
   contract unless a separate dtype decision is made.
+- The latest external implementation audit found no direct FP32 drop-in for
+  serving GDN: vLLM/FLA prefill is BF16-oriented, FlashInfer GDN kernels are not
+  a FP32 activation route, and the useful upstream shape is vLLM's packed decode
+  kernel. Treat packed decode as the first port/fork boundary; do not start with
+  segmented prefill or fused projection+GDN.
 - A local CUDA/JAX FFI packed FP32 GDN decode core now exists as
   `gdn_packed_decode_step_fp32`. It accepts vLLM-style
   `mixed_qkv + a/b/A_log/dt_bias`, consumes native `[B,HV,V,K]` state,
@@ -958,6 +968,10 @@ previous Pallas regressions, it should not be the first production path for GDN.
   fallback-only availability wrapper. Focused tests confirm it remains
   unimplemented/default-off and that the packed decode reference matches the
   current recurrent rule.
+- The same neutral module owns the planned segmented prefill ABI reference and
+  pack/unpack helpers for `[nnz,H,D]` tensors plus `cu_seqlens`. Existing
+  segmented reference tests and the standalone prefill benchmark now import this
+  contract from `gdn_fla` instead of the local CUDA diagnostic module.
 
 ### Acceptance Gate
 
@@ -1461,6 +1475,15 @@ Commit 8:
   so the planned vLLM/FLA contract is separate from local CUDA diagnostics.~~
   Validation: `tests/test_gdn_packed_decode_reference.py`
   `tests/test_kernel_registry.py` `12 passed`.
+- ~~Move the planned segmented GDN prefill ABI reference imports to
+  `nanovllm_jax.kernels.gdn_fla` so both decode and prefill FLA-shaped
+  contracts live outside the local CUDA diagnostic module.~~ Validation:
+  `tests/test_gdn_segmented_reference.py`
+  `tests/test_gdn_packed_decode_reference.py`
+  `tests/test_kernel_registry.py` `13 passed`.
+- ~~Audit the installed vLLM/FLA and FlashInfer GDN routes for direct FP32 reuse
+  vs port/fork requirements.~~ Result: direct reuse is blocked for the FP32
+  activation contract; packed decode is the smallest next port/fork boundary.
 - Compare a revised segmented prefill candidate against Entry 045 chunk-32
   baseline after it beats the full-shape GDN microbenchmark gate
 
