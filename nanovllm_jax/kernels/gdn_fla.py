@@ -807,6 +807,93 @@ def gdn_fla_chunk_delta_h_packed_reference(
     return h, v_new, final_state
 
 
+def gdn_fla_chunk_fwd_o_packed_reference(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    v_new: jnp.ndarray,
+    h: jnp.ndarray,
+    gate_cumsum: jnp.ndarray | None,
+    cu_seqlens: Any,
+    *,
+    chunk_size: int,
+    chunk_indices: Any | None = None,
+    scale: float | None = None,
+) -> jnp.ndarray:
+    """Reference for FLA `chunk_fwd_o` over packed varlen tensors."""
+
+    if query.ndim != 3 or key.ndim != 3:
+        raise ValueError("query and key must have shape [nnz_tokens, key_heads, key_dim]")
+    if v_new.ndim != 3:
+        raise ValueError("v_new must have shape [nnz_tokens, output_heads, value_dim]")
+    if h.ndim != 4:
+        raise ValueError("h must have shape [num_chunks, output_heads, value_dim, key_dim]")
+    if query.shape != key.shape:
+        raise ValueError("query and key shapes must match")
+    if query.shape[0] != v_new.shape[0]:
+        raise ValueError("query and v_new token counts must match")
+    if h.shape[1] != v_new.shape[1]:
+        raise ValueError("h and v_new output heads must match")
+    if h.shape[2] != v_new.shape[2] or h.shape[3] != query.shape[2]:
+        raise ValueError("h value/key dimensions must match v_new/query")
+    if gate_cumsum is not None and gate_cumsum.shape != v_new.shape[:2]:
+        raise ValueError("gate_cumsum must have shape [nnz_tokens, output_heads]")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    key_heads = query.shape[1]
+    output_heads = v_new.shape[1]
+    if output_heads < key_heads or output_heads % key_heads != 0:
+        raise ValueError("output_heads must be a multiple of key_heads")
+    if scale is None:
+        scale = float(query.shape[-1] ** -0.5)
+
+    offsets = np.asarray(jax.device_get(cu_seqlens), dtype=np.int64).reshape(-1)
+    if len(offsets) == 0 or offsets[0] != 0:
+        raise ValueError("cu_seqlens must start with 0")
+    if np.any(offsets[1:] < offsets[:-1]):
+        raise ValueError("cu_seqlens must be non-decreasing")
+    if int(offsets[-1]) != query.shape[0]:
+        raise ValueError("last cu_seqlens entry must equal token count")
+    if chunk_indices is None:
+        chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size)
+    chunk_index_values = np.asarray(jax.device_get(chunk_indices), dtype=np.int64)
+    if chunk_index_values.ndim != 2 or chunk_index_values.shape[1] != 2:
+        raise ValueError("chunk_indices must have shape [num_chunks, 2]")
+    if h.shape[0] != len(chunk_index_values):
+        raise ValueError("h first dimension must equal number of chunks")
+
+    head_group = output_heads // key_heads
+    output = jnp.zeros(v_new.shape, dtype=jnp.float32)
+    for flat_chunk, (row, chunk) in enumerate(chunk_index_values):
+        if row < 0 or row + 1 >= len(offsets):
+            raise ValueError("chunk_indices row is out of range")
+        chunk_start = int(offsets[row]) + int(chunk) * int(chunk_size)
+        chunk_end = min(int(offsets[row + 1]), chunk_start + int(chunk_size))
+        if chunk_start < int(offsets[row]) or chunk_start >= int(offsets[row + 1]):
+            raise ValueError("chunk_indices chunk is out of range for row")
+        length = chunk_end - chunk_start
+        causal = jnp.tril(jnp.ones((length, length), dtype=jnp.float32), k=0)
+        for head in range(output_heads):
+            key_head = head // head_group
+            chunk_query = query[chunk_start:chunk_end, key_head, :].astype(jnp.float32)
+            chunk_key = key[chunk_start:chunk_end, key_head, :].astype(jnp.float32)
+            chunk_v_new = v_new[chunk_start:chunk_end, head, :].astype(jnp.float32)
+            state = h[flat_chunk, head].astype(jnp.float32)
+            state_out = chunk_query @ state.T
+            attention = chunk_query @ chunk_key.T
+            if gate_cumsum is not None:
+                chunk_gate = gate_cumsum[chunk_start:chunk_end, head].astype(
+                    jnp.float32
+                )
+                state_out = state_out * jnp.exp(chunk_gate)[:, None]
+                attention = attention * jnp.exp(
+                    chunk_gate[:, None] - chunk_gate[None, :]
+                )
+            attention = attention * causal
+            chunk_output = (state_out + attention @ chunk_v_new) * float(scale)
+            output = output.at[chunk_start:chunk_end, head, :].set(chunk_output)
+    return output
+
+
 def pack_padded_gdn_inputs(
     query: jnp.ndarray,
     key: jnp.ndarray,

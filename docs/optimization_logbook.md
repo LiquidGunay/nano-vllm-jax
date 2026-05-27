@@ -5300,3 +5300,29 @@ JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m
   `chunk_offsets=[0,0,2,4]`, prior-state `h`, ungated `v_new`, gate-rescaled
   state updates, grouped output heads over two key heads, and final-state
   parity including the zero-length row.
+
+### Entry 145 - FLA Chunk-Fwd-O Reference
+
+- change accepted: added `gdn_fla_chunk_fwd_o_packed_reference`, a JAX-side
+  reference for vLLM/FLA's `chunk_fwd_o` output stage over packed varlen
+  tensors.
+- decision: this completes the scalar/reference decomposition of the vLLM/FLA
+  prefill chunk body. The reference records the output-stage contract:
+  query-to-prior-state output plus causal intra-chunk attention over ungated
+  `v_new`, with optional gate scaling, grouped output-head to key-head mapping,
+  and explicit output scale.
+- validation:
+
+```text
+.venv/bin/python -m py_compile nanovllm_jax/kernels/gdn_fla.py tests/test_gdn_segmented_reference.py
+git diff --check
+.venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py -k 'chunk_fwd_o or chunk_delta_h or recompute_w_u or solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata'
+JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m pytest -q tests/test_gdn_segmented_reference.py -k 'chunk_fwd_o or chunk_delta_h or recompute_w_u or solve_tril or chunk_scaled_dot_kkt or chunk_local_cumsum or chunk_metadata or segmented_gdn_prefill_reference_matches_padded_chunk32'
+```
+
+- result: static checks passed, the local focused selection passed
+  `8 passed, 1 deselected`, and the elevated CUDA focused selection passed
+  `9 passed`. The new test covers ragged `cu_seqlens=[0,0,5,13]`, grouped
+  output heads over two key heads, gate scaling for state and intra-chunk terms,
+  causal inclusive masking, explicit output scaling, and composition with the
+  previous packed FLA reference stages.

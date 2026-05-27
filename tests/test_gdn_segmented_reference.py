@@ -14,6 +14,7 @@ jax.config.update("jax_default_matmul_precision", "highest")
 
 from nanovllm_jax.kernels.gdn_fla import (
     gdn_fla_chunk_delta_h_packed_reference,
+    gdn_fla_chunk_fwd_o_packed_reference,
     gdn_fla_chunk_local_cumsum_packed_reference,
     gdn_fla_chunk_scaled_dot_kkt_packed_reference,
     gdn_fla_recompute_w_u_packed_reference,
@@ -355,6 +356,99 @@ def test_gdn_fla_chunk_delta_h_packed_reference_matches_formula():
         rtol=1e-5,
         atol=1e-6,
     )
+
+
+def test_gdn_fla_chunk_fwd_o_packed_reference_matches_formula():
+    cu_seqlens = jnp.array([0, 0, 5, 13], dtype=jnp.int32)
+    chunk_indices, chunk_offsets = prepare_gdn_fla_chunk_metadata(
+        cu_seqlens,
+        chunk_size=4,
+    )
+    query = jnp.arange(13 * 2 * 3, dtype=jnp.float32).reshape(13, 2, 3) * 0.015
+    key = jnp.arange(13 * 2 * 3, dtype=jnp.float32).reshape(13, 2, 3) * 0.01
+    value = jnp.arange(13 * 4 * 5, dtype=jnp.float32).reshape(13, 4, 5) * 0.02
+    beta = jnp.linspace(0.2, 0.7, 13 * 4, dtype=jnp.float32).reshape(13, 4)
+    gate = jnp.linspace(-0.25, 0.25, 13 * 4, dtype=jnp.float32).reshape(13, 4)
+    initial_state = (
+        jnp.arange(3 * 4 * 5 * 3, dtype=jnp.float32).reshape(3, 4, 5, 3) * 0.001
+    )
+    attention_matrix = gdn_fla_chunk_scaled_dot_kkt_packed_reference(
+        key,
+        beta,
+        gate,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+    )
+    attention_inverse = gdn_fla_solve_tril_packed_reference(
+        attention_matrix,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+    )
+    w, u = gdn_fla_recompute_w_u_packed_reference(
+        key,
+        value,
+        beta,
+        gate,
+        attention_inverse,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+    )
+    h, v_new, _ = gdn_fla_chunk_delta_h_packed_reference(
+        key,
+        w,
+        u,
+        gate,
+        cu_seqlens,
+        initial_state,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+    )
+
+    actual = gdn_fla_chunk_fwd_o_packed_reference(
+        query,
+        key,
+        v_new,
+        h,
+        gate,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+        scale=0.7,
+    )
+
+    expected = np.zeros((13, 4, 5), dtype=np.float32)
+    query_np = np.asarray(query)
+    key_np = np.asarray(key)
+    v_new_np = np.asarray(v_new)
+    h_np = np.asarray(h)
+    gate_np = np.asarray(gate)
+    chunk_index_values = np.asarray(chunk_indices)
+    offsets = [0, 0, 5, 13]
+    for flat_chunk, (row, chunk) in enumerate(chunk_index_values):
+        start = offsets[row] + chunk * 4
+        end = min(offsets[row + 1], start + 4)
+        length = end - start
+        causal = np.tril(np.ones((length, length), dtype=np.float32), k=0)
+        for head in range(4):
+            key_head = head // 2
+            chunk_query = query_np[start:end, key_head, :].astype(np.float32)
+            chunk_key = key_np[start:end, key_head, :].astype(np.float32)
+            state = h_np[flat_chunk, head].astype(np.float32)
+            state_out = chunk_query @ state.T
+            attention = chunk_query @ chunk_key.T
+            chunk_gate = gate_np[start:end, head].astype(np.float32)
+            state_out *= np.exp(chunk_gate)[:, None]
+            attention *= np.exp(chunk_gate[:, None] - chunk_gate[None, :])
+            attention *= causal
+            expected[start:end, head, :] = (
+                state_out + attention @ v_new_np[start:end, head, :]
+            ) * 0.7
+
+    np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")

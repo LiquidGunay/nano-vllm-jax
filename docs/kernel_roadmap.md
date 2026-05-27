@@ -327,6 +327,10 @@ gdn_segmented_prefill_chunk32(
   `chunk_indices` for per-sequence chunk traversal, stores prior chunk states
   in `h`, stores ungated `v_new`, and applies gate-rescaled deltas to the FP32
   final state.
+- chunk-fwd-o status: `gdn_fla_chunk_fwd_o_packed_reference` defines the final
+  FLA chunk-body output stage. It combines query-to-prior-state output with
+  causal intra-chunk attention over ungated `v_new`, with optional gate scaling
+  and grouped output-head to key-head mapping.
 - SM86 port note: on the current A10G host, vLLM's Hopper/TMA branches are not
   active. The local target should therefore mirror the non-TMA FLA path first.
   Preserve FP32 gate/beta/state; vLLM rejects FP32 q/k/v in its Torch wrapper,
