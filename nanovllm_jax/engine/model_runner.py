@@ -1001,6 +1001,7 @@ class CanonicalModelRunner:
         self._mtp1_debug_events: List[Dict[str, Any]] = []
         self._device_token_carry_seq_ids: tuple[int, ...] | None = None
         self._device_token_carry_tokens: jnp.ndarray | None = None
+        self._device_token_carry_by_seq_id: dict[int, DeviceTokenRef] = {}
         self.reset_speculative_stats()
         self._warmup_compiled = False
 
@@ -1154,29 +1155,49 @@ class CanonicalModelRunner:
             if slot is not None:
                 self._free_hybrid_slots.append(slot)
             self._mtp1_drafts.pop(seq_id, None)
-        if (
-            self._device_token_carry_seq_ids is not None
-            and any(seq_id in self._device_token_carry_seq_ids for seq_id in seq_ids)
-        ):
+        carry_by_seq_id = getattr(self, "_device_token_carry_by_seq_id", {})
+        if carry_by_seq_id and any(seq_id in carry_by_seq_id for seq_id in seq_ids):
             self._clear_device_token_carry()
 
     def _clear_device_token_carry(self) -> None:
         self._device_token_carry_seq_ids = None
         self._device_token_carry_tokens = None
+        self._device_token_carry_by_seq_id = {}
 
     def _maybe_apply_device_token_carry(self, batch: ScheduledBatch) -> ScheduledBatch:
         if (
             not _device_token_carry_enabled()
             or batch.is_prefill
-            or self._device_token_carry_seq_ids is None
-            or self._device_token_carry_tokens is None
+            or not getattr(self, "_device_token_carry_by_seq_id", {})
             or batch.seq_ids_host is None
             or batch.tokens.shape[1] != 1
-            or tuple(int(seq_id) for seq_id in batch.seq_ids_host) != self._device_token_carry_seq_ids
-            or self._device_token_carry_tokens.shape[0] != batch.tokens.shape[0]
         ):
             return batch
-        return replace(batch, tokens=self._device_token_carry_tokens[:, None])
+
+        carried_seq_ids = getattr(self, "_device_token_carry_seq_ids", None)
+        carried_tokens = getattr(self, "_device_token_carry_tokens", None)
+        tokens = batch.tokens
+
+        if (
+            carried_seq_ids is not None
+            and tuple(batch.seq_ids_host) == carried_seq_ids
+            and carried_tokens is not None
+        ):
+            token_vector = jnp.asarray(carried_tokens, dtype=jnp.int32).reshape(-1)
+            if token_vector.shape[0] == int(tokens.shape[0]):
+                return replace(batch, tokens=token_vector[:, None])
+
+        applied = False
+        for row, seq_id in enumerate(batch.seq_ids_host):
+            token_ref = self._device_token_carry_by_seq_id.get(int(seq_id))
+            if token_ref is None:
+                continue
+            token_vector = jnp.asarray(token_ref.tokens, dtype=jnp.int32).reshape(-1)
+            tokens = tokens.at[row, 0].set(token_vector[int(token_ref.row)])
+            applied = True
+        if not applied:
+            return batch
+        return replace(batch, tokens=tokens)
 
     def _record_device_token_carry(
         self,
@@ -1191,7 +1212,7 @@ class CanonicalModelRunner:
             not _device_token_carry_enabled()
             or batch.seq_ids_host is None
             or not active_rows
-            or any(seqs[row].temperature != 0 or not seqs[row].ignore_eos for row in active_rows)
+            or any(row >= len(seqs) or seqs[row].temperature != 0 or not seqs[row].ignore_eos for row in active_rows)
             or (
                 batch.is_prefill
                 and any(
@@ -1202,8 +1223,21 @@ class CanonicalModelRunner:
         ):
             self._clear_device_token_carry()
             return
-        self._device_token_carry_seq_ids = tuple(int(seq_id) for seq_id in batch.seq_ids_host)
-        self._device_token_carry_tokens = token_ids.astype(jnp.int32)
+        token_ids = token_ids.astype(jnp.int32)
+        full_batch_tokens = int(token_ids.shape[0]) == int(batch.tokens.shape[0])
+        carry_by_seq_id: dict[int, DeviceTokenRef] = {}
+        for active_index, row in enumerate(active_rows):
+            seq_id = int(batch.seq_ids_host[row])
+            if seq_id < 0:
+                continue
+            token_row = row if full_batch_tokens else active_index
+            carry_by_seq_id[seq_id] = DeviceTokenRef(tokens=token_ids, row=token_row)
+        if not carry_by_seq_id:
+            self._clear_device_token_carry()
+            return
+        self._device_token_carry_seq_ids = tuple(carry_by_seq_id)
+        self._device_token_carry_tokens = token_ids
+        self._device_token_carry_by_seq_id = carry_by_seq_id
 
     def _build_scheduled_batch(self, seqs: List[Sequence], is_prefill: bool) -> ScheduledBatch:
         query_tokens: List[List[int]] = []

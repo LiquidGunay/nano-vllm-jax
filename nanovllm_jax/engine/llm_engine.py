@@ -5,7 +5,7 @@ import os
 from time import perf_counter
 from typing import List, Dict, Optional, Union
 from tqdm.auto import tqdm
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.kv_cache import KVCacheSpec, cap_num_kv_cache_blocks
@@ -27,6 +27,25 @@ _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
 
 def _device_token_carry_enabled() -> bool:
     return os.environ.get("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "0") in _TRUE_ENV_VALUES
+
+
+def _overlapped_streaming_token_prefetch_enabled() -> bool:
+    return os.environ.get("NANO_VLLM_JAX_OVERLAPPED_STREAMING_TOKEN_PREFETCH", "0") in _TRUE_ENV_VALUES
+
+
+def _offline_streaming_token_events_enabled() -> bool:
+    return os.environ.get("NANO_VLLM_JAX_OFFLINE_STREAMING_TOKEN_EVENTS", "0") in _TRUE_ENV_VALUES
+
+
+@dataclass(frozen=True)
+class _DeferredTokenStreamRecord:
+    slots: tuple
+    target_completion_lengths: dict[int, int]
+    step_seconds: float
+    step_start_seconds: float
+    step_end_seconds: float
+    scheduler_step_tokens: int
+    scheduler_step_is_decode: bool
 
 
 class LLMEngine:
@@ -314,6 +333,19 @@ class LLMEngine:
                 raise ValueError("temperature must be non-negative")
 
         seqs = [self.add_request(prompt, sp) for prompt, sp in zip(request_inputs, sampling_params)]
+        if _offline_streaming_token_events_enabled():
+            yield from self._iter_generate_offline_token_events(
+                seqs,
+                include_text=include_text,
+            )
+            return
+        if _device_token_carry_enabled() and _overlapped_streaming_token_prefetch_enabled():
+            yield from self._iter_generate_deferred_tokens(
+                seqs,
+                include_text=include_text,
+            )
+            return
+
         seq_to_request = {seq.seq_id: index for index, seq in enumerate(seqs)}
         seen_completion_lengths = {seq.seq_id: 0 for seq in seqs}
         emitted_finish = set()
@@ -369,6 +401,233 @@ class LLMEngine:
                 for index, seq in enumerate(seqs)
             ],
         }
+
+    def _iter_generate_offline_token_events(
+        self,
+        seqs: List[Sequence],
+        *,
+        include_text: bool = True,
+    ):
+        """Yield deferred token events while deferring host token IDs until finish.
+
+        This mode intentionally avoids materializing generated tokens every step,
+        trading per-step streaming IDs for exact final completion output.
+        """
+        seq_to_request = {seq.seq_id: index for index, seq in enumerate(seqs)}
+        seen_completion_lengths = {seq.seq_id: 0 for seq in seqs}
+        emitted_finish = set()
+        stream_start = perf_counter()
+
+        while not self.is_finished():
+            step_start = perf_counter()
+            _, num_tokens = self.step()
+            step_end = perf_counter()
+
+            for seq in seqs:
+                request_index = seq_to_request[seq.seq_id]
+                previous_length = seen_completion_lengths[seq.seq_id]
+                current_length = seq.num_completion_tokens
+                if current_length > previous_length:
+                    for completion_index in range(previous_length, current_length):
+                        token_event = {
+                            "event": "token",
+                            "seq_id": seq.seq_id,
+                            "request_index": request_index,
+                            "completion_index": completion_index,
+                            "token_id": None,
+                            "elapsed_seconds": step_end - stream_start,
+                            "step_seconds": step_end - step_start,
+                            "step_start_seconds": step_start - stream_start,
+                            "step_end_seconds": step_end - stream_start,
+                            "scheduler_step_tokens": int(abs(num_tokens)),
+                            "scheduler_step_is_decode": bool(num_tokens < 0),
+                        }
+                        if include_text:
+                            token_event["text"] = ""
+                        yield token_event
+                    seen_completion_lengths[seq.seq_id] = current_length
+                if seq.is_finished and seq.seq_id not in emitted_finish:
+                    emitted_finish.add(seq.seq_id)
+                    yield {
+                        "event": "finished",
+                        "seq_id": seq.seq_id,
+                        "request_index": request_index,
+                        "elapsed_seconds": step_end - stream_start,
+                        "completion_tokens": current_length,
+                    }
+
+        Sequence.materialize_device_tokens_for_sequences(seqs)
+        yield {
+            "event": "done",
+            "elapsed_seconds": perf_counter() - stream_start,
+            "results": [
+                {
+                    "request_index": index,
+                    "text": self._detokenize(seq.completion_token_ids) if include_text else "",
+                    "token_ids": [int(token) for token in seq.completion_token_ids],
+                }
+                for index, seq in enumerate(seqs)
+            ],
+        }
+
+    def _iter_generate_deferred_tokens(
+        self,
+        seqs: List[Sequence],
+        *,
+        include_text: bool = True,
+    ):
+        """Yield streaming events after overlapping device-token host copies.
+
+        The newest token snapshot remains deferred while the next scheduler
+        step runs. Once that next step completes, the older prefetched snapshot
+        is materialized and emitted. This keeps the behavior default-off and
+        preserves generation order while avoiding the normal per-step
+        ``completion_token_ids`` sync.
+        """
+        seq_to_request = {seq.seq_id: index for index, seq in enumerate(seqs)}
+        seen_completion_lengths = {seq.seq_id: 0 for seq in seqs}
+        emitted_finish = set()
+        stream_start = perf_counter()
+        pending_records: list[_DeferredTokenStreamRecord] = []
+        snapshotted_completion_lengths = {seq.seq_id: 0 for seq in seqs}
+
+        while not self.is_finished():
+            step_start = perf_counter()
+            _, num_tokens = self.step()
+            step_end = perf_counter()
+
+            slots = Sequence.snapshot_new_device_token_slots_for_sequences(
+                seqs,
+                snapshotted_completion_lengths,
+            )
+            if slots:
+                slots = Sequence.prefetch_device_token_slots(slots)
+            target_completion_lengths = {
+                int(seq.seq_id): int(seq.num_completion_tokens)
+                for seq in seqs
+            }
+            snapshotted_completion_lengths.update(target_completion_lengths)
+            pending_records.append(
+                _DeferredTokenStreamRecord(
+                    slots=slots,
+                    target_completion_lengths=target_completion_lengths,
+                    step_seconds=step_end - step_start,
+                    step_start_seconds=step_start - stream_start,
+                    step_end_seconds=step_end - stream_start,
+                    scheduler_step_tokens=int(abs(num_tokens)),
+                    scheduler_step_is_decode=bool(num_tokens < 0),
+                )
+            )
+
+            while len(pending_records) > 1:
+                record = pending_records.pop(0)
+                yield from self._emit_deferred_stream_record(
+                    seqs,
+                    record,
+                    seq_to_request=seq_to_request,
+                    seen_completion_lengths=seen_completion_lengths,
+                    emitted_finish=emitted_finish,
+                    include_text=include_text,
+                )
+
+        while pending_records:
+            record = pending_records.pop(0)
+            yield from self._emit_deferred_stream_record(
+                seqs,
+                record,
+                seq_to_request=seq_to_request,
+                seen_completion_lengths=seen_completion_lengths,
+                emitted_finish=emitted_finish,
+                include_text=include_text,
+            )
+        Sequence.materialize_device_tokens_for_sequences(seqs)
+        final_record = _DeferredTokenStreamRecord(
+            slots=(),
+            target_completion_lengths={
+                int(seq.seq_id): int(seq.num_completion_tokens)
+                for seq in seqs
+            },
+            step_seconds=0.0,
+            step_start_seconds=perf_counter() - stream_start,
+            step_end_seconds=perf_counter() - stream_start,
+            scheduler_step_tokens=0,
+            scheduler_step_is_decode=False,
+        )
+        yield from self._emit_deferred_stream_record(
+            seqs,
+            final_record,
+            seq_to_request=seq_to_request,
+            seen_completion_lengths=seen_completion_lengths,
+            emitted_finish=emitted_finish,
+            include_text=include_text,
+        )
+        yield {
+            "event": "done",
+            "elapsed_seconds": perf_counter() - stream_start,
+            "results": [
+                {
+                    "request_index": index,
+                    "text": self._detokenize(seq.completion_token_ids) if include_text else "",
+                    "token_ids": [int(token) for token in seq.completion_token_ids],
+                }
+                for index, seq in enumerate(seqs)
+            ],
+        }
+
+    def _emit_deferred_stream_record(
+        self,
+        seqs: List[Sequence],
+        record: _DeferredTokenStreamRecord,
+        *,
+        seq_to_request: dict[int, int],
+        seen_completion_lengths: dict[int, int],
+        emitted_finish: set[int],
+        include_text: bool,
+    ):
+        Sequence.materialize_device_token_slots(record.slots)
+        for seq in seqs:
+            seq_id = int(seq.seq_id)
+            request_index = seq_to_request[seq_id]
+            materialized = seq.materialized_completion_token_ids()
+            target_length = min(
+                int(record.target_completion_lengths.get(seq_id, len(materialized))),
+                len(materialized),
+            )
+            previous_length = int(seen_completion_lengths[seq_id])
+            if target_length > previous_length:
+                for offset, token_id in enumerate(materialized[previous_length:target_length]):
+                    completion_index = previous_length + offset
+                    token_event = {
+                        "event": "token",
+                        "seq_id": seq.seq_id,
+                        "request_index": request_index,
+                        "completion_index": completion_index,
+                        "token_id": int(token_id),
+                        "elapsed_seconds": record.step_end_seconds,
+                        "step_seconds": record.step_seconds,
+                        "step_start_seconds": record.step_start_seconds,
+                        "step_end_seconds": record.step_end_seconds,
+                        "scheduler_step_tokens": record.scheduler_step_tokens,
+                        "scheduler_step_is_decode": record.scheduler_step_is_decode,
+                    }
+                    if include_text:
+                        token_event["text"] = self._detokenize([int(token_id)])
+                    yield token_event
+                seen_completion_lengths[seq_id] = target_length
+            if (
+                seq.is_finished
+                and seq_id not in emitted_finish
+                and not seq.has_unmaterialized_device_tokens
+                and seen_completion_lengths[seq_id] >= seq.num_completion_tokens
+            ):
+                emitted_finish.add(seq_id)
+                yield {
+                    "event": "finished",
+                    "seq_id": seq.seq_id,
+                    "request_index": request_index,
+                    "elapsed_seconds": record.step_end_seconds,
+                    "completion_tokens": seq.num_completion_tokens,
+                }
 
     def generate_with_trace(
         self,

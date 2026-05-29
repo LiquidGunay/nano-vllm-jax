@@ -352,12 +352,28 @@ def compare_jax_to_hf(args: argparse.Namespace) -> None:
         "jax_backend": jax.default_backend(),
         "jax_version": jax.__version__,
         "gdn_kernel_flags": {
+            "packed_decode_impl": os.environ.get(
+                "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
+                "off",
+            ),
+            "packed_decode_qkv_dtype": os.environ.get(
+                "NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE",
+                "fp32",
+            ),
             "prefill_post_conv_impl": os.environ.get(
                 "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
                 "off",
             ),
             "prefill_act_dtype": os.environ.get(
                 "NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE",
+                "fp32",
+            ),
+            "prefill_qkv_dtype": os.environ.get(
+                "NANO_VLLM_JAX_GDN_PREFILL_QKV_DTYPE",
+                os.environ.get("NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE", "fp32"),
+            ),
+            "prefill_post_conv_output_dtype": os.environ.get(
+                "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE",
                 "fp32",
             ),
         },

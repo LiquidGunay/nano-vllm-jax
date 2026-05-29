@@ -7,6 +7,7 @@ activation math and native V,K recurrent state.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import jax
@@ -24,6 +25,217 @@ def require_available() -> None:
     status = availability()
     if not status.external_kernels_enabled:
         raise KernelBackendUnavailable(status.reason)
+
+
+_GDN_QKV_PREFILL_DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
+_GDN_FLA_ACCUMULATOR_DTYPE = jnp.dtype(jnp.float32)
+
+
+@dataclass(frozen=True)
+class GDNFlaPrefillKernelInputs:
+    """Validated FLA/vLLM-style GDN prefill boundary.
+
+    Future external kernels should consume this contract directly: q/k/v are
+    either BF16 or FP32 in `[B,T,H,D]`, while gate, beta, state, and outputs
+    stay FP32.
+    """
+
+    query: jnp.ndarray
+    key: jnp.ndarray
+    value: jnp.ndarray
+    gate: jnp.ndarray
+    beta: jnp.ndarray
+    seq_lens: jnp.ndarray
+    initial_state: jnp.ndarray
+
+
+def _dtype_names(dtypes: tuple[jnp.dtype, ...]) -> str:
+    return " or ".join(str(dtype) for dtype in dtypes)
+
+
+def _require_dtype(name: str, array: jnp.ndarray, allowed: tuple[jnp.dtype, ...]) -> None:
+    actual = jnp.dtype(array.dtype)
+    if actual not in allowed:
+        raise ValueError(f"{name} must be {_dtype_names(allowed)}, got {actual}")
+
+
+def _require_prepared_fla_prefill_dtypes(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    gate: jnp.ndarray,
+    beta: jnp.ndarray,
+    initial_state: jnp.ndarray,
+) -> None:
+    """Guard the FLA prefill contract: optional BF16 q/k/v, FP32 accumulators."""
+
+    _require_dtype("query", query, _GDN_QKV_PREFILL_DTYPES)
+    if jnp.dtype(key.dtype) != jnp.dtype(query.dtype):
+        raise ValueError("key dtype must match query dtype")
+    if jnp.dtype(value.dtype) != jnp.dtype(query.dtype):
+        raise ValueError("value dtype must match query dtype")
+    _require_dtype("gate", gate, (jnp.dtype(jnp.float32),))
+    _require_dtype("beta", beta, (jnp.dtype(jnp.float32),))
+    _require_dtype("initial_state", initial_state, (jnp.dtype(jnp.float32),))
+
+
+def _require_gdn_packed_decode_reference_dtypes(
+    mixed_qkv: jnp.ndarray,
+    a: jnp.ndarray,
+    b: jnp.ndarray,
+    decay: jnp.ndarray,
+    dt_bias: jnp.ndarray,
+    state: jnp.ndarray,
+) -> None:
+    _require_dtype("a", a, (_GDN_FLA_ACCUMULATOR_DTYPE,))
+    _require_dtype("b", b, (_GDN_FLA_ACCUMULATOR_DTYPE,))
+    _require_dtype("decay", decay, (_GDN_FLA_ACCUMULATOR_DTYPE,))
+    _require_dtype("dt_bias", dt_bias, (_GDN_FLA_ACCUMULATOR_DTYPE,))
+    _require_dtype("state", state, (_GDN_FLA_ACCUMULATOR_DTYPE,))
+
+
+def prepare_gdn_packed_decode_reference_from_decay_inputs(
+    mixed_qkv: jnp.ndarray,
+    a: jnp.ndarray,
+    b: jnp.ndarray,
+    decay: jnp.ndarray,
+    dt_bias: jnp.ndarray,
+    state: jnp.ndarray,
+    *,
+    qkv_dtype: Any,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Validate and cast the packed decode reference boundary inputs."""
+
+    if mixed_qkv.ndim != 2:
+        raise ValueError("mixed_qkv must have shape [batch, packed_dim]")
+    if a.ndim != 2:
+        raise ValueError("a must have shape [batch, value_heads]")
+    if b.ndim != 2:
+        raise ValueError("b must have shape [batch, value_heads]")
+    if decay.ndim != 1:
+        raise ValueError("decay must have shape [value_heads]")
+    if dt_bias.ndim != 1:
+        raise ValueError("dt_bias must have shape [value_heads]")
+    if state.ndim != 4:
+        raise ValueError("state must have shape [batch, heads, value_dim, key_dim]")
+
+    _require_gdn_packed_decode_reference_dtypes(
+        mixed_qkv,
+        a,
+        b,
+        decay,
+        dt_bias,
+        state,
+    )
+    normalized_qkv_dtype = _normalize_gdn_fla_prefill_qkv_dtype(qkv_dtype)
+    return (
+        mixed_qkv.astype(normalized_qkv_dtype),
+        a.astype(_GDN_FLA_ACCUMULATOR_DTYPE),
+        b.astype(_GDN_FLA_ACCUMULATOR_DTYPE),
+        decay.astype(_GDN_FLA_ACCUMULATOR_DTYPE),
+        dt_bias.astype(_GDN_FLA_ACCUMULATOR_DTYPE),
+        state.astype(_GDN_FLA_ACCUMULATOR_DTYPE),
+    )
+
+
+def _normalize_gdn_fla_prefill_qkv_dtype(dtype: Any) -> jnp.dtype:
+    if isinstance(dtype, str):
+        normalized = dtype.lower()
+        if normalized in {"bf16", "bfloat16"}:
+            return jnp.dtype(jnp.bfloat16)
+        if normalized in {"fp32", "float32"}:
+            return jnp.dtype(jnp.float32)
+    actual = jnp.dtype(dtype)
+    if actual not in _GDN_QKV_PREFILL_DTYPES:
+        raise ValueError(
+            "qkv_dtype must be "
+            f"{_dtype_names(_GDN_QKV_PREFILL_DTYPES)}, got {actual}"
+        )
+    return actual
+
+
+def prepare_gdn_fla_prefill_kernel_inputs(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    gate: jnp.ndarray,
+    beta: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    initial_state: jnp.ndarray,
+    *,
+    qkv_dtype: Any,
+) -> GDNFlaPrefillKernelInputs:
+    """Validate and cast the future external GDN prefill kernel boundary.
+
+    The only dtype conversion this helper performs is q/k/v to the requested
+    kernel input dtype. Accumulators and recurrent state must already be FP32,
+    so accidental BF16 gate/beta/state paths fail before a backend is called.
+    """
+
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("query, key, and value must have shape [batch, time, heads, dim]")
+    if gate.ndim != 3 or beta.ndim != 3:
+        raise ValueError("gate and beta must have shape [batch, time, heads]")
+    if seq_lens.ndim != 1:
+        raise ValueError("seq_lens must have shape [batch]")
+    if not np.issubdtype(np.dtype(seq_lens.dtype), np.integer):
+        raise ValueError("seq_lens must have an integer dtype")
+    if key.shape != query.shape:
+        raise ValueError("query and key shapes must match")
+    if value.shape[:3] != query.shape[:3]:
+        raise ValueError("value must match query [batch, time, heads]")
+    if gate.shape != query.shape[:3] or beta.shape != query.shape[:3]:
+        raise ValueError("gate and beta must have shape [batch, time, heads]")
+
+    batch, _, num_heads, key_dim = query.shape
+    value_dim = value.shape[-1]
+    if seq_lens.shape != (batch,):
+        raise ValueError("seq_lens must have shape [batch]")
+    if initial_state.shape != (batch, num_heads, value_dim, key_dim):
+        raise ValueError("initial_state must have shape [batch, heads, value_dim, key_dim]")
+
+    normalized_qkv_dtype = _normalize_gdn_fla_prefill_qkv_dtype(qkv_dtype)
+    prepared = GDNFlaPrefillKernelInputs(
+        query=query.astype(normalized_qkv_dtype),
+        key=key.astype(normalized_qkv_dtype),
+        value=value.astype(normalized_qkv_dtype),
+        gate=gate,
+        beta=beta,
+        seq_lens=seq_lens.astype(jnp.int32),
+        initial_state=initial_state,
+    )
+    _require_prepared_fla_prefill_dtypes(
+        prepared.query,
+        prepared.key,
+        prepared.value,
+        prepared.gate,
+        prepared.beta,
+        prepared.initial_state,
+    )
+    return prepared
+
+
+def validate_gdn_fla_prefill_kernel_output(
+    output: jnp.ndarray,
+    final_state: jnp.ndarray,
+    inputs: GDNFlaPrefillKernelInputs,
+) -> None:
+    """Validate the FP32 output side of the FLA/vLLM GDN prefill boundary."""
+
+    expected_output_shape = inputs.value.shape
+    expected_state_shape = inputs.initial_state.shape
+    if output.shape != expected_output_shape:
+        raise ValueError(
+            "output must have shape [batch, time, heads, value_dim], "
+            f"got {output.shape}, expected {expected_output_shape}"
+        )
+    if final_state.shape != expected_state_shape:
+        raise ValueError(
+            "final_state must have shape [batch, heads, value_dim, key_dim], "
+            f"got {final_state.shape}, expected {expected_state_shape}"
+        )
+    _require_dtype("output", output, (_GDN_FLA_ACCUMULATOR_DTYPE,))
+    _require_dtype("final_state", final_state, (_GDN_FLA_ACCUMULATOR_DTYPE,))
 
 
 def gdn_recurrent_decode_step(*args: Any, **kwargs: Any):
@@ -124,6 +336,7 @@ def gdn_packed_decode_reference_from_decay(
     dt_bias: jnp.ndarray,
     state: jnp.ndarray,
     *,
+    qkv_dtype: Any = jnp.float32,
     use_qk_l2norm_in_kernel: bool = True,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Pure-JAX packed GDN decode reference using local positive decay `A`.
@@ -136,8 +349,22 @@ def gdn_packed_decode_reference_from_decay(
 
     from nanovllm_jax.model import jax_recurrent_gated_delta_rule
 
-    if state.ndim != 4:
-        raise ValueError("state must have shape [batch, heads, value_dim, key_dim]")
+    (
+        mixed_qkv,
+        a,
+        b,
+        decay,
+        dt_bias,
+        state,
+    ) = prepare_gdn_packed_decode_reference_from_decay_inputs(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        decay=decay,
+        dt_bias=dt_bias,
+        state=state,
+        qkv_dtype=qkv_dtype,
+    )
     batch, num_value_heads, value_dim, key_dim = state.shape
     if mixed_qkv.shape[0] != batch:
         raise ValueError("mixed_qkv batch must match state batch")
@@ -161,6 +388,9 @@ def gdn_packed_decode_reference_from_decay(
         repeat = num_value_heads // num_q_heads
         query = jnp.repeat(query, repeat, axis=1)
         key = jnp.repeat(key, repeat, axis=1)
+    query = query.astype(jnp.float32)
+    key = key.astype(jnp.float32)
+    value = value.astype(jnp.float32)
 
     gate = -decay.astype(jnp.float32)[None, :] * jax.nn.softplus(a.astype(jnp.float32) + dt_bias[None, :])
     beta = jax.nn.sigmoid(b).astype(jnp.float32)
@@ -173,7 +403,7 @@ def gdn_packed_decode_reference_from_decay(
         initial_state=state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
-    return output, new_state
+    return output.astype(jnp.float32), new_state
 
 
 def prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
@@ -292,25 +522,24 @@ def gdn_fla_prefill_chunk32_fp32_reference(
 
     from nanovllm_jax.model import jax_chunk_gated_delta_rule
 
-    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
-        raise ValueError("query, key, and value must have shape [batch, time, heads, dim]")
-    if gate.ndim != 3 or beta.ndim != 3:
-        raise ValueError("gate and beta must have shape [batch, time, heads]")
-    if key.shape != query.shape:
-        raise ValueError("query and key shapes must match")
-    if value.shape[:3] != query.shape[:3]:
-        raise ValueError("value must match query [batch, time, heads]")
-
+    inputs = prepare_gdn_fla_prefill_kernel_inputs(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        seq_lens,
+        initial_state,
+        qkv_dtype=query.dtype,
+    )
+    query = inputs.query
+    key = inputs.key
+    value = inputs.value
+    gate = inputs.gate
+    beta = inputs.beta
+    seq_lens = inputs.seq_lens
+    initial_state = inputs.initial_state
     batch, seq_len, num_heads, key_dim = query.shape
-    value_dim = value.shape[-1]
-    if gate.shape != (batch, seq_len, num_heads):
-        raise ValueError("gate must have shape [batch, time, heads]")
-    if beta.shape != (batch, seq_len, num_heads):
-        raise ValueError("beta must have shape [batch, time, heads]")
-    if seq_lens.shape != (batch,):
-        raise ValueError("seq_lens must have shape [batch]")
-    if initial_state.shape != (batch, num_heads, value_dim, key_dim):
-        raise ValueError("initial_state must have shape [batch, heads, value_dim, key_dim]")
 
     valid = jnp.arange(seq_len, dtype=jnp.int32)[None, :] < seq_lens.astype(jnp.int32)[:, None]
     query = jnp.where(valid[:, :, None, None], query.astype(jnp.float32), 0.0)
@@ -330,7 +559,9 @@ def gdn_fla_prefill_chunk32_fp32_reference(
         output_final_state=True,
         use_qk_l2norm_in_kernel=False,
     )
-    return output.transpose(0, 2, 1, 3), final_state
+    output = output.transpose(0, 2, 1, 3)
+    validate_gdn_fla_prefill_kernel_output(output, final_state, inputs)
+    return output, final_state
 
 
 def gdn_post_conv_prefill_reference_from_decay(
@@ -607,6 +838,98 @@ def gdn_fla_solve_tril_packed_reference(
             inverse = jnp.linalg.inv(identity + matrix)
             output = output.at[chunk_start:chunk_end, head, :length].set(inverse)
     return output
+
+
+def _vllm_like_quantize_inverse_block(
+    block: np.ndarray,
+    *,
+    output_dtype: str,
+) -> np.ndarray:
+    if output_dtype == "bfloat16":
+        return np.asarray(jnp.asarray(block, dtype=jnp.bfloat16), dtype=np.float32)
+    if output_dtype == "float32":
+        return np.asarray(block, dtype=np.float32)
+    raise ValueError(f"unsupported output_dtype: {output_dtype}")
+
+
+def _vllm_like_inverse_i_plus_strict_lower(
+    strict_lower: np.ndarray,
+    *,
+    output_dtype: str,
+) -> np.ndarray:
+    n = strict_lower.shape[0]
+    if n <= 16:
+        inv = np.linalg.inv(np.eye(n, dtype=np.float32) + strict_lower.astype(np.float32))
+        return _vllm_like_quantize_inverse_block(inv, output_dtype=output_dtype)
+    split = 16 if n <= 32 else 32
+    a11 = strict_lower[:split, :split]
+    a22 = strict_lower[split:, split:]
+    a21 = strict_lower[split:, :split]
+    inv11 = _vllm_like_inverse_i_plus_strict_lower(a11, output_dtype=output_dtype)
+    inv22 = _vllm_like_inverse_i_plus_strict_lower(a22, output_dtype=output_dtype)
+    inv21 = -(inv22 @ a21.astype(np.float32)) @ inv11
+    inv = np.zeros((n, n), dtype=np.float32)
+    inv[:split, :split] = inv11
+    inv[split:, split:] = inv22
+    inv[split:, :split] = inv21
+    return _vllm_like_quantize_inverse_block(inv, output_dtype=output_dtype)
+
+
+def gdn_fla_solve_tril_packed_vllm_like_reference(
+    attention_matrix: jnp.ndarray,
+    cu_seqlens: Any,
+    *,
+    chunk_size: int,
+    chunk_indices: Any | None = None,
+    output_dtype: str = "bfloat16",
+) -> jnp.ndarray:
+    """Probe-only vLLM-like `solve_tril` approximation over packed chunk matrices.
+
+    This keeps local default reference behavior untouched. It approximates vLLM
+    solve numerics by:
+    1) recursively merging 16->32->64 lower-triangular blocks, and
+    2) quantizing the inverse block to the requested output dtype at each merge.
+    """
+
+    if attention_matrix.ndim != 3:
+        raise ValueError("attention_matrix must have shape [nnz_tokens, heads, chunk_size]")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if attention_matrix.shape[-1] != chunk_size:
+        raise ValueError("attention_matrix last dimension must equal chunk_size")
+    if output_dtype not in {"bfloat16", "float32"}:
+        raise ValueError("output_dtype must be 'bfloat16' or 'float32'")
+    offsets = np.asarray(jax.device_get(cu_seqlens), dtype=np.int64).reshape(-1)
+    if len(offsets) == 0 or offsets[0] != 0:
+        raise ValueError("cu_seqlens must start with 0")
+    if np.any(offsets[1:] < offsets[:-1]):
+        raise ValueError("cu_seqlens must be non-decreasing")
+    if int(offsets[-1]) != attention_matrix.shape[0]:
+        raise ValueError("last cu_seqlens entry must equal token count")
+    if chunk_indices is None:
+        chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size)
+    chunk_index_values = np.asarray(jax.device_get(chunk_indices), dtype=np.int64)
+    if chunk_index_values.ndim != 2 or chunk_index_values.shape[1] != 2:
+        raise ValueError("chunk_indices must have shape [num_chunks, 2]")
+
+    output = np.zeros(attention_matrix.shape, dtype=np.float32)
+    attention_np = np.asarray(jax.device_get(attention_matrix), dtype=np.float32)
+    for row, chunk in chunk_index_values:
+        if row < 0 or row + 1 >= len(offsets):
+            raise ValueError("chunk_indices row is out of range")
+        chunk_start = int(offsets[row]) + int(chunk) * int(chunk_size)
+        chunk_end = min(int(offsets[row + 1]), chunk_start + int(chunk_size))
+        if chunk_start < int(offsets[row]) or chunk_start >= int(offsets[row + 1]):
+            raise ValueError("chunk_indices chunk is out of range for row")
+        length = chunk_end - chunk_start
+        for head in range(attention_matrix.shape[1]):
+            strict_lower = attention_np[chunk_start:chunk_end, head, :length]
+            inv = _vllm_like_inverse_i_plus_strict_lower(
+                strict_lower,
+                output_dtype=output_dtype,
+            )
+            output[chunk_start:chunk_end, head, :length] = inv
+    return jnp.asarray(output, dtype=jnp.float32)
 
 
 def gdn_fla_recompute_w_u_packed_reference(
@@ -925,6 +1248,7 @@ def gdn_fla_chunk_gated_delta_rule_packed_reference(
         raise ValueError("last cu_seqlens entry must equal token count")
     if initial_state.shape[:2] != (len(offsets) - 1, query.shape[1]):
         raise ValueError("initial_state batch/head dimensions must match cu_seqlens/query")
+    _require_prepared_fla_prefill_dtypes(query, key, value, gate, beta, initial_state)
 
     if use_qk_l2norm_in_kernel:
         from nanovllm_jax.layers import l2norm
@@ -1155,8 +1479,25 @@ def gdn_fla_prefill_varlen_reference(
     reference, then unpacks the valid outputs back to `[B,T,H,V]`.
     """
 
+    inputs = prepare_gdn_fla_prefill_kernel_inputs(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        seq_lens,
+        initial_state,
+        qkv_dtype=query.dtype,
+    )
     packed_query, packed_key, packed_value, packed_gate, packed_beta, cu_seqlens = (
-        pack_prepared_gdn_prefill_inputs(query, key, value, gate, beta, seq_lens)
+        pack_prepared_gdn_prefill_inputs(
+            inputs.query,
+            inputs.key,
+            inputs.value,
+            inputs.gate,
+            inputs.beta,
+            inputs.seq_lens,
+        )
     )
     packed_output, final_state = gdn_segmented_prefill_chunk32_reference(
         packed_query,
@@ -1165,14 +1506,73 @@ def gdn_fla_prefill_varlen_reference(
         packed_beta,
         packed_gate,
         cu_seqlens,
-        initial_state,
+        inputs.initial_state,
         chunk_size=chunk_size,
         use_qk_l2norm_in_kernel=False,
     )
-    return (
-        unpack_prepared_gdn_prefill_output(packed_output, cu_seqlens, query.shape[1]),
-        final_state,
+    output = unpack_prepared_gdn_prefill_output(
+        packed_output,
+        cu_seqlens,
+        inputs.query.shape[1],
     )
+    validate_gdn_fla_prefill_kernel_output(output, final_state, inputs)
+    return output, final_state
+
+
+def gdn_fla_prefill_varlen_composed_reference(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    gate: jnp.ndarray,
+    beta: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    initial_state: jnp.ndarray,
+    *,
+    chunk_size: int = 64,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Pure-JAX composed FLA reference for packed varlen prefill tensors.
+
+    This route keeps the older rectangular reference contract intact while
+    exercising the staged vLLM/FLA-style chunk pipeline end to end.
+    """
+
+    inputs = prepare_gdn_fla_prefill_kernel_inputs(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        seq_lens,
+        initial_state,
+        qkv_dtype=query.dtype,
+    )
+    packed_query, packed_key, packed_value, packed_gate, packed_beta, cu_seqlens = (
+        pack_prepared_gdn_prefill_inputs(
+            inputs.query,
+            inputs.key,
+            inputs.value,
+            inputs.gate,
+            inputs.beta,
+            inputs.seq_lens,
+        )
+    )
+    packed_output, final_state = gdn_fla_chunk_gated_delta_rule_packed_reference(
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_gate,
+        packed_beta,
+        cu_seqlens,
+        inputs.initial_state,
+        chunk_size=chunk_size,
+    )
+    output = unpack_prepared_gdn_prefill_output(
+        packed_output,
+        cu_seqlens,
+        inputs.query.shape[1],
+    )
+    validate_gdn_fla_prefill_kernel_output(output, final_state, inputs)
+    return output, final_state
 
 
 def unpack_segmented_gdn_output(
@@ -1238,6 +1638,13 @@ def gdn_segmented_prefill_chunk32_reference(
     batch = len(offsets) - 1
     if initial_state.shape[:2] != (batch, query.shape[1]):
         raise ValueError("initial_state batch/head dimensions must match cu_seqlens/query")
+    _require_prepared_fla_prefill_dtypes(query, key, value, gate, beta, initial_state)
+    query = query.astype(jnp.float32)
+    key = key.astype(jnp.float32)
+    value = value.astype(jnp.float32)
+    gate = gate.astype(jnp.float32)
+    beta = beta.astype(jnp.float32)
+    initial_state = initial_state.astype(jnp.float32)
 
     output_parts = []
     final_states = []

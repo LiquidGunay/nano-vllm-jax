@@ -31,6 +31,15 @@ class DeviceTokenRef:
     row: int
 
 
+@dataclass(frozen=True)
+class DeviceTokenSlot:
+    """Snapshot of one deferred token slot in a sequence."""
+
+    seq: Any
+    index: int
+    token: Any
+
+
 class Sequence:
     """Represents a sequence being generated."""
     
@@ -93,6 +102,22 @@ class Sequence:
         return self.token_ids[self.num_prompt_tokens:]
 
     @property
+    def num_materialized_completion_tokens(self) -> int:
+        """Return the contiguous completion prefix that is already on host."""
+        completion_start = self.num_prompt_tokens
+        completion_end = self.num_tokens
+        for index in sorted(self._device_token_indices):
+            if index >= completion_start:
+                completion_end = min(completion_end, index)
+                break
+        return max(0, completion_end - completion_start)
+
+    def materialized_completion_token_ids(self) -> List[int]:
+        """Return only the contiguous completion prefix that does not sync."""
+        completion_end = self.num_prompt_tokens + self.num_materialized_completion_tokens
+        return self.token_ids[self.num_prompt_tokens:completion_end]
+
+    @property
     def has_unmaterialized_device_tokens(self) -> bool:
         return bool(self._device_token_slots)
 
@@ -142,29 +167,76 @@ class Sequence:
         self.materialize_device_tokens_for_sequences([self])
 
     @staticmethod
+    def snapshot_device_token_slots_for_sequences(seqs: List["Sequence"]) -> tuple[DeviceTokenSlot, ...]:
+        """Capture currently deferred token slots without resolving them."""
+        slots: List[DeviceTokenSlot] = []
+        for seq in seqs:
+            for index, token in seq._device_token_slots:
+                slots.append(DeviceTokenSlot(seq=seq, index=index, token=token))
+        return tuple(slots)
+
+    @staticmethod
+    def snapshot_new_device_token_slots_for_sequences(
+        seqs: List["Sequence"],
+        min_completion_lengths: dict[int, int],
+    ) -> tuple[DeviceTokenSlot, ...]:
+        """Capture deferred slots added after each sequence's known prefix."""
+        slots: List[DeviceTokenSlot] = []
+        for seq in seqs:
+            min_index = seq.num_prompt_tokens + int(min_completion_lengths.get(int(seq.seq_id), 0))
+            for index, token in seq._device_token_slots:
+                if index >= min_index:
+                    slots.append(DeviceTokenSlot(seq=seq, index=index, token=token))
+        return tuple(slots)
+
+    @staticmethod
+    def prefetch_device_token_slots(slots: tuple[DeviceTokenSlot, ...]) -> tuple[DeviceTokenSlot, ...]:
+        """Ask JAX to start host transfer for the arrays referenced by a slot snapshot."""
+        seen_arrays: set[int] = set()
+        for slot in slots:
+            token = slot.token.tokens if isinstance(slot.token, DeviceTokenRef) else slot.token
+            token_id = id(token)
+            if token_id in seen_arrays:
+                continue
+            seen_arrays.add(token_id)
+            copy_to_host_async = getattr(token, "copy_to_host_async", None)
+            if copy_to_host_async is not None:
+                copy_to_host_async()
+        return slots
+
+    @staticmethod
     def materialize_device_tokens_for_sequences(seqs: List["Sequence"]):
         """Resolve deferred device token IDs for multiple sequences in one sync."""
-        entries: List[tuple["Sequence", int]] = []
+        Sequence.materialize_device_token_slots(
+            Sequence.snapshot_device_token_slots_for_sequences(seqs)
+        )
+
+    @staticmethod
+    def materialize_device_token_slots(slots: tuple[DeviceTokenSlot, ...]):
+        """Resolve only the deferred token slots captured by ``slots``."""
+        entries: List[DeviceTokenSlot] = []
         scalar_entries: List[int] = []
         scalar_arrays = []
         vector_entries: List[tuple[int, int, int]] = []
         vector_arrays = []
         vector_slots: dict[int, int] = {}
-        for seq in seqs:
-            for index, token in seq._device_token_slots:
-                entries.append((seq, index))
-                entry_index = len(entries) - 1
-                if isinstance(token, DeviceTokenRef):
-                    vector_id = id(token.tokens)
-                    vector_slot = vector_slots.get(vector_id)
-                    if vector_slot is None:
-                        vector_slot = len(vector_arrays)
-                        vector_slots[vector_id] = vector_slot
-                        vector_arrays.append(token.tokens)
-                    vector_entries.append((entry_index, vector_slot, int(token.row)))
-                else:
-                    scalar_entries.append(entry_index)
-                    scalar_arrays.append(token)
+        for slot in slots:
+            seq = slot.seq
+            if not any(index == slot.index and token is slot.token for index, token in seq._device_token_slots):
+                continue
+            entries.append(slot)
+            entry_index = len(entries) - 1
+            if isinstance(slot.token, DeviceTokenRef):
+                vector_id = id(slot.token.tokens)
+                vector_slot = vector_slots.get(vector_id)
+                if vector_slot is None:
+                    vector_slot = len(vector_arrays)
+                    vector_slots[vector_id] = vector_slot
+                    vector_arrays.append(slot.token.tokens)
+                vector_entries.append((entry_index, vector_slot, int(slot.token.row)))
+            else:
+                scalar_entries.append(entry_index)
+                scalar_arrays.append(slot.token)
         if not scalar_arrays and not vector_arrays:
             return
 
@@ -185,18 +257,29 @@ class Sequence:
 
         touched: List["Sequence"] = []
         seen: set[int] = set()
-        for entry_index, (seq, index) in enumerate(entries):
+        materialized_by_seq: dict[int, set[tuple[int, int]]] = {}
+        for entry_index, slot in enumerate(entries):
             value = values_by_entry[entry_index]
-            seq.token_ids[index] = value
+            seq = slot.seq
+            seq.token_ids[slot.index] = value
+            materialized_by_seq.setdefault(id(seq), set()).add((slot.index, id(slot.token)))
             seq_id = id(seq)
             if seq_id not in seen:
                 touched.append(seq)
                 seen.add(seq_id)
         for seq in touched:
+            materialized = materialized_by_seq[id(seq)]
+            seq._device_token_slots = [
+                (index, token)
+                for index, token in seq._device_token_slots
+                if (index, id(token)) not in materialized
+            ]
+            seq._device_token_indices = {index for index, _ in seq._device_token_slots}
             seq.last_token = seq.token_ids[-1]
-            seq.last_token_device = None
-            seq._device_token_slots.clear()
-            seq._device_token_indices.clear()
+            if seq._device_token_slots and seq._device_token_slots[-1][0] == len(seq.token_ids) - 1:
+                seq.last_token_device = seq._device_token_slots[-1][1]
+            else:
+                seq.last_token_device = None
 
     def get_absolute_positions(self) -> List[int]:
         """Get absolute positions for all tokens in sequence."""

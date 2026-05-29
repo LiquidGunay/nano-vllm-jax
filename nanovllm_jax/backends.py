@@ -13,6 +13,7 @@ from typing import Protocol
 
 import jax
 import jax.numpy as jnp
+from jax import core
 
 from nanovllm_jax.kernels.registry import (
     KernelBackendStatus,
@@ -43,6 +44,11 @@ _CUDA_FP32_GDN_DECODE_ENV = "NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE"
 _GDN_PACKED_DECODE_IMPL_ENV = "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL"
 _GDN_PREFILL_POST_CONV_IMPL_ENV = "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL"
 _GDN_PREFILL_ACT_DTYPE_ENV = "NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE"
+_GDN_PREFILL_QKV_DTYPE_ENV = "NANO_VLLM_JAX_GDN_PREFILL_QKV_DTYPE"
+_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE_ENV = (
+    "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE"
+)
+_GDN_PACKED_DECODE_QKV_DTYPE_ENV = "NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE"
 _OFF_ENV_VALUES = {"", "0", "false", "no", "off", "none", "False"}
 
 
@@ -55,11 +61,13 @@ def _gdn_packed_decode_impl() -> str:
         return "off"
     if normalized in {"reference", "jax", "pure_jax"}:
         return "reference"
+    if normalized in {"triton_fla", "fla_triton", "jax_triton", "triton"}:
+        return "triton_fla"
     if normalized in {"cuda", "cuda_fp32", "fast"}:
         return "cuda_fp32"
     raise ValueError(
         f"Unknown {_GDN_PACKED_DECODE_IMPL_ENV}={value!r}; "
-        "expected off, reference, or cuda_fp32"
+        "expected off, reference, triton_fla, or cuda_fp32"
     )
 
 
@@ -79,6 +87,33 @@ def _gdn_prefill_post_conv_impl() -> str:
     if normalized in {"reference_fla", "reference_fla_chunk32", "fla_reference"}:
         return "reference_fla_chunk32"
     if normalized in {
+        "reference_fla_packed",
+        "reference_fla_composed",
+        "fla_packed_reference",
+        "fla_composed_reference",
+    }:
+        return "reference_fla_packed"
+    if normalized in {
+        "triton_fla_packed",
+        "fla_triton_packed",
+        "triton_fla_packed_reference",
+        "packed_triton_fla",
+    }:
+        return "triton_fla_packed"
+    if normalized in {
+        "triton_fla_padded",
+        "triton_fla_grid",
+        "fla_triton_padded",
+    }:
+        return "triton_fla_padded"
+    if normalized in {
+        "triton_fla_prep_bf16",
+        "fla_triton_prep_bf16",
+        "triton_prep_bf16",
+        "jax_triton_prep_bf16",
+    }:
+        return "triton_fla_prep_bf16"
+    if normalized in {
         "cuda_fla",
         "cuda_fla_chunk32",
         "cuda_fla_chunk32_fp32",
@@ -96,8 +131,11 @@ def _gdn_prefill_post_conv_impl() -> str:
         return "cuda_prep_prefill_fp32"
     raise ValueError(
         f"Unknown {_GDN_PREFILL_POST_CONV_IMPL_ENV}={value!r}; "
-        "expected off, reference, reference_fla_chunk32, "
-        "cuda_fla_chunk32_fp32, cuda_prep_fp32, or cuda_prep_prefill_fp32"
+        "expected off, reference, reference_fla_chunk32, reference_fla_packed, "
+        "triton_fla_padded, triton_fla_packed, triton_fla_prep_bf16, "
+        "cuda_fla_chunk32_fp32, "
+        "cuda_prep_fp32, "
+        "or cuda_prep_prefill_fp32"
     )
 
 
@@ -105,15 +143,50 @@ def gdn_prefill_post_conv_enabled() -> bool:
     return _gdn_prefill_post_conv_impl() != "off"
 
 
-def _gdn_prefill_activation_dtype() -> str:
-    value = os.environ.get(_GDN_PREFILL_ACT_DTYPE_ENV, "fp32").strip()
+def _normalize_gdn_prefill_dtype(value: str, env_name: str) -> str:
     normalized = value.lower()
     if normalized in _OFF_ENV_VALUES or normalized in {"fp32", "float32"}:
         return "fp32"
     if normalized in {"bf16", "bfloat16"}:
         return "bf16"
-    raise ValueError(
-        f"Unknown {_GDN_PREFILL_ACT_DTYPE_ENV}={value!r}; expected fp32 or bf16"
+    raise ValueError(f"Unknown {env_name}={value!r}; expected fp32 or bf16")
+
+
+def _gdn_prefill_qkv_activation_dtype() -> str:
+    value = os.environ.get(_GDN_PREFILL_QKV_DTYPE_ENV)
+    env_name = _GDN_PREFILL_QKV_DTYPE_ENV
+    if value is None:
+        value = os.environ.get(_GDN_PREFILL_ACT_DTYPE_ENV, "fp32")
+        env_name = _GDN_PREFILL_ACT_DTYPE_ENV
+    return _normalize_gdn_prefill_dtype(value.strip(), env_name)
+
+
+def _gdn_packed_decode_qkv_activation_dtype() -> str:
+    value = os.environ.get(_GDN_PACKED_DECODE_QKV_DTYPE_ENV, "fp32").strip()
+    return _normalize_gdn_prefill_dtype(value, _GDN_PACKED_DECODE_QKV_DTYPE_ENV)
+
+
+def _gdn_prefill_activation_dtype() -> str:
+    return _gdn_prefill_qkv_activation_dtype()
+
+
+def _gdn_prefill_qkv_activation_jnp_dtype() -> jnp.dtype:
+    if _gdn_prefill_qkv_activation_dtype() == "bf16":
+        return jnp.bfloat16
+    return jnp.float32
+
+
+def _gdn_packed_decode_qkv_activation_jnp_dtype() -> jnp.dtype:
+    if _gdn_packed_decode_qkv_activation_dtype() == "bf16":
+        return jnp.bfloat16
+    return jnp.float32
+
+
+def _gdn_prefill_post_conv_output_dtype() -> str:
+    value = os.environ.get(_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE_ENV, "fp32").strip()
+    return _normalize_gdn_prefill_dtype(
+        value,
+        _GDN_PREFILL_POST_CONV_OUTPUT_DTYPE_ENV,
     )
 
 
@@ -122,14 +195,20 @@ def _cast_gdn_prefill_activations(
     key: jnp.ndarray,
     value: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    act_dtype = _gdn_prefill_activation_dtype()
-    if act_dtype == "bf16":
+    act_dtype = _gdn_prefill_qkv_activation_jnp_dtype()
+    if act_dtype == jnp.bfloat16:
         return (
             query.astype(jnp.bfloat16),
             key.astype(jnp.bfloat16),
             value.astype(jnp.bfloat16),
         )
     return query, key, value
+
+
+def _cast_gdn_prefill_post_conv_output(output: jnp.ndarray) -> jnp.ndarray:
+    if _gdn_prefill_post_conv_output_dtype() == "bf16":
+        return output.astype(jnp.bfloat16)
+    return output
 
 
 class InferenceBackend(Protocol):
@@ -565,6 +644,7 @@ class PureJAXBackend:
         if impl == "reference_fla_chunk32":
             from nanovllm_jax.kernels.gdn_fla import (
                 gdn_fla_prefill_chunk32_fp32_reference,
+                prepare_gdn_fla_prefill_kernel_inputs,
                 prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
             )
 
@@ -593,8 +673,7 @@ class PureJAXBackend:
                     normalize_qk=use_qk_l2norm_in_kernel,
                 )
             )
-            query, key, value = _cast_gdn_prefill_activations(query, key, value)
-            output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
+            prepared = prepare_gdn_fla_prefill_kernel_inputs(
                 query,
                 key,
                 value,
@@ -602,10 +681,331 @@ class PureJAXBackend:
                 beta.astype(jnp.float32),
                 seq_lens,
                 initial_state.astype(jnp.float32),
+                qkv_dtype=_gdn_prefill_qkv_activation_jnp_dtype(),
+            )
+            output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
+                prepared.query,
+                prepared.key,
+                prepared.value,
+                prepared.gate,
+                prepared.beta,
+                prepared.seq_lens,
+                prepared.initial_state,
                 chunk_size=chunk_size,
             )
-            if _gdn_prefill_activation_dtype() == "bf16":
-                output = output.astype(jnp.bfloat16)
+            output = _cast_gdn_prefill_post_conv_output(output)
+            return output.transpose(0, 2, 1, 3), final_state
+
+        if impl == "reference_fla_packed":
+            from nanovllm_jax.kernels.gdn_fla import (
+                gdn_fla_prefill_varlen_composed_reference,
+                prepare_gdn_fla_prefill_kernel_inputs,
+                prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
+            )
+
+            if initial_state is None:
+                initial_state = jnp.zeros(
+                    (
+                        conv_out.shape[0],
+                        num_value_heads,
+                        value_head_dim,
+                        key_head_dim,
+                    ),
+                    dtype=jnp.float32,
+                )
+            query, key, value, gate, beta, seq_lens = (
+                prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
+                    conv_out,
+                    a,
+                    b,
+                    decay,
+                    dt_bias,
+                    valid_token_mask,
+                    num_key_heads=num_key_heads,
+                    num_value_heads=num_value_heads,
+                    key_head_dim=key_head_dim,
+                    value_head_dim=value_head_dim,
+                    normalize_qk=use_qk_l2norm_in_kernel,
+                )
+            )
+            prepared = prepare_gdn_fla_prefill_kernel_inputs(
+                query,
+                key,
+                value,
+                gate.astype(jnp.float32),
+                beta.astype(jnp.float32),
+                seq_lens,
+                initial_state.astype(jnp.float32),
+                qkv_dtype=_gdn_prefill_qkv_activation_jnp_dtype(),
+            )
+            output, final_state = gdn_fla_prefill_varlen_composed_reference(
+                prepared.query,
+                prepared.key,
+                prepared.value,
+                prepared.gate,
+                prepared.beta,
+                prepared.seq_lens,
+                prepared.initial_state,
+                chunk_size=chunk_size,
+            )
+            output = _cast_gdn_prefill_post_conv_output(output)
+            return output.transpose(0, 2, 1, 3), final_state
+
+        if impl == "triton_fla_packed":
+            from nanovllm_jax.kernels.gdn_fla import (
+                pack_prepared_gdn_prefill_inputs,
+                prepare_gdn_fla_prefill_kernel_inputs,
+                prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
+                unpack_prepared_gdn_prefill_output,
+            )
+            from nanovllm_jax.kernels.gdn_fla_triton import (
+                gdn_fla_chunk_gated_delta_rule_packed_triton,
+            )
+
+            if initial_state is None:
+                initial_state = jnp.zeros(
+                    (
+                        conv_out.shape[0],
+                        num_value_heads,
+                        value_head_dim,
+                        key_head_dim,
+                    ),
+                    dtype=jnp.float32,
+                )
+            query, key, value, gate, beta, seq_lens = (
+                prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
+                    conv_out,
+                    a,
+                    b,
+                    decay,
+                    dt_bias,
+                    valid_token_mask,
+                    num_key_heads=num_key_heads,
+                    num_value_heads=num_value_heads,
+                    key_head_dim=key_head_dim,
+                    value_head_dim=value_head_dim,
+                    normalize_qk=use_qk_l2norm_in_kernel,
+                )
+            )
+            prepared = prepare_gdn_fla_prefill_kernel_inputs(
+                query,
+                key,
+                value,
+                gate.astype(jnp.float32),
+                beta.astype(jnp.float32),
+                seq_lens,
+                initial_state.astype(jnp.float32),
+                qkv_dtype=_gdn_prefill_qkv_activation_jnp_dtype(),
+            )
+            if isinstance(prepared.seq_lens, core.Tracer):
+                from nanovllm_jax.kernels.gdn_fla import (
+                    gdn_fla_prefill_chunk32_fp32_reference,
+                )
+
+                output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
+                    prepared.query,
+                    prepared.key,
+                    prepared.value,
+                    prepared.gate,
+                    prepared.beta,
+                    prepared.seq_lens,
+                    prepared.initial_state,
+                    chunk_size=chunk_size,
+                )
+                output = _cast_gdn_prefill_post_conv_output(output)
+                return output.transpose(0, 2, 1, 3), final_state
+
+            packed_query, packed_key, packed_value, packed_gate, packed_beta, cu_seqlens = (
+                pack_prepared_gdn_prefill_inputs(
+                    prepared.query,
+                    prepared.key,
+                    prepared.value,
+                    prepared.gate,
+                    prepared.beta,
+                    prepared.seq_lens,
+                )
+            )
+            output, final_state = gdn_fla_chunk_gated_delta_rule_packed_triton(
+                packed_query,
+                packed_key,
+                packed_value,
+                packed_gate,
+                packed_beta,
+                cu_seqlens,
+                prepared.initial_state,
+                chunk_size=chunk_size,
+                # Q/K normalization was already applied during post-conv prep
+                # when requested; do not normalize the packed tensors again.
+                use_qk_l2norm_in_kernel=False,
+            )
+            output = unpack_prepared_gdn_prefill_output(
+                output,
+                cu_seqlens,
+                prepared.query.shape[1],
+            )
+            output = _cast_gdn_prefill_post_conv_output(output)
+            return output.transpose(0, 2, 1, 3), final_state
+
+        if impl == "triton_fla_padded":
+            from nanovllm_jax.kernels.gdn_fla import (
+                prepare_gdn_fla_prefill_kernel_inputs,
+                prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
+            )
+            from nanovllm_jax.kernels.gdn_fla_triton import (
+                gdn_fla_chunk_gated_delta_rule_packed_triton,
+            )
+
+            if initial_state is None:
+                initial_state = jnp.zeros(
+                    (
+                        conv_out.shape[0],
+                        num_value_heads,
+                        value_head_dim,
+                        key_head_dim,
+                    ),
+                    dtype=jnp.float32,
+                )
+            query, key, value, gate, beta, seq_lens = (
+                prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
+                    conv_out,
+                    a,
+                    b,
+                    decay,
+                    dt_bias,
+                    valid_token_mask,
+                    num_key_heads=num_key_heads,
+                    num_value_heads=num_value_heads,
+                    key_head_dim=key_head_dim,
+                    value_head_dim=value_head_dim,
+                    normalize_qk=use_qk_l2norm_in_kernel,
+                )
+            )
+            prepared = prepare_gdn_fla_prefill_kernel_inputs(
+                query,
+                key,
+                value,
+                gate.astype(jnp.float32),
+                beta.astype(jnp.float32),
+                seq_lens,
+                initial_state.astype(jnp.float32),
+                qkv_dtype=_gdn_prefill_qkv_activation_jnp_dtype(),
+            )
+            packed_query = prepared.query.reshape(
+                -1,
+                prepared.query.shape[2],
+                prepared.query.shape[3],
+            )
+            packed_key = prepared.key.reshape(
+                -1,
+                prepared.key.shape[2],
+                prepared.key.shape[3],
+            )
+            packed_value = prepared.value.reshape(
+                -1,
+                prepared.value.shape[2],
+                prepared.value.shape[3],
+            )
+            packed_gate = prepared.gate.reshape(
+                -1,
+                prepared.gate.shape[2],
+            )
+            packed_beta = prepared.beta.reshape(
+                -1,
+                prepared.beta.shape[2],
+            )
+            batch, seq_len, num_key_heads_out, key_head_dim_prepared = (
+                prepared.query.shape
+            )
+            if key_head_dim_prepared != key_head_dim:
+                raise ValueError(
+                    "prepared query head dim must match configured key_head_dim"
+                )
+            value_dim = prepared.value.shape[-1]
+            packed_cu_seqlens = (
+                jnp.arange(batch + 1, dtype=jnp.int32) * jnp.int32(seq_len)
+            )
+            max_chunks_per_row = (seq_len + chunk_size - 1) // chunk_size
+            row_ids = jnp.repeat(jnp.arange(batch, dtype=jnp.int32), max_chunks_per_row)
+            chunk_ids = jnp.tile(
+                jnp.arange(max_chunks_per_row, dtype=jnp.int32), batch
+            )
+            packed_chunk_indices = jnp.stack((row_ids, chunk_ids), axis=1)
+            packed_chunk_offsets = (
+                jnp.arange(batch + 1, dtype=jnp.int32) * max_chunks_per_row
+            )
+            output, final_state = gdn_fla_chunk_gated_delta_rule_packed_triton(
+                packed_query,
+                packed_key,
+                packed_value,
+                packed_gate,
+                packed_beta,
+                packed_cu_seqlens,
+                prepared.initial_state,
+                chunk_size=chunk_size,
+                # Q/K normalization was already applied during post-conv prep
+                # when requested; do not normalize the packed tensors again.
+                use_qk_l2norm_in_kernel=False,
+                max_row_chunks=max_chunks_per_row,
+                chunk_indices=packed_chunk_indices,
+                chunk_offsets=packed_chunk_offsets,
+            )
+            output = output.reshape(batch, seq_len, num_key_heads_out, value_dim)
+            output = _cast_gdn_prefill_post_conv_output(output)
+            return output.transpose(0, 2, 1, 3), final_state
+
+        if impl == "triton_fla_prep_bf16":
+            from nanovllm_jax.kernels.gdn_fla import (
+                gdn_fla_prefill_chunk32_fp32_reference,
+            )
+            from nanovllm_jax.kernels.gdn_fla_triton import (
+                gdn_post_conv_prep_bf16,
+            )
+
+            if initial_state is None:
+                initial_state = jnp.zeros(
+                    (
+                        conv_out.shape[0],
+                        num_value_heads,
+                        value_head_dim,
+                        key_head_dim,
+                    ),
+                    dtype=jnp.float32,
+                )
+            if valid_token_mask is None:
+                valid_token_mask = jnp.ones(conv_out.shape[:2], dtype=jnp.int32)
+            else:
+                valid_token_mask = valid_token_mask.astype(jnp.int32)
+            query, key, value, gate, beta = gdn_post_conv_prep_bf16(
+                conv_out,
+                a,
+                b,
+                decay,
+                dt_bias,
+                valid_token_mask,
+                num_key_heads=num_key_heads,
+                num_value_heads=num_value_heads,
+                key_head_dim=key_head_dim,
+                value_head_dim=value_head_dim,
+                normalize_qk=use_qk_l2norm_in_kernel,
+            )
+            beta = jax.nn.sigmoid(b.astype(jnp.float32))
+            gate = -decay.astype(jnp.float32) * jax.nn.softplus(
+                a.astype(jnp.float32) + dt_bias.astype(jnp.float32)
+            )
+            beta = jnp.where(valid_token_mask[:, :, None] > 0, beta, 0.0)
+            gate = jnp.where(valid_token_mask[:, :, None] > 0, gate, 0.0)
+            seq_lens = valid_token_mask.sum(axis=1).astype(jnp.int32)
+            output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
+                query,
+                key,
+                value,
+                gate,
+                beta,
+                seq_lens,
+                initial_state.astype(jnp.float32),
+                chunk_size=chunk_size,
+            )
+            output = _cast_gdn_prefill_post_conv_output(output)
             return output.transpose(0, 2, 1, 3), final_state
 
         if impl == "cuda_fla_chunk32_fp32":
@@ -668,6 +1068,7 @@ class PureJAXBackend:
                     initial_state.astype(jnp.float32),
                     chunk_size=chunk_size,
                 )
+            output = _cast_gdn_prefill_post_conv_output(output)
             return output.transpose(0, 2, 1, 3), final_state
 
         if impl in {"cuda_prep_fp32", "cuda_prep_prefill_fp32"}:
@@ -806,6 +1207,7 @@ class PureJAXBackend:
         use_qk_l2norm_in_kernel: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         impl = _gdn_packed_decode_impl()
+        packed_qkv_dtype = _gdn_packed_decode_qkv_activation_jnp_dtype()
         if impl == "off":
             raise RuntimeError(
                 f"{_GDN_PACKED_DECODE_IMPL_ENV} is off; use gated_delta_decode"
@@ -813,9 +1215,21 @@ class PureJAXBackend:
 
         if impl == "reference":
             from nanovllm_jax.kernels.gdn_fla import (
+                prepare_gdn_packed_decode_reference_from_decay_inputs,
                 gdn_packed_decode_reference_from_decay,
             )
 
+            mixed_qkv, a, b, decay, dt_bias, initial_state = (
+                prepare_gdn_packed_decode_reference_from_decay_inputs(
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    decay=decay,
+                    dt_bias=dt_bias,
+                    state=initial_state,
+                    qkv_dtype=packed_qkv_dtype,
+                )
+            )
             return gdn_packed_decode_reference_from_decay(
                 mixed_qkv,
                 a,
@@ -823,12 +1237,41 @@ class PureJAXBackend:
                 decay,
                 dt_bias,
                 initial_state,
+                qkv_dtype=packed_qkv_dtype,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
 
         if impl == "cuda_fp32":
             if not use_qk_l2norm_in_kernel:
                 raise ValueError("CUDA FP32 packed GDN decode requires q/k l2norm")
+            if packed_qkv_dtype == jnp.bfloat16:
+                from nanovllm_jax.kernels.gdn_fla import (
+                    prepare_gdn_packed_decode_reference_from_decay_inputs,
+                )
+
+                mixed_qkv, a, b, decay, dt_bias, initial_state = (
+                    prepare_gdn_packed_decode_reference_from_decay_inputs(
+                        mixed_qkv=mixed_qkv,
+                        a=a,
+                        b=b,
+                        decay=decay,
+                        dt_bias=dt_bias,
+                        state=initial_state,
+                        qkv_dtype=packed_qkv_dtype,
+                    )
+                )
+                from nanovllm_jax.kernels.cuda_fp32_ffi import (
+                    gdn_packed_decode_step_fp32_bf16qkv,
+                )
+                return gdn_packed_decode_step_fp32_bf16qkv(
+                    mixed_qkv,
+                    a,
+                    b,
+                    decay,
+                    dt_bias,
+                    initial_state,
+                )
+
             for name, value_array in (
                 ("mixed_qkv", mixed_qkv),
                 ("a", a),
@@ -850,6 +1293,38 @@ class PureJAXBackend:
                 jnp.log(decay),
                 dt_bias,
                 initial_state,
+            )
+
+        if impl == "triton_fla":
+            if not use_qk_l2norm_in_kernel:
+                raise ValueError("Triton FLA packed GDN decode requires q/k l2norm")
+            from nanovllm_jax.kernels.gdn_fla import (
+                prepare_gdn_packed_decode_reference_from_decay_inputs,
+            )
+
+            mixed_qkv, a, b, decay, dt_bias, initial_state = (
+                prepare_gdn_packed_decode_reference_from_decay_inputs(
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    decay=decay,
+                    dt_bias=dt_bias,
+                    state=initial_state,
+                    qkv_dtype=jnp.bfloat16,
+                )
+            )
+            from nanovllm_jax.kernels.gdn_fla_triton import (
+                gdn_packed_decode_step_bf16,
+            )
+
+            return gdn_packed_decode_step_bf16(
+                mixed_qkv,
+                a,
+                b,
+                decay,
+                dt_bias,
+                initial_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
 
         raise AssertionError(f"Unhandled packed GDN decode implementation {impl!r}")

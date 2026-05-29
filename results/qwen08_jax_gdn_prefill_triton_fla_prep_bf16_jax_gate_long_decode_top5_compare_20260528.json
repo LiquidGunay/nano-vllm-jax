@@ -1,0 +1,205 @@
+{
+  "elapsed_seconds": 24.789893321925774,
+  "first_ordered_top5_mismatches": [
+    {
+      "hf_top_id_logit_max_abs_diff": 0.006626129150390625,
+      "hf_top_ids": [
+        440,
+        11,
+        321,
+        13,
+        303
+      ],
+      "hf_top_values": [
+        24.218032836914062,
+        20.845443725585938,
+        20.48760223388672,
+        19.3397216796875,
+        17.105741500854492
+      ],
+      "jax_top_ids": [
+        440,
+        11,
+        321,
+        13,
+        1472
+      ],
+      "jax_top_values": [
+        24.219974517822266,
+        20.849876403808594,
+        20.491043090820312,
+        19.34634780883789,
+        17.10822296142578
+      ],
+      "prefix_len": 13,
+      "ranked_logit_max_abs_diff": 0.006626129150390625,
+      "same_top5_set": false,
+      "step": 3
+    },
+    {
+      "hf_top_id_logit_max_abs_diff": 0.0027370452880859375,
+      "hf_top_ids": [
+        314,
+        13,
+        11,
+        3611,
+        271
+      ],
+      "hf_top_values": [
+        29.1734676361084,
+        21.914592742919922,
+        18.94956398010254,
+        18.946918487548828,
+        18.892749786376953
+      ],
+      "jax_top_ids": [
+        314,
+        13,
+        3611,
+        11,
+        271
+      ],
+      "jax_top_values": [
+        29.176204681396484,
+        21.91374969482422,
+        18.94872283935547,
+        18.947465896606445,
+        18.8935489654541
+      ],
+      "prefix_len": 182,
+      "ranked_logit_max_abs_diff": 0.0027370452880859375,
+      "same_top5_set": true,
+      "step": 172
+    },
+    {
+      "hf_top_id_logit_max_abs_diff": 0.0015277862548828125,
+      "hf_top_ids": [
+        314,
+        271,
+        198,
+        14791,
+        1020
+      ],
+      "hf_top_values": [
+        29.765621185302734,
+        19.30323028564453,
+        17.950448989868164,
+        17.949729919433594,
+        17.1678524017334
+      ],
+      "jax_top_ids": [
+        314,
+        271,
+        14791,
+        198,
+        1020
+      ],
+      "jax_top_values": [
+        29.765716552734375,
+        19.30400848388672,
+        17.950550079345703,
+        17.94950294494629,
+        17.16938018798828
+      ],
+      "prefix_len": 349,
+      "ranked_logit_max_abs_diff": 0.0015277862548828125,
+      "same_top5_set": true,
+      "step": 339
+    },
+    {
+      "hf_top_id_logit_max_abs_diff": 0.004146575927734375,
+      "hf_top_ids": [
+        668,
+        271,
+        9257,
+        198,
+        4686
+      ],
+      "hf_top_values": [
+        29.253520965576172,
+        20.476486206054688,
+        17.615440368652344,
+        17.034929275512695,
+        17.03375244140625
+      ],
+      "jax_top_ids": [
+        668,
+        271,
+        9257,
+        4686,
+        198
+      ],
+      "jax_top_values": [
+        29.254133224487305,
+        20.477500915527344,
+        17.61129379272461,
+        17.034839630126953,
+        17.03424072265625
+      ],
+      "prefix_len": 457,
+      "ranked_logit_max_abs_diff": 0.004146575927734375,
+      "same_top5_set": true,
+      "step": 447
+    }
+  ],
+  "first_top1_mismatches": [],
+  "first_top5_set_mismatches": [
+    {
+      "hf_top_ids": [
+        440,
+        11,
+        321,
+        13,
+        303
+      ],
+      "jax_top_ids": [
+        440,
+        11,
+        321,
+        13,
+        1472
+      ],
+      "prefix_len": 13,
+      "step": 3
+    }
+  ],
+  "gdn_kernel_flags": {
+    "packed_decode_impl": "off",
+    "packed_decode_qkv_dtype": "fp32",
+    "prefill_act_dtype": "fp32",
+    "prefill_post_conv_impl": "triton_fla_prep_bf16",
+    "prefill_post_conv_output_dtype": "fp32",
+    "prefill_qkv_dtype": "fp32"
+  },
+  "git_head": "6dc2032",
+  "guardrail": {
+    "exact_generated_token_match": true,
+    "max_hf_topk_id_logit_diff_lte": 2e-05,
+    "max_hf_topk_id_logit_diff_within_gate": false,
+    "ordered_top5_exact_match": false,
+    "ordered_top5_exact_matches_required": 500,
+    "passes_required_gate": false,
+    "top1_exact_match": true,
+    "top1_exact_matches_required": 500,
+    "top5_set_exact_match": false,
+    "top5_set_exact_matches_required": 500
+  },
+  "hf_reference": "results/qwen08_hf_bf16w_fp32act_long_decode_top5_500.npz",
+  "jax_activation_dtype": "float32",
+  "jax_backend": "gpu",
+  "jax_version": "0.10.1",
+  "jax_weight_dtype": "bfloat16",
+  "max_hf_topk_id_logit_diff": 0.008432388305664062,
+  "max_ranked_topk_logit_diff": 0.008432388305664062,
+  "max_top1_abs_logit_diff_when_id_matches": 0.008260726928710938,
+  "model": "Qwen/Qwen3.5-0.8B",
+  "ordered_top5_exact_matches": 496,
+  "ordered_top5_mismatches": 4,
+  "prompt": "The future of artificial intelligence is poised to revolutionize",
+  "steps_checked": 500,
+  "top1_exact_matches": 500,
+  "top1_mismatches": 0,
+  "top5_set_exact_matches": 499,
+  "top5_set_mismatches": 1,
+  "top_k": 5
+}

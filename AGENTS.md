@@ -1,5 +1,10 @@
 # Agent Instructions
 
+## Subagents
+
+- Prefer `gpt-5.3-codex-spark` for newly spawned subagents unless a task clearly
+  needs a different model.
+
 ## GPU And Benchmark Commands
 
 - Run benchmark, profiling, vLLM, JAX GPU, CUDA, NVIDIA, and model-serving

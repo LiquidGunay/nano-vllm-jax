@@ -15,6 +15,7 @@ from nanovllm_jax.backends import (
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.layers import rms_norm, apply_rope, repeat_kv, causal_mask, get_activation, l2norm, causal_conv1d_update
 from nanovllm_jax.kv_cache import AttentionMetadata, HybridLayerState, KVCacheState, init_linear_attention_states
+from nanovllm_jax.mtp.mtp_layer import MTPParams
 from nanovllm_jax.conv1d_metal import causal_conv1d_metal
 
 
@@ -24,7 +25,7 @@ class ModelParams:
     layers: List[Dict[str, jnp.ndarray]]
     norm_weight: jnp.ndarray
     lm_head: Optional[jnp.ndarray] = None
-    mtp_params: Optional['MTPParams'] = None  # MTP head parameters for speculative decoding
+    mtp_params: Optional[MTPParams] = None  # MTP head parameters for speculative decoding
 
 
 def _tokenwise_decode_dot(x: jnp.ndarray, weight: jnp.ndarray, *, force_width1: bool = False) -> jnp.ndarray:

@@ -108,6 +108,20 @@ def _json_safe(value: Any) -> Any:
     return repr(value)
 
 
+def _block_until_ready(value: Any) -> None:
+    ready = getattr(value, "block_until_ready", None)
+    if callable(ready):
+        ready()
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _block_until_ready(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _block_until_ready(item)
+
+
 def _percentile(values: list[float], percentile: float) -> float | None:
     if not values:
         return None
@@ -292,12 +306,14 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     nhd_cache = getattr(engine.model_runner, "full_attention_nhd_cache", None)
     if args.warmup:
         warmup_params = _build_sampling_params([], min(2, args.output_len))
-        engine.generate_with_trace(prompts, sampling_params=warmup_params, include_text=False)
+        warmup_trace = engine.generate_with_trace(prompts, sampling_params=warmup_params, include_text=False)
+        _block_until_ready(warmup_trace)
 
     sampling_params = _build_sampling_params(output_lengths, args.output_len)
     recorder.start_jax_profile(enabled=args.profile)
     started = time.perf_counter()
     trace = engine.generate_with_trace(prompts, sampling_params=sampling_params, include_text=False)
+    _block_until_ready(trace)
     elapsed = time.perf_counter() - started
     recorder.stop_jax_profile()
     profile_counters = _profile_counters(recorder.profile_path) if args.profile else None
@@ -346,12 +362,24 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                     "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
                     "off",
                 ),
+                "packed_decode_qkv_dtype": os.environ.get(
+                    "NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE",
+                    "fp32",
+                ),
                 "prefill_post_conv_impl": os.environ.get(
                     "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
                     "off",
                 ),
+                "prefill_qkv_dtype": os.environ.get(
+                    "NANO_VLLM_JAX_GDN_PREFILL_QKV_DTYPE",
+                    os.environ.get("NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE", "fp32"),
+                ),
                 "prefill_act_dtype": os.environ.get(
                     "NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE",
+                    "fp32",
+                ),
+                "prefill_post_conv_output_dtype": os.environ.get(
+                    "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE",
                     "fp32",
                 ),
             },

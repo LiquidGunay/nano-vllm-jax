@@ -870,3 +870,207 @@ def test_backend_gdn_packed_decode_reference_and_cuda_match(monkeypatch):
             rtol=3e-5,
             atol=3e-5,
         )
+
+
+@pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_backend_gdn_packed_decode_bf16_cuda_matches_reference(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
+
+    batch = 2
+    num_q_heads = 2
+    num_value_heads = 4
+    key_dim = 16
+    value_dim = 16
+    packed_dim = 2 * num_q_heads * key_dim + num_value_heads * value_dim
+    mixed_qkv = jnp.linspace(
+        -0.5,
+        0.5,
+        batch * packed_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, packed_dim)
+    a = jnp.linspace(-0.3, 0.2, batch * num_value_heads, dtype=jnp.float32).reshape(
+        batch,
+        num_value_heads,
+    )
+    b = jnp.linspace(-1.0, 1.0, batch * num_value_heads, dtype=jnp.float32).reshape(
+        batch,
+        num_value_heads,
+    )
+    a_log = jnp.linspace(-0.2, 0.1, num_value_heads, dtype=jnp.float32)
+    dt_bias = jnp.linspace(0.05, 0.2, num_value_heads, dtype=jnp.float32)
+    decay = jnp.exp(a_log)
+    state = jnp.linspace(
+        -0.03,
+        0.04,
+        batch * num_value_heads * value_dim * key_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_value_heads, value_dim, key_dim)
+
+    expected_out, expected_state = gdn_packed_decode_step_fp32_reference(
+        mixed_qkv.astype(jnp.bfloat16),
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state,
+    )
+
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", "reference")
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE", "bf16")
+    ref_out, ref_state = PureJAXBackend().gated_delta_packed_decode(
+        mixed_qkv,
+        a,
+        b,
+        decay,
+        dt_bias,
+        state,
+        use_qk_l2norm_in_kernel=True,
+    )
+    assert ref_out.dtype == jnp.float32
+    assert ref_state.dtype == jnp.float32
+
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", "cuda_fp32")
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE", "bf16")
+    actual_out, actual_state = PureJAXBackend().gated_delta_packed_decode(
+        mixed_qkv,
+        a,
+        b,
+        decay,
+        dt_bias,
+        state,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(ref_out),
+        np.asarray(expected_out),
+        rtol=3e-5,
+        atol=3e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(ref_state),
+        np.asarray(expected_state),
+        rtol=3e-5,
+        atol=3e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_out),
+        np.asarray(expected_out),
+        rtol=3e-5,
+        atol=3e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
+        rtol=3e-5,
+        atol=3e-5,
+    )
+
+
+@pytest.mark.skipif(not _has_nvcc(), reason="nvcc is required for local CUDA FFI")
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_backend_gdn_packed_decode_bf16_cuda_stays_exact_over_recurrent_steps(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp")
+
+    # Model-shaped packed decode geometry similar to real decode widths.
+    batch = 2
+    num_q_heads = 2
+    num_value_heads = 4
+    key_dim = 16
+    value_dim = 32
+    packed_dim = 2 * num_q_heads * key_dim + num_value_heads * value_dim
+    num_steps = 500
+
+    state = jnp.zeros(
+        (batch, num_value_heads, value_dim, key_dim),
+        dtype=jnp.float32,
+    )
+    decay = jnp.logspace(-0.35, -0.10, num_value_heads, dtype=jnp.float32)
+    dt_bias = jnp.linspace(-0.12, 0.12, num_value_heads, dtype=jnp.float32)
+
+    mixed_qkv_rng = np.random.default_rng(12345)
+    step_control_rng = np.random.default_rng(54321)
+    mixed_qkv_steps = []
+    a_steps = []
+    b_steps = []
+    for step in range(num_steps):
+        mixed_qkv_steps.append(
+            jnp.asarray(
+                mixed_qkv_rng.standard_normal((batch, packed_dim), dtype=np.float32),
+                dtype=jnp.float32,
+            )
+        )
+        a_steps.append(
+            jnp.asarray(
+                0.6 * np.tanh(
+                    np.sin(step_control_rng.standard_normal((batch, num_value_heads), dtype=np.float32))
+                ),
+                dtype=jnp.float32,
+            )
+        )
+        b_steps.append(
+            jnp.asarray(
+                np.tanh(
+                    step_control_rng.standard_normal((batch, num_value_heads), dtype=np.float32)
+                ),
+                dtype=jnp.float32,
+            )
+        )
+
+    ref_state = state
+    cuda_state = state
+    ref_env = {
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL": "reference",
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE": "bf16",
+    }
+    cuda_env = {
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL": "cuda_fp32",
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE": "bf16",
+    }
+
+    def _run_with_env(env: dict[str, str], mixed_qkv_step, a_step, b_step, current_state):
+        with monkeypatch.context() as _patch:
+            for key, value in env.items():
+                _patch.setenv(key, value)
+            return PureJAXBackend().gated_delta_packed_decode(
+                mixed_qkv_step,
+                a_step,
+                b_step,
+                decay,
+                dt_bias,
+                current_state,
+                use_qk_l2norm_in_kernel=True,
+            )
+
+    for step, (mixed_qkv, a_step, b_step) in enumerate(
+        zip(mixed_qkv_steps, a_steps, b_steps)
+    ):
+        ref_out, ref_state = _run_with_env(
+            ref_env,
+            mixed_qkv,
+            jnp.asarray(a_step),
+            jnp.asarray(b_step),
+            ref_state,
+        )
+        cuda_out, cuda_state = _run_with_env(
+            cuda_env,
+            mixed_qkv,
+            jnp.asarray(a_step),
+            jnp.asarray(b_step),
+            cuda_state,
+        )
+        np.testing.assert_allclose(
+            np.asarray(cuda_out),
+            np.asarray(ref_out),
+            rtol=1e-6,
+            atol=1e-6,
+            err_msg=f"out mismatch at step={step}",
+        )
+        np.testing.assert_allclose(
+            np.asarray(cuda_state),
+            np.asarray(ref_state),
+            rtol=1e-6,
+            atol=1e-6,
+            err_msg=f"state mismatch at step={step}",
+        )

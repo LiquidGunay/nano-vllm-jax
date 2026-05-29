@@ -1,0 +1,171 @@
+{
+  "date_utc": "2026-05-28",
+  "model": "Qwen/Qwen3.5-0.8B",
+  "lengths": [
+    128,
+    256,
+    512
+  ],
+  "chunk_size": 64,
+  "results": [
+    {
+      "length": 128,
+      "inverse_diff": {
+        "jax_ref_vs_vllm": {
+          "max_abs": 0.11207771301269531,
+          "mean_abs": 9.150958067039028e-05,
+          "nan_count": 0
+        },
+        "vllm_like_vs_vllm": {
+          "max_abs": 0.46875,
+          "mean_abs": 0.0003777082893066108,
+          "nan_count": 0
+        }
+      },
+      "downstream_diff": {
+        "ref_vs_vllm": {
+          "out": {
+            "max_abs": 0.006262302398681641,
+            "mean_abs": 5.382585641200421e-06,
+            "nan_count": 31872
+          },
+          "state": {
+            "max_abs": 0.07232451438903809,
+            "mean_abs": 3.619974449975416e-05,
+            "nan_count": 0
+          }
+        },
+        "vllm_like_vs_vllm": {
+          "out": {
+            "max_abs": 0.025841139256954193,
+            "mean_abs": 6.666276476607891e-06,
+            "nan_count": 31872
+          },
+          "state": {
+            "max_abs": 0.31091248989105225,
+            "mean_abs": 7.219181134132668e-05,
+            "nan_count": 0
+          }
+        },
+        "vllm_like_vs_ref": {
+          "out": {
+            "max_abs": 0.021760962903499603,
+            "mean_abs": 3.3604883356019855e-06,
+            "nan_count": 31872
+          },
+          "state": {
+            "max_abs": 0.23858797550201416,
+            "mean_abs": 5.1168695790693164e-05,
+            "nan_count": 0
+          }
+        }
+      }
+    },
+    {
+      "length": 256,
+      "inverse_diff": {
+        "jax_ref_vs_vllm": {
+          "max_abs": 0.11207771301269531,
+          "mean_abs": 9.122866322286427e-05,
+          "nan_count": 0
+        },
+        "vllm_like_vs_vllm": {
+          "max_abs": 1.0625,
+          "mean_abs": 0.0005197436548769474,
+          "nan_count": 0
+        }
+      },
+      "downstream_diff": {
+        "ref_vs_vllm": {
+          "out": {
+            "max_abs": 0.04627549648284912,
+            "mean_abs": 1.316723592026392e-05,
+            "nan_count": 63744
+          },
+          "state": {
+            "max_abs": 0.7822480201721191,
+            "mean_abs": 0.00019377625721972436,
+            "nan_count": 0
+          }
+        },
+        "vllm_like_vs_vllm": {
+          "out": {
+            "max_abs": 0.18946081399917603,
+            "mean_abs": 2.387682798143942e-05,
+            "nan_count": 63744
+          },
+          "state": {
+            "max_abs": 1.8660812377929688,
+            "mean_abs": 0.00036425472353585064,
+            "nan_count": 0
+          }
+        },
+        "vllm_like_vs_ref": {
+          "out": {
+            "max_abs": 0.1764935553073883,
+            "mean_abs": 1.8892156731453724e-05,
+            "nan_count": 63744
+          },
+          "state": {
+            "max_abs": 1.7975516319274902,
+            "mean_abs": 0.00041905679972842336,
+            "nan_count": 0
+          }
+        }
+      }
+    },
+    {
+      "length": 512,
+      "inverse_diff": {
+        "jax_ref_vs_vllm": {
+          "max_abs": 0.11207771301269531,
+          "mean_abs": 9.087041689781472e-05,
+          "nan_count": 0
+        },
+        "vllm_like_vs_vllm": {
+          "max_abs": 1.28125,
+          "mean_abs": 0.0004844042123295367,
+          "nan_count": 0
+        }
+      },
+      "downstream_diff": {
+        "ref_vs_vllm": {
+          "out": {
+            "max_abs": 5.21795654296875,
+            "mean_abs": 0.0003220988728571683,
+            "nan_count": 127232
+          },
+          "state": {
+            "max_abs": 34.56756591796875,
+            "mean_abs": 0.009581528604030609,
+            "nan_count": 0
+          }
+        },
+        "vllm_like_vs_vllm": {
+          "out": {
+            "max_abs": 6.958130836486816,
+            "mean_abs": 0.0005204239278100431,
+            "nan_count": 127232
+          },
+          "state": {
+            "max_abs": 68.65850830078125,
+            "mean_abs": 0.02392815798521042,
+            "nan_count": 0
+          }
+        },
+        "vllm_like_vs_ref": {
+          "out": {
+            "max_abs": 2.496005058288574,
+            "mean_abs": 0.00028044654754921794,
+            "nan_count": 127232
+          },
+          "state": {
+            "max_abs": 46.38372802734375,
+            "mean_abs": 0.015739239752292633,
+            "nan_count": 0
+          }
+        }
+      }
+    }
+  ]
+}

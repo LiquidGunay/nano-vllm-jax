@@ -27,6 +27,9 @@ _TARGET_KV_APPEND = "nanovllm_jax_fp32_kv_append_paged_nhd"
 _TARGET_PAGED_DECODE = "nanovllm_jax_fp32_paged_decode_attention_gqa_nhd"
 _TARGET_GDN_DECODE = "nanovllm_jax_fp32_gdn_recurrent_decode"
 _TARGET_GDN_PACKED_DECODE = "nanovllm_jax_fp32_gdn_packed_decode"
+_TARGET_GDN_PACKED_DECODE_BF16QKV = (
+    "nanovllm_jax_fp32_gdn_packed_decode_bf16qkv"
+)
 _TARGET_GDN_POST_CONV_PREP = "nanovllm_jax_fp32_gdn_post_conv_prep"
 _TARGET_GDN_PREFILL = "nanovllm_jax_fp32_gdn_prefill_chunk32"
 _TARGET_GDN_PREFILL_V64 = "nanovllm_jax_fp32_gdn_prefill_chunk32_v64"
@@ -183,6 +186,9 @@ def _register_kv_append_target() -> None:
         decode_handler = library.NanoVllmJaxFp32PagedDecodeAttention
         gdn_decode_handler = library.NanoVllmJaxFp32GdnRecurrentDecode
         gdn_packed_decode_handler = library.NanoVllmJaxFp32GdnPackedDecode
+        gdn_packed_decode_bf16qkv_handler = (
+            library.NanoVllmJaxFp32GdnPackedDecodeBf16qkv
+        )
         gdn_post_conv_prep_handler = library.NanoVllmJaxFp32GdnPostConvPrep
         gdn_prefill_handler = library.NanoVllmJaxFp32GdnPrefillChunk32
         gdn_prefill_v64_handler = library.NanoVllmJaxFp32GdnPrefillChunk32V64
@@ -208,6 +214,12 @@ def _register_kv_append_target() -> None:
         jax.ffi.register_ffi_target(
             _TARGET_GDN_PACKED_DECODE,
             jax.ffi.pycapsule(gdn_packed_decode_handler),
+            platform="gpu",
+            api_version=1,
+        )
+        jax.ffi.register_ffi_target(
+            _TARGET_GDN_PACKED_DECODE_BF16QKV,
+            jax.ffi.pycapsule(gdn_packed_decode_bf16qkv_handler),
             platform="gpu",
             api_version=1,
         )
@@ -650,6 +662,8 @@ def _validate_fp32_gdn_packed_decode_inputs(
     a_log: jnp.ndarray,
     dt_bias: jnp.ndarray,
     state: jnp.ndarray,
+    *,
+    mixed_qkv_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[int, int, int, int, int]:
     for name, value_array, rank in (
         ("mixed_qkv", mixed_qkv, 2),
@@ -659,8 +673,11 @@ def _validate_fp32_gdn_packed_decode_inputs(
         ("dt_bias", dt_bias, 1),
         ("state", state, 4),
     ):
-        if value_array.dtype != jnp.float32:
-            raise ValueError(f"{name} must be float32")
+        expected_dtype = jnp.float32
+        if name == "mixed_qkv":
+            expected_dtype = mixed_qkv_dtype
+        if value_array.dtype != expected_dtype:
+            raise ValueError(f"{name} must be {expected_dtype}")
         if value_array.ndim != rank:
             raise ValueError(f"{name} must be rank-{rank}")
     batch, num_value_heads, value_dim, key_dim = state.shape
@@ -677,6 +694,59 @@ def _validate_fp32_gdn_packed_decode_inputs(
     if num_value_heads % num_q_heads != 0:
         raise ValueError("value head count must be divisible by packed Q/K head count")
     return batch, num_q_heads, num_value_heads, value_dim, key_dim
+
+
+def gdn_packed_decode_step_fp32_bf16qkv(
+    mixed_qkv: Any,
+    a: Any,
+    b: Any,
+    decay: Any,
+    dt_bias: Any,
+    state: Any,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """vLLM-style packed width-1 GDN decode with BF16 mixed QKV and FP32 state."""
+
+    mixed_qkv = _as_jax_array("mixed_qkv", mixed_qkv)
+    a = _as_jax_array("a", a)
+    b = _as_jax_array("b", b)
+    decay = _as_jax_array("decay", decay)
+    dt_bias = _as_jax_array("dt_bias", dt_bias)
+    state = _as_jax_array("state", state)
+    if mixed_qkv.dtype != jnp.bfloat16:
+        raise ValueError("mixed_qkv must be bfloat16")
+    for name, value_array in (
+        ("a", a),
+        ("b", b),
+        ("decay", decay),
+        ("dt_bias", dt_bias),
+        ("state", state),
+    ):
+        if value_array.dtype != jnp.float32:
+            raise ValueError(f"{name} must be float32")
+    batch, _, num_value_heads, value_dim, _ = _validate_fp32_gdn_packed_decode_inputs(
+        mixed_qkv,
+        a,
+        b,
+        decay,
+        dt_bias,
+        state,
+        mixed_qkv_dtype=jnp.bfloat16,
+    )
+    gate = jnp.exp(-decay * jax.nn.softplus(a + dt_bias[None, :]))
+    beta = jax.nn.sigmoid(b)
+    _register_kv_append_target()
+    call = jax.ffi.ffi_call(
+        _TARGET_GDN_PACKED_DECODE_BF16QKV,
+        (
+            jax.ShapeDtypeStruct(
+                (batch, num_value_heads, 1, value_dim),
+                state.dtype,
+            ),
+            jax.ShapeDtypeStruct(state.shape, state.dtype),
+        ),
+        has_side_effect=False,
+    )
+    return call(mixed_qkv, gate, beta, decay, dt_bias, state)
 
 
 def gdn_packed_decode_step_fp32(

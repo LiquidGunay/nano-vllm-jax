@@ -98,10 +98,11 @@ _SPECS: dict[str, KernelBackendSpec] = {
     "gdn_fla": KernelBackendSpec(
         name="gdn_fla",
         aliases=("gdn_fla", "fla_gdn", "vllm_fla", "flash_linear_attention"),
-        required_modules=("triton",),
+        required_modules=("triton", "jax_triton"),
         provided_kernels=(
             "gdn_recurrent_decode_step",
             "gdn_segmented_prefill_chunk32",
+            "gdn_packed_decode_step_bf16",
         ),
         implemented=False,
         description="Future vLLM/Flash Linear Attention-style Gated DeltaNet kernels.",

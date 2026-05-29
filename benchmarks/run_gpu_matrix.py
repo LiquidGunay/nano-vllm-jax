@@ -256,6 +256,15 @@ def parse_args() -> argparse.Namespace:
             "then the current interpreter."
         ),
     )
+    parser.add_argument(
+        "--jax-execution",
+        choices=["eager", "decode-jit", "jit"],
+        default="",
+        help=(
+            "Optional override for benchmark script --jax-execution "
+            "(eager, decode-jit, jit)."
+        ),
+    )
     parser.add_argument("--continue-on-error", action="store_true")
     return parser.parse_args()
 
@@ -480,9 +489,17 @@ def _append_cli_arg(command: list[str], key: str, value: Any) -> None:
     command.extend([flag, str(value)])
 
 
-def _effective_jax_args(config: dict[str, Any], workload: Workload) -> dict[str, Any]:
+def _effective_jax_args(
+    config: dict[str, Any],
+    workload: Workload,
+    jax_execution_override: str,
+) -> dict[str, Any]:
     args = dict(config.get("args", {}))
     args.update(workload.arg_overrides)
+    if jax_execution_override:
+        args["jax_execution"] = jax_execution_override
+    if args.get("jax_execution") == "":
+        args.pop("jax_execution", None)
     args["input_lens"] = workload.input_lens
     args["output_len"] = workload.output_len
     args["prompt_suite"] = workload.prompt_suite
@@ -504,12 +521,13 @@ def _effective_jax_args(config: dict[str, Any], workload: Workload) -> dict[str,
 def _jax_command(
     config: dict[str, Any],
     workload: Workload,
+    jax_execution_override: str,
     output_json: Path,
     reference_json: Path | None,
     run_label: str,
     jax_python: Path,
 ) -> list[str]:
-    args = _effective_jax_args(config, workload)
+    args = _effective_jax_args(config, workload, jax_execution_override)
     args["output_json"] = str(output_json)
     args["run_label"] = run_label
     if reference_json is not None:
@@ -1508,6 +1526,7 @@ def main() -> None:
                 command = _jax_command(
                     config,
                     workload,
+                    args.jax_execution,
                     output_path,
                     reference_path,
                     run_label,
@@ -1534,7 +1553,7 @@ def main() -> None:
                 "config": {
                     "description": config.get("description"),
                     "env": config.get("env", {}),
-                    "args": _effective_jax_args(config, workload),
+                    "args": _effective_jax_args(config, workload, args.jax_execution),
                 },
                 "workload": {
                     "prompt_source": workload.prompt_source,

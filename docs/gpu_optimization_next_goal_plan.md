@@ -65,6 +65,26 @@ optimization work starts.
     fails (`498/500` ordered top-5, `499/500` top-5 set,
     `max_hf_topk_id_logit_diff=0.010448455810546875`). Keep this path
     default-off unless a true external BF16-input kernel passes the full gates.
+14. Stop investing in the local CUDA BF16 packed-decode prototype as an
+    optimization route. The BF16 packed-decode reference boundary is correct
+    enough for the diagnostic lane, but the local CUDA BF16 implementation
+    fails the 500-token HF top-5 guardrail (`499/500` top-1,
+    `491/500` ordered top-5, `max_hf_topk_id_logit_diff=0.02606964111328125`).
+    Use the BF16 reference route as the semantic contract and go directly to a
+    vLLM/FLA-derived kernel route for GDN.
+15. JAX-Triton is viable as an optional bridge only if Triton's bundled CUDA
+    12.8 `ptxas` is first on `PATH`; the system CUDA 12.0 `ptxas` cannot
+    assemble Triton's PTX 8.7. Keep `jax-triton` optional and default-off.
+16. Do not promote the current JAX-Triton BF16 GDN decode or prefill-prep-only
+    routes. They compile and pass focused tests, but fail the full top-5/logit
+    guardrails and remain below target (`0.793x` and `0.797x` vLLM
+    diagnostics). The next GDN kernel attempt must port the full vLLM/FLA
+    chunk-body schedule behind the existing prepared boundary; split/norm/prep
+    alone is too narrow.
+17. For the full FLA chunk-body port, start with `chunk_local_cumsum`. It is
+    scalar, independently testable, and every later FLA stage consumes its
+    cumulative gate output. Porting later stages first makes failures harder to
+    localize.
 
 ## Next Goal Handoff
 
@@ -107,12 +127,14 @@ documentation/configuration-first:
    external-kernel compatibility, not a correctness-contract change for the
    default path.
 10. Do not promote the historical standalone local CUDA GDN probes as the
-    serving default. A local CUDA/JAX FFI implementation is acceptable only when
-    it sits behind the same vLLM/FLA-shaped boundary as the pure-JAX reference,
-    with the fast path selected explicitly by backend flag. The next real kernel
-    route should still use FlashInfer for paged KV/attention and vLLM/Flash
-    Linear Attention references for GDN.
-11. Run GPU, benchmark, profiling, vLLM, CUDA, NVIDIA, and model-serving
+    serving default. The local CUDA/JAX FFI GDN implementations are now
+    diagnostics only unless a later design explicitly revives one for a focused
+    replay fixture. The next real kernel route should use FlashInfer for paged
+    KV/attention and vLLM/Flash Linear Attention references for GDN.
+11. Treat direct FlashInfer GDN prefill as blocked on the current A10G/SM86
+    host. The local FlashInfer GDN path requires SM90/SM100, so the actionable
+    GDN route is a vLLM/FLA-derived JAX-facing port.
+12. Run GPU, benchmark, profiling, vLLM, CUDA, NVIDIA, and model-serving
     commands outside the sandbox with elevated access. The sandbox can miss
     `/dev/nvidia*` and report false GPU communication failures. Keep all
     benchmark/model/cache/temp paths under `/mountpoint/.exp`.
@@ -234,6 +256,13 @@ The composed FLA packed-body reference is now explicit too:
 `gdn_fla_chunk_gated_delta_rule_packed_reference` runs the full audited FLA
 stage order over packed ragged tensors and matches the existing segmented JAX
 reference on a ragged normalized-Q/K parity test.
+The BF16 packed-decode reference boundary is also useful but only as a semantic
+contract: it passes the diagnostic long-decode lane, while the local CUDA BF16
+packed-decode implementation fails full-model top-5 parity. Do not spend more
+optimization effort on that local CUDA route. The next implementation should
+replace `gdn_fla_chunk_gated_delta_rule_packed_reference` or the prepared
+post-conv body with a vLLM/FLA-derived lowered implementation and keep the
+reference path as the correctness oracle.
 
 Immediate kernel implementation checkpoint: the latest elevated long-prefill
 target artifact, `results/gpu_matrix_20260527_current_goal_target.json`, is
@@ -373,6 +402,19 @@ Current tracked records:
   `results/qwen08_jax_bf16_prefillact_long_decode_top5_compare_20260527.json`
   failed promotion: top-1 exact `500/500`, ordered top-5 `498/500`, top-5 set
   `499/500`, and `max_hf_topk_id_logit_diff=0.010448455810546875`.
+- Current BF16 packed-decode boundary scaffold result:
+  `results/qwen08_jax_packed_decode_bf16qkv_fp32out_long_decode_top5_compare_20260527.json`
+  keeps exact generated-token, top-1, and top-5 identity (`500/500` for all),
+  with `max_hf_topk_id_logit_diff=2.6702880859375e-05`. This misses the
+  default FP32-activation gate of `<=2e-5` but passes the BF16 external-kernel
+  boundary threshold (`<=1e-4`). Keep it as a default-off BF16-lane scaffold,
+  not a promoted speed path, until it also wins a benchmark target.
+- Current rejected local CUDA BF16 packed-decode route:
+  `results/qwen08_jax_packed_decode_cuda_bf16qkv_fp32out_long_decode_top5_compare_20260527.json`
+  passes focused CUDA parity but fails the full 500-token HF top-5 guardrail:
+  generated-token/top-1 exact `499/500`, ordered top-5 `491/500`, top-5 set
+  `499/500`, and `max_hf_topk_id_logit_diff=0.02606964111328125`. Do not run
+  speed claims for this variant; use it only as a diagnostic replay source.
 - Current external GDN kernel feasibility probe:
   `results/external_gdn_kernel_probe_20260527_sm86.json` records installed
   FlashInfer `0.6.11.post3`, `jax-tvm-ffi 0.1.3`, torch `2.12.0`, Triton
@@ -1317,6 +1359,14 @@ previous Pallas regressions, it should not be the first production path for GDN.
   accepted/scoped default: `88.41 tok/s`, `0.760x` vLLM, versus `90.81 tok/s`,
   `0.780x` vLLM. Keep the route as an implementation tool, not a promoted
   serving path.
+- The BF16 packed-decode reference variant
+  (`NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL=reference`,
+  `NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE=bf16`) passes the BF16 diagnostic
+  long-decode gate. The corresponding local CUDA variant fails the same
+  full-model guardrail (`499/500` top-1, `491/500` ordered top-5,
+  `max_hf_topk_id_logit_diff=0.02606964111328125`). Do not continue optimizing
+  that local CUDA variant for speed; use the reference variant as the oracle for
+  FLA/vLLM-derived kernels.
 - The optional backend registry now recognizes `gdn_fla` and aliases
   `fla_gdn`, `vllm_fla`, and `flash_linear_attention`. These requests resolve
   to the pure-JAX fallback until a vLLM/FLA-shaped kernel path is implemented
@@ -1461,6 +1511,8 @@ decision or a separate FP32-capable port.
   500/500 ordered top-5 match, 500/500 top-5 set match, and
   `max_hf_topk_id_logit_diff <= 2e-5` against the stored HF long-decode
   artifact.
+  A separate BF16 external-kernel lane keeps identity exact and can use
+  `max_hf_topk_id_logit_diff <= 1e-4` when explicitly scoped.
 - Kernel-phase guardrail revalidation on 2026-05-26 produced
   `results/qwen08_jax_bf16w_fp32act_long_decode_top5_compare_20260526_kernel_phase_gate.json`
   at git head `d66b285`. It kept exact `500/500` top-1, ordered top-5, and
@@ -1929,6 +1981,11 @@ Commit 8:
   `chunk_fwd_o`. Keep Torch autograd/runtime wrappers out of the JAX port.
   Preserve FP32 gate/beta/state. BF16 q/k/v remains an opt-in diagnostic unless
   it passes the long-decode top-logit gates.
+- Use the existing BF16 packed-decode reference as the decode-side semantic
+  oracle, but do not continue the local CUDA BF16 packed-decode route after its
+  500-token guardrail failure. If decode is revisited, adapt the vLLM/FLA
+  packed decode semantics directly instead of repairing the historical local
+  prototype.
 - ~~Add the FLA varlen chunk metadata helper for `chunk_indices` and
   `chunk_offsets`, preserving original row ids when bucket padding creates
   zero-length rows.~~ Validation: elevated CUDA focused selection
@@ -2016,7 +2073,7 @@ the pure-JAX correctness path.
 9. Maintain both accepted-baseline and fastest-achieved records for tracked workloads.
 10. For GDN, target V,K serving state; do not preserve K,V as the serving ABI merely because the old JAX path used it.
 11. Keep BF16 GDN prefill activations as a separate opt-in experiment after V,K correctness is established.
-12. Do not use local CUDA probes as the optimization path. They are historical diagnostics only unless explicitly reauthorized. Use FlashInfer for paged KV/attention and vLLM/FLA-derived kernels for GDN unless those routes are explicitly blocked.
+12. Do not use local CUDA probes as the optimization path. They are historical diagnostics only. Use FlashInfer for paged KV/attention and vLLM/FLA-derived kernels for GDN unless those routes are explicitly blocked.
 ```
 
 ## Expected Strategic Outcome

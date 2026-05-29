@@ -4,6 +4,7 @@
 #include <string>
 
 #include <cuda_runtime_api.h>
+#include <cuda_bf16.h>
 #include "xla/ffi/api/c_api.h"
 
 namespace {
@@ -47,6 +48,14 @@ bool HasTypeAndRank(
     XLA_FFI_DataType dtype,
     int64_t rank) {
   return buffer != nullptr && buffer->dtype == dtype && buffer->rank == rank;
+}
+
+__device__ __forceinline__ float ToFloat(float value) {
+  return value;
+}
+
+__device__ __forceinline__ float ToFloat(__nv_bfloat16 value) {
+  return __bfloat162float(value);
 }
 
 XLA_FFI_Error* CheckCallFrame(XLA_FFI_CallFrame* call_frame) {
@@ -350,6 +359,90 @@ XLA_FFI_Error* CheckGdnPackedDecodeCallFrame(XLA_FFI_CallFrame* call_frame) {
       !HasTypeAndRank(new_state, XLA_FFI_DataType_F32, 4)) {
     return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
                        "packed GDN decode buffers must be FP32 with expected ranks");
+  }
+
+  int64_t batch = state->dims[0];
+  int64_t num_value_heads = state->dims[1];
+  int64_t value_dim = state->dims[2];
+  int64_t key_dim = state->dims[3];
+  if (mixed_qkv->dims[0] != batch ||
+      a->dims[0] != batch ||
+      b->dims[0] != batch ||
+      a->dims[1] != num_value_heads ||
+      b->dims[1] != num_value_heads ||
+      a_log->dims[0] != num_value_heads ||
+      dt_bias->dims[0] != num_value_heads) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "packed GDN decode batch/head metadata must match state");
+  }
+  int64_t qk_dim = mixed_qkv->dims[1] - num_value_heads * value_dim;
+  if (qk_dim <= 0 || qk_dim % (2 * key_dim) != 0) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "packed GDN decode mixed_qkv has invalid Q/K dimensions");
+  }
+  int64_t num_q_heads = qk_dim / (2 * key_dim);
+  if (num_q_heads <= 0 || num_value_heads % num_q_heads != 0) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "packed GDN decode value heads must be divisible by Q heads");
+  }
+  if (out->dims[0] != batch ||
+      out->dims[1] != num_value_heads ||
+      out->dims[2] != 1 ||
+      out->dims[3] != value_dim) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "packed GDN decode output must have shape [B,HV,1,V]");
+  }
+  for (int i = 0; i < 4; ++i) {
+    if (new_state->dims[i] != state->dims[i]) {
+      return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                         "packed GDN decode state output shape must match state");
+    }
+  }
+  return nullptr;
+}
+
+XLA_FFI_Error* CheckGdnPackedDecodeBf16QkvCallFrame(XLA_FFI_CallFrame* call_frame) {
+  const XLA_FFI_Api* api = call_frame->api;
+  if (call_frame->stage != XLA_FFI_ExecutionStage_EXECUTE) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "fp32 packed GDN decode only supports execute stage");
+  }
+  if (call_frame->args.size != 6 || call_frame->rets.size != 2) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "fp32 packed GDN decode expects 6 arguments and 2 results");
+  }
+  for (int64_t i = 0; i < call_frame->args.size; ++i) {
+    if (!IsBufferArg(call_frame, i)) {
+      return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                         "all fp32 packed GDN decode arguments must be buffers");
+    }
+  }
+  for (int64_t i = 0; i < call_frame->rets.size; ++i) {
+    if (!IsBufferRet(call_frame, i)) {
+      return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                         "all fp32 packed GDN decode results must be buffers");
+    }
+  }
+
+  const XLA_FFI_Buffer* mixed_qkv = ArgBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* a = ArgBuffer(call_frame, 1);
+  const XLA_FFI_Buffer* b = ArgBuffer(call_frame, 2);
+  const XLA_FFI_Buffer* a_log = ArgBuffer(call_frame, 3);
+  const XLA_FFI_Buffer* dt_bias = ArgBuffer(call_frame, 4);
+  const XLA_FFI_Buffer* state = ArgBuffer(call_frame, 5);
+  const XLA_FFI_Buffer* out = RetBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* new_state = RetBuffer(call_frame, 1);
+
+  if (!HasTypeAndRank(mixed_qkv, XLA_FFI_DataType_BF16, 2) ||
+      !HasTypeAndRank(a, XLA_FFI_DataType_F32, 2) ||
+      !HasTypeAndRank(b, XLA_FFI_DataType_F32, 2) ||
+      !HasTypeAndRank(a_log, XLA_FFI_DataType_F32, 1) ||
+      !HasTypeAndRank(dt_bias, XLA_FFI_DataType_F32, 1) ||
+      !HasTypeAndRank(state, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(out, XLA_FFI_DataType_F32, 4) ||
+      !HasTypeAndRank(new_state, XLA_FFI_DataType_F32, 4)) {
+    return CreateError(api, XLA_FFI_Error_Code_INVALID_ARGUMENT,
+                       "packed GDN decode buffers have invalid dtypes or ranks");
   }
 
   int64_t batch = state->dims[0];
@@ -908,9 +1001,9 @@ __global__ void Fp32GdnRecurrentDecodeKernel(
     __syncthreads();
   }
 
-  float q_inv_norm = rsqrtf(reduce_q[0] + 1.0e-6f);
-  float k_inv_norm = rsqrtf(reduce_k[0] + 1.0e-6f);
-  float query_scale = rsqrtf(static_cast<float>(key_dim));
+  float q_inv_norm = 1.0f / sqrtf(reduce_q[0] + 1.0e-6f);
+  float k_inv_norm = 1.0f / sqrtf(reduce_k[0] + 1.0e-6f);
+  float query_scale = 1.0f / sqrtf(static_cast<float>(key_dim));
   for (int64_t dim = tid; dim < key_dim; dim += blockDim.x) {
     q_norm[dim] = query[q_base + dim] * q_inv_norm * query_scale;
     k_norm[dim] = key[q_base + dim] * k_inv_norm;
@@ -949,7 +1042,7 @@ __global__ void Fp32GdnRecurrentDecodeKernel(
 }
 
 __device__ inline float SoftplusF32(float x) {
-  return x > 20.0f ? x : log1pf(expf(x));
+  return log1pf(expf(-fabsf(x))) + fmaxf(x, 0.0f);
 }
 
 __device__ inline float SigmoidF32(float x) {
@@ -1053,8 +1146,9 @@ __global__ void Fp32GdnPostConvPrepKernel(
   }
 }
 
+template <typename TQ>
 __global__ void Fp32GdnPackedDecodeKernel(
-    const float* mixed_qkv,
+    const TQ* mixed_qkv,
     const float* a,
     const float* b,
     const float* a_log,
@@ -1067,7 +1161,8 @@ __global__ void Fp32GdnPackedDecodeKernel(
     int64_t num_value_heads,
     int64_t key_dim,
     int64_t value_dim,
-    int64_t packed_dim) {
+    int64_t packed_dim,
+    bool precompute_gate_beta) {
   extern __shared__ float shared[];
   float* q_norm = shared;
   float* k_norm = q_norm + key_dim;
@@ -1094,8 +1189,8 @@ __global__ void Fp32GdnPackedDecodeKernel(
   float local_q_sum = 0.0f;
   float local_k_sum = 0.0f;
   for (int64_t dim = tid; dim < key_dim; dim += blockDim.x) {
-    float q_value = mixed_qkv[query_base + dim];
-    float k_value = mixed_qkv[key_base + dim];
+    float q_value = ToFloat(mixed_qkv[query_base + dim]);
+    float k_value = ToFloat(mixed_qkv[key_base + dim]);
     local_q_sum += q_value * q_value;
     local_k_sum += k_value * k_value;
   }
@@ -1111,27 +1206,36 @@ __global__ void Fp32GdnPackedDecodeKernel(
     __syncthreads();
   }
 
-  float q_inv_norm = rsqrtf(reduce_q[0] + 1.0e-6f);
-  float k_inv_norm = rsqrtf(reduce_k[0] + 1.0e-6f);
-  float query_scale = rsqrtf(static_cast<float>(key_dim));
+  float q_inv_norm = 1.0f / sqrtf(reduce_q[0] + 1.0e-6f);
+  float k_inv_norm = 1.0f / sqrtf(reduce_k[0] + 1.0e-6f);
+  float query_scale = 1.0f / sqrtf(static_cast<float>(key_dim));
   for (int64_t dim = tid; dim < key_dim; dim += blockDim.x) {
-    q_norm[dim] = mixed_qkv[query_base + dim] * q_inv_norm * query_scale;
-    k_norm[dim] = mixed_qkv[key_base + dim] * k_inv_norm;
+    q_norm[dim] = ToFloat(mixed_qkv[query_base + dim]) * q_inv_norm * query_scale;
+    k_norm[dim] = ToFloat(mixed_qkv[key_base + dim]) * k_inv_norm;
   }
   __syncthreads();
 
-  float gate_raw =
-      -expf(a_log[value_head]) *
-      SoftplusF32(a[gate_base] + dt_bias[value_head]);
-  float gate = expf(gate_raw);
-  float beta_value = 1.0f / (1.0f + expf(-b[gate_base]));
+  float gate;
+  float beta_value;
+  if (precompute_gate_beta) {
+    // For BF16 QKV route, gate/beta are precomputed in the Python caller as:
+    // gate = exp(-decay * softplus(a + dt_bias)) and beta = sigmoid(b).
+    gate = a[gate_base];
+    beta_value = b[gate_base];
+  } else {
+    float gate_raw =
+        -expf(a_log[value_head]) *
+        SoftplusF32(a[gate_base] + dt_bias[value_head]);
+    gate = expf(gate_raw);
+    beta_value = SigmoidF32(b[gate_base]);
+  }
   for (int64_t v_dim = tid; v_dim < value_dim; v_dim += blockDim.x) {
     float kv_mem = 0.0f;
     for (int64_t k_dim = 0; k_dim < key_dim; ++k_dim) {
       kv_mem +=
           state[state_base + v_dim * key_dim + k_dim] * gate * k_norm[k_dim];
     }
-    delta[v_dim] = (mixed_qkv[value_base + v_dim] - kv_mem) * beta_value;
+    delta[v_dim] = (ToFloat(mixed_qkv[value_base + v_dim]) - kv_mem) * beta_value;
   }
   __syncthreads();
 
@@ -1693,7 +1797,7 @@ extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPackedDecode(
       static_cast<size_t>(key_dim * 2 + value_dim + threads * 2) *
       sizeof(float);
 
-  Fp32GdnPackedDecodeKernel<<<static_cast<int>(grid), threads, shared_bytes, stream>>>(
+  Fp32GdnPackedDecodeKernel<float><<<static_cast<int>(grid), threads, shared_bytes, stream>>>(
       static_cast<const float*>(mixed_qkv->data),
       static_cast<const float*>(a->data),
       static_cast<const float*>(b->data),
@@ -1707,7 +1811,77 @@ extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPackedDecode(
       num_value_heads,
       key_dim,
       value_dim,
-      packed_dim);
+      packed_dim,
+      false);
+  cudaError_t launch_error = cudaGetLastError();
+  if (launch_error != cudaSuccess) {
+    return CreateError(api, XLA_FFI_Error_Code_INTERNAL,
+                       cudaGetErrorString(launch_error));
+  }
+  return nullptr;
+}
+
+extern "C" XLA_FFI_Error* NanoVllmJaxFp32GdnPackedDecodeBf16qkv(
+    XLA_FFI_CallFrame* call_frame) {
+  MaybeSetMetadata(call_frame);
+  if (call_frame->extension_start != nullptr) {
+    return nullptr;
+  }
+
+  if (XLA_FFI_Error* error = CheckGdnPackedDecodeBf16QkvCallFrame(call_frame)) {
+    return error;
+  }
+
+  const XLA_FFI_Api* api = call_frame->api;
+  XLA_FFI_Stream_Get_Args stream_args;
+  stream_args.struct_size = XLA_FFI_Stream_Get_Args_STRUCT_SIZE;
+  stream_args.extension_start = nullptr;
+  stream_args.ctx = call_frame->ctx;
+  stream_args.stream = nullptr;
+  if (XLA_FFI_Error* error = api->XLA_FFI_Stream_Get(&stream_args)) {
+    return error;
+  }
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_args.stream);
+
+  const XLA_FFI_Buffer* mixed_qkv = ArgBuffer(call_frame, 0);
+  const XLA_FFI_Buffer* a = ArgBuffer(call_frame, 1);
+  const XLA_FFI_Buffer* b = ArgBuffer(call_frame, 2);
+  const XLA_FFI_Buffer* a_log = ArgBuffer(call_frame, 3);
+  const XLA_FFI_Buffer* dt_bias = ArgBuffer(call_frame, 4);
+  const XLA_FFI_Buffer* state = ArgBuffer(call_frame, 5);
+  XLA_FFI_Buffer* out = RetBuffer(call_frame, 0);
+  XLA_FFI_Buffer* new_state = RetBuffer(call_frame, 1);
+
+  int64_t batch = state->dims[0];
+  int64_t num_value_heads = state->dims[1];
+  int64_t value_dim = state->dims[2];
+  int64_t key_dim = state->dims[3];
+  int64_t packed_dim = mixed_qkv->dims[1];
+  int64_t qk_dim = packed_dim - num_value_heads * value_dim;
+  int64_t num_q_heads = qk_dim / (2 * key_dim);
+  int threads = 256;
+  int64_t grid = batch * num_value_heads;
+  size_t shared_bytes =
+      static_cast<size_t>(key_dim * 2 + value_dim + threads * 2) *
+      sizeof(float);
+
+  Fp32GdnPackedDecodeKernel<__nv_bfloat16><<<
+      static_cast<int>(grid), threads, shared_bytes, stream>>>(
+      static_cast<const __nv_bfloat16*>(mixed_qkv->data),
+      static_cast<const float*>(a->data),
+      static_cast<const float*>(b->data),
+      static_cast<const float*>(a_log->data),
+      static_cast<const float*>(dt_bias->data),
+      static_cast<const float*>(state->data),
+      static_cast<float*>(out->data),
+      static_cast<float*>(new_state->data),
+      batch,
+      num_q_heads,
+      num_value_heads,
+      key_dim,
+      value_dim,
+      packed_dim,
+      true);
   cudaError_t launch_error = cudaGetLastError();
   if (launch_error != cudaSuccess) {
     return CreateError(api, XLA_FFI_Error_Code_INTERNAL,

@@ -1,0 +1,354 @@
+{
+  "elapsed_seconds": 22.282437867950648,
+  "first_ordered_top5_mismatches": [
+    {
+      "hf_top_id_logit_max_abs_diff": 0.002704620361328125,
+      "hf_top_ids": [
+        6206,
+        369,
+        5392,
+        4400,
+        17454
+      ],
+      "hf_top_values": [
+        17.347190856933594,
+        17.342437744140625,
+        17.265146255493164,
+        17.046512603759766,
+        16.674217224121094
+      ],
+      "jax_top_ids": [
+        369,
+        6206,
+        5392,
+        4400,
+        17454
+      ],
+      "jax_top_values": [
+        17.345142364501953,
+        17.344911575317383,
+        17.265583038330078,
+        17.04491424560547,
+        16.67365264892578
+      ],
+      "prefix_len": 18,
+      "ranked_logit_max_abs_diff": 0.0024738311767578125,
+      "same_top5_set": true,
+      "step": 8
+    },
+    {
+      "hf_top_id_logit_max_abs_diff": 0.012643814086914062,
+      "hf_top_ids": [
+        314,
+        13,
+        11,
+        3611,
+        271
+      ],
+      "hf_top_values": [
+        29.1734676361084,
+        21.914592742919922,
+        18.94956398010254,
+        18.946918487548828,
+        18.892749786376953
+      ],
+      "jax_top_ids": [
+        314,
+        13,
+        3611,
+        11,
+        271
+      ],
+      "jax_top_values": [
+        29.16621208190918,
+        21.901948928833008,
+        18.953937530517578,
+        18.947895050048828,
+        18.89725112915039
+      ],
+      "prefix_len": 182,
+      "ranked_logit_max_abs_diff": 0.012643814086914062,
+      "same_top5_set": true,
+      "step": 172
+    },
+    {
+      "hf_top_id_logit_max_abs_diff": 0.012578964233398438,
+      "hf_top_ids": [
+        944,
+        271,
+        3827,
+        14061,
+        198
+      ],
+      "hf_top_values": [
+        29.18390655517578,
+        18.888439178466797,
+        17.805381774902344,
+        17.470060348510742,
+        17.45426368713379
+      ],
+      "jax_top_ids": [
+        944,
+        271,
+        3827,
+        198,
+        14061
+      ],
+      "jax_top_values": [
+        29.179630279541016,
+        18.894521713256836,
+        17.796098709106445,
+        17.466842651367188,
+        17.465778350830078
+      ],
+      "prefix_len": 208,
+      "ranked_logit_max_abs_diff": 0.011514663696289062,
+      "same_top5_set": true,
+      "step": 198
+    },
+    {
+      "hf_top_id_logit_max_abs_diff": 0.00574493408203125,
+      "hf_top_ids": [
+        5224,
+        271,
+        5269,
+        5484,
+        198
+      ],
+      "hf_top_values": [
+        24.683395385742188,
+        16.40660858154297,
+        15.78935718536377,
+        15.415299415588379,
+        15.414305686950684
+      ],
+      "jax_top_ids": [
+        5224,
+        271,
+        5269,
+        198,
+        5484
+      ],
+      "jax_top_values": [
+        24.680133819580078,
+        16.41183090209961,
+        15.78459644317627,
+        15.418983459472656,
+        15.409554481506348
+      ],
+      "prefix_len": 233,
+      "ranked_logit_max_abs_diff": 0.005222320556640625,
+      "same_top5_set": true,
+      "step": 223
+    },
+    {
+      "hf_top_id_logit_max_abs_diff": 0.0052127838134765625,
+      "hf_top_ids": [
+        6481,
+        4006,
+        471,
+        271,
+        15752
+      ],
+      "hf_top_values": [
+        28.423582077026367,
+        19.155902862548828,
+        18.851966857910156,
+        18.58313751220703,
+        18.399555206298828
+      ],
+      "jax_top_ids": [
+        6481,
+        4006,
+        471,
+        271,
+        14791
+      ],
+      "jax_top_values": [
+        28.427913665771484,
+        19.154333114624023,
+        18.850826263427734,
+        18.585208892822266,
+        18.406309127807617
+      ],
+      "prefix_len": 388,
+      "ranked_logit_max_abs_diff": 0.0067539215087890625,
+      "same_top5_set": false,
+      "step": 378
+    },
+    {
+      "hf_top_id_logit_max_abs_diff": 0.008220672607421875,
+      "hf_top_ids": [
+        567,
+        271,
+        1165,
+        353,
+        488
+      ],
+      "hf_top_values": [
+        30.99761199951172,
+        19.920673370361328,
+        18.908876419067383,
+        18.90801239013672,
+        18.739959716796875
+      ],
+      "jax_top_ids": [
+        567,
+        271,
+        353,
+        1165,
+        488
+      ],
+      "jax_top_values": [
+        30.989391326904297,
+        19.925739288330078,
+        18.911489486694336,
+        18.903738021850586,
+        18.744651794433594
+      ],
+      "prefix_len": 411,
+      "ranked_logit_max_abs_diff": 0.008220672607421875,
+      "same_top5_set": true,
+      "step": 401
+    },
+    {
+      "hf_top_id_logit_max_abs_diff": 0.018472671508789062,
+      "hf_top_ids": [
+        668,
+        271,
+        9257,
+        198,
+        4686
+      ],
+      "hf_top_values": [
+        29.253520965576172,
+        20.476486206054688,
+        17.615440368652344,
+        17.034929275512695,
+        17.03375244140625
+      ],
+      "jax_top_ids": [
+        668,
+        271,
+        9257,
+        4686,
+        198
+      ],
+      "jax_top_values": [
+        29.251140594482422,
+        20.476543426513672,
+        17.596967697143555,
+        17.035228729248047,
+        17.032451629638672
+      ],
+      "prefix_len": 457,
+      "ranked_logit_max_abs_diff": 0.018472671508789062,
+      "same_top5_set": true,
+      "step": 447
+    },
+    {
+      "hf_top_id_logit_max_abs_diff": 0.0059185028076171875,
+      "hf_top_ids": [
+        6481,
+        271,
+        4006,
+        471,
+        14791
+      ],
+      "hf_top_values": [
+        29.24810028076172,
+        19.168010711669922,
+        18.99517822265625,
+        18.652027130126953,
+        18.6430606842041
+      ],
+      "jax_top_ids": [
+        6481,
+        271,
+        4006,
+        14791,
+        471
+      ],
+      "jax_top_values": [
+        29.24581527709961,
+        19.17355728149414,
+        18.99302864074707,
+        18.64897918701172,
+        18.646236419677734
+      ],
+      "prefix_len": 490,
+      "ranked_logit_max_abs_diff": 0.00554656982421875,
+      "same_top5_set": true,
+      "step": 480
+    }
+  ],
+  "first_top1_mismatches": [
+    {
+      "hf_top_id": 6206,
+      "hf_top_value": 17.347190856933594,
+      "jax_top_id": 369,
+      "jax_top_value": 17.345142364501953,
+      "prefix_len": 18,
+      "step": 8
+    }
+  ],
+  "first_top5_set_mismatches": [
+    {
+      "hf_top_ids": [
+        6481,
+        4006,
+        471,
+        271,
+        15752
+      ],
+      "jax_top_ids": [
+        6481,
+        4006,
+        471,
+        271,
+        14791
+      ],
+      "prefix_len": 388,
+      "step": 378
+    }
+  ],
+  "gdn_kernel_flags": {
+    "packed_decode_impl": "triton_fla",
+    "packed_decode_qkv_dtype": "bf16",
+    "prefill_act_dtype": "fp32",
+    "prefill_post_conv_impl": "off",
+    "prefill_post_conv_output_dtype": "fp32",
+    "prefill_qkv_dtype": "fp32"
+  },
+  "git_head": "6dc2032",
+  "guardrail": {
+    "exact_generated_token_match": false,
+    "max_hf_topk_id_logit_diff_lte": 2e-05,
+    "max_hf_topk_id_logit_diff_within_gate": false,
+    "ordered_top5_exact_match": false,
+    "ordered_top5_exact_matches_required": 500,
+    "passes_required_gate": false,
+    "top1_exact_match": false,
+    "top1_exact_matches_required": 500,
+    "top5_set_exact_match": false,
+    "top5_set_exact_matches_required": 500
+  },
+  "hf_reference": "results/qwen08_hf_bf16w_fp32act_long_decode_top5_500.npz",
+  "jax_activation_dtype": "float32",
+  "jax_backend": "gpu",
+  "jax_version": "0.10.1",
+  "jax_weight_dtype": "bfloat16",
+  "max_hf_topk_id_logit_diff": 0.027135848999023438,
+  "max_ranked_topk_logit_diff": 0.027135848999023438,
+  "max_top1_abs_logit_diff_when_id_matches": 0.018413543701171875,
+  "model": "Qwen/Qwen3.5-0.8B",
+  "ordered_top5_exact_matches": 492,
+  "ordered_top5_mismatches": 8,
+  "prompt": "The future of artificial intelligence is poised to revolutionize",
+  "steps_checked": 500,
+  "top1_exact_matches": 499,
+  "top1_mismatches": 1,
+  "top5_set_exact_matches": 499,
+  "top5_set_mismatches": 1,
+  "top_k": 5
+}

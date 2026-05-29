@@ -5353,3 +5353,113 @@ JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m
   existing segmented JAX reference on ragged lengths `[0,3,7,9]`, chunk size
   `4`, Q/K L2 normalization enabled, grouped state/output shapes, and final
   state parity.
+
+### Entry 151 - BF16 Packed-Decode Long-Decode Boundary Scaffold
+
+- change accepted: added/updated a packed-decoding boundary artifact check for the
+  BF16 qkv external-kernel lane.
+- artifact:
+  `results/qwen08_jax_packed_decode_bf16qkv_fp32out_long_decode_top5_compare_20260527.json`
+- result: generated-token identity is exact, top-1/ordered top-5/top-5 set parity is
+  `500/500`, and `max_hf_topk_id_logit_diff=2.6702880859375e-05`. This misses the
+  strict default FP32-activation requirement (`max_hf_topk_id_logit_diff <= 2e-5`)
+  but passes the BF16 external-kernel boundary limit (`<=1e-4`) with
+  `exact_generated_token_match=true`.
+- decision: accept this as BF16 boundary-scaffold status only (not a promoted speed
+  path) while keeping it default-off, and continue treating BF16 packed decode
+  as an experiment lane until it wins on benchmark targets.
+
+### Entry 152 - Rejected Local CUDA BF16 Packed-Decode Route
+
+- experiment: tested the local CUDA/JAX FFI packed GDN decode implementation
+  with BF16 packed q/k/v input and FP32 gate/beta/state/output behind
+  `NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL=cuda_fp32` and
+  `NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE=bf16`.
+- focused validation: elevated CUDA focused tests passed after relaxing an
+  over-strict unit assertion from bit-exact CUDA-vs-JAX FP32 identity to
+  `rtol=1e-6, atol=1e-6`. The original unit drift was only about `4.47e-08`;
+  this was not the model-level blocker.
+- artifact:
+  `results/qwen08_jax_packed_decode_cuda_bf16qkv_fp32out_long_decode_top5_compare_20260527.json`
+- result: the 500-token HF top-5 guardrail failed. Generated-token/top-1
+  identity was `499/500`, ordered top-5 identity was `491/500`, top-5 set
+  identity was `499/500`, and `max_hf_topk_id_logit_diff` was
+  `0.02606964111328125`, far outside both the default `2e-5` gate and the
+  BF16 diagnostic `1e-4` lane.
+- decision: reject this local CUDA BF16 packed-decode route for promotion and
+  do not run speed claims for it. Keep the BF16 packed-decode reference path as
+  the semantic contract, and move directly to a vLLM/FLA-derived kernel route
+  for GDN instead of repairing the historical local CUDA prototype.
+
+### Entry 153 - JAX-Triton Optional Kernel Bridge
+
+- change accepted as scaffold: added optional `jax-triton==0.3.1` dependency
+  metadata, a `benchmarks/probe_jax_triton.py` smoke probe, and a
+  `nanovllm_jax.kernels.gdn_fla_triton` module for vLLM/FLA-shaped GDN
+  experiments.
+- runtime finding: `jax_triton` imports with JAX `0.10.1` and Triton `3.7.0`,
+  but XLA custom-call assembly must prefer Triton's bundled CUDA 12.8 `ptxas`.
+  The system `/usr/bin/ptxas` is CUDA 12.0 and fails generated PTX 8.7 with
+  `Unsupported .version 8.7; current version is '8.0'`. The probe and kernel
+  module therefore put Triton's bundled `ptxas` first on `PATH`.
+- validation:
+
+```text
+NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
+  PATH=.venv/lib/python3.11/site-packages/triton/backends/nvidia/bin:$PATH \
+  .venv/bin/python benchmarks/probe_jax_triton.py
+```
+
+- result: the elevated GPU smoke passed on `cuda:0` with `ok=True`.
+- external-kernel finding:
+  `results/external_gdn_kernel_probe_20260528_gpu_jaxtriton.json` confirms the
+  host GPU is NVIDIA A10G / SM86, while direct FlashInfer GDN prefill requires
+  SM90/SM100. Continue using vLLM/FLA Triton sources as the GDN port reference;
+  do not pursue direct FlashInfer GDN prefill on this host.
+
+### Entry 154 - Rejected JAX-Triton BF16 Packed GDN Decode
+
+- experiment: ported the vLLM/FLA-style packed decode recurrence to a
+  JAX-Triton custom call behind
+  `NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL=triton_fla`. The route consumes BF16
+  packed q/k/v and FP32 gate/beta/decay/state, with the pure-JAX BF16 reference
+  still serving as the semantic oracle.
+- focused validation: elevated CUDA test
+  `tests/test_gdn_packed_decode_reference.py::test_packed_gdn_decode_triton_bf16_matches_reference`
+  passed.
+- correctness artifact:
+  `results/qwen08_jax_packed_decode_triton_fla_bf16qkv_fp32out_long_decode_top5_compare_20260528.json`
+- result: the 500-token HF guardrail failed. Generated-token/top-1 identity was
+  `499/500`, ordered top-5 identity was `493/500`, top-5 set identity was
+  `499/500`, and `max_hf_topk_id_logit_diff=0.029291152954101562`.
+- diagnostic speed artifact:
+  `results/gpu_matrix_20260528_gdn_packed_triton_fla_bf16qkv_device_carry_diag_target.json`
+- speed result: one-repeat diagnostic was only `92.33 tok/s`, `0.793x` vLLM,
+  below the `0.9x` target and not speed-claim ready.
+- decision: reject for promotion. Keep default-off only as a porting scaffold.
+  Replacing decode recurrence alone adds custom-call/command-buffer cost and
+  the Triton math path drifts enough to fail full-model gates.
+
+### Entry 155 - Rejected JAX-Triton BF16 GDN Prefill Prep Only
+
+- experiment: added a JAX-Triton fused post-conv prep route behind
+  `NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL=triton_fla_prep_bf16`. The route
+  produces prepared BF16 q/k/v and keeps FP32 gate/beta/state; after the first
+  guardrail failure, gate/beta were moved back to JAX reference math and the
+  Triton custom call was limited to the normalized BF16 q/k/v prep boundary.
+- focused validation: elevated CUDA test
+  `tests/test_gdn_post_conv_prefill_reference.py::test_post_conv_triton_bf16_prep_matches_reference_boundary`
+  passed.
+- correctness artifact:
+  `results/qwen08_jax_gdn_prefill_triton_fla_prep_bf16_jax_gate_long_decode_top5_compare_20260528.json`
+- correctness result: generated-token/top-1 identity was `500/500`, but
+  ordered top-5 identity was `496/500`, top-5 set identity was `499/500`, and
+  `max_hf_topk_id_logit_diff=0.008432388305664062`. This fails both the default
+  FP32 gate and the BF16 external-kernel diagnostic gate.
+- diagnostic speed artifact:
+  `results/gpu_matrix_20260528_gdn_prefill_triton_fla_prep_bf16_device_carry_diag_target.json`
+- speed result: one-repeat diagnostic was `92.80 tok/s`, `0.797x` vLLM, below
+  the `0.9x` target. The benchmark also failed exact generated-token parity on
+  the multi-prompt long-prefill target.
+- decision: reject for promotion. A prep-only kernel is too narrow; the next
+  GDN speed attempt must move the full FLA chunk body, not just split/norm/prep.

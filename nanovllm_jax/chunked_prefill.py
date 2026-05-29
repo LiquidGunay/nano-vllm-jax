@@ -6,8 +6,11 @@ then can handle any sequence length by processing in chunks.
 
 import jax
 import jax.numpy as jnp
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from dataclasses import replace
+
+if TYPE_CHECKING:
+    from nanovllm_jax.kv_cache import KVCacheState
 
 def create_chunked_attention_mask(
     chunk_size: int,
@@ -141,7 +144,7 @@ def chunked_full_attention_block(
     params: dict,
     positions: jnp.ndarray,  # [batch, seq_len]
     config,
-    kv_cache_state: Optional['KVCacheState'],
+    kv_cache_state: Optional["KVCacheState"],
     actual_lens: jnp.ndarray,  # [batch] - actual length within chunk
     chunk_size: int,
 ):

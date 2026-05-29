@@ -235,6 +235,48 @@ Current GPU artifacts:
 | `batch4_16_32_64_128x24` | vLLM async baseline | diverges on `len_64` at generated index 6 | 549.03 | 63.09 | 4.87 | first-step top-1 matches all rows; correctness issue is logged in the run journal. |
 | `batch4_16_32_64_128x24` | vLLM offline MTP1 | same `len_64` divergence as vLLM baseline | 32.08 | n/a | n/a | slower than vLLM offline baseline; offline API has no true ITL. |
 
+## HF long-prefill reference generation
+
+Use `benchmarks/precompute_hf_prompt_reference.py` when a benchmark needs a
+standalone HuggingFace greedy reference JSON instead of a live HF comparison in
+the same process. The helper writes generated token IDs plus per-step top-k
+logits/logprobs for each prompt row.
+
+Default GPU correctness reference:
+
+```bash
+uv run python benchmarks/precompute_hf_prompt_reference.py \
+  --model Qwen/Qwen3.5-0.8B \
+  --dtype float32 \
+  --weight-dtype bfloat16 \
+  --input-lens 512,1024,1536,2048 \
+  --output-len 16 \
+  --prompt-suite mixed \
+  --prompt-source tokenized_seed_repeat \
+  --top-k 5 \
+  --output-json results/qwen08_hf_bf16w_fp32act_long_prefill_512_2048x16.json
+```
+
+BF16 activation diagnostic reference:
+
+```bash
+uv run python benchmarks/precompute_hf_prompt_reference.py \
+  --model Qwen/Qwen3.5-0.8B \
+  --dtype bfloat16 \
+  --weight-dtype bfloat16 \
+  --input-lens 512,1024,1536,2048 \
+  --output-len 16 \
+  --prompt-suite mixed \
+  --prompt-source tokenized_seed_repeat \
+  --top-k 5 \
+  --output-json results/qwen08_hf_bf16w_bf16act_long_prefill_512_2048x16.json
+```
+
+Keep the runtime environment rooted under `/mountpoint/.exp` as described
+above. For `--prompt-source vllm_random`, preserve the emitted
+`*.prompts.jsonl` manifest and its SHA in the artifact; otherwise regenerated
+references are not comparable to prior random-prompt runs.
+
 ## Historical TPU result table
 
 Preserved TPU findings from `docs/mtp_tpu_spot_findings_2026-05-09.md`; keep these for historical comparison only:

@@ -608,11 +608,17 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
         for prompt in prompts
     ]
 
-    async def consume_prompt(prompt: dict[str, Any], request_id: str, sampling: SamplingParams, start: float) -> dict[str, Any]:
+    async def consume_prompt(
+        async_engine: AsyncLLMEngine,
+        prompt: dict[str, Any],
+        request_id: str,
+        sampling: SamplingParams,
+        start: float,
+    ) -> dict[str, Any]:
         token_events = []
         token_ids = []
         topk_rows = []
-        async for output in engine.generate(
+        async for output in async_engine.generate(
             {"prompt_token_ids": prompt["input_ids"]},
             sampling,
             request_id=request_id,
@@ -646,8 +652,13 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
             "token_events": token_events,
         }
 
-    async def drain_prompt(prompt: dict[str, Any], request_id: str, warm_sampling: SamplingParams) -> None:
-        async for _ in engine.generate(
+    async def drain_prompt(
+        async_engine: AsyncLLMEngine,
+        prompt: dict[str, Any],
+        request_id: str,
+        warm_sampling: SamplingParams,
+    ) -> None:
+        async for _ in async_engine.generate(
             {"prompt_token_ids": prompt["input_ids"]},
             warm_sampling,
             request_id=request_id,
@@ -659,6 +670,7 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
     await asyncio.gather(
         *[
             drain_prompt(
+                engine,
                 prompt,
                 f"warmup-{index}",
                 _make_sampling_params(
@@ -675,7 +687,7 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
     started = time.perf_counter()
     rows = await asyncio.gather(
         *[
-            consume_prompt(prompt, f"bench-{index}", sampling_by_prompt[index], started)
+            consume_prompt(engine, prompt, f"bench-{index}", sampling_by_prompt[index], started)
             for index, prompt in enumerate(prompts)
         ]
     )
