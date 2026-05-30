@@ -340,6 +340,7 @@ gdn_segmented_prefill_chunk32(
   active. The local target should therefore mirror the non-TMA FLA path first.
   Preserve FP32 gate/beta/state; vLLM rejects FP32 q/k/v in its Torch wrapper,
   so a FP32 JAX port must intentionally own that dtype contract rather than
+- CPU-only validation note (2026-05-29): local environment reports `CUDA_ERROR_NO_DEVICE`; JAX falls back to `CpuDevice(id=0)`. Focused segmented-reference tests pass on CPU (`2 passed, 1 skipped` for chunk_metadata + prefill-chunk32 parity; `8 passed, 10 skipped` for triton/padded/packed). Triton/packed skips are expected without GPU. Canonical GPU benchmark `run_gpu_matrix.py --configs gpu_paged_default --workloads long_prefill_512_2048 --repeats 2 --require-goal-target-ready` remains unverified locally.
   calling the upstream wrapper directly.
 
 ## P2.1 - `paged_prefill_attention_gqa_nhd`
@@ -401,3 +402,9 @@ sample_topk_topp(logits, temperature, top_k, top_p, rng_state) -> token_ids
 - performance gate: only considered after decode ITL is closer to vLLM.
 - do-not-merge conditions: distracts from P0/P1, or adds complexity without a
   product requirement or MTP diagnostic need.
+
+- GPU escalation note (2026-05-29): parent supervisor confirmed NVIDIA A10G
+  (driver 580.159.03, CUDA 13.0, 23028 MiB) is present and idle via elevated
+  `nvidia-smi`. Subagent sandbox cannot access the GPU (exit code 9, elevated
+  retry rejected by auto-review). The `gdn_fla implemented=False` guardrail
+  remains in effect until correctness/benchmark gates run on-device.

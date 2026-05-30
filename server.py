@@ -12,7 +12,10 @@ import traceback
 from typing import Any
 
 from runtime_paths import configure_compilation_cache, configure_xla_flags
+from nanovllm_jax.server_config import load_server_config
 
+# Load YAML config (env section applied to os.environ before JAX init)
+_server_cfg = load_server_config()
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
@@ -426,28 +429,37 @@ def completions():
 
 
 def main():
+    global _server_cfg
+    cfg = _server_cfg  # loaded at module init (before JAX)
     parser = argparse.ArgumentParser(description="nano-vllm-jax LLMEngine API server")
-    parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--backend", default="auto")
-    parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float16")
-    parser.add_argument("--weight-dtype", choices=["float16", "bfloat16", "float32"], default=None)
-    parser.add_argument("--jax-execution", choices=["eager", "decode-jit", "jit"], default="jit")
-    parser.add_argument("--prefill-buckets", default="16")
-    parser.add_argument("--batch-size-buckets", default="1")
-    parser.add_argument("--max-prefill", type=int, default=16)
-    parser.add_argument("--max-kv-cache-mb", type=int, default=64)
-    parser.add_argument("--num-kvcache-blocks", type=int, default=8)
-    parser.add_argument("--max-num-seqs", type=int, default=1)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=16)
-    parser.add_argument("--max-tokens-default", type=int, default=16)
-    parser.add_argument("--num-speculative-tokens", type=int, choices=[0, 1], default=0)
-    parser.add_argument("--skip-compile", action="store_true")
+    parser.add_argument("--model", default=cfg.engine["model"])
+    parser.add_argument("--host", default=cfg.server["host"])
+    parser.add_argument("--port", type=int, default=cfg.server["port"])
+    parser.add_argument("--backend", default=cfg.engine["backend"])
+    parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default=cfg.engine["dtype"])
+    parser.add_argument("--weight-dtype", choices=["float16", "bfloat16", "float32"], default=cfg.engine.get("weight_dtype"))
+    parser.add_argument("--jax-execution", choices=["eager", "decode-jit", "jit"], default=cfg.engine["jax_execution"])
+    parser.add_argument("--prefill-buckets", default=cfg.engine["prefill_buckets"])
+    parser.add_argument("--batch-size-buckets", default=cfg.engine["batch_size_buckets"])
+    parser.add_argument("--max-prefill", type=int, default=cfg.engine["max_prefill"])
+    parser.add_argument("--max-kv-cache-mb", type=int, default=cfg.engine["max_kv_cache_mb"])
+    parser.add_argument("--num-kvcache-blocks", type=int, default=cfg.engine["num_kvcache_blocks"])
+    parser.add_argument("--max-num-seqs", type=int, default=cfg.engine["max_num_seqs"])
+    parser.add_argument("--max-num-batched-tokens", type=int, default=cfg.engine["max_num_batched_tokens"])
+    parser.add_argument("--max-tokens-default", type=int, default=cfg.server["max_tokens_default"])
+    parser.add_argument("--num-speculative-tokens", type=int, choices=[0, 1], default=cfg.engine["num_speculative_tokens"])
+    parser.add_argument("--skip-compile", action="store_true", default=cfg.engine.get("skip_compile", False))
+    parser.add_argument("--config", default=None, help="Path to server_config.yaml (overrides NANO_VLLM_JAX_SERVER_CONFIG)")
     args = parser.parse_args()
+
+    # Reload config if --config given (overrides the module-level load)
+    if args.config:
+        _server_cfg = load_server_config(args.config)
+
     app.config["MAX_TOKENS_DEFAULT"] = args.max_tokens_default
 
     print("nano-vllm-jax LLMEngine server")
+    print(f"config_source={_server_cfg.source}")
     print(f"model={args.model} dtype={args.dtype} weight_dtype={args.weight_dtype or args.dtype} execution={args.jax_execution}")
     print(f"prefill_buckets={args.prefill_buckets} batch_size_buckets={args.batch_size_buckets}")
     load_engine(args)

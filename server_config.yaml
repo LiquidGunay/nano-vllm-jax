@@ -1,0 +1,40 @@
+# nano-vllm-jax server configuration
+# Env vars override any value here (e.g. NANO_VLLM_JAX_PORT=9090 overrides port).
+# Set NANO_VLLM_JAX_SERVER_CONFIG to load a different file.
+
+server:
+  host: "127.0.0.1"
+  port: 8080
+  max_tokens_default: 16
+
+engine:
+  model: "Qwen/Qwen3.5-0.8B"
+  backend: "auto"
+  dtype: "float16"
+  # weight_dtype: null          # defaults to dtype
+  jax_execution: "jit"
+  prefill_buckets: "16"
+  batch_size_buckets: "1"
+  max_prefill: 16
+  max_kv_cache_mb: 64
+  num_kvcache_blocks: 8
+  max_num_seqs: 1
+  max_num_batched_tokens: 16
+  num_speculative_tokens: 0
+  skip_compile: false
+
+# Runtime environment knobs applied to os.environ before JAX init.
+# Each key is an env-var name; the value is the default.  An explicit
+# env-var in the shell always wins over what is set here.
+env:
+  TOKENIZERS_PARALLELISM: "false"
+  XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+  TF_GPU_ALLOCATOR: "cuda_malloc_async"
+  # NANO_VLLM_JAX_XLA_GPU_AUTOTUNE_LEVEL: "4"
+  # NANO_VLLM_JAX_KERNEL_BACKEND: "pure_jax"
+  # NANO_VLLM_JAX_DEVICE_TOKEN_CARRY: "0"
+  # NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL: "off"
+  # NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL: "off"
+  # NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_WARPS: "1"
+  # NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_BLOCK_V: "32"
+  # NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY: "all_or_none"

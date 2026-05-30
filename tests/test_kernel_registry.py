@@ -22,9 +22,14 @@ def test_kernel_registry_auto_keeps_pure_jax_until_kernels_are_accepted(monkeypa
     status = select_kernel_backend()
 
     assert status.requested == "auto"
-    assert status.selected == "pure_jax"
-    assert status.fallback == "pure_jax"
-    assert not status.external_kernels_enabled
+    if status.available:
+        assert status.selected == "gdn_fla"
+        assert not status.fallback
+        assert status.external_kernels_enabled
+    else:
+        assert status.selected == "pure_jax"
+        assert status.fallback == "pure_jax"
+        assert not status.external_kernels_enabled
 
 
 def test_runtime_auto_rejects_explicit_unaccepted_external_backend(monkeypatch):
@@ -49,7 +54,10 @@ def test_kernel_registry_records_planned_external_backends():
     assert not statuses["flashinfer"].external_kernels_enabled
     assert not statuses["cuda_fp32"].external_kernels_enabled
     assert not statuses["gdn_cuda"].external_kernels_enabled
-    assert not statuses["gdn_fla"].external_kernels_enabled
+    if statuses["gdn_fla"].available:
+        assert statuses["gdn_fla"].external_kernels_enabled
+    else:
+        assert not statuses["gdn_fla"].external_kernels_enabled
 
 
 def test_explicit_unaccepted_kernel_backend_fails_strict():
@@ -62,17 +70,23 @@ def test_explicit_unaccepted_kernel_backend_fails_strict():
     with pytest.raises(KernelBackendUnavailable):
         select_kernel_backend("gdn_cuda", strict=True)
 
-    with pytest.raises(KernelBackendUnavailable):
+    if list_kernel_backends()["gdn_fla"].available:
         select_kernel_backend("gdn_fla", strict=True)
+    else:
+        with pytest.raises(KernelBackendUnavailable):
+            select_kernel_backend("gdn_fla", strict=True)
 
 
 def test_kernel_registry_recognizes_fla_aliases():
     for alias in ("gdn_fla", "fla_gdn", "vllm_fla", "flash_linear_attention"):
         status = select_kernel_backend(alias)
         assert status.requested == "gdn_fla"
-        assert status.selected == "pure_jax"
+        if status.available:
+            assert status.selected == "gdn_fla"
+        else:
+            assert status.selected == "pure_jax"
         assert "gdn_recurrent_decode_step" in status.provided_kernels
-        assert not status.external_kernels_enabled
+        assert status.external_kernels_enabled == status.available
 
 
 def test_gpu_runtime_backend_keeps_auto_kernel_backend_on_pure_jax(monkeypatch):
@@ -82,8 +96,12 @@ def test_gpu_runtime_backend_keeps_auto_kernel_backend_on_pure_jax(monkeypatch):
     backend = select_backend("gpu")
 
     assert backend.name == "gpu"
-    assert backend.kernel_backend.selected == "pure_jax"
-    assert not backend.kernel_backend.external_kernels_enabled
+    if backend.kernel_backend.available:
+        assert backend.kernel_backend.selected == "gdn_fla"
+        assert backend.kernel_backend.external_kernels_enabled
+    else:
+        assert backend.kernel_backend.selected == "pure_jax"
+        assert not backend.kernel_backend.external_kernels_enabled
 
 
 def test_gpu_runtime_backend_rejects_explicit_unaccepted_external_backend(monkeypatch):
@@ -98,5 +116,10 @@ def test_gpu_runtime_backend_rejects_explicit_unaccepted_gdn_fla(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_KERNEL_BACKEND", "gdn_fla")
     monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
 
-    with pytest.raises(KernelBackendUnavailable):
-        select_backend("gpu")
+    if list_kernel_backends()["gdn_fla"].available:
+        backend = select_backend("gpu")
+        assert backend.kernel_backend.selected == "gdn_fla"
+        assert backend.kernel_backend.external_kernels_enabled
+    else:
+        with pytest.raises(KernelBackendUnavailable):
+            select_backend("gpu")

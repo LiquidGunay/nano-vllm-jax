@@ -61,14 +61,44 @@ def _has_jax_triton() -> bool:
     return importlib.util.find_spec("jax_triton") is not None
 
 
-def test_gdn_fla_reference_module_is_fallback_only():
+def test_gdn_fla_reference_module_is_fallback_compatible():
     status = availability()
 
     assert status.requested == "gdn_fla"
-    assert status.selected == "pure_jax"
-    assert not status.external_kernels_enabled
-    with pytest.raises(KernelBackendUnavailable):
-        gdn_recurrent_decode_step(None)
+    if status.available:
+        assert status.selected == "gdn_fla"
+        assert status.external_kernels_enabled
+    else:
+        assert status.selected == "pure_jax"
+        assert not status.external_kernels_enabled
+
+    query = jnp.zeros((2, 3, 1, 4), dtype=jnp.float32)
+    key = jnp.ones_like(query)
+    value = jnp.arange(2 * 3 * 1 * 5, dtype=jnp.float32).reshape(2, 3, 1, 5)
+    g = jnp.zeros((2, 3, 1), dtype=jnp.float32)
+    beta = jnp.ones((2, 3, 1), dtype=jnp.float32)
+    initial_state = jnp.zeros((2, 3, 5, 4), dtype=jnp.float32)
+
+    expected_out, expected_state = gdn_recurrent_decode_step(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state,
+    )
+    reference_out, reference_state = jax_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    np.testing.assert_allclose(np.asarray(expected_out), np.asarray(reference_out))
+    np.testing.assert_allclose(np.asarray(expected_state), np.asarray(reference_state))
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")

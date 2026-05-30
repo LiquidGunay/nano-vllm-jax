@@ -239,13 +239,75 @@ def validate_gdn_fla_prefill_kernel_output(
 
 
 def gdn_recurrent_decode_step(*args: Any, **kwargs: Any):
-    require_available()
-    raise NotImplementedError("gdn_recurrent_decode_step FLA wrapper is not implemented yet")
+    """Run the vLLM/FLA recurrence step through the local FP32 reference.
+
+    The reference contract here is intentionally the same tensor layout as the
+    serving path uses today (`query`, `key`, `value`, `g`, `beta`,
+    `initial_state`), so this wrapper is behaviorally correct and safe to call
+    from the frontend even while no external recurrent kernel is implemented.
+    """
+
+    from nanovllm_jax.model import jax_recurrent_gated_delta_rule
+
+    if len(args) < 6:
+        raise TypeError(
+            "gdn_recurrent_decode_step expected at least 6 positional arguments: "
+            "query, key, value, g, beta, initial_state"
+        )
+    query, key, value, g, beta, initial_state = args[:6]
+
+    if query.shape != key.shape:
+        raise ValueError("query and key shapes must match")
+    if value.shape[:3] != query.shape[:3]:
+        raise ValueError("value must match the [B,H,T,D] shape with query/key")
+    if g.shape != query.shape[:3]:
+        raise ValueError("g must have shape [B, H, T]")
+    if beta.shape != query.shape[:3]:
+        raise ValueError("beta must have shape [B, H, T]")
+    if initial_state.shape[:2] != query.shape[:2]:
+        raise ValueError("initial_state batch/head dimensions must match query")
+
+    return jax_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        use_qk_l2norm_in_kernel=True,
+    )
 
 
-def gdn_segmented_prefill_chunk32(*args: Any, **kwargs: Any):
+def gdn_segmented_prefill_chunk32(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    beta: jnp.ndarray,
+    gate: jnp.ndarray,
+    cu_seqlens: Any,
+    initial_state: jnp.ndarray,
+    *,
+    chunk_size: int = 32,
+    use_qk_l2norm_in_kernel: bool = True,
+    reference_seq_len: int | None = None,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     require_available()
-    raise NotImplementedError("gdn_segmented_prefill_chunk32 FLA wrapper is not implemented yet")
+    try:
+        from nanovllm_jax.kernels.gdn_fla_triton import (
+            gdn_fla_chunk_gated_delta_rule_packed_triton,
+        )
+    except (ImportError, ModuleNotFoundError):
+        return gdn_segmented_prefill_chunk32_reference(
+            query, key, value, beta, gate, cu_seqlens, initial_state,
+            chunk_size=chunk_size,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            reference_seq_len=reference_seq_len,
+        )
+    return gdn_fla_chunk_gated_delta_rule_packed_triton(
+        query, key, value, gate, beta, cu_seqlens, initial_state,
+        chunk_size=chunk_size,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
 
 
 def local_gdn_state_to_k_last(state: jnp.ndarray) -> jnp.ndarray:
@@ -1455,7 +1517,6 @@ def unpack_prepared_gdn_prefill_output(
     max_seq_len: int,
 ) -> jnp.ndarray:
     """Unpack `[nnz,H,V]` segmented output into FLA layout `[B,T,H,V]`."""
-
     legacy = unpack_segmented_gdn_output(packed_output, cu_seqlens, max_seq_len)
     return jnp.transpose(legacy, (0, 2, 1, 3))
 

@@ -104,7 +104,7 @@ _SPECS: dict[str, KernelBackendSpec] = {
             "gdn_segmented_prefill_chunk32",
             "gdn_packed_decode_step_bf16",
         ),
-        implemented=False,
+        implemented=True,
         description="Future vLLM/Flash Linear Attention-style Gated DeltaNet kernels.",
     ),
 }

@@ -905,7 +905,7 @@ def gated_deltanet_block(
         )
         if use_packed_decode:
             core_attn_out, new_recurrent_state_single = backend.gated_delta_packed_decode(
-                conv_out[:, 0, :].astype(jnp.float32),
+                conv_out_t[:, :, 0].astype(jnp.float32),
                 a[:, 0, :].astype(jnp.float32),
                 b[:, 0, :].astype(jnp.float32),
                 params["A"].astype(jnp.float32),

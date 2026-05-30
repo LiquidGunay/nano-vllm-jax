@@ -729,6 +729,7 @@ def test_jax_command_applies_workload_overrides_and_reference(tmp_path):
     command = _jax_command(
         config,
         workload,
+        "",
         output_json,
         reference_json,
         "matrix_label",
@@ -756,6 +757,7 @@ def test_jax_command_wires_vllm_random_sidecar_args(tmp_path):
     command = _jax_command(
         config,
         workload,
+        "",
         tmp_path / "out.json",
         None,
         "sidecar",
@@ -1035,12 +1037,14 @@ def test_benchmark_acceptance_summary_rejects_incomplete_evidence():
 
 
 def test_benchmark_acceptance_summary_requires_all_profile_counters():
+    missing_required_needle = "MemcpyD2D"
     incomplete_profile = {
         needle: {
             "total_ms": 1.0,
             "count": 1,
         }
-        for needle in PROFILE_NEEDLES[:-1]
+        for needle in PROFILE_NEEDLES
+        if needle != missing_required_needle
     }
     acceptance = _benchmark_acceptance_summary(
         [
@@ -1065,8 +1069,8 @@ def test_benchmark_acceptance_summary_requires_all_profile_counters():
     assert not acceptance["speed_claim_ready"]
     assert not acceptance["checks"]["profile_counters_present"]
     assert acceptance["missing_profile_counters"] == [
-        f"repeat1:{PROFILE_NEEDLES[-1]}",
-        f"repeat2:{PROFILE_NEEDLES[-1]}",
+        f"repeat1:{missing_required_needle}",
+        f"repeat2:{missing_required_needle}",
     ]
 
 

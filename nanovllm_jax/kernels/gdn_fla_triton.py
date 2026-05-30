@@ -19,6 +19,21 @@ import triton
 import triton.language as tl
 
 
+def _normalize_int_env(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    """Read an integer env override with bounds; return ``default`` when unset."""
+
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer; got {value!r}") from exc
+    if not (min_value <= parsed <= max_value):
+        raise ValueError(f"{name} must be between {min_value} and {max_value}; got {parsed}")
+    return parsed
+
+
 def _runtime_root() -> Path:
     configured = os.environ.get("NANO_VLLM_JAX_CACHE_ROOT")
     if configured:
@@ -30,6 +45,23 @@ def _runtime_root() -> Path:
     if mountpath.exists():
         return mountpath
     return Path.cwd()
+
+
+def _decode_triton_num_warps(value_dim: int) -> int:
+    env_name = "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_WARPS"
+    default = 1 if value_dim <= 128 else 2
+    return _normalize_int_env(env_name, default, min_value=1, max_value=8)
+
+
+def _decode_triton_num_stages() -> int:
+    env_name = "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_STAGES"
+    return _normalize_int_env(env_name, 3, min_value=1, max_value=8)
+
+
+def _decode_triton_block_v(value_dim: int) -> int:
+    env_name = "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_BLOCK_V"
+    block_v = min(jt.next_power_of_2(value_dim), 32)
+    return _normalize_int_env(env_name, block_v, min_value=1, max_value=128)
 
 
 def _configure_triton_runtime() -> None:
@@ -1562,6 +1594,7 @@ def gdn_fla_recompute_w_u_packed_triton(
         (key.shape[0], output_heads, value_dim),
         jnp.float32,
     )
+
     w = jt.triton_call(
         key_fp32,
         beta_fp32,
@@ -1683,7 +1716,7 @@ def gdn_post_conv_prep_bf16(
         APPLY_L2NORM=_normalize_bool(normalize_qk),
         SOFTPLUS_THRESHOLD=20.0,
         num_warps=4,
-        num_stages=3,
+        num_stages=_decode_triton_num_stages(),
         zeroed_outputs=(0, 1, 2, 3, 4),
     )
 
@@ -1745,7 +1778,8 @@ def gdn_packed_decode_step_bf16(
         raise ValueError("value_heads must be divisible by num_q_heads")
 
     block_k = jt.next_power_of_2(key_dim)
-    block_v = min(jt.next_power_of_2(value_dim), 32)
+    block_v = _decode_triton_block_v(value_dim)
+    num_warps = _decode_triton_num_warps(value_dim)
     out_shape = (
         jax.ShapeDtypeStruct((batch, value_heads, 1, value_dim), jnp.float32),
         jax.ShapeDtypeStruct(state.shape, jnp.float32),
@@ -1770,8 +1804,8 @@ def gdn_packed_decode_step_bf16(
         SCALE=1.0 / (key_dim**0.5),
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=_normalize_bool(use_qk_l2norm_in_kernel),
-        num_warps=1,
-        num_stages=3,
+        num_warps=num_warps,
+        num_stages=_decode_triton_num_stages(),
     )
 
 

@@ -26,6 +26,7 @@ from nanovllm_jax.kernels.gdn_fla import (
     prepare_gdn_fla_chunk_metadata,
     unpack_segmented_gdn_output,
 )
+from nanovllm_jax.kernels.gdn_fla import gdn_segmented_prefill_chunk32
 from nanovllm_jax.model import jax_chunk_gated_delta_rule
 
 
@@ -1544,3 +1545,79 @@ def test_segmented_gdn_prefill_reference_matches_padded_chunk32(monkeypatch):
     assert float(jnp.max(jnp.abs(state_diff))) <= 1e-5
     assert float(jnp.max(jnp.abs(padded_valid_output_diff))) <= 1e-5
     assert float(jnp.max(jnp.abs(padded_state_diff))) <= 1e-5
+    assert float(jnp.max(jnp.abs(padded_state_diff))) <= 1e-5
+
+
+def test_gdn_segmented_prefill_chunk32_matches_reference(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_KERNEL_BACKEND", "gdn_fla")
+
+    batch = 2
+    num_heads = 2
+    key_dim = 4
+    value_dim = 4
+    lengths = jnp.array([3, 5], dtype=jnp.int32)
+    keys = jax.random.split(jax.random.PRNGKey(42), 6)
+    query = jax.random.normal(keys[0], (batch, num_heads, 5, key_dim), dtype=jnp.float32)
+    key = jax.random.normal(keys[1], (batch, num_heads, 5, key_dim), dtype=jnp.float32)
+    value = jax.random.normal(keys[2], (batch, num_heads, 5, value_dim), dtype=jnp.float32)
+    gate = jax.random.normal(keys[3], (batch, num_heads, 5), dtype=jnp.float32) * 0.05
+    beta = jax.random.uniform(keys[4], (batch, num_heads, 5), dtype=jnp.float32, minval=0.05, maxval=0.95)
+    initial_state = jax.random.normal(keys[5], (batch, num_heads, value_dim, key_dim), dtype=jnp.float32) * 0.01
+
+    valid = jnp.arange(5, dtype=jnp.int32)[None, :] < lengths[:, None]
+    query = jnp.where(valid[:, None, :, None], query, 0.0)
+    key = jnp.where(valid[:, None, :, None], key, 0.0)
+    value = jnp.where(valid[:, None, :, None], value, 0.0)
+    gate = jnp.where(valid[:, None, :], gate, 0.0)
+    beta = jnp.where(valid[:, None, :], beta, 0.0)
+
+    (
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_gate,
+        packed_beta,
+        cu_seqlens,
+    ) = pack_padded_gdn_inputs(query, key, value, gate, beta, lengths)
+
+    ref_out, ref_state = gdn_segmented_prefill_chunk32_reference(
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_beta,
+        packed_gate,
+        cu_seqlens,
+        initial_state,
+        chunk_size=32,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    # Monkeypatch require_available so the public wrapper does not raise
+    import nanovllm_jax.kernels.gdn_fla as _gdn_fla_mod
+    monkeypatch.setattr(_gdn_fla_mod, "require_available", lambda: None)
+
+    wrapper_out, wrapper_state = gdn_segmented_prefill_chunk32(
+        packed_query,
+        packed_key,
+        packed_value,
+        packed_beta,
+        packed_gate,
+        cu_seqlens,
+        initial_state,
+        chunk_size=32,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(wrapper_out),
+        np.asarray(ref_out),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(wrapper_state),
+        np.asarray(ref_state),
+        rtol=2e-5,
+        atol=2e-5,
+    )
