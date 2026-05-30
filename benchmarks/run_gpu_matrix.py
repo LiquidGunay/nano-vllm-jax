@@ -59,6 +59,11 @@ PROFILE_NEEDLES = (
     "np.asarray(jax.Array)",
 )
 
+OPTIONAL_PROFILE_NEEDLES = (
+    "array.py:325 tolist",
+    "np.asarray(jax.Array)",
+)
+
 
 @dataclass(frozen=True)
 class Workload:
@@ -1230,6 +1235,8 @@ def _missing_profile_counters(repeats: list[dict[str, Any]]) -> list[str]:
         metrics = row.get("metrics") or {}
         profile = metrics.get("profile") or {}
         for needle in PROFILE_NEEDLES:
+            if needle in OPTIONAL_PROFILE_NEEDLES:
+                continue
             bucket = profile.get(needle) or {}
             if bucket.get("total_ms") is None or bucket.get("count") is None:
                 missing.add(f"repeat{repeat_index}:{needle}")
@@ -1445,6 +1452,7 @@ def main() -> None:
             default_command = _jax_command(
                 default_config,
                 workload,
+                args.jax_execution,
                 generated_default_reference,
                 None,
                 f"gpu_matrix_jax_default_reference_{workload_name}_{timestamp}",
