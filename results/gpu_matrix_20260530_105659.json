@@ -1,0 +1,1534 @@
+{
+  "acceptance": {
+    "hetero8": {
+      "gpu_paged_gdn_fla_decode": {
+        "checks": {
+          "correctness_checked": true,
+          "exact_generated_token_match": true,
+          "first_forward_step_present": true,
+          "jax_latency_present": true,
+          "jax_performance_present": true,
+          "minimum_repeats": false,
+          "profile_counters_present": true,
+          "runs_succeeded": true,
+          "vllm_reference_present": true
+        },
+        "missing_profile_counters": [],
+        "notes": "not enough evidence for a performance claim",
+        "speed_claim_ready": false,
+        "target_vllm_ratio": 0.9,
+        "target_vllm_ratio_met": false
+      }
+    }
+  },
+  "comparisons": {
+    "hetero8": {
+      "gpu_paged_gdn_fla_decode": {
+        "itl_ms_p50_delta_vs_jax_reference": -3.529961802996695,
+        "itl_ms_p50_delta_vs_vllm": 4.159490636084229,
+        "jax_output_token_throughput_median": 425.3100714561213,
+        "jax_over_jax_reference_throughput": 1.1563712070961247,
+        "jax_over_vllm_throughput": 0.49215479926995964,
+        "jax_over_vllm_total_token_throughput": null,
+        "jax_reference_artifact": "results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json",
+        "jax_reference_source": "stored_entry045",
+        "jax_reference_tokens_per_second": 367.79718212126573,
+        "jax_request_throughput_median": 13.29093973300379,
+        "jax_tokens_per_second_median": 425.3100714561213,
+        "jax_total_token_throughput_median": 4253.100714561213,
+        "profile_delta_vs_jax_reference": {
+          "MemcpyD2D": {
+            "count_delta": null,
+            "current_count_median": 909.0,
+            "current_total_ms_median": 25.66625300000001,
+            "reference_count": null,
+            "reference_total_ms": null,
+            "total_ms_delta": null,
+            "total_ms_ratio": null
+          },
+          "PjRtCApiLoadedExecutable::Execute": {
+            "count_delta": null,
+            "current_count_median": 91.0,
+            "current_total_ms_median": 144.12049700000003,
+            "reference_count": null,
+            "reference_total_ms": null,
+            "total_ms_delta": null,
+            "total_ms_ratio": null
+          },
+          "array.py:325 tolist": {
+            "count_delta": null,
+            "current_count_median": null,
+            "current_total_ms_median": null,
+            "reference_count": null,
+            "reference_total_ms": null,
+            "total_ms_delta": null,
+            "total_ms_ratio": null
+          },
+          "command_buffer::execute": {
+            "count_delta": null,
+            "current_count_median": 1886.0,
+            "current_total_ms_median": 59.655673,
+            "reference_count": null,
+            "reference_total_ms": null,
+            "total_ms_delta": null,
+            "total_ms_ratio": null
+          },
+          "command_buffer::update": {
+            "count_delta": null,
+            "current_count_median": 950.0,
+            "current_total_ms_median": 19.611215000000005,
+            "reference_count": null,
+            "reference_total_ms": null,
+            "total_ms_delta": null,
+            "total_ms_ratio": null
+          },
+          "forward_step_token_ids_jit": {
+            "count_delta": null,
+            "current_count_median": 32.0,
+            "current_total_ms_median": 148.01060399999994,
+            "reference_count": null,
+            "reference_total_ms": null,
+            "total_ms_delta": null,
+            "total_ms_ratio": null
+          },
+          "gather": {
+            "count_delta": null,
+            "current_count_median": 135.0,
+            "current_total_ms_median": 12.347263999999985,
+            "reference_count": null,
+            "reference_total_ms": null,
+            "total_ms_delta": null,
+            "total_ms_ratio": null
+          },
+          "np.asarray(jax.Array)": {
+            "count_delta": null,
+            "current_count_median": 256.0,
+            "current_total_ms_median": 28.56305599999998,
+            "reference_count": null,
+            "reference_total_ms": null,
+            "total_ms_delta": null,
+            "total_ms_ratio": null
+          },
+          "transpose": {
+            "count_delta": null,
+            "current_count_median": 468.0,
+            "current_total_ms_median": 14.912695999999983,
+            "reference_count": null,
+            "reference_total_ms": null,
+            "total_ms_delta": null,
+            "total_ms_ratio": null
+          }
+        },
+        "profile_scoped_delta_vs_jax_reference": {
+          "cpu": {
+            "MemcpyD2D": {
+              "count_delta": null,
+              "current_count_median": 427.0,
+              "current_total_ms_median": 7.738932999999996,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "PjRtCApiLoadedExecutable::Execute": {
+              "count_delta": null,
+              "current_count_median": 91.0,
+              "current_total_ms_median": 144.12049700000003,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "array.py:325 tolist": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "command_buffer::execute": {
+              "count_delta": null,
+              "current_count_median": 1886.0,
+              "current_total_ms_median": 59.655673,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "command_buffer::update": {
+              "count_delta": null,
+              "current_count_median": 950.0,
+              "current_total_ms_median": 19.611215000000005,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "forward_step_token_ids_jit": {
+              "count_delta": null,
+              "current_count_median": 32.0,
+              "current_total_ms_median": 148.01060399999994,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "gather": {
+              "count_delta": null,
+              "current_count_median": 22.0,
+              "current_total_ms_median": 9.655584999999997,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "np.asarray(jax.Array)": {
+              "count_delta": null,
+              "current_count_median": 256.0,
+              "current_total_ms_median": 28.56305599999998,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "transpose": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            }
+          },
+          "gpu": {
+            "MemcpyD2D": {
+              "count_delta": null,
+              "current_count_median": 482.0,
+              "current_total_ms_median": 17.927319999999984,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "PjRtCApiLoadedExecutable::Execute": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "array.py:325 tolist": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "command_buffer::execute": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "command_buffer::update": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "forward_step_token_ids_jit": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "gather": {
+              "count_delta": null,
+              "current_count_median": 113.0,
+              "current_total_ms_median": 2.6916790000000046,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "np.asarray(jax.Array)": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "transpose": {
+              "count_delta": null,
+              "current_count_median": 468.0,
+              "current_total_ms_median": 14.912695999999983,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            }
+          }
+        },
+        "required_jax_speedup_to_target": 1.8286929261586389,
+        "target_tokens_per_second": 777.7615190958343,
+        "target_vllm_ratio": 0.9,
+        "tokens_per_second_delta_vs_jax_reference": 57.51288933485557,
+        "tokens_per_second_gap_to_target": 352.45144763971297,
+        "ttft_ms_p50_delta_vs_jax_reference": -246.19509605690837,
+        "ttft_ms_p50_delta_vs_vllm": -84.0119170024991,
+        "vllm_output_token_throughput": null,
+        "vllm_reference_source": "stored",
+        "vllm_request_throughput": null,
+        "vllm_tokens_per_second": 864.1794656620381,
+        "vllm_total_token_throughput": null
+      }
+    }
+  },
+  "configs": [
+    "gpu_paged_gdn_fla_decode"
+  ],
+  "created_at_utc": "20260530_105659",
+  "dry_run": false,
+  "goal_target": {
+    "config": "gpu_paged_default",
+    "description": "non-speculative Qwen/Qwen3.5-0.8B server on long heterogeneous mixed-shape requests must be speed-claim-ready and reach at least 0.9x vLLM throughput",
+    "target_vllm_ratio": 0.9,
+    "workload": "long_prefill_512_2048"
+  },
+  "jax_default_references": {
+    "hetero8": {
+      "artifact": null,
+      "metrics": null,
+      "missing_selected_config_references": [],
+      "run": null,
+      "source": "stored"
+    }
+  },
+  "jax_python": {
+    "available": true,
+    "path": "/root/miniconda3/bin/python"
+  },
+  "matrix": {
+    "hetero8": {
+      "gpu_paged_gdn_fla_decode": {
+        "aggregate": {
+          "all_correct": true,
+          "all_correctness_checked": true,
+          "all_exact_generated_token_match": true,
+          "first_forward_step_token_ids_jit_ms_median": 31.16594,
+          "itl_ms_p50_median": 9.614817099645734,
+          "itl_ms_p95_median": 71.52002700604498,
+          "output_token_throughput_median": 425.3100714561213,
+          "profile_medians": {
+            "MemcpyD2D": {
+              "count_median": 909.0,
+              "total_ms_median": 25.66625300000001
+            },
+            "PjRtCApiLoadedExecutable::Execute": {
+              "count_median": 91.0,
+              "total_ms_median": 144.12049700000003
+            },
+            "array.py:325 tolist": {
+              "count_median": null,
+              "total_ms_median": null
+            },
+            "command_buffer::execute": {
+              "count_median": 1886.0,
+              "total_ms_median": 59.655673
+            },
+            "command_buffer::update": {
+              "count_median": 950.0,
+              "total_ms_median": 19.611215000000005
+            },
+            "forward_step_token_ids_jit": {
+              "count_median": 32.0,
+              "total_ms_median": 148.01060399999994
+            },
+            "gather": {
+              "count_median": 135.0,
+              "total_ms_median": 12.347263999999985
+            },
+            "np.asarray(jax.Array)": {
+              "count_median": 256.0,
+              "total_ms_median": 28.56305599999998
+            },
+            "transpose": {
+              "count_median": 468.0,
+              "total_ms_median": 14.912695999999983
+            }
+          },
+          "profile_scoped_range_medians": {
+            "cpu": {
+              "MemcpyD2D": {
+                "count_median": 427.0,
+                "total_ms_median": 7.738932999999996
+              },
+              "PjRtCApiLoadedExecutable::Execute": {
+                "count_median": 91.0,
+                "total_ms_median": 144.12049700000003
+              },
+              "array.py:325 tolist": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "command_buffer::execute": {
+                "count_median": 1886.0,
+                "total_ms_median": 59.655673
+              },
+              "command_buffer::update": {
+                "count_median": 950.0,
+                "total_ms_median": 19.611215000000005
+              },
+              "forward_step_token_ids_jit": {
+                "count_median": 32.0,
+                "total_ms_median": 148.01060399999994
+              },
+              "gather": {
+                "count_median": 22.0,
+                "total_ms_median": 9.655584999999997
+              },
+              "np.asarray(jax.Array)": {
+                "count_median": 256.0,
+                "total_ms_median": 28.56305599999998
+              },
+              "transpose": {
+                "count_median": null,
+                "total_ms_median": null
+              }
+            },
+            "gpu": {
+              "MemcpyD2D": {
+                "count_median": 482.0,
+                "total_ms_median": 17.927319999999984
+              },
+              "PjRtCApiLoadedExecutable::Execute": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "array.py:325 tolist": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "command_buffer::execute": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "command_buffer::update": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "forward_step_token_ids_jit": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "gather": {
+                "count_median": 113.0,
+                "total_ms_median": 2.6916790000000046
+              },
+              "np.asarray(jax.Array)": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "transpose": {
+                "count_median": 468.0,
+                "total_ms_median": 14.912695999999983
+              }
+            }
+          },
+          "repeat_count": 1,
+          "request_throughput_median": 13.29093973300379,
+          "scheduler_diagnostics_median": {
+            "available": true,
+            "decode_step_count": 31.0,
+            "decode_step_seconds_total": 0.5505849334876984,
+            "max_decode_step_sequences": 8.0,
+            "max_prefill_step_sequences": 8.0,
+            "max_step_sequences": 8.0,
+            "max_step_tokens": 2304.0,
+            "prefill_step_count": 1.0,
+            "prefill_step_seconds_total": 0.04377985093742609,
+            "step_count": 32.0,
+            "total_step_seconds": 0.5943647844251245
+          },
+          "tokens_per_second_median": 425.3100714561213,
+          "total_input_tokens_median": 2304.0,
+          "total_output_tokens_median": 256.0,
+          "total_token_throughput_median": 4253.100714561213,
+          "ttft_ms_p50_median": 43.78426098264754,
+          "ttft_ms_p95_median": 43.78426098264754
+        },
+        "config": {
+          "args": {
+            "backend": "gpu",
+            "batch_size_buckets": "1,2,4,8",
+            "dtype": "float32",
+            "input_lens": "64,128,192,256,320,384,448,512",
+            "jax_execution": "jit",
+            "max_blocks_per_seq": 40,
+            "max_kv_cache_mb": 3072,
+            "max_num_batched_tokens": 4096,
+            "max_num_seqs": 8,
+            "model": "Qwen/Qwen3.5-0.8B",
+            "num_kvcache_blocks": 256,
+            "num_speculative_tokens": 0,
+            "output_len": 32,
+            "prefill_buckets": "64,128,256,384,512",
+            "profile": true,
+            "prompt_source": "tokenized_seed_repeat",
+            "prompt_suite": "mixed",
+            "seed": 0,
+            "top_k": 5,
+            "warmup": true,
+            "weight_dtype": "bfloat16"
+          },
+          "description": "Decode-heavy GDN FLA configuration for single-sequence decode-path comparison.",
+          "env": {
+            "JAX_PLATFORMS": "cuda",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_MLP": "1",
+            "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY": "1",
+            "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL": "triton_fla",
+            "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL": "triton_fla_wrapper",
+            "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH": "1",
+            "NANO_VLLM_JAX_KERNEL_BACKEND": "pure_jax",
+            "NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD": "1"
+          }
+        },
+        "repeats": [
+          {
+            "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_105659/hetero8_gpu_paged_gdn_fla_decode_repeat1.json",
+            "metrics": {
+              "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_105659/hetero8_gpu_paged_gdn_fla_decode_repeat1.json",
+              "correctness": {
+                "checked": true,
+                "exact_generated_token_match": true,
+                "full_length_ok": true,
+                "ok": true,
+                "rows": [
+                  {
+                    "checked": true,
+                    "comparison_length": 32,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 32,
+                    "generated_prefix_match": true,
+                    "name": "len_64",
+                    "reference_first_step_topk": [],
+                    "reference_length": 32,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 32,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 32,
+                    "generated_prefix_match": true,
+                    "name": "len_128",
+                    "reference_first_step_topk": [],
+                    "reference_length": 32,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 32,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 32,
+                    "generated_prefix_match": true,
+                    "name": "len_192",
+                    "reference_first_step_topk": [],
+                    "reference_length": 32,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 32,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 32,
+                    "generated_prefix_match": true,
+                    "name": "len_256",
+                    "reference_first_step_topk": [],
+                    "reference_length": 32,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 32,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 32,
+                    "generated_prefix_match": true,
+                    "name": "len_320",
+                    "reference_first_step_topk": [],
+                    "reference_length": 32,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 32,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 32,
+                    "generated_prefix_match": true,
+                    "name": "len_384",
+                    "reference_first_step_topk": [],
+                    "reference_length": 32,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 32,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 32,
+                    "generated_prefix_match": true,
+                    "name": "len_448",
+                    "reference_first_step_topk": [],
+                    "reference_length": 32,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  },
+                  {
+                    "checked": true,
+                    "comparison_length": 32,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 32,
+                    "generated_prefix_match": true,
+                    "name": "len_512",
+                    "reference_first_step_topk": [],
+                    "reference_length": 32,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  }
+                ]
+              },
+              "exists": true,
+              "first_forward_step_token_ids_jit_ms": 31.16594,
+              "mtp_admission": {
+                "active_bucket": null,
+                "buckets": [],
+                "confidence_min_accept_rate": 0.75,
+                "enabled": false,
+                "probe_steps": 2
+              },
+              "performance": {
+                "generated_tokens": 256,
+                "itl_ms_p50": 9.614817099645734,
+                "itl_ms_p95": 71.52002700604498,
+                "output_token_throughput": 425.3100714561213,
+                "request_throughput": 13.29093973300379,
+                "seconds": 0.6019137969706208,
+                "tokens_per_second": 425.3100714561213,
+                "total_input_tokens": 2304,
+                "total_output_tokens": 256,
+                "total_token_throughput": 4253.100714561213,
+                "ttft_ms_p50": 43.78426098264754,
+                "ttft_ms_p95": 43.78426098264754
+              },
+              "profile": {
+                "MemcpyD2D": {
+                  "count": 909,
+                  "total_ms": 25.66625300000001
+                },
+                "PjRtCApiLoadedExecutable::Execute": {
+                  "count": 91,
+                  "total_ms": 144.12049700000003
+                },
+                "array.py:325 tolist": {
+                  "count": null,
+                  "total_ms": null
+                },
+                "command_buffer::execute": {
+                  "count": 1886,
+                  "total_ms": 59.655673
+                },
+                "command_buffer::update": {
+                  "count": 950,
+                  "total_ms": 19.611215000000005
+                },
+                "forward_step_token_ids_jit": {
+                  "count": 32,
+                  "total_ms": 148.01060399999994
+                },
+                "gather": {
+                  "count": 135,
+                  "total_ms": 12.347263999999985
+                },
+                "np.asarray(jax.Array)": {
+                  "count": 256,
+                  "total_ms": 28.56305599999998
+                },
+                "transpose": {
+                  "count": 468,
+                  "total_ms": 14.912695999999983
+                }
+              },
+              "profile_scoped_ranges": {
+                "cpu": {
+                  "MemcpyD2D": {
+                    "count": 427,
+                    "total_ms": 7.738932999999996
+                  },
+                  "PjRtCApiLoadedExecutable::Execute": {
+                    "count": 91,
+                    "total_ms": 144.12049700000003
+                  },
+                  "Thunks::Initialize": {
+                    "count": 91,
+                    "total_ms": 12.697630000000002
+                  },
+                  "_batch_hybrid_state": {
+                    "count": 64,
+                    "total_ms": 8.591677999999995
+                  },
+                  "_record_kv_snapshot": {
+                    "count": 32,
+                    "total_ms": 0.687413
+                  },
+                  "_run_main_and_sample": {
+                    "count": 32,
+                    "total_ms": 180.180024
+                  },
+                  "_store_batch_hybrid_state": {
+                    "count": 32,
+                    "total_ms": 0.6669760000000001
+                  },
+                  "command_buffer::execute": {
+                    "count": 1886,
+                    "total_ms": 59.655673
+                  },
+                  "command_buffer::update": {
+                    "count": 950,
+                    "total_ms": 19.611215000000005
+                  },
+                  "cutlass": {
+                    "count": 30,
+                    "total_ms": 0.253715
+                  },
+                  "forward_step_token_ids_jit": {
+                    "count": 32,
+                    "total_ms": 148.01060399999994
+                  },
+                  "fusion": {
+                    "count": 400,
+                    "total_ms": 8.288647000000001
+                  },
+                  "gather": {
+                    "count": 22,
+                    "total_ms": 9.655584999999997
+                  },
+                  "generate_with_trace": {
+                    "count": 2,
+                    "total_ms": 1192.363068
+                  },
+                  "jit_compiled:XLA GPU module": {
+                    "count": 32,
+                    "total_ms": 118.10489899999996
+                  },
+                  "loop_dynamic_update_slice_fusion": {
+                    "count": 384,
+                    "total_ms": 7.920603
+                  },
+                  "np.asarray(jax.Array)": {
+                    "count": 256,
+                    "total_ms": 28.56305599999998
+                  },
+                  "while": {
+                    "count": 36,
+                    "total_ms": 14.495861000000001
+                  }
+                },
+                "gpu": {
+                  "MemcpyD2D": {
+                    "count": 482,
+                    "total_ms": 17.927319999999984
+                  },
+                  "cutlass": {
+                    "count": 30,
+                    "total_ms": 30.447043999999995
+                  },
+                  "fusion": {
+                    "count": 18726,
+                    "total_ms": 378.7362909999939
+                  },
+                  "gather": {
+                    "count": 113,
+                    "total_ms": 2.6916790000000046
+                  },
+                  "gemm_fusion": {
+                    "count": 4682,
+                    "total_ms": 203.25990300000038
+                  },
+                  "input_reduce_fusion": {
+                    "count": 1037,
+                    "total_ms": 14.098751000000016
+                  },
+                  "loop_dynamic_update_slice_fusion": {
+                    "count": 1998,
+                    "total_ms": 36.20441600000004
+                  },
+                  "loop_multiply_fusion": {
+                    "count": 1041,
+                    "total_ms": 10.245558000000127
+                  },
+                  "transpose": {
+                    "count": 468,
+                    "total_ms": 14.912695999999983
+                  },
+                  "wrapped_concatenate": {
+                    "count": 576,
+                    "total_ms": 36.07071999999999
+                  }
+                }
+              },
+              "profile_scoped_top_events_by_total_ms": {
+                "cpu": [
+                  {
+                    "count": 1,
+                    "name": "$llm_engine.py:632 generate_with_trace",
+                    "total_ms": 596.218375
+                  },
+                  {
+                    "count": 1,
+                    "name": "$llm_engine.py:661 _generate_with_trace_deferred_tokens",
+                    "total_ms": 596.144693
+                  },
+                  {
+                    "count": 32,
+                    "name": "$llm_engine.py:161 step",
+                    "total_ms": 593.8439669999999
+                  },
+                  {
+                    "count": 544,
+                    "name": "$profiler.py:424 wrapper",
+                    "total_ms": 358.79339699999986
+                  },
+                  {
+                    "count": 32,
+                    "name": "$scheduler.py:151 schedule",
+                    "total_ms": 346.75263300000006
+                  },
+                  {
+                    "count": 32,
+                    "name": "$scheduler.py:303 build_scheduled_batch",
+                    "total_ms": 340.59872399999995
+                  },
+                  {
+                    "count": 32,
+                    "name": "$scheduler.py:16 _device_int32_arrays",
+                    "total_ms": 338.36263999999994
+                  },
+                  {
+                    "count": 32,
+                    "name": "$api.py:2106 device_put",
+                    "total_ms": 336.752011
+                  },
+                  {
+                    "count": 32,
+                    "name": "$dispatch.py:599 _batched_device_put_impl",
+                    "total_ms": 331.34442000000007
+                  },
+                  {
+                    "count": 32,
+                    "name": "shard_args",
+                    "total_ms": 326.698746
+                  },
+                  {
+                    "count": 32,
+                    "name": "$pxla.py:86 shard_args",
+                    "total_ms": 326.46486
+                  },
+                  {
+                    "count": 32,
+                    "name": "$pxla.py:170 _shard_np_array",
+                    "total_ms": 324.15562
+                  },
+                  {
+                    "count": 192,
+                    "name": "$pxla.py:214 batched_device_put",
+                    "total_ms": 318.049078
+                  },
+                  {
+                    "count": 192,
+                    "name": "DevicePutWithSharding",
+                    "total_ms": 315.2076980000002
+                  },
+                  {
+                    "count": 202,
+                    "name": "PjRtStreamExecutorClient::LinearizeHostBufferInto",
+                    "total_ms": 310.3212719999998
+                  },
+                  {
+                    "count": 293,
+                    "name": "GetEventForComputeStreamSyncPoint",
+                    "total_ms": 306.99837399999984
+                  },
+                  {
+                    "count": 64,
+                    "name": "PjitFunction(compiled)",
+                    "total_ms": 291.770348
+                  },
+                  {
+                    "count": 32,
+                    "name": "PjRtCApiCompiler::BufferFromHostBuffer(s32[8,40])",
+                    "total_ms": 266.81339399999996
+                  },
+                  {
+                    "count": 32,
+                    "name": "$model_runner.py:3737 run",
+                    "total_ms": 181.64449899999994
+                  },
+                  {
+                    "count": 32,
+                    "name": "$model_runner.py:1899 _run_main_and_sample",
+                    "total_ms": 180.180024
+                  },
+                  {
+                    "count": 32,
+                    "name": "$model_executor.py:501 forward_step_token_ids_jit",
+                    "total_ms": 148.01060399999994
+                  },
+                  {
+                    "count": 32,
+                    "name": "$model_executor.py:260 _profile_jit_call",
+                    "total_ms": 146.06212999999997
+                  },
+                  {
+                    "count": 91,
+                    "name": "PjRtCApiLoadedExecutable::Execute",
+                    "total_ms": 144.12049700000003
+                  },
+                  {
+                    "count": 91,
+                    "name": "PJRT_LoadedExecutable_Execute",
+                    "total_ms": 143.32989900000007
+                  },
+                  {
+                    "count": 91,
+                    "name": "CommonPjRtLoadedExecutable::ExecuteHelperOnSingleDevice",
+                    "total_ms": 142.54318400000002
+                  },
+                  {
+                    "count": 32,
+                    "name": "CommonPjRtLoadedExecutable::Execute (jit_compiled)",
+                    "total_ms": 137.050487
+                  },
+                  {
+                    "count": 91,
+                    "name": "[0] PjRtStreamExecutorRawLoadedExecutable::Execute",
+                    "total_ms": 137.046834
+                  },
+                  {
+                    "count": 91,
+                    "name": "[0] GpuExecutable::ExecuteThunks",
+                    "total_ms": 130.56891099999999
+                  },
+                  {
+                    "count": 32,
+                    "name": "jit_compiled:XLA GPU module",
+                    "total_ms": 118.10489899999996
+                  },
+                  {
+                    "count": 1,
+                    "name": "$run_tracking.py:154 stop_jax_profile",
+                    "total_ms": 106.988759
+                  },
+                  {
+                    "count": 1,
+                    "name": "$profiler.py:278 stop_trace",
+                    "total_ms": 106.981739
+                  },
+                  {
+                    "count": 32,
+                    "name": "$llm_engine.py:201 <listcomp>",
+                    "total_ms": 62.397772999999994
+                  },
+                  {
+                    "count": 16,
+                    "name": "$sequence.py:99 completion_token_ids",
+                    "total_ms": 62.20483699999999
+                  },
+                  {
+                    "count": 16,
+                    "name": "$sequence.py:165 materialize_device_tokens",
+                    "total_ms": 62.188855999999994
+                  },
+                  {
+                    "count": 17,
+                    "name": "$sequence.py:207 materialize_device_tokens_for_sequences",
+                    "total_ms": 62.18111499999999
+                  },
+                  {
+                    "count": 17,
+                    "name": "$sequence.py:214 materialize_device_token_slots",
+                    "total_ms": 61.39591099999999
+                  },
+                  {
+                    "count": 1886,
+                    "name": "command_buffer::execute",
+                    "total_ms": 59.655673
+                  },
+                  {
+                    "count": 8,
+                    "name": "$api.py:2348 device_get",
+                    "total_ms": 34.38751899999999
+                  },
+                  {
+                    "count": 8,
+                    "name": "$tree_util.py:386 tree_map",
+                    "total_ms": 30.862614000000004
+                  },
+                  {
+                    "count": 264,
+                    "name": "$tree_util.py:394 <genexpr>",
+                    "total_ms": 30.713739000000007
+                  }
+                ],
+                "gpu": [
+                  {
+                    "count": 576,
+                    "name": "wrapped_concatenate",
+                    "total_ms": 36.07071999999999
+                  },
+                  {
+                    "count": 31,
+                    "name": "gemm_fusion_dot_234",
+                    "total_ms": 31.813829
+                  },
+                  {
+                    "count": 30,
+                    "name": "void cutlass::Kernel<cutlass_80_tensorop_s1688gemm_128x128_16x5_nn_align4>(cutlass_80_tensorop_s1688gemm_128x128_16x5_nn_align4::Params)",
+                    "total_ms": 30.447043999999995
+                  },
+                  {
+                    "count": 744,
+                    "name": "gemm_fusion_dot_286",
+                    "total_ms": 25.57641500000005
+                  },
+                  {
+                    "count": 18,
+                    "name": "gemm_fusion_dot_181",
+                    "total_ms": 23.845837000000007
+                  },
+                  {
+                    "count": 558,
+                    "name": "gemm_fusion_dot_285",
+                    "total_ms": 23.326673000000014
+                  },
+                  {
+                    "count": 62,
+                    "name": "memcpy128",
+                    "total_ms": 21.041543
+                  },
+                  {
+                    "count": 482,
+                    "name": "MemcpyD2D",
+                    "total_ms": 17.927319999999984
+                  },
+                  {
+                    "count": 558,
+                    "name": "_gdn_packed_decode_kernel",
+                    "total_ms": 17.731247000000025
+                  },
+                  {
+                    "count": 288,
+                    "name": "loop_add_fusion_18",
+                    "total_ms": 15.12418
+                  },
+                  {
+                    "count": 24,
+                    "name": "gemm_fusion_dot_general_746",
+                    "total_ms": 14.630037999999999
+                  },
+                  {
+                    "count": 24,
+                    "name": "gemm_fusion_dot_2",
+                    "total_ms": 13.384472
+                  },
+                  {
+                    "count": 18,
+                    "name": "input_multiply_reduce_select_fusion_17",
+                    "total_ms": 13.063448000000001
+                  },
+                  {
+                    "count": 744,
+                    "name": "gemm_fusion_dot_374",
+                    "total_ms": 12.631238999999999
+                  },
+                  {
+                    "count": 589,
+                    "name": "input_reduce_fusion",
+                    "total_ms": 11.121569000000008
+                  },
+                  {
+                    "count": 288,
+                    "name": "loop_dynamic_slice_multiply_subtract_fusion",
+                    "total_ms": 9.676058999999992
+                  },
+                  {
+                    "count": 744,
+                    "name": "gemm_fusion_dot_373",
+                    "total_ms": 9.506210999999979
+                  },
+                  {
+                    "count": 288,
+                    "name": "gemm_fusion_dot_252",
+                    "total_ms": 9.068248999999998
+                  },
+                  {
+                    "count": 288,
+                    "name": "gemm_fusion_dot_253",
+                    "total_ms": 7.516606000000004
+                  },
+                  {
+                    "count": 36,
+                    "name": "gemm_fusion_dot_326",
+                    "total_ms": 5.578520999999999
+                  },
+                  {
+                    "count": 474,
+                    "name": "input_concatenate_fusion",
+                    "total_ms": 5.485789000000048
+                  },
+                  {
+                    "count": 24,
+                    "name": "loop_multiply_fusion_24",
+                    "total_ms": 4.907388000000001
+                  },
+                  {
+                    "count": 186,
+                    "name": "gemm_fusion_dot_361",
+                    "total_ms": 4.509824000000006
+                  },
+                  {
+                    "count": 186,
+                    "name": "gemm_fusion_dot_362",
+                    "total_ms": 4.436544999999999
+                  },
+                  {
+                    "count": 186,
+                    "name": "gemm_fusion_dot_272",
+                    "total_ms": 4.428639999999998
+                  },
+                  {
+                    "count": 18,
+                    "name": "input_scatter_fusion_89",
+                    "total_ms": 4.213691000000001
+                  },
+                  {
+                    "count": 1,
+                    "name": "loop_broadcast_fusion_5",
+                    "total_ms": 3.9687330000000003
+                  },
+                  {
+                    "count": 17,
+                    "name": "input_reduce_select_fusion",
+                    "total_ms": 3.904381999999999
+                  },
+                  {
+                    "count": 18,
+                    "name": "fusion_2688",
+                    "total_ms": 3.724925
+                  },
+                  {
+                    "count": 21,
+                    "name": "loop_add_fusion_73",
+                    "total_ms": 2.8365419999999992
+                  },
+                  {
+                    "count": 589,
+                    "name": "loop_dynamic_update_slice_fusion",
+                    "total_ms": 2.733178
+                  },
+                  {
+                    "count": 18,
+                    "name": "gemm_fusion_dot_324",
+                    "total_ms": 2.711002
+                  },
+                  {
+                    "count": 49,
+                    "name": "loop_multiply_fusion_6",
+                    "total_ms": 2.546589000000002
+                  },
+                  {
+                    "count": 18,
+                    "name": "loop_select_fusion_19",
+                    "total_ms": 2.522877
+                  },
+                  {
+                    "count": 288,
+                    "name": "loop_dynamic_update_slice_fusion_18",
+                    "total_ms": 2.4623679999999997
+                  },
+                  {
+                    "count": 192,
+                    "name": "loop_divide_fusion_5",
+                    "total_ms": 2.3041580000000232
+                  },
+                  {
+                    "count": 22,
+                    "name": "triton_softmax_152",
+                    "total_ms": 2.2480309999999997
+                  },
+                  {
+                    "count": 288,
+                    "name": "gemm_fusion_dot_254",
+                    "total_ms": 2.2470709999999996
+                  },
+                  {
+                    "count": 24,
+                    "name": "input_concatenate_fusion_43",
+                    "total_ms": 2.2191020000000004
+                  },
+                  {
+                    "count": 288,
+                    "name": "gemm_fusion_dot_255",
+                    "total_ms": 2.1353909999999994
+                  }
+                ]
+              },
+              "profile_trace_json_gz": "/mountpoint/.exp/profiles/20260530-105659-6486-gpu_matrix_hetero8_gpu_paged_gdn_fla_decode_r1_20260530_105659/plugins/profile/2026_05_30_10_57_21/INDCS0291.atrapa.deloitte.com.trace.json.gz",
+              "prompt": {
+                "dataset_name": "tokenized_seed_repeat",
+                "input_lens": [
+                  64,
+                  128,
+                  192,
+                  256,
+                  320,
+                  384,
+                  448,
+                  512
+                ],
+                "num_prompts": 8,
+                "output_len": 32,
+                "output_lengths": [
+                  32,
+                  32,
+                  32,
+                  32,
+                  32,
+                  32,
+                  32,
+                  32
+                ],
+                "prompt_manifest_jsonl": null,
+                "prompt_manifest_sha256": null,
+                "prompt_source": "tokenized_seed_repeat",
+                "prompt_suite": "mixed",
+                "random_input_len": 1280,
+                "random_output_len": 16,
+                "random_range_ratio": {
+                  "input": 0.0,
+                  "output": 0.0
+                },
+                "seed": 0
+              },
+              "run": {
+                "issues": [],
+                "profile_enabled": true,
+                "profile_error": null,
+                "profile_path": "/mountpoint/.exp/profiles/20260530-105659-6486-gpu_matrix_hetero8_gpu_paged_gdn_fla_decode_r1_20260530_105659",
+                "profile_started": false,
+                "run_id": "20260530-105659-6486-gpu_matrix_hetero8_gpu_paged_gdn_fla_decode_r1_20260530_105659",
+                "run_label": "gpu_matrix_hetero8_gpu_paged_gdn_fla_decode_r1_20260530_105659",
+                "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+              },
+              "scheduler_diagnostics": {
+                "available": true,
+                "decode_step_count": 31,
+                "decode_step_seconds_total": 0.5505849334876984,
+                "max_decode_step_sequences": 8,
+                "max_prefill_step_sequences": 8,
+                "max_step_sequences": 8,
+                "max_step_tokens": 2304,
+                "prefill_step_count": 1,
+                "prefill_step_seconds_total": 0.04377985093742609,
+                "step_count": 32,
+                "total_step_seconds": 0.5943647844251245
+              },
+              "speculative": {
+                "acceptance_rate": 0.0,
+                "bonus_tokens": 0,
+                "debug_events": [],
+                "draft_position_accepted": [],
+                "draft_position_proposed": [],
+                "drafts_accepted": 0,
+                "drafts_proposed": 0,
+                "drafts_rejected": 0,
+                "enabled": false,
+                "fallback_gated_no_spec_steps": 0,
+                "fallback_partial_rows": 0,
+                "fallback_seeded_main_steps": 0,
+                "fallback_steps": 0
+              }
+            },
+            "reference_json": "results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json",
+            "reference_source": "stored_entry045",
+            "repeat": 1,
+            "run": {
+              "command": [
+                "/root/miniconda3/bin/python",
+                "/mountpoint/.exp/nano-vllm-jax/benchmarks/benchmark_jax_server_trace.py",
+                "--model",
+                "Qwen/Qwen3.5-0.8B",
+                "--backend",
+                "gpu",
+                "--dtype",
+                "float32",
+                "--weight-dtype",
+                "bfloat16",
+                "--jax-execution",
+                "jit",
+                "--input-lens",
+                "64,128,192,256,320,384,448,512",
+                "--output-len",
+                "32",
+                "--prompt-suite",
+                "mixed",
+                "--num-speculative-tokens",
+                "0",
+                "--max-kv-cache-mb",
+                "3072",
+                "--num-kvcache-blocks",
+                "256",
+                "--max-num-seqs",
+                "8",
+                "--max-num-batched-tokens",
+                "4096",
+                "--prefill-buckets",
+                "64,128,256,384,512",
+                "--batch-size-buckets",
+                "1,2,4,8",
+                "--max-blocks-per-seq",
+                "40",
+                "--top-k",
+                "5",
+                "--warmup",
+                "--profile",
+                "--prompt-source",
+                "tokenized_seed_repeat",
+                "--seed",
+                "0",
+                "--output-json",
+                "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_105659/hetero8_gpu_paged_gdn_fla_decode_repeat1.json",
+                "--run-label",
+                "gpu_matrix_hetero8_gpu_paged_gdn_fla_decode_r1_20260530_105659",
+                "--reference-json",
+                "results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json"
+              ],
+              "elapsed_seconds": 26.239764749072492,
+              "output_tail": "Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\nLoading pretrained weights from Qwen/Qwen3.5-0.8B...\nLoading weights for Qwen/Qwen3.5-0.8B...\nResolving Qwen/Qwen3.5-0.8B from Hugging Face cache...\n\nFetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]\nFetching 9 files: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 9/9 [00:00<00:00, 109734.70it/s]\nW0530 10:57:20.058568    6486 cupti_tracer.cc:1453] Fail to use per-thread activity buffer, cupti trace overhead may be big. CUPTI ERROR CODE:1\nUsing snapshot: /mountpoint/.exp/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17\nConverting weights...\nMaterializing tied LM head as a separate [hidden, vocab] weight...\n\u2713 Loaded weights: 24 layers\n\u2713 Using pretrained weights\n",
+              "returncode": 0,
+              "status": "ok"
+            }
+          }
+        ],
+        "workload": {
+          "acceptance_scope": "speed_claim",
+          "dataset_name": null,
+          "num_prompts": null,
+          "prompt_source": "tokenized_seed_repeat",
+          "random_input_len": null,
+          "random_output_len": null,
+          "random_range_ratio": null,
+          "seed": 0
+        }
+      }
+    }
+  },
+  "output_json": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_20260530_105659.json",
+  "repeats": 1,
+  "report_md": null,
+  "required_metrics": [
+    "total tok/s",
+    "request throughput",
+    "output-token throughput",
+    "total-token throughput",
+    "TTFT p50/p95",
+    "ITL p50/p95",
+    "exact generated-token match vs baseline",
+    "PjRt Execute total/count",
+    "command_buffer::execute total/count",
+    "command_buffer::update total/count",
+    "forward_step_token_ids_jit total/count",
+    "first forward_step_token_ids_jit",
+    "gather total",
+    "transpose total",
+    "MemcpyD2D total",
+    "tolist / np.asarray sync attribution"
+  ],
+  "run_dir": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_105659",
+  "schema_version": 1,
+  "vllm_references": {
+    "hetero8": {
+      "artifact": "results/qwen08_vllm_async_delta_baseline_hetero8_64_512x32.json",
+      "metrics": {
+        "artifact": "results/qwen08_vllm_async_delta_baseline_hetero8_64_512x32.json",
+        "correctness": {
+          "checked": false,
+          "exact_generated_token_match": false,
+          "full_length_ok": null,
+          "ok": true,
+          "rows": null
+        },
+        "exists": true,
+        "first_forward_step_token_ids_jit_ms": null,
+        "mtp_admission": null,
+        "performance": {
+          "generated_tokens": 256,
+          "itl_ms_p50": 5.455326463561505,
+          "itl_ms_p95": 6.401571468450129,
+          "output_token_throughput": null,
+          "request_throughput": null,
+          "seconds": 0.2962347639258951,
+          "tokens_per_second": 864.1794656620381,
+          "total_input_tokens": null,
+          "total_output_tokens": null,
+          "total_token_throughput": null,
+          "ttft_ms_p50": 127.79617798514664,
+          "ttft_ms_p95": 131.9977245060727
+        },
+        "profile": {
+          "MemcpyD2D": {
+            "count": null,
+            "total_ms": null
+          },
+          "PjRtCApiLoadedExecutable::Execute": {
+            "count": null,
+            "total_ms": null
+          },
+          "array.py:325 tolist": {
+            "count": null,
+            "total_ms": null
+          },
+          "command_buffer::execute": {
+            "count": null,
+            "total_ms": null
+          },
+          "command_buffer::update": {
+            "count": null,
+            "total_ms": null
+          },
+          "forward_step_token_ids_jit": {
+            "count": null,
+            "total_ms": null
+          },
+          "gather": {
+            "count": null,
+            "total_ms": null
+          },
+          "np.asarray(jax.Array)": {
+            "count": null,
+            "total_ms": null
+          },
+          "transpose": {
+            "count": null,
+            "total_ms": null
+          }
+        },
+        "profile_scoped_ranges": {},
+        "profile_scoped_top_events_by_total_ms": {},
+        "profile_trace_json_gz": null,
+        "prompt": {
+          "dataset_name": null,
+          "input_lens": [
+            64,
+            128,
+            192,
+            256,
+            320,
+            384,
+            448,
+            512
+          ],
+          "num_prompts": null,
+          "output_len": 32,
+          "output_lengths": null,
+          "prompt_manifest_jsonl": null,
+          "prompt_manifest_sha256": null,
+          "prompt_source": "tokenized_seed_repeat",
+          "prompt_suite": null,
+          "random_input_len": null,
+          "random_output_len": null,
+          "random_range_ratio": null,
+          "seed": null
+        },
+        "run": {
+          "issues": [],
+          "profile_enabled": false,
+          "profile_error": null,
+          "profile_path": "/mountpoint/.exp/profiles/20260525-180639-1818281-vllm_async_hetero8_64_512x32_baseline",
+          "profile_started": false,
+          "run_id": "20260525-180639-1818281-vllm_async_hetero8_64_512x32_baseline",
+          "run_label": "vllm_async_hetero8_64_512x32_baseline",
+          "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+        },
+        "scheduler_diagnostics": {
+          "available": false,
+          "decode_step_count": 0,
+          "prefill_step_count": 0,
+          "step_count": 0
+        },
+        "speculative": null
+      },
+      "source": "stored"
+    }
+  },
+  "workloads": [
+    "hetero8"
+  ]
+}

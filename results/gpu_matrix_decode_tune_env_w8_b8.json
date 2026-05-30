@@ -1,0 +1,2904 @@
+{
+  "acceptance": {
+    "decode_heavy_128x128": {
+      "gpu_paged_gdn_fla_decode_off_prefill": {
+        "checks": {
+          "correctness_checked": true,
+          "exact_generated_token_match": true,
+          "first_forward_step_present": true,
+          "jax_latency_present": true,
+          "jax_performance_present": true,
+          "minimum_repeats": true,
+          "profile_counters_present": true,
+          "runs_succeeded": true,
+          "vllm_reference_present": true
+        },
+        "missing_profile_counters": [],
+        "notes": "profile bucket movement still needs human explanation in the logbook",
+        "speed_claim_ready": true,
+        "target_vllm_ratio": 0.9,
+        "target_vllm_ratio_met": false
+      }
+    }
+  },
+  "comparisons": {
+    "decode_heavy_128x128": {
+      "gpu_paged_gdn_fla_decode_off_prefill": {
+        "itl_ms_p50_delta_vs_jax_reference": 1.6893005231395364,
+        "itl_ms_p50_delta_vs_vllm": 2.3165143793448806,
+        "jax_output_token_throughput_median": 129.4709161077073,
+        "jax_over_jax_reference_throughput": 0.7119018982313783,
+        "jax_over_vllm_throughput": 0.5931846854528992,
+        "jax_over_vllm_total_token_throughput": 0.5931846854528992,
+        "jax_reference_artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/references/jax_default_decode_heavy_128x128.json",
+        "jax_reference_source": "live_jax_default",
+        "jax_reference_tokens_per_second": 181.86623245331958,
+        "jax_request_throughput_median": 1.0114915320914633,
+        "jax_tokens_per_second_median": 129.4709161077073,
+        "jax_total_token_throughput_median": 258.9418322154146,
+        "profile_delta_vs_jax_reference": {
+          "MemcpyD2D": {
+            "count_delta": 0.0,
+            "current_count_median": 384.0,
+            "current_total_ms_median": 5.233350999999991,
+            "reference_count": 384,
+            "reference_total_ms": 4.891535999999967,
+            "total_ms_delta": 0.3418150000000244,
+            "total_ms_ratio": 1.06987886831458
+          },
+          "PjRtCApiLoadedExecutable::Execute": {
+            "count_delta": 0.0,
+            "current_count_median": 283.0,
+            "current_total_ms_median": 601.9324644999999,
+            "reference_count": 283,
+            "reference_total_ms": 306.79427600000014,
+            "total_ms_delta": 295.1381884999998,
+            "total_ms_ratio": 1.9620068286410912
+          },
+          "array.py:325 tolist": {
+            "count_delta": null,
+            "current_count_median": null,
+            "current_total_ms_median": null,
+            "reference_count": null,
+            "reference_total_ms": null,
+            "total_ms_delta": null,
+            "total_ms_ratio": null
+          },
+          "command_buffer::execute": {
+            "count_delta": 2286.0,
+            "current_count_median": 2517.0,
+            "current_total_ms_median": 162.12784700000034,
+            "reference_count": 231,
+            "reference_total_ms": 96.44627099999994,
+            "total_ms_delta": 65.6815760000004,
+            "total_ms_ratio": 1.6810172681533788
+          },
+          "command_buffer::update": {
+            "count_delta": 2277.5,
+            "current_count_median": 2403.5,
+            "current_total_ms_median": 163.90443800000008,
+            "reference_count": 126,
+            "reference_total_ms": 93.85056399999996,
+            "total_ms_delta": 70.05387400000012,
+            "total_ms_ratio": 1.7464406287425205
+          },
+          "forward_step_token_ids_jit": {
+            "count_delta": 0.0,
+            "current_count_median": 128.0,
+            "current_total_ms_median": 629.1211115000001,
+            "reference_count": 128,
+            "reference_total_ms": 325.8868689999998,
+            "total_ms_delta": 303.2342425000003,
+            "total_ms_ratio": 1.930489293510014
+          },
+          "gather": {
+            "count_delta": 0.0,
+            "current_count_median": 1603.0,
+            "current_total_ms_median": 41.09236049999999,
+            "reference_count": 1603,
+            "reference_total_ms": 15.184583000000078,
+            "total_ms_delta": 25.907777499999913,
+            "total_ms_ratio": 2.7061895937478018
+          },
+          "np.asarray(jax.Array)": {
+            "count_delta": 0.0,
+            "current_count_median": 128.0,
+            "current_total_ms_median": 15.490769499999995,
+            "reference_count": 128,
+            "reference_total_ms": 6.908016000000001,
+            "total_ms_delta": 8.582753499999995,
+            "total_ms_ratio": 2.2424339347216327
+          },
+          "transpose": {
+            "count_delta": 0.0,
+            "current_count_median": 30.0,
+            "current_total_ms_median": 0.0737905,
+            "reference_count": 30,
+            "reference_total_ms": 0.074211,
+            "total_ms_delta": -0.0004205000000000042,
+            "total_ms_ratio": 0.9943337241109808
+          }
+        },
+        "profile_scoped_delta_vs_jax_reference": {
+          "cpu": {
+            "MemcpyD2D": {
+              "count_delta": 0.0,
+              "current_count_median": 175.0,
+              "current_total_ms_median": 4.3405325,
+              "reference_count": 175,
+              "reference_total_ms": 3.911113999999999,
+              "total_ms_delta": 0.42941850000000104,
+              "total_ms_ratio": 1.1097944217427569
+            },
+            "PjRtCApiLoadedExecutable::Execute": {
+              "count_delta": 0.0,
+              "current_count_median": 283.0,
+              "current_total_ms_median": 601.9324644999999,
+              "reference_count": 283,
+              "reference_total_ms": 306.79427600000014,
+              "total_ms_delta": 295.1381884999998,
+              "total_ms_ratio": 1.9620068286410912
+            },
+            "array.py:325 tolist": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "command_buffer::execute": {
+              "count_delta": 2286.0,
+              "current_count_median": 2517.0,
+              "current_total_ms_median": 162.12784700000034,
+              "reference_count": 231,
+              "reference_total_ms": 96.44627099999994,
+              "total_ms_delta": 65.6815760000004,
+              "total_ms_ratio": 1.6810172681533788
+            },
+            "command_buffer::update": {
+              "count_delta": 2277.5,
+              "current_count_median": 2403.5,
+              "current_total_ms_median": 163.90443800000008,
+              "reference_count": 126,
+              "reference_total_ms": 93.85056399999996,
+              "total_ms_delta": 70.05387400000012,
+              "total_ms_ratio": 1.7464406287425205
+            },
+            "forward_step_token_ids_jit": {
+              "count_delta": 0.0,
+              "current_count_median": 128.0,
+              "current_total_ms_median": 629.1211115000001,
+              "reference_count": 128,
+              "reference_total_ms": 325.8868689999998,
+              "total_ms_delta": 303.2342425000003,
+              "total_ms_ratio": 1.930489293510014
+            },
+            "gather": {
+              "count_delta": 0.0,
+              "current_count_median": 18.0,
+              "current_total_ms_median": 35.785296,
+              "reference_count": 18,
+              "reference_total_ms": 9.837178,
+              "total_ms_delta": 25.948118,
+              "total_ms_ratio": 3.6377603414312523
+            },
+            "np.asarray(jax.Array)": {
+              "count_delta": 0.0,
+              "current_count_median": 128.0,
+              "current_total_ms_median": 15.490769499999995,
+              "reference_count": 128,
+              "reference_total_ms": 6.908016000000001,
+              "total_ms_delta": 8.582753499999995,
+              "total_ms_ratio": 2.2424339347216327
+            },
+            "transpose": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            }
+          },
+          "gpu": {
+            "MemcpyD2D": {
+              "count_delta": 0.0,
+              "current_count_median": 209.0,
+              "current_total_ms_median": 0.8928184999999996,
+              "reference_count": 209,
+              "reference_total_ms": 0.9804219999999996,
+              "total_ms_delta": -0.08760349999999995,
+              "total_ms_ratio": 0.910647149900757
+            },
+            "PjRtCApiLoadedExecutable::Execute": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "array.py:325 tolist": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "command_buffer::execute": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "command_buffer::update": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "forward_step_token_ids_jit": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "gather": {
+              "count_delta": 0.0,
+              "current_count_median": 1585.0,
+              "current_total_ms_median": 5.307064500000006,
+              "reference_count": 1585,
+              "reference_total_ms": 5.34740500000001,
+              "total_ms_delta": -0.040340500000003665,
+              "total_ms_ratio": 0.9924560604629715
+            },
+            "np.asarray(jax.Array)": {
+              "count_delta": null,
+              "current_count_median": null,
+              "current_total_ms_median": null,
+              "reference_count": null,
+              "reference_total_ms": null,
+              "total_ms_delta": null,
+              "total_ms_ratio": null
+            },
+            "transpose": {
+              "count_delta": 0.0,
+              "current_count_median": 30.0,
+              "current_total_ms_median": 0.0737905,
+              "reference_count": 30,
+              "reference_total_ms": 0.074211,
+              "total_ms_delta": -0.0004205000000000042,
+              "total_ms_ratio": 0.9943337241109808
+            }
+          }
+        },
+        "required_jax_speedup_to_target": 1.517234045435354,
+        "target_tokens_per_second": 196.43768181231806,
+        "target_vllm_ratio": 0.9,
+        "tokens_per_second_delta_vs_jax_reference": -52.39531634561229,
+        "tokens_per_second_gap_to_target": 66.96676570461076,
+        "ttft_ms_p50_delta_vs_jax_reference": 41.60515847615898,
+        "ttft_ms_p50_delta_vs_vllm": 47.69974760711193,
+        "vllm_output_token_throughput": 218.26409090257562,
+        "vllm_reference_source": "live",
+        "vllm_request_throughput": 1.705188210176372,
+        "vllm_tokens_per_second": 218.26409090257562,
+        "vllm_total_token_throughput": 436.52818180515123
+      }
+    }
+  },
+  "configs": [
+    "gpu_paged_gdn_fla_decode_off_prefill"
+  ],
+  "created_at_utc": "20260530_123400",
+  "dry_run": false,
+  "goal_target": {
+    "config": "gpu_paged_default",
+    "description": "non-speculative Qwen/Qwen3.5-0.8B server on long heterogeneous mixed-shape requests must be speed-claim-ready and reach at least 0.9x vLLM throughput",
+    "target_vllm_ratio": 0.9,
+    "workload": "long_prefill_512_2048"
+  },
+  "jax_default_references": {
+    "decode_heavy_128x128": {
+      "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/references/jax_default_decode_heavy_128x128.json",
+      "metrics": {
+        "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/references/jax_default_decode_heavy_128x128.json",
+        "correctness": {
+          "checked": false,
+          "exact_generated_token_match": false,
+          "full_length_ok": null,
+          "ok": true,
+          "rows": null
+        },
+        "exists": true,
+        "first_forward_step_token_ids_jit_ms": 29.16158,
+        "mtp_admission": {
+          "active_bucket": null,
+          "buckets": [],
+          "confidence_min_accept_rate": 0.75,
+          "enabled": false,
+          "probe_steps": 2
+        },
+        "performance": {
+          "generated_tokens": 128,
+          "itl_ms_p50": 4.970375914126635,
+          "itl_ms_p95": 5.5929184425622225,
+          "output_token_throughput": 181.86623245331958,
+          "request_throughput": 1.4208299410415592,
+          "seconds": 0.7038139970973134,
+          "tokens_per_second": 181.86623245331958,
+          "total_input_tokens": 128,
+          "total_output_tokens": 128,
+          "total_token_throughput": 363.73246490663917,
+          "ttft_ms_p50": 41.11232399009168,
+          "ttft_ms_p95": 41.11232399009168
+        },
+        "profile": {
+          "MemcpyD2D": {
+            "count": 384,
+            "total_ms": 4.891535999999967
+          },
+          "PjRtCApiLoadedExecutable::Execute": {
+            "count": 283,
+            "total_ms": 306.79427600000014
+          },
+          "array.py:325 tolist": {
+            "count": null,
+            "total_ms": null
+          },
+          "command_buffer::execute": {
+            "count": 231,
+            "total_ms": 96.44627099999994
+          },
+          "command_buffer::update": {
+            "count": 126,
+            "total_ms": 93.85056399999996
+          },
+          "forward_step_token_ids_jit": {
+            "count": 128,
+            "total_ms": 325.8868689999998
+          },
+          "gather": {
+            "count": 1603,
+            "total_ms": 15.184583000000078
+          },
+          "np.asarray(jax.Array)": {
+            "count": 128,
+            "total_ms": 6.908016000000001
+          },
+          "transpose": {
+            "count": 30,
+            "total_ms": 0.074211
+          }
+        },
+        "profile_scoped_ranges": {
+          "cpu": {
+            "MemcpyD2D": {
+              "count": 175,
+              "total_ms": 3.911113999999999
+            },
+            "PjRtCApiLoadedExecutable::Execute": {
+              "count": 283,
+              "total_ms": 306.79427600000014
+            },
+            "Thunks::Initialize": {
+              "count": 283,
+              "total_ms": 11.484455999999987
+            },
+            "_batch_hybrid_state": {
+              "count": 256,
+              "total_ms": 10.059646999999996
+            },
+            "_record_kv_snapshot": {
+              "count": 128,
+              "total_ms": 2.3786370000000003
+            },
+            "_run_main_and_sample": {
+              "count": 128,
+              "total_ms": 418.942689
+            },
+            "_store_batch_hybrid_state": {
+              "count": 128,
+              "total_ms": 1.6850939999999994
+            },
+            "command_buffer::execute": {
+              "count": 231,
+              "total_ms": 96.44627099999994
+            },
+            "command_buffer::update": {
+              "count": 126,
+              "total_ms": 93.85056399999996
+            },
+            "forward_step_token_ids_jit": {
+              "count": 128,
+              "total_ms": 325.8868689999998
+            },
+            "fusion": {
+              "count": 4646,
+              "total_ms": 28.12096000000004
+            },
+            "gather": {
+              "count": 18,
+              "total_ms": 9.837178
+            },
+            "gemm_fusion": {
+              "count": 34,
+              "total_ms": 0.19229699999999994
+            },
+            "generate_with_trace": {
+              "count": 2,
+              "total_ms": 1401.9589259999998
+            },
+            "input_reduce_fusion": {
+              "count": 1116,
+              "total_ms": 7.043499000000001
+            },
+            "jit_compiled:XLA GPU module": {
+              "count": 128,
+              "total_ms": 221.39489400000008
+            },
+            "loop_dynamic_update_slice_fusion": {
+              "count": 1146,
+              "total_ms": 7.541157000000006
+            },
+            "loop_multiply_fusion": {
+              "count": 1116,
+              "total_ms": 6.231476000000008
+            },
+            "np.asarray(jax.Array)": {
+              "count": 128,
+              "total_ms": 6.908016000000001
+            },
+            "while": {
+              "count": 36,
+              "total_ms": 17.373178000000006
+            }
+          },
+          "gpu": {
+            "MemcpyD2D": {
+              "count": 209,
+              "total_ms": 0.9804219999999996
+            },
+            "fusion": {
+              "count": 69548,
+              "total_ms": 634.1184870000153
+            },
+            "gather": {
+              "count": 1585,
+              "total_ms": 5.34740500000001
+            },
+            "gemm_fusion": {
+              "count": 2102,
+              "total_ms": 141.24680100000003
+            },
+            "input_reduce_fusion": {
+              "count": 28506,
+              "total_ms": 375.9285370000049
+            },
+            "loop_dynamic_update_slice_fusion": {
+              "count": 6744,
+              "total_ms": 26.728260000000923
+            },
+            "loop_multiply_fusion": {
+              "count": 11512,
+              "total_ms": 21.442172000000078
+            },
+            "transpose": {
+              "count": 30,
+              "total_ms": 0.074211
+            },
+            "wrapped_concatenate": {
+              "count": 36,
+              "total_ms": 0.15529400000000002
+            }
+          }
+        },
+        "profile_scoped_top_events_by_total_ms": {
+          "cpu": [
+            {
+              "count": 1,
+              "name": "$llm_engine.py:632 generate_with_trace",
+              "total_ms": 700.9997079999999
+            },
+            {
+              "count": 1,
+              "name": "$llm_engine.py:661 _generate_with_trace_deferred_tokens",
+              "total_ms": 700.959218
+            },
+            {
+              "count": 128,
+              "name": "$llm_engine.py:161 step",
+              "total_ms": 697.7212550000004
+            },
+            {
+              "count": 256,
+              "name": "PjitFunction(compiled)",
+              "total_ms": 638.1358029999997
+            },
+            {
+              "count": 128,
+              "name": "$model_runner.py:3737 run",
+              "total_ms": 423.26881899999984
+            },
+            {
+              "count": 128,
+              "name": "$model_runner.py:1899 _run_main_and_sample",
+              "total_ms": 418.942689
+            },
+            {
+              "count": 128,
+              "name": "$model_executor.py:501 forward_step_token_ids_jit",
+              "total_ms": 325.8868689999998
+            },
+            {
+              "count": 128,
+              "name": "$model_executor.py:260 _profile_jit_call",
+              "total_ms": 319.74728
+            },
+            {
+              "count": 283,
+              "name": "PjRtCApiLoadedExecutable::Execute",
+              "total_ms": 306.79427600000014
+            },
+            {
+              "count": 283,
+              "name": "PJRT_LoadedExecutable_Execute",
+              "total_ms": 304.37062000000003
+            },
+            {
+              "count": 283,
+              "name": "CommonPjRtLoadedExecutable::ExecuteHelperOnSingleDevice",
+              "total_ms": 302.2477449999999
+            },
+            {
+              "count": 128,
+              "name": "CommonPjRtLoadedExecutable::Execute (jit_compiled)",
+              "total_ms": 289.467356
+            },
+            {
+              "count": 283,
+              "name": "[0] PjRtStreamExecutorRawLoadedExecutable::Execute",
+              "total_ms": 283.5081670000002
+            },
+            {
+              "count": 283,
+              "name": "[0] GpuExecutable::ExecuteThunks",
+              "total_ms": 257.07664700000004
+            },
+            {
+              "count": 128,
+              "name": "$scheduler.py:151 schedule",
+              "total_ms": 233.7946500000002
+            },
+            {
+              "count": 128,
+              "name": "$scheduler.py:303 build_scheduled_batch",
+              "total_ms": 229.8731889999999
+            },
+            {
+              "count": 128,
+              "name": "$scheduler.py:16 _device_int32_arrays",
+              "total_ms": 226.53063699999993
+            },
+            {
+              "count": 128,
+              "name": "$api.py:2106 device_put",
+              "total_ms": 223.60758099999998
+            },
+            {
+              "count": 128,
+              "name": "jit_compiled:XLA GPU module",
+              "total_ms": 221.39489400000008
+            },
+            {
+              "count": 384,
+              "name": "$profiler.py:424 wrapper",
+              "total_ms": 206.75874399999967
+            },
+            {
+              "count": 128,
+              "name": "$dispatch.py:599 _batched_device_put_impl",
+              "total_ms": 203.92955399999997
+            },
+            {
+              "count": 128,
+              "name": "command_buffer_1",
+              "total_ms": 188.014877
+            },
+            {
+              "count": 128,
+              "name": "shard_args",
+              "total_ms": 186.91531299999997
+            },
+            {
+              "count": 128,
+              "name": "$pxla.py:86 shard_args",
+              "total_ms": 185.9551730000001
+            },
+            {
+              "count": 128,
+              "name": "$pxla.py:170 _shard_np_array",
+              "total_ms": 177.3495340000001
+            },
+            {
+              "count": 1,
+              "name": "$run_tracking.py:154 stop_jax_profile",
+              "total_ms": 170.569377
+            },
+            {
+              "count": 1,
+              "name": "$profiler.py:278 stop_trace",
+              "total_ms": 170.56232699999998
+            },
+            {
+              "count": 768,
+              "name": "$pxla.py:214 batched_device_put",
+              "total_ms": 154.4877810000002
+            },
+            {
+              "count": 768,
+              "name": "DevicePutWithSharding",
+              "total_ms": 144.3491140000001
+            },
+            {
+              "count": 778,
+              "name": "PjRtStreamExecutorClient::LinearizeHostBufferInto",
+              "total_ms": 127.38472800000001
+            },
+            {
+              "count": 1061,
+              "name": "GetEventForComputeStreamSyncPoint",
+              "total_ms": 114.29383500000004
+            },
+            {
+              "count": 257,
+              "name": "PjRtCApiCompiler::BufferFromHostBuffer(s32[1])",
+              "total_ms": 103.21070000000002
+            },
+            {
+              "count": 231,
+              "name": "command_buffer::execute",
+              "total_ms": 96.44627099999994
+            },
+            {
+              "count": 126,
+              "name": "command_buffer::update",
+              "total_ms": 93.85056399999996
+            },
+            {
+              "count": 127,
+              "name": "cuGraphLaunch (CudaGraph:152)",
+              "total_ms": 92.803795
+            },
+            {
+              "count": 281,
+              "name": "BUFFER_FLUSH",
+              "total_ms": 82.81306400000005
+            },
+            {
+              "count": 128,
+              "name": "$model_runner.py:1167 _maybe_apply_device_token_carry",
+              "total_ms": 54.118873999999984
+            },
+            {
+              "count": 257,
+              "name": "$array.py:338 __getitem__",
+              "total_ms": 48.86369799999998
+            },
+            {
+              "count": 257,
+              "name": "$indexing.py:1061 rewriting_take",
+              "total_ms": 46.867134
+            },
+            {
+              "count": 128,
+              "name": "$llm_engine.py:201 <listcomp>",
+              "total_ms": 35.952274
+            }
+          ],
+          "gpu": [
+            {
+              "count": 127,
+              "name": "gemm_fusion_dot_265",
+              "total_ms": 127.43290900000007
+            },
+            {
+              "count": 3048,
+              "name": "input_reduce_fusion_110",
+              "total_ms": 105.29812600000008
+            },
+            {
+              "count": 3048,
+              "name": "input_reduce_fusion_152",
+              "total_ms": 64.11185600000026
+            },
+            {
+              "count": 2286,
+              "name": "input_reduce_fusion_80",
+              "total_ms": 62.92318700000047
+            },
+            {
+              "count": 2286,
+              "name": "input_reduce_fusion_176",
+              "total_ms": 34.84163699999978
+            },
+            {
+              "count": 2286,
+              "name": "input_reduce_fusion_128",
+              "total_ms": 32.2878480000002
+            },
+            {
+              "count": 2286,
+              "name": "input_reduce_fusion_194",
+              "total_ms": 19.097766999999894
+            },
+            {
+              "count": 762,
+              "name": "input_reduce_fusion_86",
+              "total_ms": 17.898839000000017
+            },
+            {
+              "count": 762,
+              "name": "input_reduce_fusion_173",
+              "total_ms": 14.07322100000003
+            },
+            {
+              "count": 2286,
+              "name": "fusion_2043",
+              "total_ms": 12.359772999999976
+            },
+            {
+              "count": 254,
+              "name": "memcpy128",
+              "total_ms": 10.501697000000007
+            },
+            {
+              "count": 1524,
+              "name": "input_reduce_fusion_209",
+              "total_ms": 7.099060000000135
+            },
+            {
+              "count": 762,
+              "name": "loop_multiply_fusion_79",
+              "total_ms": 5.614847000000014
+            },
+            {
+              "count": 3048,
+              "name": "loop_multiply_fusion_76",
+              "total_ms": 4.360887000000073
+            },
+            {
+              "count": 2292,
+              "name": "input_reduce_fusion_24",
+              "total_ms": 3.6577949999998567
+            },
+            {
+              "count": 762,
+              "name": "gemm_fusion_dot_239",
+              "total_ms": 3.4192009999999993
+            },
+            {
+              "count": 2286,
+              "name": "loop_exponential_fusion",
+              "total_ms": 3.386633000000105
+            },
+            {
+              "count": 254,
+              "name": "loop_pad_fusion",
+              "total_ms": 3.256570999999996
+            },
+            {
+              "count": 254,
+              "name": "loop_pad_fusion_10",
+              "total_ms": 3.2314489999999996
+            },
+            {
+              "count": 254,
+              "name": "loop_pad_fusion_6",
+              "total_ms": 3.229041999999998
+            },
+            {
+              "count": 254,
+              "name": "loop_pad_fusion_4",
+              "total_ms": 3.216314999999999
+            },
+            {
+              "count": 254,
+              "name": "loop_pad_fusion_8",
+              "total_ms": 3.2069689999999977
+            },
+            {
+              "count": 254,
+              "name": "loop_pad_fusion_2",
+              "total_ms": 3.2036849999999997
+            },
+            {
+              "count": 1270,
+              "name": "input_add_reduce_fusion_9",
+              "total_ms": 3.1841309999999674
+            },
+            {
+              "count": 2286,
+              "name": "loop_divide_fusion_17",
+              "total_ms": 3.0109339999999354
+            },
+            {
+              "count": 1397,
+              "name": "input_reduce_fusion_56",
+              "total_ms": 2.981147999999963
+            },
+            {
+              "count": 1397,
+              "name": "input_reduce_fusion_57",
+              "total_ms": 2.7918050000000054
+            },
+            {
+              "count": 762,
+              "name": "gemm_fusion_dot_238",
+              "total_ms": 2.402950000000001
+            },
+            {
+              "count": 1397,
+              "name": "input_reduce_fusion_58",
+              "total_ms": 2.3529809999999975
+            },
+            {
+              "count": 1397,
+              "name": "loop_multiply_fusion_68",
+              "total_ms": 2.069916999999995
+            },
+            {
+              "count": 1397,
+              "name": "loop_multiply_fusion_69",
+              "total_ms": 2.036134000000003
+            },
+            {
+              "count": 1397,
+              "name": "loop_multiply_fusion_71",
+              "total_ms": 2.002150000000033
+            },
+            {
+              "count": 1397,
+              "name": "loop_multiply_fusion_72",
+              "total_ms": 1.9417560000000273
+            },
+            {
+              "count": 24,
+              "name": "gemm_fusion_dot_338",
+              "total_ms": 1.7909760000000001
+            },
+            {
+              "count": 834,
+              "name": "input_concatenate_fusion",
+              "total_ms": 1.7293429999999832
+            },
+            {
+              "count": 18,
+              "name": "gemm_fusion_dot_337",
+              "total_ms": 1.7112939999999999
+            },
+            {
+              "count": 199,
+              "name": "loop_dynamic_update_slice_fusion_18",
+              "total_ms": 1.686274
+            },
+            {
+              "count": 127,
+              "name": "loop_dynamic_update_slice_fusion_26",
+              "total_ms": 1.5698280000000007
+            },
+            {
+              "count": 127,
+              "name": "loop_dynamic_update_slice_fusion_2",
+              "total_ms": 1.5626249999999993
+            },
+            {
+              "count": 127,
+              "name": "loop_dynamic_update_slice_fusion_10",
+              "total_ms": 1.5575390000000005
+            }
+          ]
+        },
+        "profile_trace_json_gz": "/mountpoint/.exp/profiles/20260530-123401-60665-gpu_matrix_jax_default_reference_decode_heavy_128x128_20260530_123400/plugins/profile/2026_05_30_12_34_32/INDCS0291.atrapa.deloitte.com.trace.json.gz",
+        "prompt": {
+          "dataset_name": "tokenized_seed_repeat",
+          "input_lens": [
+            128
+          ],
+          "num_prompts": 1,
+          "output_len": 128,
+          "output_lengths": [
+            128
+          ],
+          "prompt_manifest_jsonl": null,
+          "prompt_manifest_sha256": null,
+          "prompt_source": "tokenized_seed_repeat",
+          "prompt_suite": "mixed",
+          "random_input_len": 1280,
+          "random_output_len": 16,
+          "random_range_ratio": {
+            "input": 0.0,
+            "output": 0.0
+          },
+          "seed": 0
+        },
+        "run": {
+          "issues": [],
+          "profile_enabled": true,
+          "profile_error": null,
+          "profile_path": "/mountpoint/.exp/profiles/20260530-123401-60665-gpu_matrix_jax_default_reference_decode_heavy_128x128_20260530_123400",
+          "profile_started": false,
+          "run_id": "20260530-123401-60665-gpu_matrix_jax_default_reference_decode_heavy_128x128_20260530_123400",
+          "run_label": "gpu_matrix_jax_default_reference_decode_heavy_128x128_20260530_123400",
+          "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+        },
+        "scheduler_diagnostics": {
+          "available": true,
+          "decode_step_count": 127,
+          "decode_step_seconds_total": 0.6582545612473041,
+          "max_decode_step_sequences": 1,
+          "max_prefill_step_sequences": 1,
+          "max_step_sequences": 1,
+          "max_step_tokens": 128,
+          "prefill_step_count": 1,
+          "prefill_step_seconds_total": 0.04110847390256822,
+          "step_count": 128,
+          "total_step_seconds": 0.6993630351498723
+        },
+        "speculative": {
+          "acceptance_rate": 0.0,
+          "bonus_tokens": 0,
+          "debug_events": [],
+          "draft_position_accepted": [],
+          "draft_position_proposed": [],
+          "drafts_accepted": 0,
+          "drafts_proposed": 0,
+          "drafts_rejected": 0,
+          "enabled": false,
+          "fallback_gated_no_spec_steps": 0,
+          "fallback_partial_rows": 0,
+          "fallback_seeded_main_steps": 0,
+          "fallback_steps": 0
+        }
+      },
+      "missing_selected_config_references": [
+        "gpu_paged_gdn_fla_decode_off_prefill"
+      ],
+      "run": {
+        "command": [
+          "/root/miniconda3/bin/python3",
+          "/mountpoint/.exp/nano-vllm-jax/benchmarks/benchmark_jax_server_trace.py",
+          "--model",
+          "Qwen/Qwen3.5-0.8B",
+          "--backend",
+          "gpu",
+          "--dtype",
+          "float32",
+          "--weight-dtype",
+          "bfloat16",
+          "--jax-execution",
+          "jit",
+          "--input-lens",
+          "128",
+          "--output-len",
+          "128",
+          "--prompt-suite",
+          "mixed",
+          "--num-speculative-tokens",
+          "0",
+          "--max-kv-cache-mb",
+          "1024",
+          "--num-kvcache-blocks",
+          "128",
+          "--max-num-seqs",
+          "1",
+          "--max-num-batched-tokens",
+          "512",
+          "--prefill-buckets",
+          "128",
+          "--batch-size-buckets",
+          "1",
+          "--max-blocks-per-seq",
+          "24",
+          "--top-k",
+          "5",
+          "--warmup",
+          "--profile",
+          "--prompt-source",
+          "tokenized_seed_repeat",
+          "--seed",
+          "0",
+          "--output-json",
+          "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/references/jax_default_decode_heavy_128x128.json",
+          "--run-label",
+          "gpu_matrix_jax_default_reference_decode_heavy_128x128_20260530_123400"
+        ],
+        "elapsed_seconds": 39.5006774070207,
+        "output_tail": "Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\nLoading pretrained weights from Qwen/Qwen3.5-0.8B...\nLoading weights for Qwen/Qwen3.5-0.8B...\nResolving Qwen/Qwen3.5-0.8B from Hugging Face cache...\n\nFetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]\nFetching 9 files: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 9/9 [00:00<00:00, 123766.35it/s]\nW0530 12:34:30.631697   60665 cupti_tracer.cc:1453] Fail to use per-thread activity buffer, cupti trace overhead may be big. CUPTI ERROR CODE:1\nUsing snapshot: /mountpoint/.exp/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17\nConverting weights...\nMaterializing tied LM head as a separate [hidden, vocab] weight...\n\u2713 Loaded weights: 24 layers\n\u2713 Using pretrained weights\n",
+        "returncode": 0,
+        "status": "ok"
+      },
+      "source": "live_jax_default"
+    }
+  },
+  "jax_python": {
+    "available": true,
+    "path": "/root/miniconda3/bin/python3"
+  },
+  "matrix": {
+    "decode_heavy_128x128": {
+      "gpu_paged_gdn_fla_decode_off_prefill": {
+        "aggregate": {
+          "all_correct": true,
+          "all_correctness_checked": true,
+          "all_exact_generated_token_match": true,
+          "first_forward_step_token_ids_jit_ms_median": 56.352301,
+          "itl_ms_p50_median": 6.659676437266171,
+          "itl_ms_p95_median": 10.398535151034594,
+          "output_token_throughput_median": 129.4709161077073,
+          "profile_medians": {
+            "MemcpyD2D": {
+              "count_median": 384.0,
+              "total_ms_median": 5.233350999999991
+            },
+            "PjRtCApiLoadedExecutable::Execute": {
+              "count_median": 283.0,
+              "total_ms_median": 601.9324644999999
+            },
+            "array.py:325 tolist": {
+              "count_median": null,
+              "total_ms_median": null
+            },
+            "command_buffer::execute": {
+              "count_median": 2517.0,
+              "total_ms_median": 162.12784700000034
+            },
+            "command_buffer::update": {
+              "count_median": 2403.5,
+              "total_ms_median": 163.90443800000008
+            },
+            "forward_step_token_ids_jit": {
+              "count_median": 128.0,
+              "total_ms_median": 629.1211115000001
+            },
+            "gather": {
+              "count_median": 1603.0,
+              "total_ms_median": 41.09236049999999
+            },
+            "np.asarray(jax.Array)": {
+              "count_median": 128.0,
+              "total_ms_median": 15.490769499999995
+            },
+            "transpose": {
+              "count_median": 30.0,
+              "total_ms_median": 0.0737905
+            }
+          },
+          "profile_scoped_range_medians": {
+            "cpu": {
+              "MemcpyD2D": {
+                "count_median": 175.0,
+                "total_ms_median": 4.3405325
+              },
+              "PjRtCApiLoadedExecutable::Execute": {
+                "count_median": 283.0,
+                "total_ms_median": 601.9324644999999
+              },
+              "array.py:325 tolist": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "command_buffer::execute": {
+                "count_median": 2517.0,
+                "total_ms_median": 162.12784700000034
+              },
+              "command_buffer::update": {
+                "count_median": 2403.5,
+                "total_ms_median": 163.90443800000008
+              },
+              "forward_step_token_ids_jit": {
+                "count_median": 128.0,
+                "total_ms_median": 629.1211115000001
+              },
+              "gather": {
+                "count_median": 18.0,
+                "total_ms_median": 35.785296
+              },
+              "np.asarray(jax.Array)": {
+                "count_median": 128.0,
+                "total_ms_median": 15.490769499999995
+              },
+              "transpose": {
+                "count_median": null,
+                "total_ms_median": null
+              }
+            },
+            "gpu": {
+              "MemcpyD2D": {
+                "count_median": 209.0,
+                "total_ms_median": 0.8928184999999996
+              },
+              "PjRtCApiLoadedExecutable::Execute": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "array.py:325 tolist": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "command_buffer::execute": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "command_buffer::update": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "forward_step_token_ids_jit": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "gather": {
+                "count_median": 1585.0,
+                "total_ms_median": 5.307064500000006
+              },
+              "np.asarray(jax.Array)": {
+                "count_median": null,
+                "total_ms_median": null
+              },
+              "transpose": {
+                "count_median": 30.0,
+                "total_ms_median": 0.0737905
+              }
+            }
+          },
+          "repeat_count": 2,
+          "request_throughput_median": 1.0114915320914633,
+          "scheduler_diagnostics_median": {
+            "available": true,
+            "decode_step_count": 127.0,
+            "decode_step_seconds_total": 0.9609141875989735,
+            "max_decode_step_sequences": 1.0,
+            "max_prefill_step_sequences": 1.0,
+            "max_step_sequences": 1.0,
+            "max_step_tokens": 128.0,
+            "prefill_step_count": 1.0,
+            "prefill_step_seconds_total": 0.08271119743585587,
+            "step_count": 128.0,
+            "total_step_seconds": 1.0436253850348294
+          },
+          "tokens_per_second_median": 129.4709161077073,
+          "total_input_tokens_median": 128.0,
+          "total_output_tokens_median": 128.0,
+          "total_token_throughput_median": 258.9418322154146,
+          "ttft_ms_p50_median": 82.71748246625066,
+          "ttft_ms_p95_median": 82.71748246625066
+        },
+        "config": {
+          "args": {
+            "backend": "gpu",
+            "batch_size_buckets": "1",
+            "dtype": "float32",
+            "input_lens": "128",
+            "jax_execution": "jit",
+            "max_blocks_per_seq": 24,
+            "max_kv_cache_mb": 1024,
+            "max_num_batched_tokens": 512,
+            "max_num_seqs": 1,
+            "model": "Qwen/Qwen3.5-0.8B",
+            "num_kvcache_blocks": 128,
+            "num_speculative_tokens": 0,
+            "output_len": 128,
+            "prefill_buckets": "128",
+            "profile": true,
+            "prompt_source": "tokenized_seed_repeat",
+            "prompt_suite": "mixed",
+            "seed": 0,
+            "top_k": 5,
+            "warmup": true,
+            "weight_dtype": "bfloat16"
+          },
+          "description": "Decode-heavy GDN FLA variant with prefill post-conv wrapper disabled.",
+          "env": {
+            "JAX_PLATFORMS": "cuda",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV": "1",
+            "NANO_VLLM_JAX_COMPACT_PREFILL_MLP": "1",
+            "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY": "1",
+            "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL": "triton_fla",
+            "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL": "off",
+            "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH": "1",
+            "NANO_VLLM_JAX_KERNEL_BACKEND": "pure_jax",
+            "NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD": "1"
+          }
+        },
+        "repeats": [
+          {
+            "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_repeat1.json",
+            "metrics": {
+              "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_repeat1.json",
+              "correctness": {
+                "checked": true,
+                "exact_generated_token_match": true,
+                "full_length_ok": true,
+                "ok": true,
+                "rows": [
+                  {
+                    "checked": true,
+                    "comparison_length": 128,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 128,
+                    "generated_prefix_match": true,
+                    "name": "len_128",
+                    "reference_first_step_topk": [],
+                    "reference_length": 128,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  }
+                ]
+              },
+              "exists": true,
+              "first_forward_step_token_ids_jit_ms": 82.895377,
+              "mtp_admission": {
+                "active_bucket": null,
+                "buckets": [],
+                "confidence_min_accept_rate": 0.75,
+                "enabled": false,
+                "probe_steps": 2
+              },
+              "performance": {
+                "generated_tokens": 128,
+                "itl_ms_p50": 7.878866977989674,
+                "itl_ms_p95": 13.940982986241579,
+                "output_token_throughput": 98.03765089183081,
+                "request_throughput": 0.7659191475924282,
+                "seconds": 1.3056208388879895,
+                "tokens_per_second": 98.03765089183081,
+                "total_input_tokens": 128,
+                "total_output_tokens": 128,
+                "total_token_throughput": 196.07530178366162,
+                "ttft_ms_p50": 120.24380289949477,
+                "ttft_ms_p95": 120.24380289949477
+              },
+              "profile": {
+                "MemcpyD2D": {
+                  "count": 384,
+                  "total_ms": 5.991686999999998
+                },
+                "PjRtCApiLoadedExecutable::Execute": {
+                  "count": 283,
+                  "total_ms": 761.415762
+                },
+                "array.py:325 tolist": {
+                  "count": null,
+                  "total_ms": null
+                },
+                "command_buffer::execute": {
+                  "count": 2517,
+                  "total_ms": 192.94133400000067
+                },
+                "command_buffer::update": {
+                  "count": 2413,
+                  "total_ms": 202.7285840000001
+                },
+                "forward_step_token_ids_jit": {
+                  "count": 128,
+                  "total_ms": 790.539004
+                },
+                "gather": {
+                  "count": 1603,
+                  "total_ms": 66.6605159999999
+                },
+                "np.asarray(jax.Array)": {
+                  "count": 128,
+                  "total_ms": 24.516391999999993
+                },
+                "transpose": {
+                  "count": 30,
+                  "total_ms": 0.07398099999999999
+                }
+              },
+              "profile_scoped_ranges": {
+                "cpu": {
+                  "MemcpyD2D": {
+                    "count": 175,
+                    "total_ms": 5.159041999999998
+                  },
+                  "PjRtCApiLoadedExecutable::Execute": {
+                    "count": 283,
+                    "total_ms": 761.415762
+                  },
+                  "Thunks::Initialize": {
+                    "count": 283,
+                    "total_ms": 33.269574000000034
+                  },
+                  "_batch_hybrid_state": {
+                    "count": 256,
+                    "total_ms": 37.51770100000002
+                  },
+                  "_record_kv_snapshot": {
+                    "count": 128,
+                    "total_ms": 6.588024000000001
+                  },
+                  "_run_main_and_sample": {
+                    "count": 128,
+                    "total_ms": 976.3989020000004
+                  },
+                  "_store_batch_hybrid_state": {
+                    "count": 128,
+                    "total_ms": 3.4500680000000004
+                  },
+                  "command_buffer::execute": {
+                    "count": 2517,
+                    "total_ms": 192.94133400000067
+                  },
+                  "command_buffer::update": {
+                    "count": 2413,
+                    "total_ms": 202.7285840000001
+                  },
+                  "forward_step_token_ids_jit": {
+                    "count": 128,
+                    "total_ms": 790.539004
+                  },
+                  "fusion": {
+                    "count": 4646,
+                    "total_ms": 56.22340699999996
+                  },
+                  "gather": {
+                    "count": 18,
+                    "total_ms": 61.357379
+                  },
+                  "gemm_fusion": {
+                    "count": 34,
+                    "total_ms": 0.366317
+                  },
+                  "generate_with_trace": {
+                    "count": 2,
+                    "total_ms": 2600.3400759999995
+                  },
+                  "input_reduce_fusion": {
+                    "count": 1116,
+                    "total_ms": 13.217048999999982
+                  },
+                  "jit_compiled:XLA GPU module": {
+                    "count": 128,
+                    "total_ms": 554.7386789999998
+                  },
+                  "loop_dynamic_update_slice_fusion": {
+                    "count": 1146,
+                    "total_ms": 14.631058999999995
+                  },
+                  "loop_multiply_fusion": {
+                    "count": 1116,
+                    "total_ms": 14.190346000000007
+                  },
+                  "np.asarray(jax.Array)": {
+                    "count": 128,
+                    "total_ms": 24.516391999999993
+                  },
+                  "while": {
+                    "count": 36,
+                    "total_ms": 35.815622
+                  }
+                },
+                "gpu": {
+                  "MemcpyD2D": {
+                    "count": 209,
+                    "total_ms": 0.8326449999999992
+                  },
+                  "fusion": {
+                    "count": 60404,
+                    "total_ms": 613.5263149999911
+                  },
+                  "gather": {
+                    "count": 1585,
+                    "total_ms": 5.303137000000013
+                  },
+                  "gemm_fusion": {
+                    "count": 2102,
+                    "total_ms": 141.30369000000005
+                  },
+                  "input_reduce_fusion": {
+                    "count": 23934,
+                    "total_ms": 339.87273500000305
+                  },
+                  "loop_dynamic_update_slice_fusion": {
+                    "count": 6744,
+                    "total_ms": 29.479216000000587
+                  },
+                  "loop_multiply_fusion": {
+                    "count": 11512,
+                    "total_ms": 21.287046000000416
+                  },
+                  "transpose": {
+                    "count": 30,
+                    "total_ms": 0.07398099999999999
+                  },
+                  "wrapped_concatenate": {
+                    "count": 36,
+                    "total_ms": 0.153985
+                  }
+                }
+              },
+              "profile_scoped_top_events_by_total_ms": {
+                "cpu": [
+                  {
+                    "count": 256,
+                    "name": "PjitFunction(compiled)",
+                    "total_ms": 1555.9122129999998
+                  },
+                  {
+                    "count": 1,
+                    "name": "$llm_engine.py:632 generate_with_trace",
+                    "total_ms": 1300.201764
+                  },
+                  {
+                    "count": 1,
+                    "name": "$llm_engine.py:661 _generate_with_trace_deferred_tokens",
+                    "total_ms": 1300.1383119999998
+                  },
+                  {
+                    "count": 128,
+                    "name": "$llm_engine.py:161 step",
+                    "total_ms": 1293.2773530000006
+                  },
+                  {
+                    "count": 128,
+                    "name": "$model_runner.py:3737 run",
+                    "total_ms": 982.9613619999998
+                  },
+                  {
+                    "count": 128,
+                    "name": "$model_runner.py:1899 _run_main_and_sample",
+                    "total_ms": 976.3989020000004
+                  },
+                  {
+                    "count": 128,
+                    "name": "$model_executor.py:501 forward_step_token_ids_jit",
+                    "total_ms": 790.539004
+                  },
+                  {
+                    "count": 128,
+                    "name": "$model_executor.py:260 _profile_jit_call",
+                    "total_ms": 779.149166
+                  },
+                  {
+                    "count": 283,
+                    "name": "PjRtCApiLoadedExecutable::Execute",
+                    "total_ms": 761.415762
+                  },
+                  {
+                    "count": 283,
+                    "name": "PJRT_LoadedExecutable_Execute",
+                    "total_ms": 757.2328600000005
+                  },
+                  {
+                    "count": 283,
+                    "name": "CommonPjRtLoadedExecutable::ExecuteHelperOnSingleDevice",
+                    "total_ms": 753.881737
+                  },
+                  {
+                    "count": 128,
+                    "name": "CommonPjRtLoadedExecutable::Execute (jit_compiled)",
+                    "total_ms": 728.5523100000001
+                  },
+                  {
+                    "count": 283,
+                    "name": "[0] PjRtStreamExecutorRawLoadedExecutable::Execute",
+                    "total_ms": 719.0488499999998
+                  },
+                  {
+                    "count": 283,
+                    "name": "[0] GpuExecutable::ExecuteThunks",
+                    "total_ms": 653.4541359999997
+                  },
+                  {
+                    "count": 128,
+                    "name": "jit_compiled:XLA GPU module",
+                    "total_ms": 554.7386789999998
+                  },
+                  {
+                    "count": 1,
+                    "name": "$run_tracking.py:154 stop_jax_profile",
+                    "total_ms": 307.394222
+                  },
+                  {
+                    "count": 1,
+                    "name": "$profiler.py:278 stop_trace",
+                    "total_ms": 307.383831
+                  },
+                  {
+                    "count": 128,
+                    "name": "$scheduler.py:151 schedule",
+                    "total_ms": 223.583602
+                  },
+                  {
+                    "count": 128,
+                    "name": "$scheduler.py:303 build_scheduled_batch",
+                    "total_ms": 212.85464300000007
+                  },
+                  {
+                    "count": 128,
+                    "name": "$scheduler.py:16 _device_int32_arrays",
+                    "total_ms": 207.86274899999998
+                  },
+                  {
+                    "count": 128,
+                    "name": "$api.py:2106 device_put",
+                    "total_ms": 202.96907300000007
+                  },
+                  {
+                    "count": 2413,
+                    "name": "command_buffer::update",
+                    "total_ms": 202.7285840000001
+                  },
+                  {
+                    "count": 2517,
+                    "name": "command_buffer::execute",
+                    "total_ms": 192.94133400000067
+                  },
+                  {
+                    "count": 384,
+                    "name": "$profiler.py:424 wrapper",
+                    "total_ms": 188.49228000000008
+                  },
+                  {
+                    "count": 128,
+                    "name": "$dispatch.py:599 _batched_device_put_impl",
+                    "total_ms": 170.923997
+                  },
+                  {
+                    "count": 128,
+                    "name": "shard_args",
+                    "total_ms": 138.39794899999998
+                  },
+                  {
+                    "count": 128,
+                    "name": "$pxla.py:86 shard_args",
+                    "total_ms": 136.92656400000007
+                  },
+                  {
+                    "count": 128,
+                    "name": "$pxla.py:170 _shard_np_array",
+                    "total_ms": 121.444286
+                  },
+                  {
+                    "count": 257,
+                    "name": "$array.py:338 __getitem__",
+                    "total_ms": 99.34186800000005
+                  },
+                  {
+                    "count": 257,
+                    "name": "$indexing.py:1061 rewriting_take",
+                    "total_ms": 95.73680800000002
+                  },
+                  {
+                    "count": 128,
+                    "name": "$model_runner.py:1167 _maybe_apply_device_token_carry",
+                    "total_ms": 93.71227999999999
+                  },
+                  {
+                    "count": 768,
+                    "name": "$pxla.py:214 batched_device_put",
+                    "total_ms": 88.42454999999991
+                  },
+                  {
+                    "count": 128,
+                    "name": "$llm_engine.py:201 <listcomp>",
+                    "total_ms": 77.453919
+                  },
+                  {
+                    "count": 3,
+                    "name": "$sequence.py:207 materialize_device_tokens_for_sequences",
+                    "total_ms": 76.912019
+                  },
+                  {
+                    "count": 2,
+                    "name": "$sequence.py:99 completion_token_ids",
+                    "total_ms": 76.911199
+                  },
+                  {
+                    "count": 2,
+                    "name": "$sequence.py:165 materialize_device_tokens",
+                    "total_ms": 76.90600900000001
+                  },
+                  {
+                    "count": 3,
+                    "name": "$sequence.py:214 materialize_device_token_slots",
+                    "total_ms": 75.46391799999999
+                  },
+                  {
+                    "count": 768,
+                    "name": "DevicePutWithSharding",
+                    "total_ms": 69.641935
+                  },
+                  {
+                    "count": 145,
+                    "name": "$core.py:627 bind",
+                    "total_ms": 58.906981999999985
+                  },
+                  {
+                    "count": 266,
+                    "name": "PjitFunction(broadcast_in_dim)",
+                    "total_ms": 55.17413900000004
+                  }
+                ],
+                "gpu": [
+                  {
+                    "count": 127,
+                    "name": "gemm_fusion_dot_265",
+                    "total_ms": 127.45348199999998
+                  },
+                  {
+                    "count": 3048,
+                    "name": "input_reduce_fusion_92",
+                    "total_ms": 103.45389700000052
+                  },
+                  {
+                    "count": 3048,
+                    "name": "input_reduce_fusion_116",
+                    "total_ms": 64.07079400000029
+                  },
+                  {
+                    "count": 2286,
+                    "name": "input_reduce_fusion_62",
+                    "total_ms": 62.78513100000046
+                  },
+                  {
+                    "count": 2286,
+                    "name": "fusion_922",
+                    "total_ms": 37.28318800000016
+                  },
+                  {
+                    "count": 2286,
+                    "name": "input_reduce_fusion_140",
+                    "total_ms": 37.003999999999884
+                  },
+                  {
+                    "count": 2286,
+                    "name": "input_reduce_fusion_164",
+                    "total_ms": 18.992042999999907
+                  },
+                  {
+                    "count": 762,
+                    "name": "input_reduce_fusion_68",
+                    "total_ms": 17.88787299999995
+                  },
+                  {
+                    "count": 762,
+                    "name": "input_reduce_fusion_137",
+                    "total_ms": 14.019046000000005
+                  },
+                  {
+                    "count": 2286,
+                    "name": "_gdn_packed_decode_kernel",
+                    "total_ms": 11.808320999999966
+                  },
+                  {
+                    "count": 254,
+                    "name": "memcpy128",
+                    "total_ms": 10.372285000000002
+                  },
+                  {
+                    "count": 1524,
+                    "name": "input_reduce_fusion_172",
+                    "total_ms": 7.073341000000132
+                  },
+                  {
+                    "count": 762,
+                    "name": "loop_multiply_fusion_79",
+                    "total_ms": 5.506282000000021
+                  },
+                  {
+                    "count": 3048,
+                    "name": "loop_multiply_fusion_76",
+                    "total_ms": 4.340461000000064
+                  },
+                  {
+                    "count": 762,
+                    "name": "gemm_fusion_dot_239",
+                    "total_ms": 3.463748000000003
+                  },
+                  {
+                    "count": 254,
+                    "name": "loop_pad_fusion",
+                    "total_ms": 3.242008000000001
+                  },
+                  {
+                    "count": 254,
+                    "name": "loop_pad_fusion_6",
+                    "total_ms": 3.238628
+                  },
+                  {
+                    "count": 254,
+                    "name": "loop_pad_fusion_8",
+                    "total_ms": 3.2349469999999996
+                  },
+                  {
+                    "count": 254,
+                    "name": "loop_pad_fusion_10",
+                    "total_ms": 3.2289740000000005
+                  },
+                  {
+                    "count": 254,
+                    "name": "loop_pad_fusion_4",
+                    "total_ms": 3.219843999999999
+                  },
+                  {
+                    "count": 254,
+                    "name": "loop_pad_fusion_2",
+                    "total_ms": 3.2025919999999997
+                  },
+                  {
+                    "count": 1270,
+                    "name": "input_add_reduce_fusion_9",
+                    "total_ms": 3.2005939999999535
+                  },
+                  {
+                    "count": 2286,
+                    "name": "wrapped_convert",
+                    "total_ms": 3.1292260000000542
+                  },
+                  {
+                    "count": 1397,
+                    "name": "input_reduce_fusion_38",
+                    "total_ms": 3.024264999999968
+                  },
+                  {
+                    "count": 2286,
+                    "name": "loop_convert_fusion",
+                    "total_ms": 2.837927999999944
+                  },
+                  {
+                    "count": 1397,
+                    "name": "input_reduce_fusion_39",
+                    "total_ms": 2.7260110000000224
+                  },
+                  {
+                    "count": 762,
+                    "name": "gemm_fusion_dot_238",
+                    "total_ms": 2.397145000000003
+                  },
+                  {
+                    "count": 1397,
+                    "name": "input_reduce_fusion_40",
+                    "total_ms": 2.373606999999979
+                  },
+                  {
+                    "count": 1397,
+                    "name": "loop_multiply_fusion_68",
+                    "total_ms": 2.0729990000000096
+                  },
+                  {
+                    "count": 1397,
+                    "name": "loop_multiply_fusion_69",
+                    "total_ms": 2.038306000000005
+                  },
+                  {
+                    "count": 1397,
+                    "name": "loop_multiply_fusion_71",
+                    "total_ms": 2.0049420000000295
+                  },
+                  {
+                    "count": 1397,
+                    "name": "loop_multiply_fusion_72",
+                    "total_ms": 1.9382850000000276
+                  },
+                  {
+                    "count": 24,
+                    "name": "gemm_fusion_dot_338",
+                    "total_ms": 1.7908499999999996
+                  },
+                  {
+                    "count": 834,
+                    "name": "input_concatenate_fusion",
+                    "total_ms": 1.717346999999981
+                  },
+                  {
+                    "count": 18,
+                    "name": "gemm_fusion_dot_337",
+                    "total_ms": 1.7080009999999999
+                  },
+                  {
+                    "count": 199,
+                    "name": "loop_dynamic_update_slice_fusion_18",
+                    "total_ms": 1.6555220000000004
+                  },
+                  {
+                    "count": 128,
+                    "name": "loop_dynamic_update_slice_fusion_42",
+                    "total_ms": 1.5720350000000014
+                  },
+                  {
+                    "count": 127,
+                    "name": "loop_dynamic_update_slice_fusion_34",
+                    "total_ms": 1.5596799999999997
+                  },
+                  {
+                    "count": 127,
+                    "name": "loop_dynamic_update_slice_fusion_2",
+                    "total_ms": 1.558972999999999
+                  },
+                  {
+                    "count": 127,
+                    "name": "loop_dynamic_update_slice_fusion_26",
+                    "total_ms": 1.5473649999999999
+                  }
+                ]
+              },
+              "profile_trace_json_gz": "/mountpoint/.exp/profiles/20260530-123618-61862-gpu_matrix_decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_r1_20260530_123400/plugins/profile/2026_05_30_12_36_55/INDCS0291.atrapa.deloitte.com.trace.json.gz",
+              "prompt": {
+                "dataset_name": "tokenized_seed_repeat",
+                "input_lens": [
+                  128
+                ],
+                "num_prompts": 1,
+                "output_len": 128,
+                "output_lengths": [
+                  128
+                ],
+                "prompt_manifest_jsonl": null,
+                "prompt_manifest_sha256": null,
+                "prompt_source": "tokenized_seed_repeat",
+                "prompt_suite": "mixed",
+                "random_input_len": 1280,
+                "random_output_len": 16,
+                "random_range_ratio": {
+                  "input": 0.0,
+                  "output": 0.0
+                },
+                "seed": 0
+              },
+              "run": {
+                "issues": [],
+                "profile_enabled": true,
+                "profile_error": null,
+                "profile_path": "/mountpoint/.exp/profiles/20260530-123618-61862-gpu_matrix_decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_r1_20260530_123400",
+                "profile_started": false,
+                "run_id": "20260530-123618-61862-gpu_matrix_decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_r1_20260530_123400",
+                "run_label": "gpu_matrix_decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_r1_20260530_123400",
+                "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+              },
+              "scheduler_diagnostics": {
+                "available": true,
+                "decode_step_count": 127,
+                "decode_step_seconds_total": 1.1772850225679576,
+                "max_decode_step_sequences": 1,
+                "max_prefill_step_sequences": 1,
+                "max_step_sequences": 1,
+                "max_step_tokens": 128,
+                "prefill_step_count": 1,
+                "prefill_step_seconds_total": 0.12023548292927444,
+                "step_count": 128,
+                "total_step_seconds": 1.297520505497232
+              },
+              "speculative": {
+                "acceptance_rate": 0.0,
+                "bonus_tokens": 0,
+                "debug_events": [],
+                "draft_position_accepted": [],
+                "draft_position_proposed": [],
+                "drafts_accepted": 0,
+                "drafts_proposed": 0,
+                "drafts_rejected": 0,
+                "enabled": false,
+                "fallback_gated_no_spec_steps": 0,
+                "fallback_partial_rows": 0,
+                "fallback_seeded_main_steps": 0,
+                "fallback_steps": 0
+              }
+            },
+            "reference_json": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/references/jax_default_decode_heavy_128x128.json",
+            "reference_source": "live_jax_default",
+            "repeat": 1,
+            "run": {
+              "command": [
+                "/root/miniconda3/bin/python3",
+                "/mountpoint/.exp/nano-vllm-jax/benchmarks/benchmark_jax_server_trace.py",
+                "--model",
+                "Qwen/Qwen3.5-0.8B",
+                "--backend",
+                "gpu",
+                "--dtype",
+                "float32",
+                "--weight-dtype",
+                "bfloat16",
+                "--jax-execution",
+                "jit",
+                "--input-lens",
+                "128",
+                "--output-len",
+                "128",
+                "--prompt-suite",
+                "mixed",
+                "--num-speculative-tokens",
+                "0",
+                "--max-kv-cache-mb",
+                "1024",
+                "--num-kvcache-blocks",
+                "128",
+                "--max-num-seqs",
+                "1",
+                "--max-num-batched-tokens",
+                "512",
+                "--prefill-buckets",
+                "128",
+                "--batch-size-buckets",
+                "1",
+                "--max-blocks-per-seq",
+                "24",
+                "--top-k",
+                "5",
+                "--warmup",
+                "--profile",
+                "--prompt-source",
+                "tokenized_seed_repeat",
+                "--seed",
+                "0",
+                "--output-json",
+                "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_repeat1.json",
+                "--run-label",
+                "gpu_matrix_decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_r1_20260530_123400",
+                "--reference-json",
+                "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/references/jax_default_decode_heavy_128x128.json"
+              ],
+              "elapsed_seconds": 48.3535333618056,
+              "output_tail": "Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\nLoading pretrained weights from Qwen/Qwen3.5-0.8B...\nLoading weights for Qwen/Qwen3.5-0.8B...\nResolving Qwen/Qwen3.5-0.8B from Hugging Face cache...\n\nFetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]\nFetching 9 files: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 9/9 [00:00<00:00, 122164.19it/s]\nW0530 12:36:52.779830   61862 cupti_tracer.cc:1453] Fail to use per-thread activity buffer, cupti trace overhead may be big. CUPTI ERROR CODE:1\nUsing snapshot: /mountpoint/.exp/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17\nConverting weights...\nMaterializing tied LM head as a separate [hidden, vocab] weight...\n\u2713 Loaded weights: 24 layers\n\u2713 Using pretrained weights\n",
+              "returncode": 0,
+              "status": "ok"
+            }
+          },
+          {
+            "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_repeat2.json",
+            "metrics": {
+              "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_repeat2.json",
+              "correctness": {
+                "checked": true,
+                "exact_generated_token_match": true,
+                "full_length_ok": true,
+                "ok": true,
+                "rows": [
+                  {
+                    "checked": true,
+                    "comparison_length": 128,
+                    "first_diff": null,
+                    "first_step_top1_match": null,
+                    "first_step_topk_ordered_match": null,
+                    "first_step_topk_overlap": null,
+                    "generated_full_match": true,
+                    "generated_length": 128,
+                    "generated_prefix_match": true,
+                    "name": "len_128",
+                    "reference_first_step_topk": [],
+                    "reference_length": 128,
+                    "reference_source": "exact_shape",
+                    "vllm_first_step_topk": []
+                  }
+                ]
+              },
+              "exists": true,
+              "first_forward_step_token_ids_jit_ms": 29.809224999999998,
+              "mtp_admission": {
+                "active_bucket": null,
+                "buckets": [],
+                "confidence_min_accept_rate": 0.75,
+                "enabled": false,
+                "probe_steps": 2
+              },
+              "performance": {
+                "generated_tokens": 128,
+                "itl_ms_p50": 5.440485896542668,
+                "itl_ms_p95": 6.856087315827608,
+                "output_token_throughput": 160.9041813235838,
+                "request_throughput": 1.2570639165904984,
+                "seconds": 0.7955044980626553,
+                "tokens_per_second": 160.9041813235838,
+                "total_input_tokens": 128,
+                "total_output_tokens": 128,
+                "total_token_throughput": 321.8083626471676,
+                "ttft_ms_p50": 45.19116203300655,
+                "ttft_ms_p95": 45.19116203300655
+              },
+              "profile": {
+                "MemcpyD2D": {
+                  "count": 384,
+                  "total_ms": 4.475014999999984
+                },
+                "PjRtCApiLoadedExecutable::Execute": {
+                  "count": 283,
+                  "total_ms": 442.4491669999999
+                },
+                "array.py:325 tolist": {
+                  "count": null,
+                  "total_ms": null
+                },
+                "command_buffer::execute": {
+                  "count": 2517,
+                  "total_ms": 131.31436000000002
+                },
+                "command_buffer::update": {
+                  "count": 2394,
+                  "total_ms": 125.08029200000004
+                },
+                "forward_step_token_ids_jit": {
+                  "count": 128,
+                  "total_ms": 467.7032190000002
+                },
+                "gather": {
+                  "count": 1603,
+                  "total_ms": 15.52420500000008
+                },
+                "np.asarray(jax.Array)": {
+                  "count": 128,
+                  "total_ms": 6.465146999999998
+                },
+                "transpose": {
+                  "count": 30,
+                  "total_ms": 0.0736
+                }
+              },
+              "profile_scoped_ranges": {
+                "cpu": {
+                  "MemcpyD2D": {
+                    "count": 175,
+                    "total_ms": 3.5220230000000017
+                  },
+                  "PjRtCApiLoadedExecutable::Execute": {
+                    "count": 283,
+                    "total_ms": 442.4491669999999
+                  },
+                  "Thunks::Initialize": {
+                    "count": 283,
+                    "total_ms": 13.863835999999981
+                  },
+                  "_batch_hybrid_state": {
+                    "count": 256,
+                    "total_ms": 11.507028000000004
+                  },
+                  "_record_kv_snapshot": {
+                    "count": 128,
+                    "total_ms": 3.3929800000000023
+                  },
+                  "_run_main_and_sample": {
+                    "count": 128,
+                    "total_ms": 577.2944709999999
+                  },
+                  "_store_batch_hybrid_state": {
+                    "count": 128,
+                    "total_ms": 2.5364490000000006
+                  },
+                  "command_buffer::execute": {
+                    "count": 2517,
+                    "total_ms": 131.31436000000002
+                  },
+                  "command_buffer::update": {
+                    "count": 2394,
+                    "total_ms": 125.08029200000004
+                  },
+                  "forward_step_token_ids_jit": {
+                    "count": 128,
+                    "total_ms": 467.7032190000002
+                  },
+                  "fusion": {
+                    "count": 4646,
+                    "total_ms": 27.755775999999962
+                  },
+                  "gather": {
+                    "count": 18,
+                    "total_ms": 10.213213
+                  },
+                  "gemm_fusion": {
+                    "count": 34,
+                    "total_ms": 0.21755499999999997
+                  },
+                  "generate_with_trace": {
+                    "count": 2,
+                    "total_ms": 1583.264781
+                  },
+                  "input_reduce_fusion": {
+                    "count": 1116,
+                    "total_ms": 6.266970000000002
+                  },
+                  "jit_compiled:XLA GPU module": {
+                    "count": 128,
+                    "total_ms": 343.050639
+                  },
+                  "loop_dynamic_update_slice_fusion": {
+                    "count": 1146,
+                    "total_ms": 7.1410109999999865
+                  },
+                  "loop_multiply_fusion": {
+                    "count": 1116,
+                    "total_ms": 6.518397999999996
+                  },
+                  "np.asarray(jax.Array)": {
+                    "count": 128,
+                    "total_ms": 6.465146999999998
+                  },
+                  "while": {
+                    "count": 36,
+                    "total_ms": 17.639586000000005
+                  }
+                },
+                "gpu": {
+                  "MemcpyD2D": {
+                    "count": 209,
+                    "total_ms": 0.9529920000000001
+                  },
+                  "fusion": {
+                    "count": 60404,
+                    "total_ms": 613.7662999999983
+                  },
+                  "gather": {
+                    "count": 1585,
+                    "total_ms": 5.310991999999999
+                  },
+                  "gemm_fusion": {
+                    "count": 2102,
+                    "total_ms": 141.29771899999986
+                  },
+                  "input_reduce_fusion": {
+                    "count": 23934,
+                    "total_ms": 339.90048799999846
+                  },
+                  "loop_dynamic_update_slice_fusion": {
+                    "count": 6744,
+                    "total_ms": 29.580937000000432
+                  },
+                  "loop_multiply_fusion": {
+                    "count": 11512,
+                    "total_ms": 21.316524000000552
+                  },
+                  "transpose": {
+                    "count": 30,
+                    "total_ms": 0.0736
+                  },
+                  "wrapped_concatenate": {
+                    "count": 36,
+                    "total_ms": 0.15414200000000003
+                  }
+                }
+              },
+              "profile_scoped_top_events_by_total_ms": {
+                "cpu": [
+                  {
+                    "count": 256,
+                    "name": "PjitFunction(compiled)",
+                    "total_ms": 919.9679689999998
+                  },
+                  {
+                    "count": 1,
+                    "name": "$llm_engine.py:632 generate_with_trace",
+                    "total_ms": 791.654986
+                  },
+                  {
+                    "count": 1,
+                    "name": "$llm_engine.py:661 _generate_with_trace_deferred_tokens",
+                    "total_ms": 791.6097950000001
+                  },
+                  {
+                    "count": 128,
+                    "name": "$llm_engine.py:161 step",
+                    "total_ms": 787.1021839999999
+                  },
+                  {
+                    "count": 128,
+                    "name": "$model_runner.py:3737 run",
+                    "total_ms": 582.091773
+                  },
+                  {
+                    "count": 128,
+                    "name": "$model_runner.py:1899 _run_main_and_sample",
+                    "total_ms": 577.2944709999999
+                  },
+                  {
+                    "count": 128,
+                    "name": "$model_executor.py:501 forward_step_token_ids_jit",
+                    "total_ms": 467.7032190000002
+                  },
+                  {
+                    "count": 128,
+                    "name": "$model_executor.py:260 _profile_jit_call",
+                    "total_ms": 460.89907199999993
+                  },
+                  {
+                    "count": 283,
+                    "name": "PjRtCApiLoadedExecutable::Execute",
+                    "total_ms": 442.4491669999999
+                  },
+                  {
+                    "count": 283,
+                    "name": "PJRT_LoadedExecutable_Execute",
+                    "total_ms": 439.42935599999987
+                  },
+                  {
+                    "count": 283,
+                    "name": "CommonPjRtLoadedExecutable::ExecuteHelperOnSingleDevice",
+                    "total_ms": 437.0071100000002
+                  },
+                  {
+                    "count": 128,
+                    "name": "CommonPjRtLoadedExecutable::Execute (jit_compiled)",
+                    "total_ms": 422.81690699999984
+                  },
+                  {
+                    "count": 283,
+                    "name": "[0] PjRtStreamExecutorRawLoadedExecutable::Execute",
+                    "total_ms": 411.6702870000001
+                  },
+                  {
+                    "count": 283,
+                    "name": "[0] GpuExecutable::ExecuteThunks",
+                    "total_ms": 385.5548320000002
+                  },
+                  {
+                    "count": 128,
+                    "name": "jit_compiled:XLA GPU module",
+                    "total_ms": 343.050639
+                  },
+                  {
+                    "count": 1,
+                    "name": "$run_tracking.py:154 stop_jax_profile",
+                    "total_ms": 217.852079
+                  },
+                  {
+                    "count": 1,
+                    "name": "$profiler.py:278 stop_trace",
+                    "total_ms": 217.841488
+                  },
+                  {
+                    "count": 128,
+                    "name": "$scheduler.py:151 schedule",
+                    "total_ms": 161.518945
+                  },
+                  {
+                    "count": 128,
+                    "name": "$scheduler.py:303 build_scheduled_batch",
+                    "total_ms": 154.41531200000003
+                  },
+                  {
+                    "count": 128,
+                    "name": "$scheduler.py:16 _device_int32_arrays",
+                    "total_ms": 150.675115
+                  },
+                  {
+                    "count": 128,
+                    "name": "$api.py:2106 device_put",
+                    "total_ms": 147.00041199999995
+                  },
+                  {
+                    "count": 2517,
+                    "name": "command_buffer::execute",
+                    "total_ms": 131.31436000000002
+                  },
+                  {
+                    "count": 2394,
+                    "name": "command_buffer::update",
+                    "total_ms": 125.08029200000004
+                  },
+                  {
+                    "count": 128,
+                    "name": "$dispatch.py:599 _batched_device_put_impl",
+                    "total_ms": 123.70860100000003
+                  },
+                  {
+                    "count": 384,
+                    "name": "$profiler.py:424 wrapper",
+                    "total_ms": 121.86290600000008
+                  },
+                  {
+                    "count": 128,
+                    "name": "shard_args",
+                    "total_ms": 105.46425599999999
+                  },
+                  {
+                    "count": 128,
+                    "name": "$pxla.py:86 shard_args",
+                    "total_ms": 104.48112099999999
+                  },
+                  {
+                    "count": 128,
+                    "name": "$pxla.py:170 _shard_np_array",
+                    "total_ms": 94.66639799999997
+                  },
+                  {
+                    "count": 768,
+                    "name": "$pxla.py:214 batched_device_put",
+                    "total_ms": 72.23347000000004
+                  },
+                  {
+                    "count": 768,
+                    "name": "DevicePutWithSharding",
+                    "total_ms": 61.84913800000003
+                  },
+                  {
+                    "count": 128,
+                    "name": "$model_runner.py:1167 _maybe_apply_device_token_carry",
+                    "total_ms": 60.05147199999998
+                  },
+                  {
+                    "count": 257,
+                    "name": "$array.py:338 __getitem__",
+                    "total_ms": 56.515143000000066
+                  },
+                  {
+                    "count": 257,
+                    "name": "$indexing.py:1061 rewriting_take",
+                    "total_ms": 53.99007400000001
+                  },
+                  {
+                    "count": 778,
+                    "name": "PjRtStreamExecutorClient::LinearizeHostBufferInto",
+                    "total_ms": 43.28747300000004
+                  },
+                  {
+                    "count": 128,
+                    "name": "$llm_engine.py:201 <listcomp>",
+                    "total_ms": 37.715553
+                  },
+                  {
+                    "count": 3,
+                    "name": "$sequence.py:207 materialize_device_tokens_for_sequences",
+                    "total_ms": 37.392077
+                  },
+                  {
+                    "count": 2,
+                    "name": "$sequence.py:99 completion_token_ids",
+                    "total_ms": 37.390847
+                  },
+                  {
+                    "count": 2,
+                    "name": "$sequence.py:165 materialize_device_tokens",
+                    "total_ms": 37.386066
+                  },
+                  {
+                    "count": 3,
+                    "name": "$sequence.py:214 materialize_device_token_slots",
+                    "total_ms": 36.13369899999999
+                  },
+                  {
+                    "count": 266,
+                    "name": "PjitFunction(broadcast_in_dim)",
+                    "total_ms": 36.06261999999999
+                  }
+                ],
+                "gpu": [
+                  {
+                    "count": 127,
+                    "name": "gemm_fusion_dot_265",
+                    "total_ms": 127.449944
+                  },
+                  {
+                    "count": 3048,
+                    "name": "input_reduce_fusion_92",
+                    "total_ms": 103.44457800000039
+                  },
+                  {
+                    "count": 3048,
+                    "name": "input_reduce_fusion_116",
+                    "total_ms": 64.06853000000031
+                  },
+                  {
+                    "count": 2286,
+                    "name": "input_reduce_fusion_62",
+                    "total_ms": 62.780675000000464
+                  },
+                  {
+                    "count": 2286,
+                    "name": "fusion_922",
+                    "total_ms": 37.29679500000023
+                  },
+                  {
+                    "count": 2286,
+                    "name": "input_reduce_fusion_140",
+                    "total_ms": 37.023229999999955
+                  },
+                  {
+                    "count": 2286,
+                    "name": "input_reduce_fusion_164",
+                    "total_ms": 18.990532999999882
+                  },
+                  {
+                    "count": 762,
+                    "name": "input_reduce_fusion_68",
+                    "total_ms": 17.904668000000004
+                  },
+                  {
+                    "count": 762,
+                    "name": "input_reduce_fusion_137",
+                    "total_ms": 14.024815000000007
+                  },
+                  {
+                    "count": 2286,
+                    "name": "_gdn_packed_decode_kernel",
+                    "total_ms": 11.806357999999983
+                  },
+                  {
+                    "count": 254,
+                    "name": "memcpy128",
+                    "total_ms": 10.376398
+                  },
+                  {
+                    "count": 1524,
+                    "name": "input_reduce_fusion_172",
+                    "total_ms": 7.0818190000001175
+                  },
+                  {
+                    "count": 762,
+                    "name": "loop_multiply_fusion_79",
+                    "total_ms": 5.51506600000002
+                  },
+                  {
+                    "count": 3048,
+                    "name": "loop_multiply_fusion_76",
+                    "total_ms": 4.346467000000063
+                  },
+                  {
+                    "count": 762,
+                    "name": "gemm_fusion_dot_239",
+                    "total_ms": 3.455950000000007
+                  },
+                  {
+                    "count": 254,
+                    "name": "loop_pad_fusion_6",
+                    "total_ms": 3.2776349999999983
+                  },
+                  {
+                    "count": 254,
+                    "name": "loop_pad_fusion",
+                    "total_ms": 3.255212000000001
+                  },
+                  {
+                    "count": 254,
+                    "name": "loop_pad_fusion_8",
+                    "total_ms": 3.235191999999998
+                  },
+                  {
+                    "count": 254,
+                    "name": "loop_pad_fusion_10",
+                    "total_ms": 3.229045999999997
+                  },
+                  {
+                    "count": 254,
+                    "name": "loop_pad_fusion_4",
+                    "total_ms": 3.2203599999999972
+                  },
+                  {
+                    "count": 254,
+                    "name": "loop_pad_fusion_2",
+                    "total_ms": 3.2066220000000003
+                  },
+                  {
+                    "count": 1270,
+                    "name": "input_add_reduce_fusion_9",
+                    "total_ms": 3.2026839999999575
+                  },
+                  {
+                    "count": 2286,
+                    "name": "wrapped_convert",
+                    "total_ms": 3.1284620000000523
+                  },
+                  {
+                    "count": 1397,
+                    "name": "input_reduce_fusion_38",
+                    "total_ms": 3.0126199999999614
+                  },
+                  {
+                    "count": 2286,
+                    "name": "loop_convert_fusion",
+                    "total_ms": 2.8422299999999407
+                  },
+                  {
+                    "count": 1397,
+                    "name": "input_reduce_fusion_39",
+                    "total_ms": 2.72592900000002
+                  },
+                  {
+                    "count": 762,
+                    "name": "gemm_fusion_dot_238",
+                    "total_ms": 2.417402000000004
+                  },
+                  {
+                    "count": 1397,
+                    "name": "input_reduce_fusion_40",
+                    "total_ms": 2.377246999999982
+                  },
+                  {
+                    "count": 1397,
+                    "name": "loop_multiply_fusion_68",
+                    "total_ms": 2.079704000000005
+                  },
+                  {
+                    "count": 1397,
+                    "name": "loop_multiply_fusion_69",
+                    "total_ms": 2.0274710000000122
+                  },
+                  {
+                    "count": 1397,
+                    "name": "loop_multiply_fusion_71",
+                    "total_ms": 2.01956900000002
+                  },
+                  {
+                    "count": 1397,
+                    "name": "loop_multiply_fusion_72",
+                    "total_ms": 1.944096000000028
+                  },
+                  {
+                    "count": 24,
+                    "name": "gemm_fusion_dot_338",
+                    "total_ms": 1.7873289999999997
+                  },
+                  {
+                    "count": 834,
+                    "name": "input_concatenate_fusion",
+                    "total_ms": 1.7162929999999788
+                  },
+                  {
+                    "count": 18,
+                    "name": "gemm_fusion_dot_337",
+                    "total_ms": 1.70573
+                  },
+                  {
+                    "count": 199,
+                    "name": "loop_dynamic_update_slice_fusion_18",
+                    "total_ms": 1.6971880000000001
+                  },
+                  {
+                    "count": 128,
+                    "name": "loop_dynamic_update_slice_fusion_42",
+                    "total_ms": 1.5920329999999998
+                  },
+                  {
+                    "count": 127,
+                    "name": "loop_dynamic_update_slice_fusion_34",
+                    "total_ms": 1.5524500000000006
+                  },
+                  {
+                    "count": 127,
+                    "name": "loop_dynamic_update_slice_fusion_2",
+                    "total_ms": 1.5438140000000002
+                  },
+                  {
+                    "count": 127,
+                    "name": "loop_dynamic_update_slice_fusion_10",
+                    "total_ms": 1.5428500000000007
+                  }
+                ]
+              },
+              "profile_trace_json_gz": "/mountpoint/.exp/profiles/20260530-123708-62313-gpu_matrix_decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_r2_20260530_123400/plugins/profile/2026_05_30_12_37_34/INDCS0291.atrapa.deloitte.com.trace.json.gz",
+              "prompt": {
+                "dataset_name": "tokenized_seed_repeat",
+                "input_lens": [
+                  128
+                ],
+                "num_prompts": 1,
+                "output_len": 128,
+                "output_lengths": [
+                  128
+                ],
+                "prompt_manifest_jsonl": null,
+                "prompt_manifest_sha256": null,
+                "prompt_source": "tokenized_seed_repeat",
+                "prompt_suite": "mixed",
+                "random_input_len": 1280,
+                "random_output_len": 16,
+                "random_range_ratio": {
+                  "input": 0.0,
+                  "output": 0.0
+                },
+                "seed": 0
+              },
+              "run": {
+                "issues": [],
+                "profile_enabled": true,
+                "profile_error": null,
+                "profile_path": "/mountpoint/.exp/profiles/20260530-123708-62313-gpu_matrix_decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_r2_20260530_123400",
+                "profile_started": false,
+                "run_id": "20260530-123708-62313-gpu_matrix_decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_r2_20260530_123400",
+                "run_label": "gpu_matrix_decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_r2_20260530_123400",
+                "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+              },
+              "scheduler_diagnostics": {
+                "available": true,
+                "decode_step_count": 127,
+                "decode_step_seconds_total": 0.7445433526299894,
+                "max_decode_step_sequences": 1,
+                "max_prefill_step_sequences": 1,
+                "max_step_sequences": 1,
+                "max_step_tokens": 128,
+                "prefill_step_count": 1,
+                "prefill_step_seconds_total": 0.04518691194243729,
+                "step_count": 128,
+                "total_step_seconds": 0.7897302645724267
+              },
+              "speculative": {
+                "acceptance_rate": 0.0,
+                "bonus_tokens": 0,
+                "debug_events": [],
+                "draft_position_accepted": [],
+                "draft_position_proposed": [],
+                "drafts_accepted": 0,
+                "drafts_proposed": 0,
+                "drafts_rejected": 0,
+                "enabled": false,
+                "fallback_gated_no_spec_steps": 0,
+                "fallback_partial_rows": 0,
+                "fallback_seeded_main_steps": 0,
+                "fallback_steps": 0
+              }
+            },
+            "reference_json": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/references/jax_default_decode_heavy_128x128.json",
+            "reference_source": "live_jax_default",
+            "repeat": 2,
+            "run": {
+              "command": [
+                "/root/miniconda3/bin/python3",
+                "/mountpoint/.exp/nano-vllm-jax/benchmarks/benchmark_jax_server_trace.py",
+                "--model",
+                "Qwen/Qwen3.5-0.8B",
+                "--backend",
+                "gpu",
+                "--dtype",
+                "float32",
+                "--weight-dtype",
+                "bfloat16",
+                "--jax-execution",
+                "jit",
+                "--input-lens",
+                "128",
+                "--output-len",
+                "128",
+                "--prompt-suite",
+                "mixed",
+                "--num-speculative-tokens",
+                "0",
+                "--max-kv-cache-mb",
+                "1024",
+                "--num-kvcache-blocks",
+                "128",
+                "--max-num-seqs",
+                "1",
+                "--max-num-batched-tokens",
+                "512",
+                "--prefill-buckets",
+                "128",
+                "--batch-size-buckets",
+                "1",
+                "--max-blocks-per-seq",
+                "24",
+                "--top-k",
+                "5",
+                "--warmup",
+                "--profile",
+                "--prompt-source",
+                "tokenized_seed_repeat",
+                "--seed",
+                "0",
+                "--output-json",
+                "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_repeat2.json",
+                "--run-label",
+                "gpu_matrix_decode_heavy_128x128_gpu_paged_gdn_fla_decode_off_prefill_r2_20260530_123400",
+                "--reference-json",
+                "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/references/jax_default_decode_heavy_128x128.json"
+              ],
+              "elapsed_seconds": 35.036446740152314,
+              "output_tail": "Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\nLoading pretrained weights from Qwen/Qwen3.5-0.8B...\nLoading weights for Qwen/Qwen3.5-0.8B...\nResolving Qwen/Qwen3.5-0.8B from Hugging Face cache...\n\nFetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]\nFetching 9 files: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 9/9 [00:00<00:00, 119081.19it/s]\nW0530 12:37:32.286942   62313 cupti_tracer.cc:1453] Fail to use per-thread activity buffer, cupti trace overhead may be big. CUPTI ERROR CODE:1\nUsing snapshot: /mountpoint/.exp/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17\nConverting weights...\nMaterializing tied LM head as a separate [hidden, vocab] weight...\n\u2713 Loaded weights: 24 layers\n\u2713 Using pretrained weights\n",
+              "returncode": 0,
+              "status": "ok"
+            }
+          }
+        ],
+        "workload": {
+          "acceptance_scope": "speed_claim",
+          "dataset_name": null,
+          "num_prompts": null,
+          "prompt_source": "tokenized_seed_repeat",
+          "random_input_len": null,
+          "random_output_len": null,
+          "random_range_ratio": null,
+          "seed": 0
+        }
+      }
+    }
+  },
+  "output_json": "results/gpu_matrix_decode_tune_env_w8_b8.json",
+  "repeats": 2,
+  "report_md": "results/gpu_matrix_decode_tune_env_w8_b8.md",
+  "required_metrics": [
+    "total tok/s",
+    "request throughput",
+    "output-token throughput",
+    "total-token throughput",
+    "TTFT p50/p95",
+    "ITL p50/p95",
+    "exact generated-token match vs baseline",
+    "PjRt Execute total/count",
+    "command_buffer::execute total/count",
+    "command_buffer::update total/count",
+    "forward_step_token_ids_jit total/count",
+    "first forward_step_token_ids_jit",
+    "gather total",
+    "transpose total",
+    "MemcpyD2D total",
+    "tolist / np.asarray sync attribution"
+  ],
+  "run_dir": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400",
+  "schema_version": 1,
+  "vllm_references": {
+    "decode_heavy_128x128": {
+      "metrics": {
+        "artifact": "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/references/vllm_decode_heavy_128x128.json",
+        "correctness": {
+          "checked": false,
+          "exact_generated_token_match": false,
+          "full_length_ok": null,
+          "ok": true,
+          "rows": null
+        },
+        "exists": true,
+        "first_forward_step_token_ids_jit_ms": null,
+        "mtp_admission": null,
+        "performance": {
+          "generated_tokens": 128,
+          "itl_ms_p50": 4.34316205792129,
+          "itl_ms_p95": 4.531800094991922,
+          "output_token_throughput": 218.26409090257562,
+          "request_throughput": 1.705188210176372,
+          "seconds": 0.5864455278497189,
+          "tokens_per_second": 218.26409090257562,
+          "total_input_tokens": 128,
+          "total_output_tokens": 128,
+          "total_token_throughput": 436.52818180515123,
+          "ttft_ms_p50": 35.01773485913873,
+          "ttft_ms_p95": 35.01773485913873
+        },
+        "profile": {
+          "MemcpyD2D": {
+            "count": null,
+            "total_ms": null
+          },
+          "PjRtCApiLoadedExecutable::Execute": {
+            "count": null,
+            "total_ms": null
+          },
+          "array.py:325 tolist": {
+            "count": null,
+            "total_ms": null
+          },
+          "command_buffer::execute": {
+            "count": null,
+            "total_ms": null
+          },
+          "command_buffer::update": {
+            "count": null,
+            "total_ms": null
+          },
+          "forward_step_token_ids_jit": {
+            "count": null,
+            "total_ms": null
+          },
+          "gather": {
+            "count": null,
+            "total_ms": null
+          },
+          "np.asarray(jax.Array)": {
+            "count": null,
+            "total_ms": null
+          },
+          "transpose": {
+            "count": null,
+            "total_ms": null
+          }
+        },
+        "profile_scoped_ranges": {},
+        "profile_scoped_top_events_by_total_ms": {},
+        "profile_trace_json_gz": null,
+        "prompt": {
+          "dataset_name": "tokenized_seed_repeat",
+          "input_lens": [
+            128
+          ],
+          "num_prompts": 1,
+          "output_len": 128,
+          "output_lengths": [
+            128
+          ],
+          "prompt_manifest_jsonl": null,
+          "prompt_manifest_sha256": null,
+          "prompt_source": "tokenized_seed_repeat",
+          "prompt_suite": "mixed",
+          "random_input_len": 1280,
+          "random_output_len": 16,
+          "random_range_ratio": {
+            "input": 0.0,
+            "output": 0.0
+          },
+          "seed": 0
+        },
+        "run": {
+          "issues": [],
+          "profile_enabled": false,
+          "profile_error": null,
+          "profile_path": "/mountpoint/.exp/profiles/20260530-123441-61025-gpu_matrix_vllm_decode_heavy_128x128_20260530_123400",
+          "profile_started": false,
+          "run_id": "20260530-123441-61025-gpu_matrix_vllm_decode_heavy_128x128_20260530_123400",
+          "run_label": "gpu_matrix_vllm_decode_heavy_128x128_20260530_123400",
+          "run_log_path": "/mountpoint/.exp/run_logs/run_journal.jsonl"
+        },
+        "scheduler_diagnostics": {
+          "available": false,
+          "decode_step_count": 0,
+          "prefill_step_count": 0,
+          "step_count": 0
+        },
+        "speculative": null
+      },
+      "python": "/mountpoint/.exp/vllm-venv/bin/python",
+      "run": {
+        "command": [
+          "/mountpoint/.exp/vllm-venv/bin/python",
+          "/mountpoint/.exp/nano-vllm-jax/benchmarks/benchmark_vllm_qwen35.py",
+          "--model",
+          "Qwen/Qwen3.5-0.8B",
+          "--dtype",
+          "bfloat16",
+          "--tensor-parallel-size",
+          "1",
+          "--execution",
+          "async",
+          "--mode",
+          "baseline",
+          "--input-lens",
+          "128",
+          "--output-len",
+          "128",
+          "--prompt-suite",
+          "mixed",
+          "--prompt-source",
+          "tokenized_seed_repeat",
+          "--top-k",
+          "5",
+          "--output-json",
+          "/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260530_123400/references/vllm_decode_heavy_128x128.json",
+          "--run-label",
+          "gpu_matrix_vllm_decode_heavy_128x128_20260530_123400",
+          "--trust-remote-code",
+          "--seed",
+          "0",
+          "--max-model-len",
+          "512",
+          "--gpu-memory-utilization",
+          "0.55"
+        ],
+        "elapsed_seconds": 96.32692242297344,
+        "output_tail": "ervabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=Qwen/Qwen3.5-0.8B, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['none'], 'ir_enable_torch_wrap': True, 'splitting_ops': ['vllm::unified_attention_with_output', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::gdn_attention_core', 'vllm::gdn_attention_core_xpu', 'vllm::olmo_hybrid_gdn_full_forward', 'vllm::kda_attention', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::deepseek_v4_attention', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update'], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [2048], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'fuse_act_padding': False}, 'max_cudagraph_capture_size': 256, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native']), enable_flashinfer_autotune=False, moe_backend='auto')\n(EngineCore pid=61431) [transformers] `Qwen2VLImageProcessorFast` is deprecated. The `Fast` suffix for image processors has been removed; use `Qwen2VLImageProcessor` instead.\n(EngineCore pid=61431) Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\n(EngineCore pid=61431) INFO 05-30 12:35:40 [parallel_state.py:1410] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://10.89.130.219:56875 backend=nccl\n(EngineCore pid=61431) INFO 05-30 12:35:40 [parallel_state.py:1723] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A\n(EngineCore pid=61431) INFO 05-30 12:35:41 [topk_topp_sampler.py:45] Using FlashInfer for top-p & top-k sampling.\n(EngineCore pid=61431) [transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend=\"torchvision\"` instead of `use_fast=True`, or `backend=\"pil\"` instead of `use_fast=False`.\n(EngineCore pid=61431) INFO 05-30 12:35:59 [gpu_model_runner.py:4857] Starting to load model Qwen/Qwen3.5-0.8B...\n(EngineCore pid=61431) INFO 05-30 12:36:00 [cuda.py:427] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention\n(EngineCore pid=61431) INFO 05-30 12:36:00 [mm_encoder_attention.py:372] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.\n(EngineCore pid=61431) INFO 05-30 12:36:00 [gdn_linear_attn.py:169] Using Triton/FLA GDN prefill kernel\n(EngineCore pid=61431) INFO 05-30 12:36:00 [cuda.py:372] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].\n(EngineCore pid=61431) INFO 05-30 12:36:00 [flash_attn.py:641] Using FlashAttention version 2\n(EngineCore pid=61431) INFO 05-30 12:36:01 [weight_utils.py:938] Filesystem type for checkpoints: EXT4. Checkpoint size: 1.63 GiB. Available RAM: 8.19 GiB.\n(EngineCore pid=61431) INFO 05-30 12:36:01 [weight_utils.py:961] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.\n(EngineCore pid=61431) \nLoading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]\n(EngineCore pid=61431) \nLoading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.73it/s]\n(EngineCore pid=61431) \nLoading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.73it/s]\n(EngineCore pid=61431) \n(EngineCore pid=61431) INFO 05-30 12:36:02 [default_loader.py:397] Loading weights took 0.31 seconds\n(EngineCore pid=61431) INFO 05-30 12:36:02 [gpu_model_runner.py:4959] Model loading took 1.72 GiB memory and 2.021826 seconds\n(EngineCore pid=61431) INFO 05-30 12:36:02 [interface.py:645] Setting attention block size to 544 tokens to ensure that attention page size is >= mamba page size.\n(EngineCore pid=61431) INFO 05-30 12:36:02 [interface.py:669] Padding mamba page size by 2.64% to ensure that mamba page size and attention page size are exactly equal.\n(EngineCore pid=61431) INFO 05-30 12:36:03 [gpu_model_runner.py:5920] Encoder cache will be initialized with a budget of 16384 tokens, and profiled with 1 image items of the maximum feature size.\n(EngineCore pid=61431) INFO 05-30 12:36:05 [backends.py:1089] Using cache directory: /mountpoint/.exp/.cache/vllm/torch_compile_cache/4329f007f5/rank_0_0/backbone for vLLM's torch.compile\n(EngineCore pid=61431) INFO 05-30 12:36:05 [backends.py:1148] Dynamo bytecode transform time: 1.34 s\n(EngineCore pid=61431) INFO 05-30 12:36:08 [backends.py:292] Directly load the compiled graph(s) for compile range (1, 2048) from the cache, took 1.947 s\n(EngineCore pid=61431) INFO 05-30 12:36:08 [decorators.py:311] Directly load AOT compilation from path /mountpoint/.exp/.cache/vllm/torch_compile_cache/torch_aot_compile/74aba85b3dd51fb1e20f6711afe58807159cc4cb5822cbf0aeafbc0cc0ea4240/rank_0_0/model\n(EngineCore pid=61431) INFO 05-30 12:36:08 [monitor.py:53] torch.compile took 3.49 s in total\n(EngineCore pid=61431) INFO 05-30 12:36:08 [monitor.py:81] Initial profiling/warmup run took 0.17 s\n(EngineCore pid=61431) INFO 05-30 12:36:08 [gpu_model_runner.py:6063] Profiling CUDA graph memory: PIECEWISE=35 (largest=256), FULL=19 (largest=128)\n(EngineCore pid=61431) INFO 05-30 12:36:09 [gpu_model_runner.py:6142] Estimated CUDA graph memory: 0.19 GiB total\n(EngineCore pid=61431) INFO 05-30 12:36:09 [gpu_worker.py:462] Available KV cache memory: 8.8 GiB\n(EngineCore pid=61431) INFO 05-30 12:36:09 [gpu_worker.py:477] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.5500 is equivalent to --gpu-memory-utilization=0.5414 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.5586. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.\n(EngineCore pid=61431) INFO 05-30 12:36:09 [kv_cache_utils.py:1710] GPU KV cache size: 180,736 tokens\n(EngineCore pid=61431) INFO 05-30 12:36:09 [kv_cache_utils.py:1711] Maximum concurrency for 512 tokens per request: 353.00x\n(EngineCore pid=61431) INFO 05-30 12:36:09 [kernel_warmup.py:44] Skipping FlashInfer autotune because it is disabled.\n(EngineCore pid=61431) \nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):   0%|          | 0/35 [00:00<?, ?it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  11%|\u2588\u258f        | 4/35 [00:00<00:00, 33.74it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  23%|\u2588\u2588\u258e       | 8/35 [00:00<00:00, 31.35it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  34%|\u2588\u2588\u2588\u258d      | 12/35 [00:00<00:00, 28.42it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  43%|\u2588\u2588\u2588\u2588\u258e     | 15/35 [00:00<00:00, 25.04it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  51%|\u2588\u2588\u2588\u2588\u2588\u258f    | 18/35 [00:00<00:00, 25.23it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  63%|\u2588\u2588\u2588\u2588\u2588\u2588\u258e   | 22/35 [00:00<00:00, 27.59it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  74%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258d  | 26/35 [00:00<00:00, 29.29it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  83%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258e | 29/35 [00:01<00:00, 28.82it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE):  94%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258d| 33/35 [00:01<00:00, 30.09it/s]\nCapturing CUDA graphs (mixed prefill-decode, PIECEWISE): 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 35/35 [00:01<00:00, 28.34it/s]\n(EngineCore pid=61431) \nCapturing CUDA graphs (decode, FULL):   0%|          | 0/19 [00:00<?, ?it/s]\nCapturing CUDA graphs (decode, FULL):  16%|\u2588\u258c        | 3/19 [00:00<00:00, 26.36it/s]\nCapturing CUDA graphs (decode, FULL):  32%|\u2588\u2588\u2588\u258f      | 6/19 [00:00<00:00, 27.54it/s]\nCapturing CUDA graphs (decode, FULL):  47%|\u2588\u2588\u2588\u2588\u258b     | 9/19 [00:00<00:00, 27.56it/s]\nCapturing CUDA graphs (decode, FULL):  63%|\u2588\u2588\u2588\u2588\u2588\u2588\u258e   | 12/19 [00:00<00:00, 28.15it/s]\nCapturing CUDA graphs (decode, FULL):  79%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2589  | 15/19 [00:00<00:00, 28.21it/s]\nCapturing CUDA graphs (decode, FULL):  95%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258d| 18/19 [00:00<00:00, 28.61it/s]\nCapturing CUDA graphs (decode, FULL): 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 19/19 [00:00<00:00, 28.10it/s]\n(EngineCore pid=61431) INFO 05-30 12:36:12 [gpu_model_runner.py:6243] Graph capturing finished in 2 secs, took 0.27 GiB\n(EngineCore pid=61431) INFO 05-30 12:36:12 [gpu_worker.py:621] CUDA graph pool memory: 0.27 GiB (actual), 0.19 GiB (estimated), difference: 0.08 GiB (30.7%).\n(EngineCore pid=61431) INFO 05-30 12:36:12 [jit_monitor.py:54] Kernel JIT monitor activated \u2014 Triton JIT compilations during inference will be logged as warnings.\n(EngineCore pid=61431) INFO 05-30 12:36:12 [core.py:299] init engine (profile, create kv cache, warmup model) took 9.58 s (compilation: 3.49 s)\n(EngineCore pid=61431) INFO 05-30 12:36:12 [vllm.py:886] Asynchronous scheduling is enabled.\n(EngineCore pid=61431) INFO 05-30 12:36:12 [kernel.py:212] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])\nWARNING 05-30 12:36:12 [input_processor.py:274] Passing raw prompts to InputProcessor is deprecated and will be removed in v0.18. You should instead pass the outputs of Renderer.render_cmpl() or Renderer.render_chat().\n(EngineCore pid=61431) WARNING 05-30 12:36:12 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _zero_kv_blocks_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.\n(EngineCore pid=61431) WARNING 05-30 12:36:12 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _compute_slot_mapping_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.\n(EngineCore pid=61431) WARNING 05-30 12:36:12 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _causal_conv1d_fwd_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.\n(EngineCore pid=61431) INFO 05-30 12:36:13 [core.py:1242] Shutdown initiated (timeout=0)\n(EngineCore pid=61431) INFO 05-30 12:36:13 [core.py:1265] Shutdown complete\n[rank0]:[W530 12:36:14.801960491 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())\n",
+        "returncode": 0,
+        "status": "ok"
+      },
+      "source": "live"
+    }
+  },
+  "workloads": [
+    "decode_heavy_128x128"
+  ]
+}
