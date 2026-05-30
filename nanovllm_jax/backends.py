@@ -42,6 +42,9 @@ _CUDA_FP32_KV_APPEND_ENV = "NANO_VLLM_JAX_CUDA_FP32_KV_APPEND"
 _CUDA_FP32_DECODE_ATTN_ENV = "NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"
 _CUDA_FP32_GDN_DECODE_ENV = "NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE"
 _GDN_PACKED_DECODE_IMPL_ENV = "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL"
+_GDN_PACKED_DECODE_PRENORMALIZE_QK_ENV = (
+    "NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK"
+)
 _GDN_PREFILL_POST_CONV_IMPL_ENV = "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL"
 _GDN_PREFILL_ACT_DTYPE_ENV = "NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE"
 _GDN_PREFILL_QKV_DTYPE_ENV = "NANO_VLLM_JAX_GDN_PREFILL_QKV_DTYPE"
@@ -185,6 +188,13 @@ def _gdn_packed_decode_qkv_activation_jnp_dtype() -> jnp.dtype:
     if _gdn_packed_decode_qkv_activation_dtype() == "bf16":
         return jnp.bfloat16
     return jnp.float32
+
+
+def _gdn_packed_decode_pre_normalize_qk() -> bool:
+    return (
+        os.environ.get(_GDN_PACKED_DECODE_PRENORMALIZE_QK_ENV, "0").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
 
 
 def _gdn_prefill_post_conv_output_dtype() -> str:
@@ -1450,13 +1460,28 @@ class PureJAXBackend:
             )
 
         if impl == "triton_fla":
-            if not use_qk_l2norm_in_kernel:
-                raise ValueError("Triton FLA packed GDN decode requires q/k l2norm")
+            pre_normalize_qk = _gdn_packed_decode_pre_normalize_qk()
+            if pre_normalize_qk and use_qk_l2norm_in_kernel:
+                # q/k are already normalized before entering the kernel. Leave the
+                # argument False so triton avoids redundant reductions.
+                use_qk_l2norm_in_kernel = False
+            elif not use_qk_l2norm_in_kernel:
+                raise ValueError(
+                    "Triton FLA packed GDN decode requires q/k l2norm; "
+                    "set NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK=1 to "
+                    "pre-normalize outside the kernel"
+                )
             from nanovllm_jax.kernels.gdn_fla import (
+                gdn_packed_decode_pre_normalize_qk,
                 prepare_gdn_packed_decode_reference_from_decay_inputs,
                 gdn_packed_decode_reference_from_decay,
             )
 
+            if pre_normalize_qk:
+                mixed_qkv = gdn_packed_decode_pre_normalize_qk(
+                    mixed_qkv,
+                    initial_state,
+                )
             mixed_qkv, a, b, decay, dt_bias, initial_state = (
                 prepare_gdn_packed_decode_reference_from_decay_inputs(
                     mixed_qkv=mixed_qkv,

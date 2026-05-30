@@ -20,6 +20,7 @@ else:
     from nanovllm_jax.backends import PureJAXBackend
     from nanovllm_jax.kernels.gdn_fla import (
         availability,
+        gdn_packed_decode_pre_normalize_qk,
         gdn_packed_decode_reference_from_decay,
         gdn_packed_decode_reference_local_state,
         gdn_recurrent_decode_step,
@@ -653,6 +654,70 @@ def test_packed_gdn_decode_cuda_bf16_path_rejects_gate_like_bf16_inputs(
             invalid_state,
             use_qk_l2norm_in_kernel=True,
         )
+
+
+def test_packed_gdn_decode_pre_normalize_qk_matches_reference():
+    batch = 2
+    num_q_heads = 2
+    num_value_heads = 4
+    key_dim = 4
+    value_dim = 5
+    packed_dim = 2 * num_q_heads * key_dim + num_value_heads * value_dim
+    mixed_qkv = jnp.linspace(
+        -0.5,
+        0.5,
+        batch * packed_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, packed_dim)
+    a = jnp.linspace(
+        -0.25,
+        0.35,
+        batch * num_value_heads,
+        dtype=jnp.float32,
+    ).reshape(batch, num_value_heads)
+    b = jnp.linspace(-0.5, 0.4, batch * num_value_heads, dtype=jnp.float32).reshape(
+        batch,
+        num_value_heads,
+    )
+    decay = jnp.linspace(0.75, 1.2, num_value_heads, dtype=jnp.float32)
+    dt_bias = jnp.linspace(-0.15, 0.2, num_value_heads, dtype=jnp.float32)
+    state = jnp.linspace(
+        -0.02,
+        0.025,
+        batch * num_value_heads * value_dim * key_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_value_heads, value_dim, key_dim)
+
+    pre_normalized = gdn_packed_decode_pre_normalize_qk(
+        mixed_qkv,
+        state,
+    ).astype(jnp.float32)
+    expected_out, expected_state = gdn_packed_decode_reference_from_decay(
+        pre_normalized,
+        a,
+        b,
+        decay,
+        dt_bias,
+        state,
+        use_qk_l2norm_in_kernel=False,
+    )
+    actual_out, actual_state = gdn_packed_decode_reference_from_decay(
+        mixed_qkv,
+        a,
+        b,
+        decay,
+        dt_bias,
+        state,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    assert pre_normalized.shape == mixed_qkv.shape
+    np.testing.assert_allclose(np.asarray(actual_out), np.asarray(expected_out), rtol=1e-5)
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
+        rtol=1e-5,
+    )
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")

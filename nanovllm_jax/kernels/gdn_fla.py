@@ -361,6 +361,57 @@ def split_packed_gdn_decode_mixed_qkv(
     return query, key, value
 
 
+def gdn_packed_decode_pre_normalize_qk(
+    mixed_qkv: jnp.ndarray,
+    state: jnp.ndarray,
+    *,
+    eps: float = 1e-6,
+) -> jnp.ndarray:
+    """Pre-normalize Q/K vectors in packed decode input.
+
+    Uses the recurrent state shape to infer the packed head dimensions and
+    applies `l2norm` to all Q/K vectors in a single pass before the packed
+    Triton decode kernel. This removes repeated Q/K reductions that otherwise
+    happen for every value-block program.
+    """
+    if mixed_qkv.ndim != 2:
+        raise ValueError("mixed_qkv must have shape [batch, packed_dim]")
+    if state.ndim != 4:
+        raise ValueError("state must have shape [batch, value_heads, value_dim, key_dim]")
+    if mixed_qkv.shape[0] != state.shape[0]:
+        raise ValueError("mixed_qkv batch must match state batch")
+
+    num_value_heads = int(state.shape[1])
+    value_dim = int(state.shape[2])
+    key_dim = int(state.shape[3])
+    packed_dim = int(mixed_qkv.shape[1])
+    qk_dim = packed_dim - num_value_heads * value_dim
+    if qk_dim <= 0 or qk_dim % (2 * key_dim) != 0:
+        raise ValueError("mixed_qkv has an invalid packed Q/K dimension")
+    num_q_heads = qk_dim // (2 * key_dim)
+
+    query, key, value = split_packed_gdn_decode_mixed_qkv(
+        mixed_qkv,
+        num_q_heads=num_q_heads,
+        num_value_heads=num_value_heads,
+        key_dim=key_dim,
+        value_dim=value_dim,
+    )
+
+    from nanovllm_jax.layers import l2norm
+
+    query = l2norm(query.astype(jnp.float32), axis=-1, eps=eps)
+    key = l2norm(key.astype(jnp.float32), axis=-1, eps=eps)
+    return jnp.concatenate(
+        [
+            query.reshape(mixed_qkv.shape[0], num_q_heads * key_dim),
+            key.reshape(mixed_qkv.shape[0], num_q_heads * key_dim),
+            value.reshape(mixed_qkv.shape[0], num_value_heads * value_dim),
+        ],
+        axis=-1,
+    )
+
+
 def gdn_packed_decode_reference_local_state(
     mixed_qkv: jnp.ndarray,
     a: jnp.ndarray,
