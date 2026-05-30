@@ -945,10 +945,8 @@ def gdn_fla_chunk_gated_delta_rule_packed_triton(
 @triton.jit
 def _gdn_packed_decode_kernel(
     mixed_qkv,
-    a,
-    b,
-    decay,
-    dt_bias,
+    gate,
+    beta,
     state,
     out,
     new_state,
@@ -960,7 +958,6 @@ def _gdn_packed_decode_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     SCALE: tl.constexpr,
-    SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     FULL_K: tl.constexpr,
     FULL_V: tl.constexpr,
@@ -977,23 +974,23 @@ def _gdn_packed_decode_kernel(
     mask_v = offs_v < V
     mask_state = mask_v[:, None] & mask_k[None, :]
 
-    p_state = state + ((i_n * HV + i_hv) * V * K) + offs_v[:, None] * K + offs_k[None, :]
-    if FULL_K and FULL_V:
-        h = tl.load(p_state).to(tl.float32)
-    elif FULL_K:
-        h = tl.load(p_state, mask=mask_v[:, None], other=0.0).to(tl.float32)
-    elif FULL_V:
-        h = tl.load(p_state, mask=mask_k[None, :], other=0.0).to(tl.float32)
-    else:
-        h = tl.load(p_state, mask=mask_state, other=0.0).to(tl.float32)
+    p_state = state + ((i_n * HV + i_hv) * V * K)
 
     p_mixed = mixed_qkv + i_n * qkv_dim
     if FULL_K:
         q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
         k = tl.load(p_mixed + H * K + i_h * K + offs_k).to(tl.float32)
     else:
-        q = tl.load(p_mixed + i_h * K + offs_k, mask=mask_k, other=0.0).to(tl.float32)
-        k = tl.load(p_mixed + H * K + i_h * K + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        q = tl.load(
+            p_mixed + i_h * K + offs_k,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        k = tl.load(
+            p_mixed + H * K + i_h * K + offs_k,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
     if FULL_V:
         v = tl.load(p_mixed + 2 * H * K + i_hv * V + offs_v).to(tl.float32)
     else:
@@ -1004,28 +1001,51 @@ def _gdn_packed_decode_kernel(
         ).to(tl.float32)
 
     if USE_QK_L2NORM_IN_KERNEL:
-        q = q / tl.sqrt(tl.sum(q * q, axis=0) + 1e-6)
-        k = k / tl.sqrt(tl.sum(k * k, axis=0) + 1e-6)
-    q = q * SCALE
+        q_scale = SCALE / (tl.sqrt(tl.sum(q * q, axis=0) + 1e-6))
+        k_scale = 1.0 / tl.sqrt(tl.sum(k * k, axis=0) + 1e-6)
+    else:
+        q_scale = SCALE
+        k_scale = 1.0
 
-    a_val = tl.load(a + i_n * HV + i_hv).to(tl.float32)
-    b_val = tl.load(b + i_n * HV + i_hv).to(tl.float32)
-    decay_val = tl.load(decay + i_hv).to(tl.float32)
-    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
-    x = a_val + dt_bias_val
-    softplus_x = tl.where(
-        x <= SOFTPLUS_THRESHOLD,
-        tl.log(1.0 + tl.exp(x)),
-        x,
-    )
-    gate = -decay_val * softplus_x
-    beta = tl.sigmoid(b_val)
+    gate_val = tl.load(gate + i_n * HV + i_hv).to(tl.float32)
+    beta_val = tl.load(beta + i_n * HV + i_hv).to(tl.float32)
 
-    h *= tl.exp(gate)
+    gate_scale = tl.exp(gate_val)
+
+    if FULL_K and FULL_V:
+        h = tl.load(
+            p_state + offs_v[:, None] * K + offs_k[None, :],
+            mask=mask_v[:, None] & mask_k[None, :],
+        ).to(tl.float32)
+    elif FULL_K:
+        h = tl.load(
+            p_state + offs_v[:, None] * K + offs_k[None, :],
+            mask=mask_v[:, None],
+            other=0.0,
+        ).to(tl.float32)
+    elif FULL_V:
+        h = tl.load(
+            p_state + offs_v[:, None] * K + offs_k[None, :],
+            mask=mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+    else:
+        h = tl.load(
+            p_state + offs_v[:, None] * K + offs_k[None, :],
+            mask=mask_v[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+    h = h * gate_scale
+    q = q * q_scale
+    k = k * k_scale
     kv_mem = tl.sum(h * k[None, :], axis=1)
-    delta = (v - kv_mem) * beta
-    h += delta[:, None] * k[None, :]
-    o = tl.sum(h * q[None, :], axis=1)
+    state_dot_q = tl.sum(h * q[None, :], axis=1)
+    qk_dot = tl.sum(q * k, axis=0)
+    delta = (v - kv_mem) * beta_val
+    o = state_dot_q + delta * qk_dot
+
+    h = h + delta[:, None] * k[None, :]
 
     p_out = out + ((i_n * HV + i_hv) * V) + offs_v
     if FULL_V:
@@ -1033,15 +1053,31 @@ def _gdn_packed_decode_kernel(
     else:
         tl.store(p_out, o, mask=mask_v)
 
-    p_new_state = new_state + ((i_n * HV + i_hv) * V * K) + offs_v[:, None] * K + offs_k[None, :]
+    p_new_state = new_state + ((i_n * HV + i_hv) * V * K)
     if FULL_K and FULL_V:
-        tl.store(p_new_state, h)
+        tl.store(
+            p_new_state + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=mask_v[:, None] & mask_k[None, :],
+        )
     elif FULL_K:
-        tl.store(p_new_state, h, mask=mask_v[:, None])
+        tl.store(
+            p_new_state + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=mask_v[:, None],
+        )
     elif FULL_V:
-        tl.store(p_new_state, h, mask=mask_k[None, :])
+        tl.store(
+            p_new_state + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=mask_k[None, :],
+        )
     else:
-        tl.store(p_new_state, h, mask=mask_state)
+        tl.store(
+            p_new_state + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=mask_v[:, None] & mask_k[None, :],
+        )
 
 
 @triton.jit
@@ -1749,10 +1785,8 @@ def gdn_post_conv_prep_bf16(
 
 def gdn_packed_decode_step_bf16(
     mixed_qkv: jax.Array,
-    a: jax.Array,
-    b: jax.Array,
-    decay: jax.Array,
-    dt_bias: jax.Array,
+    gate: jax.Array,
+    beta: jax.Array,
     state: jax.Array,
     *,
     use_qk_l2norm_in_kernel: bool,
@@ -1761,8 +1795,7 @@ def gdn_packed_decode_step_bf16(
 
     Inputs:
     - ``mixed_qkv``: ``[B, 2 * H * K + HV * V]`` BF16.
-    - ``a``/``b``: ``[B, HV]`` FP32.
-    - ``decay``/``dt_bias``: ``[HV]`` FP32, where ``decay = exp(A_log)``.
+    - ``gate``/``beta``: ``[B, HV]`` FP32, where ``gate = -decay * softplus(a + dt_bias)``.
     - ``state``: ``[B, HV, V, K]`` FP32.
 
     Returns ``output [B, HV, 1, V]`` and ``new_state [B, HV, V, K]`` in FP32.
@@ -1770,19 +1803,15 @@ def gdn_packed_decode_step_bf16(
 
     if mixed_qkv.ndim != 2:
         raise ValueError("mixed_qkv must have shape [batch, packed_dim]")
-    if a.ndim != 2 or b.ndim != 2:
-        raise ValueError("a and b must have shape [batch, value_heads]")
-    if decay.ndim != 1 or dt_bias.ndim != 1:
-        raise ValueError("decay and dt_bias must have shape [value_heads]")
+    if gate.ndim != 2 or beta.ndim != 2:
+        raise ValueError("gate and beta must have shape [batch, value_heads]")
     if state.ndim != 4:
         raise ValueError("state must have shape [batch, value_heads, value_dim, key_dim]")
     if mixed_qkv.dtype != jnp.bfloat16:
         raise ValueError("gdn_packed_decode_step_bf16 requires BF16 packed QKV")
     for name, array in (
-        ("a", a),
-        ("b", b),
-        ("decay", decay),
-        ("dt_bias", dt_bias),
+        ("gate", gate),
+        ("beta", beta),
         ("state", state),
     ):
         if array.dtype != jnp.float32:
@@ -1792,10 +1821,8 @@ def gdn_packed_decode_step_bf16(
     state_batch, value_heads, value_dim, key_dim = state.shape
     if state_batch != batch:
         raise ValueError("state batch must match mixed_qkv batch")
-    if a.shape != (batch, value_heads) or b.shape != (batch, value_heads):
-        raise ValueError("a and b must have shape [batch, value_heads]")
-    if decay.shape != (value_heads,) or dt_bias.shape != (value_heads,):
-        raise ValueError("decay and dt_bias must have shape [value_heads]")
+    if gate.shape != (batch, value_heads) or beta.shape != (batch, value_heads):
+        raise ValueError("gate and beta must have shape [batch, value_heads]")
     qk_dim = packed_dim - value_heads * value_dim
     if qk_dim <= 0 or qk_dim % (2 * key_dim) != 0:
         raise ValueError("mixed_qkv has an invalid packed Q/K dimension")
@@ -1812,10 +1839,8 @@ def gdn_packed_decode_step_bf16(
     )
     return jt.triton_call(
         mixed_qkv,
-        a,
-        b,
-        decay,
-        dt_bias,
+        gate,
+        beta,
         state,
         kernel=_gdn_packed_decode_kernel,
         out_shape=out_shape,
@@ -1830,7 +1855,6 @@ def gdn_packed_decode_step_bf16(
         FULL_K=key_dim == block_k,
         FULL_V=value_dim % block_v == 0,
         SCALE=1.0 / (key_dim**0.5),
-        SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=_normalize_bool(use_qk_l2norm_in_kernel),
         num_warps=num_warps,
         num_stages=_decode_triton_num_stages(),

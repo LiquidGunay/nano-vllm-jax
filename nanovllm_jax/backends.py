@@ -1493,6 +1493,9 @@ class PureJAXBackend:
                     qkv_dtype=jnp.bfloat16,
                 )
             )
+
+            gate = -decay * jax.nn.softplus(a + dt_bias)
+            beta = jax.nn.sigmoid(b)
             try:
                 from nanovllm_jax.kernels.gdn_fla_triton import (
                     gdn_packed_decode_step_bf16,
@@ -1511,10 +1514,8 @@ class PureJAXBackend:
 
             return gdn_packed_decode_step_bf16(
                 mixed_qkv,
-                a,
-                b,
-                decay,
-                dt_bias,
+                gate,
+                beta,
                 initial_state,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
