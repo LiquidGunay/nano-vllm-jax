@@ -16,6 +16,29 @@ Do not run JAX CPU-only paths for the current GPU validation workflow. CPU numbe
 
 Older TPU benchmark findings are retained below for history only. They are not current GPU serving evidence.
 
+## Upstream nano-vLLM baseline
+
+`GeeeekExplorer/nano-vllm` uses a single `bench.py` script for throughput:
+
+- fixed sample model path (`Qwen/Qwen3-0.6B` in upstream example)
+- 256 synthetic prompts
+- random prompt lengths in `[100, 1024]`
+- random max-output in `[100, 1024]`
+- one warm-up `llm.generate(...)`
+- one timed call and one metric: output tokens divided by elapsed seconds
+- no native TTFT/ITL breakdown, no repeated medians, no cross-run statistical checks
+
+Our matrix runner is intentionally more strict for serving evidence:
+
+- workload families for mixed prefill/decode mixes plus long-prefill and decode-heavy shapes
+- deterministic prompt manifests, seed/range config, and explicit env/model/version capture
+- repeated runs with median aggregation
+- warmup before timing
+- HF/JAX/vLLM correctness gates and latency profile metrics in one artifact
+- explicit acceptance checks (`exact_generated_token_match`, TTFT/ITL presence, profile counters, vLLM reference presence, and run repeats)
+
+Result: upstream `bench.py` is a coarse baseline; our `run_gpu_matrix` outputs are the canonical signal for speed claims and regression decisions.
+
 ## Required benchmark rules
 
 A result is reportable only if it states:
