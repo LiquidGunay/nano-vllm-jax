@@ -962,6 +962,8 @@ def _gdn_packed_decode_kernel(
     SCALE: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    FULL_K: tl.constexpr,
+    FULL_V: tl.constexpr,
 ):
     i_v = tl.program_id(0)
     i_nh = tl.program_id(1)
@@ -976,16 +978,30 @@ def _gdn_packed_decode_kernel(
     mask_state = mask_v[:, None] & mask_k[None, :]
 
     p_state = state + ((i_n * HV + i_hv) * V * K) + offs_v[:, None] * K + offs_k[None, :]
-    h = tl.load(p_state, mask=mask_state, other=0.0).to(tl.float32)
+    if FULL_K and FULL_V:
+        h = tl.load(p_state).to(tl.float32)
+    elif FULL_K:
+        h = tl.load(p_state, mask=mask_v[:, None], other=0.0).to(tl.float32)
+    elif FULL_V:
+        h = tl.load(p_state, mask=mask_k[None, :], other=0.0).to(tl.float32)
+    else:
+        h = tl.load(p_state, mask=mask_state, other=0.0).to(tl.float32)
 
     p_mixed = mixed_qkv + i_n * qkv_dim
-    q = tl.load(p_mixed + i_h * K + offs_k, mask=mask_k, other=0.0).to(tl.float32)
-    k = tl.load(p_mixed + H * K + i_h * K + offs_k, mask=mask_k, other=0.0).to(tl.float32)
-    v = tl.load(
-        p_mixed + 2 * H * K + i_hv * V + offs_v,
-        mask=mask_v,
-        other=0.0,
-    ).to(tl.float32)
+    if FULL_K:
+        q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
+        k = tl.load(p_mixed + H * K + i_h * K + offs_k).to(tl.float32)
+    else:
+        q = tl.load(p_mixed + i_h * K + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        k = tl.load(p_mixed + H * K + i_h * K + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+    if FULL_V:
+        v = tl.load(p_mixed + 2 * H * K + i_hv * V + offs_v).to(tl.float32)
+    else:
+        v = tl.load(
+            p_mixed + 2 * H * K + i_hv * V + offs_v,
+            mask=mask_v,
+            other=0.0,
+        ).to(tl.float32)
 
     if USE_QK_L2NORM_IN_KERNEL:
         q = q / tl.sqrt(tl.sum(q * q, axis=0) + 1e-6)
@@ -1012,10 +1028,20 @@ def _gdn_packed_decode_kernel(
     o = tl.sum(h * q[None, :], axis=1)
 
     p_out = out + ((i_n * HV + i_hv) * V) + offs_v
-    tl.store(p_out, o, mask=mask_v)
+    if FULL_V:
+        tl.store(p_out, o)
+    else:
+        tl.store(p_out, o, mask=mask_v)
 
     p_new_state = new_state + ((i_n * HV + i_hv) * V * K) + offs_v[:, None] * K + offs_k[None, :]
-    tl.store(p_new_state, h, mask=mask_state)
+    if FULL_K and FULL_V:
+        tl.store(p_new_state, h)
+    elif FULL_K:
+        tl.store(p_new_state, h, mask=mask_v[:, None])
+    elif FULL_V:
+        tl.store(p_new_state, h, mask=mask_k[None, :])
+    else:
+        tl.store(p_new_state, h, mask=mask_state)
 
 
 @triton.jit
@@ -1801,6 +1827,8 @@ def gdn_packed_decode_step_bf16(
         V=value_dim,
         BK=block_k,
         BV=block_v,
+        FULL_K=key_dim == block_k,
+        FULL_V=value_dim % block_v == 0,
         SCALE=1.0 / (key_dim**0.5),
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=_normalize_bool(use_qk_l2norm_in_kernel),
