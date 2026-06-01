@@ -1,19 +1,20 @@
-"""YAML-based server configuration with environment-variable overrides.
+"""YAML-based runtime configuration with environment-variable overrides.
 
 Loads ``server_config.yaml`` (or a path given by ``NANO_VLLM_JAX_SERVER_CONFIG``)
-at startup.  Every key can be overridden by an environment variable of the same
-name (upper-cased, ``NANO_VLLM_JAX_`` prefix).  Env vars always win, preserving
-backward compatibility.
+at startup.  Server/engine keys keep their existing env-var overrides, and
+runtime/kernel env vars already set in the shell win over values translated from
+the config file.
 
 The config is split into two sections:
 
 * ``server`` – Flask / network knobs (host, port, max_tokens_default).
 * ``engine`` – LLMEngine / scheduler knobs (model, dtype, buckets, KV cache …).
-* ``env``    – Runtime environment knobs that were previously only set via
-               ``os.environ`` (XLA flags, kernel backend, MTP policy, etc.).
-               These are applied to ``os.environ`` *before* JAX / XLA init so
-               that the existing ``os.getenv`` call-sites continue to work
-               unchanged.
+* ``runtime`` – Process/JAX startup knobs such as platform, allocator, cache,
+                and serving fast-path toggles.
+* ``kernels`` – Kernel policy in typed, readable form.  This is translated to
+                the legacy env vars before JAX/XLA init.
+* ``env``     – Compatibility escape hatch for low-level process variables and
+                old configs.  Prefer ``runtime``/``kernels`` for new configs.
 """
 
 from __future__ import annotations
@@ -82,53 +83,59 @@ _ENGINE_ENV_MAP: dict[str, tuple[str, type]] = {
     "skip_compile": ("NANO_VLLM_JAX_SKIP_COMPILE", bool),
 }
 
-# Env-section keys: these are applied to os.environ before JAX init.
-# The YAML key is the env-var name (without the NANO_VLLM_JAX_ prefix for
-# brevity, but the full env-var name is also accepted).
-_ENV_SECTION_KEYS: list[str] = [
+# Non-NANO env vars that are accepted verbatim in the legacy ``env`` section.
+_UNPREFIXED_ENV_KEYS: set[str] = {
     "TOKENIZERS_PARALLELISM",
     "XLA_PYTHON_CLIENT_PREALLOCATE",
     "TF_GPU_ALLOCATOR",
-    "NANO_VLLM_JAX_XLA_GPU_AUTOTUNE_LEVEL",
-    "NANO_VLLM_JAX_CACHE_ROOT",
-    "NANO_VLLM_JAX_COMPILE_CACHE_DIR",
     "JAX_COMPILATION_CACHE_DIR",
-    "NANO_VLLM_JAX_KERNEL_BACKEND",
-    "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
-    "NANO_VLLM_JAX_OVERLAPPED_STREAMING_TOKEN_PREFETCH",
-    "NANO_VLLM_JAX_OFFLINE_STREAMING_TOKEN_EVENTS",
-    "NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE",
-    "NANO_VLLM_JAX_FLASHINFER_KV_APPEND",
+    "JAX_PLATFORMS",
+    "HF_HUB_OFFLINE",
+    "XLA_FLAGS",
+}
+
+_DIRECT_ENV_PREFIXES = (
+    _ENV_PREFIX,
+    "JAX_",
+    "XLA_",
+    "TF_",
+    "HF_",
+    "TOKENIZERS_",
+    "CUDA_",
+    "NVIDIA_",
+    "XDG_",
+    "UV_",
+    "PIP_",
+)
+
+_LOCAL_CUDA_PROBE_ENV_KEYS = {
     "NANO_VLLM_JAX_CUDA_FP32_KV_APPEND",
     "NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN",
     "NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE",
-    "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
-    "NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK",
-    "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS",
-    "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
-    "NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE",
-    "NANO_VLLM_JAX_GDN_PREFILL_QKV_DTYPE",
-    "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE",
-    "NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE",
-    "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_WARPS",
-    "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_STAGES",
-    "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_BLOCK_V",
-    "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
-    "NANO_VLLM_JAX_MTP_COMMIT_SELECT",
-    "NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1",
-    "NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1",
-    "NANO_VLLM_JAX_MTP_ENABLE_REUSE_FALLBACK",
-    "NANO_VLLM_JAX_MTP_CHECK_NEXT_STEP_SANITY",
-    "NANO_VLLM_JAX_EXEC_LOG_STEPS",
-    "NANO_VLLM_JAX_FORCE_CUDA_FFI_REBUILD",
-    "NANO_VLLM_JAX_NVCC",
-    "NANO_VLLM_JAX_CUDA_ARCH",
-    "NANO_VLLM_JAX_PROFILE",
-    "NANO_VLLM_JAX_JAX_PLATFORMS",
-    "NANO_VLLM_JAX_PLATFORMS",
-    "HF_HUB_OFFLINE",
-    "XLA_FLAGS",
-]
+}
+
+_LOCAL_CUDA_GDN_PREFILL_IMPLS = {
+    "cuda_fla_chunk32_fp32",
+    "cuda_prep_fp32",
+    "cuda_prep_prefill_fp32",
+}
+
+
+def _config_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_bool(value: Any) -> str:
+    return "1" if _config_bool(value) else "0"
+
+
+def _put_env(env: dict[str, str], key: str, value: Any) -> None:
+    if value is not None:
+        env[key] = _env_bool(value) if isinstance(value, bool) else str(value)
 
 
 def _coerce(value: str, target_type: type) -> Any:
@@ -147,20 +154,177 @@ def _apply_env_overrides(section: dict, env_map: dict[str, tuple[str, type]]) ->
     return result
 
 
-def _apply_env_section(env_section: dict) -> None:
-    """Set os.environ from the ``env`` config section (env vars still win)."""
-    for key in _ENV_SECTION_KEYS:
-        # Accept both short key (e.g. "TOKENIZERS_PARALLELISM") and full
-        # env-var name in the YAML.
-        yaml_value = env_section.get(key)
-        if yaml_value is None:
-            # Try with NANO_VLLM_JAX_ prefix stripped for short-form keys
-            if key.startswith(_ENV_PREFIX):
-                short = key[len(_ENV_PREFIX):]
-                yaml_value = env_section.get(short)
+def _normalize_env_section_key(key: Any) -> str:
+    """Normalize legacy ``env`` keys.
+
+    Full env var names are kept verbatim. Short nano-vllm keys such as
+    ``DEVICE_TOKEN_CARRY`` are expanded to ``NANO_VLLM_JAX_DEVICE_TOKEN_CARRY``.
+    """
+
+    normalized = str(key).strip()
+    if normalized in _UNPREFIXED_ENV_KEYS or normalized.startswith(_DIRECT_ENV_PREFIXES):
+        return normalized
+    return f"{_ENV_PREFIX}{normalized}"
+
+
+def _env_section_to_env(env_section: dict) -> dict[str, str]:
+    """Return env vars from the legacy raw ``env`` config section."""
+    env: dict[str, str] = {}
+    for key, yaml_value in env_section.items():
         if yaml_value is not None:
-            # Env var takes precedence over config file
-            os.environ.setdefault(key, str(yaml_value))
+            env[_normalize_env_section_key(key)] = str(yaml_value)
+    return env
+
+
+def _runtime_section_to_env(runtime_section: dict) -> dict[str, str]:
+    env: dict[str, str] = {}
+    _put_env(env, "JAX_PLATFORMS", runtime_section.get("platform"))
+    _put_env(env, "NANO_VLLM_JAX_CACHE_ROOT", runtime_section.get("cache_root"))
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_COMPILE_CACHE_DIR",
+        runtime_section.get("compile_cache_dir"),
+    )
+    _put_env(
+        env,
+        "JAX_COMPILATION_CACHE_DIR",
+        runtime_section.get("jax_compilation_cache_dir"),
+    )
+    _put_env(
+        env,
+        "TOKENIZERS_PARALLELISM",
+        runtime_section.get("tokenizers_parallelism"),
+    )
+
+    xla = runtime_section.get("xla", {}) or {}
+    _put_env(env, "XLA_PYTHON_CLIENT_PREALLOCATE", xla.get("preallocate"))
+    _put_env(env, "TF_GPU_ALLOCATOR", xla.get("gpu_allocator"))
+    _put_env(env, "NANO_VLLM_JAX_XLA_GPU_AUTOTUNE_LEVEL", xla.get("autotune_level"))
+    _put_env(env, "XLA_FLAGS", xla.get("flags"))
+
+    fastpaths = runtime_section.get("fastpaths", {}) or {}
+    fastpath_map = {
+        "greedy_token": "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH",
+        "materialize_tied_lm_head": "NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD",
+        "compact_prefill_in_proj_qkv": "NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV",
+        "compact_prefill_gdn_z": "NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z",
+        "compact_prefill_full_attn_proj": "NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ",
+        "compact_prefill_mlp": "NANO_VLLM_JAX_COMPACT_PREFILL_MLP",
+        "device_token_carry": "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+    }
+    for key, env_key in fastpath_map.items():
+        _put_env(env, env_key, fastpaths.get(key))
+    return env
+
+
+def _kernels_section_to_env(kernels_section: dict) -> dict[str, str]:
+    env: dict[str, str] = {}
+    _put_env(env, "NANO_VLLM_JAX_KERNEL_BACKEND", kernels_section.get("backend"))
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_ALLOW_LOCAL_CUDA_PROBES",
+        kernels_section.get("allow_local_cuda_probes"),
+    )
+
+    full_attention = kernels_section.get("full_attention", {}) or {}
+    full_attention_map = {
+        "nhd_full_attention_kv_cache": "NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE",
+        "flashinfer_kv_append": "NANO_VLLM_JAX_FLASHINFER_KV_APPEND",
+        "cuda_fp32_kv_append": "NANO_VLLM_JAX_CUDA_FP32_KV_APPEND",
+        "cuda_fp32_decode_attention": "NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN",
+    }
+    for key, env_key in full_attention_map.items():
+        _put_env(env, env_key, full_attention.get(key))
+
+    gdn = kernels_section.get("gdn", {}) or {}
+    _put_env(env, "NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE", gdn.get("cuda_fp32_decode"))
+    _put_env(env, "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS", gdn.get("disable_fallbacks"))
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
+        gdn.get("prefill_post_conv_impl"),
+    )
+    _put_env(env, "NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE", gdn.get("prefill_act_dtype"))
+    _put_env(env, "NANO_VLLM_JAX_GDN_PREFILL_QKV_DTYPE", gdn.get("prefill_qkv_dtype"))
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE",
+        gdn.get("prefill_post_conv_output_dtype"),
+    )
+
+    packed_decode = gdn.get("packed_decode", {}) or {}
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
+        packed_decode.get("impl"),
+    )
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE",
+        packed_decode.get("qkv_dtype"),
+    )
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK",
+        packed_decode.get("pre_normalize_qk"),
+    )
+
+    triton_decode = packed_decode.get("triton", {}) or {}
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_WARPS",
+        triton_decode.get("num_warps"),
+    )
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_STAGES",
+        triton_decode.get("num_stages"),
+    )
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_BLOCK_V",
+        triton_decode.get("block_v"),
+    )
+    return env
+
+
+def _uses_local_cuda_probe(env: dict[str, str]) -> bool:
+    for key in _LOCAL_CUDA_PROBE_ENV_KEYS:
+        if _config_bool(env.get(key)):
+            return True
+    packed_decode = env.get("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", "").lower()
+    if packed_decode == "cuda_fp32":
+        return True
+    prefill_impl = env.get("NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL", "").lower()
+    return prefill_impl in _LOCAL_CUDA_GDN_PREFILL_IMPLS
+
+
+def _validate_local_cuda_probe_policy(env: dict[str, str]) -> None:
+    if not _uses_local_cuda_probe(env):
+        return
+    if _config_bool(env.get("NANO_VLLM_JAX_ALLOW_LOCAL_CUDA_PROBES")):
+        return
+    raise ValueError(
+        "Local CUDA/JAX FFI probes are disabled for runtime configs. "
+        "Use Pallas/CuteDSL or borrowed/adapted Triton kernels for serving paths. "
+        "Set kernels.allow_local_cuda_probes=true only for explicit diagnostic probes."
+    )
+
+
+def runtime_env_from_config(config: dict) -> dict[str, str]:
+    """Translate typed ``runtime``/``kernels`` plus legacy ``env`` to env vars."""
+    env: dict[str, str] = {}
+    env.update(_runtime_section_to_env(config.get("runtime", {}) or {}))
+    env.update(_kernels_section_to_env(config.get("kernels", {}) or {}))
+    env.update(_env_section_to_env(config.get("env", {}) or {}))
+    _validate_local_cuda_probe_policy(env)
+    return env
+
+
+def _apply_runtime_env(env: dict[str, str]) -> None:
+    """Set os.environ from resolved runtime config; existing env vars still win."""
+    for key, value in env.items():
+        os.environ.setdefault(key, value)
 
 
 # ---------------------------------------------------------------------------
@@ -168,23 +332,38 @@ def _apply_env_section(env_section: dict) -> None:
 # ---------------------------------------------------------------------------
 
 class ServerConfig:
-    """Resolved server + engine + env configuration.
+    """Resolved server, engine, and runtime/kernel configuration.
 
     Attributes:
         server:  dict of Flask / network settings.
         engine:  dict of LLMEngine / scheduler settings.
+        runtime: dict of typed process/JAX startup settings.
+        kernels: dict of typed kernel policy settings.
+        env:     dict of env vars derived from runtime/kernels/env sections.
         source:  Path to the loaded config file, or ``"<defaults>"``.
     """
 
-    def __init__(self, server: dict, engine: dict, source: str):
+    def __init__(
+        self,
+        server: dict,
+        engine: dict,
+        runtime: dict,
+        kernels: dict,
+        env: dict[str, str],
+        source: str,
+    ):
         self.server = server
         self.engine = engine
+        self.runtime = runtime
+        self.kernels = kernels
+        self.env = env
         self.source = source
 
     def __repr__(self) -> str:
         return (
             f"ServerConfig(source={self.source!r}, "
-            f"server={self.server}, engine={self.engine})"
+            f"server={self.server}, engine={self.engine}, "
+            f"runtime={self.runtime}, kernels={self.kernels})"
         )
 
 
@@ -235,9 +414,16 @@ def load_server_config(path: str | Path | None = None) -> ServerConfig:
     server = _apply_env_overrides({**server_defaults, **raw.get("server", {})}, _SERVER_ENV_MAP)
     engine = _apply_env_overrides({**engine_defaults, **raw.get("engine", {})}, _ENGINE_ENV_MAP)
 
-    # Apply env-section *before* returning so callers can run JAX init after.
-    env_section = raw.get("env", {})
-    if env_section:
-        _apply_env_section(env_section)
+    runtime = dict(raw.get("runtime", {}) or {})
+    kernels = dict(raw.get("kernels", {}) or {})
+    env = runtime_env_from_config(raw)
+    _apply_runtime_env(env)
 
-    return ServerConfig(server=server, engine=engine, source=source)
+    return ServerConfig(
+        server=server,
+        engine=engine,
+        runtime=runtime,
+        kernels=kernels,
+        env=env,
+        source=source,
+    )

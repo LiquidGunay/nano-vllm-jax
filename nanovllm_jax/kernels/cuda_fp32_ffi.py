@@ -1,4 +1,9 @@
-"""Local CUDA/JAX FFI prototypes for FP32 serving kernels."""
+"""Local CUDA/JAX FFI diagnostic probes.
+
+These historical probes are kept to reproduce earlier correctness/performance
+experiments. They are not the serving-kernel direction; backend routing requires
+``NANO_VLLM_JAX_ALLOW_LOCAL_CUDA_PROBES=1``.
+"""
 
 from __future__ import annotations
 

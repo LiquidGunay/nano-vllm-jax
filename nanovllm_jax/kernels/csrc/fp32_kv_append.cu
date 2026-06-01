@@ -1,3 +1,8 @@
+// Historical local CUDA/JAX FFI diagnostic probes.
+// Do not route or extend this file as the serving kernel path without an
+// explicit decision to reopen local CUDA work; prefer Python-facing Pallas,
+// CuteDSL, or borrowed/adapted Triton kernels for new lowered kernel work.
+
 #include <cmath>
 #include <cfloat>
 #include <cstdint>

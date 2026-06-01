@@ -32,6 +32,11 @@ from nanovllm_jax.model import gated_deltanet_block, init_transformer_block
 jax.config.update("jax_default_matmul_precision", "highest")
 
 
+@pytest.fixture(autouse=True)
+def _allow_local_cuda_probe_backend_routes(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_ALLOW_LOCAL_CUDA_PROBES", "1")
+
+
 def _has_cuda_backend() -> bool:
     try:
         return bool(jax.devices("gpu"))

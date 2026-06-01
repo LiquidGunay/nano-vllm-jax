@@ -1,4 +1,4 @@
-"""CUDA Gated DeltaNet kernel placeholders and segmented reference helpers."""
+"""Historical CUDA GDN placeholders and JAX reference packing helpers."""
 
 from __future__ import annotations
 

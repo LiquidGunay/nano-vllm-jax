@@ -38,6 +38,7 @@ from nanovllm_jax.kv_cache import (
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
 _NHD_FULL_ATTN_CACHE_ENV = "NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE"
 _FLASHINFER_KV_APPEND_ENV = "NANO_VLLM_JAX_FLASHINFER_KV_APPEND"
+_ALLOW_LOCAL_CUDA_PROBES_ENV = "NANO_VLLM_JAX_ALLOW_LOCAL_CUDA_PROBES"
 _CUDA_FP32_KV_APPEND_ENV = "NANO_VLLM_JAX_CUDA_FP32_KV_APPEND"
 _CUDA_FP32_DECODE_ATTN_ENV = "NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"
 _CUDA_FP32_GDN_DECODE_ENV = "NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE"
@@ -68,6 +69,23 @@ def _raise_if_gdn_fallback_disabled(reason: str) -> None:
         raise RuntimeError(
             f"{reason}; implicit GDN kernel fallbacks are disabled by "
             f"{_GDN_DISABLE_FALLBACKS_ENV}=1"
+        )
+
+
+def _allow_local_cuda_probes() -> bool:
+    return (
+        os.environ.get(_ALLOW_LOCAL_CUDA_PROBES_ENV, "0").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
+
+
+def _require_local_cuda_probe_opt_in(reason: str) -> None:
+    if not _allow_local_cuda_probes():
+        raise RuntimeError(
+            f"{reason} uses local CUDA/JAX FFI probe code. These probes are not "
+            "a serving kernel direction; use Pallas/CuteDSL or borrowed/adapted "
+            f"Triton kernels instead. Set {_ALLOW_LOCAL_CUDA_PROBES_ENV}=1 only "
+            "for explicit diagnostics."
         )
 
 
@@ -453,6 +471,7 @@ class PureJAXBackend:
         metadata: AttentionMetadata,
     ) -> KVCacheStorage:
         if os.environ.get(_CUDA_FP32_KV_APPEND_ENV, "0") in _TRUE_ENV_VALUES:
+            _require_local_cuda_probe_opt_in("CUDA FP32 KV append")
             if os.environ.get(_FLASHINFER_KV_APPEND_ENV, "0") in _TRUE_ENV_VALUES:
                 raise ValueError(
                     "Set only one KV append backend: CUDA FP32 or FlashInfer"
@@ -564,6 +583,7 @@ class PureJAXBackend:
             and cache.k_cache.ndim == 5
             and cache.v_cache.ndim == 5
         ):
+            _require_local_cuda_probe_opt_in("CUDA FP32 decode attention")
             from nanovllm_jax.kernels.cuda_fp32_ffi import (
                 paged_decode_attention_gqa_nhd_fp32,
             )
@@ -1198,6 +1218,7 @@ class PureJAXBackend:
             return output.transpose(0, 2, 1, 3), final_state
 
         if impl == "cuda_fla_chunk32_fp32":
+            _require_local_cuda_probe_opt_in("CUDA FP32 GDN chunk32 prefill")
             from nanovllm_jax.kernels.gdn_fla import (
                 gdn_fla_prefill_chunk32_fp32_reference,
                 prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
@@ -1264,6 +1285,7 @@ class PureJAXBackend:
             return output.transpose(0, 2, 1, 3), final_state
 
         if impl in {"cuda_prep_fp32", "cuda_prep_prefill_fp32"}:
+            _require_local_cuda_probe_opt_in("CUDA FP32 GDN prep/prefill")
             if not use_qk_l2norm_in_kernel:
                 raise ValueError("CUDA FP32 post-conv prep requires q/k l2norm")
             from nanovllm_jax.kernels.cuda_fp32_ffi import (
@@ -1369,6 +1391,7 @@ class PureJAXBackend:
             and initial_state.dtype == jnp.float32
         )
         if cuda_decode_requested:
+            _require_local_cuda_probe_opt_in("CUDA FP32 recurrent GDN decode")
             if not cuda_decode_compatible:
                 _raise_if_gdn_fallback_disabled(
                     "CUDA FP32 recurrent GDN decode kernel cannot handle this shape or dtype"
@@ -1445,6 +1468,7 @@ class PureJAXBackend:
             )
 
         if impl == "cuda_fp32":
+            _require_local_cuda_probe_opt_in("CUDA FP32 packed GDN decode")
             if not use_qk_l2norm_in_kernel:
                 raise ValueError("CUDA FP32 packed GDN decode requires q/k l2norm")
             if packed_qkv_dtype == jnp.bfloat16:

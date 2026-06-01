@@ -23,18 +23,39 @@ engine:
   num_speculative_tokens: 0
   skip_compile: false
 
-# Runtime environment knobs applied to os.environ before JAX init.
-# Each key is an env-var name; the value is the default.  An explicit
-# env-var in the shell always wins over what is set here.
-env:
-  TOKENIZERS_PARALLELISM: "false"
-  XLA_PYTHON_CLIENT_PREALLOCATE: "false"
-  TF_GPU_ALLOCATOR: "cuda_malloc_async"
-  # NANO_VLLM_JAX_XLA_GPU_AUTOTUNE_LEVEL: "4"
-  # NANO_VLLM_JAX_KERNEL_BACKEND: "pure_jax"
-  # NANO_VLLM_JAX_DEVICE_TOKEN_CARRY: "0"
-  # NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL: "off"
-  # NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL: "off"
-  # NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_WARPS: "1"
-  # NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_BLOCK_V: "32"
-  # NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY: "all_or_none"
+# Runtime knobs applied before JAX init. Env vars in the shell still win.
+runtime:
+  platform: "cuda"
+  tokenizers_parallelism: false
+  xla:
+    preallocate: false
+    gpu_allocator: "cuda_malloc_async"
+    # autotune_level: 4
+  fastpaths:
+    # device_token_carry: true
+    # greedy_token: true
+    # materialize_tied_lm_head: true
+    # compact_prefill_in_proj_qkv: true
+    # compact_prefill_gdn_z: true
+    # compact_prefill_full_attn_proj: true
+    # compact_prefill_mlp: true
+
+kernels:
+  backend: "pure_jax"
+  # Local CUDA/JAX FFI code in this repo is probe-only. Leave this false for
+  # serving and benchmark configs unless explicitly running diagnostics.
+  allow_local_cuda_probes: false
+  gdn:
+    # disable_fallbacks: true
+    # prefill_post_conv_impl: "triton_fla_padded"
+    # packed_decode:
+    #   impl: "triton_fla"
+    #   qkv_dtype: "bf16"
+    #   pre_normalize_qk: true
+    #   triton:
+    #     num_warps: 8
+    #     num_stages: 2
+    #     block_v: 32
+
+# Compatibility escape hatch for raw process env vars. Prefer runtime/kernels.
+env: {}

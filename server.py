@@ -14,8 +14,16 @@ from typing import Any
 from runtime_paths import configure_compilation_cache, configure_xla_flags
 from nanovllm_jax.server_config import load_server_config
 
-# Load YAML config (env section applied to os.environ before JAX init)
-_server_cfg = load_server_config()
+
+def _initial_config_path_from_argv() -> str | None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", default=None)
+    args, _ = parser.parse_known_args()
+    return args.config
+
+
+# Load YAML config before importing the engine/JAX stack.
+_server_cfg = load_server_config(_initial_config_path_from_argv())
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
@@ -451,10 +459,6 @@ def main():
     parser.add_argument("--skip-compile", action="store_true", default=cfg.engine.get("skip_compile", False))
     parser.add_argument("--config", default=None, help="Path to server_config.yaml (overrides NANO_VLLM_JAX_SERVER_CONFIG)")
     args = parser.parse_args()
-
-    # Reload config if --config given (overrides the module-level load)
-    if args.config:
-        _server_cfg = load_server_config(args.config)
 
     app.config["MAX_TOKENS_DEFAULT"] = args.max_tokens_default
 

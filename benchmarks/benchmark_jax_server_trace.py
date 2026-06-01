@@ -357,6 +357,9 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 "cuda_fp32_decode_attention": _env_flag("NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"),
             },
             "gdn_kernel_flags": {
+                "allow_local_cuda_probes": _env_flag(
+                    "NANO_VLLM_JAX_ALLOW_LOCAL_CUDA_PROBES"
+                ),
                 "cuda_fp32_gdn_decode": _env_flag("NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE"),
                 "disable_fallbacks": _env_flag("NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS"),
                 "packed_decode_impl": os.environ.get(

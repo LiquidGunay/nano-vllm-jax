@@ -6248,3 +6248,52 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   they make the kernel route measurable and prevent misleading fallback wins.
   Do not retain Triton FLA padded prefill as the tracked route; its multi-stage
   materialization cost overwhelms any lowering benefit on the target shape.
+
+### Entry 188 - Runtime Config Refactor And CUDA Probe Demotion
+
+- date: 2026-06-01
+- change:
+  - added typed `runtime` and `kernels` config sections and translated them
+    through the same startup env path used by the existing code;
+  - changed the server to load `--config` before importing the engine/JAX stack,
+    so runtime/XLA/kernel settings are applied before JAX initialization;
+  - changed the GPU matrix runner to consume the same typed config translation
+    while preserving legacy raw `env` configs;
+  - demoted local CUDA/JAX FFI routes behind
+    `NANO_VLLM_JAX_ALLOW_LOCAL_CUDA_PROBES=1` and updated docs/source comments
+    to mark them as diagnostics, not the serving-kernel direction.
+- CUDA file audit:
+  - the active local CUDA source is
+    `nanovllm_jax/kernels/csrc/fp32_kv_append.cu`, loaded through
+    `nanovllm_jax/kernels/cuda_fp32_ffi.py`;
+  - it contains historical FP32 KV append, decode attention, GDN decode, and
+    GDN prefill probes used by earlier correctness/performance experiments;
+  - `nanovllm_jax/kernels/cuda_gdn.py` is still a Python helper/placeholder
+    module, not a compiled serving implementation.
+- config decision:
+  - keep the C++/CUDA files only as explicitly opted-in probes for reproducing
+    prior results;
+  - new kernel work should be implemented in Python-facing Pallas/CuteDSL, or
+    Triton when adapting an existing kernel schedule;
+  - the tracked `gpu_paged_gdn_fla_decode_bf16_qkv` config now uses strict
+    Triton FLA padded prefill plus Triton packed decode, with local CUDA probes
+    disabled.
+- validation:
+  - `python -m json.tool benchmarks/configs/gpu_paged_gdn_fla_decode_bf16_qkv.json`
+  - `python -m py_compile nanovllm_jax/server_config.py benchmarks/run_gpu_matrix.py benchmarks/benchmark_jax_server_trace.py nanovllm_jax/backends.py server.py`
+  - `pytest -q tests/test_server_config.py tests/test_gpu_matrix_runner.py -q`
+    - 50 passed.
+  - `pytest -q tests/test_server_config.py -q`
+    - 6 passed.
+  - `XLA_PYTHON_CLIENT_PREALLOCATE=false TF_GPU_ALLOCATOR=cuda_malloc_async pytest -q tests/test_gdn_post_conv_prefill_reference.py -k "triton_fla_padded or fallback_without_triton_module or strict_rejects" -q`
+    - 5 passed.
+  - `XLA_PYTHON_CLIENT_PREALLOCATE=false TF_GPU_ALLOCATOR=cuda_malloc_async pytest -q tests/test_gdn_packed_decode_reference.py -k "triton" -q`
+    - 1 passed.
+  - dry-run matrix config translation:
+    `.venv/bin/python3 -m benchmarks.run_gpu_matrix --configs gpu_paged_gdn_fla_decode_bf16_qkv --workloads decode_heavy_128x128 --repeats 1 --dry-run --output-json results/gpu_matrix_config_refactor_dryrun_20260601.json --run-dir results/gpu_matrix_runs/20260601_config_refactor_dryrun`
+- status:
+  - config refactor is in place and compatibility with legacy benchmark `env`
+    sections is preserved;
+  - no new speed claim is recorded here. The best non-local-CUDA strict route
+    remains the previously measured Triton FLA padded path, which was correct
+    but slow on long prefill (`22.80 tok/s` in Entry 187).

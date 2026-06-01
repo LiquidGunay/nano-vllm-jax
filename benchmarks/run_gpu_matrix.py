@@ -22,9 +22,13 @@ from subprocess import CompletedProcess
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+try:
+    sys.path.remove(str(REPO_ROOT))
+except ValueError:
+    pass
+sys.path.insert(0, str(REPO_ROOT))
 from benchmarks.summarize_gpu_matrix import render_markdown
+from nanovllm_jax.server_config import runtime_env_from_config
 
 CONFIG_DIR = REPO_ROOT / "benchmarks" / "configs"
 RESULTS_DIR = REPO_ROOT / "results"
@@ -402,7 +406,10 @@ def _validate_summary_shape(summary: dict[str, Any], schema: dict[str, Any]) -> 
             )
 
 
-def _runtime_env(config_env: dict[str, str]) -> dict[str, str]:
+def _runtime_env(config: dict[str, Any] | None = None) -> dict[str, str]:
+    config = config or {}
+    if not any(key in config for key in ("runtime", "kernels", "env")):
+        config = {"env": config}
     env = os.environ.copy()
     root = Path(env.get("NANO_VLLM_JAX_CACHE_ROOT", "/mountpoint/.exp"))
     defaults = {
@@ -425,7 +432,7 @@ def _runtime_env(config_env: dict[str, str]) -> dict[str, str]:
     }
     for key, value in defaults.items():
         env[key] = value
-    env.update({str(key): str(value) for key, value in config_env.items()})
+    env.update(runtime_env_from_config(config))
     for key in (
         "TMPDIR",
         "XDG_CACHE_HOME",
@@ -1460,7 +1467,7 @@ def main() -> None:
             )
             default_result = _run_command(
                 default_command,
-                _runtime_env(default_config.get("env", {})),
+                _runtime_env(default_config),
                 dry_run=args.dry_run,
             )
             if not args.dry_run and default_result["status"] != "ok" and not args.continue_on_error:
@@ -1540,7 +1547,7 @@ def main() -> None:
                     run_label,
                     jax_python,
                 )
-                env = _runtime_env(config.get("env", {}))
+                env = _runtime_env(config)
                 result = _run_command(command, env, dry_run=args.dry_run)
                 metrics = _metric_summary(output_path) if output_path.exists() else None
                 config_repeats.append(
@@ -1561,6 +1568,8 @@ def main() -> None:
                 "config": {
                     "description": config.get("description"),
                     "env": config.get("env", {}),
+                    "runtime": config.get("runtime", {}),
+                    "kernels": config.get("kernels", {}),
                     "args": _effective_jax_args(config, workload, args.jax_execution),
                 },
                 "workload": {
