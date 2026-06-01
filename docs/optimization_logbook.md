@@ -6297,3 +6297,54 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - no new speed claim is recorded here. The best non-local-CUDA strict route
     remains the previously measured Triton FLA padded path, which was correct
     but slow on long prefill (`22.80 tok/s` in Entry 187).
+
+### Entry 189 - Decode BF16 Fastpath Pass
+
+- date: 2026-06-01
+- accepted changes:
+  - added typed runtime fastpaths for decode-only LM-head activation dtype and
+    decode projection activation dtype;
+  - enabled BF16 LM-head decode activations for the strict Triton GDN config;
+  - enabled BF16 projection activations only for single-sequence decode
+    (`bf16_single_seq`), leaving batched decode and prefill on FP32;
+  - specialized `forward_step_token_ids_jit` decode to use `hidden[:, :1, :]`
+    instead of building a dynamic last-token gather.
+- rejected experiments:
+  - fusing GDN gate/beta scalar preparation into the packed Triton decode kernel
+    preserved exactness but did not improve end-to-end throughput; W8/S2/B32
+    regressed from `165.53 tok/s` to `161.69 tok/s` in one repeat.
+  - global BF16 model activations improved single-sequence decode but failed
+    exact generated-token match on `long_prefill_512_2048`.
+  - BF16 decode projections for all decode batch sizes stayed exact on
+    long-prefill but regressed batched decode throughput to about `23 tok/s`;
+    the retained config therefore restricts this to single-sequence decode.
+- validation:
+  - `pytest -q tests/test_server_config.py tests/test_lm_head_helpers.py`
+    - 9 passed.
+  - `pytest -q tests/test_backend_boundaries.py -k 'executor_greedy_decode_burst_matches_iterative_token_path'`
+    - 1 passed.
+- benchmark artifacts:
+  - baseline comparison:
+    `results/gpu_matrix_decode_longpass_variants_r1_20260601.json`
+  - LM-head BF16:
+    `results/gpu_matrix_decode_bf16_lmhead_r1_20260601.json`
+  - single-sequence decode projection BF16:
+    `results/gpu_matrix_decode_proj_bf16_single_seq_r1_20260601.json`
+  - final three-repeat decode:
+    `results/gpu_matrix_decode_final_bf16_fastpaths_r3_20260601.json`
+  - long-prefill audit:
+    `results/gpu_matrix_decode_proj_bf16_single_seq_r1_20260601.json`
+- retained benchmark result:
+  - `decode_heavy_128x128`: JAX median `155.45 tok/s`, vLLM `213.54 tok/s`,
+    JAX/vLLM `0.728x`, exact generated-token match true.
+  - single-repeat accepted fastpath measurement reached `158.72 tok/s`
+    (`0.743x` vLLM) before the final three-repeat run settled lower.
+  - `long_prefill_512_2048`: still exact but slow on the strict Triton-padded
+    prefill route (`22.82 tok/s` in the single-sequence projection audit);
+    this pass did not solve the prefill route.
+- decision:
+  - retain the decode BF16 fastpaths because they improve the tracked strict
+    no-local-CUDA decode route over the refactored baseline (`150.38 tok/s`
+    single-repeat baseline, `155.45 tok/s` final median) without changing
+    generated tokens.
+  - do not claim progress on long-prefill; it remains a separate bottleneck.

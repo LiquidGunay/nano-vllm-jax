@@ -1,6 +1,6 @@
 {
   "name": "gpu_paged_gdn_fla_decode_bf16_qkv",
-  "description": "Strict Triton GDN route with bf16 packed-decoder QKV path, pre-normalized Q/K, and no local CUDA FFI probes.",
+  "description": "Strict Triton GDN route with bf16 packed-decoder QKV path, pre-normalized Q/K, single-sequence BF16 decode projections, and no local CUDA FFI probes.",
   "benchmark_script": "benchmarks/benchmark_jax_server_trace.py",
   "reference_json": "results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json",
   "vllm_reference_json": "",
@@ -25,7 +25,9 @@
       "compact_prefill_gdn_z": true,
       "compact_prefill_full_attn_proj": true,
       "compact_prefill_mlp": true,
-      "device_token_carry": true
+      "device_token_carry": true,
+      "lm_head_decode_act_dtype": "bf16",
+      "decode_proj_act_dtype": "bf16_single_seq"
     }
   },
   "kernels": {

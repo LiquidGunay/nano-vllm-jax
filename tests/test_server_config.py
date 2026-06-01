@@ -16,6 +16,8 @@ def test_runtime_and_kernel_sections_translate_to_env():
                 "fastpaths": {
                     "greedy_token": True,
                     "device_token_carry": True,
+                    "lm_head_decode_act_dtype": "bf16",
+                    "decode_proj_act_dtype": "bf16_single_seq",
                 },
                 "xla": {
                     "preallocate": False,
@@ -46,6 +48,8 @@ def test_runtime_and_kernel_sections_translate_to_env():
     assert env["TOKENIZERS_PARALLELISM"] == "0"
     assert env["NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH"] == "1"
     assert env["NANO_VLLM_JAX_DEVICE_TOKEN_CARRY"] == "1"
+    assert env["NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE"] == "bf16"
+    assert env["NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE"] == "bf16_single_seq"
     assert env["NANO_VLLM_JAX_KERNEL_BACKEND"] == "pure_jax"
     assert env["NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS"] == "1"
     assert env["NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL"] == "triton_fla_padded"

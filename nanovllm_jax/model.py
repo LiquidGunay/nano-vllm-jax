@@ -118,6 +118,33 @@ def _force_width1_decode_math() -> bool:
     }
 
 
+def _lm_head_decode_activation_dtype() -> jnp.dtype:
+    value = os.environ.get("NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE", "fp32").strip().lower()
+    if value in {"", "0", "false", "no", "off", "none", "fp32", "float32"}:
+        return jnp.float32
+    if value in {"bf16", "bfloat16"}:
+        return jnp.bfloat16
+    raise ValueError(
+        "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE must be fp32 or bf16, "
+        f"got {value!r}"
+    )
+
+
+def _decode_projection_activation_dtype(batch_size: int | None = None) -> jnp.dtype:
+    value = os.environ.get("NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE", "fp32").strip().lower()
+    if value in {"", "0", "false", "no", "off", "none", "fp32", "float32"}:
+        return jnp.float32
+    if value in {"bf16", "bfloat16"}:
+        return jnp.bfloat16
+    if value in {"bf16_single_seq", "bfloat16_single_seq", "bf16_single_sequence"}:
+        return jnp.bfloat16 if batch_size == 1 else jnp.float32
+    raise ValueError(
+        "NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE must be fp32, bf16, "
+        "or bf16_single_seq, "
+        f"got {value!r}"
+    )
+
+
 def _enable_chunked_gdn_prefill() -> bool:
     """Use the chunked cached-prefill GDN path; set env to 0 for fallback."""
     return os.environ.get("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1") in {
@@ -261,7 +288,9 @@ def lm_head_token_ids_and_topk(
     compiled graph and return only small verifier products.
     """
     hidden_norm = hidden if hidden_is_normed else rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
-    hidden_norm = hidden_norm.astype(jnp.float32)
+    hidden_norm = hidden_norm.astype(
+        _lm_head_decode_activation_dtype() if not is_prefill else jnp.float32
+    )
     output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
     logits = _tokenwise_decode_dot(
         hidden_norm,
@@ -775,7 +804,9 @@ def gated_deltanet_block(
     
     # Cast to target dtype (bfloat16 for CPU/CUDA, float16 for Metal)
     dtype = config.get_dtype()
-    x_cast = x.astype(dtype)
+    x_cast = x.astype(
+        _decode_projection_activation_dtype(batch) if not is_prefill else dtype
+    )
     
     key_dim = config.linear_num_key_heads * config.linear_key_head_dim
     value_dim = config.linear_num_value_heads * config.linear_value_head_dim
@@ -1292,7 +1323,9 @@ def full_attention_block(
     
     # Cast to target dtype (bfloat16 for CPU/CUDA, float16 for Metal)
     dtype = config.get_dtype()
-    x_cast = x.astype(dtype)
+    x_cast = x.astype(
+        _decode_projection_activation_dtype(batch) if not is_prefill else dtype
+    )
     valid_token_mask = None
     compact_prefill_tokens = None
     if is_prefill and attention_metadata is not None:
@@ -1672,8 +1705,9 @@ def transformer_block(
             compact_prefill_tokens,
         )
     else:
-        gate = _tokenwise_decode_dot(x, params["gate_proj"], force_width1=force_width1_dot)
-        up = _tokenwise_decode_dot(x, params["up_proj"], force_width1=force_width1_dot)
+        x_proj = x.astype(_decode_projection_activation_dtype(x.shape[0]))
+        gate = _tokenwise_decode_dot(x_proj, params["gate_proj"], force_width1=force_width1_dot)
+        up = _tokenwise_decode_dot(x_proj, params["up_proj"], force_width1=force_width1_dot)
         x = activation_fn(gate) * up
         x = _tokenwise_decode_dot(x, params["down_proj"], force_width1=force_width1_dot)
     mlp_out = x

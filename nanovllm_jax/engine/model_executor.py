@@ -594,11 +594,14 @@ class ModelExecutor:
                     last_logits_only=False,
                     backend=self.backend,
                 )
-                gather_positions = self._logit_positions(step_batch)
-                gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
-                gather_idx = gather_idx[:, None, None]
-                gather_idx = jnp.broadcast_to(gather_idx, (hidden.shape[0], 1, hidden.shape[-1]))
-                last_hidden = jnp.take_along_axis(hidden, gather_idx, axis=1)
+                if is_prefill:
+                    gather_positions = self._logit_positions(step_batch)
+                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
+                    gather_idx = gather_idx[:, None, None]
+                    gather_idx = jnp.broadcast_to(gather_idx, (hidden.shape[0], 1, hidden.shape[-1]))
+                    last_hidden = jnp.take_along_axis(hidden, gather_idx, axis=1)
+                else:
+                    last_hidden = hidden[:, :1, :]
                 token_ids, _, _ = lm_head_token_ids_and_topk(
                     last_hidden,
                     params,

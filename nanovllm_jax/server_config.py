@@ -211,6 +211,8 @@ def _runtime_section_to_env(runtime_section: dict) -> dict[str, str]:
         "compact_prefill_full_attn_proj": "NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ",
         "compact_prefill_mlp": "NANO_VLLM_JAX_COMPACT_PREFILL_MLP",
         "device_token_carry": "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+        "lm_head_decode_act_dtype": "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE",
+        "decode_proj_act_dtype": "NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE",
     }
     for key, env_key in fastpath_map.items():
         _put_env(env, env_key, fastpaths.get(key))
