@@ -391,6 +391,62 @@ def test_gdn_fla_solve_tril_packed_triton_matches_reference_num_heads3():
     )
 
 
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_gdn_fla_chunk_scaled_dot_kkt_packed_triton_block_dot_matches_reference_shape():
+    from nanovllm_jax.kernels.gdn_fla_triton import (
+        gdn_fla_chunk_scaled_dot_kkt_packed_triton_block,
+    )
+
+    rng = np.random.default_rng(7)
+    cu_seqlens = jnp.array([0, 64], dtype=jnp.int32)
+    chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=64)
+    key = jnp.asarray(
+        rng.normal(0.0, 0.2, size=(64, 2, 64)).astype(np.float32),
+        dtype=jnp.bfloat16,
+    )
+    beta = jnp.asarray(
+        rng.uniform(0.1, 0.8, size=(64, 4)).astype(np.float32),
+    )
+    gate = jnp.asarray(
+        rng.normal(0.0, 0.02, size=(64, 4)).astype(np.float32),
+    )
+
+    actual = gdn_fla_chunk_scaled_dot_kkt_packed_triton_block(
+        key,
+        beta,
+        gate,
+        cu_seqlens,
+        chunk_size=64,
+        chunk_indices=chunk_indices,
+    )
+    expected = gdn_fla_chunk_scaled_dot_kkt_packed_reference(
+        key,
+        beta,
+        gate,
+        cu_seqlens,
+        chunk_size=64,
+        chunk_indices=chunk_indices,
+    )
+
+    actual_np = np.asarray(actual)
+    np.testing.assert_equal(actual_np.shape, (64, 4, 64))
+    assert np.isfinite(actual_np).all()
+    np.testing.assert_allclose(
+        actual_np,
+        np.asarray(expected),
+        rtol=0,
+        atol=2e-3,
+    )
+    for head in range(actual_np.shape[1]):
+        np.testing.assert_allclose(
+            np.triu(actual_np[:, head, :], k=0),
+            np.zeros((64, 64), dtype=np.float32),
+            rtol=0,
+            atol=0,
+        )
+
+
 def test_gdn_fla_solve_tril_packed_reference_inverts_i_plus_a_per_chunk():
     cu_seqlens = jnp.array([0, 0, 5, 13], dtype=jnp.int32)
     chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=4)
@@ -426,6 +482,141 @@ def test_gdn_fla_solve_tril_packed_reference_inverts_i_plus_a_per_chunk():
                 expected[start:end, head, :length] = inverse
 
     np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 4, 8, 16, 17, 20, 32, 48, 64])
+def test_vllm_like_inverse_matches_full_precision_formula(n: int):
+    import nanovllm_jax.kernels.gdn_fla as gdn_fla_mod
+
+    rng = np.random.default_rng(123)
+    strict_lower = np.tril(rng.standard_normal((n, n), dtype=np.float32) * 0.01, k=-1)
+    actual = gdn_fla_mod._vllm_like_inverse_i_plus_strict_lower(
+        strict_lower,
+        output_dtype="float32",
+    )
+    expected = np.linalg.inv(np.eye(n, dtype=np.float32) + strict_lower.astype(np.float32))
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=5e-7)
+
+
+def test_vllm_like_inverse_quantizes_like_vllm_output_dtype():
+    import nanovllm_jax.kernels.gdn_fla as gdn_fla_mod
+    import jax.numpy as jnp
+
+    strict_lower = np.array(
+        [[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [0.02, 0.03, 0.0]],
+        dtype=np.float32,
+    )
+    actual = gdn_fla_mod._vllm_like_inverse_i_plus_strict_lower(
+        strict_lower,
+        output_dtype="bfloat16",
+    )
+    expected = np.asarray(
+        jnp.asarray(np.linalg.inv(np.eye(3, dtype=np.float32) + strict_lower), dtype=jnp.bfloat16),
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
+
+
+def test_vllm_like_recompute_w_u_quantizes_rhs_before_dot():
+    def bf16(x):
+        return np.asarray(jnp.asarray(x, dtype=jnp.bfloat16), dtype=np.float32)
+
+    cu_seqlens = jnp.array([0, 4], dtype=jnp.int32)
+    chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=4)
+    key = jnp.array(
+        np.linspace(-0.7, 0.9, 4 * 1 * 3, dtype=np.float32).reshape(4, 1, 3)
+    )
+    value = jnp.array(
+        np.linspace(0.15, 1.25, 4 * 1 * 2, dtype=np.float32).reshape(4, 1, 2)
+    )
+    beta = jnp.array([[0.17], [0.31], [0.43], [0.59]], dtype=jnp.float32)
+    gate = jnp.array([[-0.2], [0.05], [0.17], [0.33]], dtype=jnp.float32)
+    attention_inverse = jnp.array(
+        [
+            [[1.0, 0.0, 0.0, 0.0]],
+            [[-0.11, 1.0, 0.0, 0.0]],
+            [[0.07, -0.19, 1.0, 0.0]],
+            [[-0.03, 0.13, -0.23, 1.0]],
+        ],
+        dtype=jnp.float32,
+    )
+
+    actual_w, actual_u = gdn_fla_recompute_w_u_packed_reference(
+        key,
+        value,
+        beta,
+        gate,
+        attention_inverse,
+        cu_seqlens,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+        vllm_like=True,
+        stage_output_dtype="bfloat16",
+    )
+
+    matrix = bf16(np.asarray(attention_inverse)[:, 0, :])
+    weighted_value = bf16(np.asarray(value)[:, 0, :] * np.asarray(beta)[:, 0, None])
+    weighted_key = bf16(
+        np.asarray(key)[:, 0, :]
+        * np.asarray(beta)[:, 0, None]
+        * np.exp(np.asarray(gate)[:, 0, None])
+    )
+    expected_u = bf16(matrix @ weighted_value)[:, None, :]
+    expected_w = bf16(matrix @ weighted_key)[:, None, :]
+
+    np.testing.assert_allclose(np.asarray(actual_u), expected_u, rtol=0, atol=0)
+    np.testing.assert_allclose(np.asarray(actual_w), expected_w, rtol=0, atol=0)
+
+
+def test_vllm_like_chunk_delta_h_quantizes_delta_after_gate_for_recurrence():
+    def bf16(x):
+        return np.asarray(jnp.asarray(x, dtype=jnp.bfloat16), dtype=np.float32)
+
+    cu_seqlens = jnp.array([0, 4], dtype=jnp.int32)
+    chunk_indices, chunk_offsets = prepare_gdn_fla_chunk_metadata(
+        cu_seqlens,
+        chunk_size=4,
+    )
+    key = jnp.array(
+        np.linspace(-0.35, 0.55, 4 * 1 * 3, dtype=np.float32).reshape(4, 1, 3)
+    )
+    w = jnp.array(
+        np.linspace(0.12, 0.82, 4 * 1 * 3, dtype=np.float32).reshape(4, 1, 3)
+    )
+    u = jnp.array(
+        np.linspace(-0.44, 0.63, 4 * 1 * 2, dtype=np.float32).reshape(4, 1, 2)
+    )
+    gate = jnp.array([[-0.3], [-0.05], [0.1], [0.27]], dtype=jnp.float32)
+    initial_state = jnp.array(
+        np.linspace(-0.2, 0.4, 1 * 1 * 2 * 3, dtype=np.float32).reshape(1, 1, 2, 3)
+    )
+
+    actual_h, actual_v_new, actual_final = gdn_fla_chunk_delta_h_packed_reference(
+        key,
+        w,
+        u,
+        gate,
+        cu_seqlens,
+        initial_state,
+        chunk_size=4,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        vllm_like=True,
+        stage_output_dtype="bfloat16",
+    )
+
+    state_for_dot = bf16(np.asarray(initial_state)[0, 0])
+    delta = bf16(np.asarray(u)[:, 0]) - bf16(np.asarray(w)[:, 0]) @ state_for_dot.T
+    last_gate = np.asarray(gate)[-1, 0]
+    update_delta = bf16(delta * np.exp(last_gate - np.asarray(gate)[:, 0])[:, None])
+    expected_final = (
+        state_for_dot * np.exp(last_gate)
+        + update_delta.T @ bf16(np.asarray(key)[:, 0])
+    )[None, None, :, :]
+
+    np.testing.assert_allclose(np.asarray(actual_h)[0, 0], state_for_dot, rtol=0, atol=0)
+    np.testing.assert_allclose(np.asarray(actual_v_new)[:, 0], bf16(delta), rtol=0, atol=0)
+    np.testing.assert_allclose(np.asarray(actual_final), expected_final, rtol=0, atol=2e-7)
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
@@ -494,6 +685,61 @@ def test_gdn_fla_recompute_w_u_packed_triton_matches_reference():
         np.asarray(expected_u),
         rtol=0,
         atol=1e-6,
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax_triton is required")
+def test_gdn_fla_recompute_w_u_packed_triton_block_dot_matches_reference(monkeypatch):
+    from nanovllm_jax.kernels.gdn_fla_triton import (
+        gdn_fla_recompute_w_u_packed_triton,
+    )
+
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_RECOMPUTE_BLOCK_DOT", "1")
+    cu_seqlens = jnp.array([0, 96], dtype=jnp.int32)
+    chunk_size = 64
+    chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=chunk_size)
+    keys = jax.random.split(jax.random.PRNGKey(20260603), 5)
+    key = jax.random.normal(keys[0], (96, 2, 64), dtype=jnp.float32) * 0.02
+    value = jax.random.normal(keys[1], (96, 4, 64), dtype=jnp.float32) * 0.03
+    beta = jax.random.uniform(keys[2], (96, 4), dtype=jnp.float32, minval=0.2, maxval=0.7)
+    gate = jax.random.normal(keys[3], (96, 4), dtype=jnp.float32) * 0.01
+    attention_inverse = jax.random.normal(
+        keys[4], (96, 4, chunk_size), dtype=jnp.float32
+    ) * 0.02
+
+    actual_w, actual_u = gdn_fla_recompute_w_u_packed_triton(
+        key,
+        value,
+        beta,
+        gate,
+        attention_inverse,
+        cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+    )
+    expected_w, expected_u = gdn_fla_recompute_w_u_packed_reference(
+        key,
+        value,
+        beta,
+        gate,
+        attention_inverse,
+        cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_w),
+        np.asarray(expected_w),
+        rtol=0,
+        atol=2e-4,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_u),
+        np.asarray(expected_u),
+        rtol=0,
+        atol=2e-4,
     )
 
 
@@ -744,6 +990,70 @@ def test_gdn_fla_chunk_delta_h_packed_triton_matches_reference():
     )
 
 
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_gdn_fla_chunk_delta_h_packed_triton_block_dot_matches_reference(monkeypatch):
+    from nanovllm_jax.kernels.gdn_fla_triton import (
+        gdn_fla_chunk_delta_h_packed_triton,
+    )
+
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_DELTA_H_BLOCK_DOT", "1")
+    cu_seqlens = jnp.array([0, 96], dtype=jnp.int32)
+    chunk_size = 64
+    chunk_indices, chunk_offsets = prepare_gdn_fla_chunk_metadata(
+        cu_seqlens,
+        chunk_size=chunk_size,
+    )
+    keys = jax.random.split(jax.random.PRNGKey(20260602), 5)
+    key = jax.random.normal(keys[0], (96, 2, 64), dtype=jnp.float32) * 0.02
+    w = jax.random.normal(keys[1], (96, 4, 64), dtype=jnp.float32) * 0.02
+    u = jax.random.normal(keys[2], (96, 4, 64), dtype=jnp.float32) * 0.03
+    gate = jax.random.normal(keys[3], (96, 4), dtype=jnp.float32) * 0.01
+    initial_state = jax.random.normal(keys[4], (1, 4, 64, 64), dtype=jnp.float32) * 0.01
+
+    actual_h, actual_v_new, actual_final = gdn_fla_chunk_delta_h_packed_triton(
+        key,
+        w,
+        u,
+        gate,
+        cu_seqlens,
+        initial_state,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+    )
+    expected_h, expected_v_new, expected_final = gdn_fla_chunk_delta_h_packed_reference(
+        key,
+        w,
+        u,
+        gate,
+        cu_seqlens,
+        initial_state,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_h),
+        np.asarray(expected_h),
+        rtol=0,
+        atol=8e-4,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_v_new),
+        np.asarray(expected_v_new),
+        rtol=0,
+        atol=8e-4,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_final),
+        np.asarray(expected_final),
+        rtol=0,
+        atol=8e-4,
+    )
+
+
 def test_gdn_fla_chunk_fwd_o_packed_reference_matches_formula():
     cu_seqlens = jnp.array([0, 0, 5, 13], dtype=jnp.int32)
     chunk_indices, chunk_offsets = prepare_gdn_fla_chunk_metadata(
@@ -952,6 +1262,55 @@ def test_gdn_fla_chunk_fwd_o_packed_triton_matches_reference():
         np.asarray(expected_no_gate),
         rtol=0,
         atol=1e-6,
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_gdn_fla_chunk_fwd_o_packed_triton_block_dot_matches_reference_shape():
+    from nanovllm_jax.kernels.gdn_fla_triton import (
+        gdn_fla_chunk_fwd_o_packed_triton_block,
+    )
+
+    cu_seqlens = jnp.array([0, 96], dtype=jnp.int32)
+    chunk_size = 64
+    chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=chunk_size)
+    keys = jax.random.split(jax.random.PRNGKey(20260601), 5)
+    query = jax.random.normal(keys[0], (96, 2, 64), dtype=jnp.float32) * 0.02
+    key = jax.random.normal(keys[1], (96, 2, 64), dtype=jnp.float32) * 0.02
+    v_new = jax.random.normal(keys[2], (96, 4, 64), dtype=jnp.float32) * 0.03
+    h = jax.random.normal(keys[3], (2, 4, 64, 64), dtype=jnp.float32) * 0.01
+    gate = jax.random.normal(keys[4], (96, 4), dtype=jnp.float32) * 0.01
+
+    actual = gdn_fla_chunk_fwd_o_packed_triton_block(
+        query,
+        key,
+        v_new,
+        h,
+        gate,
+        cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+        scale=0.125,
+    )
+    expected = gdn_fla_chunk_fwd_o_packed_reference(
+        query,
+        key,
+        v_new,
+        h,
+        gate,
+        cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+        scale=0.125,
+    )
+
+    assert actual.shape == expected.shape
+    np.testing.assert_allclose(
+        np.asarray(actual),
+        np.asarray(expected),
+        rtol=0,
+        atol=2e-4,
     )
 
 

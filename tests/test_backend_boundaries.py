@@ -1556,6 +1556,76 @@ def test_executor_jit_matches_eager_cached_decode():
     )
 
 
+def test_executor_jit_decode_derives_position_from_seq_len_for_static_metadata():
+    config = _tiny_full_attention_config()
+    params = init_params(jax.random.PRNGKey(22), config)
+    executor = ModelExecutor(config, params, backend="pure_jax")
+    spec = KVCacheSpec(
+        num_layers=config.num_hidden_layers,
+        num_blocks=config.num_kvcache_blocks,
+        block_size=config.block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        dtype=config.get_dtype(),
+        max_kv_cache_bytes=config.max_kv_cache_bytes,
+    )
+    correct_cache = executor.backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=2)
+    stale_cache = executor.backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=2)
+    empty_hybrid = HybridLayerState(
+        conv_state=jnp.zeros((1, 0, 1, 1)),
+        recurrent_state=jnp.zeros((1, 0, 1, 1, 1)),
+    )
+    prompt_batch = _scheduled_batch(
+        tokens=[1, 2, 3],
+        positions=[0, 1, 2],
+        block_tables=[0, 1],
+        seq_lens=3,
+        is_prefill=True,
+    )
+    correct_prompt = executor.forward_step_jit(
+        prompt_batch,
+        cache_storage=correct_cache,
+        hybrid_state=empty_hybrid,
+    )
+    stale_prompt = executor.forward_step_jit(
+        prompt_batch,
+        cache_storage=stale_cache,
+        hybrid_state=empty_hybrid,
+    )
+    correct_position_batch = _scheduled_batch(
+        tokens=[4],
+        positions=[3],
+        block_tables=[0, 1],
+        seq_lens=4,
+        is_prefill=False,
+    )
+    stale_position_batch = _scheduled_batch(
+        tokens=[4],
+        positions=[0],
+        block_tables=[0, 1],
+        seq_lens=4,
+        is_prefill=False,
+    )
+
+    correct = executor.forward_step_jit(
+        correct_position_batch,
+        cache_storage=correct_prompt.cache_storage,
+        hybrid_state=correct_prompt.hybrid_state,
+    )
+    stale = executor.forward_step_jit(
+        stale_position_batch,
+        cache_storage=stale_prompt.cache_storage,
+        hybrid_state=stale_prompt.hybrid_state,
+    )
+
+    np.testing.assert_allclose(
+        np.array(stale.activations),
+        np.array(correct.activations),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
 def test_executor_greedy_decode_burst_matches_iterative_token_path():
     config = _tiny_full_attention_config()
     params = init_params(jax.random.PRNGKey(22), config)
@@ -1599,7 +1669,6 @@ def test_executor_greedy_decode_burst_matches_iterative_token_path():
         ),
         hybrid_state=empty_hybrid,
     )
-
     def decode_batch(tokens, positions, seq_lens, *, decode_steps=1):
         return ScheduledBatch(
             tokens=tokens,

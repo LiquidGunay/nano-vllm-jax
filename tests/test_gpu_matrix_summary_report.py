@@ -92,6 +92,7 @@ def _summary():
                     "aggregate": {
                         "scheduler_diagnostics_median": {
                             "available": True,
+                            "step_count": 64,
                             "prefill_step_count": 4,
                             "decode_step_count": 60,
                             "max_prefill_step_sequences": 4,
@@ -199,6 +200,9 @@ def test_render_markdown_includes_goal_matrix_and_sorted_profile_deltas():
     assert "| long_prefill_512_2048 | gpu_paged_default | yes | yes | 105.00 |" in report
     assert "## Scheduler Diagnostics" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | 4 | 60 | 4 | 8192 | 2.40 s | 0.80 s |" in report
+    assert "## Host Replay Diagnostics" in report
+    assert "| workload | config | bucket | steps | decode steps | count | count/step | ms/step | ref count | ref count/step | ref ms/step |" in report
+    assert "| long_prefill_512_2048 | gpu_paged_default | forward_step_token_ids_jit | 64 | 60 | 1.0 | 0.02 | 0.47 ms | - | - | - |" in report
     assert "## Prompt Provenance" in report
     assert "| long_prefill_512_2048 | gpu_paged_default | vllm_random | random | 128 | 7 | 1280 | 16 | {\"input\":0.6,\"output\":0.0} | abcdef123456 | abcdef123456 | yes |" in report
     assert "## Scoped Profile Range Medians" in report

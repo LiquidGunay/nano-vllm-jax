@@ -52,6 +52,7 @@ _GDN_PREFILL_QKV_DTYPE_ENV = "NANO_VLLM_JAX_GDN_PREFILL_QKV_DTYPE"
 _GDN_PREFILL_POST_CONV_OUTPUT_DTYPE_ENV = (
     "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE"
 )
+_GDN_PREFILL_FLA_VLLM_LIKE_ENV = "NANO_VLLM_JAX_GDN_PREFILL_FLA_VLLM_LIKE"
 _GDN_PACKED_DECODE_QKV_DTYPE_ENV = "NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE"
 _GDN_DISABLE_FALLBACKS_ENV = "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS"
 _OFF_ENV_VALUES = {"", "0", "false", "no", "off", "none", "False"}
@@ -227,6 +228,13 @@ def _gdn_packed_decode_qkv_activation_jnp_dtype() -> jnp.dtype:
 def _gdn_packed_decode_pre_normalize_qk() -> bool:
     return (
         os.environ.get(_GDN_PACKED_DECODE_PRENORMALIZE_QK_ENV, "0").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
+
+
+def _gdn_prefill_fla_vllm_like_enabled() -> bool:
+    return (
+        os.environ.get(_GDN_PREFILL_FLA_VLLM_LIKE_ENV, "0").strip().lower()
         in _TRUE_ENV_VALUES
     )
 
@@ -798,6 +806,7 @@ class PureJAXBackend:
                 prepared.seq_lens,
                 prepared.initial_state,
                 chunk_size=chunk_size,
+                vllm_like=_gdn_prefill_fla_vllm_like_enabled(),
             )
             output = _cast_gdn_prefill_post_conv_output(output)
             return output.transpose(0, 2, 1, 3), final_state

@@ -86,6 +86,101 @@ optimization work starts.
     cumulative gate output. Porting later stages first makes failures harder to
     localize.
 
+## Active Decode Plan - 2026-06-01
+
+The active `0.9x` vLLM goal is now driven by the decode-heavy profile, not by
+the older KV-append-first roadmap. The current strict no-local-CUDA decode best
+is `results/gpu_matrix_decode_static_metadata_r3_20260601.json`: `165.81 tok/s`,
+`0.776x` vLLM on `decode_heavy_128x128`, exact generated-token parity, with the
+vLLM target at `192.18 tok/s`. The required JAX improvement is now about
+`1.16x`. Long prefill remains unacceptable at about `0.196x` vLLM on the
+strict Triton FLA route, so prefill work must continue in parallel after the
+decode loop is moving.
+
+Next implementation order:
+
+1. Decode projection GEMV lowering. HLO for the 2026-06-01 decode profile
+   showed the largest `input_reduce_fusion_*` GPU ranges were not RMSNorms:
+   they were B=1 decode projection GEMVs for MLP gate/up, MLP down, and GDN
+   QKV. The accepted padded-GEMM route now lowers these selected projections
+   through small GEMM shapes and records `162.10 tok/s`, `0.759x` vLLM on
+   `decode_heavy_128x128` with exact generated-token parity. Keep this route as
+   the accepted projection base route, but do not extend it blindly; rows=4 and rows=16
+   both lost to rows=8.
+2. Static decode execution / replay boundary. The remaining top GPU event is
+   the LM-head GEMM, while CPU still spends substantial time in PjRt execute and
+   command-buffer work. The next attempt should keep token, position, sequence
+   length, block-table, KV, and hybrid-state buffers device-resident across
+   repeated decode steps for fixed buckets. The first accepted static-metadata
+   slice records `165.81 tok/s`, `0.776x` vLLM, and should be kept as the
+   current measured decode best, but it does not yet reduce the GPU GEMM/GDN
+   buckets or prove a CUDA-graph-like replay boundary.
+3. Greedy LM-head top-1. The LM-head GEMM remains the top event. Revisit a
+   streaming/tiled top-1 path only after the reduction work, preserving exact
+   `jnp.argmax` tie behavior and keeping full logits for diagnostics and non-
+   greedy modes.
+4. Proper strict GDN chunked-prefill body. Port/fork the vLLM/Flash Linear
+   Attention chunk schedule behind the existing prepared boundary using
+   Pallas/CuteDSL or borrowed/adapted Triton. Do not promote local CUDA probes
+   as serving routes.
+5. Device-owned cache/state metadata. Remove avoidable per-token host metadata
+   rebuilds and hot-path materializations only where the profile confirms they
+   affect decode or long-prefill throughput.
+
+Benchmark discipline for every slice:
+
+- use strict no-fallback configs for kernel-route claims;
+- record exact generated-token parity, vLLM ratio, top CPU/GPU profile events,
+  and whether the change targets decode, long prefill, or both;
+- keep microbenchmarks as diagnostics only until the integrated GPU matrix
+  confirms the win.
+
+Orchestration assignments:
+
+- Worker A owns static decode execution and replay. Target the CPU-side
+  `forward_step_token_ids_jit`, `PjRtCApiLoadedExecutable::Execute`,
+  `command_buffer::execute`, and `command_buffer::update` buckets by reducing
+  repeated host metadata rebuilds and keeping fixed decode-bucket state on
+  device.
+- Worker B owns greedy LM-head top-1 and logits materialization. Target the
+  remaining top `gemm_fusion_dot_199` bucket without changing exact
+  `jnp.argmax` tie behavior; keep full logits only where diagnostics or
+  non-greedy modes require them.
+- Worker C owns decode projection structure. Target remaining projection GEMM
+  launch count and shape quality through safe gate/up and QKV packing or
+  merging, while keeping the accepted padded-GEMM route compatible.
+- Worker D owns strict GDN/FLA prefill and decode kernels. Target the packed
+  GDN decode bucket and the much larger long-prefill gap using Pallas, Triton,
+  CuteDSL, or adapted external FLA schedules, with local CUDA probes remaining
+  diagnostics only.
+- Worker E owns benchmark/profile strategy. Keep the plan aligned with
+  nano-vLLM/vLLM structural advantages: merged projections, CUDA-graph-like
+  replay, paged/cache metadata discipline, FlashAttention/FlashInfer-style
+  kernels, reduced host sync, and optimized GEMM only where profile evidence
+  shows a real shape or fusion problem.
+
+Post-pass orchestration rule: avoid further fan-out unless there is a clear
+need for independent read-only checks. Use one reusable worker for bounded
+follow-up slices, refresh that worker's brief with the current anchor artifacts,
+and close/reset it when its context becomes noisy.
+
+Do-not-repeat guardrail for the current decode pass:
+
+- Do not retry static `seq_lens` device carry for static metadata. It regressed
+  the confirmed run to `165.31 tok/s` and worsened `MemcpyD2D`/`np.asarray`
+  buckets.
+- Do not retry `_gdn_fla_chunk_fwd_o_packed_kernel` `num_warps=4`; it raised
+  the `chunk_fwd_o` bucket to about `80 ms` and regressed throughput to
+  `159.43 tok/s`.
+- Do not continue packed-GDN decode launch-param-only sweeps such as
+  `w4/s2/b32` or `w8/s3/b32`; they did not reduce `_gdn_packed_decode_kernel`
+  or the dominant GEMM/GDN buckets. Reopen only with a kernel-body or launch
+  structure change.
+- Do not retry runtime/source-level MLP gate/up concatenation or persistent
+  duplicated gate/up weight leaves in the rejected forms already recorded in
+  the logbook. A future gate/up proposal must explain the material difference
+  from those failures before implementation.
+
 ## Next Goal Handoff
 
 Use this file as the main goal contract. The first goal slice should stay

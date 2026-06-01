@@ -1164,7 +1164,19 @@ class CanonicalModelRunner:
         self._device_token_carry_tokens = None
         self._device_token_carry_by_seq_id = {}
 
+    @staticmethod
+    def _active_decode_rows_host(batch: ScheduledBatch) -> List[int]:
+        if batch.seq_ids_host is None or batch.query_lens_host is None:
+            return []
+        return [
+            row
+            for row, (seq_id, query_len) in enumerate(zip(batch.seq_ids_host, batch.query_lens_host))
+            if int(seq_id) >= 0 and int(query_len) > 0
+        ]
+
     def _maybe_apply_device_token_carry(self, batch: ScheduledBatch) -> ScheduledBatch:
+        static_decode_metadata = bool(getattr(batch, "uses_static_decode_metadata", False))
+        active_rows = self._active_decode_rows_host(batch)
         if (
             not _device_token_carry_enabled()
             or batch.is_prefill
@@ -1172,6 +1184,8 @@ class CanonicalModelRunner:
             or batch.seq_ids_host is None
             or batch.tokens.shape[1] != 1
         ):
+            if static_decode_metadata:
+                raise RuntimeError("static decode metadata requires a device-token carry for every active row")
             return batch
 
         carried_seq_ids = getattr(self, "_device_token_carry_seq_ids", None)
@@ -1185,17 +1199,32 @@ class CanonicalModelRunner:
         ):
             token_vector = jnp.asarray(carried_tokens, dtype=jnp.int32).reshape(-1)
             if token_vector.shape[0] == int(tokens.shape[0]):
-                return replace(batch, tokens=token_vector[:, None])
+                tokens = token_vector[:, None]
+                applied = True
+            else:
+                applied = False
+        else:
+            applied = False
 
-        applied = False
-        for row, seq_id in enumerate(batch.seq_ids_host):
-            token_ref = self._device_token_carry_by_seq_id.get(int(seq_id))
-            if token_ref is None:
-                continue
-            token_vector = jnp.asarray(token_ref.tokens, dtype=jnp.int32).reshape(-1)
-            tokens = tokens.at[row, 0].set(token_vector[int(token_ref.row)])
-            applied = True
+        missing_static_rows: List[int] = []
         if not applied:
+            for row, seq_id in enumerate(batch.seq_ids_host):
+                token_ref = self._device_token_carry_by_seq_id.get(int(seq_id))
+                if token_ref is None:
+                    if static_decode_metadata and row in active_rows:
+                        missing_static_rows.append(row)
+                    continue
+                token_vector = jnp.asarray(token_ref.tokens, dtype=jnp.int32).reshape(-1)
+                tokens = tokens.at[row, 0].set(token_vector[int(token_ref.row)])
+                applied = True
+        if missing_static_rows:
+            raise RuntimeError(
+                "static decode metadata is missing device-token carry rows "
+                f"{tuple(missing_static_rows)}"
+            )
+        if not applied:
+            if static_decode_metadata:
+                raise RuntimeError("static decode metadata did not apply any device-token carry")
             return batch
         return replace(batch, tokens=tokens)
 

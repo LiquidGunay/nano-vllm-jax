@@ -418,9 +418,12 @@ class ModelExecutor:
                 params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
                 num_query_tokens = query_start_loc[-1].astype(jnp.int32)
                 num_prefill_tokens = static_num_prefill_tokens if static_num_prefill_tokens is not None else num_query_tokens
+                step_positions = positions
+                if not is_prefill and positions.shape[1] == 1:
+                    step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
                 step_batch = ScheduledBatch(
                     tokens=tokens,
-                    positions=positions,
+                    positions=step_positions,
                     seq_ids=jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
                     query_start_loc=query_start_loc,
                     is_prefill=is_prefill,
@@ -552,9 +555,12 @@ class ModelExecutor:
                 params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
                 num_query_tokens = query_start_loc[-1].astype(jnp.int32)
                 num_prefill_tokens = static_num_prefill_tokens if static_num_prefill_tokens is not None else num_query_tokens
+                step_positions = positions
+                if not is_prefill and positions.shape[1] == 1:
+                    step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
                 step_batch = ScheduledBatch(
                     tokens=tokens,
-                    positions=positions,
+                    positions=step_positions,
                     seq_ids=jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
                     query_start_loc=query_start_loc,
                     is_prefill=is_prefill,
@@ -696,6 +702,7 @@ class ModelExecutor:
                 query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
                 active = query_lens > 0
                 num_query_tokens = query_start_loc[-1].astype(jnp.int32)
+                initial_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
 
                 def step(carry, _):
                     (
@@ -777,7 +784,7 @@ class ModelExecutor:
 
                 initial = (
                     tokens,
-                    positions,
+                    initial_positions,
                     seq_lens,
                     k_cache,
                     v_cache,

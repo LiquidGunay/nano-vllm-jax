@@ -2,6 +2,7 @@
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.engine.llm_engine import LLMEngine
@@ -123,8 +124,15 @@ def test_sequence_prefetches_snapshot_before_later_materialization_without_clear
     assert events == ["prefetch-33", "materialize-33"]
 
 
-def _decode_batch(seq_ids: tuple[int, ...], tokens: list[int]) -> ScheduledBatch:
+def _decode_batch(
+    seq_ids: tuple[int, ...],
+    tokens: list[int],
+    *,
+    seq_lens: list[int] | None = None,
+) -> ScheduledBatch:
     query_lens = [1 if seq_id >= 0 else 0 for seq_id in seq_ids]
+    if seq_lens is None:
+        seq_lens = query_lens
     query_start_loc = [0]
     for query_len in query_lens:
         query_start_loc.append(query_start_loc[-1] + query_len)
@@ -137,10 +145,10 @@ def _decode_batch(seq_ids: tuple[int, ...], tokens: list[int]) -> ScheduledBatch
         num_prefill_tokens=0,
         num_decode_tokens=sum(query_lens),
         block_tables=jnp.zeros((len(seq_ids), 1), dtype=jnp.int32),
-        seq_lens=jnp.asarray(query_lens, dtype=jnp.int32),
+        seq_lens=jnp.asarray(seq_lens, dtype=jnp.int32),
         seq_ids_host=seq_ids,
         query_lens_host=tuple(query_lens),
-        seq_lens_host=tuple(query_lens),
+        seq_lens_host=tuple(seq_lens),
     )
 
 
@@ -190,6 +198,59 @@ def test_model_runner_device_token_carry_follows_seq_ids_after_row_order_change(
     carried_batch = runner._maybe_apply_device_token_carry(next_batch)
 
     np.testing.assert_array_equal(np.asarray(carried_batch.tokens[:, 0]), np.asarray([80, 70, 0]))
+
+
+def test_scheduler_static_decode_metadata_reuses_fixed_device_arrays(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_METADATA", "1")
+    token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
+    scheduler = Scheduler(
+        Qwen3_5Config(
+            max_num_seqs=2,
+            batch_size_buckets=(2,),
+            max_blocks_per_seq=2,
+            num_kvcache_blocks=4,
+            jax_execution="jit",
+            static_decode_metadata=True,
+        )
+    )
+    seq_a = Sequence([1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7)
+    seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
+    seq_a.block_table = [0]
+    seq_b.block_table = [1]
+    seq_a.last_token = 0
+    seq_b.last_token = 0
+    seq_a.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
+    seq_b.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
+
+    first = scheduler.build_scheduled_batch([seq_a, seq_b], is_prefill=False)
+    seq_a.append_token_device(DeviceTokenRef(tokens=token_vector, row=0))
+    seq_b.append_token_device(DeviceTokenRef(tokens=token_vector, row=1))
+    second = scheduler.build_scheduled_batch([seq_a, seq_b], is_prefill=False)
+
+    assert first.uses_static_decode_metadata
+    assert second.uses_static_decode_metadata
+    assert second.tokens is first.tokens
+    assert second.positions is first.positions
+    assert second.seq_ids is first.seq_ids
+    assert second.query_start_loc is first.query_start_loc
+    assert second.block_tables is first.block_tables
+    np.testing.assert_array_equal(np.asarray(first.seq_lens), np.asarray([2, 2]))
+    np.testing.assert_array_equal(np.asarray(second.seq_lens), np.asarray([3, 3]))
+    assert second.seq_lens_host == (3, 3)
+
+
+def test_model_runner_static_decode_metadata_requires_token_carry(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    runner = ModelRunner.__new__(ModelRunner)
+    runner._device_token_carry_seq_ids = None
+    runner._device_token_carry_tokens = None
+    runner._device_token_carry_by_seq_id = {}
+    batch = _decode_batch((7,), [0])
+    batch.uses_static_decode_metadata = True
+
+    with pytest.raises(RuntimeError, match="requires a device-token carry"):
+        runner._maybe_apply_device_token_carry(batch)
 
 
 def test_scheduler_postprocess_can_defer_greedy_device_token(monkeypatch):

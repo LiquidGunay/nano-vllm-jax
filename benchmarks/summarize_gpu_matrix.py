@@ -351,6 +351,62 @@ def _scoped_profile_range_rows(
     return [row for _, row in rows[: max(0, int(limit))]]
 
 
+def _safe_divide(numerator: Any, denominator: Any) -> float | None:
+    if numerator is None or denominator in (None, 0):
+        return None
+    return float(numerator) / float(denominator)
+
+
+def _host_replay_rows(summary: dict[str, Any]) -> list[list[str]]:
+    """Expose launch/update density as a proxy for static replay movement."""
+
+    buckets = (
+        "forward_step_token_ids_jit",
+        "PjRtCApiLoadedExecutable::Execute",
+        "command_buffer::execute",
+        "command_buffer::update",
+        "np.asarray(jax.Array)",
+    )
+    rows: list[list[str]] = []
+    for workload in summary.get("workloads") or []:
+        for config in summary.get("configs") or []:
+            matrix_row = ((summary.get("matrix") or {}).get(workload) or {}).get(config) or {}
+            aggregate = matrix_row.get("aggregate") or {}
+            scheduler = aggregate.get("scheduler_diagnostics_median") or {}
+            step_count = scheduler.get("step_count")
+            decode_step_count = scheduler.get("decode_step_count")
+            if not scheduler.get("available") or not step_count:
+                continue
+            cpu_ranges = (aggregate.get("profile_scoped_range_medians") or {}).get("cpu") or {}
+            comparison = ((summary.get("comparisons") or {}).get(workload) or {}).get(config) or {}
+            cpu_delta = (comparison.get("profile_scoped_delta_vs_jax_reference") or {}).get("cpu") or {}
+            for bucket in buckets:
+                current = cpu_ranges.get(bucket) or {}
+                current_count = current.get("count_median")
+                current_total = current.get("total_ms_median")
+                if current_count is None and current_total is None:
+                    continue
+                reference = cpu_delta.get(bucket) or {}
+                reference_count = reference.get("reference_count")
+                reference_total = reference.get("reference_total_ms")
+                rows.append(
+                    [
+                        str(workload),
+                        str(config),
+                        bucket,
+                        _fmt(step_count, digits=1),
+                        _fmt(decode_step_count, digits=1),
+                        _fmt(current_count, digits=1),
+                        _fmt(_safe_divide(current_count, step_count), digits=2),
+                        _fmt(_safe_divide(current_total, step_count), suffix=" ms"),
+                        _fmt(reference_count, digits=1),
+                        _fmt(_safe_divide(reference_count, step_count), digits=2),
+                        _fmt(_safe_divide(reference_total, step_count), suffix=" ms"),
+                    ]
+                )
+    return rows
+
+
 def _markdown_table(headers: list[str], rows: list[list[str]]) -> list[str]:
     if not rows:
         return ["No rows."]
@@ -468,6 +524,28 @@ def render_markdown(
                     "decode step s",
                 ],
                 scheduler_rows,
+            )
+        )
+
+    host_replay_rows = _host_replay_rows(summary)
+    if host_replay_rows:
+        lines.extend(["", "## Host Replay Diagnostics", ""])
+        lines.extend(
+            _markdown_table(
+                [
+                    "workload",
+                    "config",
+                    "bucket",
+                    "steps",
+                    "decode steps",
+                    "count",
+                    "count/step",
+                    "ms/step",
+                    "ref count",
+                    "ref count/step",
+                    "ref ms/step",
+                ],
+                host_replay_rows,
             )
         )
 

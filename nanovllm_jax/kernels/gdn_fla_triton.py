@@ -82,6 +82,34 @@ def _decode_triton_block_v(value_dim: int) -> int:
     return _normalize_int_env(env_name, block_v, min_value=1, max_value=128)
 
 
+def _kkt_block_dot_enabled() -> bool:
+    return (
+        os.environ.get("NANO_VLLM_JAX_GDN_KKT_BLOCK_DOT", "0").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
+
+
+def _fwd_o_block_dot_enabled() -> bool:
+    return (
+        os.environ.get("NANO_VLLM_JAX_GDN_FWD_O_BLOCK_DOT", "0").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
+
+
+def _delta_h_block_dot_enabled() -> bool:
+    return (
+        os.environ.get("NANO_VLLM_JAX_GDN_DELTA_H_BLOCK_DOT", "0").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
+
+
+def _recompute_block_dot_enabled() -> bool:
+    return (
+        os.environ.get("NANO_VLLM_JAX_GDN_RECOMPUTE_BLOCK_DOT", "0").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
+
+
 def _configure_triton_runtime() -> None:
     root = _runtime_root()
     triton_cache = root / ".cache" / "triton"
@@ -257,6 +285,90 @@ def _gdn_fla_chunk_scaled_dot_kkt_packed_kernel(
         out + out_offsets,
         scores,
         mask=use_row & row_in_bounds & (col_offsets < chunk_size),
+    )
+
+
+@triton.jit
+def _gdn_fla_chunk_scaled_dot_kkt_packed_block_kernel(
+    key,
+    beta,
+    gate_cumsum,
+    cu_seqlens,
+    chunk_indices,
+    out,
+    num_key_heads: tl.constexpr,
+    num_output_heads: tl.constexpr,
+    key_dim: tl.constexpr,
+    chunk_size: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    USE_GATE: tl.constexpr,
+):
+    pid_chunk = tl.program_id(0)
+    pid_head = tl.program_id(1)
+
+    head_mask = pid_head < num_output_heads
+    offs_t = tl.arange(0, BLOCK_S)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    chunk_row = tl.load(chunk_indices + pid_chunk * 2 + 0).to(tl.int32)
+    chunk_id = tl.load(chunk_indices + pid_chunk * 2 + 1).to(tl.int32)
+
+    row_start = tl.load(cu_seqlens + chunk_row)
+    row_end = tl.load(cu_seqlens + chunk_row + 1)
+    chunk_start = row_start + chunk_id * chunk_size
+    chunk_end = tl.minimum(row_end, row_start + (chunk_id + 1) * chunk_size)
+    chunk_len = chunk_end - chunk_start
+    valid_t = offs_t < chunk_len
+
+    head_group = num_output_heads // num_key_heads
+    key_head = pid_head // head_group
+
+    beta_vals = tl.load(
+        beta + (chunk_start + offs_t) * num_output_heads + pid_head,
+        mask=head_mask & valid_t,
+        other=0.0,
+    ).to(tl.float32)
+    k_offsets = (
+        (chunk_start + offs_t[:, None]) * num_key_heads * key_dim
+        + key_head * key_dim
+        + offs_k[None, :]
+    )
+    key_vals = tl.load(
+        key + k_offsets,
+        mask=head_mask & valid_t[:, None] & (offs_k[None, :] < key_dim),
+        other=0.0,
+    )
+    key_beta = key_vals * beta_vals[:, None]
+    scores = tl.dot(key_beta, tl.trans(key_vals).to(key_beta.dtype))
+
+    if USE_GATE:
+        gate_vals = tl.load(
+            gate_cumsum + (chunk_start + offs_t) * num_output_heads + pid_head,
+            mask=head_mask & valid_t,
+            other=0.0,
+        ).to(tl.float32)
+        scores *= tl.exp(gate_vals[:, None] - gate_vals[None, :])
+
+    row_offsets = offs_t[:, None]
+    col_offsets = offs_t[None, :]
+    local_mask = (
+        (row_offsets > col_offsets)
+        & (row_offsets < chunk_len)
+        & (col_offsets < chunk_len)
+    )
+    scores = tl.where(local_mask, scores, 0.0)
+
+    out_offsets = (
+        ((chunk_start + row_offsets) * num_output_heads + pid_head) * chunk_size
+        + col_offsets
+    )
+    tl.store(
+        out + out_offsets,
+        scores,
+        mask=head_mask
+        & (row_offsets < chunk_len)
+        & (col_offsets < chunk_size),
     )
 
 
@@ -468,6 +580,256 @@ def _gdn_fla_chunk_delta_h_packed_kernel(
 
 
 @triton.jit
+def _gdn_fla_chunk_delta_h_packed_block_kernel(
+    key,
+    w,
+    u,
+    gate_cumsum,
+    initial_state,
+    cu_seqlens,
+    chunk_offsets,
+    out_h,
+    out_v_new,
+    out_final_state,
+    num_key_heads: tl.constexpr,
+    num_output_heads: tl.constexpr,
+    key_dim: tl.constexpr,
+    value_dim: tl.constexpr,
+    chunk_size: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    MAX_CHUNKS: tl.constexpr,
+    USE_GATE: tl.constexpr,
+):
+    pid_v_block = tl.program_id(0)
+    pid_row = tl.program_id(1)
+    pid_head = tl.program_id(2)
+
+    head_mask = pid_head < num_output_heads
+    offs_t = tl.arange(0, BLOCK_T)
+    offs_v = pid_v_block * BLOCK_V + tl.arange(0, BLOCK_V)
+    offs_k = tl.arange(0, BLOCK_K)
+    val_mask = offs_v < value_dim
+
+    row_start = tl.load(cu_seqlens + pid_row).to(tl.int32)
+    row_end = tl.load(cu_seqlens + pid_row + 1).to(tl.int32)
+    row_len = row_end - row_start
+    row_chunk_count = (row_len + chunk_size - 1) // chunk_size
+    row_chunk_base = tl.load(chunk_offsets + pid_row).to(tl.int32)
+    head_group = num_output_heads // num_key_heads
+    key_head = pid_head // head_group
+
+    state_base = (pid_row * num_output_heads + pid_head) * value_dim * key_dim
+    h1 = tl.load(
+        initial_state + state_base + offs_v[:, None] * key_dim + offs_k[None, :],
+        mask=head_mask & val_mask[:, None] & (offs_k[None, :] < key_dim),
+        other=0.0,
+    ).to(tl.float32)
+    if key_dim > 64:
+        k2 = 64 + offs_k
+        h2 = tl.load(
+            initial_state + state_base + offs_v[:, None] * key_dim + k2[None, :],
+            mask=head_mask & val_mask[:, None] & (k2[None, :] < key_dim),
+            other=0.0,
+        ).to(tl.float32)
+    if key_dim > 128:
+        k3 = 128 + offs_k
+        h3 = tl.load(
+            initial_state + state_base + offs_v[:, None] * key_dim + k3[None, :],
+            mask=head_mask & val_mask[:, None] & (k3[None, :] < key_dim),
+            other=0.0,
+        ).to(tl.float32)
+    if key_dim > 192:
+        k4 = 192 + offs_k
+        h4 = tl.load(
+            initial_state + state_base + offs_v[:, None] * key_dim + k4[None, :],
+            mask=head_mask & val_mask[:, None] & (k4[None, :] < key_dim),
+            other=0.0,
+        ).to(tl.float32)
+
+    for local_chunk in range(MAX_CHUNKS):
+        has_chunk = head_mask & (local_chunk < row_chunk_count)
+        chunk_start = row_start + local_chunk * chunk_size
+        chunk_end = tl.minimum(row_end, row_start + (local_chunk + 1) * chunk_size)
+        chunk_len = chunk_end - chunk_start
+        valid_t = offs_t < chunk_len
+        has_tokens = has_chunk & (chunk_len > 0)
+        output_chunk_id = row_chunk_base + local_chunk
+
+        h_base = (output_chunk_id * num_output_heads + pid_head) * value_dim * key_dim
+        tl.store(
+            out_h + h_base + offs_v[:, None] * key_dim + offs_k[None, :],
+            h1,
+            mask=has_chunk & val_mask[:, None] & (offs_k[None, :] < key_dim),
+        )
+        if key_dim > 64:
+            k2 = 64 + offs_k
+            tl.store(
+                out_h + h_base + offs_v[:, None] * key_dim + k2[None, :],
+                h2,
+                mask=has_chunk & val_mask[:, None] & (k2[None, :] < key_dim),
+            )
+        if key_dim > 128:
+            k3 = 128 + offs_k
+            tl.store(
+                out_h + h_base + offs_v[:, None] * key_dim + k3[None, :],
+                h3,
+                mask=has_chunk & val_mask[:, None] & (k3[None, :] < key_dim),
+            )
+        if key_dim > 192:
+            k4 = 192 + offs_k
+            tl.store(
+                out_h + h_base + offs_v[:, None] * key_dim + k4[None, :],
+                h4,
+                mask=has_chunk & val_mask[:, None] & (k4[None, :] < key_dim),
+            )
+
+        w_base = (chunk_start + offs_t[:, None]) * num_output_heads * key_dim + pid_head * key_dim
+        v_delta = tl.zeros((BLOCK_T, BLOCK_V), dtype=tl.float32)
+        w1 = tl.load(
+            w + w_base + offs_k[None, :],
+            mask=has_tokens & valid_t[:, None] & (offs_k[None, :] < key_dim),
+            other=0.0,
+        )
+        v_delta += tl.dot(w1, tl.trans(h1).to(w1.dtype))
+        if key_dim > 64:
+            k2 = 64 + offs_k
+            w2 = tl.load(
+                w + w_base + k2[None, :],
+                mask=has_tokens & valid_t[:, None] & (k2[None, :] < key_dim),
+                other=0.0,
+            )
+            v_delta += tl.dot(w2, tl.trans(h2).to(w2.dtype))
+        if key_dim > 128:
+            k3 = 128 + offs_k
+            w3 = tl.load(
+                w + w_base + k3[None, :],
+                mask=has_tokens & valid_t[:, None] & (k3[None, :] < key_dim),
+                other=0.0,
+            )
+            v_delta += tl.dot(w3, tl.trans(h3).to(w3.dtype))
+        if key_dim > 192:
+            k4 = 192 + offs_k
+            w4 = tl.load(
+                w + w_base + k4[None, :],
+                mask=has_tokens & valid_t[:, None] & (k4[None, :] < key_dim),
+                other=0.0,
+            )
+            v_delta += tl.dot(w4, tl.trans(h4).to(w4.dtype))
+
+        u_vals = tl.load(
+            u
+            + (chunk_start + offs_t[:, None]) * num_output_heads * value_dim
+            + pid_head * value_dim
+            + offs_v[None, :],
+            mask=has_tokens & valid_t[:, None] & val_mask[None, :],
+            other=0.0,
+        )
+        v_delta = u_vals - v_delta
+        tl.store(
+            out_v_new
+            + (chunk_start + offs_t[:, None]) * num_output_heads * value_dim
+            + pid_head * value_dim
+            + offs_v[None, :],
+            v_delta,
+            mask=has_tokens & valid_t[:, None] & val_mask[None, :],
+        )
+
+        v_update = v_delta
+        if USE_GATE:
+            last_idx = tl.minimum((local_chunk + 1) * chunk_size, row_len) - 1
+            last_gate = tl.load(
+                gate_cumsum + (row_start + last_idx) * num_output_heads + pid_head,
+                mask=has_tokens,
+                other=0.0,
+            ).to(tl.float32)
+            gate_vals = tl.load(
+                gate_cumsum + (chunk_start + offs_t) * num_output_heads + pid_head,
+                mask=has_tokens & valid_t,
+                other=0.0,
+            ).to(tl.float32)
+            v_update = v_update * tl.where(
+                valid_t[:, None],
+                tl.exp(last_gate - gate_vals)[:, None],
+                0.0,
+            )
+            state_scale = tl.where(has_tokens, tl.exp(last_gate), 1.0)
+            h1 *= state_scale
+            if key_dim > 64:
+                h2 *= state_scale
+            if key_dim > 128:
+                h3 *= state_scale
+            if key_dim > 192:
+                h4 *= state_scale
+        else:
+            v_update = tl.where(valid_t[:, None], v_update, 0.0)
+
+        key_base = (
+            (chunk_start + offs_t[None, :]) * num_key_heads * key_dim
+            + key_head * key_dim
+        )
+        k1 = tl.load(
+            key + key_base + offs_k[:, None],
+            mask=has_tokens & valid_t[None, :] & (offs_k[:, None] < key_dim),
+            other=0.0,
+        )
+        h1 += tl.trans(tl.dot(k1, v_update.to(k1.dtype)))
+        if key_dim > 64:
+            k2 = 64 + offs_k
+            key2 = tl.load(
+                key + key_base + k2[:, None],
+                mask=has_tokens & valid_t[None, :] & (k2[:, None] < key_dim),
+                other=0.0,
+            )
+            h2 += tl.trans(tl.dot(key2, v_update.to(key2.dtype)))
+        if key_dim > 128:
+            k3 = 128 + offs_k
+            key3 = tl.load(
+                key + key_base + k3[:, None],
+                mask=has_tokens & valid_t[None, :] & (k3[:, None] < key_dim),
+                other=0.0,
+            )
+            h3 += tl.trans(tl.dot(key3, v_update.to(key3.dtype)))
+        if key_dim > 192:
+            k4 = 192 + offs_k
+            key4 = tl.load(
+                key + key_base + k4[:, None],
+                mask=has_tokens & valid_t[None, :] & (k4[:, None] < key_dim),
+                other=0.0,
+            )
+            h4 += tl.trans(tl.dot(key4, v_update.to(key4.dtype)))
+
+    final_base = (pid_row * num_output_heads + pid_head) * value_dim * key_dim
+    tl.store(
+        out_final_state + final_base + offs_v[:, None] * key_dim + offs_k[None, :],
+        h1,
+        mask=head_mask & val_mask[:, None] & (offs_k[None, :] < key_dim),
+    )
+    if key_dim > 64:
+        k2 = 64 + offs_k
+        tl.store(
+            out_final_state + final_base + offs_v[:, None] * key_dim + k2[None, :],
+            h2,
+            mask=head_mask & val_mask[:, None] & (k2[None, :] < key_dim),
+        )
+    if key_dim > 128:
+        k3 = 128 + offs_k
+        tl.store(
+            out_final_state + final_base + offs_v[:, None] * key_dim + k3[None, :],
+            h3,
+            mask=head_mask & val_mask[:, None] & (k3[None, :] < key_dim),
+        )
+    if key_dim > 192:
+        k4 = 192 + offs_k
+        tl.store(
+            out_final_state + final_base + offs_v[:, None] * key_dim + k4[None, :],
+            h4,
+            mask=head_mask & val_mask[:, None] & (k4[None, :] < key_dim),
+        )
+
+
+@triton.jit
 def _gdn_fla_recompute_w_packed_kernel(
     key,
     beta,
@@ -611,6 +973,111 @@ def _gdn_fla_recompute_u_packed_kernel(
 
 
 @triton.jit
+def _gdn_fla_recompute_w_u_packed_block_kernel(
+    key,
+    value,
+    beta,
+    gate_cumsum,
+    attention_inverse,
+    cu_seqlens,
+    chunk_indices,
+    out_w,
+    out_u,
+    num_key_heads: tl.constexpr,
+    num_output_heads: tl.constexpr,
+    key_dim: tl.constexpr,
+    value_dim: tl.constexpr,
+    chunk_size: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    pid_chunk = tl.program_id(0)
+    pid_head = tl.program_id(1)
+
+    head_mask = pid_head < num_output_heads
+    offs_t = tl.arange(0, BLOCK_T)
+    offs_col = tl.arange(0, BLOCK_T)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_v = tl.arange(0, BLOCK_V)
+
+    chunk_row = tl.load(chunk_indices + pid_chunk * 2 + 0).to(tl.int32)
+    chunk_id = tl.load(chunk_indices + pid_chunk * 2 + 1).to(tl.int32)
+
+    row_start = tl.load(cu_seqlens + chunk_row).to(tl.int32)
+    row_end = tl.load(cu_seqlens + chunk_row + 1).to(tl.int32)
+    chunk_start = row_start + chunk_id * chunk_size
+    chunk_end = tl.minimum(row_end, row_start + (chunk_id + 1) * chunk_size)
+    chunk_len = chunk_end - chunk_start
+    valid_t = offs_t < chunk_len
+    valid_col = offs_col < chunk_len
+
+    block_a = tl.load(
+        attention_inverse
+        + ((chunk_start + offs_t[:, None]) * num_output_heads + pid_head) * chunk_size
+        + offs_col[None, :],
+        mask=head_mask & valid_t[:, None] & valid_col[None, :],
+        other=0.0,
+    )
+    beta_vals = tl.load(
+        beta + (chunk_start + offs_t) * num_output_heads + pid_head,
+        mask=head_mask & valid_t,
+        other=0.0,
+    )
+
+    for v_block in range(0, value_dim, BLOCK_V):
+        v_offsets = v_block + offs_v
+        value_vals = tl.load(
+            value
+            + (chunk_start + offs_t[:, None]) * num_output_heads * value_dim
+            + pid_head * value_dim
+            + v_offsets[None, :],
+            mask=head_mask & valid_t[:, None] & (v_offsets[None, :] < value_dim),
+            other=0.0,
+        )
+        rhs = (value_vals * beta_vals[:, None]).to(value_vals.dtype)
+        u_vals = tl.dot(block_a, rhs)
+        tl.store(
+            out_u
+            + (chunk_start + offs_t[:, None]) * num_output_heads * value_dim
+            + pid_head * value_dim
+            + v_offsets[None, :],
+            u_vals,
+            mask=head_mask & valid_t[:, None] & (v_offsets[None, :] < value_dim),
+        )
+
+    gate_vals = tl.exp(
+        tl.load(
+            gate_cumsum + (chunk_start + offs_t) * num_output_heads + pid_head,
+            mask=head_mask & valid_t,
+            other=0.0,
+        ).to(tl.float32)
+    )
+    head_group = num_output_heads // num_key_heads
+    key_head = pid_head // head_group
+    for k_block in range(0, key_dim, BLOCK_K):
+        k_offsets = k_block + offs_k
+        key_vals = tl.load(
+            key
+            + (chunk_start + offs_t[:, None]) * num_key_heads * key_dim
+            + key_head * key_dim
+            + k_offsets[None, :],
+            mask=head_mask & valid_t[:, None] & (k_offsets[None, :] < key_dim),
+            other=0.0,
+        )
+        rhs = (key_vals * beta_vals[:, None] * gate_vals[:, None]).to(key_vals.dtype)
+        w_vals = tl.dot(block_a, rhs)
+        tl.store(
+            out_w
+            + (chunk_start + offs_t[:, None]) * num_output_heads * key_dim
+            + pid_head * key_dim
+            + k_offsets[None, :],
+            w_vals,
+            mask=head_mask & valid_t[:, None] & (k_offsets[None, :] < key_dim),
+        )
+
+
+@triton.jit
 def _gdn_fla_chunk_fwd_o_packed_kernel(
     query,
     key,
@@ -722,6 +1189,118 @@ def _gdn_fla_chunk_fwd_o_packed_kernel(
     tl.store(out + out_offsets, out_vals, mask=store_mask)
 
 
+@triton.jit
+def _gdn_fla_chunk_fwd_o_packed_block_kernel(
+    query,
+    key,
+    v_new,
+    h,
+    gate_cumsum,
+    cu_seqlens,
+    chunk_indices,
+    out,
+    num_key_heads: tl.constexpr,
+    num_output_heads: tl.constexpr,
+    value_dim: tl.constexpr,
+    key_dim: tl.constexpr,
+    chunk_size: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    USE_GATE: tl.constexpr,
+):
+    pid_v_block = tl.program_id(0)
+    pid_chunk = tl.program_id(1)
+    pid_head = tl.program_id(2)
+
+    head_mask = pid_head < num_output_heads
+    offs_t = tl.arange(0, BLOCK_T)
+    offs_v = pid_v_block * BLOCK_V + tl.arange(0, BLOCK_V)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    chunk_row = tl.load(chunk_indices + pid_chunk * 2 + 0).to(tl.int32)
+    chunk_id = tl.load(chunk_indices + pid_chunk * 2 + 1).to(tl.int32)
+
+    row_start = tl.load(cu_seqlens + chunk_row).to(tl.int32)
+    row_end = tl.load(cu_seqlens + chunk_row + 1).to(tl.int32)
+    chunk_start = row_start + chunk_id * chunk_size
+    chunk_end = tl.minimum(row_end, row_start + (chunk_id + 1) * chunk_size)
+    chunk_len = chunk_end - chunk_start
+
+    valid_t = offs_t < chunk_len
+    valid_v = offs_v < value_dim
+    head_group = num_output_heads // num_key_heads
+    key_head = pid_head // head_group
+
+    block_o = tl.zeros((BLOCK_T, BLOCK_V), dtype=tl.float32)
+    block_a = tl.zeros((BLOCK_T, BLOCK_T), dtype=tl.float32)
+
+    for k_block in range(0, key_dim, BLOCK_K):
+        k_offsets = k_block + offs_k
+        q_vals = tl.load(
+            query
+            + (chunk_start + offs_t[:, None]) * num_key_heads * key_dim
+            + key_head * key_dim
+            + k_offsets[None, :],
+            mask=head_mask & valid_t[:, None] & (k_offsets[None, :] < key_dim),
+            other=0.0,
+        )
+        k_vals_t = tl.load(
+            key
+            + (chunk_start + offs_t[None, :]) * num_key_heads * key_dim
+            + key_head * key_dim
+            + k_offsets[:, None],
+            mask=head_mask & valid_t[None, :] & (k_offsets[:, None] < key_dim),
+            other=0.0,
+        )
+        h_vals = tl.load(
+            h
+            + (pid_chunk * num_output_heads + pid_head) * value_dim * key_dim
+            + offs_v[:, None] * key_dim
+            + k_offsets[None, :],
+            mask=head_mask & valid_v[:, None] & (k_offsets[None, :] < key_dim),
+            other=0.0,
+        )
+        block_o += tl.dot(q_vals, tl.trans(h_vals).to(q_vals.dtype))
+        block_a += tl.dot(q_vals, k_vals_t.to(q_vals.dtype))
+
+    if USE_GATE:
+        gate_vals = tl.load(
+            gate_cumsum + (chunk_start + offs_t) * num_output_heads + pid_head,
+            mask=head_mask & valid_t,
+            other=0.0,
+        ).to(tl.float32)
+        block_o *= tl.exp(gate_vals)[:, None]
+        block_a *= tl.exp(gate_vals[:, None] - gate_vals[None, :])
+
+    row_offsets = offs_t[:, None]
+    col_offsets = offs_t[None, :]
+    local_mask = (
+        (row_offsets >= col_offsets)
+        & (row_offsets < chunk_len)
+        & (col_offsets < chunk_len)
+    )
+    block_a = tl.where(local_mask, block_a, 0.0)
+
+    v_vals = tl.load(
+        v_new
+        + (chunk_start + offs_t[:, None]) * num_output_heads * value_dim
+        + pid_head * value_dim
+        + offs_v[None, :],
+        mask=head_mask & valid_t[:, None] & valid_v[None, :],
+        other=0.0,
+    )
+    out_vals = block_o + tl.dot(block_a.to(v_vals.dtype), v_vals)
+    tl.store(
+        out
+        + (chunk_start + offs_t[:, None]) * num_output_heads * value_dim
+        + pid_head * value_dim
+        + offs_v[None, :],
+        out_vals,
+        mask=head_mask & valid_t[:, None] & valid_v[None, :],
+    )
+
+
 def gdn_fla_chunk_fwd_o_packed_triton(
     query: jax.Array,
     key: jax.Array,
@@ -789,6 +1368,18 @@ def gdn_fla_chunk_fwd_o_packed_triton(
     num_chunks = int(chunk_indices.shape[0])
     if num_chunks == 0:
         return jnp.zeros(v_new.shape, dtype=jnp.float32)
+    if _fwd_o_block_dot_enabled():
+        return gdn_fla_chunk_fwd_o_packed_triton_block(
+            query_fp32,
+            key_fp32,
+            v_new_fp32,
+            h_fp32,
+            reference_gate,
+            cu,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            scale=scale,
+        )
 
     block_t = int(jt.next_power_of_2(int(chunk_size)))
     block_v = int(jt.next_power_of_2(int(value_dim)))
@@ -836,6 +1427,123 @@ def gdn_fla_chunk_fwd_o_packed_triton(
         USE_GATE=_normalize_bool(use_gate),
         num_warps=1,
         num_stages=2,
+    ) * float(scale)
+
+
+def gdn_fla_chunk_fwd_o_packed_triton_block(
+    query: jax.Array,
+    key: jax.Array,
+    v_new: jax.Array,
+    h: jax.Array,
+    gate_cumsum: jax.Array | None,
+    cu_seqlens: jax.Array,
+    *,
+    chunk_size: int,
+    chunk_indices: Any | None = None,
+    scale: float | None = None,
+) -> jax.Array:
+    """vLLM-shaped packed output stage using block dots for QH and QK/V."""
+
+    if query.ndim != 3 or key.ndim != 3:
+        raise ValueError("query and key must have shape [nnz_tokens, key_heads, key_dim]")
+    if query.shape != key.shape:
+        raise ValueError("query and key shapes must match")
+    if v_new.ndim != 3:
+        raise ValueError("v_new must have shape [nnz_tokens, output_heads, value_dim]")
+    if h.ndim != 4:
+        raise ValueError("h must have shape [num_chunks, output_heads, value_dim, key_dim]")
+    if query.shape[0] != v_new.shape[0]:
+        raise ValueError("query and v_new token counts must match")
+    if v_new.shape[1] != h.shape[1]:
+        raise ValueError("v_new and h output-head dimensions must match")
+    if h.shape[2] != v_new.shape[2] or h.shape[3] != query.shape[2]:
+        raise ValueError("h value/key dimensions must match v_new/query")
+    if gate_cumsum is not None and gate_cumsum.shape != v_new.shape[:2]:
+        raise ValueError("gate_cumsum must have shape [nnz_tokens, output_heads]")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if scale is None:
+        scale = float(query.shape[-1] ** -0.5)
+
+    key_dim = query.shape[2]
+    value_dim = v_new.shape[2]
+    num_key_heads = query.shape[1]
+    output_heads = v_new.shape[1]
+    if output_heads < num_key_heads or output_heads % num_key_heads != 0:
+        raise ValueError("output_heads must be a multiple of key_heads")
+
+    query_fp32 = query.astype(jnp.float32)
+    key_fp32 = key.astype(jnp.float32)
+    v_new_fp32 = v_new.astype(jnp.float32)
+    h_fp32 = h.astype(jnp.float32)
+    if gate_cumsum is None:
+        gate_fp32 = jnp.zeros((query.shape[0], output_heads), dtype=jnp.float32)
+        use_gate = False
+        reference_gate = None
+    else:
+        gate_fp32 = gate_cumsum.astype(jnp.float32)
+        use_gate = True
+        reference_gate = gate_fp32
+
+    cu = cu_seqlens.astype(jnp.int32)
+    from nanovllm_jax.kernels.gdn_fla import prepare_gdn_fla_chunk_metadata
+
+    if chunk_indices is None:
+        chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu, chunk_size)
+
+    if chunk_indices.ndim != 2 or chunk_indices.shape[1] != 2:
+        raise ValueError("chunk_indices must have shape [num_chunks, 2]")
+
+    num_chunks = int(chunk_indices.shape[0])
+    if num_chunks == 0:
+        return jnp.zeros(v_new.shape, dtype=jnp.float32)
+
+    block_t = int(jt.next_power_of_2(int(chunk_size)))
+    block_k = min(max(32, int(jt.next_power_of_2(int(key_dim)))), 64)
+    block_v = min(max(32, int(jt.next_power_of_2(int(value_dim)))), 64)
+    if block_t < 16 or block_t > 1024 or block_k > 1024 or block_v > 1024:
+        _raise_if_gdn_fallback_disabled(
+            "Triton block-dot FLA output prefill kernel cannot handle this block size"
+        )
+        from nanovllm_jax.kernels.gdn_fla import (
+            gdn_fla_chunk_fwd_o_packed_reference,
+        )
+
+        return gdn_fla_chunk_fwd_o_packed_reference(
+            query_fp32,
+            key_fp32,
+            v_new_fp32,
+            h_fp32,
+            reference_gate,
+            cu,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            scale=scale,
+        )
+
+    out_shape = jax.ShapeDtypeStruct(v_new.shape, jnp.float32)
+    return jt.triton_call(
+        query_fp32,
+        key_fp32,
+        v_new_fp32,
+        h_fp32,
+        gate_fp32,
+        cu,
+        chunk_indices,
+        kernel=_gdn_fla_chunk_fwd_o_packed_block_kernel,
+        out_shape=out_shape,
+        grid=(jt.cdiv(value_dim, block_v), num_chunks, int(output_heads)),
+        num_key_heads=int(num_key_heads),
+        num_output_heads=int(output_heads),
+        value_dim=value_dim,
+        key_dim=int(key_dim),
+        chunk_size=chunk_size,
+        BLOCK_T=block_t,
+        BLOCK_V=block_v,
+        BLOCK_K=block_k,
+        USE_GATE=_normalize_bool(use_gate),
+        num_warps=4,
+        num_stages=3,
     ) * float(scale)
 
 
@@ -1291,6 +1999,15 @@ def gdn_fla_chunk_scaled_dot_kkt_packed_triton(
     num_chunks = int(chunk_indices.shape[0])
     if num_chunks == 0:
         return jnp.zeros((key.shape[0], beta.shape[1], int(chunk_size)), dtype=jnp.float32)
+    if _kkt_block_dot_enabled():
+        return gdn_fla_chunk_scaled_dot_kkt_packed_triton_block(
+            key,
+            beta,
+            gate_cumsum,
+            cu,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+        )
 
     key_fp32 = key.astype(jnp.float32)
     beta_fp32 = beta.astype(jnp.float32)
@@ -1354,6 +2071,103 @@ def gdn_fla_chunk_scaled_dot_kkt_packed_triton(
         USE_GATE=_normalize_bool(use_gate),
         num_warps=1,
         num_stages=2,
+    )
+
+
+def gdn_fla_chunk_scaled_dot_kkt_packed_triton_block(
+    key: jax.Array,
+    beta: jax.Array,
+    gate_cumsum: jax.Array | None,
+    cu_seqlens: jax.Array,
+    *,
+    chunk_size: int,
+    chunk_indices: Any | None = None,
+) -> jax.Array:
+    """vLLM-shaped packed KKT stage using one Triton block dot per chunk/head."""
+
+    if key.ndim != 3:
+        raise ValueError("key must have shape [nnz_tokens, key_heads, key_dim]")
+    if beta.ndim != 2:
+        raise ValueError("beta must have shape [nnz_tokens, output_heads]")
+    if key.shape[0] != beta.shape[0]:
+        raise ValueError("key and beta token counts must match")
+    if gate_cumsum is not None and gate_cumsum.shape != beta.shape:
+        raise ValueError("gate_cumsum must have the same shape as beta")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    from nanovllm_jax.kernels.gdn_fla import prepare_gdn_fla_chunk_metadata
+
+    cu = cu_seqlens.astype(jnp.int32)
+    if chunk_indices is None:
+        chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu, chunk_size)
+
+    if chunk_indices.ndim != 2 or chunk_indices.shape[1] != 2:
+        raise ValueError("chunk_indices must have shape [num_chunks, 2]")
+
+    num_chunks = int(chunk_indices.shape[0])
+    output_heads = beta.shape[1]
+    if num_chunks == 0:
+        return jnp.zeros((key.shape[0], output_heads, int(chunk_size)), dtype=jnp.float32)
+
+    key_heads = key.shape[1]
+    if output_heads < key_heads or output_heads % key_heads != 0:
+        raise ValueError("output_heads must be a multiple of key_heads")
+    key_dim = key.shape[2]
+    if key_dim <= 0:
+        raise ValueError("key_dim must be positive")
+
+    key_fp32 = key.astype(jnp.float32)
+    beta_fp32 = beta.astype(jnp.float32)
+    if gate_cumsum is None:
+        gate_fp32 = jnp.zeros_like(beta_fp32)
+        use_gate = False
+        reference_gate = None
+    else:
+        gate_fp32 = gate_cumsum.astype(jnp.float32)
+        use_gate = True
+        reference_gate = gate_fp32
+
+    block_s = int(jt.next_power_of_2(int(chunk_size)))
+    block_k = int(jt.next_power_of_2(int(key_dim)))
+    if block_s < 16 or block_k < 32 or block_s > 1024 or block_k > 1024:
+        _raise_if_gdn_fallback_disabled(
+            "Triton block-dot FLA scaled KKT prefill kernel cannot handle this block size"
+        )
+        from nanovllm_jax.kernels.gdn_fla import (
+            gdn_fla_chunk_scaled_dot_kkt_packed_reference,
+        )
+
+        return gdn_fla_chunk_scaled_dot_kkt_packed_reference(
+            key_fp32,
+            beta_fp32,
+            reference_gate,
+            cu,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+        )
+
+    out_shape = jax.ShapeDtypeStruct(
+        (key.shape[0], output_heads, int(chunk_size)),
+        jnp.float32,
+    )
+    return jt.triton_call(
+        key_fp32,
+        beta_fp32,
+        gate_fp32,
+        cu,
+        chunk_indices,
+        kernel=_gdn_fla_chunk_scaled_dot_kkt_packed_block_kernel,
+        out_shape=out_shape,
+        grid=(num_chunks, int(output_heads)),
+        num_key_heads=key_heads,
+        num_output_heads=output_heads,
+        key_dim=key_dim,
+        chunk_size=chunk_size,
+        BLOCK_K=block_k,
+        BLOCK_S=block_s,
+        USE_GATE=_normalize_bool(use_gate),
+        num_warps=4,
+        num_stages=3,
     )
 
 
@@ -1543,6 +2357,74 @@ def gdn_fla_chunk_delta_h_packed_triton(
                 max_row_chunks = int(((row_lengths + chunk_size - 1) // chunk_size).max())
     block_k = int(jt.next_power_of_2(int(key_dim)))
     block_v = int(jt.next_power_of_2(int(value_dim)))
+    if _delta_h_block_dot_enabled():
+        block_t = int(jt.next_power_of_2(int(chunk_size)))
+        delta_block_k = 64
+        delta_block_v = 32
+        if (
+            (not is_tracer and (max_row_chunks == 0 or max_row_chunks > 256))
+            or block_t < 16
+            or block_t > 1024
+            or key_dim > 256
+            or delta_block_v > 1024
+        ):
+            _raise_if_gdn_fallback_disabled(
+                "Triton block-dot FLA delta-H prefill kernel cannot handle this shape"
+            )
+            from nanovllm_jax.kernels.gdn_fla import (
+                gdn_fla_chunk_delta_h_packed_reference,
+            )
+            return gdn_fla_chunk_delta_h_packed_reference(
+                key_fp32,
+                w_fp32,
+                u_fp32,
+                gate_fp32,
+                cu,
+                state,
+                chunk_size=chunk_size,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
+                output_final_state=True,
+                save_new_value=True,
+            )
+
+        h_shape = jax.ShapeDtypeStruct(
+            (num_chunks, output_heads, value_dim, key_dim),
+            jnp.float32,
+        )
+        v_shape = jax.ShapeDtypeStruct(
+            (key.shape[0], output_heads, value_dim),
+            jnp.float32,
+        )
+        final_shape = jax.ShapeDtypeStruct(
+            (batch, output_heads, value_dim, key_dim),
+            jnp.float32,
+        )
+        return jt.triton_call(
+            key_fp32,
+            w_fp32,
+            u_fp32,
+            gate_fp32,
+            state,
+            cu,
+            chunk_offsets,
+            kernel=_gdn_fla_chunk_delta_h_packed_block_kernel,
+            out_shape=(h_shape, v_shape, final_shape),
+            grid=(jt.cdiv(value_dim, delta_block_v), batch, output_heads),
+            num_key_heads=key_heads,
+            num_output_heads=output_heads,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            chunk_size=chunk_size,
+            BLOCK_T=block_t,
+            BLOCK_V=delta_block_v,
+            BLOCK_K=delta_block_k,
+            MAX_CHUNKS=max_row_chunks,
+            USE_GATE=_normalize_bool(gate_cumsum is not None),
+            num_warps=4,
+            num_stages=3,
+        )
+
     if (
         (not is_tracer and (max_row_chunks == 0 or max_row_chunks > 256))
         or block_k > 1024
@@ -1698,6 +2580,47 @@ def gdn_fla_recompute_w_u_packed_triton(
         (key.shape[0], output_heads, value_dim),
         jnp.float32,
     )
+    if _recompute_block_dot_enabled():
+        recompute_block_k = 64
+        recompute_block_v = 64
+        if block_s < 16 or block_s > 1024:
+            _raise_if_gdn_fallback_disabled(
+                "Triton block-dot FLA recompute W/U prefill kernel cannot handle this chunk size"
+            )
+            from nanovllm_jax.kernels.gdn_fla import gdn_fla_recompute_w_u_packed_reference
+
+            return gdn_fla_recompute_w_u_packed_reference(
+                key_fp32,
+                value_fp32,
+                beta_fp32,
+                gate_fp32,
+                inverse_fp32,
+                cu,
+                chunk_size=chunk_size,
+                chunk_indices=chunk_indices,
+            )
+        return jt.triton_call(
+            key_fp32,
+            value_fp32,
+            beta_fp32,
+            gate_fp32,
+            inverse_fp32,
+            cu,
+            chunk_indices,
+            kernel=_gdn_fla_recompute_w_u_packed_block_kernel,
+            out_shape=(w_shape, u_shape),
+            grid=(num_chunks, output_heads),
+            num_key_heads=num_key_heads,
+            num_output_heads=output_heads,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            chunk_size=chunk_size,
+            BLOCK_T=block_s,
+            BLOCK_K=recompute_block_k,
+            BLOCK_V=recompute_block_v,
+            num_warps=4,
+            num_stages=3,
+        )
 
     w = jt.triton_call(
         key_fp32,

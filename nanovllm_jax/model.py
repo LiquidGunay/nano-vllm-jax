@@ -4,7 +4,7 @@ import os
 import jax
 import jax.numpy as jnp
 from jax import nn, lax
-from typing import Tuple, Optional, List, Dict
+from typing import Optional, List, Dict
 from dataclasses import dataclass, replace
 from nanovllm_jax.backends import (
     InferenceBackend,
@@ -79,6 +79,14 @@ def _decode_width1_rms_norm(
         "on",
         "True",
     }
+    if force_width1:
+        from nanovllm_jax.kernels.decode_reductions import (
+            decode_rms_norm,
+            lowered_decode_rms_norm_enabled,
+        )
+
+        if lowered_decode_rms_norm_enabled():
+            return decode_rms_norm(x, weight, eps)
     if not force_width1 or x.ndim < 3 or x.shape[1] <= 1:
         return _stable_rmsnorm_fp32(x, weight, eps) if stable_decode_norm and force_width1 else rms_norm(x, weight, eps)
     norm_fn = _stable_rmsnorm_fp32 if stable_decode_norm else rms_norm
@@ -128,6 +136,77 @@ def _lm_head_decode_activation_dtype() -> jnp.dtype:
         "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE must be fp32 or bf16, "
         f"got {value!r}"
     )
+
+
+def _decode_padded_gemm_enabled() -> bool:
+    return os.environ.get("NANO_VLLM_JAX_DECODE_PADDED_GEMM", "0") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "True",
+    }
+
+
+def _decode_padded_gemm_gate_up_enabled() -> bool:
+    return os.environ.get("NANO_VLLM_JAX_DECODE_PADDED_GEMM_GATE_UP", "0") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "True",
+    }
+
+
+def _decode_padded_gemm_rows() -> int:
+    value = os.environ.get("NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS", "8")
+    try:
+        rows = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS must be an integer, "
+            f"got {value!r}"
+        ) from exc
+    if rows < 1:
+        raise ValueError("NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS must be positive")
+    return rows
+
+
+def _decode_padded_gemm_max_out_dim() -> int:
+    value = os.environ.get("NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM", "8192")
+    try:
+        out_dim = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM must be an integer, "
+            f"got {value!r}"
+        ) from exc
+    if out_dim < 1:
+        raise ValueError("NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM must be positive")
+    return out_dim
+
+
+def _can_use_decode_padded_gemm(x: jnp.ndarray, weight: jnp.ndarray) -> bool:
+    return (
+        _decode_padded_gemm_enabled()
+        and x.ndim == 3
+        and weight.ndim == 2
+        and int(x.shape[0]) == 1
+        and int(x.shape[1]) == 1
+        and int(x.shape[-1]) == int(weight.shape[0])
+        and int(weight.shape[1]) <= _decode_padded_gemm_max_out_dim()
+    )
+
+
+def _decode_padded_gemm_dot(x: jnp.ndarray, weight: jnp.ndarray) -> jnp.ndarray:
+    """Run a B=1 decode projection through a small GEMM-shaped dot."""
+    hidden = int(x.shape[-1])
+    out_dim = int(weight.shape[1])
+    rows = _decode_padded_gemm_rows()
+    x_row = jnp.reshape(x, (1, hidden))
+    x_padded = jnp.broadcast_to(x_row, (rows, hidden))
+    out = jnp.dot(x_padded, weight)
+    return out[:1, :].reshape(1, 1, out_dim)
 
 
 def _decode_projection_activation_dtype(batch_size: int | None = None) -> jnp.dtype:
@@ -287,7 +366,22 @@ def lm_head_token_ids_and_topk(
     bloats the verifier path. Keep the dense LM-head computation inside the
     compiled graph and return only small verifier products.
     """
-    hidden_norm = hidden if hidden_is_normed else rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
+    if hidden_is_normed:
+        hidden_norm = hidden
+    else:
+        if not is_prefill:
+            from nanovllm_jax.kernels.decode_reductions import (
+                decode_rms_norm,
+                lowered_decode_rms_norm_enabled,
+            )
+
+            hidden_norm = (
+                decode_rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
+                if lowered_decode_rms_norm_enabled()
+                else rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
+            )
+        else:
+            hidden_norm = rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
     hidden_norm = hidden_norm.astype(
         _lm_head_decode_activation_dtype() if not is_prefill else jnp.float32
     )
@@ -846,7 +940,14 @@ def gated_deltanet_block(
             compact_prefill_tokens,
         )
     else:
-        mixed_qkv = _tokenwise_decode_dot(x_cast, params["in_proj_qkv"], force_width1=force_width1_dot)
+        if _can_use_decode_padded_gemm(x_cast, params["in_proj_qkv"]):
+            mixed_qkv = _decode_padded_gemm_dot(x_cast, params["in_proj_qkv"])
+        else:
+            mixed_qkv = _tokenwise_decode_dot(
+                x_cast,
+                params["in_proj_qkv"],
+                force_width1=force_width1_dot,
+            )
     if is_prefill:
         z = _compact_prefill_dot_if_enabled(
             x_cast,
@@ -1706,10 +1807,21 @@ def transformer_block(
         )
     else:
         x_proj = x.astype(_decode_projection_activation_dtype(x.shape[0]))
-        gate = _tokenwise_decode_dot(x_proj, params["gate_proj"], force_width1=force_width1_dot)
-        up = _tokenwise_decode_dot(x_proj, params["up_proj"], force_width1=force_width1_dot)
+        if (
+            _decode_padded_gemm_gate_up_enabled()
+            and _can_use_decode_padded_gemm(x_proj, params["gate_proj"])
+            and params["up_proj"].shape == params["gate_proj"].shape
+        ):
+            gate = _decode_padded_gemm_dot(x_proj, params["gate_proj"])
+            up = _decode_padded_gemm_dot(x_proj, params["up_proj"])
+        else:
+            gate = _tokenwise_decode_dot(x_proj, params["gate_proj"], force_width1=force_width1_dot)
+            up = _tokenwise_decode_dot(x_proj, params["up_proj"], force_width1=force_width1_dot)
         x = activation_fn(gate) * up
-        x = _tokenwise_decode_dot(x, params["down_proj"], force_width1=force_width1_dot)
+        if _can_use_decode_padded_gemm(x, params["down_proj"]):
+            x = _decode_padded_gemm_dot(x, params["down_proj"])
+        else:
+            x = _tokenwise_decode_dot(x, params["down_proj"], force_width1=force_width1_dot)
     mlp_out = x
 
     x = residual + x
