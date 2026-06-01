@@ -6159,3 +6159,40 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   tuning; we are in the same neighborhood (~`0.82x`) and should move on to the
   next decoder-stage opportunities (command-buffer pressure and Triton decode-step
   arithmetic lowering).
+
+### Entry 186 - Current GDN Decode Config And Prep Cleanup
+
+- date: 2026-06-01
+- change:
+  - promoted the tracked `gpu_paged_gdn_fla_decode_bf16_qkv` config to the
+    current pre-normalized packed-decode settings:
+    `NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK=1`,
+    `TRITON_NUM_WARPS=8`, `TRITON_NUM_STAGES=2`, `TRITON_BLOCK_V=32`;
+  - removed the redundant JAX-side `gate`/`beta` recompute in the
+    `triton_fla_prep_bf16` post-conv prefill path. Both the JAX fallback helper
+    and the Triton prep kernel already return masked FP32 `gate`/`beta`.
+  - updated `AGENTS.md` to stop using `realmai_worker` and prefer
+    `gpt-5.3-codex-spark` for newly spawned subagents.
+- focused tests:
+  - `pytest -q tests/test_gdn_packed_decode_reference.py tests/test_cuda_fp32_ffi.py -q`
+    - 36 passed.
+  - `pytest -q tests/test_gdn_post_conv_prefill_reference.py -k "triton_fla_prep_bf16 or post_conv_prep_bf16" -q`
+    - 1 passed.
+- benchmark artifact: `results/gpu_matrix_gdn_current_best_20260601_postpatch.json`
+- report: `results/gpu_matrix_gdn_current_best_20260601_postpatch.md`
+- benchmark command:
+  `.venv/bin/python3 -m benchmarks.run_gpu_matrix --configs gpu_paged_gdn_fla_decode_bf16_qkv --workloads decode_heavy_128x128 --repeats 2 --no-live-vllm --output-json results/gpu_matrix_gdn_current_best_20260601_postpatch.json --run-dir results/gpu_matrix_runs/20260601_gdn_current_best_postpatch`
+- benchmark result:
+  - `speed_claim_ready=true`, `exact_generated_token_match=true`;
+  - JAX `163.62 tok/s`, vLLM `213.54 tok/s`, JAX/vLLM `0.766x`;
+  - JAX reference `151.84 tok/s`, JAX/reference `1.078x`;
+  - `target_vllm_ratio_met=false` for the `0.9x` target.
+- reproducibility check: reran commit `55247ab` with the same pre-normalized
+  decode settings and current runtime; it measured `164.22 tok/s`, JAX/vLLM
+  `0.769x` on one repeat. The earlier `0.842x` pre-normalized artifact was not
+  reproduced, so the current reproducible evidence is the `~0.77x` range.
+- conclusion: retain the tracked config promotion and redundant prep cleanup.
+  The GDN FLA decode path remains correctness-clean and faster than the stored
+  JAX reference, but it is still below the requested `0.9x` vLLM target. Next
+  work should target decoder-stage command-buffer/update pressure and remaining
+  compiled-step reductions rather than more packed-decode launch tuning.

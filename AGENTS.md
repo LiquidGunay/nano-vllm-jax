@@ -2,6 +2,7 @@
 
 ## Subagents
 
+- Do not use `realmai_worker` for new delegated work.
 - Prefer `gpt-5.3-codex-spark` for newly spawned subagents unless a task clearly
   needs a different model.
 

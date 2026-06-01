@@ -1153,12 +1153,6 @@ class PureJAXBackend:
                     normalize_qk=use_qk_l2norm_in_kernel,
                 )
                 seq_lens = valid_token_mask.sum(axis=1).astype(jnp.int32)
-            beta = jax.nn.sigmoid(b.astype(jnp.float32))
-            gate = -decay.astype(jnp.float32) * jax.nn.softplus(
-                a.astype(jnp.float32) + dt_bias.astype(jnp.float32)
-            )
-            beta = jnp.where(valid_token_mask[:, :, None] > 0, beta, 0.0)
-            gate = jnp.where(valid_token_mask[:, :, None] > 0, gate, 0.0)
             output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
                 query,
                 key,
