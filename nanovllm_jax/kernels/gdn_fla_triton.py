@@ -18,6 +18,24 @@ import jax_triton as jt
 import triton
 import triton.language as tl
 
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
+_GDN_DISABLE_FALLBACKS_ENV = "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS"
+
+
+def _gdn_disable_fallbacks() -> bool:
+    return (
+        os.environ.get(_GDN_DISABLE_FALLBACKS_ENV, "0").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
+
+
+def _raise_if_gdn_fallback_disabled(reason: str) -> None:
+    if _gdn_disable_fallbacks():
+        raise RuntimeError(
+            f"{reason}; implicit GDN kernel fallbacks are disabled by "
+            f"{_GDN_DISABLE_FALLBACKS_ENV}=1"
+        )
+
 
 def _normalize_int_env(name: str, default: int, *, min_value: int, max_value: int) -> int:
     """Read an integer env override with bounds; return ``default`` when unset."""
@@ -776,6 +794,9 @@ def gdn_fla_chunk_fwd_o_packed_triton(
     block_v = int(jt.next_power_of_2(int(value_dim)))
     block_k = int(jt.next_power_of_2(int(key_dim)))
     if block_t > 1024 or block_v > 1024 or block_k > 1024:
+        _raise_if_gdn_fallback_disabled(
+            "Triton FLA chunk forward-output prefill kernel cannot handle this block size"
+        )
         from nanovllm_jax.kernels.gdn_fla import (
             gdn_fla_chunk_fwd_o_packed_reference,
         )
@@ -847,6 +868,9 @@ def gdn_fla_chunk_gated_delta_rule_packed_triton(
         raise ValueError("initial_state batch/head dimensions must match cu_seqlens/query")
 
     if use_qk_l2norm_in_kernel:
+        _raise_if_gdn_fallback_disabled(
+            "Triton FLA composed prefill kernel does not support in-kernel q/k l2norm"
+        )
         from nanovllm_jax.kernels.gdn_fla import (
             gdn_fla_chunk_gated_delta_rule_packed_reference,
         )
@@ -1204,6 +1228,9 @@ def gdn_fla_chunk_local_cumsum_packed_triton(
 
     block = int(jt.next_power_of_2(int(chunk_size)))
     if block > 1024:
+        _raise_if_gdn_fallback_disabled(
+            "Triton FLA local-cumsum prefill kernel cannot handle this chunk size"
+        )
         from nanovllm_jax.kernels.gdn_fla import gdn_fla_chunk_local_cumsum_packed_reference
 
         return gdn_fla_chunk_local_cumsum_packed_reference(
@@ -1289,6 +1316,9 @@ def gdn_fla_chunk_scaled_dot_kkt_packed_triton(
     block_s = int(jt.next_power_of_2(int(chunk_size)))
     block_k = int(jt.next_power_of_2(int(key_dim)))
     if block_s > 1024 or block_k > 1024:
+        _raise_if_gdn_fallback_disabled(
+            "Triton FLA scaled KKT prefill kernel cannot handle this block size"
+        )
         from nanovllm_jax.kernels.gdn_fla import (
             gdn_fla_chunk_scaled_dot_kkt_packed_reference,
         )
@@ -1359,6 +1389,9 @@ def gdn_fla_solve_tril_packed_triton(
     num_heads = attention_matrix.shape[1]
     block_s = int(jt.next_power_of_2(int(chunk_size)))
     if block_s > 1024:
+        _raise_if_gdn_fallback_disabled(
+            "Triton FLA triangular solve prefill kernel cannot handle this chunk size"
+        )
         from nanovllm_jax.kernels.gdn_fla import gdn_fla_solve_tril_packed_reference
 
         return gdn_fla_solve_tril_packed_reference(
@@ -1421,6 +1454,9 @@ def gdn_fla_chunk_delta_h_packed_triton(
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
     if not output_final_state or not save_new_value:
+        _raise_if_gdn_fallback_disabled(
+            "Triton FLA delta-H prefill kernel requires final state and new value outputs"
+        )
         from nanovllm_jax.kernels.gdn_fla import (
             gdn_fla_chunk_delta_h_packed_reference,
         )
@@ -1512,6 +1548,9 @@ def gdn_fla_chunk_delta_h_packed_triton(
         or block_k > 1024
         or block_v > 1024
     ):
+        _raise_if_gdn_fallback_disabled(
+            "Triton FLA delta-H prefill kernel cannot handle this block size or row chunk count"
+        )
         from nanovllm_jax.kernels.gdn_fla import (
             gdn_fla_chunk_delta_h_packed_reference,
         )
@@ -1635,6 +1674,9 @@ def gdn_fla_recompute_w_u_packed_triton(
     block_k = int(jt.next_power_of_2(int(key_dim)))
     block_u = int(jt.next_power_of_2(int(value_dim)))
     if block_s > 1024 or block_k > 1024 or block_u > 1024:
+        _raise_if_gdn_fallback_disabled(
+            "Triton FLA recompute W/U prefill kernel cannot handle this block size"
+        )
         from nanovllm_jax.kernels.gdn_fla import gdn_fla_recompute_w_u_packed_reference
 
         return gdn_fla_recompute_w_u_packed_reference(

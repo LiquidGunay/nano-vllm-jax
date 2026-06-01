@@ -7,6 +7,7 @@ activation math and native V,K recurrent state.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +30,15 @@ def require_available() -> None:
 
 _GDN_QKV_PREFILL_DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
 _GDN_FLA_ACCUMULATOR_DTYPE = jnp.dtype(jnp.float32)
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
+_GDN_DISABLE_FALLBACKS_ENV = "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS"
+
+
+def _gdn_disable_fallbacks() -> bool:
+    return (
+        os.environ.get(_GDN_DISABLE_FALLBACKS_ENV, "0").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
 
 
 @dataclass(frozen=True)
@@ -297,6 +307,12 @@ def gdn_segmented_prefill_chunk32(
             gdn_fla_chunk_gated_delta_rule_packed_triton,
         )
     except (ImportError, ModuleNotFoundError):
+        if _gdn_disable_fallbacks():
+            raise RuntimeError(
+                "Triton FLA segmented prefill kernel is unavailable; "
+                f"implicit GDN kernel fallbacks are disabled by "
+                f"{_GDN_DISABLE_FALLBACKS_ENV}=1"
+            )
         return gdn_segmented_prefill_chunk32_reference(
             query, key, value, beta, gate, cu_seqlens, initial_state,
             chunk_size=chunk_size,

@@ -6196,3 +6196,55 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   JAX reference, but it is still below the requested `0.9x` vLLM target. Next
   work should target decoder-stage command-buffer/update pressure and remaining
   compiled-step reductions rather than more packed-decode launch tuning.
+
+### Entry 187 - Strict GDN Kernel Route Audit
+
+- date: 2026-06-01
+- change:
+  - added `NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS=1` to fail hard when a requested
+    GDN kernel path would silently use a pure-JAX/reference fallback;
+  - applied the guard in the backend prefill/decode selection, the segmented FLA
+    wrapper, and the internal Triton FLA prefill stage fallbacks;
+  - exposed the flag through server config and benchmark artifact metadata;
+  - changed the tracked `gpu_paged_gdn_fla_decode_bf16_qkv` config to the best
+    strict kernel route found in this pass: CUDA fused post-conv prep+prefill
+    (`cuda_prep_prefill_fp32`) plus bf16 Triton packed decode.
+- important finding:
+  - `triton_fla_wrapper` is not JIT-safe for strict kernel investigation because
+    traced `seq_lens` force the previous pure-JAX reference path.
+  - `triton_fla_padded` does exercise the FLA Triton prefill kernels, but is a
+    severe regression on the target long-prefill workload:
+    `22.80 tok/s` vs stored JAX reference `78.02 tok/s`.
+  - the FLA prefill profile is dominated by materialized multi-stage kernels:
+    `_gdn_fla_chunk_fwd_o_packed_kernel` `931.80 ms`,
+    `_gdn_fla_chunk_delta_h_packed_kernel` `842.48 ms`,
+    `_gdn_fla_chunk_scaled_dot_kkt_packed_kernel` `302.92 ms` (one repeat).
+  - CUDA fused prefill is the current best strict kernel route, but still misses
+    the target: the fused `Fp32GdnPrefillChunk32Kernel<64,false>` takes about
+    `444 ms` over 18 launches on `long_prefill_512_2048`.
+- focused tests:
+  - `pytest -q tests/test_gdn_post_conv_prefill_reference.py -k "triton_fla_padded or fallback_without_triton_module or strict_rejects or cuda_post_conv_prep" -q`
+    - 7 passed.
+  - `pytest -q tests/test_gdn_packed_decode_reference.py tests/test_cuda_fp32_ffi.py -q`
+    - 36 passed.
+  - `python -m json.tool benchmarks/configs/gpu_paged_gdn_fla_decode_bf16_qkv.json >/dev/null`
+  - `python -m py_compile benchmarks/benchmark_jax_server_trace.py nanovllm_jax/backends.py nanovllm_jax/kernels/gdn_fla.py nanovllm_jax/kernels/gdn_fla_triton.py nanovllm_jax/server_config.py tests/test_gdn_post_conv_prefill_reference.py`
+- benchmark artifacts:
+  - strict FLA padded audit: `results/gpu_matrix_gdn_strict_kernel_20260601.json`
+  - strict FLA padded long-prefill audit:
+    `results/gpu_matrix_gdn_strict_kernel_longprefill_20260601.json`
+  - retained strict CUDA-prefill route:
+    `results/gpu_matrix_gdn_cuda_prefill_strict_r2_20260601.json`
+  - report: `results/gpu_matrix_gdn_cuda_prefill_strict_r2_20260601.md`
+- retained benchmark command:
+  `.venv/bin/python3 -m benchmarks.run_gpu_matrix --configs gpu_paged_gdn_fla_decode_bf16_qkv --workloads decode_heavy_128x128,long_prefill_512_2048 --repeats 2 --no-live-vllm --output-json results/gpu_matrix_gdn_cuda_prefill_strict_r2_20260601.json --run-dir results/gpu_matrix_runs/20260601_gdn_cuda_prefill_strict_r2`
+- retained benchmark result:
+  - `decode_heavy_128x128`: JAX `165.88 tok/s`, vLLM `213.54 tok/s`,
+    JAX/vLLM `0.777x`, JAX/reference `1.092x`;
+  - `long_prefill_512_2048`: JAX `63.98 tok/s`, vLLM `116.37 tok/s`,
+    JAX/vLLM `0.550x`, JAX/reference `0.820x`;
+  - correctness and minimum-repeat checks passed; `target_vllm_ratio_met=false`.
+- decision: retain strict fallback gating and the CUDA-prefill config because
+  they make the kernel route measurable and prevent misleading fallback wins.
+  Do not retain Triton FLA padded prefill as the tracked route; its multi-stage
+  materialization cost overwhelms any lowering benefit on the target shape.

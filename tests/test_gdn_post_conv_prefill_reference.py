@@ -1230,6 +1230,46 @@ def test_model_post_conv_prefill_fallback_without_triton_module(monkeypatch, imp
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+def test_model_post_conv_prefill_strict_rejects_missing_triton_module(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL", "triton_fla_padded")
+    monkeypatch.setitem(sys.modules, "nanovllm_jax.kernels.gdn_fla_triton", None)
+
+    backend = PureJAXBackend()
+    batch = 2
+    seq_len = 8
+    num_key_heads = 2
+    num_value_heads = 4
+    key_dim = 4
+    value_dim = 6
+    conv_dim = 2 * num_key_heads * key_dim + num_value_heads * value_dim
+    conv_out = jnp.zeros((batch, seq_len, conv_dim), dtype=jnp.float32)
+    a = jnp.zeros((batch, seq_len, num_value_heads), dtype=jnp.float32)
+    b = jnp.zeros((batch, seq_len, num_value_heads), dtype=jnp.float32)
+    decay = jnp.ones((num_value_heads,), dtype=jnp.float32)
+    dt_bias = jnp.zeros((num_value_heads,), dtype=jnp.float32)
+    valid_token_mask = jnp.ones((batch, seq_len), dtype=jnp.int32)
+
+    with pytest.raises(RuntimeError, match="fallbacks are disabled"):
+        backend.gated_delta_prefill_post_conv(
+            conv_out,
+            a,
+            b,
+            decay,
+            dt_bias,
+            valid_token_mask,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
+            key_head_dim=key_dim,
+            value_head_dim=value_dim,
+            chunk_size=8,
+            initial_state=None,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 def test_cuda_post_conv_prep_matches_jax_prep_with_mask():
     batch = 2
     seq_len = 7

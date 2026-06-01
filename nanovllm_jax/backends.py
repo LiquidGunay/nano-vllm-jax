@@ -52,7 +52,23 @@ _GDN_PREFILL_POST_CONV_OUTPUT_DTYPE_ENV = (
     "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE"
 )
 _GDN_PACKED_DECODE_QKV_DTYPE_ENV = "NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE"
+_GDN_DISABLE_FALLBACKS_ENV = "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS"
 _OFF_ENV_VALUES = {"", "0", "false", "no", "off", "none", "False"}
+
+
+def _gdn_disable_fallbacks() -> bool:
+    return (
+        os.environ.get(_GDN_DISABLE_FALLBACKS_ENV, "0").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
+
+
+def _raise_if_gdn_fallback_disabled(reason: str) -> None:
+    if _gdn_disable_fallbacks():
+        raise RuntimeError(
+            f"{reason}; implicit GDN kernel fallbacks are disabled by "
+            f"{_GDN_DISABLE_FALLBACKS_ENV}=1"
+        )
 
 
 def _gdn_packed_decode_impl() -> str:
@@ -817,6 +833,9 @@ class PureJAXBackend:
                 qkv_dtype=_gdn_prefill_qkv_activation_jnp_dtype(),
             )
             if isinstance(prepared.seq_lens, core.Tracer):
+                _raise_if_gdn_fallback_disabled(
+                    "triton_fla_packed requires concrete seq_lens for packed prefill"
+                )
                 output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
                     prepared.query,
                     prepared.key,
@@ -831,6 +850,9 @@ class PureJAXBackend:
                 return output.transpose(0, 2, 1, 3), final_state
 
             if gdn_fla_chunk_gated_delta_rule_packed_triton is None:
+                _raise_if_gdn_fallback_disabled(
+                    "Triton FLA packed prefill kernel is unavailable"
+                )
                 output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
                     prepared.query,
                     prepared.key,
@@ -920,6 +942,9 @@ class PureJAXBackend:
                 qkv_dtype=_gdn_prefill_qkv_activation_jnp_dtype(),
             )
             if isinstance(prepared.seq_lens, core.Tracer):
+                _raise_if_gdn_fallback_disabled(
+                    "triton_fla_wrapper requires concrete seq_lens for packed prefill"
+                )
                 from nanovllm_jax.kernels.gdn_fla import (
                     gdn_fla_prefill_chunk32_fp32_reference,
                 )
@@ -1061,6 +1086,9 @@ class PureJAXBackend:
             )
 
             if gdn_fla_chunk_gated_delta_rule_packed_triton is None:
+                _raise_if_gdn_fallback_disabled(
+                    "Triton FLA padded prefill kernel is unavailable"
+                )
                 output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
                     prepared.query,
                     prepared.key,
@@ -1123,6 +1151,9 @@ class PureJAXBackend:
             else:
                 valid_token_mask = valid_token_mask.astype(jnp.int32)
             if gdn_post_conv_prep_bf16 is None:
+                _raise_if_gdn_fallback_disabled(
+                    "Triton BF16 GDN post-conv prep kernel is unavailable"
+                )
                 query, key, value, gate, beta, seq_lens = (
                     prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
                         conv_out,
@@ -1216,6 +1247,9 @@ class PureJAXBackend:
                     initial_state.astype(jnp.float32),
                 )
             else:
+                _raise_if_gdn_fallback_disabled(
+                    "CUDA FP32 chunk32 prefill kernel cannot handle this shape"
+                )
                 output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
                     query,
                     key,
@@ -1293,6 +1327,9 @@ class PureJAXBackend:
                         seq_lens,
                         initial_state.astype(jnp.float32),
                     )
+                _raise_if_gdn_fallback_disabled(
+                    "CUDA FP32 prep+prefill kernel cannot handle this shape"
+                )
             return jax_chunk_gated_delta_rule(
                 query,
                 key,
@@ -1317,9 +1354,11 @@ class PureJAXBackend:
         initial_state: jnp.ndarray | None,
         use_qk_l2norm_in_kernel: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        if (
+        cuda_decode_requested = (
             os.environ.get(_CUDA_FP32_GDN_DECODE_ENV, "0") in _TRUE_ENV_VALUES
-            and use_qk_l2norm_in_kernel
+        )
+        cuda_decode_compatible = (
+            use_qk_l2norm_in_kernel
             and initial_state is not None
             and query.shape[2] == 1
             and query.dtype == jnp.float32
@@ -1328,19 +1367,25 @@ class PureJAXBackend:
             and g.dtype == jnp.float32
             and beta.dtype == jnp.float32
             and initial_state.dtype == jnp.float32
-        ):
-            from nanovllm_jax.kernels.cuda_fp32_ffi import (
-                gdn_recurrent_decode_step_fp32,
-            )
+        )
+        if cuda_decode_requested:
+            if not cuda_decode_compatible:
+                _raise_if_gdn_fallback_disabled(
+                    "CUDA FP32 recurrent GDN decode kernel cannot handle this shape or dtype"
+                )
+            else:
+                from nanovllm_jax.kernels.cuda_fp32_ffi import (
+                    gdn_recurrent_decode_step_fp32,
+                )
 
-            return gdn_recurrent_decode_step_fp32(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                initial_state,
-            )
+                return gdn_recurrent_decode_step_fp32(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    initial_state,
+                )
 
         from nanovllm_jax.model import jax_recurrent_gated_delta_rule
 
@@ -1495,6 +1540,9 @@ class PureJAXBackend:
                     gdn_packed_decode_step_bf16,
                 )
             except (ImportError, ModuleNotFoundError, AttributeError):
+                _raise_if_gdn_fallback_disabled(
+                    "Triton FLA packed decode kernel is unavailable"
+                )
                 return gdn_packed_decode_reference_from_decay(
                     mixed_qkv,
                     a,
