@@ -41,10 +41,7 @@
     "gdn": {
       "disable_fallbacks": true,
       "prefill_post_conv_impl": "triton_fla_padded",
-      "kkt_block_dot": true,
-      "fwd_o_block_dot": true,
-      "delta_h_block_dot": true,
-      "recompute_block_dot": true,
+      "prefill_block_dot": true,
       "packed_decode": {
         "impl": "triton_fla",
         "qkv_dtype": "bf16",

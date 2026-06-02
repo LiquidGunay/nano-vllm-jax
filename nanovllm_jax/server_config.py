@@ -261,10 +261,27 @@ def _kernels_section_to_env(kernels_section: dict) -> dict[str, str]:
         "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE",
         gdn.get("prefill_post_conv_output_dtype"),
     )
-    _put_env(env, "NANO_VLLM_JAX_GDN_KKT_BLOCK_DOT", gdn.get("kkt_block_dot"))
-    _put_env(env, "NANO_VLLM_JAX_GDN_FWD_O_BLOCK_DOT", gdn.get("fwd_o_block_dot"))
-    _put_env(env, "NANO_VLLM_JAX_GDN_DELTA_H_BLOCK_DOT", gdn.get("delta_h_block_dot"))
-    _put_env(env, "NANO_VLLM_JAX_GDN_RECOMPUTE_BLOCK_DOT", gdn.get("recompute_block_dot"))
+    prefill_block_dot = gdn.get("prefill_block_dot")
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_KKT_BLOCK_DOT",
+        prefill_block_dot if prefill_block_dot is not None else gdn.get("kkt_block_dot"),
+    )
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_FWD_O_BLOCK_DOT",
+        prefill_block_dot if prefill_block_dot is not None else gdn.get("fwd_o_block_dot"),
+    )
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_DELTA_H_BLOCK_DOT",
+        prefill_block_dot if prefill_block_dot is not None else gdn.get("delta_h_block_dot"),
+    )
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_RECOMPUTE_BLOCK_DOT",
+        prefill_block_dot if prefill_block_dot is not None else gdn.get("recompute_block_dot"),
+    )
 
     packed_decode = gdn.get("packed_decode", {}) or {}
     _put_env(

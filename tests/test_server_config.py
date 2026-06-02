@@ -37,10 +37,7 @@ def test_runtime_and_kernel_sections_translate_to_env():
                 "gdn": {
                     "disable_fallbacks": True,
                     "prefill_post_conv_impl": "triton_fla_padded",
-                    "kkt_block_dot": True,
-                    "fwd_o_block_dot": True,
-                    "delta_h_block_dot": True,
-                    "recompute_block_dot": True,
+                    "prefill_block_dot": True,
                     "packed_decode": {
                         "impl": "triton_fla",
                         "qkv_dtype": "bf16",

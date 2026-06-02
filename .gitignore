@@ -62,6 +62,11 @@ logs/
 # Local tooling / generated benchmark artifacts
 node_modules/
 tpu_profile*.json
+benchmarks/configs/gpu_paged_gdn_fla_decode_tmp_*.json
+results/gpu_matrix_*.json
+results/gpu_matrix_*.md
+results/gpu_matrix_*/
+results/gpu_matrix_runs/
 
 # OS
 .DS_Store

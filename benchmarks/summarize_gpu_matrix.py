@@ -118,6 +118,8 @@ def _matrix_rows(summary: dict[str, Any]) -> list[list[str]]:
                     _fmt(comparison.get("tokens_per_second_gap_to_target")),
                     _fmt(comparison.get("jax_reference_tokens_per_second")),
                     _fmt_ratio(comparison.get("jax_over_jax_reference_throughput")),
+                    _fmt(comparison.get("jax_reference_source")),
+                    _fmt(comparison.get("vllm_reference_source")),
                 ]
             )
     return rows
@@ -482,8 +484,11 @@ def render_markdown(
             f"(target {_fmt_ratio(target_ratio)})",
             f"- JAX tok/s: {_fmt(goal_comparison.get('jax_tokens_per_second_median'))}",
             f"- vLLM tok/s: {_fmt(goal_comparison.get('vllm_tokens_per_second'))}",
+            f"- vLLM reference source: `{_fmt(goal_comparison.get('vllm_reference_source'))}`",
             f"- target tok/s: {_fmt(goal_comparison.get('target_tokens_per_second'))}",
             f"- gap to target tok/s: {_fmt(goal_comparison.get('tokens_per_second_gap_to_target'))}",
+            f"- JAX reference source: `{_fmt(goal_comparison.get('jax_reference_source'))}`",
+            f"- JAX reference artifact: `{_fmt(goal_comparison.get('jax_reference_artifact'))}`",
             "",
             "## Matrix",
             "",
@@ -503,6 +508,8 @@ def render_markdown(
                 "gap tok/s",
                 "JAX ref tok/s",
                 "JAX/ref",
+                "JAX ref source",
+                "vLLM ref source",
             ],
             _matrix_rows(summary),
         )

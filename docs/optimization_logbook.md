@@ -6743,11 +6743,9 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     vLLM-shaped tiled `tl.dot` kernels while preserving the strict local
     correctness contract.
 - changes:
-  - added typed config/env switches:
-    `kernels.gdn.kkt_block_dot`,
-    `kernels.gdn.recompute_block_dot`,
-    `kernels.gdn.delta_h_block_dot`, and
-    `kernels.gdn.fwd_o_block_dot`;
+  - added typed config/env switches for the individual block-dot stages; later
+    public benchmark configs use `kernels.gdn.prefill_block_dot` as the single
+    all-stage knob to avoid config/env sprawl;
   - added `gpu_paged_gdn_fla_decode_kkt_fwd_o_block_dot` as the strict
     no-local-CUDA benchmark config for the block-dot FLA route;
   - ported the vLLM/FLA layout strategy for:
@@ -6795,3 +6793,45 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - next speed work should target the remaining non-GDN GEMM/host buckets or
     integrate these block-dot kernels as the default once broader workload
     coverage is clean.
+
+### Entry 198 - Mixed-Length Block-Dot Prefill Coverage And Benchmark Hygiene
+
+- date: 2026-06-02
+- purpose:
+  - validate the composed block-dot GDN/FLA prefill route on mixed packed
+    lengths, and prevent mixed-workload smoke results from being interpreted as
+    long-prefill speed claims.
+- changes:
+  - added a focused CUDA/JAX-Triton regression for packed `cu_seqlens`
+    `[0, 0, 17, 81, 160, 290]` with `chunk_size=64`, covering empty rows,
+    partial chunks, exact one-chunk rows, and multi-chunk rows;
+  - added `.gitignore` guards for newly generated GPU matrix artifacts so full
+    run payloads stay local unless deliberately promoted;
+  - made the report matrix show JAX and vLLM reference sources;
+  - added `docs/gdn_fla_kernel_flow.md` for the block-dot flow, model-specific
+    assumptions, and benchmark interpretation rules.
+- validation:
+  - `PYTHONPATH=. .venv/bin/python -m pytest tests/test_gdn_segmented_reference.py -k block_dot_mixed_lengths -q`
+    passed: `1 passed`;
+  - `PYTHONPATH=. .venv/bin/python -m pytest tests/test_gdn_segmented_reference.py -k block_dot -q`
+    passed: `5 passed`;
+  - one-repeat `hetero8/gpu_paged_gdn_fla_decode_kkt_fwd_o_block_dot` smoke
+    passed exact generated-token correctness.
+- mixed-workload smoke result:
+  - local artifact:
+    `results/gpu_matrix_hetero8_block_dot_mixed_prefill_r1_20260602.json`;
+  - exact generated-token match: yes;
+  - repeats: `1`, so not speed-claim-ready;
+  - throughput: `308.27 tok/s`;
+  - versus accepted hetero8 JAX reference `stored_entry045`: `0.838x`;
+  - versus stored hetero8 vLLM reference: `0.357x`.
+- interpretation:
+  - this is a loss on the `hetero8` mixed serving workload and must not be
+    presented as a serving-wide win;
+  - it does not invalidate Entry 197's long-prefill result, because
+    `hetero8` combines one prefill step with many decode steps and still shows
+    decode/host/GEMM buckets outside the prefill GDN route;
+  - the correct next hill-climb target depends on the claim: use
+    `long_prefill_512_2048` for prefill-kernel claims, and use `hetero8` plus
+    `decode_heavy_128x128` before promoting the route as a default serving
+    improvement.
