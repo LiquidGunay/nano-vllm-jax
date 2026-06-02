@@ -1,6 +1,6 @@
 {
   "name": "gpu_paged_gdn_fla_decode_static_metadata",
-  "description": "Strict Triton GDN route plus padded-GEMM decode projections and opt-in static decode metadata reuse.",
+  "description": "Strict block-dot FLA prefill route plus explicit BF16-QKV packed-reference GDN decode, padded-GEMM decode projections, and opt-in static decode metadata reuse.",
   "benchmark_script": "benchmarks/benchmark_jax_server_trace.py",
   "reference_json": "results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json",
   "vllm_reference_json": "",
@@ -41,15 +41,10 @@
     "gdn": {
       "disable_fallbacks": true,
       "prefill_post_conv_impl": "triton_fla_padded",
+      "prefill_block_dot": true,
       "packed_decode": {
-        "impl": "triton_fla",
-        "qkv_dtype": "bf16",
-        "pre_normalize_qk": true,
-        "triton": {
-          "num_warps": 8,
-          "num_stages": 2,
-          "block_v": 32
-        }
+        "impl": "reference",
+        "qkv_dtype": "bf16"
       }
     }
   },

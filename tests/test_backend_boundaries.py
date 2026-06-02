@@ -340,6 +340,35 @@ def test_model_runner_hybrid_state_prefers_physical_row_slots_for_new_sequences(
     np.testing.assert_array_equal(np.array(batched_state.recurrent_state), np.zeros((2, 1, 1, 2, 3), dtype=np.float32))
 
 
+def test_model_runner_hybrid_slot_ids_zero_new_allocations():
+    runner = _hybrid_state_runner_with_two_slots()
+    runner._hybrid_slots = {1: 1}
+    runner._free_hybrid_slots = [0]
+    runner._hybrid_state_table = HybridLayerState(
+        conv_state=jnp.full_like(runner._hybrid_state_table.conv_state, 7.0),
+        recurrent_state=jnp.full_like(runner._hybrid_state_table.recurrent_state, 9.0),
+    )
+    batch = _hybrid_state_batch([8, 1], [1, 1])
+
+    slot_ids = runner._batch_hybrid_slot_ids(batch)
+
+    np.testing.assert_array_equal(np.asarray(slot_ids), np.array([0, 1], dtype=np.int32))
+    assert batch.hybrid_slot_ids_host == (0, 1)
+    assert runner._hybrid_slots == {1: 1, 8: 0}
+    np.testing.assert_array_equal(
+        np.array(runner._hybrid_state_table.conv_state[0]),
+        np.zeros((1, 3, 4), dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        np.array(runner._hybrid_state_table.recurrent_state[0]),
+        np.zeros((1, 1, 2, 3), dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        np.array(runner._hybrid_state_table.conv_state[1]),
+        np.full((1, 3, 4), 7.0, dtype=np.float32),
+    )
+
+
 def test_model_runner_hybrid_state_zeroes_reused_slot_on_allocation_not_release():
     runner = _hybrid_state_runner_with_two_slots()
     runner.hybrid_states = {0: object()}
@@ -891,6 +920,94 @@ def test_bucketed_linear_prefill_preserves_hybrid_state_for_decode():
         np.array(exact_decode.activations),
         rtol=1e-5,
         atol=1e-5,
+    )
+
+
+def test_executor_table_hybrid_decode_matches_sliced_decode():
+    config = _tiny_linear_attention_config()
+    params = init_params(jax.random.PRNGKey(44), config)
+    executor = ModelExecutor(config, params, backend="pure_jax")
+    spec = KVCacheSpec(
+        num_layers=config.num_hidden_layers,
+        num_blocks=config.num_kvcache_blocks,
+        block_size=config.block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        dtype=config.get_dtype(),
+        max_kv_cache_bytes=config.max_kv_cache_bytes,
+    )
+    base_hybrid = HybridLayerState(
+        conv_state=jnp.zeros((1, 1, 12, config.linear_conv_kernel_size), dtype=config.get_dtype()),
+        recurrent_state=jnp.zeros((1, 1, 1, config.linear_value_head_dim, config.linear_key_head_dim), dtype=jnp.float32),
+    )
+    prompt_batch = _scheduled_batch(
+        tokens=[1, 2, 3],
+        positions=[0, 1, 2],
+        block_tables=[0, 1, 2],
+        seq_lens=3,
+        is_prefill=True,
+    )
+    ref_prompt = executor.forward_step_token_ids_jit(
+        prompt_batch,
+        cache_storage=executor.backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=3),
+        hybrid_state=base_hybrid,
+    )
+    table_prompt = executor.forward_step_token_ids_jit(
+        prompt_batch,
+        cache_storage=executor.backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=3),
+        hybrid_state=base_hybrid,
+    )
+    decode_batch = ScheduledBatch(
+        tokens=ref_prompt.activations[:, None],
+        positions=jnp.array([[3]], dtype=jnp.int32),
+        seq_ids=jnp.array([0], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1], dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=1,
+        block_tables=jnp.array([[0, 1, 2]], dtype=jnp.int32),
+        seq_lens=jnp.array([4], dtype=jnp.int32),
+        seq_ids_host=(0,),
+        query_lens_host=(1,),
+        seq_lens_host=(4,),
+    )
+
+    ref = executor.forward_step_token_ids_jit(
+        decode_batch,
+        cache_storage=ref_prompt.cache_storage,
+        hybrid_state=ref_prompt.hybrid_state,
+    )
+    conv_table = jnp.zeros(
+        (2,) + table_prompt.hybrid_state.conv_state.shape[1:],
+        dtype=table_prompt.hybrid_state.conv_state.dtype,
+    ).at[1].set(table_prompt.hybrid_state.conv_state[0])
+    recurrent_table = jnp.zeros(
+        (2,) + table_prompt.hybrid_state.recurrent_state.shape[1:],
+        dtype=table_prompt.hybrid_state.recurrent_state.dtype,
+    ).at[1].set(table_prompt.hybrid_state.recurrent_state[0])
+    actual = executor.forward_step_token_ids_table_jit(
+        decode_batch,
+        cache_storage=table_prompt.cache_storage,
+        hybrid_state_table=HybridLayerState(conv_table, recurrent_table),
+        hybrid_slot_ids=jnp.array([1], dtype=jnp.int32),
+    )
+
+    np.testing.assert_array_equal(np.array(actual.activations), np.array(ref.activations))
+    np.testing.assert_allclose(
+        np.array(actual.hybrid_state.conv_state[1:2]),
+        np.array(ref.hybrid_state.conv_state),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.array(actual.hybrid_state.recurrent_state[1:2]),
+        np.array(ref.hybrid_state.recurrent_state),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_array_equal(
+        np.array(actual.hybrid_state.conv_state[0]),
+        np.zeros_like(np.array(actual.hybrid_state.conv_state[0])),
     )
 
 

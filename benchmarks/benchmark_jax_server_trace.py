@@ -377,6 +377,18 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                     "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
                     "off",
                 ),
+                "prefill_kkt_block_dot": _env_flag(
+                    "NANO_VLLM_JAX_GDN_KKT_BLOCK_DOT"
+                ),
+                "prefill_fwd_o_block_dot": _env_flag(
+                    "NANO_VLLM_JAX_GDN_FWD_O_BLOCK_DOT"
+                ),
+                "prefill_delta_h_block_dot": _env_flag(
+                    "NANO_VLLM_JAX_GDN_DELTA_H_BLOCK_DOT"
+                ),
+                "prefill_recompute_block_dot": _env_flag(
+                    "NANO_VLLM_JAX_GDN_RECOMPUTE_BLOCK_DOT"
+                ),
                 "prefill_qkv_dtype": os.environ.get(
                     "NANO_VLLM_JAX_GDN_PREFILL_QKV_DTYPE",
                     os.environ.get("NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE", "fp32"),

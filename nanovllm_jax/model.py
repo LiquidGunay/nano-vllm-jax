@@ -8,6 +8,7 @@ from typing import Optional, List, Dict
 from dataclasses import dataclass, replace
 from nanovllm_jax.backends import (
     InferenceBackend,
+    gdn_packed_decode_conv_enabled,
     gdn_packed_decode_enabled,
     gdn_packed_decode_max_batch,
     gdn_prefill_post_conv_enabled,
@@ -930,6 +931,7 @@ def gated_deltanet_block(
         )
     )
     linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
+    row_valid = None
     
     # === PROJECTIONS (same for both modes) ===
     force_width1_dot = (not is_prefill) and seq_len > 1 and _force_width1_decode_math()
@@ -976,58 +978,17 @@ def gated_deltanet_block(
         
         # 1. Convolution update - use per-layer conv_state
         # conv_state shape: [batch, num_linear_layers, conv_dim, kernel_size]
-        layer_conv_state = hybrid_state.conv_state[:, linear_layer_idx]  # [batch, conv_dim, kernel_size]
+        layer_conv_state = hybrid_state.conv_state[:, linear_layer_idx]
         conv_weight = params["conv1d_weight"].reshape(conv_dim, config.linear_conv_kernel_size)
         conv_bias = params.get("conv1d_bias")
-
-        def conv_step(state, mixed_qkv_t_step):
-            conv_out_t, next_state = causal_conv1d_update(
-                mixed_qkv_t_step,
-                state,
-                conv_weight,
-                conv_bias,
-                "silu",
-            )
-            return next_state, conv_out_t
-
-        if seq_len > 1:
-            # Match sequential decode exactly: unroll static width-1 conv updates
-            # instead of scanning over a width-2 tensor. Each call sees [B, D, 1],
-            # the same shape used by the normal single-token decode path.
-            state = layer_conv_state
-            conv_out_parts = []
-            conv_state_parts = []
-            for t in range(seq_len):
-                state, conv_out_t = conv_step(state, mixed_qkv_t[:, :, t : t + 1])
-                conv_out_parts.append(conv_out_t)
-                if return_prefix_state or (return_first_prefix_state and t == 0):
-                    conv_state_parts.append(state)
-            new_layer_conv_state = state
-            conv_out_steps = jnp.stack(conv_out_parts, axis=0)
-            if return_prefix_state:
-                prefix_layer_conv_state = jnp.stack(conv_state_parts, axis=0).transpose(1, 0, 2, 3)
-            elif return_first_prefix_state:
-                prefix_layer_conv_state = conv_state_parts[0] if conv_state_parts else state
-            else:
-                prefix_layer_conv_state = None
-        elif return_prefix_state or return_first_prefix_state:
-            new_layer_conv_state, conv_out_t = conv_step(layer_conv_state, mixed_qkv_t[:, :, :1])
-            conv_out_steps = conv_out_t[None, ...]
-            prefix_layer_conv_state = (
-                new_layer_conv_state[:, None, :, :]
-                if return_prefix_state
-                else new_layer_conv_state
-            )
-        else:
-            new_layer_conv_state, conv_out_t = conv_step(layer_conv_state, mixed_qkv_t[:, :, :1])
-            conv_out_steps = conv_out_t[None, ...]
-            prefix_layer_conv_state = None
-        conv_out = conv_out_steps.transpose(1, 0, 2, 3).reshape(batch, seq_len, conv_dim)
 
         # recurrent_state shape: [batch, num_layers, num_heads, v_dim, k_dim]
         # Extract recurrent state for this layer: [batch, num_heads, v_dim, k_dim]
         # linear_layer_idx computed above
-        initial_recurrent = hybrid_state.recurrent_state[:, linear_layer_idx] if hybrid_state.recurrent_state is not None else None
+        if hybrid_state.recurrent_state is not None:
+            initial_recurrent = hybrid_state.recurrent_state[:, linear_layer_idx]
+        else:
+            initial_recurrent = None
 
         packed_decode_max_batch = gdn_packed_decode_max_batch()
         use_packed_decode = (
@@ -1038,7 +999,70 @@ def gated_deltanet_block(
             and not return_first_prefix_state
             and initial_recurrent is not None
         )
-        if use_packed_decode:
+        use_conv_packed_decode = use_packed_decode and gdn_packed_decode_conv_enabled()
+        if use_conv_packed_decode:
+            core_attn_out, new_layer_conv_state, new_recurrent_state_single = (
+                backend.gated_delta_conv_packed_decode(
+                    mixed_qkv[:, 0, :],
+                    a[:, 0, :].astype(jnp.float32),
+                    b[:, 0, :].astype(jnp.float32),
+                    params["A"].astype(jnp.float32),
+                    params["dt_bias"].astype(jnp.float32),
+                    layer_conv_state,
+                    conv_weight,
+                    conv_bias,
+                    initial_recurrent.astype(jnp.float32),
+                    use_qk_l2norm_in_kernel=True,
+                )
+            )
+            prefix_layer_conv_state = None
+            prefix_recurrent_state_single = None
+        else:
+            def conv_step(state, mixed_qkv_t_step):
+                conv_out_t, next_state = causal_conv1d_update(
+                    mixed_qkv_t_step,
+                    state,
+                    conv_weight,
+                    conv_bias,
+                    "silu",
+                )
+                return next_state, conv_out_t
+
+            if seq_len > 1:
+                # Match sequential decode exactly: unroll static width-1 conv updates
+                # instead of scanning over a width-2 tensor. Each call sees [B, D, 1],
+                # the same shape used by the normal single-token decode path.
+                state = layer_conv_state
+                conv_out_parts = []
+                conv_state_parts = []
+                for t in range(seq_len):
+                    state, conv_out_t = conv_step(state, mixed_qkv_t[:, :, t : t + 1])
+                    conv_out_parts.append(conv_out_t)
+                    if return_prefix_state or (return_first_prefix_state and t == 0):
+                        conv_state_parts.append(state)
+                new_layer_conv_state = state
+                conv_out_steps = jnp.stack(conv_out_parts, axis=0)
+                if return_prefix_state:
+                    prefix_layer_conv_state = jnp.stack(conv_state_parts, axis=0).transpose(1, 0, 2, 3)
+                elif return_first_prefix_state:
+                    prefix_layer_conv_state = conv_state_parts[0] if conv_state_parts else state
+                else:
+                    prefix_layer_conv_state = None
+            elif return_prefix_state or return_first_prefix_state:
+                new_layer_conv_state, conv_out_t = conv_step(layer_conv_state, mixed_qkv_t[:, :, :1])
+                conv_out_steps = conv_out_t[None, ...]
+                prefix_layer_conv_state = (
+                    new_layer_conv_state[:, None, :, :]
+                    if return_prefix_state
+                    else new_layer_conv_state
+                )
+            else:
+                new_layer_conv_state, conv_out_t = conv_step(layer_conv_state, mixed_qkv_t[:, :, :1])
+                conv_out_steps = conv_out_t[None, ...]
+                prefix_layer_conv_state = None
+            conv_out = conv_out_steps.transpose(1, 0, 2, 3).reshape(batch, seq_len, conv_dim)
+
+        if use_packed_decode and not use_conv_packed_decode:
             core_attn_out, new_recurrent_state_single = backend.gated_delta_packed_decode(
                 conv_out_t[:, :, 0].astype(jnp.float32),
                 a[:, 0, :].astype(jnp.float32),
@@ -1049,7 +1073,7 @@ def gated_deltanet_block(
                 use_qk_l2norm_in_kernel=True,
             )
             prefix_recurrent_state_single = None
-        else:
+        elif not use_conv_packed_decode:
             # 2. Split q, k, v
             query = conv_out[:, :, :key_dim].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
             key = conv_out[:, :, key_dim:key_dim*2].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
@@ -1117,7 +1141,8 @@ def gated_deltanet_block(
                 prefix_recurrent_state_single = None
         # new_recurrent_state_single has shape [batch, num_heads, v_dim, k_dim]
         if valid_token_mask is not None:
-            row_valid = (valid_token_mask.astype(jnp.int32).sum(axis=1) > 0)
+            if row_valid is None:
+                row_valid = (valid_token_mask.astype(jnp.int32).sum(axis=1) > 0)
             conv_keep = row_valid[:, None, None]
             recurrent_keep = row_valid[:, None, None, None]
             new_layer_conv_state = jnp.where(

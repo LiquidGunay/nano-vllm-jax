@@ -1813,6 +1813,397 @@ def _gdn_packed_decode_kernel(
 
 
 @triton.jit
+def _gdn_packed_decode_raw_gate_kernel(
+    mixed_qkv,
+    a,
+    b,
+    decay,
+    dt_bias,
+    state,
+    out,
+    new_state,
+    qkv_dim: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    SCALE: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    FULL_K: tl.constexpr,
+    FULL_V: tl.constexpr,
+    SOFTPLUS_THRESHOLD: tl.constexpr,
+):
+    i_v = tl.program_id(0)
+    i_nh = tl.program_id(1)
+    i_n = i_nh // HV
+    i_hv = i_nh % HV
+    i_h = i_hv // (HV // H)
+
+    offs_k = tl.arange(0, BK)
+    offs_v = i_v * BV + tl.arange(0, BV)
+    mask_k = offs_k < K
+    mask_v = offs_v < V
+
+    p_state = state + ((i_n * HV + i_hv) * V * K)
+
+    p_mixed = mixed_qkv + i_n * qkv_dim
+    if FULL_K:
+        q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
+        k = tl.load(p_mixed + H * K + i_h * K + offs_k).to(tl.float32)
+    else:
+        q = tl.load(
+            p_mixed + i_h * K + offs_k,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        k = tl.load(
+            p_mixed + H * K + i_h * K + offs_k,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+    if FULL_V:
+        v = tl.load(p_mixed + 2 * H * K + i_hv * V + offs_v).to(tl.float32)
+    else:
+        v = tl.load(
+            p_mixed + 2 * H * K + i_hv * V + offs_v,
+            mask=mask_v,
+            other=0.0,
+        ).to(tl.float32)
+
+    if USE_QK_L2NORM_IN_KERNEL:
+        q_scale = SCALE / (tl.sqrt(tl.sum(q * q, axis=0) + 1e-6))
+        k_scale = 1.0 / tl.sqrt(tl.sum(k * k, axis=0) + 1e-6)
+    else:
+        q_scale = SCALE
+        k_scale = 1.0
+
+    a_val = tl.load(a + i_n * HV + i_hv).to(tl.float32)
+    b_val = tl.load(b + i_n * HV + i_hv).to(tl.float32)
+    decay_val = tl.load(decay + i_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    x = a_val + dt_bias_val
+    softplus_x = tl.where(
+        x > 0.0,
+        x + tl.log(1.0 + tl.exp(-x)),
+        tl.log(1.0 + tl.exp(x)),
+    )
+    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, softplus_x, x)
+    gate_scale = tl.exp(-decay_val * softplus_x)
+    beta_val = tl.sigmoid(b_val)
+
+    if FULL_K and FULL_V:
+        h = tl.load(
+            p_state + offs_v[:, None] * K + offs_k[None, :],
+            mask=mask_v[:, None] & mask_k[None, :],
+        ).to(tl.float32)
+    elif FULL_K:
+        h = tl.load(
+            p_state + offs_v[:, None] * K + offs_k[None, :],
+            mask=mask_v[:, None],
+            other=0.0,
+        ).to(tl.float32)
+    elif FULL_V:
+        h = tl.load(
+            p_state + offs_v[:, None] * K + offs_k[None, :],
+            mask=mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+    else:
+        h = tl.load(
+            p_state + offs_v[:, None] * K + offs_k[None, :],
+            mask=mask_v[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+    h = h * gate_scale
+    q = q * q_scale
+    k = k * k_scale
+    kv_mem = tl.sum(h * k[None, :], axis=1)
+    state_dot_q = tl.sum(h * q[None, :], axis=1)
+    qk_dot = tl.sum(q * k, axis=0)
+    delta = (v - kv_mem) * beta_val
+    o = state_dot_q + delta * qk_dot
+
+    h = h + delta[:, None] * k[None, :]
+
+    p_out = out + ((i_n * HV + i_hv) * V) + offs_v
+    if FULL_V:
+        tl.store(p_out, o)
+    else:
+        tl.store(p_out, o, mask=mask_v)
+
+    p_new_state = new_state + ((i_n * HV + i_hv) * V * K)
+    if FULL_K and FULL_V:
+        tl.store(
+            p_new_state + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=mask_v[:, None] & mask_k[None, :],
+        )
+    elif FULL_K:
+        tl.store(
+            p_new_state + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=mask_v[:, None],
+        )
+    elif FULL_V:
+        tl.store(
+            p_new_state + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=mask_k[None, :],
+        )
+    else:
+        tl.store(
+            p_new_state + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=mask_v[:, None] & mask_k[None, :],
+        )
+
+
+@triton.jit
+def _gdn_conv_packed_decode_raw_gate_kernel(
+    mixed_qkv,
+    a,
+    b,
+    decay,
+    dt_bias,
+    conv_state,
+    conv_weight,
+    conv_bias,
+    state,
+    out,
+    new_conv_state,
+    new_state,
+    qkv_dim: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    CONV_KERNEL: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    SCALE: tl.constexpr,
+    FULL_K: tl.constexpr,
+    FULL_V: tl.constexpr,
+    SOFTPLUS_THRESHOLD: tl.constexpr,
+):
+    i_v = tl.program_id(0)
+    i_nh = tl.program_id(1)
+    i_n = i_nh // HV
+    i_hv = i_nh % HV
+    heads_per_key = HV // H
+    i_h = i_hv // heads_per_key
+
+    offs_k = tl.arange(0, BK)
+    offs_v = i_v * BV + tl.arange(0, BV)
+    mask_k = offs_k < K
+    mask_v = offs_v < V
+
+    q_dims = i_h * K + offs_k
+    k_dims = H * K + i_h * K + offs_k
+    v_dims = 2 * H * K + i_hv * V + offs_v
+
+    q_acc = tl.zeros((BK,), dtype=tl.float32)
+    k_acc = tl.zeros((BK,), dtype=tl.float32)
+    v_acc = tl.zeros((BV,), dtype=tl.float32)
+
+    for conv_i in range(CONV_KERNEL):
+        if conv_i == CONV_KERNEL - 1:
+            q_src = tl.load(
+                mixed_qkv + i_n * qkv_dim + q_dims,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            k_src = tl.load(
+                mixed_qkv + i_n * qkv_dim + k_dims,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            v_src = tl.load(
+                mixed_qkv + i_n * qkv_dim + v_dims,
+                mask=mask_v,
+                other=0.0,
+            ).to(tl.float32)
+        else:
+            q_src = tl.load(
+                conv_state + (i_n * qkv_dim + q_dims) * CONV_KERNEL + conv_i + 1,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            k_src = tl.load(
+                conv_state + (i_n * qkv_dim + k_dims) * CONV_KERNEL + conv_i + 1,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            v_src = tl.load(
+                conv_state + (i_n * qkv_dim + v_dims) * CONV_KERNEL + conv_i + 1,
+                mask=mask_v,
+                other=0.0,
+            ).to(tl.float32)
+
+        q_w = tl.load(
+            conv_weight + q_dims * CONV_KERNEL + conv_i,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        k_w = tl.load(
+            conv_weight + k_dims * CONV_KERNEL + conv_i,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        v_w = tl.load(
+            conv_weight + v_dims * CONV_KERNEL + conv_i,
+            mask=mask_v,
+            other=0.0,
+        ).to(tl.float32)
+        q_acc += q_src * q_w
+        k_acc += k_src * k_w
+        v_acc += v_src * v_w
+
+    q_acc += tl.load(conv_bias + q_dims, mask=mask_k, other=0.0).to(tl.float32)
+    k_acc += tl.load(conv_bias + k_dims, mask=mask_k, other=0.0).to(tl.float32)
+    v_acc += tl.load(conv_bias + v_dims, mask=mask_v, other=0.0).to(tl.float32)
+
+    q = q_acc * tl.sigmoid(q_acc)
+    k = k_acc * tl.sigmoid(k_acc)
+    v = v_acc * tl.sigmoid(v_acc)
+
+    q = (q * (SCALE / tl.sqrt(tl.sum(q * q, axis=0) + 1.0e-6))).to(tl.bfloat16).to(tl.float32)
+    k = (k / tl.sqrt(tl.sum(k * k, axis=0) + 1.0e-6)).to(tl.bfloat16).to(tl.float32)
+    v = v.to(tl.bfloat16).to(tl.float32)
+
+    store_qk = (i_hv % heads_per_key == 0) & (i_v == 0)
+    for conv_i in range(CONV_KERNEL):
+        if conv_i == CONV_KERNEL - 1:
+            q_new = tl.load(
+                mixed_qkv + i_n * qkv_dim + q_dims,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            k_new = tl.load(
+                mixed_qkv + i_n * qkv_dim + k_dims,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            v_new = tl.load(
+                mixed_qkv + i_n * qkv_dim + v_dims,
+                mask=mask_v,
+                other=0.0,
+            ).to(tl.float32)
+        else:
+            q_new = tl.load(
+                conv_state + (i_n * qkv_dim + q_dims) * CONV_KERNEL + conv_i + 1,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            k_new = tl.load(
+                conv_state + (i_n * qkv_dim + k_dims) * CONV_KERNEL + conv_i + 1,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            v_new = tl.load(
+                conv_state + (i_n * qkv_dim + v_dims) * CONV_KERNEL + conv_i + 1,
+                mask=mask_v,
+                other=0.0,
+            ).to(tl.float32)
+        tl.store(
+            new_conv_state + (i_n * qkv_dim + q_dims) * CONV_KERNEL + conv_i,
+            q_new,
+            mask=store_qk & mask_k,
+        )
+        tl.store(
+            new_conv_state + (i_n * qkv_dim + k_dims) * CONV_KERNEL + conv_i,
+            k_new,
+            mask=store_qk & mask_k,
+        )
+        tl.store(
+            new_conv_state + (i_n * qkv_dim + v_dims) * CONV_KERNEL + conv_i,
+            v_new,
+            mask=mask_v,
+        )
+
+    a_val = tl.load(a + i_n * HV + i_hv).to(tl.float32)
+    b_val = tl.load(b + i_n * HV + i_hv).to(tl.float32)
+    decay_val = tl.load(decay + i_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    x = a_val + dt_bias_val
+    softplus_x = tl.where(
+        x > 0.0,
+        x + tl.log(1.0 + tl.exp(-x)),
+        tl.log(1.0 + tl.exp(x)),
+    )
+    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, softplus_x, x)
+    gate_scale = tl.exp(-decay_val * softplus_x)
+    beta_val = tl.sigmoid(b_val)
+
+    p_state = state + ((i_n * HV + i_hv) * V * K)
+    if FULL_K and FULL_V:
+        h = tl.load(
+            p_state + offs_v[:, None] * K + offs_k[None, :],
+            mask=mask_v[:, None] & mask_k[None, :],
+        ).to(tl.float32)
+    elif FULL_K:
+        h = tl.load(
+            p_state + offs_v[:, None] * K + offs_k[None, :],
+            mask=mask_v[:, None],
+            other=0.0,
+        ).to(tl.float32)
+    elif FULL_V:
+        h = tl.load(
+            p_state + offs_v[:, None] * K + offs_k[None, :],
+            mask=mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+    else:
+        h = tl.load(
+            p_state + offs_v[:, None] * K + offs_k[None, :],
+            mask=mask_v[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+    h = h * gate_scale
+    kv_mem = tl.sum(h * k[None, :], axis=1)
+    state_dot_q = tl.sum(h * q[None, :], axis=1)
+    qk_dot = tl.sum(q * k, axis=0)
+    delta = (v - kv_mem) * beta_val
+    o = state_dot_q + delta * qk_dot
+    h = h + delta[:, None] * k[None, :]
+
+    p_out = out + ((i_n * HV + i_hv) * V) + offs_v
+    if FULL_V:
+        tl.store(p_out, o)
+    else:
+        tl.store(p_out, o, mask=mask_v)
+
+    p_new_state = new_state + ((i_n * HV + i_hv) * V * K)
+    if FULL_K and FULL_V:
+        tl.store(
+            p_new_state + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=mask_v[:, None] & mask_k[None, :],
+        )
+    elif FULL_K:
+        tl.store(
+            p_new_state + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=mask_v[:, None],
+        )
+    elif FULL_V:
+        tl.store(
+            p_new_state + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=mask_k[None, :],
+        )
+    else:
+        tl.store(
+            p_new_state + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=mask_v[:, None] & mask_k[None, :],
+        )
+
+
+@triton.jit
 def _gdn_post_conv_prep_kernel(
     conv_out,
     a,
@@ -2826,6 +3217,184 @@ def gdn_packed_decode_step_bf16(
     )
 
 
+def gdn_packed_decode_step_bf16_raw_gates(
+    mixed_qkv: jax.Array,
+    a: jax.Array,
+    b: jax.Array,
+    decay: jax.Array,
+    dt_bias: jax.Array,
+    state: jax.Array,
+    *,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[jax.Array, jax.Array]:
+    """Run packed decode while computing the vLLM raw-gate contract in-kernel."""
+
+    if mixed_qkv.ndim != 2:
+        raise ValueError("mixed_qkv must have shape [batch, packed_dim]")
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("a and b must have shape [batch, value_heads]")
+    if decay.ndim != 1 or dt_bias.ndim != 1:
+        raise ValueError("decay and dt_bias must have shape [value_heads]")
+    if state.ndim != 4:
+        raise ValueError("state must have shape [batch, value_heads, value_dim, key_dim]")
+    if mixed_qkv.dtype != jnp.bfloat16:
+        raise ValueError("gdn_packed_decode_step_bf16_raw_gates requires BF16 packed QKV")
+    for name, array in (
+        ("a", a),
+        ("b", b),
+        ("decay", decay),
+        ("dt_bias", dt_bias),
+        ("state", state),
+    ):
+        if array.dtype != jnp.float32:
+            raise ValueError(f"{name} must be float32")
+
+    batch, packed_dim = mixed_qkv.shape
+    state_batch, value_heads, value_dim, key_dim = state.shape
+    if state_batch != batch:
+        raise ValueError("state batch must match mixed_qkv batch")
+    if a.shape != (batch, value_heads) or b.shape != (batch, value_heads):
+        raise ValueError("a and b must have shape [batch, value_heads]")
+    if decay.shape != (value_heads,) or dt_bias.shape != (value_heads,):
+        raise ValueError("decay and dt_bias must have shape [value_heads]")
+    qk_dim = packed_dim - value_heads * value_dim
+    if qk_dim <= 0 or qk_dim % (2 * key_dim) != 0:
+        raise ValueError("mixed_qkv has an invalid packed Q/K dimension")
+    num_q_heads = qk_dim // (2 * key_dim)
+    if value_heads % num_q_heads != 0:
+        raise ValueError("value_heads must be divisible by num_q_heads")
+
+    block_k = jt.next_power_of_2(key_dim)
+    block_v = _decode_triton_block_v(value_dim)
+    num_warps = _decode_triton_num_warps(value_dim)
+    out_shape = (
+        jax.ShapeDtypeStruct((batch, value_heads, 1, value_dim), jnp.float32),
+        jax.ShapeDtypeStruct(state.shape, jnp.float32),
+    )
+    return jt.triton_call(
+        mixed_qkv,
+        a,
+        b,
+        decay,
+        dt_bias,
+        state,
+        kernel=_gdn_packed_decode_raw_gate_kernel,
+        out_shape=out_shape,
+        grid=(jt.cdiv(value_dim, block_v), batch * value_heads),
+        qkv_dim=packed_dim,
+        H=num_q_heads,
+        HV=value_heads,
+        K=key_dim,
+        V=value_dim,
+        BK=block_k,
+        BV=block_v,
+        FULL_K=key_dim == block_k,
+        FULL_V=value_dim % block_v == 0,
+        SCALE=1.0 / (key_dim**0.5),
+        USE_QK_L2NORM_IN_KERNEL=_normalize_bool(use_qk_l2norm_in_kernel),
+        SOFTPLUS_THRESHOLD=20.0,
+        num_warps=num_warps,
+        num_stages=_decode_triton_num_stages(),
+    )
+
+
+def gdn_conv_packed_decode_step_bf16_raw_gates(
+    mixed_qkv: jax.Array,
+    a: jax.Array,
+    b: jax.Array,
+    decay: jax.Array,
+    dt_bias: jax.Array,
+    conv_state: jax.Array,
+    conv_weight: jax.Array,
+    conv_bias: jax.Array,
+    recurrent_state: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Run one GDN decode step with conv update and packed recurrent update fused."""
+
+    if mixed_qkv.ndim != 2:
+        raise ValueError("mixed_qkv must have shape [batch, conv_dim]")
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("a and b must have shape [batch, value_heads]")
+    if decay.ndim != 1 or dt_bias.ndim != 1:
+        raise ValueError("decay and dt_bias must have shape [value_heads]")
+    if conv_state.ndim != 3:
+        raise ValueError("conv_state must have shape [batch, conv_dim, kernel_size]")
+    if conv_weight.ndim != 2 or conv_bias.ndim != 1:
+        raise ValueError("conv_weight/conv_bias must have shape [conv_dim, kernel_size]/[conv_dim]")
+    if recurrent_state.ndim != 4:
+        raise ValueError("recurrent_state must have shape [batch, value_heads, value_dim, key_dim]")
+    if mixed_qkv.dtype != jnp.bfloat16:
+        raise ValueError("gdn_conv_packed_decode_step_bf16_raw_gates requires BF16 mixed_qkv")
+    for name, array in (
+        ("a", a),
+        ("b", b),
+        ("decay", decay),
+        ("dt_bias", dt_bias),
+        ("conv_state", conv_state),
+        ("conv_weight", conv_weight),
+        ("conv_bias", conv_bias),
+        ("recurrent_state", recurrent_state),
+    ):
+        if array.dtype != jnp.float32:
+            raise ValueError(f"{name} must be float32")
+
+    batch, conv_dim = mixed_qkv.shape
+    state_batch, value_heads, value_dim, key_dim = recurrent_state.shape
+    if state_batch != batch or conv_state.shape[0] != batch:
+        raise ValueError("state batch dimensions must match mixed_qkv batch")
+    if conv_state.shape[1] != conv_dim or conv_weight.shape[0] != conv_dim or conv_bias.shape[0] != conv_dim:
+        raise ValueError("conv dimensions must match mixed_qkv")
+    if conv_weight.shape[1] != conv_state.shape[2]:
+        raise ValueError("conv kernel sizes must match")
+    if a.shape != (batch, value_heads) or b.shape != (batch, value_heads):
+        raise ValueError("a and b must have shape [batch, value_heads]")
+    if decay.shape != (value_heads,) or dt_bias.shape != (value_heads,):
+        raise ValueError("decay and dt_bias must have shape [value_heads]")
+    qk_dim = conv_dim - value_heads * value_dim
+    if qk_dim <= 0 or qk_dim % (2 * key_dim) != 0:
+        raise ValueError("mixed_qkv has an invalid packed Q/K dimension")
+    num_q_heads = qk_dim // (2 * key_dim)
+    if value_heads % num_q_heads != 0:
+        raise ValueError("value_heads must be divisible by num_q_heads")
+
+    block_k = jt.next_power_of_2(key_dim)
+    block_v = _decode_triton_block_v(value_dim)
+    num_warps = _decode_triton_num_warps(value_dim)
+    out_shape = (
+        jax.ShapeDtypeStruct((batch, value_heads, 1, value_dim), jnp.float32),
+        jax.ShapeDtypeStruct(conv_state.shape, jnp.float32),
+        jax.ShapeDtypeStruct(recurrent_state.shape, jnp.float32),
+    )
+    return jt.triton_call(
+        mixed_qkv,
+        a,
+        b,
+        decay,
+        dt_bias,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        recurrent_state,
+        kernel=_gdn_conv_packed_decode_raw_gate_kernel,
+        out_shape=out_shape,
+        grid=(jt.cdiv(value_dim, block_v), batch * value_heads),
+        qkv_dim=conv_dim,
+        H=num_q_heads,
+        HV=value_heads,
+        K=key_dim,
+        V=value_dim,
+        CONV_KERNEL=conv_state.shape[2],
+        BK=block_k,
+        BV=block_v,
+        FULL_K=key_dim == block_k,
+        FULL_V=value_dim % block_v == 0,
+        SCALE=1.0 / (key_dim**0.5),
+        SOFTPLUS_THRESHOLD=20.0,
+        num_warps=num_warps,
+        num_stages=_decode_triton_num_stages(),
+    )
+
+
 def available() -> bool:
     try:
         _configure_triton_runtime()
@@ -2844,5 +3413,7 @@ __all__ = [
     "gdn_fla_chunk_fwd_o_packed_triton",
     "gdn_fla_chunk_gated_delta_rule_packed_triton",
     "gdn_packed_decode_step_bf16",
+    "gdn_packed_decode_step_bf16_raw_gates",
+    "gdn_conv_packed_decode_step_bf16_raw_gates",
     "gdn_post_conv_prep_bf16",
 ]

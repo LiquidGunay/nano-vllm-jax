@@ -102,16 +102,35 @@ def _gdn_packed_decode_impl() -> str:
         return "reference"
     if normalized in {"triton_fla", "fla_triton", "jax_triton", "triton"}:
         return "triton_fla"
+    if normalized in {
+        "triton_fla_raw_gates",
+        "triton_raw_gates",
+        "fla_triton_raw_gates",
+        "triton_fla_raw",
+    }:
+        return "triton_fla_raw_gates"
+    if normalized in {
+        "triton_fla_conv_raw_gates",
+        "triton_conv_raw_gates",
+        "fla_triton_conv_raw_gates",
+        "triton_fla_conv",
+    }:
+        return "triton_fla_conv_raw_gates"
     if normalized in {"cuda", "cuda_fp32", "fast"}:
         return "cuda_fp32"
     raise ValueError(
         f"Unknown {_GDN_PACKED_DECODE_IMPL_ENV}={value!r}; "
-        "expected off, reference, triton_fla, or cuda_fp32"
+        "expected off, reference, triton_fla, triton_fla_raw_gates, "
+        "triton_fla_conv_raw_gates, or cuda_fp32"
     )
 
 
 def gdn_packed_decode_enabled() -> bool:
     return _gdn_packed_decode_impl() != "off"
+
+
+def gdn_packed_decode_conv_enabled() -> bool:
+    return _gdn_packed_decode_impl() == "triton_fla_conv_raw_gates"
 
 
 def gdn_packed_decode_max_batch() -> int | None:
@@ -384,6 +403,21 @@ class InferenceBackend(Protocol):
         initial_state: jnp.ndarray,
         use_qk_l2norm_in_kernel: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        ...
+
+    def gated_delta_conv_packed_decode(
+        self,
+        mixed_qkv: jnp.ndarray,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        conv_state: jnp.ndarray,
+        conv_weight: jnp.ndarray,
+        conv_bias: jnp.ndarray | None,
+        recurrent_state: jnp.ndarray,
+        use_qk_l2norm_in_kernel: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         ...
 
 
@@ -1540,7 +1574,7 @@ class PureJAXBackend:
                 initial_state,
             )
 
-        if impl == "triton_fla":
+        if impl in {"triton_fla", "triton_fla_raw_gates"}:
             pre_normalize_qk = _gdn_packed_decode_pre_normalize_qk()
             if pre_normalize_qk and use_qk_l2norm_in_kernel:
                 # q/k are already normalized before entering the kernel. Leave the
@@ -1575,12 +1609,15 @@ class PureJAXBackend:
                 )
             )
 
-            gate = -decay * jax.nn.softplus(a + dt_bias)
-            beta = jax.nn.sigmoid(b)
             try:
-                from nanovllm_jax.kernels.gdn_fla_triton import (
-                    gdn_packed_decode_step_bf16,
-                )
+                if impl == "triton_fla_raw_gates":
+                    from nanovllm_jax.kernels.gdn_fla_triton import (
+                        gdn_packed_decode_step_bf16_raw_gates,
+                    )
+                else:
+                    from nanovllm_jax.kernels.gdn_fla_triton import (
+                        gdn_packed_decode_step_bf16,
+                    )
             except (ImportError, ModuleNotFoundError, AttributeError):
                 _raise_if_gdn_fallback_disabled(
                     "Triton FLA packed decode kernel is unavailable"
@@ -1596,6 +1633,19 @@ class PureJAXBackend:
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 )
 
+            if impl == "triton_fla_raw_gates":
+                return gdn_packed_decode_step_bf16_raw_gates(
+                    mixed_qkv,
+                    a,
+                    b,
+                    decay,
+                    dt_bias,
+                    initial_state,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
+
+            gate = -decay * jax.nn.softplus(a + dt_bias)
+            beta = jax.nn.sigmoid(b)
             return gdn_packed_decode_step_bf16(
                 mixed_qkv,
                 gate,
@@ -1605,6 +1655,88 @@ class PureJAXBackend:
             )
 
         raise AssertionError(f"Unhandled packed GDN decode implementation {impl!r}")
+
+    def gated_delta_conv_packed_decode(
+        self,
+        mixed_qkv: jnp.ndarray,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        conv_state: jnp.ndarray,
+        conv_weight: jnp.ndarray,
+        conv_bias: jnp.ndarray | None,
+        recurrent_state: jnp.ndarray,
+        use_qk_l2norm_in_kernel: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        impl = _gdn_packed_decode_impl()
+        if impl != "triton_fla_conv_raw_gates":
+            raise RuntimeError(
+                "gated_delta_conv_packed_decode is only enabled by "
+                f"{_GDN_PACKED_DECODE_IMPL_ENV}=triton_fla_conv_raw_gates"
+            )
+        if not use_qk_l2norm_in_kernel:
+            raise ValueError("conv packed GDN decode requires q/k l2norm")
+
+        def reference() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+            from nanovllm_jax.layers import causal_conv1d_update
+            from nanovllm_jax.kernels.gdn_fla import (
+                gdn_packed_decode_pre_normalize_qk,
+                gdn_packed_decode_reference_from_decay,
+            )
+
+            conv_out_t, new_conv_state = causal_conv1d_update(
+                mixed_qkv[:, :, None],
+                conv_state,
+                conv_weight,
+                conv_bias,
+                "silu",
+            )
+            conv_out = gdn_packed_decode_pre_normalize_qk(
+                conv_out_t[:, :, 0].astype(jnp.float32),
+                recurrent_state,
+            )
+            out, new_recurrent_state = gdn_packed_decode_reference_from_decay(
+                conv_out,
+                a,
+                b,
+                decay,
+                dt_bias,
+                recurrent_state,
+                qkv_dtype=jnp.bfloat16,
+                use_qk_l2norm_in_kernel=False,
+            )
+            return out, new_conv_state, new_recurrent_state
+
+        try:
+            from nanovllm_jax.kernels.gdn_fla_triton import (
+                gdn_conv_packed_decode_step_bf16_raw_gates,
+            )
+        except (ImportError, ModuleNotFoundError, AttributeError):
+            _raise_if_gdn_fallback_disabled(
+                "Triton FLA conv+packed decode kernel is unavailable"
+            )
+            return reference()
+
+        if conv_bias is None:
+            conv_bias = jnp.zeros((conv_weight.shape[0],), dtype=conv_weight.dtype)
+        try:
+            return gdn_conv_packed_decode_step_bf16_raw_gates(
+                mixed_qkv.astype(jnp.bfloat16),
+                a.astype(jnp.float32),
+                b.astype(jnp.float32),
+                decay.astype(jnp.float32),
+                dt_bias.astype(jnp.float32),
+                conv_state.astype(jnp.float32),
+                conv_weight.astype(jnp.float32),
+                conv_bias.astype(jnp.float32),
+                recurrent_state.astype(jnp.float32),
+            )
+        except Exception:
+            _raise_if_gdn_fallback_disabled(
+                "Triton FLA conv+packed decode kernel cannot handle this shape"
+            )
+            return reference()
 
 
 class KernelBackendPlaceholder(PureJAXBackend):
