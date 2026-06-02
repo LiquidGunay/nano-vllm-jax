@@ -7484,3 +7484,44 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - next work should keep this route as the baseline and either broaden the
     same composition to hetero8 or target the remaining decode GEMM/reduction
     buckets only if the new baseline fails on broader workloads.
+
+### Entry 211 - Full Workload Sanity Check After Target Hit
+
+- date: 2026-06-02
+- purpose:
+  - sanity check the promoted Entry 210 config across the regular benchmark
+    workloads with no profiling overhead before updating the PR.
+- setup:
+  - strict no-fallback route:
+    `prefill_block_dot=true`, `packed_decode.impl=reference`,
+    `packed_decode.qkv_dtype=bf16`, static decode metadata, padded decode
+    GEMMs, and local CUDA probes disabled;
+  - two no-profile repeats per workload using
+    `benchmarks/benchmark_jax_server_trace.py`;
+  - artifacts stored under:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/full_matrix_sanity_20260602/`.
+- results:
+  - `hetero8`: exact parity in both repeats; `316.68`, `318.03 tok/s`,
+    median `317.35 tok/s`; stored vLLM `864.18 tok/s`; ratio `0.367x`;
+  - `short_32_128`: exact parity in both repeats; `391.13`,
+    `381.92 tok/s`, median `386.52 tok/s`; stored vLLM `568.26 tok/s`;
+    ratio `0.680x`;
+  - `long_prefill_512_2048`: exact parity in both repeats; `106.17`,
+    `105.98 tok/s`, median `106.08 tok/s`; stored vLLM `116.37 tok/s`;
+    ratio `0.912x`;
+  - `decode_heavy_128x128`: exact parity in both repeats; `197.02`,
+    `198.18 tok/s`, median `197.60 tok/s`; fresh vLLM async baseline
+    `219.03 tok/s`; ratio `0.902x`.
+- interpretation:
+  - the promoted config is correctness-clean on all four sanity workloads;
+  - the `0.9x` target remains met for the two target-sensitive workloads:
+    decode-heavy and long-prefill;
+  - `decode_heavy_128x128` is close to the line, but the new two-repeat median
+    plus Entry 210's prior three-repeat median are both above the fresh `0.9x`
+    threshold;
+  - hetero8 and short are not solved by this route. Hetero8 remains the main
+    broader-serving bottleneck and should not be presented as target-met.
+- decision:
+  - update the PR with the target-hit result and the broader sanity caveat;
+  - keep future speed work focused on hetero8/broader serving rather than
+    re-opening the decode-heavy composition unless it regresses below target.

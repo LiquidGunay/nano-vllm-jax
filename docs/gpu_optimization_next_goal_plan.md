@@ -101,6 +101,16 @@ work is to preserve this config as the baseline, validate broader workloads,
 and only then attack the remaining decode GEMM/reduction buckets if they block
 the broader claim.
 
+Full no-profile sanity after promotion:
+
+- `hetero8`: exact, median `317.35 tok/s`, `0.367x` stored vLLM;
+- `short_32_128`: exact, median `386.52 tok/s`, `0.680x` stored vLLM;
+- `long_prefill_512_2048`: exact, median `106.08 tok/s`, `0.912x` stored vLLM;
+- `decode_heavy_128x128`: exact, median `197.60 tok/s`, `0.902x` fresh vLLM.
+
+The config is correctness-clean across the sanity set. The target claim is
+decode-heavy plus long-prefill; hetero8 remains open.
+
 Next implementation order:
 
 1. Preserve and remeasure the Entry 210 baseline. Use
@@ -2230,6 +2240,12 @@ Status as of 2026-06-02:
     four block-dot flags as true, but profiling lowers throughput to
     `191.23 tok/s`; use it for bucket movement, not for the no-profile speed
     claim.
+- Entry 211 full no-profile sanity:
+  - all four sanity workloads passed exact parity;
+  - `long_prefill_512_2048` median `106.08 tok/s`, `0.912x` stored vLLM;
+  - `decode_heavy_128x128` median `197.60 tok/s`, `0.902x` fresh vLLM;
+  - `hetero8` and `short_32_128` remain below target at `0.367x` and `0.680x`
+    stored vLLM respectively.
 
 Profile interpretation guardrails:
 
