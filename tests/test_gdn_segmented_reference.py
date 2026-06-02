@@ -1553,6 +1553,109 @@ def test_gdn_fla_chunk_gated_delta_rule_packed_triton_matches_reference():
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_gdn_fla_chunk_gated_delta_rule_packed_triton_block_dot_mixed_lengths(
+    monkeypatch,
+):
+    from nanovllm_jax.kernels.gdn_fla_triton import (
+        gdn_fla_chunk_gated_delta_rule_packed_triton,
+    )
+
+    for env_name in (
+        "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS",
+        "NANO_VLLM_JAX_GDN_KKT_BLOCK_DOT",
+        "NANO_VLLM_JAX_GDN_RECOMPUTE_BLOCK_DOT",
+        "NANO_VLLM_JAX_GDN_DELTA_H_BLOCK_DOT",
+        "NANO_VLLM_JAX_GDN_FWD_O_BLOCK_DOT",
+    ):
+        monkeypatch.setenv(env_name, "1")
+
+    chunk_size = 64
+    cu_seqlens = jnp.array([0, 0, 17, 81, 160, 290], dtype=jnp.int32)
+    chunk_indices, chunk_offsets = prepare_gdn_fla_chunk_metadata(
+        cu_seqlens,
+        chunk_size=chunk_size,
+    )
+    total_tokens = int(cu_seqlens[-1])
+    batch = int(cu_seqlens.shape[0] - 1)
+    num_heads = 4
+    key_dim = 64
+    value_dim = 64
+    keys = jax.random.split(jax.random.PRNGKey(20260604), 6)
+    query = jax.random.normal(
+        keys[0],
+        (total_tokens, num_heads, key_dim),
+        dtype=jnp.float32,
+    ) * 0.02
+    key = jax.random.normal(
+        keys[1],
+        (total_tokens, num_heads, key_dim),
+        dtype=jnp.float32,
+    ) * 0.02
+    value = jax.random.normal(
+        keys[2],
+        (total_tokens, num_heads, value_dim),
+        dtype=jnp.float32,
+    ) * 0.03
+    gate = jax.random.normal(
+        keys[3],
+        (total_tokens, num_heads),
+        dtype=jnp.float32,
+    ) * 0.01
+    beta = jax.random.uniform(
+        keys[4],
+        (total_tokens, num_heads),
+        dtype=jnp.float32,
+        minval=0.2,
+        maxval=0.7,
+    )
+    initial_state = jax.random.normal(
+        keys[5],
+        (batch, num_heads, value_dim, key_dim),
+        dtype=jnp.float32,
+    ) * 0.01
+
+    actual_out, actual_state = gdn_fla_chunk_gated_delta_rule_packed_triton(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        cu_seqlens,
+        initial_state,
+        chunk_size=chunk_size,
+        use_qk_l2norm_in_kernel=False,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        max_row_chunks=3,
+    )
+    expected_out, expected_state = gdn_fla_chunk_gated_delta_rule_packed_reference(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        cu_seqlens,
+        initial_state,
+        chunk_size=chunk_size,
+        use_qk_l2norm_in_kernel=False,
+    )
+
+    _assert_allclose_with_nan_counts(
+        "block_dot_mixed_lengths_output",
+        actual_out,
+        expected_out,
+        atol=2e-3,
+    )
+    _assert_allclose_with_nan_counts(
+        "block_dot_mixed_lengths_state",
+        actual_state,
+        expected_state,
+        atol=5e-3,
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
 def test_gdn_fla_chunk_gated_delta_rule_triton_stage_diagnostics():
     from nanovllm_jax.kernels.gdn_fla_triton import (
         gdn_fla_chunk_delta_h_packed_triton,
