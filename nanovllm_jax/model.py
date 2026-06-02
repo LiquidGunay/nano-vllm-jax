@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from nanovllm_jax.backends import (
     InferenceBackend,
     gdn_packed_decode_enabled,
+    gdn_packed_decode_max_batch,
     gdn_prefill_post_conv_enabled,
     select_backend,
 )
@@ -1028,8 +1029,10 @@ def gated_deltanet_block(
         # linear_layer_idx computed above
         initial_recurrent = hybrid_state.recurrent_state[:, linear_layer_idx] if hybrid_state.recurrent_state is not None else None
 
+        packed_decode_max_batch = gdn_packed_decode_max_batch()
         use_packed_decode = (
             gdn_packed_decode_enabled()
+            and (packed_decode_max_batch is None or batch <= packed_decode_max_batch)
             and seq_len == 1
             and not return_prefix_state
             and not return_first_prefix_state

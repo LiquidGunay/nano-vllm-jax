@@ -46,6 +46,7 @@
         "impl": "triton_fla",
         "qkv_dtype": "bf16",
         "pre_normalize_qk": true,
+        "max_batch": 1,
         "triton": {
           "num_warps": 8,
           "num_stages": 2,

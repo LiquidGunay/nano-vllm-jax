@@ -54,6 +54,7 @@ _GDN_PREFILL_POST_CONV_OUTPUT_DTYPE_ENV = (
 )
 _GDN_PREFILL_FLA_VLLM_LIKE_ENV = "NANO_VLLM_JAX_GDN_PREFILL_FLA_VLLM_LIKE"
 _GDN_PACKED_DECODE_QKV_DTYPE_ENV = "NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE"
+_GDN_PACKED_DECODE_MAX_BATCH_ENV = "NANO_VLLM_JAX_GDN_PACKED_DECODE_MAX_BATCH"
 _GDN_DISABLE_FALLBACKS_ENV = "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS"
 _OFF_ENV_VALUES = {"", "0", "false", "no", "off", "none", "False"}
 
@@ -111,6 +112,14 @@ def _gdn_packed_decode_impl() -> str:
 
 def gdn_packed_decode_enabled() -> bool:
     return _gdn_packed_decode_impl() != "off"
+
+
+def gdn_packed_decode_max_batch() -> int | None:
+    value = os.environ.get(_GDN_PACKED_DECODE_MAX_BATCH_ENV, "").strip()
+    if not value:
+        return None
+    max_batch = int(value)
+    return max_batch if max_batch > 0 else None
 
 
 def _gdn_prefill_post_conv_impl() -> str:

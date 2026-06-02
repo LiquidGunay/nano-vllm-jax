@@ -299,6 +299,11 @@ def _kernels_section_to_env(kernels_section: dict) -> dict[str, str]:
         "NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK",
         packed_decode.get("pre_normalize_qk"),
     )
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_MAX_BATCH",
+        packed_decode.get("max_batch"),
+    )
 
     triton_decode = packed_decode.get("triton", {}) or {}
     _put_env(

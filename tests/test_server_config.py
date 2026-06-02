@@ -42,6 +42,7 @@ def test_runtime_and_kernel_sections_translate_to_env():
                         "impl": "triton_fla",
                         "qkv_dtype": "bf16",
                         "pre_normalize_qk": True,
+                        "max_batch": 1,
                         "triton": {
                             "num_warps": 8,
                             "num_stages": 2,
@@ -77,6 +78,7 @@ def test_runtime_and_kernel_sections_translate_to_env():
     assert env["NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL"] == "triton_fla"
     assert env["NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE"] == "bf16"
     assert env["NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK"] == "1"
+    assert env["NANO_VLLM_JAX_GDN_PACKED_DECODE_MAX_BATCH"] == "1"
     assert env["NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_WARPS"] == "8"
 
 

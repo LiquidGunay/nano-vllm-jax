@@ -6835,3 +6835,80 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     `long_prefill_512_2048` for prefill-kernel claims, and use `hetero8` plus
     `decode_heavy_128x128` before promoting the route as a default serving
     improvement.
+
+### Entry 199 - Hetero8 Decode Bottleneck Pass
+
+- date: 2026-06-02
+- purpose:
+  - profile the `hetero8` mixed workload after the block-dot prefill route and
+    identify the next integrated bottleneck without reusing rejected source-level
+    rewrites.
+- starting artifact:
+  - `results/gpu_matrix_hetero8_block_dot_mixed_prefill_r1_20260602.json`.
+- starting result:
+  - exact generated-token match: yes;
+  - repeats: `1`, so not speed-claim-ready;
+  - throughput: `308.27 tok/s`, `0.838x` stored Entry 045 JAX reference,
+    `0.357x` stored vLLM reference;
+  - scheduler split: one prefill step took `0.02495 s`; 31 decode steps took
+    `0.79231 s`.
+- starting bottlenecks:
+  - CPU/PJRT: `forward_step_token_ids_jit` `559.13 ms`,
+    `PjRtCApiLoadedExecutable::Execute` `552.10 ms`;
+  - final token host materialization: `np.asarray(jax.Array)` `96.54 ms`;
+  - command-buffer churn: execute/update counts `992`/`961`, totaling
+    `44.31 ms`/`44.01 ms`;
+  - top GPU buckets remained non-GDN model work: `gemm_fusion_dot_164`
+    `110.73 ms`, `gemm_fusion_dot_163` `97.20 ms`, plus smaller GEMM,
+    concatenate, transpose, and D2D buckets.
+- rejected experiment:
+  - attempted to materialize only the requested rows from device token vectors
+    before host readback;
+  - artifact:
+    `results/gpu_matrix_hetero8_token_ref_gather_r1_20260602.json`;
+  - exact generated-token match: yes;
+  - throughput regressed to `183.34 tok/s`, `0.498x` stored Entry 045 and
+    `0.212x` stored vLLM;
+  - although `np.asarray(jax.Array)` fell to `11.68 ms`, CPU `gather` rose to
+    `1454.40 ms`, PJRT execute rose to `858.21 ms`, and decode time rose to
+    `1.35713 s`;
+  - decision: reject/revert. Do not retry token-row gather materialization in
+    this form.
+- accepted change:
+  - added `kernels.gdn.packed_decode.max_batch` /
+    `NANO_VLLM_JAX_GDN_PACKED_DECODE_MAX_BATCH`;
+  - set the block-dot benchmark config to `max_batch: 1`, keeping the Triton
+    packed GDN decode route for single-sequence decode-heavy runs while using
+    the pure-JAX recurrent path for wider decode batches.
+- accepted artifact:
+  - `results/gpu_matrix_hetero8_block_dot_maxbatch1_r1_20260602.json`.
+- accepted result:
+  - exact generated-token match: yes;
+  - repeats: `1`, so not speed-claim-ready;
+  - throughput: `322.79 tok/s`, `0.878x` stored Entry 045 JAX reference,
+    `0.374x` stored vLLM reference;
+  - delta versus starting block-dot route: `+14.52 tok/s`, decode time
+    `0.79231 s -> 0.76085 s`;
+  - command-buffer execute/update counts fell from `992`/`961` to `279`/`248`.
+- current remaining bottlenecks after the accepted change:
+  - decode dominates: one prefill step is still only `0.02482 s`, while 31
+    decode steps total `0.76085 s`;
+  - CPU/PJRT compiled execution remains large:
+    `forward_step_token_ids_jit` `542.83 ms` and PJRT execute `539.47 ms`;
+  - final token materialization is still visible at `109.04 ms`;
+  - top GPU buckets are still mostly model GEMM/concatenate/transpose work:
+    `gemm_fusion_dot_164` `110.72 ms`, `gemm_fusion_dot_163` `97.19 ms`,
+    `gemm_fusion_dot_286` `43.63 ms`, `gemm_fusion_dot_general_473`
+    `41.09 ms`, and `wrapped_concatenate` `36.46 ms`.
+- same-pass current-default check:
+  - `results/gpu_matrix_hetero8_current_default_r1_20260602.json` measured
+    `292.71 tok/s`, exact, `0.796x` stored Entry 045;
+  - this confirms the block-dot plus max-batch guard route beats the current
+    branch default in the same one-repeat profiler setup, but it does not
+    replace the stored Entry 045 baseline as the acceptance anchor.
+- decision:
+  - keep the max-batch routing guard as a small integrated hetero8 win;
+  - do not claim the block-dot route is a serving-wide win yet;
+  - next hetero8 work should target either compiled decode model buckets or
+    final device-token materialization scheduling, but must avoid row-gather
+    materialization and must be measured against stored Entry 045 plus vLLM.

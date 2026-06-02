@@ -46,7 +46,11 @@ The route is controlled in typed configs with:
 "kernels": {
   "gdn": {
     "prefill_post_conv_impl": "triton_fla_padded",
-    "prefill_block_dot": true
+    "prefill_block_dot": true,
+    "packed_decode": {
+      "impl": "triton_fla",
+      "max_batch": 1
+    }
   }
 }
 ```
@@ -54,6 +58,13 @@ The route is controlled in typed configs with:
 The older per-stage keys remain available for narrow ablations, but benchmark
 configs should prefer the single `prefill_block_dot` knob to avoid config/env
 sprawl.
+
+`packed_decode.max_batch` limits the Triton packed GDN decode route by static
+decode batch size. On the current A10G evidence, the route is useful for the
+single-sequence decode-heavy target, but it adds overhead on multi-sequence
+`hetero8`. The block-dot benchmark config therefore keeps Triton packed decode
+available only for `batch <= 1` and uses the pure-JAX recurrent GDN decode path
+for wider decode batches.
 
 ## Model-Specific Assumptions
 

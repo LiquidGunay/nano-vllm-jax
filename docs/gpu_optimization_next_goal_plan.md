@@ -2154,6 +2154,41 @@ validation commit before Commit 4. That commit should prove an optional external
 kernel can be discovered, gated, called, profiled, and bypassed without touching
 the pure-JAX correctness path.
 
+## Current Hetero8 Bottleneck Tracker
+
+Status as of 2026-06-02:
+
+- Current accepted local hetero8 route under investigation:
+  `gpu_paged_gdn_fla_decode_kkt_fwd_o_block_dot` with block-dot GDN prefill and
+  `kernels.gdn.packed_decode.max_batch: 1`.
+- Current one-repeat artifact:
+  `results/gpu_matrix_hetero8_block_dot_maxbatch1_r1_20260602.json`.
+- Current result: exact generated-token match, `322.79 tok/s`, `0.878x` stored
+  Entry 045 JAX reference, `0.374x` stored vLLM reference. This is an
+  improvement over the earlier block-dot mixed smoke (`308.27 tok/s`) but is
+  not speed-claim-ready.
+- Dominant shape: decode, not prefill. One prefill step is about `24.82 ms`;
+  31 decode steps total about `760.85 ms`.
+- Current main buckets:
+  - compiled decode execution: `forward_step_token_ids_jit` `542.83 ms`,
+    PJRT execute `539.47 ms`;
+  - final device-token materialization: `np.asarray(jax.Array)` `109.04 ms`;
+  - top GPU model buckets: two large GEMMs around `110.72 ms` and `97.19 ms`,
+    then smaller GEMM/concatenate/transpose buckets.
+- Recently accepted optimization: cap Triton packed GDN decode to
+  `batch <= 1`, because it helps single-sequence decode-heavy runs but adds
+  command-buffer overhead on batch-8 hetero. Command-buffer execute/update counts
+  moved from `992`/`961` to `279`/`248`.
+- Recently rejected optimization: device-token vector row-gather
+  materialization. It reduced the visible `np.asarray` bucket but added
+  `1454.40 ms` of CPU gather and cut throughput to `183.34 tok/s`. Do not retry
+  this shape of fix.
+
+Next hetero8 experiments should reduce one of the current dominant buckets and
+must compare against both stored Entry 045 and stored vLLM. Avoid source-level
+rewrites unless the profile shows that the rewrite removes a dominant bucket in
+the integrated server trace.
+
 ## Hard Rules For The Agent
 
 ```text
