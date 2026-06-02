@@ -6912,3 +6912,87 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - next hetero8 work should target either compiled decode model buckets or
     final device-token materialization scheduling, but must avoid row-gather
     materialization and must be measured against stored Entry 045 plus vLLM.
+
+### Entry 200 - vLLM Packed Decode Boundary Audit
+
+- date: 2026-06-02
+- purpose:
+  - explain why the vLLM-shaped packed GDN decode kernel has not produced a
+    prefill-like speedup, and separate raw kernel cost from the JAX integration
+    boundary.
+- source comparison:
+  - vLLM's current packed decode boundary takes packed `mixed_qkv`, raw `a`/`b`,
+    `A_log`/`dt_bias`, a preallocated output buffer, state indices, and an
+    in-place state buffer;
+  - the vLLM kernel computes softplus/sigmoid gating, optional Q/K L2 norm,
+    recurrence, output, and state update inside one Triton launch;
+  - the local JAX route computes or normalizes several inputs outside the
+    Triton call, launches through `jax_triton`, returns a separate `new_state`
+    value, and lets XLA/JAX own the state/output buffer plumbing.
+- artifacts:
+  - microbench:
+    `results/gdn_decode_kernel_boundary_microbench_20260602.json`;
+  - Q/K norm microbench:
+    `results/gdn_decode_l2norm_boundary_microbench_20260602.json`;
+  - decode-heavy current pre-normalized route:
+    `results/gpu_matrix_decode_packed_prenorm_audit_r1_20260602.json`;
+  - decode-heavy in-kernel Q/K norm ablation:
+    `results/gpu_matrix_decode_packed_in_kernel_norm_audit_r1_20260602.json`;
+  - hetero8 block-dot packed-decode in-kernel Q/K norm ablation:
+    `results/gpu_matrix_hetero8_blockdot_packed_in_kernel_norm_audit_r1_20260602.json`.
+- focused microbench findings:
+  - batch 1:
+    - pure JAX packed reference boundary: `0.0941 ms/step`;
+    - current Triton boundary: `0.0996 ms/step`;
+    - Triton kernel-only with prepared inputs: `0.0665 ms/step`;
+  - batch 8:
+    - pure JAX packed reference boundary: `0.0664 ms/step`;
+    - current Triton boundary: `0.1054 ms/step`;
+    - Triton kernel-only with prepared inputs: `0.0644 ms/step`;
+  - interpretation: the raw recurrence kernel is not slow; the current boundary
+    around it can erase the win, especially for batch 8.
+- Q/K norm ablation:
+  - in-kernel Q/K norm was not a server-level fix;
+  - microbench batch 8 boundary moved from `0.1209 ms/step` with external
+    pre-normalization to `0.1053 ms/step` with in-kernel normalization in that
+    isolated run, but integrated decode did not improve.
+- integrated decode-heavy result:
+  - current pre-normalized route:
+    - exact generated-token match: yes;
+    - `158.80 tok/s`, `0.744x` stored vLLM, `1.046x` stored JAX reference;
+    - `_gdn_packed_decode_kernel`: `11.11 ms` across `2286` launches;
+    - larger buckets: `forward_step_token_ids_jit` `414.86 ms`,
+      PJRT execute `391.07 ms`, command-buffer execute/update
+      `132.67 ms`/`94.64 ms`, and GPU GEMM/reduction buckets such as
+      `gemm_fusion_dot_265` `126.37 ms` and `input_reduce_fusion_153`
+      `103.20 ms`.
+  - in-kernel Q/K norm route:
+    - exact generated-token match: yes;
+    - `157.27 tok/s`, `0.737x` stored vLLM, `1.036x` stored JAX reference;
+    - `_gdn_packed_decode_kernel`: `12.98 ms` across `2286` launches;
+    - no integrated win.
+- integrated hetero8 result:
+  - block-dot prefill with packed decode enabled for batch 8 and in-kernel Q/K
+    norm:
+    - exact generated-token match: yes;
+    - `316.68 tok/s`, `0.861x` stored Entry 045, `0.366x` stored vLLM;
+    - `_gdn_packed_decode_kernel`: `18.71 ms` across `558` launches.
+  - comparison:
+    - old block-dot route with packed decode and external pre-normalization:
+      `308.27 tok/s`;
+    - accepted `packed_decode.max_batch=1` route:
+      `322.79 tok/s`;
+    - therefore keep `max_batch=1`; in-kernel Q/K norm improves the packed
+      batch-8 variant but still loses to disabling packed decode for batch 8.
+- decision:
+  - do not expect the current packed recurrence kernel alone to give a
+    prefill-like speedup;
+  - the local problem is not the raw `_gdn_packed_decode_kernel` body. It is the
+    narrow JAX boundary plus the surrounding decode graph: gate/beta and Q/K
+    prep, command-buffer churn, state/output buffer plumbing, GEMM/reduction
+    buckets, and token/readback scheduling;
+  - keep `packed_decode.max_batch=1` for now;
+  - the next serious vLLM-style decode attempt should be a coarser boundary
+    that owns packed input prep/gating/QK norm/state update/output together, or
+    a runtime strategy that reduces command-buffer/PJRT overhead. Retuning the
+    current narrow packed kernel is unlikely to close the gap.
