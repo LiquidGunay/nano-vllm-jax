@@ -96,17 +96,20 @@ lengths, and output lengths vary within a declared range.
 Current best:
 
 - artifact:
-  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_b8_320width_static_cache_split_decode_block_buckets_128_256_320_r1_20260604.json`;
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_noprofile_after_driver_fix_20260604.json`;
 - workload: `15` requests, `30506` input tokens, `11602` output tokens,
   prompt lengths `1077..4022`, output lengths `425..1007`;
 - generic warmup compiled all batch buckets `1,2,4,8`, prefill token buckets
   `128,256,512,1024,2048`, and decode block-table buckets `128,256,320`;
 - generated lengths complete and measured-phase JIT growth was zero
   (`32 -> 32`);
-- throughput `436.24 output tok/s`, live vLLM reference
-  `1531.33 output tok/s`, ratio `0.285x`;
-- the `0.9x` target requires about `1378.19 output tok/s`, so the remaining
-  speedup needed is about `3.16x`.
+- throughput `437.63 output tok/s`, fresh same-manifest vLLM reference
+  `1541.89 output tok/s`, ratio `0.284x`;
+- the `0.9x` target requires about `1387.70 output tok/s`, so the remaining
+  speedup needed is about `3.17x`.
+- the previous accepted run
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_b8_320width_static_cache_split_decode_block_buckets_128_256_320_r1_20260604.json`
+  remains equivalent evidence at `436.24 output tok/s`.
 
 Rules for this lane:
 
@@ -119,18 +122,66 @@ Rules for this lane:
   `/mountpoint/.exp/profiles`.
 - Treat decode block-table bucketing as accepted but minor. The next material
   path must reduce full decode-step cost, not only metadata width.
+- Treat the random gap as a serving-architecture gap, not a single isolated
+  kernel gap. The target run must improve arbitrary-batch decode and
+  prefill/decode interleaving without overfitting to the seed-`1234` manifest.
 
 Next implementation order:
 
-1. Validate and benchmark a production-shaped width-1 paged decode-attention
-   kernel against the current BF16 full-attention KV cache. The draft Triton
-   prototype must remain unselected until GPU parity and integrated random
-   throughput are measured.
-2. If decode attention does not move B8 materially, target broader decode
-   fusion around full-attention/GDN projection and output work. Avoid
-   parameter-only GEMM sweeps.
-3. Reprofile only after a structural change and compare against this random
-   anchor, the Entry 240 anchor, and the live vLLM reference.
+1. Match vLLM's serving ABI more closely:
+   - support resident logical concurrency above the execution batch bucket
+     (`max_num_seqs=8` should not force a second full admission wave for the
+     random lane);
+   - implement chunked prefill plus decode backfill so long prefills and decode
+     steps can share scheduler iterations under generic token buckets;
+   - keep compile keys expressed as finite serving buckets, not exact request
+     shapes.
+2. Make arbitrary-batch decode efficient before widening the serving envelope:
+   - compact active decode rows into generic batch buckets such as
+     `1,2,4,8,16`;
+   - pass slot mapping, block tables, sequence lengths, and state handles in a
+     vLLM-shaped packed boundary;
+   - keep per-step metadata/state update work proportional to active rows and
+     scheduled tokens, not to the total resident capacity.
+3. Replace slow decode kernels behind that packed boundary:
+   - full-attention decode should use a production paged decode-attention path
+     rather than materializing/gathering K/V windows in JAX;
+   - GDN decode should continue toward the vLLM/FLA-style fused boundary with
+     BF16 activations and FP32 recurrent state where required;
+   - LM-head/sampling should compute only the greedy token unless top-k/logit
+     diagnostics are explicitly requested.
+4. Add a generic greedy decode micro-burst path only after the packed
+   arbitrary-batch boundary is in place:
+   - compile a small fixed set of burst buckets, for example `1,2,4,8`, during
+     normal startup warmup;
+   - choose the runtime burst from a cost model and scheduler constraints, not
+     per-GPU hand tuning;
+   - stop early per row with masks when a sequence reaches its requested output
+     length or EOS policy, and fall back to burst `1` when prefill/backfill
+     pressure would otherwise starve waiting work.
+5. Reprofile only after a structural change and compare against the fresh
+   random anchor, the Entry 240 anchor, and the live vLLM reference.
+
+Micro-burst selection model:
+
+- A width-`K` greedy burst replaces `K` host/PJRT scheduler executions with one
+  compiled execution that loops or scans `K` decode iterations on device. It
+  reduces fixed per-step overhead but increases on-device work per call and may
+  delay scheduler decisions.
+- Use a simple runtime score for each warmed burst bucket:
+  `estimated_seconds(K) = fixed_step_overhead + K * device_decode_seconds +
+  wasted_masked_seconds(K) + scheduling_delay_penalty(K)`.
+- Estimate `fixed_step_overhead` from burst-`1` timing and profile counters;
+  estimate `device_decode_seconds` from recent same-batch decode medians; bound
+  `wasted_masked_seconds` by the number of rows that will finish before `K`;
+  bound `scheduling_delay_penalty` by waiting-prefill/backfill pressure.
+- Select the largest warmed `K` whose predicted win over `K` separate burst-`1`
+  steps is positive and whose delay penalty is below a configured service
+  bound. This makes the policy portable across GPUs: different hardware changes
+  the measured coefficients, not the algorithm.
+- The default admissible bucket set should stay small and model-family
+  general. Expanding it is a benchmarked policy change, not a hand-tuned tile
+  sweep.
 
 ## Active Hetero8 Contract - 2026-06-03
 
