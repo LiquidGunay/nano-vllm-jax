@@ -4,11 +4,13 @@ import os
 import jax
 import jax.numpy as jnp
 from jax import nn, lax
-from typing import Tuple, Optional, List, Dict
+from typing import Optional, List, Dict
 from dataclasses import dataclass, replace
 from nanovllm_jax.backends import (
     InferenceBackend,
+    gdn_packed_decode_conv_enabled,
     gdn_packed_decode_enabled,
+    gdn_packed_decode_max_batch,
     gdn_prefill_post_conv_enabled,
     select_backend,
 )
@@ -79,6 +81,14 @@ def _decode_width1_rms_norm(
         "on",
         "True",
     }
+    if force_width1:
+        from nanovllm_jax.kernels.decode_reductions import (
+            decode_rms_norm,
+            lowered_decode_rms_norm_enabled,
+        )
+
+        if lowered_decode_rms_norm_enabled():
+            return decode_rms_norm(x, weight, eps)
     if not force_width1 or x.ndim < 3 or x.shape[1] <= 1:
         return _stable_rmsnorm_fp32(x, weight, eps) if stable_decode_norm and force_width1 else rms_norm(x, weight, eps)
     norm_fn = _stable_rmsnorm_fp32 if stable_decode_norm else rms_norm
@@ -128,6 +138,77 @@ def _lm_head_decode_activation_dtype() -> jnp.dtype:
         "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE must be fp32 or bf16, "
         f"got {value!r}"
     )
+
+
+def _decode_padded_gemm_enabled() -> bool:
+    return os.environ.get("NANO_VLLM_JAX_DECODE_PADDED_GEMM", "0") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "True",
+    }
+
+
+def _decode_padded_gemm_gate_up_enabled() -> bool:
+    return os.environ.get("NANO_VLLM_JAX_DECODE_PADDED_GEMM_GATE_UP", "0") in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "True",
+    }
+
+
+def _decode_padded_gemm_rows() -> int:
+    value = os.environ.get("NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS", "8")
+    try:
+        rows = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS must be an integer, "
+            f"got {value!r}"
+        ) from exc
+    if rows < 1:
+        raise ValueError("NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS must be positive")
+    return rows
+
+
+def _decode_padded_gemm_max_out_dim() -> int:
+    value = os.environ.get("NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM", "8192")
+    try:
+        out_dim = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM must be an integer, "
+            f"got {value!r}"
+        ) from exc
+    if out_dim < 1:
+        raise ValueError("NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM must be positive")
+    return out_dim
+
+
+def _can_use_decode_padded_gemm(x: jnp.ndarray, weight: jnp.ndarray) -> bool:
+    return (
+        _decode_padded_gemm_enabled()
+        and x.ndim == 3
+        and weight.ndim == 2
+        and int(x.shape[0]) == 1
+        and int(x.shape[1]) == 1
+        and int(x.shape[-1]) == int(weight.shape[0])
+        and int(weight.shape[1]) <= _decode_padded_gemm_max_out_dim()
+    )
+
+
+def _decode_padded_gemm_dot(x: jnp.ndarray, weight: jnp.ndarray) -> jnp.ndarray:
+    """Run a B=1 decode projection through a small GEMM-shaped dot."""
+    hidden = int(x.shape[-1])
+    out_dim = int(weight.shape[1])
+    rows = _decode_padded_gemm_rows()
+    x_row = jnp.reshape(x, (1, hidden))
+    x_padded = jnp.broadcast_to(x_row, (rows, hidden))
+    out = jnp.dot(x_padded, weight)
+    return out[:1, :].reshape(1, 1, out_dim)
 
 
 def _decode_projection_activation_dtype(batch_size: int | None = None) -> jnp.dtype:
@@ -287,7 +368,22 @@ def lm_head_token_ids_and_topk(
     bloats the verifier path. Keep the dense LM-head computation inside the
     compiled graph and return only small verifier products.
     """
-    hidden_norm = hidden if hidden_is_normed else rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
+    if hidden_is_normed:
+        hidden_norm = hidden
+    else:
+        if not is_prefill:
+            from nanovllm_jax.kernels.decode_reductions import (
+                decode_rms_norm,
+                lowered_decode_rms_norm_enabled,
+            )
+
+            hidden_norm = (
+                decode_rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
+                if lowered_decode_rms_norm_enabled()
+                else rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
+            )
+        else:
+            hidden_norm = rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
     hidden_norm = hidden_norm.astype(
         _lm_head_decode_activation_dtype() if not is_prefill else jnp.float32
     )
@@ -835,6 +931,7 @@ def gated_deltanet_block(
         )
     )
     linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
+    row_valid = None
     
     # === PROJECTIONS (same for both modes) ===
     force_width1_dot = (not is_prefill) and seq_len > 1 and _force_width1_decode_math()
@@ -846,7 +943,14 @@ def gated_deltanet_block(
             compact_prefill_tokens,
         )
     else:
-        mixed_qkv = _tokenwise_decode_dot(x_cast, params["in_proj_qkv"], force_width1=force_width1_dot)
+        if _can_use_decode_padded_gemm(x_cast, params["in_proj_qkv"]):
+            mixed_qkv = _decode_padded_gemm_dot(x_cast, params["in_proj_qkv"])
+        else:
+            mixed_qkv = _tokenwise_decode_dot(
+                x_cast,
+                params["in_proj_qkv"],
+                force_width1=force_width1_dot,
+            )
     if is_prefill:
         z = _compact_prefill_dot_if_enabled(
             x_cast,
@@ -874,67 +978,91 @@ def gated_deltanet_block(
         
         # 1. Convolution update - use per-layer conv_state
         # conv_state shape: [batch, num_linear_layers, conv_dim, kernel_size]
-        layer_conv_state = hybrid_state.conv_state[:, linear_layer_idx]  # [batch, conv_dim, kernel_size]
+        layer_conv_state = hybrid_state.conv_state[:, linear_layer_idx]
         conv_weight = params["conv1d_weight"].reshape(conv_dim, config.linear_conv_kernel_size)
         conv_bias = params.get("conv1d_bias")
-
-        def conv_step(state, mixed_qkv_t_step):
-            conv_out_t, next_state = causal_conv1d_update(
-                mixed_qkv_t_step,
-                state,
-                conv_weight,
-                conv_bias,
-                "silu",
-            )
-            return next_state, conv_out_t
-
-        if seq_len > 1:
-            # Match sequential decode exactly: unroll static width-1 conv updates
-            # instead of scanning over a width-2 tensor. Each call sees [B, D, 1],
-            # the same shape used by the normal single-token decode path.
-            state = layer_conv_state
-            conv_out_parts = []
-            conv_state_parts = []
-            for t in range(seq_len):
-                state, conv_out_t = conv_step(state, mixed_qkv_t[:, :, t : t + 1])
-                conv_out_parts.append(conv_out_t)
-                if return_prefix_state or (return_first_prefix_state and t == 0):
-                    conv_state_parts.append(state)
-            new_layer_conv_state = state
-            conv_out_steps = jnp.stack(conv_out_parts, axis=0)
-            if return_prefix_state:
-                prefix_layer_conv_state = jnp.stack(conv_state_parts, axis=0).transpose(1, 0, 2, 3)
-            elif return_first_prefix_state:
-                prefix_layer_conv_state = conv_state_parts[0] if conv_state_parts else state
-            else:
-                prefix_layer_conv_state = None
-        elif return_prefix_state or return_first_prefix_state:
-            new_layer_conv_state, conv_out_t = conv_step(layer_conv_state, mixed_qkv_t[:, :, :1])
-            conv_out_steps = conv_out_t[None, ...]
-            prefix_layer_conv_state = (
-                new_layer_conv_state[:, None, :, :]
-                if return_prefix_state
-                else new_layer_conv_state
-            )
-        else:
-            new_layer_conv_state, conv_out_t = conv_step(layer_conv_state, mixed_qkv_t[:, :, :1])
-            conv_out_steps = conv_out_t[None, ...]
-            prefix_layer_conv_state = None
-        conv_out = conv_out_steps.transpose(1, 0, 2, 3).reshape(batch, seq_len, conv_dim)
 
         # recurrent_state shape: [batch, num_layers, num_heads, v_dim, k_dim]
         # Extract recurrent state for this layer: [batch, num_heads, v_dim, k_dim]
         # linear_layer_idx computed above
-        initial_recurrent = hybrid_state.recurrent_state[:, linear_layer_idx] if hybrid_state.recurrent_state is not None else None
+        if hybrid_state.recurrent_state is not None:
+            initial_recurrent = hybrid_state.recurrent_state[:, linear_layer_idx]
+        else:
+            initial_recurrent = None
 
+        packed_decode_max_batch = gdn_packed_decode_max_batch()
         use_packed_decode = (
             gdn_packed_decode_enabled()
+            and (packed_decode_max_batch is None or batch <= packed_decode_max_batch)
             and seq_len == 1
             and not return_prefix_state
             and not return_first_prefix_state
             and initial_recurrent is not None
         )
-        if use_packed_decode:
+        use_conv_packed_decode = use_packed_decode and gdn_packed_decode_conv_enabled()
+        if use_conv_packed_decode:
+            core_attn_out, new_layer_conv_state, new_recurrent_state_single = (
+                backend.gated_delta_conv_packed_decode(
+                    mixed_qkv[:, 0, :],
+                    a[:, 0, :].astype(jnp.float32),
+                    b[:, 0, :].astype(jnp.float32),
+                    params["A"].astype(jnp.float32),
+                    params["dt_bias"].astype(jnp.float32),
+                    layer_conv_state,
+                    conv_weight,
+                    conv_bias,
+                    initial_recurrent.astype(jnp.float32),
+                    use_qk_l2norm_in_kernel=True,
+                )
+            )
+            prefix_layer_conv_state = None
+            prefix_recurrent_state_single = None
+        else:
+            def conv_step(state, mixed_qkv_t_step):
+                conv_out_t, next_state = causal_conv1d_update(
+                    mixed_qkv_t_step,
+                    state,
+                    conv_weight,
+                    conv_bias,
+                    "silu",
+                )
+                return next_state, conv_out_t
+
+            if seq_len > 1:
+                # Match sequential decode exactly: unroll static width-1 conv updates
+                # instead of scanning over a width-2 tensor. Each call sees [B, D, 1],
+                # the same shape used by the normal single-token decode path.
+                state = layer_conv_state
+                conv_out_parts = []
+                conv_state_parts = []
+                for t in range(seq_len):
+                    state, conv_out_t = conv_step(state, mixed_qkv_t[:, :, t : t + 1])
+                    conv_out_parts.append(conv_out_t)
+                    if return_prefix_state or (return_first_prefix_state and t == 0):
+                        conv_state_parts.append(state)
+                new_layer_conv_state = state
+                conv_out_steps = jnp.stack(conv_out_parts, axis=0)
+                if return_prefix_state:
+                    prefix_layer_conv_state = jnp.stack(conv_state_parts, axis=0).transpose(1, 0, 2, 3)
+                elif return_first_prefix_state:
+                    prefix_layer_conv_state = conv_state_parts[0] if conv_state_parts else state
+                else:
+                    prefix_layer_conv_state = None
+            elif return_prefix_state or return_first_prefix_state:
+                new_layer_conv_state, conv_out_t = conv_step(layer_conv_state, mixed_qkv_t[:, :, :1])
+                conv_out_steps = conv_out_t[None, ...]
+                prefix_layer_conv_state = (
+                    new_layer_conv_state[:, None, :, :]
+                    if return_prefix_state
+                    else new_layer_conv_state
+                )
+            else:
+                new_layer_conv_state, conv_out_t = conv_step(layer_conv_state, mixed_qkv_t[:, :, :1])
+                conv_out_steps = conv_out_t[None, ...]
+                prefix_layer_conv_state = None
+            conv_out = conv_out_steps.transpose(1, 0, 2, 3).reshape(batch, seq_len, conv_dim)
+
+        if use_packed_decode and not use_conv_packed_decode:
             core_attn_out, new_recurrent_state_single = backend.gated_delta_packed_decode(
                 conv_out_t[:, :, 0].astype(jnp.float32),
                 a[:, 0, :].astype(jnp.float32),
@@ -945,7 +1073,7 @@ def gated_deltanet_block(
                 use_qk_l2norm_in_kernel=True,
             )
             prefix_recurrent_state_single = None
-        else:
+        elif not use_conv_packed_decode:
             # 2. Split q, k, v
             query = conv_out[:, :, :key_dim].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
             key = conv_out[:, :, key_dim:key_dim*2].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
@@ -1013,7 +1141,8 @@ def gated_deltanet_block(
                 prefix_recurrent_state_single = None
         # new_recurrent_state_single has shape [batch, num_heads, v_dim, k_dim]
         if valid_token_mask is not None:
-            row_valid = (valid_token_mask.astype(jnp.int32).sum(axis=1) > 0)
+            if row_valid is None:
+                row_valid = (valid_token_mask.astype(jnp.int32).sum(axis=1) > 0)
             conv_keep = row_valid[:, None, None]
             recurrent_keep = row_valid[:, None, None, None]
             new_layer_conv_state = jnp.where(
@@ -1706,10 +1835,21 @@ def transformer_block(
         )
     else:
         x_proj = x.astype(_decode_projection_activation_dtype(x.shape[0]))
-        gate = _tokenwise_decode_dot(x_proj, params["gate_proj"], force_width1=force_width1_dot)
-        up = _tokenwise_decode_dot(x_proj, params["up_proj"], force_width1=force_width1_dot)
+        if (
+            _decode_padded_gemm_gate_up_enabled()
+            and _can_use_decode_padded_gemm(x_proj, params["gate_proj"])
+            and params["up_proj"].shape == params["gate_proj"].shape
+        ):
+            gate = _decode_padded_gemm_dot(x_proj, params["gate_proj"])
+            up = _decode_padded_gemm_dot(x_proj, params["up_proj"])
+        else:
+            gate = _tokenwise_decode_dot(x_proj, params["gate_proj"], force_width1=force_width1_dot)
+            up = _tokenwise_decode_dot(x_proj, params["up_proj"], force_width1=force_width1_dot)
         x = activation_fn(gate) * up
-        x = _tokenwise_decode_dot(x, params["down_proj"], force_width1=force_width1_dot)
+        if _can_use_decode_padded_gemm(x, params["down_proj"]):
+            x = _decode_padded_gemm_dot(x, params["down_proj"])
+        else:
+            x = _tokenwise_decode_dot(x, params["down_proj"], force_width1=force_width1_dot)
     mlp_out = x
 
     x = residual + x

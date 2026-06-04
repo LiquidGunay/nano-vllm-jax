@@ -16,8 +16,16 @@ def test_runtime_and_kernel_sections_translate_to_env():
                 "fastpaths": {
                     "greedy_token": True,
                     "device_token_carry": True,
+                    "static_decode_metadata": True,
                     "lm_head_decode_act_dtype": "bf16",
                     "decode_proj_act_dtype": "bf16_single_seq",
+                    "decode_padded_gemm": True,
+                    "decode_padded_gemm_gate_up": True,
+                    "decode_padded_gemm_rows": 8,
+                    "decode_padded_gemm_max_out_dim": 8192,
+                    "pallas_decode_rmsnorm": True,
+                    "triton_decode_rmsnorm": True,
+                    "pallas_gdn_qk_prenorm": True,
                 },
                 "xla": {
                     "preallocate": False,
@@ -29,10 +37,12 @@ def test_runtime_and_kernel_sections_translate_to_env():
                 "gdn": {
                     "disable_fallbacks": True,
                     "prefill_post_conv_impl": "triton_fla_padded",
+                    "prefill_block_dot": True,
                     "packed_decode": {
                         "impl": "triton_fla",
                         "qkv_dtype": "bf16",
                         "pre_normalize_qk": True,
+                        "max_batch": 1,
                         "triton": {
                             "num_warps": 8,
                             "num_stages": 2,
@@ -48,14 +58,27 @@ def test_runtime_and_kernel_sections_translate_to_env():
     assert env["TOKENIZERS_PARALLELISM"] == "0"
     assert env["NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH"] == "1"
     assert env["NANO_VLLM_JAX_DEVICE_TOKEN_CARRY"] == "1"
+    assert env["NANO_VLLM_JAX_STATIC_DECODE_METADATA"] == "1"
     assert env["NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE"] == "bf16"
     assert env["NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE"] == "bf16_single_seq"
+    assert env["NANO_VLLM_JAX_DECODE_PADDED_GEMM"] == "1"
+    assert env["NANO_VLLM_JAX_DECODE_PADDED_GEMM_GATE_UP"] == "1"
+    assert env["NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS"] == "8"
+    assert env["NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM"] == "8192"
+    assert env["NANO_VLLM_JAX_PALLAS_DECODE_RMSNORM"] == "1"
+    assert env["NANO_VLLM_JAX_TRITON_DECODE_RMSNORM"] == "1"
+    assert env["NANO_VLLM_JAX_PALLAS_GDN_QK_PRENORM"] == "1"
     assert env["NANO_VLLM_JAX_KERNEL_BACKEND"] == "pure_jax"
     assert env["NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS"] == "1"
     assert env["NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL"] == "triton_fla_padded"
+    assert env["NANO_VLLM_JAX_GDN_KKT_BLOCK_DOT"] == "1"
+    assert env["NANO_VLLM_JAX_GDN_FWD_O_BLOCK_DOT"] == "1"
+    assert env["NANO_VLLM_JAX_GDN_DELTA_H_BLOCK_DOT"] == "1"
+    assert env["NANO_VLLM_JAX_GDN_RECOMPUTE_BLOCK_DOT"] == "1"
     assert env["NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL"] == "triton_fla"
     assert env["NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE"] == "bf16"
     assert env["NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK"] == "1"
+    assert env["NANO_VLLM_JAX_GDN_PACKED_DECODE_MAX_BATCH"] == "1"
     assert env["NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_WARPS"] == "8"
 
 

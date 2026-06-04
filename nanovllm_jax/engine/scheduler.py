@@ -24,6 +24,10 @@ def _device_token_carry_enabled() -> bool:
     return os.environ.get("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "0") in _TRUE_ENV_VALUES
 
 
+def _static_decode_metadata_enabled() -> bool:
+    return os.environ.get("NANO_VLLM_JAX_STATIC_DECODE_METADATA", "0") in _TRUE_ENV_VALUES
+
+
 def _is_device_token(value) -> bool:
     return isinstance(value, DeviceTokenRef) or (hasattr(value, "dtype") and hasattr(value, "shape"))
 
@@ -46,6 +50,7 @@ class Scheduler:
         self.enable_prefix_cache_execution = not getattr(config, "linear_attn_layers", ())
         self.prefill_buckets = tuple(getattr(config, "prefill_buckets", ()))
         self.batch_size_buckets = tuple(getattr(config, "batch_size_buckets", ()))
+        self.jax_execution = getattr(config, "jax_execution", "eager")
         self.prefill_chunk_budget = (
             max(self.prefill_buckets)
             if self.prefill_buckets
@@ -97,6 +102,11 @@ class Scheduler:
         self.mtp_baseline_latency_steps = 0
         self.mtp_spec_latency_steps = 0
         self.max_blocks_per_seq = getattr(config, "max_blocks_per_seq", None)
+        self.static_decode_metadata = bool(
+            getattr(config, "static_decode_metadata", False)
+            or _static_decode_metadata_enabled()
+        )
+        self._static_decode_metadata_cache: dict[str, object] | None = None
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, 
             config.block_size
@@ -393,21 +403,48 @@ class Scheduler:
         seq_ids_host = tuple([seq.seq_id for seq in seqs] + [-1] * (batch_size_bucket - len(seqs)))
         query_lens_host = tuple(query_lens)
         seq_lens_host = tuple(seq_lens)
-        (
-            tokens_array,
-            positions_array,
-            seq_ids_array,
-            query_start_loc_array,
-            block_tables_array,
-            seq_lens_array,
-        ) = _device_int32_arrays(
-            padded_tokens,
-            padded_positions,
-            seq_ids_host,
-            query_start_loc,
-            block_tables,
-            seq_lens,
+        uses_static_decode_metadata = self._can_use_static_decode_metadata(
+            seqs,
+            is_prefill=is_prefill,
+            query_len_bucket=query_len_bucket,
+            padded_tokens=padded_tokens,
+            query_lens_host=query_lens_host,
         )
+        if uses_static_decode_metadata:
+            (
+                tokens_array,
+                positions_array,
+                seq_ids_array,
+                query_start_loc_array,
+                block_tables_array,
+                seq_lens_array,
+            ) = self._static_decode_device_arrays(
+                padded_tokens=padded_tokens,
+                padded_positions=padded_positions,
+                seq_ids_host=seq_ids_host,
+                query_start_loc=query_start_loc,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                query_lens_host=query_lens_host,
+            )
+        else:
+            if not is_prefill:
+                self._static_decode_metadata_cache = None
+            (
+                tokens_array,
+                positions_array,
+                seq_ids_array,
+                query_start_loc_array,
+                block_tables_array,
+                seq_lens_array,
+            ) = _device_int32_arrays(
+                padded_tokens,
+                padded_positions,
+                seq_ids_host,
+                query_start_loc,
+                block_tables,
+                seq_lens,
+            )
         return ScheduledBatch(
             tokens=tokens_array,
             positions=positions_array,
@@ -423,6 +460,95 @@ class Scheduler:
             query_lens_host=query_lens_host,
             seq_lens_host=seq_lens_host,
             decode_step_count_host=1 if is_prefill else max(1, int(decode_step_count)),
+            uses_static_decode_metadata=uses_static_decode_metadata,
+        )
+
+    def _can_use_static_decode_metadata(
+        self,
+        seqs: List[Sequence],
+        *,
+        is_prefill: bool,
+        query_len_bucket: int,
+        padded_tokens: List[List[int]],
+        query_lens_host: tuple[int, ...],
+    ) -> bool:
+        if (
+            is_prefill
+            or not self.static_decode_metadata
+            or self.jax_execution not in {"decode-jit", "jit"}
+            or not _device_token_carry_enabled()
+            or self.num_speculative_tokens != 0
+            or self.greedy_decode_burst_steps != 1
+            or query_len_bucket != 1
+            or not seqs
+        ):
+            return False
+        for row, seq in enumerate(seqs):
+            if int(query_lens_host[row]) != 1:
+                return False
+            if seq.temperature != 0 or not seq.ignore_eos:
+                return False
+            if not _is_device_token(getattr(seq, "last_token_device", None)):
+                return False
+            # The runner must replace this placeholder from its device-token
+            # carry map before executing the JIT. If it cannot, it raises.
+            if int(padded_tokens[row][0]) != 0:
+                return False
+        return True
+
+    def _static_decode_device_arrays(
+        self,
+        *,
+        padded_tokens: List[List[int]],
+        padded_positions: List[List[int]],
+        seq_ids_host: tuple[int, ...],
+        query_start_loc: List[int],
+        block_tables: List[List[int]],
+        seq_lens: List[int],
+        query_lens_host: tuple[int, ...],
+    ):
+        key = (
+            tuple((len(padded_tokens), len(padded_tokens[0]) if padded_tokens else 0)),
+            tuple((len(block_tables), len(block_tables[0]) if block_tables else 0)),
+            seq_ids_host,
+            query_lens_host,
+            tuple(tuple(row) for row in block_tables),
+        )
+        cache = self._static_decode_metadata_cache
+        if cache is None or cache.get("key") != key:
+            (
+                tokens_array,
+                positions_array,
+                seq_ids_array,
+                query_start_loc_array,
+                block_tables_array,
+                seq_lens_array,
+            ) = _device_int32_arrays(
+                padded_tokens,
+                padded_positions,
+                seq_ids_host,
+                query_start_loc,
+                block_tables,
+                seq_lens,
+            )
+            cache = {
+                "key": key,
+                "tokens": tokens_array,
+                "positions": positions_array,
+                "seq_ids": seq_ids_array,
+                "query_start_loc": query_start_loc_array,
+                "block_tables": block_tables_array,
+            }
+            self._static_decode_metadata_cache = cache
+        else:
+            seq_lens_array = jax.device_put(np.asarray(seq_lens, dtype=np.int32))
+        return (
+            cache["tokens"],
+            cache["positions"],
+            cache["seq_ids"],
+            cache["query_start_loc"],
+            cache["block_tables"],
+            seq_lens_array,
         )
 
     @staticmethod

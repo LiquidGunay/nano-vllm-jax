@@ -74,6 +74,7 @@ class Qwen3_5Config:
     batch_size_buckets: tuple = field(default_factory=tuple)
     max_blocks_per_seq: Optional[int] = None
     jax_execution: str = "eager"
+    static_decode_metadata: bool = False
     
     # Vision config (for multimodal)
     vision_depth: int = 12
@@ -252,6 +253,7 @@ class Qwen3_5Config:
             "batch_size_buckets": self.batch_size_buckets,
             "max_blocks_per_seq": self.max_blocks_per_seq,
             "jax_execution": self.jax_execution,
+            "static_decode_metadata": self.static_decode_metadata,
         }
     
     @classmethod

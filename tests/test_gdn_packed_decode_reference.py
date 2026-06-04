@@ -31,6 +31,7 @@ else:
     from nanovllm_jax.kernels.registry import KernelBackendUnavailable
     from nanovllm_jax.config import Qwen3_5Config
     from nanovllm_jax.kv_cache import HybridLayerState
+    from nanovllm_jax.layers import causal_conv1d_update
     from nanovllm_jax.model import (
         gated_deltanet_block,
         init_transformer_block,
@@ -727,7 +728,8 @@ def test_packed_gdn_decode_pre_normalize_qk_matches_reference():
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
-def test_packed_gdn_decode_triton_bf16_matches_reference(monkeypatch):
+@pytest.mark.parametrize("impl", ["triton_fla", "triton_fla_raw_gates"])
+def test_packed_gdn_decode_triton_bf16_matches_reference(monkeypatch, impl):
     batch = 2
     num_q_heads = 2
     num_value_heads = 4
@@ -770,7 +772,7 @@ def test_packed_gdn_decode_triton_bf16_matches_reference(monkeypatch):
         use_qk_l2norm_in_kernel=True,
     )
 
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", "triton_fla")
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", impl)
     backend = PureJAXBackend()
     actual_out, actual_state = jax.jit(
         lambda mixed, a_in, b_in, decay_in, dt_bias_in, state_in: (
@@ -800,6 +802,125 @@ def test_packed_gdn_decode_triton_bf16_matches_reference(monkeypatch):
         np.asarray(actual_state),
         np.asarray(expected_state),
         atol=5e-7,
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_conv_packed_gdn_decode_triton_matches_reference(monkeypatch):
+    batch = 2
+    num_q_heads = 2
+    num_value_heads = 4
+    key_dim = 16
+    value_dim = 16
+    kernel_size = 4
+    packed_dim = 2 * num_q_heads * key_dim + num_value_heads * value_dim
+    mixed_qkv = jnp.linspace(
+        -0.35,
+        0.4,
+        batch * packed_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, packed_dim)
+    conv_state = jnp.linspace(
+        -0.15,
+        0.2,
+        batch * packed_dim * kernel_size,
+        dtype=jnp.float32,
+    ).reshape(batch, packed_dim, kernel_size)
+    conv_weight = jnp.linspace(
+        -0.2,
+        0.25,
+        packed_dim * kernel_size,
+        dtype=jnp.float32,
+    ).reshape(packed_dim, kernel_size)
+    conv_bias = jnp.linspace(-0.05, 0.07, packed_dim, dtype=jnp.float32)
+    a = jnp.linspace(
+        -0.25,
+        0.35,
+        batch * num_value_heads,
+        dtype=jnp.float32,
+    ).reshape(batch, num_value_heads)
+    b = jnp.linspace(-0.5, 0.4, batch * num_value_heads, dtype=jnp.float32).reshape(
+        batch,
+        num_value_heads,
+    )
+    decay = jnp.linspace(0.75, 1.2, num_value_heads, dtype=jnp.float32)
+    dt_bias = jnp.linspace(-0.15, 0.2, num_value_heads, dtype=jnp.float32)
+    state = jnp.linspace(
+        -0.02,
+        0.025,
+        batch * num_value_heads * value_dim * key_dim,
+        dtype=jnp.float32,
+    ).reshape(batch, num_value_heads, value_dim, key_dim)
+
+    mixed_qkv_bf16 = mixed_qkv.astype(jnp.bfloat16)
+    conv_out_t, expected_conv_state = causal_conv1d_update(
+        mixed_qkv_bf16[:, :, None],
+        conv_state,
+        conv_weight,
+        conv_bias,
+        "silu",
+    )
+    conv_out = gdn_packed_decode_pre_normalize_qk(
+        conv_out_t[:, :, 0].astype(jnp.float32),
+        state,
+    )
+    expected_out, expected_state = gdn_packed_decode_reference_from_decay(
+        conv_out,
+        a,
+        b,
+        decay,
+        dt_bias,
+        state,
+        qkv_dtype=jnp.bfloat16,
+        use_qk_l2norm_in_kernel=False,
+    )
+
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
+        "triton_fla_conv_raw_gates",
+    )
+    backend = PureJAXBackend()
+    actual_out, actual_conv_state, actual_state = jax.jit(
+        lambda mixed, a_in, b_in, decay_in, dt_bias_in, conv_s, conv_w, conv_b, state_in: (
+            backend.gated_delta_conv_packed_decode(
+                mixed,
+                a_in,
+                b_in,
+                decay_in,
+                dt_bias_in,
+                conv_s,
+                conv_w,
+                conv_b,
+                state_in,
+                use_qk_l2norm_in_kernel=True,
+            )
+        )
+    )(
+        mixed_qkv,
+        a,
+        b,
+        decay,
+        dt_bias,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        state,
+    )
+
+    assert actual_out.dtype == jnp.float32
+    assert actual_conv_state.dtype == jnp.float32
+    assert actual_state.dtype == jnp.float32
+    np.testing.assert_allclose(np.asarray(actual_out), np.asarray(expected_out), atol=2e-5)
+    np.testing.assert_allclose(
+        np.asarray(actual_conv_state),
+        np.asarray(expected_conv_state),
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
+        atol=2e-5,
     )
 
 

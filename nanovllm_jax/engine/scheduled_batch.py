@@ -31,6 +31,7 @@ class ScheduledBatch:
     seq_lens_host: tuple[int, ...] | None = None
     hybrid_slot_ids_host: tuple[int, ...] | None = None
     decode_step_count_host: int = 1
+    uses_static_decode_metadata: bool = False
 
     @property
     def batch_size(self) -> int:

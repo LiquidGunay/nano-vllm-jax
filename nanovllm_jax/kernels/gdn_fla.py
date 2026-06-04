@@ -406,6 +406,18 @@ def gdn_packed_decode_pre_normalize_qk(
         raise ValueError("mixed_qkv has an invalid packed Q/K dimension")
     num_q_heads = qk_dim // (2 * key_dim)
 
+    from nanovllm_jax.kernels.decode_reductions import (
+        gdn_packed_decode_pre_normalize_qk_pallas,
+        pallas_gdn_qk_prenorm_enabled,
+    )
+
+    if pallas_gdn_qk_prenorm_enabled():
+        return gdn_packed_decode_pre_normalize_qk_pallas(
+            mixed_qkv,
+            state,
+            eps=eps,
+        )
+
     query, key, value = split_packed_gdn_decode_mixed_qkv(
         mixed_qkv,
         num_q_heads=num_q_heads,
@@ -981,27 +993,109 @@ def _vllm_like_quantize_inverse_block(
     raise ValueError(f"unsupported output_dtype: {output_dtype}")
 
 
+def _vllm_like_quantize_stage(
+    tensor: jnp.ndarray,
+    *,
+    output_dtype: str,
+) -> jnp.ndarray:
+    if output_dtype == "bfloat16":
+        return jnp.asarray(tensor, dtype=jnp.bfloat16).astype(jnp.float32)
+    if output_dtype == "float32":
+        return jnp.asarray(tensor, dtype=jnp.float32)
+    raise ValueError(f"unsupported output_dtype: {output_dtype}")
+
+
+def _vllm_like_inverse_tril_16x16(
+    strict_lower: np.ndarray,
+    *,
+    total_tokens: int,
+) -> np.ndarray:
+    strict_lower = strict_lower.astype(np.float32)
+    inv = -np.where(
+        np.tri(16, 16, k=-1, dtype=np.float32),
+        strict_lower,
+        0.0,
+    ).astype(np.float32)
+    valid_rows = max(0, min(16, total_tokens))
+    for i in range(2, valid_rows):
+        row = -strict_lower[i, :]
+        row = row + row @ inv
+        inv[i, :] = row
+    inv += np.eye(16, dtype=np.float32)
+    return inv.astype(np.float32)
+
+
+def _vllm_like_unpack_16x16_block(
+    strict_lower: np.ndarray,
+    row_start: int,
+    col_start: int,
+) -> np.ndarray:
+    n = int(strict_lower.shape[0])
+    row_stop = min(16, max(0, n - row_start))
+    col_stop = min(16, max(0, n - col_start))
+    block = np.zeros((16, 16), dtype=np.float32)
+    if row_stop > 0 and col_stop > 0:
+        block[:row_stop, :col_stop] = strict_lower[
+            row_start : row_start + row_stop, col_start : col_start + col_stop
+        ]
+    return block
+
+
 def _vllm_like_inverse_i_plus_strict_lower(
     strict_lower: np.ndarray,
     *,
     output_dtype: str,
 ) -> np.ndarray:
     n = strict_lower.shape[0]
-    if n <= 16:
-        inv = np.linalg.inv(np.eye(n, dtype=np.float32) + strict_lower.astype(np.float32))
-        return _vllm_like_quantize_inverse_block(inv, output_dtype=output_dtype)
-    split = 16 if n <= 32 else 32
-    a11 = strict_lower[:split, :split]
-    a22 = strict_lower[split:, split:]
-    a21 = strict_lower[split:, :split]
-    inv11 = _vllm_like_inverse_i_plus_strict_lower(a11, output_dtype=output_dtype)
-    inv22 = _vllm_like_inverse_i_plus_strict_lower(a22, output_dtype=output_dtype)
-    inv21 = -(inv22 @ a21.astype(np.float32)) @ inv11
-    inv = np.zeros((n, n), dtype=np.float32)
-    inv[:split, :split] = inv11
-    inv[split:, split:] = inv22
-    inv[split:, :split] = inv21
-    return _vllm_like_quantize_inverse_block(inv, output_dtype=output_dtype)
+    if n == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    if n > 64:
+        raise ValueError("strict_lower size exceeds supported 64x64 vLLM kernel schedule")
+
+    inv11 = _vllm_like_inverse_tril_16x16(
+        _vllm_like_unpack_16x16_block(strict_lower, 0, 0),
+        total_tokens=n,
+    )
+    inv22 = _vllm_like_inverse_tril_16x16(
+        _vllm_like_unpack_16x16_block(strict_lower, 16, 16),
+        total_tokens=n - 16,
+    )
+    inv33 = _vllm_like_inverse_tril_16x16(
+        _vllm_like_unpack_16x16_block(strict_lower, 32, 32),
+        total_tokens=n - 32,
+    )
+    inv44 = _vllm_like_inverse_tril_16x16(
+        _vllm_like_unpack_16x16_block(strict_lower, 48, 48),
+        total_tokens=n - 48,
+    )
+
+    a21 = _vllm_like_unpack_16x16_block(strict_lower, 16, 0)
+    a31 = _vllm_like_unpack_16x16_block(strict_lower, 32, 0)
+    a32 = _vllm_like_unpack_16x16_block(strict_lower, 32, 16)
+    a41 = _vllm_like_unpack_16x16_block(strict_lower, 48, 0)
+    a42 = _vllm_like_unpack_16x16_block(strict_lower, 48, 16)
+    a43 = _vllm_like_unpack_16x16_block(strict_lower, 48, 32)
+
+    inv21 = -(inv22 @ a21 @ inv11)
+    inv31 = -inv33 @ (a31 @ inv11 + a32 @ inv21)
+    inv32 = -(inv33 @ a32 @ inv22)
+    inv41 = -inv44 @ (a41 @ inv11 + a42 @ inv21 + a43 @ inv31)
+    inv42 = -inv44 @ (a42 @ inv22 + a43 @ inv32)
+    inv43 = -inv44 @ (a43 @ inv33)
+
+    inv = np.zeros((64, 64), dtype=np.float32)
+    inv[:16, :16] = inv11
+    inv[16:32, :16] = inv21
+    inv[16:32, 16:32] = inv22
+    inv[32:48, :16] = inv31
+    inv[32:48, 16:32] = inv32
+    inv[32:48, 32:48] = inv33
+    inv[48:64, :16] = inv41
+    inv[48:64, 16:32] = inv42
+    inv[48:64, 32:48] = inv43
+    inv[48:64, 48:64] = inv44
+
+    return _vllm_like_quantize_inverse_block(inv[:n, :n], output_dtype=output_dtype)
 
 
 def gdn_fla_solve_tril_packed_vllm_like_reference(
@@ -1015,9 +1109,9 @@ def gdn_fla_solve_tril_packed_vllm_like_reference(
     """Probe-only vLLM-like `solve_tril` approximation over packed chunk matrices.
 
     This keeps local default reference behavior untouched. It approximates vLLM
-    solve numerics by:
-    1) recursively merging 16->32->64 lower-triangular blocks, and
-    2) quantizing the inverse block to the requested output dtype at each merge.
+    `solve_tril` numerics for BF16/FP32 using the fixed 16x16 block schedule
+    used by the vLLM kernels (no recursive split). The reference output is then
+    quantized once to the requested output dtype.
     """
 
     if attention_matrix.ndim != 3:
@@ -1071,6 +1165,8 @@ def gdn_fla_recompute_w_u_packed_reference(
     *,
     chunk_size: int,
     chunk_indices: Any | None = None,
+    vllm_like: bool = False,
+    stage_output_dtype: str = "bfloat16",
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Reference for FLA `recompute_w_u_fwd` over packed varlen tensors."""
 
@@ -1132,10 +1228,39 @@ def gdn_fla_recompute_w_u_packed_reference(
             chunk_gate = gate_cumsum[chunk_start:chunk_end, head].astype(jnp.float32)
             chunk_value = value[chunk_start:chunk_end, head, :].astype(jnp.float32)
             chunk_key = key[chunk_start:chunk_end, key_head, :].astype(jnp.float32)
-            u_chunk = matrix @ (chunk_value * chunk_beta[:, None])
-            w_chunk = matrix @ (
-                chunk_key * chunk_beta[:, None] * jnp.exp(chunk_gate)[:, None]
-            )
+            if vllm_like:
+                matrix = _vllm_like_quantize_stage(
+                    matrix,
+                    output_dtype=stage_output_dtype,
+                )
+                weighted_value = _vllm_like_quantize_stage(
+                    chunk_value * chunk_beta[:, None],
+                    output_dtype=stage_output_dtype,
+                )
+                weighted_key = _vllm_like_quantize_stage(
+                    chunk_key
+                    * chunk_beta[:, None]
+                    * jnp.exp(chunk_gate)[:, None],
+                    output_dtype=stage_output_dtype,
+                )
+            else:
+                weighted_value = chunk_value * chunk_beta[:, None]
+                weighted_key = (
+                    chunk_key
+                    * chunk_beta[:, None]
+                    * jnp.exp(chunk_gate)[:, None]
+                )
+            u_chunk = matrix @ weighted_value
+            w_chunk = matrix @ weighted_key
+            if vllm_like:
+                u_chunk = _vllm_like_quantize_stage(
+                    u_chunk,
+                    output_dtype=stage_output_dtype,
+                )
+                w_chunk = _vllm_like_quantize_stage(
+                    w_chunk,
+                    output_dtype=stage_output_dtype,
+                )
             u = u.at[chunk_start:chunk_end, head, :].set(u_chunk)
             w = w.at[chunk_start:chunk_end, head, :].set(w_chunk)
     return w, u
@@ -1154,6 +1279,8 @@ def gdn_fla_chunk_delta_h_packed_reference(
     chunk_offsets: Any | None = None,
     output_final_state: bool = True,
     save_new_value: bool = True,
+    vllm_like: bool = False,
+    stage_output_dtype: str = "bfloat16",
 ) -> tuple[jnp.ndarray, jnp.ndarray | None, jnp.ndarray | None]:
     """Reference for FLA `chunk_gated_delta_rule_fwd_h` over packed varlen tensors."""
 
@@ -1220,10 +1347,12 @@ def gdn_fla_chunk_delta_h_packed_reference(
         if save_new_value
         else None
     )
+    final_state = jnp.zeros_like(state) if output_final_state else None
     for row in range(batch):
         row_state = state[row]
         row_start = int(offsets[row])
         row_end = int(offsets[row + 1])
+        row_final_state = jnp.asarray(row_state)
         for chunk in range(int(chunk_offset_values[row + 1] - chunk_offset_values[row])):
             flat_chunk = int(chunk_offset_values[row]) + chunk
             if tuple(chunk_index_values[flat_chunk]) != (row, chunk):
@@ -1236,12 +1365,43 @@ def gdn_fla_chunk_delta_h_packed_reference(
             for head in range(output_heads):
                 key_head = head // head_group
                 head_state = row_state[head]
-                h = h.at[flat_chunk, head].set(head_state)
+                head_state_for_dot = (
+                    _vllm_like_quantize_stage(
+                        head_state,
+                        output_dtype=stage_output_dtype,
+                    )
+                    if vllm_like
+                    else head_state
+                )
+                h = h.at[flat_chunk, head].set(
+                    _vllm_like_quantize_stage(
+                        head_state,
+                        output_dtype=stage_output_dtype,
+                    )
+                    if vllm_like
+                    else head_state
+                )
                 chunk_w = w[chunk_start:chunk_end, head, :].astype(jnp.float32)
                 chunk_u = u[chunk_start:chunk_end, head, :].astype(jnp.float32)
-                delta = chunk_u - chunk_w @ head_state.T
+                if vllm_like:
+                    chunk_w = _vllm_like_quantize_stage(
+                        chunk_w,
+                        output_dtype=stage_output_dtype,
+                    )
+                    chunk_u = _vllm_like_quantize_stage(
+                        chunk_u,
+                        output_dtype=stage_output_dtype,
+                    )
+                delta = chunk_u - chunk_w @ head_state_for_dot.T
                 if v_new is not None:
-                    v_new = v_new.at[chunk_start:chunk_end, head, :].set(delta)
+                    v_new = v_new.at[chunk_start:chunk_end, head, :].set(
+                        _vllm_like_quantize_stage(
+                            delta,
+                            output_dtype=stage_output_dtype,
+                        )
+                        if vllm_like
+                        else delta
+                    )
                 update_delta = delta
                 if gate_cumsum is not None:
                     chunk_gate = gate_cumsum[chunk_start:chunk_end, head].astype(
@@ -1249,13 +1409,35 @@ def gdn_fla_chunk_delta_h_packed_reference(
                     )
                     last_gate = chunk_gate[length - 1]
                     update_delta = delta * jnp.exp(last_gate - chunk_gate)[:, None]
-                    head_state = head_state * jnp.exp(last_gate)
+                    updated_state = head_state_for_dot * jnp.exp(last_gate)
+                else:
+                    updated_state = head_state_for_dot
+                if vllm_like:
+                    update_delta = _vllm_like_quantize_stage(
+                        update_delta,
+                        output_dtype=stage_output_dtype,
+                    )
                 chunk_key = key[chunk_start:chunk_end, key_head, :].astype(jnp.float32)
-                head_state = head_state + update_delta.T @ chunk_key
-                row_state = row_state.at[head].set(head_state)
+                if vllm_like:
+                    chunk_key = _vllm_like_quantize_stage(
+                        chunk_key,
+                        output_dtype=stage_output_dtype,
+                    )
+                updated_state = updated_state + update_delta.T @ chunk_key
+                row_final_state = row_final_state.at[head].set(updated_state)
+                if vllm_like:
+                    row_state = row_state.at[head].set(
+                        _vllm_like_quantize_stage(
+                            updated_state,
+                            output_dtype=stage_output_dtype,
+                        )
+                    )
+                else:
+                    row_state = row_state.at[head].set(updated_state)
+        if output_final_state:
+            final_state = final_state.at[row].set(row_final_state)
         state = state.at[row].set(row_state)
 
-    final_state = state if output_final_state else None
     return h, v_new, final_state
 
 
@@ -1270,6 +1452,8 @@ def gdn_fla_chunk_fwd_o_packed_reference(
     chunk_size: int,
     chunk_indices: Any | None = None,
     scale: float | None = None,
+    vllm_like: bool = False,
+    stage_output_dtype: str = "bfloat16",
 ) -> jnp.ndarray:
     """Reference for FLA `chunk_fwd_o` over packed varlen tensors."""
 
@@ -1330,6 +1514,23 @@ def gdn_fla_chunk_fwd_o_packed_reference(
             chunk_key = key[chunk_start:chunk_end, key_head, :].astype(jnp.float32)
             chunk_v_new = v_new[chunk_start:chunk_end, head, :].astype(jnp.float32)
             state = h[flat_chunk, head].astype(jnp.float32)
+            if vllm_like:
+                chunk_query = _vllm_like_quantize_stage(
+                    chunk_query,
+                    output_dtype=stage_output_dtype,
+                )
+                chunk_key = _vllm_like_quantize_stage(
+                    chunk_key,
+                    output_dtype=stage_output_dtype,
+                )
+                chunk_v_new = _vllm_like_quantize_stage(
+                    chunk_v_new,
+                    output_dtype=stage_output_dtype,
+                )
+                state = _vllm_like_quantize_stage(
+                    state,
+                    output_dtype=stage_output_dtype,
+                )
             state_out = chunk_query @ state.T
             attention = chunk_query @ chunk_key.T
             if gate_cumsum is not None:
@@ -1341,7 +1542,17 @@ def gdn_fla_chunk_fwd_o_packed_reference(
                     chunk_gate[:, None] - chunk_gate[None, :]
                 )
             attention = attention * causal
+            if vllm_like:
+                attention = _vllm_like_quantize_stage(
+                    attention,
+                    output_dtype=stage_output_dtype,
+                )
             chunk_output = (state_out + attention @ chunk_v_new) * float(scale)
+            if vllm_like:
+                chunk_output = _vllm_like_quantize_stage(
+                    chunk_output,
+                    output_dtype=stage_output_dtype,
+                )
             output = output.at[chunk_start:chunk_end, head, :].set(chunk_output)
     return output
 
@@ -1357,6 +1568,8 @@ def gdn_fla_chunk_gated_delta_rule_packed_reference(
     *,
     chunk_size: int,
     use_qk_l2norm_in_kernel: bool = False,
+    vllm_like: bool = False,
+    inverse_output_dtype: str = "bfloat16",
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Reference for the full FLA `chunk_gated_delta_rule` packed body."""
 
@@ -1409,11 +1622,21 @@ def gdn_fla_chunk_gated_delta_rule_packed_reference(
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
     )
-    attention_inverse = gdn_fla_solve_tril_packed_reference(
-        attention_matrix,
-        cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
+    attention_inverse = (
+        gdn_fla_solve_tril_packed_vllm_like_reference(
+            attention_matrix,
+            cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            output_dtype=inverse_output_dtype,
+        )
+        if vllm_like
+        else gdn_fla_solve_tril_packed_reference(
+            attention_matrix,
+            cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+        )
     )
     w, u = gdn_fla_recompute_w_u_packed_reference(
         key,
@@ -1424,6 +1647,8 @@ def gdn_fla_chunk_gated_delta_rule_packed_reference(
         cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
+        vllm_like=vllm_like,
+        stage_output_dtype=inverse_output_dtype,
     )
     h, v_new, final_state = gdn_fla_chunk_delta_h_packed_reference(
         key,
@@ -1437,6 +1662,8 @@ def gdn_fla_chunk_gated_delta_rule_packed_reference(
         chunk_offsets=chunk_offsets,
         output_final_state=True,
         save_new_value=True,
+        vllm_like=vllm_like,
+        stage_output_dtype=inverse_output_dtype,
     )
     if v_new is None or final_state is None:
         raise AssertionError("chunk delta reference must return v_new and final_state")
@@ -1450,6 +1677,8 @@ def gdn_fla_chunk_gated_delta_rule_packed_reference(
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
         scale=float(query.shape[-1] ** -0.5),
+        vllm_like=vllm_like,
+        stage_output_dtype=inverse_output_dtype,
     )
     return output, final_state
 
@@ -1657,6 +1886,7 @@ def gdn_fla_prefill_varlen_composed_reference(
     initial_state: jnp.ndarray,
     *,
     chunk_size: int = 64,
+    vllm_like: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Pure-JAX composed FLA reference for packed varlen prefill tensors.
 
@@ -1664,6 +1894,7 @@ def gdn_fla_prefill_varlen_composed_reference(
     exercising the staged vLLM/FLA-style chunk pipeline end to end.
     """
 
+    requested_qkv_dtype = jnp.bfloat16 if vllm_like else query.dtype
     inputs = prepare_gdn_fla_prefill_kernel_inputs(
         query,
         key,
@@ -1672,7 +1903,7 @@ def gdn_fla_prefill_varlen_composed_reference(
         beta,
         seq_lens,
         initial_state,
-        qkv_dtype=query.dtype,
+        qkv_dtype=requested_qkv_dtype,
     )
     packed_query, packed_key, packed_value, packed_gate, packed_beta, cu_seqlens = (
         pack_prepared_gdn_prefill_inputs(
@@ -1693,6 +1924,7 @@ def gdn_fla_prefill_varlen_composed_reference(
         cu_seqlens,
         inputs.initial_state,
         chunk_size=chunk_size,
+        vllm_like=vllm_like,
     )
     output = unpack_prepared_gdn_prefill_output(
         packed_output,

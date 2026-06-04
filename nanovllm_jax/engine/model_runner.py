@@ -31,6 +31,14 @@ def _device_token_carry_enabled() -> bool:
     return os.environ.get("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "0") in _TRUE_ENV_VALUES
 
 
+def _int32_device_vector(value) -> jnp.ndarray:
+    """Return a 1D int32 device vector without re-wrapping existing int32 arrays."""
+
+    if hasattr(value, "dtype") and getattr(value, "dtype", None) == jnp.dtype(jnp.int32):
+        return value.reshape(-1)
+    return jnp.asarray(value, dtype=jnp.int32).reshape(-1)
+
+
 class _LegacyModelRunner:
     """Runs JAX model with paged KV cache.
     
@@ -1002,6 +1010,7 @@ class CanonicalModelRunner:
         self._device_token_carry_seq_ids: tuple[int, ...] | None = None
         self._device_token_carry_tokens: jnp.ndarray | None = None
         self._device_token_carry_by_seq_id: dict[int, DeviceTokenRef] = {}
+        self._hybrid_slot_ids_device_cache: dict[tuple[int, ...], jnp.ndarray] = {}
         self.reset_speculative_stats()
         self._warmup_compiled = False
 
@@ -1164,7 +1173,19 @@ class CanonicalModelRunner:
         self._device_token_carry_tokens = None
         self._device_token_carry_by_seq_id = {}
 
+    @staticmethod
+    def _active_decode_rows_host(batch: ScheduledBatch) -> List[int]:
+        if batch.seq_ids_host is None or batch.query_lens_host is None:
+            return []
+        return [
+            row
+            for row, (seq_id, query_len) in enumerate(zip(batch.seq_ids_host, batch.query_lens_host))
+            if int(seq_id) >= 0 and int(query_len) > 0
+        ]
+
     def _maybe_apply_device_token_carry(self, batch: ScheduledBatch) -> ScheduledBatch:
+        static_decode_metadata = bool(getattr(batch, "uses_static_decode_metadata", False))
+        active_rows = self._active_decode_rows_host(batch)
         if (
             not _device_token_carry_enabled()
             or batch.is_prefill
@@ -1172,6 +1193,8 @@ class CanonicalModelRunner:
             or batch.seq_ids_host is None
             or batch.tokens.shape[1] != 1
         ):
+            if static_decode_metadata:
+                raise RuntimeError("static decode metadata requires a device-token carry for every active row")
             return batch
 
         carried_seq_ids = getattr(self, "_device_token_carry_seq_ids", None)
@@ -1183,19 +1206,34 @@ class CanonicalModelRunner:
             and tuple(batch.seq_ids_host) == carried_seq_ids
             and carried_tokens is not None
         ):
-            token_vector = jnp.asarray(carried_tokens, dtype=jnp.int32).reshape(-1)
+            token_vector = _int32_device_vector(carried_tokens)
             if token_vector.shape[0] == int(tokens.shape[0]):
-                return replace(batch, tokens=token_vector[:, None])
+                tokens = token_vector[:, None]
+                applied = True
+            else:
+                applied = False
+        else:
+            applied = False
 
-        applied = False
-        for row, seq_id in enumerate(batch.seq_ids_host):
-            token_ref = self._device_token_carry_by_seq_id.get(int(seq_id))
-            if token_ref is None:
-                continue
-            token_vector = jnp.asarray(token_ref.tokens, dtype=jnp.int32).reshape(-1)
-            tokens = tokens.at[row, 0].set(token_vector[int(token_ref.row)])
-            applied = True
+        missing_static_rows: List[int] = []
         if not applied:
+            for row, seq_id in enumerate(batch.seq_ids_host):
+                token_ref = self._device_token_carry_by_seq_id.get(int(seq_id))
+                if token_ref is None:
+                    if static_decode_metadata and row in active_rows:
+                        missing_static_rows.append(row)
+                    continue
+                token_vector = _int32_device_vector(token_ref.tokens)
+                tokens = tokens.at[row, 0].set(token_vector[int(token_ref.row)])
+                applied = True
+        if missing_static_rows:
+            raise RuntimeError(
+                "static decode metadata is missing device-token carry rows "
+                f"{tuple(missing_static_rows)}"
+            )
+        if not applied:
+            if static_decode_metadata:
+                raise RuntimeError("static decode metadata did not apply any device-token carry")
             return batch
         return replace(batch, tokens=tokens)
 
@@ -1592,8 +1630,34 @@ class CanonicalModelRunner:
             else self._hybrid_state_table.conv_state,
             recurrent_state=self._hybrid_state_table.recurrent_state.at[slot_ids].set(state.recurrent_state[row_ids])
             if self._hybrid_state_table.recurrent_state is not None and state.recurrent_state is not None
-            else self._hybrid_state_table.recurrent_state,
+                else self._hybrid_state_table.recurrent_state,
         )
+
+    def _batch_hybrid_slot_ids(self, batch: ScheduledBatch) -> jnp.ndarray:
+        """Assign hybrid slots for a batch without gathering the state table."""
+
+        seq_ids = (
+            list(batch.seq_ids_host)
+            if batch.seq_ids_host is not None
+            else [int(seq_id) for seq_id in batch.seq_ids.tolist()]
+        )
+        slot_values: List[int] = []
+        for row, seq_id in enumerate(seq_ids):
+            slot, allocated = self._assign_hybrid_slot(int(seq_id), preferred_slot=row)
+            if allocated:
+                self._zero_hybrid_slot(slot)
+            slot_values.append(slot)
+        batch.hybrid_slot_ids_host = tuple(slot_values)
+        slot_key = tuple(slot_values)
+        cache = getattr(self, "_hybrid_slot_ids_device_cache", None)
+        if cache is None:
+            cache = {}
+            self._hybrid_slot_ids_device_cache = cache
+        cached = cache.get(slot_key)
+        if cached is None:
+            cached = jnp.asarray(slot_key, dtype=jnp.int32)
+            cache[slot_key] = cached
+        return cached
 
     def _refresh_kv_snapshot(self, batch: ScheduledBatch, hybrid_state: HybridLayerState | None = None):
         if hybrid_state is None:
@@ -1628,7 +1692,10 @@ class CanonicalModelRunner:
         """
         if hybrid_state is None:
             hybrid_state = self._batch_hybrid_state(batch)
-        slot_mapping = getattr(self.kv_state, "slot_mapping", None)
+        kv_state = getattr(self, "kv_state", None)
+        if kv_state is None:
+            return
+        slot_mapping = getattr(kv_state, "slot_mapping", None)
         if slot_mapping is None:
             slot_mapping = jnp.zeros_like(batch.positions, dtype=jnp.int32)
         self.kv_state = KVCacheState(
@@ -1932,7 +1999,6 @@ class CanonicalModelRunner:
         else:
             prefill_final_flags = [True] * len(seqs)
         batch = self._maybe_apply_device_token_carry(batch)
-        hybrid_state = self._batch_hybrid_state(batch)
 
         return_hidden_for_seed = bool(seed_mtp1)
         use_greedy_token_fastpath = self._can_use_greedy_token_fastpath(
@@ -1945,6 +2011,20 @@ class CanonicalModelRunner:
             if use_greedy_token_fastpath
             else 1
         )
+        use_hybrid_table_decode = (
+            use_greedy_token_fastpath
+            and not batch.is_prefill
+            and decode_burst_steps <= 1
+            and self._hybrid_state_table.conv_state is not None
+            and self._hybrid_state_table.recurrent_state is not None
+            and hasattr(self.executor, "forward_step_token_ids_table_jit")
+        )
+        if use_hybrid_table_decode:
+            hybrid_slot_ids = self._batch_hybrid_slot_ids(batch)
+            hybrid_state = self._hybrid_state_table
+        else:
+            hybrid_slot_ids = None
+            hybrid_state = self._batch_hybrid_state(batch)
         if decode_burst_steps > 1:
             output = self.executor.forward_greedy_decode_burst_jit(
                 batch,
@@ -1953,11 +2033,19 @@ class CanonicalModelRunner:
                 decode_steps=decode_burst_steps,
             )
         elif use_greedy_token_fastpath:
-            output = self.executor.forward_step_token_ids_jit(
-                batch,
-                cache_storage=self.cache_storage,
-                hybrid_state=hybrid_state,
-            )
+            if use_hybrid_table_decode:
+                output = self.executor.forward_step_token_ids_table_jit(
+                    batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state_table=hybrid_state,
+                    hybrid_slot_ids=hybrid_slot_ids,
+                )
+            else:
+                output = self.executor.forward_step_token_ids_jit(
+                    batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state=hybrid_state,
+                )
         else:
             output = self._step_fn(batch)(
                 batch,
@@ -1968,7 +2056,10 @@ class CanonicalModelRunner:
                 last_logits_only=True,
             )
         self.cache_storage = output.cache_storage
-        self._store_batch_hybrid_state(batch, output.hybrid_state)
+        if use_hybrid_table_decode:
+            self._hybrid_state_table = output.hybrid_state
+        else:
+            self._store_batch_hybrid_state(batch, output.hybrid_state)
         snapshot_batch = batch
         if decode_burst_steps > 1:
             active = batch.active_decode_rows

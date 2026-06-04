@@ -39,6 +39,50 @@ Our matrix runner is intentionally more strict for serving evidence:
 
 Result: upstream `bench.py` is a coarse baseline; our `run_gpu_matrix` outputs are the canonical signal for speed claims and regression decisions.
 
+## Artifact policy
+
+Full benchmark JSON artifacts and profile directories are local evidence, not
+routine PR content. By default, do not commit newly generated
+`results/gpu_matrix_*.json`, `results/gpu_matrix_*.md`, or
+`results/gpu_matrix*/` payloads, and do not commit temporary sweep configs such
+as `benchmarks/configs/gpu_paged_gdn_fla_decode_tmp_*.json`. Record the
+interpretation in `docs/optimization_logbook.md` or a focused findings doc, and
+include only the artifact path, workload, config, reference sources, correctness
+result, repeat count, throughput, and the profile movement needed to justify
+the decision.
+
+Commit a full artifact only when it is deliberately promoted as a canonical
+baseline/reference and the reason is stated in the same change. Historical
+tracked result files remain in the repository, but future run payloads should be
+kept out of normal diffs unless explicitly forced with `git add -f`.
+
+## Reference taxonomy
+
+Every throughput comparison must name the workload and reference source. The
+same candidate can be a win against one reference and a loss against another.
+
+- Candidate run: the config/workload being evaluated in the current matrix.
+- Accepted JAX reference: the current correctness-gated JAX baseline for that
+  exact workload, such as `stored_entry045` for `hetero8` or
+  `stored_jax_default` for other workload-specific references.
+- Same-code control: a nearby control run from the same branch/config family.
+  This is useful for ablations, but it is not automatically the accepted
+  baseline.
+- vLLM reference: the stored or live vLLM artifact for the same workload and
+  prompt provenance.
+- Speed-claim-ready result: a run that passes correctness, repeat, latency,
+  profile, and reference checks. One-repeat smoke results are useful for
+  triage, but not for final speed claims.
+
+When reporting a result, prefer this form:
+
+```text
+<workload>/<config>: <tok/s> tok/s, exact=<yes/no>, repeats=<n>,
+vs accepted JAX <source/path>: <ratio>x,
+vs vLLM <source/path>: <ratio>x,
+speed_claim_ready=<yes/no>.
+```
+
 ## Required benchmark rules
 
 A result is reportable only if it states:

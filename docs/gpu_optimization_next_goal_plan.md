@@ -86,6 +86,112 @@ optimization work starts.
     cumulative gate output. Porting later stages first makes failures harder to
     localize.
 
+## Active Decode Plan - 2026-06-02
+
+The decode-heavy `0.9x` vLLM goal is now met by the Entry 210 composed route:
+strict block-dot FLA prefill plus explicit BF16-QKV packed-reference GDN decode
+with static metadata and padded decode GEMMs. The current no-profile
+`decode_heavy_128x128` repeats are exact at `197.91`, `196.38`, and
+`197.96 tok/s`, median `197.91 tok/s`. Against the fresh same-shape vLLM async
+baseline `219.03 tok/s`, the median ratio is `0.904x`; the fresh `0.9x` target
+is about `197.12 tok/s`.
+
+This is a decode-heavy target hit, not a blanket serving win. The remaining
+work is to preserve this config as the baseline, validate broader workloads,
+and only then attack the remaining decode GEMM/reduction buckets if they block
+the broader claim.
+
+Full no-profile sanity after promotion:
+
+- `hetero8`: exact, median `317.35 tok/s`, `0.367x` stored vLLM;
+- `short_32_128`: exact, median `386.52 tok/s`, `0.680x` stored vLLM;
+- `long_prefill_512_2048`: exact, median `106.08 tok/s`, `0.912x` stored vLLM;
+- `decode_heavy_128x128`: exact, median `197.60 tok/s`, `0.902x` fresh vLLM.
+
+The config is correctness-clean across the sanity set. The target claim is
+decode-heavy plus long-prefill; hetero8 remains open.
+
+Next implementation order:
+
+1. Preserve and remeasure the Entry 210 baseline. Use
+   `gpu_paged_gdn_fla_decode_static_metadata` as the strict decode-heavy
+   baseline: `prefill_block_dot=true`, `packed_decode.impl=reference`,
+   `qkv_dtype=bf16`, static metadata, padded decode GEMMs, and fallbacks
+   disabled.
+2. Broaden the claim to hetero8 and long-prefill using the same composition.
+   Entry 197 already hit `0.901x` vLLM on long-prefill with all block-dot FLA
+   stages, while hetero8 remains below target and decode-dominated. Do not
+   infer hetero8 from the decode-heavy win.
+3. Decode projection/GEMM buckets remain the next model-side targets only if
+   broader workloads fail. The current profiled config smoke still shows
+   LM-head `gemm_fusion_dot_199` around `126 ms`, MLP gate/up around `109 ms`,
+   GDN QKV around `65 ms`, and MLP down around `51 ms`.
+4. Greedy LM-head top-1 should only be revisited as a materially different
+   single-call GEMM/matvec-plus-argmax epilogue. Source-level
+   `top_k(logits, 1)` and two-stage Pallas argmax are rejected.
+5. Device-owned cache/state metadata should only be changed where the profile
+   confirms an integrated serving win. Entry 209 rejected another batch of
+   source-boundary and XLA-command-buffer spelling changes.
+6. Do not continue target work on narrow GDN decode-core boundary widening.
+   Entry 201 and Entry 203 showed that raw gates, in-kernel Q/K norm changes,
+   layer-internal state-table routing, and fusing width-1 conv with recurrent
+   decode are correctness-clean or close but do not move integrated
+   decode-heavy throughput.
+
+Benchmark discipline for every slice:
+
+- use strict no-fallback configs for kernel-route claims;
+- record exact generated-token parity, vLLM ratio, top CPU/GPU profile events,
+  and whether the change targets decode, long prefill, or both;
+- keep microbenchmarks as diagnostics only until the integrated GPU matrix
+  confirms the win.
+
+Orchestration assignments:
+
+- Worker A owns static decode execution and replay. Target the CPU-side
+  `forward_step_token_ids_jit`, `PjRtCApiLoadedExecutable::Execute`,
+  `command_buffer::execute`, and `command_buffer::update` buckets by reducing
+  repeated host metadata rebuilds and keeping fixed decode-bucket state on
+  device.
+- Worker B owns greedy LM-head top-1 and logits materialization. Target the
+  remaining top `gemm_fusion_dot_199` bucket without changing exact
+  `jnp.argmax` tie behavior; keep full logits only where diagnostics or
+  non-greedy modes require them.
+- Worker C owns decode projection structure. Target remaining projection GEMM
+  launch count and shape quality through safe gate/up and QKV packing or
+  merging, while keeping the accepted padded-GEMM route compatible.
+- Worker D owns strict GDN/FLA prefill and decode kernels. Target the packed
+  GDN decode bucket and the much larger long-prefill gap using Pallas, Triton,
+  CuteDSL, or adapted external FLA schedules, with local CUDA probes remaining
+  diagnostics only.
+- Worker E owns benchmark/profile strategy. Keep the plan aligned with
+  nano-vLLM/vLLM structural advantages: merged projections, CUDA-graph-like
+  replay, paged/cache metadata discipline, FlashAttention/FlashInfer-style
+  kernels, reduced host sync, and optimized GEMM only where profile evidence
+  shows a real shape or fusion problem.
+
+Post-pass orchestration rule: avoid further fan-out unless there is a clear
+need for independent read-only checks. Use one reusable worker for bounded
+follow-up slices, refresh that worker's brief with the current anchor artifacts,
+and close/reset it when its context becomes noisy.
+
+Do-not-repeat guardrail for the current decode pass:
+
+- Do not retry static `seq_lens` device carry for static metadata. It regressed
+  the confirmed run to `165.31 tok/s` and worsened `MemcpyD2D`/`np.asarray`
+  buckets.
+- Do not retry `_gdn_fla_chunk_fwd_o_packed_kernel` `num_warps=4`; it raised
+  the `chunk_fwd_o` bucket to about `80 ms` and regressed throughput to
+  `159.43 tok/s`.
+- Do not continue packed-GDN decode launch-param-only sweeps such as
+  `w4/s2/b32` or `w8/s3/b32`; they did not reduce `_gdn_packed_decode_kernel`
+  or the dominant GEMM/GDN buckets. Reopen only with a kernel-body or launch
+  structure change.
+- Do not retry runtime/source-level MLP gate/up concatenation or persistent
+  duplicated gate/up weight leaves in the rejected forms already recorded in
+  the logbook. A future gate/up proposal must explain the material difference
+  from those failures before implementation.
+
 ## Next Goal Handoff
 
 Use this file as the main goal contract. The first goal slice should stay
@@ -2058,6 +2164,141 @@ If FlashInfer/JAX FFI integration is harder than expected, insert a small ABI
 validation commit before Commit 4. That commit should prove an optional external
 kernel can be discovered, gated, called, profiled, and bypassed without touching
 the pure-JAX correctness path.
+
+## Current Decode-Heavy Split Diagnostic
+
+Status as of 2026-06-02:
+
+- Current exact-token decode-heavy diagnostic:
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/decode_split_20260602/nvj_decode_split_diag_jax_20260602.json`.
+- Fresh same-shape vLLM async reference:
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/decode_split_20260602/nvj_decode_split_diag_vllm_async_20260602.json`.
+- vLLM graph-mode CUDA-event split:
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/decode_split_20260602/nvj_decode_split_diag_vllm_offline_cuda_events_20260602.json`.
+- Current result:
+  - JAX `decode_heavy_128x128/gpu_paged_gdn_fla_decode_static_metadata`:
+    exact generated-token match, `167.65 output tok/s`, `0.7635 s`;
+  - vLLM async baseline, same `128 -> 128` shape with `logprobs=5`:
+    `219.03 output tok/s`, `0.5844 s`;
+  - current JAX ratio: `0.766x`; `0.9x` target requires about `197.12 tok/s`,
+    or roughly `114 ms` less wall time on this 128-token run.
+- LM-head/logits finding:
+  - JAX LM-head/logits bucket: `127.44 ms` across 127 decode calls;
+  - vLLM `logits_processor.forward`: `137.86 ms` across 128 calls;
+  - vLLM sampler after logits: `29.79 ms`, including top-k logprob gather.
+- Interpretation:
+  - vLLM is not faster because it avoids logits materialization; it pays a
+    similar or larger logits bucket in this benchmark;
+  - logits materialization is a shared floor, not the end-to-end upper bound;
+  - the remaining JAX gap is dominated by replay/launch/static metadata and
+    non-LM model kernels, not by the GDN decode core or LM-head alone.
+- Next optimization priority:
+  - reduce PJRT/command-buffer/static-metadata churn (`PjRT Execute`
+    `428.69 ms`, command-buffer execute/update `130.11/90.99 ms`,
+    scheduler/build/static decode arrays around `100 ms` each);
+  - reduce non-LM projection/reduction buckets before spending more target
+    time on LM-head-only kernels.
+- PjRT overlap audit:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/pjrt_split_20260602/pjrt_split_20260602.md`;
+  - `PjRT Execute` is not standalone CPU arithmetic in this trace:
+    `407.21 ms` of `428.69 ms` overlaps GPU-active intervals (`95.0%`);
+  - same-thread PjRT-exclusive time after subtracting nested children is only
+    `3.18 ms` total;
+  - grouping the `410` PjRT events shows the main contribution is still the
+    decode executable, not incidental metadata conversions: `127`
+    `forward_step_token_ids_table_jit` events account for `380.82 ms`, while
+    `convert_element_type` and `broadcast_in_dim` account for `19.81 ms` and
+    `12.23 ms`;
+  - the decode step boundary still shows replay pressure: `127`
+    `forward_step_token_ids_table_jit` rows contain `2413`
+    command-buffer executes and `2413` updates, about `19` of each per token.
+- Updated decode-heavy baseline after Entry 210:
+  - `gpu_paged_gdn_fla_decode_static_metadata` now uses explicit
+    `kernels.gdn.packed_decode.impl=reference` with BF16 QKV for decode and
+    enables all block-dot FLA prefill stages through
+    `kernels.gdn.prefill_block_dot=true`;
+  - paired no-profile smokes: `triton_fla` decode was `169.88` and
+    `170.58 tok/s`, while packed `reference` was `174.09` and
+    `173.88 tok/s`, all exact;
+  - after the slot/token conversion cache, no-profile decode-heavy is exact at
+    `173.99 tok/s`;
+  - after composing block-dot prefill with the reference decode route,
+    no-profile decode-heavy is exact at `197.91`, `196.38`, and
+    `197.96 tok/s`, median `197.91 tok/s`;
+  - against the fresh vLLM async baseline `219.03 tok/s`, the median ratio is
+    `0.904x`, which meets the fresh `0.9x` target of about `197.12 tok/s`;
+  - target artifacts:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/decode_gdn_replay_20260602/decode_heavy_static_metadata_reference_blockdot_prefill_noprofile.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/decode_gdn_replay_20260602/decode_heavy_static_metadata_reference_blockdot_prefill_noprofile_r2.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/decode_gdn_replay_20260602/decode_heavy_static_metadata_reference_blockdot_prefill_noprofile_r3.json`;
+  - profile structure is cleaner (`PjRT Execute` `198.22 ms / 283`,
+    command-buffer execute/update `79.09/35.26 ms`, `MemcpyD2D`
+    `4.18 ms / 362`) after Entry 207, but that cleanup should not be counted
+    as a standalone throughput win;
+  - the config-driven profiled smoke after Entry 210 is exact and records all
+    four block-dot flags as true, but profiling lowers throughput to
+    `191.23 tok/s`; use it for bucket movement, not for the no-profile speed
+    claim.
+- Entry 211 full no-profile sanity:
+  - all four sanity workloads passed exact parity;
+  - `long_prefill_512_2048` median `106.08 tok/s`, `0.912x` stored vLLM;
+  - `decode_heavy_128x128` median `197.60 tok/s`, `0.902x` fresh vLLM;
+  - `hetero8` and `short_32_128` remain below target at `0.367x` and `0.680x`
+    stored vLLM respectively.
+
+Profile interpretation guardrails:
+
+- Compare only same workload, same config family, same repeat policy, and same
+  profile scope before declaring a bucket moved. Do not compare decode-heavy,
+  hetero8, and long-prefill bucket totals directly.
+- Treat CPU `PjRT Execute`, `command_buffer::*`, scheduler, and `device_put`
+  labels as inclusive host-side wrapper/proxy buckets. They overlap GPU work
+  and are not additive with GPU kernel totals.
+- Do not call `PjRT Execute` a CPU-compute bottleneck unless an overlap split
+  shows substantial same-thread exclusive time. In the current split it is
+  primarily host wrapper/wait/replay wall time around GPU work.
+- Treat GPU top events as the first exclusive kernel targets, but require an
+  integrated wall-time drop. A single-kernel reduction is not enough if PJRT or
+  command-buffer counts rise.
+- For replay/launch work, the acceptance signal is lower per-step
+  `PjRT Execute`/`command_buffer` counts and lower wall time on exact-token
+  decode-heavy, not just a renamed profile bucket.
+
+## Current Hetero8 Bottleneck Tracker
+
+Status as of 2026-06-02:
+
+- Current accepted local hetero8 route under investigation:
+  `gpu_paged_gdn_fla_decode_kkt_fwd_o_block_dot` with block-dot GDN prefill and
+  `kernels.gdn.packed_decode.max_batch: 1`.
+- Current one-repeat artifact:
+  `results/gpu_matrix_hetero8_block_dot_maxbatch1_r1_20260602.json`.
+- Current result: exact generated-token match, `322.79 tok/s`, `0.878x` stored
+  Entry 045 JAX reference, `0.374x` stored vLLM reference. This is an
+  improvement over the earlier block-dot mixed smoke (`308.27 tok/s`) but is
+  not speed-claim-ready.
+- Dominant shape: decode, not prefill. One prefill step is about `24.82 ms`;
+  31 decode steps total about `760.85 ms`.
+- Current main buckets:
+  - compiled decode execution: `forward_step_token_ids_jit` `542.83 ms`,
+    PJRT execute `539.47 ms`;
+  - final device-token materialization: `np.asarray(jax.Array)` `109.04 ms`;
+  - top GPU model buckets: two large GEMMs around `110.72 ms` and `97.19 ms`,
+    then smaller GEMM/concatenate/transpose buckets.
+- Recently accepted optimization: cap Triton packed GDN decode to
+  `batch <= 1`, because it helps single-sequence decode-heavy runs but adds
+  command-buffer overhead on batch-8 hetero. Command-buffer execute/update counts
+  moved from `992`/`961` to `279`/`248`.
+- Recently rejected optimization: device-token vector row-gather
+  materialization. It reduced the visible `np.asarray` bucket but added
+  `1454.40 ms` of CPU gather and cut throughput to `183.34 tok/s`. Do not retry
+  this shape of fix.
+
+Next hetero8 experiments should reduce one of the current dominant buckets and
+must compare against both stored Entry 045 and stored vLLM. Avoid source-level
+rewrites unless the profile shows that the rewrite removes a dominant bucket in
+the integrated server trace.
 
 ## Hard Rules For The Agent
 

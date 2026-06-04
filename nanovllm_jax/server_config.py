@@ -211,8 +211,16 @@ def _runtime_section_to_env(runtime_section: dict) -> dict[str, str]:
         "compact_prefill_full_attn_proj": "NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ",
         "compact_prefill_mlp": "NANO_VLLM_JAX_COMPACT_PREFILL_MLP",
         "device_token_carry": "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+        "static_decode_metadata": "NANO_VLLM_JAX_STATIC_DECODE_METADATA",
         "lm_head_decode_act_dtype": "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE",
         "decode_proj_act_dtype": "NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE",
+        "decode_padded_gemm": "NANO_VLLM_JAX_DECODE_PADDED_GEMM",
+        "decode_padded_gemm_gate_up": "NANO_VLLM_JAX_DECODE_PADDED_GEMM_GATE_UP",
+        "decode_padded_gemm_rows": "NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS",
+        "decode_padded_gemm_max_out_dim": "NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM",
+        "pallas_decode_rmsnorm": "NANO_VLLM_JAX_PALLAS_DECODE_RMSNORM",
+        "triton_decode_rmsnorm": "NANO_VLLM_JAX_TRITON_DECODE_RMSNORM",
+        "pallas_gdn_qk_prenorm": "NANO_VLLM_JAX_PALLAS_GDN_QK_PRENORM",
     }
     for key, env_key in fastpath_map.items():
         _put_env(env, env_key, fastpaths.get(key))
@@ -253,6 +261,27 @@ def _kernels_section_to_env(kernels_section: dict) -> dict[str, str]:
         "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE",
         gdn.get("prefill_post_conv_output_dtype"),
     )
+    prefill_block_dot = gdn.get("prefill_block_dot")
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_KKT_BLOCK_DOT",
+        prefill_block_dot if prefill_block_dot is not None else gdn.get("kkt_block_dot"),
+    )
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_FWD_O_BLOCK_DOT",
+        prefill_block_dot if prefill_block_dot is not None else gdn.get("fwd_o_block_dot"),
+    )
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_DELTA_H_BLOCK_DOT",
+        prefill_block_dot if prefill_block_dot is not None else gdn.get("delta_h_block_dot"),
+    )
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_RECOMPUTE_BLOCK_DOT",
+        prefill_block_dot if prefill_block_dot is not None else gdn.get("recompute_block_dot"),
+    )
 
     packed_decode = gdn.get("packed_decode", {}) or {}
     _put_env(
@@ -269,6 +298,11 @@ def _kernels_section_to_env(kernels_section: dict) -> dict[str, str]:
         env,
         "NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK",
         packed_decode.get("pre_normalize_qk"),
+    )
+    _put_env(
+        env,
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_MAX_BATCH",
+        packed_decode.get("max_batch"),
     )
 
     triton_decode = packed_decode.get("triton", {}) or {}

@@ -6,6 +6,7 @@ Start here for current documentation. Archived notes may be useful for history, 
 
 - [Architecture](architecture.md): engine loop, scheduler/runner/executor/backend boundaries, state ownership.
 - [GPU correctness guardrails](gpu_correctness_guardrails.md): current GPU correctness contract, runtime cache roots, and guard commands.
+- [GDN FLA kernel flow](gdn_fla_kernel_flow.md): block-dot GDN/FLA prefill route, model-specific assumptions, and benchmark interpretation.
 - [KV cache](kv_cache.md): block tables, slot mapping, masks, block-boundary behavior.
 - [MTP](mtp.md): historical TPU K=1 terminology and invariants, with current GPU caveats.
 - [Scheduler](scheduler.md): prefill chunks, decode buckets, inactive rows, preemption, MTP lookahead.
@@ -16,6 +17,7 @@ Start here for current documentation. Archived notes may be useful for history, 
 ## Current GPU findings
 
 - [GPU correctness guardrails](gpu_correctness_guardrails.md): current BF16-weight/FP32-activation reference and guard commands.
+- [Benchmark/profile strategy crosscheck - 2026-06-01](benchmark_profile_strategy_crosscheck_2026-06-01.md): decode and long-prefill profile checklist against upstream nano-vLLM/vLLM strategy surfaces.
 
 ## Historical findings retained
 

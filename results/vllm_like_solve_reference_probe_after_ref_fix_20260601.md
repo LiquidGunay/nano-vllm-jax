@@ -17,4 +17,3 @@
 - inverse max diff: ref `0.112078` -> vllm_like `0.000244141`
 - output max diff vs vLLM: ref `5.21796` -> vllm_like `0.689076`
 - state max diff vs vLLM: ref `34.5676` -> vllm_like `5.00734`
-
