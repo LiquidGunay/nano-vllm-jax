@@ -270,7 +270,8 @@ class LLMEngine:
         # Run model
         token_ids = self.model_runner.run(seqs, batch=scheduled_batch)
         emitted_tokens = 0
-        if not scheduled_batch.is_prefill:
+        mixed_prefill_decode = bool(getattr(scheduled_batch, "mixed_prefill_decode", False))
+        if (not scheduled_batch.is_prefill) or mixed_prefill_decode:
             for token_id in token_ids:
                 emitted_tokens += len(token_id) if isinstance(token_id, list) else 1
 
@@ -288,7 +289,7 @@ class LLMEngine:
         step_elapsed = perf_counter() - step_t
         self.scheduler.update_mtp_admission(
             self.model_runner.get_speculative_stats(),
-            is_decode=not scheduled_batch.is_prefill,
+            is_decode=(not scheduled_batch.is_prefill) or mixed_prefill_decode,
             elapsed_seconds=step_elapsed,
             emitted_tokens=emitted_tokens,
             batch=scheduled_batch,
@@ -305,7 +306,7 @@ class LLMEngine:
             outputs = [(seq.seq_id, []) for seq in seqs if seq.is_finished]
         
         # Track throughput
-        if scheduled_batch.is_prefill:
+        if scheduled_batch.is_prefill and not mixed_prefill_decode:
             num_tokens = scheduled_batch.num_prefill_tokens
         else:
             num_tokens = -getattr(self.scheduler, "last_num_generated_tokens", scheduled_batch.num_decode_tokens)

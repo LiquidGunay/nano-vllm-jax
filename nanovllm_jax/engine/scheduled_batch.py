@@ -39,6 +39,7 @@ class ScheduledBatch:
     uses_static_decode_metadata: bool = False
     packed_prefill: bool = False
     token_row_ids: jnp.ndarray | None = None
+    mixed_prefill_decode: bool = False
 
     @property
     def batch_size(self) -> int:

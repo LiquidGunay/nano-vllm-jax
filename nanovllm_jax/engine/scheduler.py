@@ -2,6 +2,7 @@
 
 import os
 from collections import deque
+from dataclasses import replace
 from typing import Deque, List, Tuple
 
 import jax
@@ -221,7 +222,6 @@ class Scheduler:
             self.max_num_resident_seqs > self.max_num_seqs
             and ready_decode_rows >= self.max_num_seqs
         )
-        
         # Phase 1: Prefill - schedule new/waiting sequences and unfinished
         # prompt tails from already-allocated running sequences.
         waiting_blocked_by_kv = False
@@ -383,6 +383,137 @@ class Scheduler:
             is_prefill=False,
             decode_step_count=decode_step_count,
         )
+
+    def _schedule_mixed_prefill_decode(self) -> Tuple[List[Sequence], ScheduledBatch] | None:
+        """Backfill underfull decode batches with bounded packed prefill chunks."""
+        if self.prefill_layout != "packed":
+            return None
+        if self.num_speculative_tokens != 0:
+            return None
+
+        ready_decode_rows = [
+            seq
+            for seq in self.running
+            if seq.num_cached_tokens >= seq.num_prompt_tokens
+        ]
+        if not ready_decode_rows or len(ready_decode_rows) >= self.max_num_seqs:
+            return None
+
+        has_running_prefill_tail = any(
+            seq.num_cached_tokens < seq.num_prompt_tokens for seq in self.running
+        )
+        if not self.waiting and not has_running_prefill_tail:
+            return None
+
+        max_token_budget = max(
+            1,
+            self.max_num_batched_tokens if self.max_num_batched_tokens > 0 else self.prefill_chunk_budget,
+        )
+        if self.prefill_token_buckets:
+            max_token_budget = min(max_token_budget, max(self.prefill_token_buckets))
+        elif self.prefill_buckets:
+            max_token_budget = min(max_token_budget, max(self.prefill_buckets))
+
+        decode_seqs: List[Sequence] = []
+        for seq in ready_decode_rows:
+            if len(decode_seqs) >= self.max_num_seqs - 1:
+                break
+            if not self.block_manager.can_append_slots(seq, 1):
+                continue
+            decode_seqs.append(seq)
+
+        if not decode_seqs:
+            return None
+
+        row_budget = self.max_num_seqs - len(decode_seqs)
+        mixed_chunk_budget = self._mixed_prefill_chunk_budget()
+        mixed_prefill_budget = row_budget * mixed_chunk_budget
+        remaining_token_budget = min(max_token_budget - len(decode_seqs), mixed_prefill_budget)
+        if row_budget <= 0 or remaining_token_budget <= 0:
+            return None
+
+        prefill_seqs: List[Sequence] = []
+        prefill_chunk_lens: List[int] = []
+        waiting_to_allocate: List[Sequence] = []
+
+        for seq in list(self.running):
+            if len(prefill_seqs) >= row_budget or remaining_token_budget <= 0:
+                break
+            if seq.num_cached_tokens >= seq.num_prompt_tokens:
+                continue
+            remaining_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
+            chunk_len = min(remaining_tokens, mixed_chunk_budget, remaining_token_budget)
+            if chunk_len <= 0:
+                continue
+            prefill_seqs.append(seq)
+            prefill_chunk_lens.append(chunk_len)
+            remaining_token_budget -= chunk_len
+
+        while (
+            self.waiting
+            and len(prefill_seqs) < row_budget
+            and remaining_token_budget > 0
+            and len(self.running) + len(waiting_to_allocate) < self.max_num_resident_seqs
+        ):
+            candidate = self.waiting[0]
+            if not self.block_manager.can_allocate(
+                candidate,
+                use_prefix_cache=self.enable_prefix_cache_execution,
+            ):
+                break
+            remaining_tokens = candidate.num_prompt_tokens - candidate.num_cached_tokens
+            chunk_len = min(remaining_tokens, mixed_chunk_budget, remaining_token_budget)
+            if chunk_len <= 0:
+                break
+            seq = self.waiting.popleft()
+            prefill_seqs.append(seq)
+            prefill_chunk_lens.append(chunk_len)
+            waiting_to_allocate.append(seq)
+            remaining_token_budget -= chunk_len
+
+        if not prefill_seqs:
+            for seq in reversed(waiting_to_allocate):
+                self.waiting.appendleft(seq)
+            return None
+
+        for seq in decode_seqs:
+            seq.mtp_admitted = False
+            seq.mtp_admission_reason = "mixed_prefill_decode"
+            self.block_manager.may_append_slots(seq, 1)
+
+        for seq in waiting_to_allocate:
+            self.block_manager.allocate(
+                seq,
+                use_prefix_cache=self.enable_prefix_cache_execution,
+            )
+            if not self.enable_prefix_cache_execution:
+                seq.num_cached_tokens = 0
+            seq.status = SequenceStatus.RUNNING
+            seq.mtp_admitted = False
+            seq.mtp_admission_reason = "mixed_prefill_decode"
+            self.running.append(seq)
+
+        for seq in prefill_seqs:
+            if seq not in waiting_to_allocate:
+                seq.status = SequenceStatus.RUNNING
+                seq.mtp_admitted = False
+                seq.mtp_admission_reason = "mixed_prefill_decode"
+
+        scheduled_seqs = decode_seqs + prefill_seqs
+        return scheduled_seqs, self.build_mixed_prefill_decode_batch(
+            decode_seqs=decode_seqs,
+            prefill_seqs=prefill_seqs,
+            prefill_chunk_lens=prefill_chunk_lens,
+        )
+
+    def _mixed_prefill_chunk_budget(self) -> int:
+        """Smallest warmed prefill chunk used when decode rows are live."""
+        buckets = self.prefill_token_buckets or self.prefill_buckets
+        if buckets:
+            positive_buckets = [int(bucket) for bucket in buckets if int(bucket) > 0]
+            if positive_buckets:
+                return max(1, min(positive_buckets))
+        return max(1, min(self.prefill_chunk_budget, self.max_num_batched_tokens or self.prefill_chunk_budget))
 
     def build_scheduled_batch(
         self,
@@ -562,6 +693,84 @@ class Scheduler:
             decode_step_count_host=1 if is_prefill else max(1, int(decode_step_count)),
             uses_static_decode_metadata=uses_static_decode_metadata,
         )
+
+    def build_mixed_prefill_decode_batch(
+        self,
+        *,
+        decode_seqs: List[Sequence],
+        prefill_seqs: List[Sequence],
+        prefill_chunk_lens: List[int],
+    ) -> ScheduledBatch:
+        """Build a packed cached step containing decode rows and prefill chunks."""
+        if not decode_seqs:
+            raise ValueError("mixed prefill/decode batch requires at least one decode row")
+        if not prefill_seqs:
+            raise ValueError("mixed prefill/decode batch requires at least one prefill row")
+        if len(prefill_seqs) != len(prefill_chunk_lens):
+            raise ValueError("prefill_chunk_lens length must match prefill_seqs")
+
+        seqs = decode_seqs + prefill_seqs
+        actual_max_blocks = max(1, max(len(seq.block_table) for seq in seqs))
+        max_blocks = actual_max_blocks
+        max_blocks_per_seq = self.max_blocks_per_seq
+        if max_blocks_per_seq is not None:
+            if actual_max_blocks > max_blocks_per_seq:
+                raise ValueError(
+                    f"scheduled block table needs {actual_max_blocks} blocks but bucket has {max_blocks_per_seq}"
+                )
+            max_blocks = max_blocks_per_seq
+
+        query_tokens: List[List[int]] = []
+        query_positions: List[List[int]] = []
+        block_tables: List[List[int]] = []
+        seq_lens: List[int] = []
+        query_lens: List[int] = []
+        prefill_is_final: List[bool] = []
+
+        for seq in decode_seqs:
+            query_tokens.append([seq.last_token])
+            query_positions.append([seq.num_tokens - 1])
+            block_tables.append(seq.block_table + [0] * (max_blocks - len(seq.block_table)))
+            seq_lens.append(seq.num_tokens)
+            query_lens.append(1)
+            prefill_is_final.append(True)
+
+        for seq, chunk_len in zip(prefill_seqs, prefill_chunk_lens):
+            start = seq.num_cached_tokens
+            remaining_tokens = seq.num_prompt_tokens - start
+            chunk_len = min(int(chunk_len), remaining_tokens)
+            if chunk_len <= 0:
+                raise ValueError(f"Scheduled sequence {seq.seq_id} has no executable prefill tokens")
+            end = start + chunk_len
+            tokens = seq.token_ids[start:end]
+            positions = list(range(start, end))
+            query_tokens.append(tokens)
+            query_positions.append(positions)
+            block_tables.append(seq.block_table + [0] * (max_blocks - len(seq.block_table)))
+            seq_lens.append(end)
+            query_lens.append(len(tokens))
+            prefill_is_final.append(end >= seq.num_tokens)
+
+        if self.batch_size_buckets:
+            batch_size_bucket = self._select_bucket(len(seqs), self.batch_size_buckets, "batch")
+        else:
+            batch_size_bucket = len(seqs)
+        if len(seqs) > batch_size_bucket:
+            raise ValueError(f"scheduled batch has {len(seqs)} seqs but bucket has {batch_size_bucket}")
+        seq_ids_host = tuple([seq.seq_id for seq in seqs] + [-1] * (batch_size_bucket - len(seqs)))
+
+        batch = self._build_packed_prefill_batch(
+            query_tokens=query_tokens,
+            query_positions=query_positions,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            query_lens=query_lens,
+            prefill_is_final=prefill_is_final,
+            batch_size_bucket=batch_size_bucket,
+            max_blocks=max_blocks,
+            seq_ids_host=seq_ids_host,
+        )
+        return replace(batch, mixed_prefill_decode=True)
 
     def _build_packed_prefill_batch(
         self,

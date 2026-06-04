@@ -9149,3 +9149,73 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - `python -m py_compile nanovllm_jax/config.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/llm_engine.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/chunked_model_runner.py nanovllm_jax/server_config.py benchmarks/benchmark_jax_server_trace.py benchmarks/benchmark_random_request_sidecar.py`;
   - `pytest -q tests/test_device_token_carry.py tests/test_server_config.py tests/test_benchmark_random_request_sidecar.py tests/test_benchmark_jax_server_trace.py`
     -> `41 passed`.
+
+### Entry 244 - Mixed Backfill And Decode Burst Diagnostics
+
+- date: 2026-06-04
+- purpose:
+  - test the next proposed random-workload serving steps under the same
+    seed-`1234` manifest and generic warmup discipline:
+    mixed packed prefill/decode backfill and greedy decode micro-bursts.
+- changes:
+  - added a `ScheduledBatch.mixed_prefill_decode` marker plus explicit mixed
+    packed batch construction for one-token decode rows and bounded prefill
+    rows;
+  - taught device-token carry to replace placeholder packed decode tokens in
+    mixed packed batches;
+  - kept the mixed route out of automatic scheduling after integrated
+    measurements showed it regressed output throughput;
+  - fixed greedy decode burst scans so KV/hybrid carry dtypes remain stable
+    across `lax.scan`;
+  - changed generic warmup to compile every burst length from `2` through the
+    configured burst size, because request tails can choose shorter legal burst
+    lengths during serving.
+- artifacts:
+  - full-budget mixed resident16/B8:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_mixed_resident16_exec8_r1_20260604.json`;
+  - min-bucket mixed resident16/B8:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_mixed_minbucket_resident16_exec8_r1_20260604.json`;
+  - burst4 resident16/B8:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_burst4_resident16_exec8_r3_20260604.json`;
+  - burst8 resident16/B8:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_burst8_resident16_exec8_r1_20260604.json`;
+  - burst4 resident8/B8:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_burst4_resident8_exec8_r1_20260604.json`.
+- results:
+  - mixed full-budget: `165.24 output tok/s`, mean TTFT `26098 ms`,
+    zero measured-phase JIT growth (`32 -> 32`);
+  - mixed min-bucket: `113.64 output tok/s`, mean TTFT `42291 ms`,
+    zero measured-phase JIT growth (`32 -> 32`);
+  - burst4 resident16: `282.37 output tok/s`, mean TTFT `10793 ms`,
+    zero measured-phase JIT growth (`68 -> 68`);
+  - burst8 resident16: `284.73 output tok/s`, mean TTFT `10801 ms`,
+    zero measured-phase JIT growth (`116 -> 116`);
+  - burst4 resident8: `283.15 output tok/s`, mean TTFT `14786 ms`,
+    zero measured-phase JIT growth (`68 -> 68`);
+  - the B8 no-burst random anchor from Entry 242 remains better at
+    `437.63 output tok/s`, and fresh vLLM remains `1541.89 output tok/s`.
+- interpretation:
+  - automatic mixed packed backfill is rejected for this workload. It performs
+    useful prefill work, but it makes live decode rows wait behind prompt
+    chunks and harms the output-throughput/TTFT objective;
+  - smaller mixed chunks reduce worst individual stalls but increase the number
+    of mixed steps enough to lose even more overall;
+  - greedy burst now has correct dtype-stable scans and honest generic warmup,
+    but source-level full-model burst scans are still not a promotion route:
+    burst8 halves decode call count relative to burst4, yet only improves
+    output throughput by `0.8%` while adding `48` more warmup compile entries;
+  - resident8 and resident16 burst4 are effectively tied, so the current random
+    gap is not mainly resident capacity. The remaining gap is decode compute
+    inside the compiled graph plus the lack of production paged decode/GDN
+    kernels.
+- decision:
+  - keep the explicit mixed packed ABI and burst warmup/dtype fixes as
+    groundwork and diagnostics;
+  - do not enable automatic mixed backfill or increase default greedy burst
+    width as a promoted optimization;
+  - next material work should replace the decode kernels/boundaries rather than
+    further tuning scheduler burst width.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/scheduled_batch.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/llm_engine.py nanovllm_jax/engine/model_executor.py tests/test_device_token_carry.py`;
+  - `pytest -q tests/test_backend_boundaries.py::test_model_runner_warmup_compiles_greedy_decode_burst tests/test_backend_boundaries.py::test_executor_greedy_decode_burst_matches_iterative_token_path tests/test_device_token_carry.py tests/test_server_config.py tests/test_benchmark_random_request_sidecar.py tests/test_benchmark_jax_server_trace.py`
+    -> `45 passed`.

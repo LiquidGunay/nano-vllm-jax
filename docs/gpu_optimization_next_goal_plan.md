@@ -110,6 +110,12 @@ Current best:
 - the previous accepted run
   `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_b8_320width_static_cache_split_decode_block_buckets_128_256_320_r1_20260604.json`
   remains equivalent evidence at `436.24 output tok/s`.
+- Entry 244 tested mixed packed backfill and greedy decode burst diagnostics.
+  Mixed backfill is rejected for automatic scheduling (`165.24` then
+  `113.64 output tok/s`) because it delays live decode rows behind prompt
+  chunks. Greedy burst has dtype-stable scans and honest generic warmup now,
+  but burst4/burst8 resident runs only reached `282.37`/`284.73 output tok/s`
+  and remain below the B8 no-burst anchor.
 
 Rules for this lane:
 
@@ -128,33 +134,35 @@ Rules for this lane:
 
 Next implementation order:
 
-1. Match vLLM's serving ABI more closely:
+1. Replace slow decode kernels behind the packed serving boundary:
+   - full-attention decode should use a production paged decode-attention path
+     rather than materializing/gathering K/V windows in JAX;
+   - GDN decode should continue toward the vLLM/FLA-style fused boundary with
+     BF16 activations and FP32 recurrent state where required;
+   - LM-head/sampling should compute only the greedy token unless top-k/logit
+     diagnostics are explicitly requested;
+   - Entry 244 shows PJRT amortization alone is not enough: burst8 halves the
+     decode call count relative to burst4, but throughput barely moves.
+2. Match vLLM's serving ABI more closely where it enables those decode kernels:
    - resident logical concurrency above the execution batch bucket now exists
      as config/runner groundwork (`max_num_resident_seqs`), but resident-only
      widening is rejected as a performance route: resident16/B8 regressed to
      `278.97 output tok/s` because the executor still runs prefill-only or
      decode-only steps;
-   - implement the missing mixed packed boundary for chunked prefill plus
-     decode backfill so long prefills and decode steps can share scheduler
-     iterations under generic token buckets;
+   - explicit mixed packed batches now exist as ABI groundwork, but automatic
+     mixed backfill is rejected until a latency-aware policy and faster
+     decode/prefill kernels can make it win integrated output throughput;
    - keep compile keys expressed as finite serving buckets, not exact request
      shapes.
-2. Make arbitrary-batch decode efficient before widening the serving envelope:
+3. Make arbitrary-batch decode efficient before widening the serving envelope:
    - compact active decode rows into generic batch buckets such as
      `1,2,4,8,16`;
    - pass slot mapping, block tables, sequence lengths, and state handles in a
      vLLM-shaped packed boundary;
    - keep per-step metadata/state update work proportional to active rows and
      scheduled tokens, not to the total resident capacity.
-3. Replace slow decode kernels behind that packed boundary:
-   - full-attention decode should use a production paged decode-attention path
-     rather than materializing/gathering K/V windows in JAX;
-   - GDN decode should continue toward the vLLM/FLA-style fused boundary with
-     BF16 activations and FP32 recurrent state where required;
-   - LM-head/sampling should compute only the greedy token unless top-k/logit
-     diagnostics are explicitly requested.
-4. Add a generic greedy decode micro-burst path only after the packed
-   arbitrary-batch boundary is in place:
+4. Keep generic greedy decode micro-burst diagnostic-only until decode kernels
+   are faster:
    - compile a small fixed set of burst buckets, for example `1,2,4,8`, during
      normal startup warmup;
    - choose the runtime burst from a cost model and scheduler constraints, not

@@ -353,6 +353,105 @@ def test_scheduler_decode_block_table_buckets_select_smallest_fit():
     np.testing.assert_array_equal(np.asarray(batch.block_tables[1]), np.asarray([1, 3, 0, 0]))
 
 
+def test_scheduler_mixed_prefill_decode_backfills_underfull_decode_batch():
+    scheduler = Scheduler(
+        Qwen3_5Config(
+            max_num_seqs=4,
+            max_num_resident_seqs=6,
+            max_num_batched_tokens=16,
+            prefill_buckets=(16,),
+            prefill_token_buckets=(16,),
+            batch_size_buckets=(4,),
+            max_blocks_per_seq=4,
+            num_kvcache_blocks=16,
+            jax_execution="jit",
+        )
+    )
+    decode_a = Sequence(
+        [1, 2],
+        SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True),
+        seq_id=7,
+    )
+    decode_b = Sequence(
+        [3, 4],
+        SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True),
+        seq_id=8,
+    )
+    for seq, token in ((decode_a, 97), (decode_b, 98)):
+        scheduler.block_manager.allocate(seq, use_prefix_cache=False)
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        seq.append_token(token)
+        seq.status = SequenceStatus.RUNNING
+        scheduler.running.append(seq)
+
+    waiting_a = Sequence(
+        [10, 11, 12],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        seq_id=9,
+    )
+    waiting_b = Sequence(
+        [20, 21, 22],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        seq_id=10,
+    )
+    scheduler.add(waiting_a)
+    scheduler.add(waiting_b)
+
+    scheduled = scheduler._schedule_mixed_prefill_decode()
+    assert scheduled is not None
+    seqs, batch = scheduled
+
+    assert [seq.seq_id for seq in seqs] == [7, 8, 9, 10]
+    assert batch.is_prefill
+    assert batch.packed_prefill
+    assert batch.mixed_prefill_decode
+    assert batch.query_lens_host == (1, 1, 3, 3)
+    assert batch.seq_lens_host == (3, 3, 3, 3)
+    assert batch.prefill_final_flags[:4] == [True, True, True, True]
+    assert not scheduler.waiting
+    assert len(scheduler.running) == 4
+    np.testing.assert_array_equal(
+        np.asarray(batch.tokens)[0, :8],
+        np.asarray([97, 98, 10, 11, 12, 20, 21, 22]),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(batch.token_row_ids)[0, :8],
+        np.asarray([0, 1, 2, 2, 2, 3, 3, 3]),
+    )
+
+
+def test_model_runner_applies_device_token_carry_to_mixed_packed_decode_rows(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.device_token_carry = True
+    runner.config = Qwen3_5Config(device_token_carry=True)
+    token_vector = jnp.asarray([70], dtype=jnp.int32)
+    runner._device_token_carry_by_seq_id = {7: DeviceTokenRef(tokens=token_vector, row=0)}
+
+    batch = ScheduledBatch(
+        tokens=jnp.asarray([[0, 11, 12]], dtype=jnp.int32),
+        positions=jnp.asarray([[2, 0, 1]], dtype=jnp.int32),
+        seq_ids=jnp.asarray([7, 8], dtype=jnp.int32),
+        query_start_loc=jnp.asarray([0, 1, 3], dtype=jnp.int32),
+        is_prefill=True,
+        num_prefill_tokens=3,
+        num_decode_tokens=0,
+        block_tables=jnp.zeros((2, 2), dtype=jnp.int32),
+        seq_lens=jnp.asarray([3, 2], dtype=jnp.int32),
+        prefill_is_final=(True, False),
+        seq_ids_host=(7, 8),
+        query_lens_host=(1, 2),
+        seq_lens_host=(3, 2),
+        packed_prefill=True,
+        token_row_ids=jnp.asarray([[0, 1, 1]], dtype=jnp.int32),
+        mixed_prefill_decode=True,
+    )
+
+    carried = runner._maybe_apply_device_token_carry(batch)
+
+    np.testing.assert_array_equal(np.asarray(carried.tokens), np.asarray([[70, 11, 12]]))
+
+
 def test_scheduler_resident_capacity_can_exceed_execution_batch():
     scheduler = Scheduler(
         Qwen3_5Config(

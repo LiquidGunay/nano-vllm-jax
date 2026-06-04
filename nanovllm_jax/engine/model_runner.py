@@ -1311,34 +1311,35 @@ class CanonicalModelRunner:
                     and not seed_mtp1
                     and greedy_decode_burst_steps > 1
                 ):
-                    if use_hybrid_table_decode and hasattr(self.executor, "forward_greedy_decode_burst_table_jit"):
-                        hybrid_slot_ids = jnp.arange(batch_size, dtype=jnp.int32)
-                        output = self.executor.forward_greedy_decode_burst_table_jit(
-                            batch,
-                            cache_storage=self.cache_storage,
-                            hybrid_state_table=self._hybrid_state_table,
-                            hybrid_slot_ids=hybrid_slot_ids,
-                            decode_steps=greedy_decode_burst_steps,
-                        )
-                        self._hybrid_state_table = output.hybrid_state
-                        _record_decode_warmup(
-                            output,
-                            "forward_greedy_decode_burst_table_jit:decode",
-                            greedy_decode_burst_steps,
-                        )
-                    elif hasattr(self.executor, "forward_greedy_decode_burst_jit"):
-                        hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
-                        output = self.executor.forward_greedy_decode_burst_jit(
-                            batch,
-                            cache_storage=self.cache_storage,
-                            hybrid_state=hybrid_state,
-                            decode_steps=greedy_decode_burst_steps,
-                        )
-                        _record_decode_warmup(
-                            output,
-                            "forward_greedy_decode_burst_jit:decode",
-                            greedy_decode_burst_steps,
-                        )
+                    for burst_steps in range(2, greedy_decode_burst_steps + 1):
+                        if use_hybrid_table_decode and hasattr(self.executor, "forward_greedy_decode_burst_table_jit"):
+                            hybrid_slot_ids = jnp.arange(batch_size, dtype=jnp.int32)
+                            output = self.executor.forward_greedy_decode_burst_table_jit(
+                                batch,
+                                cache_storage=self.cache_storage,
+                                hybrid_state_table=self._hybrid_state_table,
+                                hybrid_slot_ids=hybrid_slot_ids,
+                                decode_steps=burst_steps,
+                            )
+                            self._hybrid_state_table = output.hybrid_state
+                            _record_decode_warmup(
+                                output,
+                                "forward_greedy_decode_burst_table_jit:decode",
+                                burst_steps,
+                            )
+                        elif hasattr(self.executor, "forward_greedy_decode_burst_jit"):
+                            hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
+                            output = self.executor.forward_greedy_decode_burst_jit(
+                                batch,
+                                cache_storage=self.cache_storage,
+                                hybrid_state=hybrid_state,
+                                decode_steps=burst_steps,
+                            )
+                            _record_decode_warmup(
+                                output,
+                                "forward_greedy_decode_burst_jit:decode",
+                                burst_steps,
+                            )
                 if use_hybrid_table_decode:
                     hybrid_slot_ids = jnp.arange(batch_size, dtype=jnp.int32)
                     output = self.executor.forward_step_token_ids_table_jit(
@@ -1482,18 +1483,48 @@ class CanonicalModelRunner:
     def _maybe_apply_device_token_carry(self, batch: ScheduledBatch) -> ScheduledBatch:
         static_decode_metadata = bool(getattr(batch, "uses_static_decode_metadata", False))
         active_rows = self._active_decode_rows_host(batch)
-        if (
-            not bool(
-                getattr(
-                    self,
+        carry_enabled = bool(
+            getattr(
+                self,
+                "device_token_carry",
+                _config_or_env_flag(
+                    getattr(self, "config", None),
                     "device_token_carry",
-                    _config_or_env_flag(
-                        getattr(self, "config", None),
-                        "device_token_carry",
-                        "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
-                    ),
-                )
+                    "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+                ),
             )
+        )
+        if (
+            carry_enabled
+            and batch.is_prefill
+            and batch.packed_prefill
+            and getattr(batch, "mixed_prefill_decode", False)
+            and getattr(self, "_device_token_carry_by_seq_id", {})
+            and batch.seq_ids_host is not None
+            and batch.query_lens_host is not None
+            and batch.tokens.shape[0] == 1
+        ):
+            tokens = batch.tokens
+            offset = 0
+            applied = False
+            for row, (seq_id, query_len) in enumerate(zip(batch.seq_ids_host, batch.query_lens_host)):
+                query_len = int(query_len)
+                if int(seq_id) >= 0 and query_len == 1:
+                    token_ref = self._device_token_carry_by_seq_id.get(int(seq_id))
+                    if token_ref is not None:
+                        token_array = jnp.asarray(token_ref.tokens, dtype=jnp.int32)
+                        if token_array.ndim == 2 and token_array.shape[1] == 1:
+                            token_value = token_array[int(token_ref.row), 0]
+                        else:
+                            token_value = _int32_device_vector(token_array)[int(token_ref.row)]
+                        tokens = tokens.at[0, offset].set(token_value)
+                        applied = True
+                offset += query_len
+            if applied:
+                return replace(batch, tokens=tokens)
+
+        if (
+            not carry_enabled
             or batch.is_prefill
             or not getattr(self, "_device_token_carry_by_seq_id", {})
             or batch.seq_ids_host is None

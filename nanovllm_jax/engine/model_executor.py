@@ -1107,14 +1107,18 @@ class ModelExecutor:
                     next_tokens = token_ids[:, None]
                     next_positions = step_positions + active[:, None].astype(step_positions.dtype)
                     next_seq_lens = jnp.where(active, step_seq_lens + 1, step_seq_lens)
+                    next_k_cache = updated_kv_state.k_cache.astype(step_k_cache.dtype)
+                    next_v_cache = updated_kv_state.v_cache.astype(step_v_cache.dtype)
+                    next_conv_state = updated_hybrid_state.conv_state.astype(step_conv_state.dtype)
+                    next_recurrent_state = updated_hybrid_state.recurrent_state.astype(step_recurrent_state.dtype)
                     return (
                         next_tokens,
                         next_positions,
                         next_seq_lens,
-                        updated_kv_state.k_cache,
-                        updated_kv_state.v_cache,
-                        updated_hybrid_state.conv_state,
-                        updated_hybrid_state.recurrent_state,
+                        next_k_cache,
+                        next_v_cache,
+                        next_conv_state,
+                        next_recurrent_state,
                     ), token_ids
 
                 initial = (
@@ -1310,14 +1314,18 @@ class ModelExecutor:
                     next_tokens = token_ids[:, None]
                     next_positions = step_positions + active[:, None].astype(step_positions.dtype)
                     next_seq_lens = jnp.where(active, step_seq_lens + 1, step_seq_lens)
+                    next_k_cache = updated_kv_state.k_cache.astype(step_k_cache.dtype)
+                    next_v_cache = updated_kv_state.v_cache.astype(step_v_cache.dtype)
+                    next_conv_state = updated_hybrid_state.conv_state.astype(step_conv_state.dtype)
+                    next_recurrent_state = updated_hybrid_state.recurrent_state.astype(step_recurrent_state.dtype)
                     return (
                         next_tokens,
                         next_positions,
                         next_seq_lens,
-                        updated_kv_state.k_cache,
-                        updated_kv_state.v_cache,
-                        updated_hybrid_state.conv_state,
-                        updated_hybrid_state.recurrent_state,
+                        next_k_cache,
+                        next_v_cache,
+                        next_conv_state,
+                        next_recurrent_state,
                     ), token_ids
 
                 initial = (
