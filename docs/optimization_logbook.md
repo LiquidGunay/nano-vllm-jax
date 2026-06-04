@@ -9022,3 +9022,80 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     process: `nvidia-smi` cannot communicate with the driver and JAX reports
     CPU only. Do not promote the draft width-1 Triton decode-attention
     prototype until GPU parity and integrated random throughput are measured.
+
+### Entry 242 - Driver Repair And Fresh Random Gap Diagnosis
+
+- date: 2026-06-04
+- purpose:
+  - merge the completed block-dot FLA prefill PR and keep the random hill-climb
+    branch readable after the squash merge;
+  - repair the local A10G CUDA runtime so random/vLLM diagnostics can run
+    again;
+  - remeasure the active random stress target and explain why its vLLM gap is
+    much larger than the smaller fixed-shape benchmark gaps.
+- GitHub state:
+  - PR #1 (`[codex] Hit decode-heavy target with block-dot FLA prefill`) was
+    squash-merged into `main` at merge commit
+    `eca56449f21ee27ecaad9cc7bfb39569ecd23b12`;
+  - PR #2 was rebuilt from the merged `origin/main` with only the random
+    checkpoint commit and force-pushed with lease. It is now one commit ahead
+    of `main`, mergeable, and remains a draft:
+    `ef10494d6476442cbe7d773bf47cd3bb40b70e53`.
+- driver diagnosis and fix:
+  - `nvcc --version` worked because the CUDA toolkit was installed, but
+    `nvidia-smi` and JAX CUDA failed because the running kernel
+    `6.17.0-1017-aws` had no loadable NVIDIA module;
+  - PCI enumeration showed the GPU was present as NVIDIA A10G
+    (`10de:2237`), while `modinfo nvidia` failed and DKMS only had
+    `nvidia-srv/580.159.03` installed for older AWS kernels
+    (`6.17.0-1010-aws` and `6.17.0-1015-aws`);
+  - installing `linux-headers-6.17.0-1017-aws`,
+    `linux-modules-nvidia-580-server-6.17.0-1017-aws`, and
+    `linux-modules-nvidia-580-server-aws` built/installed the matching DKMS
+    module;
+  - after `modprobe nvidia` and `modprobe nvidia_uvm`, `nvidia-smi` reported
+    driver `580.159.03` on NVIDIA A10G and JAX reported `CudaDevice(id=0)`.
+- fresh random measurements:
+  - fresh JAX no-profile artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_noprofile_after_driver_fix_20260604.json`;
+  - fresh vLLM artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_vllm_after_driver_fix_20260604.json`;
+  - workload: `15` requests, `30506` input tokens, `11602` output tokens;
+  - JAX: `437.63 output tok/s`, `26.51 s`, full lengths, and zero
+    measured-phase JIT growth (`32 -> 32`);
+  - vLLM: `1541.89 output tok/s`, `7.52 s`;
+  - current random ratio: `0.284x`, consistent with Entry 241's accepted
+    `436.24 tok/s` run.
+- timing diagnosis:
+  - random remains decode dominated: the accepted no-profile run has `13`
+    prefill steps and `1759` decode steps inferred from token events;
+  - B8 decode is the largest single bucket: `1006` steps, `8048` output
+    tokens, `11.84 s`, about `680 tok/s` inside that bucket;
+  - B7 and B6 decode add another `7.47 s` for `2717` tokens, and the smaller
+    tails are much less efficient (`B1` about `115 tok/s`, `B2` about
+    `253 tok/s`);
+  - the profiling rerun is diagnostic only because profiling slows the run to
+    `370.06 tok/s`, but it still confirms zero measured JIT growth and shows
+    CPU/PJRT/scheduler overhead plus many fine-grained GPU launches rather than
+    one missing compile bucket.
+- why random is much worse than the fixed-shape tests:
+  - random has `15` long requests while the current JAX serving envelope is
+    `max_num_seqs=8`, so it necessarily runs multiple admission waves and then
+    spends substantial time in underfilled B7/B6/B2/B1 tails;
+  - vLLM's fresh run uses chunked prefill, async scheduling, persistent
+    torch.compile cache, and CUDA graph capture sizes up to `256`. It can keep
+    more of the random workload resident and execute mixed prefill/decode and
+    decode graphs with much lower per-step overhead;
+  - the fixed non-random targets hide much of this serving scheduler gap:
+    `decode_heavy_128x128` is single-request/B1, so vLLM cannot exploit high
+    concurrency; `long_prefill_512_2048` is prefill dominated, where the
+    block-dot/FLA route is already close; canonical `hetero8` fits exactly in
+    the B8 envelope and avoids the second-wave random tail;
+  - the current random gap should therefore be read as a structural serving
+    gap: better arbitrary-batch decode, production paged decode attention, and
+    vLLM-like chunked-prefill/backfill are needed before further narrow
+    metadata tweaks can move the `0.9x` target.
+- decision:
+  - keep the current random branch as the best checkpoint, but do not interpret
+    the `0.284x` result as a kernel-only loss. It is exposing a broader ABI and
+    serving-policy deficit relative to vLLM.
