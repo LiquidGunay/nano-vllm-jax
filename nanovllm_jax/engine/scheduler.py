@@ -51,7 +51,12 @@ class Scheduler:
     """
 
     def __init__(self, config: Qwen3_5Config):
-        self.max_num_seqs = getattr(config, 'max_num_seqs', 16)
+        self.max_num_seqs = int(getattr(config, 'max_num_seqs', 16) or 16)
+        self.max_num_resident_seqs = int(
+            getattr(config, "max_num_resident_seqs", None) or self.max_num_seqs
+        )
+        if self.max_num_resident_seqs < self.max_num_seqs:
+            raise ValueError("max_num_resident_seqs must be >= max_num_seqs")
         self.max_num_batched_tokens = getattr(config, 'max_num_batched_tokens', 2048)
         self.eos = getattr(config, 'eos', None)
         self.block_size = config.block_size
@@ -207,6 +212,15 @@ class Scheduler:
         num_batched_tokens = 0
         prefill_chunk_lens: List[int] = []
         scheduled_running: List[Sequence] = []
+        ready_decode_rows = sum(
+            1
+            for seq in self.running
+            if seq.num_cached_tokens >= seq.num_prompt_tokens
+        )
+        defer_waiting_prefill_for_decode = (
+            self.max_num_resident_seqs > self.max_num_seqs
+            and ready_decode_rows >= self.max_num_seqs
+        )
         
         # Phase 1: Prefill - schedule new/waiting sequences and unfinished
         # prompt tails from already-allocated running sequences.
@@ -217,7 +231,8 @@ class Scheduler:
             if (
                 self.waiting
                 and not waiting_blocked_by_kv
-                and len(self.running) + len(scheduled_running) < self.max_num_seqs
+                and not defer_waiting_prefill_for_decode
+                and len(self.running) + len(scheduled_running) < self.max_num_resident_seqs
             ):
                 candidate = self.waiting[0]
                 if self.block_manager.can_allocate(

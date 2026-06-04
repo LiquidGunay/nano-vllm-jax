@@ -23,6 +23,7 @@ def test_parse_args_defaults_set_random_ranges():
     assert args.jax_profile is False
     assert args.jax_warmup_mode == "generic"
     assert args.jax_fail_on_jit_cache_growth is False
+    assert args.max_num_resident_seqs == 0
     assert args.vllm_dtype == ""
     assert sidecar._effective_vllm_dtype(args) == "bfloat16"
     assert args.vllm_num_speculative_tokens == 0
@@ -130,6 +131,8 @@ def test_jax_command_uses_generic_warmup_controls():
             "--jax-warmup-mode",
             "generic",
             "--jax-fail-on-jit-cache-growth",
+            "--max-num-resident-seqs",
+            "16",
         ]
     )
     command = sidecar._build_jax_command(
@@ -143,3 +146,4 @@ def test_jax_command_uses_generic_warmup_controls():
     assert "--fail-on-jit-cache-growth" in command
     assert command[command.index("--prefill-layout") + 1] == "packed"
     assert command[command.index("--prefill-token-buckets") + 1] == args.prefill_buckets
+    assert command[command.index("--max-num-resident-seqs") + 1] == "16"

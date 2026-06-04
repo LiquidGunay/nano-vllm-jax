@@ -157,6 +157,28 @@ runtime:
     assert loaded.engine["decode_padded_gemm_rows"] == 8
 
 
+def test_engine_config_supports_resident_sequence_capacity(tmp_path, monkeypatch):
+    monkeypatch.delenv("NANO_VLLM_JAX_MAX_NUM_RESIDENT_SEQS", raising=False)
+    config = tmp_path / "server_config.yaml"
+    config.write_text(
+        """
+engine:
+  max_num_seqs: 8
+  max_num_resident_seqs: 16
+""".strip()
+    )
+
+    loaded = load_server_config(config)
+
+    assert loaded.engine["max_num_seqs"] == 8
+    assert loaded.engine["max_num_resident_seqs"] == 16
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MAX_NUM_RESIDENT_SEQS", "12")
+    loaded = load_server_config(config)
+
+    assert loaded.engine["max_num_resident_seqs"] == 12
+
+
 def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy():
     overrides = engine_overrides_from_config(
         {

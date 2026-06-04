@@ -70,7 +70,10 @@ class _LegacyModelRunner:
         self.block_size = config.block_size
         
         # Initialize KV cache state
-        max_seqs = getattr(config, 'max_num_seqs', 16)
+        max_seqs = int(
+            getattr(config, "max_num_resident_seqs", None)
+            or getattr(config, "max_num_seqs", 16)
+        )
         kv_spec = KVCacheSpec(
             num_layers=config.num_hidden_layers,
             num_blocks=config.num_kvcache_blocks,
@@ -952,7 +955,10 @@ class CanonicalModelRunner:
         self.executor = ModelExecutor(config, params, self.backend)
         self.block_size = config.block_size
 
-        max_seqs = getattr(config, "max_num_seqs", 16)
+        max_seqs = int(
+            getattr(config, "max_num_resident_seqs", None)
+            or getattr(config, "max_num_seqs", 16)
+        )
         kv_spec = KVCacheSpec(
             num_layers=config.num_hidden_layers,
             num_blocks=config.num_kvcache_blocks,
@@ -1826,7 +1832,7 @@ class CanonicalModelRunner:
         if slot is not None:
             return slot, False
         if not self._free_hybrid_slots:
-            raise RuntimeError("No free hybrid-state slots; max_num_seqs is exhausted")
+            raise RuntimeError("No free hybrid-state slots; max_num_resident_seqs is exhausted")
         if (
             preferred_slot is not None
             and 0 <= preferred_slot < self._max_hybrid_slots

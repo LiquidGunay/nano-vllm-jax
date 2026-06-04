@@ -99,7 +99,11 @@ class LLMEngine:
         )
         self.config.num_kvcache_blocks = cap_num_kv_cache_blocks(kv_spec)
         if self.config.max_blocks_per_seq is None:
-            self.config.max_blocks_per_seq = max(1, self.config.num_kvcache_blocks // self.config.max_num_seqs)
+            resident_capacity = int(
+                getattr(self.config, "max_num_resident_seqs", None)
+                or self.config.max_num_seqs
+            )
+            self.config.max_blocks_per_seq = max(1, self.config.num_kvcache_blocks // resident_capacity)
         
         # Initialize tokenizer
         if not HAS_TRANSFORMERS:

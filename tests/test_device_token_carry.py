@@ -353,6 +353,58 @@ def test_scheduler_decode_block_table_buckets_select_smallest_fit():
     np.testing.assert_array_equal(np.asarray(batch.block_tables[1]), np.asarray([1, 3, 0, 0]))
 
 
+def test_scheduler_resident_capacity_can_exceed_execution_batch():
+    scheduler = Scheduler(
+        Qwen3_5Config(
+            max_num_seqs=2,
+            max_num_resident_seqs=4,
+            max_num_batched_tokens=4,
+            batch_size_buckets=(2,),
+            max_blocks_per_seq=2,
+            num_kvcache_blocks=8,
+            jax_execution="jit",
+        )
+    )
+    seqs = [
+        Sequence(
+            [1 + idx, 11 + idx],
+            SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+            seq_id=idx,
+        )
+        for idx in range(4)
+    ]
+    for seq in seqs:
+        scheduler.add(seq)
+
+    first_prefill_seqs, first_prefill = scheduler.schedule()
+    assert [seq.seq_id for seq in first_prefill_seqs] == [0, 1]
+    assert first_prefill.seq_ids_host == (0, 1)
+    for seq in first_prefill_seqs:
+        seq.num_cached_tokens = seq.num_prompt_tokens
+
+    first_decode_seqs, first_decode = scheduler.schedule()
+    assert [seq.seq_id for seq in first_decode_seqs] == [0, 1]
+    assert first_decode.tokens.shape[0] == 2
+    assert len(scheduler.waiting) == 2
+
+    scheduler.postprocess(first_decode_seqs, [101, 102])
+    assert len(scheduler.running) == 0
+
+    second_prefill_seqs, second_prefill = scheduler.schedule()
+    assert [seq.seq_id for seq in second_prefill_seqs] == [2, 3]
+    assert second_prefill.seq_ids_host == (2, 3)
+    for seq in second_prefill_seqs:
+        seq.num_cached_tokens = seq.num_prompt_tokens
+
+    assert not scheduler.waiting
+    assert len(scheduler.running) == 2
+
+    decode_seqs, decode_batch = scheduler.schedule()
+    assert len(decode_seqs) == 2
+    assert decode_batch.tokens.shape[0] == 2
+    assert len(scheduler.running) == 2
+
+
 def test_scheduler_static_decode_metadata_can_reuse_seq_lens_placeholder(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_METADATA", "1")

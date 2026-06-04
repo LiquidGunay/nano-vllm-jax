@@ -22,6 +22,9 @@ engine:
   max_kv_cache_mb: 64
   num_kvcache_blocks: 8
   max_num_seqs: 1
+  # Resident capacity can be larger than the compiled execution batch cap.
+  # Leave equal for the tiny default server shape.
+  max_num_resident_seqs: 1
   max_num_batched_tokens: 16
   num_speculative_tokens: 0
   greedy_token_fastpath: true

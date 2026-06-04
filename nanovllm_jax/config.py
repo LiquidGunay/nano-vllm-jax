@@ -68,6 +68,7 @@ class Qwen3_5Config:
     
     # Scheduler config
     max_num_seqs: int = 16
+    max_num_resident_seqs: Optional[int] = None
     max_num_batched_tokens: int = 2048
     eos: Optional[int] = None
     prefill_buckets: tuple = field(default_factory=tuple)
@@ -120,6 +121,17 @@ class Qwen3_5Config:
     
     def __post_init__(self):
         """Initialize layer_types if not provided."""
+        max_num_seqs = max(1, int(self.max_num_seqs or 1))
+        object.__setattr__(self, "max_num_seqs", max_num_seqs)
+        resident_raw = self.max_num_resident_seqs
+        if resident_raw is None or int(resident_raw) <= 0:
+            max_num_resident_seqs = max_num_seqs
+        else:
+            max_num_resident_seqs = int(resident_raw)
+        if max_num_resident_seqs < max_num_seqs:
+            raise ValueError("max_num_resident_seqs must be >= max_num_seqs")
+        object.__setattr__(self, "max_num_resident_seqs", max_num_resident_seqs)
+
         for field_name in (
             "prefill_buckets",
             "prefill_token_buckets",
@@ -399,6 +411,9 @@ class Qwen3_5Config:
             "mtp_use_dedicated_embeddings": self.mtp_use_dedicated_embeddings,
             "num_speculative_tokens": self.num_speculative_tokens,
             "max_kv_cache_bytes": self.max_kv_cache_bytes,
+            "max_num_seqs": self.max_num_seqs,
+            "max_num_resident_seqs": self.max_num_resident_seqs,
+            "max_num_batched_tokens": self.max_num_batched_tokens,
             "prefill_buckets": self.prefill_buckets,
             "prefill_token_buckets": self.prefill_token_buckets,
             "prefill_layout": self.prefill_layout,

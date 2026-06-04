@@ -57,6 +57,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-kv-cache-mb", type=int, default=1024)
     parser.add_argument("--num-kvcache-blocks", type=int, default=64)
     parser.add_argument("--max-num-seqs", type=int, default=4)
+    parser.add_argument(
+        "--max-num-resident-seqs",
+        type=int,
+        default=0,
+        help="Resident request capacity; 0 keeps it equal to --max-num-seqs.",
+    )
     parser.add_argument("--max-num-batched-tokens", type=int, default=512)
     parser.add_argument("--prefill-buckets", default="16,32,64,128")
     parser.add_argument("--prefill-token-buckets", default="")
@@ -351,6 +357,9 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "max_kv_cache_bytes": int(args.max_kv_cache_mb * 1024 * 1024),
         "num_kvcache_blocks": args.num_kvcache_blocks,
         "max_num_seqs": args.max_num_seqs,
+        "max_num_resident_seqs": (
+            args.max_num_resident_seqs if args.max_num_resident_seqs > 0 else None
+        ),
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "prefill_buckets": tuple(_parse_ints(args.prefill_buckets)),
         "prefill_token_buckets": (
@@ -547,6 +556,8 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "prefill_buckets": list(engine.config.prefill_buckets),
             "prefill_token_buckets": list(engine.config.prefill_token_buckets),
             "batch_size_buckets": list(engine.config.batch_size_buckets),
+            "max_num_seqs": int(engine.config.max_num_seqs),
+            "max_num_resident_seqs": int(engine.config.max_num_resident_seqs),
             "max_blocks_per_seq": int(engine.config.max_blocks_per_seq),
             "decode_block_table_buckets": list(engine.config.decode_block_table_buckets),
             "linear_chunk_size": int(engine.config.linear_chunk_size),

@@ -92,6 +92,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jax-max-kv-cache-mb", type=int, default=3072)
     parser.add_argument("--jax-num-kvcache-blocks", type=int, default=320)
     parser.add_argument("--max-num-seqs", type=int, default=8)
+    parser.add_argument(
+        "--max-num-resident-seqs",
+        type=int,
+        default=0,
+        help="Resident JAX request capacity; 0 keeps it equal to --max-num-seqs.",
+    )
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--prefill-buckets", default="128,256,512,1024,2048,4096")
     parser.add_argument("--prefill-token-buckets", default="")
@@ -412,6 +418,7 @@ def _build_jax_command(args: argparse.Namespace, manifest_jsonl: Path, output_js
         "max_kv_cache_mb": args.jax_max_kv_cache_mb,
         "num_kvcache_blocks": args.jax_num_kvcache_blocks,
         "max_num_seqs": args.max_num_seqs,
+        "max_num_resident_seqs": args.max_num_resident_seqs,
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "prefill_buckets": args.prefill_buckets,
         "prefill_token_buckets": args.prefill_token_buckets or args.prefill_buckets,
@@ -555,6 +562,7 @@ def _run() -> None:
                 "weight_dtype": args.weight_dtype,
                 "jax_execution": args.jax_execution,
                 "max_num_seqs": args.max_num_seqs,
+                "max_num_resident_seqs": args.max_num_resident_seqs,
                 "max_num_batched_tokens": args.max_num_batched_tokens,
                 "warmup": args.jax_warmup,
                 "warmup_mode": args.jax_warmup_mode,

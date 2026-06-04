@@ -129,11 +129,14 @@ Rules for this lane:
 Next implementation order:
 
 1. Match vLLM's serving ABI more closely:
-   - support resident logical concurrency above the execution batch bucket
-     (`max_num_seqs=8` should not force a second full admission wave for the
-     random lane);
-   - implement chunked prefill plus decode backfill so long prefills and decode
-     steps can share scheduler iterations under generic token buckets;
+   - resident logical concurrency above the execution batch bucket now exists
+     as config/runner groundwork (`max_num_resident_seqs`), but resident-only
+     widening is rejected as a performance route: resident16/B8 regressed to
+     `278.97 output tok/s` because the executor still runs prefill-only or
+     decode-only steps;
+   - implement the missing mixed packed boundary for chunked prefill plus
+     decode backfill so long prefills and decode steps can share scheduler
+     iterations under generic token buckets;
    - keep compile keys expressed as finite serving buckets, not exact request
      shapes.
 2. Make arbitrary-batch decode efficient before widening the serving envelope:

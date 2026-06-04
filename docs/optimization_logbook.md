@@ -9099,3 +9099,53 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - keep the current random branch as the best checkpoint, but do not interpret
     the `0.284x` result as a kernel-only loss. It is exposing a broader ABI and
     serving-policy deficit relative to vLLM.
+
+### Entry 243 - Resident Capacity Groundwork And Rejected Resident-Only Route
+
+- date: 2026-06-04
+- purpose:
+  - start the vLLM-like serving ABI path by separating resident request
+    capacity from compiled execution batch width;
+  - test whether widening resident capacity alone reduces the random workload
+    gap without benchmark-specific warmup.
+- changes:
+  - added `max_num_resident_seqs` to the model config, server config, and random
+    benchmark CLIs. `max_num_seqs` remains the compiled execution batch cap;
+    `None`/`0` keeps old behavior;
+  - widened persistent KV/GDN resident bookkeeping to the resident capacity
+    while keeping warmup keyed to execution buckets;
+  - added a scheduler guard so, when resident capacity exceeds execution
+    capacity, a full ready decode batch is not delayed behind another waiting
+    prefill wave;
+  - added focused tests for resident/execution separation, config/env loading,
+    and random sidecar command forwarding.
+- artifacts:
+  - unguarded resident16/B8 diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_resident16_exec8_r1_20260604.json`;
+  - guarded resident16/B8 diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_resident16_exec8_guard_r2_20260604.json`.
+- result:
+  - previous B8 anchor:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_noprofile_after_driver_fix_20260604.json`,
+    `437.63 output tok/s`, `26.51 s`, mean TTFT `5894 ms`;
+  - unguarded resident16/B8: `263.39 output tok/s`, `44.05 s`, mean TTFT
+    `11619 ms`, zero measured-phase JIT growth (`32 -> 32`);
+  - guarded resident16/B8: `278.97 output tok/s`, `41.59 s`, mean TTFT
+    `10760 ms`, zero measured-phase JIT growth (`32 -> 32`);
+  - fresh vLLM reference remains `1541.89 output tok/s`, so the guarded
+    resident-only route is only `0.181x` vLLM and is worse than the B8 anchor.
+- interpretation:
+  - resident capacity is necessary groundwork, but not sufficient. The current
+    executor ABI still runs prefill-only or decode-only steps, so widening
+    resident admission lets long prompt chunks consume many scheduler steps
+    before useful decode;
+  - the protective decode guard reduces the worst regression but does not
+    restore the B8 anchor, because the system still lacks true mixed
+    chunked-prefill/decode backfill;
+  - do not retry resident-only widening as a performance optimization. The next
+    material step is a mixed packed scheduler/executor boundary where decode
+    rows and bounded prefill chunks can share a warmed serving bucket.
+- validation:
+  - `python -m py_compile nanovllm_jax/config.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/llm_engine.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/chunked_model_runner.py nanovllm_jax/server_config.py benchmarks/benchmark_jax_server_trace.py benchmarks/benchmark_random_request_sidecar.py`;
+  - `pytest -q tests/test_device_token_carry.py tests/test_server_config.py tests/test_benchmark_random_request_sidecar.py tests/test_benchmark_jax_server_trace.py`
+    -> `41 passed`.
