@@ -14,13 +14,21 @@ engine:
   # weight_dtype: null          # defaults to dtype
   jax_execution: "jit"
   prefill_buckets: "16"
+  prefill_token_buckets: "16"
+  prefill_layout: "packed"
   batch_size_buckets: "1"
+  decode_block_table_buckets: "8"
   max_prefill: 16
   max_kv_cache_mb: 64
   num_kvcache_blocks: 8
   max_num_seqs: 1
   max_num_batched_tokens: 16
   num_speculative_tokens: 0
+  greedy_token_fastpath: true
+  device_token_carry: true
+  static_decode_metadata: true
+  static_decode_seq_lens_carry: false
+  greedy_decode_burst_steps: 1
   skip_compile: false
 
 # Runtime knobs applied before JAX init. Env vars in the shell still win.
@@ -30,32 +38,38 @@ runtime:
   xla:
     preallocate: false
     gpu_allocator: "cuda_malloc_async"
-    # autotune_level: 4
+    flags: "--xla_gpu_autotune_level=4 --xla_gpu_enable_triton_gemm=false"
   fastpaths:
-    # device_token_carry: true
-    # greedy_token: true
-    # materialize_tied_lm_head: true
-    # compact_prefill_in_proj_qkv: true
-    # compact_prefill_gdn_z: true
-    # compact_prefill_full_attn_proj: true
-    # compact_prefill_mlp: true
+    # These accepted serving controls are also projected into engine config.
+    device_token_carry: true
+    greedy_token: true
+    materialize_tied_lm_head: true
+    compact_prefill_in_proj_qkv: true
+    compact_prefill_gdn_z: true
+    compact_prefill_full_attn_proj: true
+    compact_prefill_mlp: true
+    compact_prefill_token_count_mode: "bucket"
+    lm_head_decode_act_dtype: "bf16"
+    decode_proj_act_dtype: "bf16"
+    decode_padded_gemm: true
+    decode_padded_gemm_gate_up: true
+    decode_padded_gemm_rows: 8
+    decode_padded_gemm_max_out_dim: 8192
 
 kernels:
   backend: "pure_jax"
   # Local CUDA/JAX FFI code in this repo is probe-only. Leave this false for
   # serving and benchmark configs unless explicitly running diagnostics.
   allow_local_cuda_probes: false
+  full_attention:
+    kv_cache_dtype: "bf16"
   gdn:
-    # disable_fallbacks: true
-    # prefill_post_conv_impl: "triton_fla_padded"
-    # packed_decode:
-    #   impl: "triton_fla"
-    #   qkv_dtype: "bf16"
-    #   pre_normalize_qk: true
-    #   triton:
-    #     num_warps: 8
-    #     num_stages: 2
-    #     block_v: 32
+    disable_fallbacks: true
+    prefill_post_conv_impl: "triton_fla_padded"
+    prefill_block_dot: true
+    packed_decode:
+      impl: "triton_fla_conv_raw_gates"
+      qkv_dtype: "bf16"
 
 # Compatibility escape hatch for raw process env vars. Prefer runtime/kernels.
 env: {}

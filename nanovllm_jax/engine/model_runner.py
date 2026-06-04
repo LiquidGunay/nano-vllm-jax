@@ -18,6 +18,7 @@ from nanovllm_jax.kv_cache import (
     KVCacheSpec,
     cap_num_kv_cache_blocks,
     init_kv_cache, 
+    init_hybrid_state,
     init_linear_attention_states,
     compute_slot_mapping,
 )
@@ -27,14 +28,27 @@ from nanovllm_jax.mtp.speculative import generate_draft_tokens, verify_draft_tok
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
 
 
-def _device_token_carry_enabled() -> bool:
-    return os.environ.get("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "0") in _TRUE_ENV_VALUES
+def _config_or_env_flag(config: Qwen3_5Config | None, attr: str, env_name: str, *, default: bool = False) -> bool:
+    if config is not None and hasattr(config, attr):
+        return bool(getattr(config, attr))
+    return os.environ.get(env_name, "1" if default else "0") in _TRUE_ENV_VALUES
+
+
+def _config_or_env_int(config: Qwen3_5Config | None, attr: str, env_name: str, *, default: int = 0) -> int:
+    env_value = os.environ.get(env_name)
+    if env_value is not None:
+        return int(env_value or default)
+    if config is not None and hasattr(config, attr):
+        return int(getattr(config, attr) or default)
+    return int(default)
 
 
 def _int32_device_vector(value) -> jnp.ndarray:
     """Return a 1D int32 device vector without re-wrapping existing int32 arrays."""
 
     if hasattr(value, "dtype") and getattr(value, "dtype", None) == jnp.dtype(jnp.int32):
+        if getattr(value, "ndim", None) == 1:
+            return value
         return value.reshape(-1)
     return jnp.asarray(value, dtype=jnp.int32).reshape(-1)
 
@@ -52,7 +66,7 @@ class _LegacyModelRunner:
     def __init__(self, config: Qwen3_5Config, params: ModelParams, backend: str = "auto"):
         self.config = config
         self.params = params
-        self.backend = select_backend(backend)
+        self.backend = select_backend(backend, config=config)
         self.block_size = config.block_size
         
         # Initialize KV cache state
@@ -78,7 +92,26 @@ class _LegacyModelRunner:
         if self.max_blocks_per_seq is None:
             self.max_blocks_per_seq = max(1, effective_num_blocks // max_seqs)
             config.max_blocks_per_seq = self.max_blocks_per_seq
+        self.decode_block_table_buckets = tuple(
+            getattr(config, "decode_block_table_buckets", ()) or ()
+        )
         self.execution = getattr(config, "jax_execution", "eager")
+        self.greedy_token_fastpath = _config_or_env_flag(
+            config,
+            "greedy_token_fastpath",
+            "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH",
+            default=True,
+        )
+        self.device_token_carry = _config_or_env_flag(
+            config,
+            "device_token_carry",
+            "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+        )
+        self.static_decode_seq_lens_carry = _config_or_env_flag(
+            config,
+            "static_decode_seq_lens_carry",
+            "NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY",
+        )
         
         self.kv_state = init_kv_cache(
             num_blocks=effective_num_blocks,
@@ -915,7 +948,7 @@ class CanonicalModelRunner:
     def __init__(self, config: Qwen3_5Config, params: ModelParams, backend: str = "auto"):
         self.config = config
         self.params = params
-        self.backend = select_backend(backend)
+        self.backend = select_backend(backend, config=config)
         self.executor = ModelExecutor(config, params, self.backend)
         self.block_size = config.block_size
 
@@ -960,23 +993,21 @@ class CanonicalModelRunner:
         self._max_hybrid_slots = max_seqs
         self._hybrid_slots: Dict[int, int] = {}
         self._free_hybrid_slots: List[int] = list(range(max_seqs))
+        self._zeroed_hybrid_slots: set[int] = set(range(max_seqs))
 
-        self.kv_state = init_kv_cache(
-            num_blocks=effective_num_blocks,
-            block_size=config.block_size,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
-            max_seqs=max_seqs,
-            max_blocks_per_seq=self.max_blocks_per_seq,
-            num_layers=config.num_hidden_layers,
-            dtype=config.get_dtype(),
-            max_kv_cache_bytes=config.max_kv_cache_bytes,
-        )
-        self.kv_state = init_linear_attention_states(
-            cache=self.kv_state,
+        empty_hybrid_state = init_hybrid_state(
             config=config,
             batch_size=1,
             dtype=config.get_dtype(),
+        )
+        self.kv_state = KVCacheState(
+            k_cache=self.cache_storage.k_cache,
+            v_cache=self.cache_storage.v_cache,
+            block_table=jnp.zeros((max_seqs, self.max_blocks_per_seq), dtype=jnp.int32),
+            kv_lens=jnp.zeros(max_seqs, dtype=jnp.int32),
+            slot_mapping=jnp.zeros((max_seqs, 1), dtype=jnp.int32),
+            conv_state=empty_hybrid_state.conv_state,
+            recurrent_state=empty_hybrid_state.recurrent_state,
         )
         self._empty_hybrid_state = self.kv_state.hybrid_state
         self._hybrid_state_table = init_hybrid_state(
@@ -1010,6 +1041,8 @@ class CanonicalModelRunner:
         self._device_token_carry_seq_ids: tuple[int, ...] | None = None
         self._device_token_carry_tokens: jnp.ndarray | None = None
         self._device_token_carry_by_seq_id: dict[int, DeviceTokenRef] = {}
+        self._device_seq_lens_carry_seq_ids: tuple[int, ...] | None = None
+        self._device_seq_lens_carry: jnp.ndarray | None = None
         self._hybrid_slot_ids_device_cache: dict[tuple[int, ...], jnp.ndarray] = {}
         self.reset_speculative_stats()
         self._warmup_compiled = False
@@ -1091,52 +1124,296 @@ class CanonicalModelRunner:
 
     def warmup_compilation(self, max_prefill_len: int = 64, max_batch: int = 1):
         """Compile configured static shapes through the canonical executor path."""
+        def _block_until_ready(value: object) -> None:
+            for leaf in jax.tree_util.tree_leaves(value):
+                ready = getattr(leaf, "block_until_ready", None)
+                if callable(ready):
+                    ready()
+
+        def _cache_entries() -> int | None:
+            cache = getattr(getattr(self, "executor", None), "_jit_cache", None)
+            return len(cache) if cache is not None else None
+
+        summary: dict[str, Any] = {
+            "mode": "generic_bucket_startup",
+            "execution": getattr(self, "execution", "eager"),
+            "prefill_buckets": [],
+            "batch_size_buckets": [],
+            "prefill_runs": [],
+            "prefill_skipped": [],
+            "decode_runs": [],
+            "decode_block_table_buckets": [],
+            "jit_cache_entries_before": _cache_entries(),
+            "jit_cache_entries_after": None,
+            "already_warmed": bool(self._warmup_compiled),
+        }
         if self._warmup_compiled:
-            return
+            summary["jit_cache_entries_after"] = _cache_entries()
+            return summary
         if self.execution not in {"decode-jit", "jit"}:
             self._warmup_compiled = True
-            return
+            summary["jit_cache_entries_after"] = _cache_entries()
+            return summary
 
-        prefill_buckets = tuple(getattr(self.config, "prefill_buckets", ())) or (max_prefill_len,)
+        prefill_buckets = (
+            tuple(getattr(self.config, "prefill_token_buckets", ()))
+            or tuple(getattr(self.config, "prefill_buckets", ()))
+            or (max_prefill_len,)
+        )
         batch_buckets = tuple(getattr(self.config, "batch_size_buckets", ())) or (max_batch,)
+        decode_block_table_buckets = (
+            tuple(getattr(self.config, "decode_block_table_buckets", ()) or ())
+            or (int(self.max_blocks_per_seq),)
+        )
+        summary["prefill_buckets"] = list(prefill_buckets)
+        summary["batch_size_buckets"] = list(batch_buckets)
+        summary["decode_block_table_buckets"] = [int(width) for width in decode_block_table_buckets]
+        row_prefill_buckets = tuple(getattr(self.config, "prefill_buckets", ()) or ())
+        use_greedy_token_fastpath = bool(
+            getattr(
+                self,
+                "greedy_token_fastpath",
+                _config_or_env_flag(
+                    getattr(self, "config", None),
+                    "greedy_token_fastpath",
+                    "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH",
+                    default=True,
+                ),
+            )
+        ) and hasattr(self.executor, "forward_step_token_ids_jit")
+        hybrid_state_table = getattr(self, "_hybrid_state_table", None)
+        use_hybrid_table_decode = (
+            use_greedy_token_fastpath
+            and hybrid_state_table is not None
+            and hybrid_state_table.conv_state is not None
+            and hybrid_state_table.recurrent_state is not None
+            and (
+                hasattr(self.executor, "forward_step_token_ids_table_jit")
+                or hasattr(self.executor, "forward_greedy_decode_burst_table_jit")
+            )
+        )
+        seed_mtp1 = bool(getattr(self, "mtp1_enabled", False))
+        greedy_decode_burst_steps = max(
+            1,
+            _config_or_env_int(
+                getattr(self, "config", None),
+                "greedy_decode_burst_steps",
+                "NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS",
+                default=1,
+            ),
+        )
 
         for prefill_len in prefill_buckets:
             if self.execution != "jit":
                 break
             for batch_size in batch_buckets:
+                dense_prefill_tokens = int(batch_size) * int(prefill_len)
+                max_batched_tokens = int(getattr(self.config, "max_num_batched_tokens", 0) or 0)
+                packed_prefill_layout = (
+                    str(getattr(self.config, "prefill_layout", "packed")).lower()
+                    == "packed"
+                )
+                if (
+                    not packed_prefill_layout
+                    and max_batched_tokens > 0
+                    and dense_prefill_tokens > max_batched_tokens
+                ):
+                    summary["prefill_skipped"].append(
+                        {
+                            "batch_size": int(batch_size),
+                            "query_len": int(prefill_len),
+                            "dense_prefill_tokens": dense_prefill_tokens,
+                            "max_num_batched_tokens": max_batched_tokens,
+                            "reason": "dense_prefill_tokens_exceed_budget",
+                        }
+                    )
+                    continue
+                if packed_prefill_layout and row_prefill_buckets:
+                    max_row_tokens = int(max(row_prefill_buckets))
+                    max_reachable_tokens = int(batch_size) * max_row_tokens
+                    if int(prefill_len) > max_reachable_tokens:
+                        summary["prefill_skipped"].append(
+                            {
+                                "batch_size": int(batch_size),
+                                "query_len": int(prefill_len),
+                                "max_row_tokens": max_row_tokens,
+                                "max_reachable_tokens": max_reachable_tokens,
+                                "reason": "packed_token_bucket_exceeds_row_bucket_capacity",
+                            }
+                        )
+                        continue
                 batch = self._dummy_batch(batch_size=batch_size, query_len=prefill_len, is_prefill=True)
                 hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
-                output = self.executor.forward_step_jit(
-                    batch,
-                    cache_storage=self.cache_storage,
-                    hybrid_state=hybrid_state,
-                    last_logits_only=True,
-                )
-                output.activations.block_until_ready()
+                if use_greedy_token_fastpath and not seed_mtp1:
+                    output = self.executor.forward_step_token_ids_jit(
+                        batch,
+                        cache_storage=self.cache_storage,
+                        hybrid_state=hybrid_state,
+                    )
+                    route = "forward_step_token_ids_jit:prefill"
+                else:
+                    output = self.executor.forward_step_jit(
+                        batch,
+                        cache_storage=self.cache_storage,
+                        hybrid_state=hybrid_state,
+                        return_hidden=seed_mtp1,
+                        return_hidden_with_logits=seed_mtp1,
+                        last_logits_only=True,
+                    )
+                    route = "forward_step_jit:prefill"
+                _block_until_ready(output.activations)
                 self.cache_storage = output.cache_storage
+                summary["prefill_runs"].append(
+                    {
+                        "batch_size": int(batch_size),
+                        "query_len": int(prefill_len),
+                        "tokens_shape": list(batch.tokens.shape),
+                        "num_prefill_tokens": int(batch.num_prefill_tokens),
+                        "route": route,
+                    }
+                )
 
         for batch_size in batch_buckets:
-            batch = self._dummy_batch(batch_size=batch_size, query_len=1, is_prefill=False)
-            hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
-            output = self.executor.forward_step_jit(
-                batch,
-                cache_storage=self.cache_storage,
-                hybrid_state=hybrid_state,
-                last_logits_only=True,
-            )
-            output.activations.block_until_ready()
-            self.cache_storage = output.cache_storage
-            self._sample_fn(
-                jnp.zeros((batch_size, self.config.vocab_size), dtype=jnp.float32),
-                jnp.zeros((batch_size,), dtype=jnp.float32),
-            ).block_until_ready()
-        self._warmup_compiled = True
+            for block_table_width in decode_block_table_buckets:
+                batch = self._dummy_batch(
+                    batch_size=batch_size,
+                    query_len=1,
+                    is_prefill=False,
+                    max_blocks_per_seq=int(block_table_width),
+                )
 
-    def _dummy_batch(self, *, batch_size: int, query_len: int, is_prefill: bool) -> ScheduledBatch:
+                def _record_decode_warmup(output, route: str, decode_steps: int = 1) -> None:
+                    _block_until_ready(output.activations)
+                    self.cache_storage = output.cache_storage
+                    self._sample_fn(
+                        jnp.zeros((batch_size, self.config.vocab_size), dtype=jnp.float32),
+                        jnp.zeros((batch_size,), dtype=jnp.float32),
+                    ).block_until_ready()
+                    summary["decode_runs"].append(
+                        {
+                            "batch_size": int(batch_size),
+                            "tokens_shape": list(batch.tokens.shape),
+                            "block_tables_shape": list(batch.block_tables.shape),
+                            "num_decode_tokens": int(batch.num_decode_tokens),
+                            "route": route,
+                            "decode_steps": int(decode_steps),
+                        }
+                    )
+
+                if (
+                    use_greedy_token_fastpath
+                    and not seed_mtp1
+                    and greedy_decode_burst_steps > 1
+                ):
+                    if use_hybrid_table_decode and hasattr(self.executor, "forward_greedy_decode_burst_table_jit"):
+                        hybrid_slot_ids = jnp.arange(batch_size, dtype=jnp.int32)
+                        output = self.executor.forward_greedy_decode_burst_table_jit(
+                            batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state_table=self._hybrid_state_table,
+                            hybrid_slot_ids=hybrid_slot_ids,
+                            decode_steps=greedy_decode_burst_steps,
+                        )
+                        self._hybrid_state_table = output.hybrid_state
+                        _record_decode_warmup(
+                            output,
+                            "forward_greedy_decode_burst_table_jit:decode",
+                            greedy_decode_burst_steps,
+                        )
+                    elif hasattr(self.executor, "forward_greedy_decode_burst_jit"):
+                        hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
+                        output = self.executor.forward_greedy_decode_burst_jit(
+                            batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state=hybrid_state,
+                            decode_steps=greedy_decode_burst_steps,
+                        )
+                        _record_decode_warmup(
+                            output,
+                            "forward_greedy_decode_burst_jit:decode",
+                            greedy_decode_burst_steps,
+                        )
+                if use_hybrid_table_decode:
+                    hybrid_slot_ids = jnp.arange(batch_size, dtype=jnp.int32)
+                    output = self.executor.forward_step_token_ids_table_jit(
+                        batch,
+                        cache_storage=self.cache_storage,
+                        hybrid_state_table=self._hybrid_state_table,
+                        hybrid_slot_ids=hybrid_slot_ids,
+                    )
+                    self._hybrid_state_table = output.hybrid_state
+                    _record_decode_warmup(output, "forward_step_token_ids_table_jit:decode")
+                else:
+                    hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
+                    if use_greedy_token_fastpath and not seed_mtp1:
+                        output = self.executor.forward_step_token_ids_jit(
+                            batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state=hybrid_state,
+                        )
+                        _record_decode_warmup(output, "forward_step_token_ids_jit:decode")
+                    else:
+                        output = self.executor.forward_step_jit(
+                            batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state=hybrid_state,
+                            return_hidden=seed_mtp1,
+                            return_hidden_with_logits=seed_mtp1,
+                            last_logits_only=True,
+                        )
+                        _record_decode_warmup(output, "forward_step_jit:decode")
+        self._warmup_compiled = True
+        summary["jit_cache_entries_after"] = _cache_entries()
+        return summary
+
+    def _dummy_batch(
+        self,
+        *,
+        batch_size: int,
+        query_len: int,
+        is_prefill: bool,
+        max_blocks_per_seq: int | None = None,
+    ) -> ScheduledBatch:
         block_tables = []
+        num_blocks = max(1, int(getattr(self.config, "num_kvcache_blocks", 1) or 1))
+        block_table_width = int(max_blocks_per_seq or self.max_blocks_per_seq)
         for row in range(batch_size):
-            start = row * self.max_blocks_per_seq
-            block_tables.append(list(range(start, start + self.max_blocks_per_seq)))
+            start = row * block_table_width
+            block_tables.append(
+                [
+                    (start + offset) % num_blocks
+                    for offset in range(block_table_width)
+                ]
+            )
+        if is_prefill and str(getattr(self.config, "prefill_layout", "packed")).lower() == "packed":
+            token_bucket = int(query_len)
+            base = token_bucket // batch_size
+            rem = token_bucket % batch_size
+            query_lens = [base + (1 if row < rem else 0) for row in range(batch_size)]
+            query_start_loc = [0]
+            packed_positions = []
+            token_row_ids = []
+            for row, qlen in enumerate(query_lens):
+                query_start_loc.append(query_start_loc[-1] + qlen)
+                packed_positions.extend(range(qlen))
+                token_row_ids.extend([row] * qlen)
+            return ScheduledBatch(
+                tokens=jnp.zeros((1, token_bucket), dtype=jnp.int32),
+                positions=jnp.array([packed_positions], dtype=jnp.int32),
+                seq_ids=jnp.arange(batch_size, dtype=jnp.int32),
+                query_start_loc=jnp.array(query_start_loc, dtype=jnp.int32),
+                is_prefill=True,
+                num_prefill_tokens=token_bucket,
+                num_decode_tokens=0,
+                block_tables=jnp.array(block_tables, dtype=jnp.int32),
+                seq_lens=jnp.array(query_lens, dtype=jnp.int32),
+                seq_ids_host=tuple(range(batch_size)),
+                query_lens_host=tuple(query_lens),
+                seq_lens_host=tuple(query_lens),
+                packed_prefill=True,
+                token_row_ids=jnp.array([token_row_ids], dtype=jnp.int32),
+            )
+
         query_lens = [query_len if is_prefill else 1] * batch_size
         query_start_loc = [0]
         for qlen in query_lens:
@@ -1166,12 +1443,25 @@ class CanonicalModelRunner:
             self._mtp1_drafts.pop(seq_id, None)
         carry_by_seq_id = getattr(self, "_device_token_carry_by_seq_id", {})
         if carry_by_seq_id and any(seq_id in carry_by_seq_id for seq_id in seq_ids):
-            self._clear_device_token_carry()
+            finished_seq_ids = {int(seq_id) for seq_id in seq_ids}
+            remaining_carry = {
+                int(seq_id): token_ref
+                for seq_id, token_ref in carry_by_seq_id.items()
+                if int(seq_id) not in finished_seq_ids
+            }
+            if remaining_carry:
+                self._device_token_carry_seq_ids = None
+                self._device_token_carry_tokens = None
+                self._device_token_carry_by_seq_id = remaining_carry
+            else:
+                self._clear_device_token_carry()
 
     def _clear_device_token_carry(self) -> None:
         self._device_token_carry_seq_ids = None
         self._device_token_carry_tokens = None
         self._device_token_carry_by_seq_id = {}
+        self._device_seq_lens_carry_seq_ids = None
+        self._device_seq_lens_carry = None
 
     @staticmethod
     def _active_decode_rows_host(batch: ScheduledBatch) -> List[int]:
@@ -1187,7 +1477,17 @@ class CanonicalModelRunner:
         static_decode_metadata = bool(getattr(batch, "uses_static_decode_metadata", False))
         active_rows = self._active_decode_rows_host(batch)
         if (
-            not _device_token_carry_enabled()
+            not bool(
+                getattr(
+                    self,
+                    "device_token_carry",
+                    _config_or_env_flag(
+                        getattr(self, "config", None),
+                        "device_token_carry",
+                        "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+                    ),
+                )
+            )
             or batch.is_prefill
             or not getattr(self, "_device_token_carry_by_seq_id", {})
             or batch.seq_ids_host is None
@@ -1199,19 +1499,38 @@ class CanonicalModelRunner:
 
         carried_seq_ids = getattr(self, "_device_token_carry_seq_ids", None)
         carried_tokens = getattr(self, "_device_token_carry_tokens", None)
+        carried_seq_lens_ids = getattr(self, "_device_seq_lens_carry_seq_ids", None)
+        carried_seq_lens = getattr(self, "_device_seq_lens_carry", None)
+        use_seq_lens_carry = bool(
+            getattr(
+                self,
+                "static_decode_seq_lens_carry",
+                _config_or_env_flag(
+                    getattr(self, "config", None),
+                    "static_decode_seq_lens_carry",
+                    "NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY",
+                ),
+            )
+        )
         tokens = batch.tokens
+        seq_lens = batch.seq_lens
 
         if (
             carried_seq_ids is not None
             and tuple(batch.seq_ids_host) == carried_seq_ids
             and carried_tokens is not None
         ):
-            token_vector = _int32_device_vector(carried_tokens)
-            if token_vector.shape[0] == int(tokens.shape[0]):
-                tokens = token_vector[:, None]
+            token_array = jnp.asarray(carried_tokens, dtype=jnp.int32)
+            if tuple(token_array.shape) == tuple(tokens.shape):
+                tokens = token_array
                 applied = True
             else:
-                applied = False
+                token_vector = _int32_device_vector(token_array)
+                if token_vector.shape[0] == int(tokens.shape[0]):
+                    tokens = jnp.reshape(token_vector, tokens.shape)
+                    applied = True
+                else:
+                    applied = False
         else:
             applied = False
 
@@ -1223,8 +1542,12 @@ class CanonicalModelRunner:
                     if static_decode_metadata and row in active_rows:
                         missing_static_rows.append(row)
                     continue
-                token_vector = _int32_device_vector(token_ref.tokens)
-                tokens = tokens.at[row, 0].set(token_vector[int(token_ref.row)])
+                token_array = jnp.asarray(token_ref.tokens, dtype=jnp.int32)
+                if token_array.ndim == 2 and token_array.shape[1] == 1:
+                    tokens = tokens.at[row, 0].set(token_array[int(token_ref.row), 0])
+                else:
+                    token_vector = _int32_device_vector(token_array)
+                    tokens = tokens.at[row, 0].set(token_vector[int(token_ref.row)])
                 applied = True
         if missing_static_rows:
             raise RuntimeError(
@@ -1235,7 +1558,35 @@ class CanonicalModelRunner:
             if static_decode_metadata:
                 raise RuntimeError("static decode metadata did not apply any device-token carry")
             return batch
-        return replace(batch, tokens=tokens)
+
+        seq_lens_applied = False
+        if use_seq_lens_carry:
+            if (
+                carried_seq_lens_ids is not None
+                and tuple(batch.seq_ids_host) == carried_seq_lens_ids
+                and carried_seq_lens is not None
+            ):
+                seq_lens_vector = _int32_device_vector(carried_seq_lens)
+                if seq_lens_vector.shape[0] == int(seq_lens.shape[0]):
+                    seq_lens = seq_lens_vector
+                    seq_lens_applied = True
+            if not seq_lens_applied and carried_seq_lens is not None and carried_seq_lens_ids is not None:
+                seq_lens_vector = _int32_device_vector(carried_seq_lens)
+                seq_id_to_row = {int(seq_id): row for row, seq_id in enumerate(carried_seq_lens_ids)}
+                for row, seq_id in enumerate(batch.seq_ids_host):
+                    source_row = seq_id_to_row.get(int(seq_id))
+                    if source_row is None:
+                        continue
+                    seq_lens = seq_lens.at[row].set(seq_lens_vector[source_row])
+                    seq_lens_applied = True
+        if (
+            static_decode_metadata
+            and use_seq_lens_carry
+            and not seq_lens_applied
+            and carried_seq_lens is not None
+        ):
+            raise RuntimeError("static decode metadata requires carried device seq_lens")
+        return replace(batch, tokens=tokens, seq_lens=seq_lens)
 
     def _record_device_token_carry(
         self,
@@ -1247,35 +1598,81 @@ class CanonicalModelRunner:
         seqs: List[Sequence],
     ) -> None:
         if (
-            not _device_token_carry_enabled()
+            not bool(
+                getattr(
+                    self,
+                    "device_token_carry",
+                    _config_or_env_flag(
+                        getattr(self, "config", None),
+                        "device_token_carry",
+                        "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+                    ),
+                )
+            )
             or batch.seq_ids_host is None
             or not active_rows
             or any(row >= len(seqs) or seqs[row].temperature != 0 or not seqs[row].ignore_eos for row in active_rows)
-            or (
-                batch.is_prefill
-                and any(
-                    row >= len(prefill_final_flags) or not prefill_final_flags[row]
-                    for row in active_rows
-                )
-            )
         ):
             self._clear_device_token_carry()
             return
+        eligible_rows = active_rows
+        if batch.is_prefill:
+            eligible_rows = [
+                row
+                for row in active_rows
+                if row < len(prefill_final_flags) and prefill_final_flags[row]
+            ]
+            if not eligible_rows:
+                return
         token_ids = token_ids.astype(jnp.int32)
         full_batch_tokens = int(token_ids.shape[0]) == int(batch.tokens.shape[0])
-        carry_by_seq_id: dict[int, DeviceTokenRef] = {}
-        for active_index, row in enumerate(active_rows):
+        active_row_to_token_row = {row: index for index, row in enumerate(active_rows)}
+        carry_by_seq_id: dict[int, DeviceTokenRef] = dict(
+            getattr(self, "_device_token_carry_by_seq_id", {})
+        )
+        new_carry_by_seq_id: dict[int, DeviceTokenRef] = {}
+        for row in eligible_rows:
             seq_id = int(batch.seq_ids_host[row])
             if seq_id < 0:
                 continue
-            token_row = row if full_batch_tokens else active_index
-            carry_by_seq_id[seq_id] = DeviceTokenRef(tokens=token_ids, row=token_row)
-        if not carry_by_seq_id:
-            self._clear_device_token_carry()
+            token_row = row if full_batch_tokens else active_row_to_token_row[row]
+            token_ref = DeviceTokenRef(tokens=token_ids, row=token_row)
+            carry_by_seq_id[seq_id] = token_ref
+            new_carry_by_seq_id[seq_id] = token_ref
+        if not new_carry_by_seq_id:
             return
-        self._device_token_carry_seq_ids = tuple(carry_by_seq_id)
+        self._device_token_carry_seq_ids = tuple(new_carry_by_seq_id)
         self._device_token_carry_tokens = token_ids
         self._device_token_carry_by_seq_id = carry_by_seq_id
+        use_seq_lens_carry = bool(
+            getattr(
+                self,
+                "static_decode_seq_lens_carry",
+                _config_or_env_flag(
+                    getattr(self, "config", None),
+                    "static_decode_seq_lens_carry",
+                    "NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY",
+                ),
+            )
+        )
+        if batch.is_prefill:
+            self._device_seq_lens_carry_seq_ids = None
+            self._device_seq_lens_carry = None
+        elif use_seq_lens_carry:
+            self._device_seq_lens_carry_seq_ids = tuple(int(seq_id) for seq_id in batch.seq_ids_host)
+            if active_rows == list(range(int(batch.tokens.shape[0]))):
+                self._device_seq_lens_carry = batch.seq_lens.astype(jnp.int32) + jnp.asarray(1, dtype=jnp.int32)
+            else:
+                active_mask = jnp.zeros((int(batch.tokens.shape[0]),), dtype=bool)
+                active_mask = active_mask.at[jnp.asarray(active_rows, dtype=jnp.int32)].set(True)
+                self._device_seq_lens_carry = jnp.where(
+                    active_mask,
+                    batch.seq_lens.astype(jnp.int32) + jnp.asarray(1, dtype=jnp.int32),
+                    batch.seq_lens.astype(jnp.int32),
+                )
+        else:
+            self._device_seq_lens_carry_seq_ids = None
+            self._device_seq_lens_carry = None
 
     def _build_scheduled_batch(self, seqs: List[Sequence], is_prefill: bool) -> ScheduledBatch:
         query_tokens: List[List[int]] = []
@@ -1284,13 +1681,22 @@ class CanonicalModelRunner:
         seq_lens: List[int] = []
         query_lens: List[int] = []
 
-        max_blocks = max(1, max(len(seq.block_table) for seq in seqs))
+        actual_max_blocks = max(1, max(len(seq.block_table) for seq in seqs))
+        max_blocks = actual_max_blocks
         if self.max_blocks_per_seq is not None:
-            if max_blocks > self.max_blocks_per_seq:
+            if actual_max_blocks > self.max_blocks_per_seq:
                 raise ValueError(
-                    f"scheduled block table needs {max_blocks} blocks but bucket has {self.max_blocks_per_seq}"
+                    f"scheduled block table needs {actual_max_blocks} blocks but bucket has {self.max_blocks_per_seq}"
                 )
             max_blocks = self.max_blocks_per_seq
+        if not is_prefill:
+            decode_block_table_buckets = tuple(getattr(self.config, "decode_block_table_buckets", ()) or ())
+            if decode_block_table_buckets:
+                max_blocks = self._select_bucket(actual_max_blocks, decode_block_table_buckets, "decode block table")
+                if self.max_blocks_per_seq is not None and max_blocks > self.max_blocks_per_seq:
+                    raise ValueError(
+                        f"decode block table bucket {max_blocks} exceeds max_blocks_per_seq {self.max_blocks_per_seq}"
+                    )
         for seq in seqs:
             if is_prefill:
                 start = seq.num_cached_tokens
@@ -1355,20 +1761,63 @@ class CanonicalModelRunner:
         raise ValueError(f"{name} size {size} exceeds configured buckets {buckets}")
 
     def _zero_hybrid_slot(self, slot: int):
-        if slot < 0:
+        self._zero_hybrid_slots([slot])
+
+    def _zero_hybrid_slots(self, slots: List[int] | Tuple[int, ...]):
+        slots = tuple(int(slot) for slot in slots if int(slot) >= 0)
+        if not slots:
             return
-        self._hybrid_state_table = HybridLayerState(
-            conv_state=self._hybrid_state_table.conv_state.at[slot].set(
-                jnp.zeros_like(self._hybrid_state_table.conv_state[slot])
-            )
-            if self._hybrid_state_table.conv_state is not None
-            else None,
-            recurrent_state=self._hybrid_state_table.recurrent_state.at[slot].set(
-                jnp.zeros_like(self._hybrid_state_table.recurrent_state[slot])
-            )
-            if self._hybrid_state_table.recurrent_state is not None
-            else None,
+        if not hasattr(self, "_zeroed_hybrid_slots"):
+            self._zeroed_hybrid_slots = set()
+        slots_to_zero = tuple(
+            slot for slot in slots if slot not in self._zeroed_hybrid_slots
         )
+        if not slots_to_zero:
+            return
+        conv_state = self._hybrid_state_table.conv_state
+        recurrent_state = self._hybrid_state_table.recurrent_state
+        if (
+            conv_state is not None
+            and recurrent_state is not None
+            and len(slots_to_zero) == int(conv_state.shape[0])
+            and slots_to_zero == tuple(range(int(conv_state.shape[0])))
+        ):
+            next_conv_state = jnp.zeros_like(conv_state)
+            next_recurrent_state = jnp.zeros_like(recurrent_state)
+        else:
+            slot_ids = jnp.asarray(slots_to_zero, dtype=jnp.int32)
+            next_conv_state = (
+                conv_state.at[slot_ids].set(
+                    jnp.zeros(
+                        (len(slots_to_zero),) + conv_state.shape[1:],
+                        dtype=conv_state.dtype,
+                    )
+                )
+                if conv_state is not None
+                else None
+            )
+            next_recurrent_state = (
+                recurrent_state.at[slot_ids].set(
+                    jnp.zeros(
+                        (len(slots_to_zero),) + recurrent_state.shape[1:],
+                        dtype=recurrent_state.dtype,
+                    )
+                )
+                if recurrent_state is not None
+                else None
+            )
+        self._hybrid_state_table = HybridLayerState(
+            conv_state=next_conv_state,
+            recurrent_state=next_recurrent_state,
+        )
+        self._zeroed_hybrid_slots.update(slots_to_zero)
+
+    def _mark_hybrid_slots_written(self, slots: List[int] | Tuple[int, ...]):
+        if not hasattr(self, "_zeroed_hybrid_slots"):
+            self._zeroed_hybrid_slots = set()
+        for slot in slots:
+            if int(slot) >= 0:
+                self._zeroed_hybrid_slots.discard(int(slot))
 
     def _assign_hybrid_slot(self, seq_id: int, preferred_slot: int | None = None) -> tuple[int, bool]:
         if seq_id < 0:
@@ -1396,7 +1845,7 @@ class CanonicalModelRunner:
     def _ensure_hybrid_slot(self, seq_id: int, preferred_slot: int | None = None) -> int:
         slot, allocated = self._assign_hybrid_slot(seq_id, preferred_slot=preferred_slot)
         if allocated:
-            self._zero_hybrid_slot(slot)
+            self._zero_hybrid_slots([slot])
         return slot
 
     def _get_hybrid_state(self, seq_id: int) -> HybridLayerState:
@@ -1554,7 +2003,18 @@ class CanonicalModelRunner:
         ]
         slot_values = [slot for slot, _ in slot_allocations]
         newly_allocated = [allocated for _, allocated in slot_allocations]
+        self._zero_hybrid_slots(
+            [slot for slot, allocated in slot_allocations if allocated]
+        )
         batch.hybrid_slot_ids_host = tuple(slot_values)
+        if (
+            self._hybrid_state_table.conv_state is not None
+            and self._hybrid_state_table.recurrent_state is not None
+            and len(slot_values) == self._hybrid_state_table.conv_state.shape[0]
+            and slot_values == list(range(len(slot_values)))
+            and all(newly_allocated)
+        ):
+            return self._hybrid_state_table
         if (
             self._hybrid_state_table.conv_state is not None
             and self._hybrid_state_table.recurrent_state is not None
@@ -1621,6 +2081,7 @@ class CanonicalModelRunner:
             and slot_values == list(range(len(slot_values)))
         ):
             self._hybrid_state_table = state
+            self._mark_hybrid_slots_written(slot_values)
             return
         row_ids = jnp.array(valid_rows, dtype=jnp.int32)
         slot_ids = jnp.array(slot_values, dtype=jnp.int32)
@@ -1632,6 +2093,7 @@ class CanonicalModelRunner:
             if self._hybrid_state_table.recurrent_state is not None and state.recurrent_state is not None
                 else self._hybrid_state_table.recurrent_state,
         )
+        self._mark_hybrid_slots_written(slot_values)
 
     def _batch_hybrid_slot_ids(self, batch: ScheduledBatch) -> jnp.ndarray:
         """Assign hybrid slots for a batch without gathering the state table."""
@@ -1645,7 +2107,7 @@ class CanonicalModelRunner:
         for row, seq_id in enumerate(seq_ids):
             slot, allocated = self._assign_hybrid_slot(int(seq_id), preferred_slot=row)
             if allocated:
-                self._zero_hybrid_slot(slot)
+                self._zero_hybrid_slots([slot])
             slot_values.append(slot)
         batch.hybrid_slot_ids_host = tuple(slot_values)
         slot_key = tuple(slot_values)
@@ -1671,6 +2133,13 @@ class CanonicalModelRunner:
             query_start_loc=batch.query_start_loc,
             num_prefill_tokens=batch.num_prefill_tokens,
             num_decode_tokens=batch.num_decode_tokens,
+            token_row_ids=batch.token_row_ids if batch.packed_prefill else None,
+            max_query_len=(
+                max(tuple(getattr(self.config, "prefill_buckets", ()) or ()))
+                if batch.packed_prefill
+                and tuple(getattr(self.config, "prefill_buckets", ()) or ())
+                else None
+            ),
         )
         self.kv_state = KVCacheState(
             k_cache=self.cache_storage.k_cache,
@@ -1717,7 +2186,18 @@ class CanonicalModelRunner:
     def _can_use_greedy_token_fastpath(self, seqs: List[Sequence], batch: ScheduledBatch, *, seed_mtp1: bool) -> bool:
         if seed_mtp1:
             return False
-        if os.environ.get("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH", "0") not in {"1", "true", "yes", "on", "True"}:
+        if not bool(
+            getattr(
+                self,
+                "greedy_token_fastpath",
+                _config_or_env_flag(
+                    getattr(self, "config", None),
+                    "greedy_token_fastpath",
+                    "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH",
+                    default=True,
+                ),
+            )
+        ):
             return False
         execution = getattr(self, "execution", "eager")
         if execution != "jit" and not (execution == "decode-jit" and not batch.is_prefill):
@@ -1732,15 +2212,16 @@ class CanonicalModelRunner:
     def _greedy_decode_burst_steps(self, seqs: List[Sequence], batch: ScheduledBatch) -> int:
         if batch.is_prefill:
             return 1
-        if os.environ.get("NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS", "1") in {
-            "",
-            "0",
-            "1",
-            "false",
-            "no",
-            "off",
-            "False",
-        }:
+        configured_steps = max(
+            1,
+            _config_or_env_int(
+                getattr(self, "config", None),
+                "greedy_decode_burst_steps",
+                "NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS",
+                default=1,
+            ),
+        )
+        if configured_steps <= 1:
             return 1
         if not hasattr(self.executor, "forward_greedy_decode_burst_jit"):
             return 1
@@ -1756,7 +2237,14 @@ class CanonicalModelRunner:
         remaining = [seq.max_tokens - seq.num_completion_tokens for seq in seqs]
         if not remaining or min(remaining) <= 1:
             return 1
-        return max(1, min(int(getattr(batch, "decode_step_count_host", 1)), min(remaining)))
+        return max(
+            1,
+            min(
+                configured_steps,
+                int(getattr(batch, "decode_step_count_host", 1)),
+                min(remaining),
+            ),
+        )
 
     def _mtp1_verifier_step_fn(self):
         if getattr(self, "execution", "eager") in {"decode-jit", "jit"}:
@@ -1998,8 +2486,6 @@ class CanonicalModelRunner:
                 prefill_final_flags.extend([True] * (len(seqs) - len(prefill_final_flags)))
         else:
             prefill_final_flags = [True] * len(seqs)
-        batch = self._maybe_apply_device_token_carry(batch)
-
         return_hidden_for_seed = bool(seed_mtp1)
         use_greedy_token_fastpath = self._can_use_greedy_token_fastpath(
             seqs,
@@ -2011,13 +2497,19 @@ class CanonicalModelRunner:
             if use_greedy_token_fastpath
             else 1
         )
+        batch = self._maybe_apply_device_token_carry(batch)
         use_hybrid_table_decode = (
             use_greedy_token_fastpath
             and not batch.is_prefill
-            and decode_burst_steps <= 1
             and self._hybrid_state_table.conv_state is not None
             and self._hybrid_state_table.recurrent_state is not None
-            and hasattr(self.executor, "forward_step_token_ids_table_jit")
+            and (
+                (decode_burst_steps <= 1 and hasattr(self.executor, "forward_step_token_ids_table_jit"))
+                or (
+                    decode_burst_steps > 1
+                    and hasattr(self.executor, "forward_greedy_decode_burst_table_jit")
+                )
+            )
         )
         if use_hybrid_table_decode:
             hybrid_slot_ids = self._batch_hybrid_slot_ids(batch)
@@ -2026,12 +2518,21 @@ class CanonicalModelRunner:
             hybrid_slot_ids = None
             hybrid_state = self._batch_hybrid_state(batch)
         if decode_burst_steps > 1:
-            output = self.executor.forward_greedy_decode_burst_jit(
-                batch,
-                cache_storage=self.cache_storage,
-                hybrid_state=hybrid_state,
-                decode_steps=decode_burst_steps,
-            )
+            if use_hybrid_table_decode:
+                output = self.executor.forward_greedy_decode_burst_table_jit(
+                    batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state_table=hybrid_state,
+                    hybrid_slot_ids=hybrid_slot_ids,
+                    decode_steps=decode_burst_steps,
+                )
+            else:
+                output = self.executor.forward_greedy_decode_burst_jit(
+                    batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state=hybrid_state,
+                    decode_steps=decode_burst_steps,
+                )
         elif use_greedy_token_fastpath:
             if use_hybrid_table_decode:
                 output = self.executor.forward_step_token_ids_table_jit(
@@ -2058,6 +2559,7 @@ class CanonicalModelRunner:
         self.cache_storage = output.cache_storage
         if use_hybrid_table_decode:
             self._hybrid_state_table = output.hybrid_state
+            self._mark_hybrid_slots_written(list(batch.hybrid_slot_ids_host or ()))
         else:
             self._store_batch_hybrid_state(batch, output.hybrid_state)
         snapshot_batch = batch
@@ -2092,7 +2594,9 @@ class CanonicalModelRunner:
             token_ids_all = output.activations[: len(seqs), :decode_burst_steps]
             last_logits = None
         elif use_greedy_token_fastpath:
-            token_ids_all = output.activations[: len(seqs)]
+            token_ids_all = output.activations
+            if int(token_ids_all.shape[0]) != len(seqs):
+                token_ids_all = token_ids_all[: len(seqs)]
             last_logits = None
         elif return_hidden_for_seed:
             hidden_activations, logits = output.activations
@@ -2114,10 +2618,33 @@ class CanonicalModelRunner:
             for row, query_len in enumerate(query_lens)
             if query_len > 0 and seq_ids_host[row] >= 0
         ]
+        carry_device_tokens = (
+            use_greedy_token_fastpath
+            and bool(
+                getattr(
+                    self,
+                    "device_token_carry",
+                    _config_or_env_flag(
+                        getattr(self, "config", None),
+                        "device_token_carry",
+                        "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+                    ),
+                )
+            )
+            and all(seqs[row].ignore_eos for row in active_rows)
+        )
         if use_greedy_token_fastpath and decode_burst_steps <= 1:
             self._record_device_token_carry(
                 batch,
                 output.activations,
+                active_rows=active_rows,
+                prefill_final_flags=prefill_final_flags,
+                seqs=seqs,
+            )
+        elif use_greedy_token_fastpath and decode_burst_steps > 1 and carry_device_tokens:
+            self._record_device_token_carry(
+                snapshot_batch,
+                output.activations[:, -1:],
                 active_rows=active_rows,
                 prefill_final_flags=prefill_final_flags,
                 seqs=seqs,
@@ -2140,10 +2667,20 @@ class CanonicalModelRunner:
                 token_rows = token_ids_all
                 if active_rows != list(range(len(seqs))):
                     token_rows = token_rows[jnp.array(active_rows, dtype=jnp.int32)]
-                token_list_by_row = {
-                    row: [int(token_id) for token_id in token_row]
-                    for row, token_row in zip(active_rows, token_rows.tolist())
-                }
+                if carry_device_tokens:
+                    burst_width = int(token_rows.shape[1])
+                    token_list_by_row = {
+                        row: [
+                            DeviceTokenRef(tokens=token_rows, row=index * burst_width + step)
+                            for step in range(burst_width)
+                        ]
+                        for index, row in enumerate(active_rows)
+                    }
+                else:
+                    token_list_by_row = {
+                        row: [int(token_id) for token_id in token_row]
+                        for row, token_row in zip(active_rows, token_rows.tolist())
+                    }
             elif use_greedy_token_fastpath:
                 if active_rows == list(range(len(seqs))):
                     token_ids = token_ids_all
@@ -2154,20 +2691,20 @@ class CanonicalModelRunner:
                 temperatures = jnp.array([seqs[row].temperature for row in active_rows], dtype=jnp.float32)
                 token_ids = self._sample_fn(last_logits[active_idx], temperatures)
             if decode_burst_steps <= 1:
-                carry_device_tokens = (
-                    use_greedy_token_fastpath
-                    and _device_token_carry_enabled()
-                    and all(seqs[row].ignore_eos for row in active_rows)
-                )
                 if carry_device_tokens:
                     token_by_row = {
                         row: DeviceTokenRef(tokens=token_ids, row=index)
                         for index, row in enumerate(active_rows)
                     }
                 else:
+                    host_token_ids = (
+                        token_ids[:, 0]
+                        if getattr(token_ids, "ndim", 0) == 2 and int(token_ids.shape[1]) == 1
+                        else token_ids
+                    )
                     token_by_row = {
                         row: int(token_id)
-                        for row, token_id in zip(active_rows, token_ids.tolist())
+                        for row, token_id in zip(active_rows, host_token_ids.tolist())
                     }
 
         outputs: List[int | List[int]] = []
@@ -3838,7 +4375,7 @@ class CanonicalModelRunner:
                 raise ValueError("Either is_prefill or batch must be provided")
             batch = self._build_scheduled_batch(seqs, is_prefill=is_prefill)
 
-        seed_mtp1 = True
+        seed_mtp1 = bool(self.mtp1_enabled)
         force_commit_select = os.environ.get("NANO_VLLM_JAX_MTP_COMMIT_SELECT", "0") in {
             "1",
             "true",
@@ -3874,7 +4411,7 @@ class CanonicalModelRunner:
             # this to verifier shape policy; bucket-padded or heterogeneous
             # final prefill rows still need initial drafts for the following
             # decode step to exercise scheduler-owned MTP admission.
-            seed_mtp1 = any(prefill_final_flags)
+            seed_mtp1 = bool(self.mtp1_enabled and any(prefill_final_flags))
             if os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_PREFILL_SEED", "0") in {
                 "1",
                 "true",

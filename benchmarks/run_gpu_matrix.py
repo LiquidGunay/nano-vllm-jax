@@ -28,7 +28,7 @@ except ValueError:
     pass
 sys.path.insert(0, str(REPO_ROOT))
 from benchmarks.summarize_gpu_matrix import render_markdown
-from nanovllm_jax.server_config import runtime_env_from_config
+from nanovllm_jax.server_config import engine_overrides_from_config, runtime_env_from_config
 
 CONFIG_DIR = REPO_ROOT / "benchmarks" / "configs"
 RESULTS_DIR = REPO_ROOT / "results"
@@ -493,6 +493,13 @@ def _append_cli_arg(command: list[str], key: str, value: Any) -> None:
             command.append("--warmup" if value else "--no-warmup")
         elif key == "profile":
             command.append("--profile" if value else "--no-profile")
+        elif key in {
+            "greedy_token_fastpath",
+            "device_token_carry",
+            "static_decode_metadata",
+            "static_decode_seq_lens_carry",
+        }:
+            command.append(flag if value else f"--no-{flag[2:]}")
         elif value:
             command.append(flag)
         return
@@ -506,7 +513,8 @@ def _effective_jax_args(
     workload: Workload,
     jax_execution_override: str,
 ) -> dict[str, Any]:
-    args = dict(config.get("args", {}))
+    args = engine_overrides_from_config(config)
+    args.update(config.get("args", {}))
     args.update(workload.arg_overrides)
     if jax_execution_override:
         args["jax_execution"] = jax_execution_override
@@ -738,8 +746,10 @@ def _metric_summary(path: Path) -> dict[str, Any]:
         },
         "performance": {
             "tokens_per_second": performance.get("tokens_per_second"),
+            "token_event_tokens_per_second": performance.get("token_event_tokens_per_second"),
             "request_throughput": performance.get("request_throughput"),
             "output_token_throughput": performance.get("output_token_throughput"),
+            "token_event_output_token_throughput": performance.get("token_event_output_token_throughput"),
             "total_token_throughput": performance.get("total_token_throughput"),
             "total_input_tokens": performance.get("total_input_tokens"),
             "total_output_tokens": performance.get("total_output_tokens"),
@@ -749,6 +759,8 @@ def _metric_summary(path: Path) -> dict[str, Any]:
             "itl_ms_p95": performance.get("itl_ms_p95"),
             "generated_tokens": performance.get("generated_tokens"),
             "seconds": performance.get("seconds"),
+            "last_token_elapsed_seconds": performance.get("last_token_elapsed_seconds"),
+            "post_last_token_drain_seconds": performance.get("post_last_token_drain_seconds"),
         },
         "correctness": {
             "checked": correctness.get("checked"),
@@ -852,11 +864,23 @@ def _aggregate_repeats(repeats: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "repeat_count": len(repeats),
         "tokens_per_second_median": _median([row.get("tokens_per_second") for row in perf_rows]),
+        "token_event_tokens_per_second_median": _median(
+            [row.get("token_event_tokens_per_second") for row in perf_rows]
+        ),
         "request_throughput_median": _median([row.get("request_throughput") for row in perf_rows]),
         "output_token_throughput_median": _median([row.get("output_token_throughput") for row in perf_rows]),
+        "token_event_output_token_throughput_median": _median(
+            [row.get("token_event_output_token_throughput") for row in perf_rows]
+        ),
         "total_token_throughput_median": _median([row.get("total_token_throughput") for row in perf_rows]),
         "total_input_tokens_median": _median([row.get("total_input_tokens") for row in perf_rows]),
         "total_output_tokens_median": _median([row.get("total_output_tokens") for row in perf_rows]),
+        "last_token_elapsed_seconds_median": _median(
+            [row.get("last_token_elapsed_seconds") for row in perf_rows]
+        ),
+        "post_last_token_drain_seconds_median": _median(
+            [row.get("post_last_token_drain_seconds") for row in perf_rows]
+        ),
         "ttft_ms_p50_median": _median([row.get("ttft_ms_p50") for row in perf_rows]),
         "ttft_ms_p95_median": _median([row.get("ttft_ms_p95") for row in perf_rows]),
         "itl_ms_p50_median": _median([row.get("itl_ms_p50") for row in perf_rows]),
@@ -1199,11 +1223,17 @@ def _comparison_summary(
     )
     return {
         "jax_tokens_per_second_median": jax_tps,
+        "jax_token_event_tokens_per_second_median": aggregate.get(
+            "token_event_tokens_per_second_median"
+        ),
         "vllm_tokens_per_second": vllm_tps,
         "jax_over_vllm_throughput": (jax_tps / vllm_tps) if jax_tps and vllm_tps else None,
         "jax_request_throughput_median": aggregate.get("request_throughput_median"),
         "vllm_request_throughput": vllm_performance.get("request_throughput"),
         "jax_output_token_throughput_median": aggregate.get("output_token_throughput_median"),
+        "jax_token_event_output_token_throughput_median": aggregate.get(
+            "token_event_output_token_throughput_median"
+        ),
         "vllm_output_token_throughput": vllm_performance.get("output_token_throughput"),
         "jax_total_token_throughput_median": aggregate.get("total_token_throughput_median"),
         "vllm_total_token_throughput": vllm_performance.get("total_token_throughput"),
@@ -1215,6 +1245,12 @@ def _comparison_summary(
         "target_tokens_per_second": target_tps,
         "tokens_per_second_gap_to_target": gap_tps,
         "required_jax_speedup_to_target": required_speedup,
+        "jax_last_token_elapsed_seconds_median": aggregate.get(
+            "last_token_elapsed_seconds_median"
+        ),
+        "jax_post_last_token_drain_seconds_median": aggregate.get(
+            "post_last_token_drain_seconds_median"
+        ),
         "ttft_ms_p50_delta_vs_vllm": (jax_ttft - vllm_ttft) if jax_ttft is not None and vllm_ttft is not None else None,
         "itl_ms_p50_delta_vs_vllm": (jax_itl - vllm_itl) if jax_itl is not None and vllm_itl is not None else None,
         "vllm_reference_source": vllm_source,

@@ -31,7 +31,9 @@ from nanovllm_jax.kv_cache import (
     init_full_attention_nhd_kv_cache,
     paged_attention,
     paged_attention_prefill,
+    paged_attention_prefill_packed,
     paged_attention_decode,
+    compute_packed_slot_mapping,
     update_kv_cache,
 )
 
@@ -42,6 +44,7 @@ _ALLOW_LOCAL_CUDA_PROBES_ENV = "NANO_VLLM_JAX_ALLOW_LOCAL_CUDA_PROBES"
 _CUDA_FP32_KV_APPEND_ENV = "NANO_VLLM_JAX_CUDA_FP32_KV_APPEND"
 _CUDA_FP32_DECODE_ATTN_ENV = "NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"
 _CUDA_FP32_GDN_DECODE_ENV = "NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE"
+_FULL_ATTN_KV_CACHE_DTYPE_ENV = "NANO_VLLM_JAX_FULL_ATTN_KV_CACHE_DTYPE"
 _GDN_PACKED_DECODE_IMPL_ENV = "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL"
 _GDN_PACKED_DECODE_PRENORMALIZE_QK_ENV = (
     "NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK"
@@ -59,15 +62,72 @@ _GDN_DISABLE_FALLBACKS_ENV = "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS"
 _OFF_ENV_VALUES = {"", "0", "false", "no", "off", "none", "False"}
 
 
-def _gdn_disable_fallbacks() -> bool:
-    return (
-        os.environ.get(_GDN_DISABLE_FALLBACKS_ENV, "0").strip().lower()
-        in _TRUE_ENV_VALUES
+def _config_or_env_bool(config, attr: str, env_name: str, *, default: bool = False) -> bool:
+    env_value = os.environ.get(env_name)
+    if env_value is not None:
+        return env_value.strip().lower() in _TRUE_ENV_VALUES
+    if config is not None and hasattr(config, attr):
+        return bool(getattr(config, attr))
+    return default
+
+
+def _config_or_env_str(config, attr: str, env_name: str, *, default: str) -> str:
+    env_value = os.environ.get(env_name)
+    if env_value is not None:
+        return env_value.strip().lower()
+    if config is not None and hasattr(config, attr):
+        return str(getattr(config, attr) or default).strip().lower()
+    return default
+
+
+def _config_or_env_int_or_none(config, attr: str, env_name: str) -> int | None:
+    env_value = os.environ.get(env_name)
+    if env_value is not None:
+        value = env_value.strip()
+        if not value:
+            return None
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    if config is not None and hasattr(config, attr):
+        value = getattr(config, attr)
+        if value is None:
+            return None
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _full_attention_kv_cache_dtype(default_dtype, config=None):
+    value = _config_or_env_str(
+        config,
+        "full_attention_kv_cache_dtype",
+        _FULL_ATTN_KV_CACHE_DTYPE_ENV,
+        default="default",
+    )
+    if value == "default" or value in _OFF_ENV_VALUES:
+        return default_dtype
+    if value in {"bf16", "bfloat16"}:
+        return jnp.bfloat16
+    if value in {"fp16", "float16"}:
+        return jnp.float16
+    if value in {"fp32", "float32"}:
+        return jnp.float32
+    raise ValueError(
+        f"Unknown {_FULL_ATTN_KV_CACHE_DTYPE_ENV}={value!r}; "
+        "expected fp32, bf16, fp16, default, or off"
     )
 
 
-def _raise_if_gdn_fallback_disabled(reason: str) -> None:
-    if _gdn_disable_fallbacks():
+def _gdn_disable_fallbacks(config=None) -> bool:
+    return _config_or_env_bool(
+        config,
+        "gdn_disable_fallbacks",
+        _GDN_DISABLE_FALLBACKS_ENV,
+    )
+
+
+def _raise_if_gdn_fallback_disabled(reason: str, config=None) -> None:
+    if _gdn_disable_fallbacks(config):
         raise RuntimeError(
             f"{reason}; implicit GDN kernel fallbacks are disabled by "
             f"{_GDN_DISABLE_FALLBACKS_ENV}=1"
@@ -91,8 +151,13 @@ def _require_local_cuda_probe_opt_in(reason: str) -> None:
         )
 
 
-def _gdn_packed_decode_impl() -> str:
-    value = os.environ.get(_GDN_PACKED_DECODE_IMPL_ENV, "off").strip()
+def _gdn_packed_decode_impl(config=None) -> str:
+    value = _config_or_env_str(
+        config,
+        "gdn_packed_decode_impl",
+        _GDN_PACKED_DECODE_IMPL_ENV,
+        default="off",
+    )
     if value in _TRUE_ENV_VALUES:
         return "cuda_fp32"
     normalized = value.lower()
@@ -125,24 +190,29 @@ def _gdn_packed_decode_impl() -> str:
     )
 
 
-def gdn_packed_decode_enabled() -> bool:
-    return _gdn_packed_decode_impl() != "off"
+def gdn_packed_decode_enabled(config=None) -> bool:
+    return _gdn_packed_decode_impl(config) != "off"
 
 
-def gdn_packed_decode_conv_enabled() -> bool:
-    return _gdn_packed_decode_impl() == "triton_fla_conv_raw_gates"
+def gdn_packed_decode_conv_enabled(config=None) -> bool:
+    return _gdn_packed_decode_impl(config) == "triton_fla_conv_raw_gates"
 
 
-def gdn_packed_decode_max_batch() -> int | None:
-    value = os.environ.get(_GDN_PACKED_DECODE_MAX_BATCH_ENV, "").strip()
-    if not value:
-        return None
-    max_batch = int(value)
-    return max_batch if max_batch > 0 else None
+def gdn_packed_decode_max_batch(config=None) -> int | None:
+    return _config_or_env_int_or_none(
+        config,
+        "gdn_packed_decode_max_batch",
+        _GDN_PACKED_DECODE_MAX_BATCH_ENV,
+    )
 
 
-def _gdn_prefill_post_conv_impl() -> str:
-    value = os.environ.get(_GDN_PREFILL_POST_CONV_IMPL_ENV, "off").strip()
+def _gdn_prefill_post_conv_impl(config=None) -> str:
+    value = _config_or_env_str(
+        config,
+        "gdn_prefill_post_conv_impl",
+        _GDN_PREFILL_POST_CONV_IMPL_ENV,
+        default="off",
+    )
     if value in _TRUE_ENV_VALUES:
         return "reference"
     normalized = value.lower()
@@ -210,8 +280,8 @@ def _gdn_prefill_post_conv_impl() -> str:
     )
 
 
-def gdn_prefill_post_conv_enabled() -> bool:
-    return _gdn_prefill_post_conv_impl() != "off"
+def gdn_prefill_post_conv_enabled(config=None) -> bool:
+    return _gdn_prefill_post_conv_impl(config) != "off"
 
 
 def _normalize_gdn_prefill_dtype(value: str, env_name: str) -> str:
@@ -223,40 +293,51 @@ def _normalize_gdn_prefill_dtype(value: str, env_name: str) -> str:
     raise ValueError(f"Unknown {env_name}={value!r}; expected fp32 or bf16")
 
 
-def _gdn_prefill_qkv_activation_dtype() -> str:
+def _gdn_prefill_qkv_activation_dtype(config=None) -> str:
     value = os.environ.get(_GDN_PREFILL_QKV_DTYPE_ENV)
     env_name = _GDN_PREFILL_QKV_DTYPE_ENV
     if value is None:
-        value = os.environ.get(_GDN_PREFILL_ACT_DTYPE_ENV, "fp32")
+        value = os.environ.get(_GDN_PREFILL_ACT_DTYPE_ENV)
         env_name = _GDN_PREFILL_ACT_DTYPE_ENV
-    return _normalize_gdn_prefill_dtype(value.strip(), env_name)
+    if value is None and config is not None and hasattr(config, "gdn_prefill_qkv_dtype"):
+        value = getattr(config, "gdn_prefill_qkv_dtype")
+        env_name = "gdn_prefill_qkv_dtype"
+    if value is None:
+        value = "fp32"
+    return _normalize_gdn_prefill_dtype(str(value).strip(), env_name)
 
 
-def _gdn_packed_decode_qkv_activation_dtype() -> str:
-    value = os.environ.get(_GDN_PACKED_DECODE_QKV_DTYPE_ENV, "fp32").strip()
+def _gdn_packed_decode_qkv_activation_dtype(config=None) -> str:
+    value = _config_or_env_str(
+        config,
+        "gdn_packed_decode_qkv_dtype",
+        _GDN_PACKED_DECODE_QKV_DTYPE_ENV,
+        default="fp32",
+    )
     return _normalize_gdn_prefill_dtype(value, _GDN_PACKED_DECODE_QKV_DTYPE_ENV)
 
 
-def _gdn_prefill_activation_dtype() -> str:
-    return _gdn_prefill_qkv_activation_dtype()
+def _gdn_prefill_activation_dtype(config=None) -> str:
+    return _gdn_prefill_qkv_activation_dtype(config)
 
 
-def _gdn_prefill_qkv_activation_jnp_dtype() -> jnp.dtype:
-    if _gdn_prefill_qkv_activation_dtype() == "bf16":
+def _gdn_prefill_qkv_activation_jnp_dtype(config=None) -> jnp.dtype:
+    if _gdn_prefill_qkv_activation_dtype(config) == "bf16":
         return jnp.bfloat16
     return jnp.float32
 
 
-def _gdn_packed_decode_qkv_activation_jnp_dtype() -> jnp.dtype:
-    if _gdn_packed_decode_qkv_activation_dtype() == "bf16":
+def _gdn_packed_decode_qkv_activation_jnp_dtype(config=None) -> jnp.dtype:
+    if _gdn_packed_decode_qkv_activation_dtype(config) == "bf16":
         return jnp.bfloat16
     return jnp.float32
 
 
-def _gdn_packed_decode_pre_normalize_qk() -> bool:
-    return (
-        os.environ.get(_GDN_PACKED_DECODE_PRENORMALIZE_QK_ENV, "0").strip().lower()
-        in _TRUE_ENV_VALUES
+def _gdn_packed_decode_pre_normalize_qk(config=None) -> bool:
+    return _config_or_env_bool(
+        config,
+        "gdn_packed_decode_pre_normalize_qk",
+        _GDN_PACKED_DECODE_PRENORMALIZE_QK_ENV,
     )
 
 
@@ -267,8 +348,13 @@ def _gdn_prefill_fla_vllm_like_enabled() -> bool:
     )
 
 
-def _gdn_prefill_post_conv_output_dtype() -> str:
-    value = os.environ.get(_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE_ENV, "fp32").strip()
+def _gdn_prefill_post_conv_output_dtype(config=None) -> str:
+    value = _config_or_env_str(
+        config,
+        "gdn_prefill_post_conv_output_dtype",
+        _GDN_PREFILL_POST_CONV_OUTPUT_DTYPE_ENV,
+        default="fp32",
+    )
     return _normalize_gdn_prefill_dtype(
         value,
         _GDN_PREFILL_POST_CONV_OUTPUT_DTYPE_ENV,
@@ -279,8 +365,9 @@ def _cast_gdn_prefill_activations(
     query: jnp.ndarray,
     key: jnp.ndarray,
     value: jnp.ndarray,
+    config=None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    act_dtype = _gdn_prefill_qkv_activation_jnp_dtype()
+    act_dtype = _gdn_prefill_qkv_activation_jnp_dtype(config)
     if act_dtype == jnp.bfloat16:
         return (
             query.astype(jnp.bfloat16),
@@ -290,10 +377,140 @@ def _cast_gdn_prefill_activations(
     return query, key, value
 
 
-def _cast_gdn_prefill_post_conv_output(output: jnp.ndarray) -> jnp.ndarray:
-    if _gdn_prefill_post_conv_output_dtype() == "bf16":
+def _cast_gdn_prefill_post_conv_output(output: jnp.ndarray, config=None) -> jnp.ndarray:
+    if _gdn_prefill_post_conv_output_dtype(config) == "bf16":
         return output.astype(jnp.bfloat16)
     return output
+
+
+def _static_packed_gdn_chunk_metadata(
+    *,
+    row_count: int,
+    token_bucket: int,
+    chunk_size: int,
+    max_row_tokens: int | None = None,
+) -> tuple[jnp.ndarray, jnp.ndarray, int]:
+    if row_count <= 0:
+        raise ValueError("packed GDN prefill requires at least one row")
+    if token_bucket <= 0:
+        raise ValueError("packed GDN prefill requires a positive token bucket")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    row_token_bucket = token_bucket
+    if max_row_tokens is not None and max_row_tokens > 0:
+        row_token_bucket = min(token_bucket, int(max_row_tokens))
+    max_row_chunks = (row_token_bucket + chunk_size - 1) // chunk_size
+    rows = jnp.repeat(
+        jnp.arange(row_count, dtype=jnp.int32),
+        max_row_chunks,
+    )
+    chunks = jnp.tile(
+        jnp.arange(max_row_chunks, dtype=jnp.int32),
+        row_count,
+    )
+    chunk_indices = jnp.stack((rows, chunks), axis=1)
+    chunk_offsets = (
+        jnp.arange(row_count + 1, dtype=jnp.int32) * jnp.int32(max_row_chunks)
+    )
+    return chunk_indices, chunk_offsets, max_row_chunks
+
+
+def _prepare_packed_gdn_post_conv_inputs_from_decay(
+    conv_out: jnp.ndarray,
+    a: jnp.ndarray,
+    b: jnp.ndarray,
+    decay: jnp.ndarray,
+    dt_bias: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    *,
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    use_qk_l2norm_in_kernel: bool,
+    config=None,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    if conv_out.ndim != 3 or conv_out.shape[0] != 1:
+        raise ValueError("packed conv_out must have shape [1, token_bucket, conv_dim]")
+    if a.ndim != 3 or b.ndim != 3 or a.shape[0] != 1 or b.shape[0] != 1:
+        raise ValueError("packed a/b must have shape [1, token_bucket, value_heads]")
+    if query_start_loc.ndim != 1:
+        raise ValueError("query_start_loc must have shape [row_count + 1]")
+    if num_value_heads % num_key_heads != 0:
+        raise ValueError("num_value_heads must be divisible by num_key_heads")
+
+    _, token_bucket, conv_dim = conv_out.shape
+    key_dim = num_key_heads * key_head_dim
+    value_dim = num_value_heads * value_head_dim
+    expected_conv_dim = 2 * key_dim + value_dim
+    if conv_dim != expected_conv_dim:
+        raise ValueError(
+            f"conv_out last dimension must be {expected_conv_dim}, got {conv_dim}"
+        )
+    if a.shape != (1, token_bucket, num_value_heads):
+        raise ValueError("a must have shape [1, token_bucket, value_heads]")
+    if b.shape != (1, token_bucket, num_value_heads):
+        raise ValueError("b must have shape [1, token_bucket, value_heads]")
+    if decay.shape != (num_value_heads,) or dt_bias.shape != (num_value_heads,):
+        raise ValueError("decay and dt_bias must have shape [value_heads]")
+
+    query = conv_out[:, :, :key_dim].reshape(
+        1,
+        token_bucket,
+        num_key_heads,
+        key_head_dim,
+    )
+    key = conv_out[:, :, key_dim : key_dim * 2].reshape(
+        1,
+        token_bucket,
+        num_key_heads,
+        key_head_dim,
+    )
+    value = conv_out[:, :, key_dim * 2 :].reshape(
+        1,
+        token_bucket,
+        num_value_heads,
+        value_head_dim,
+    )
+    beta = jax.nn.sigmoid(b)
+    gate = -decay * jax.nn.softplus(a + dt_bias)
+
+    heads_per_key = num_value_heads // num_key_heads
+    if heads_per_key > 1:
+        query = jnp.repeat(query, heads_per_key, axis=2)
+        key = jnp.repeat(key, heads_per_key, axis=2)
+
+    if use_qk_l2norm_in_kernel:
+        from nanovllm_jax.layers import l2norm
+
+        query = l2norm(query.astype(jnp.float32), axis=-1, eps=1e-6)
+        key = l2norm(key.astype(jnp.float32), axis=-1, eps=1e-6)
+
+    valid = (
+        jnp.arange(token_bucket, dtype=jnp.int32)
+        < query_start_loc[-1].astype(jnp.int32)
+    )
+    query = jnp.where(valid[None, :, None, None], query, 0.0)
+    key = jnp.where(valid[None, :, None, None], key, 0.0)
+    value = jnp.where(valid[None, :, None, None], value, 0.0)
+    gate = jnp.where(valid[None, :, None], gate, 0.0)
+    beta = jnp.where(valid[None, :, None], beta, 0.0)
+
+    qkv_dtype = _gdn_prefill_qkv_activation_jnp_dtype(config)
+    packed_query = query.reshape(token_bucket, num_value_heads, key_head_dim)
+    packed_key = key.reshape(token_bucket, num_value_heads, key_head_dim)
+    packed_value = value.reshape(token_bucket, num_value_heads, value_head_dim)
+    packed_gate = gate.reshape(token_bucket, num_value_heads)
+    packed_beta = beta.reshape(token_bucket, num_value_heads)
+    return (
+        packed_query.astype(qkv_dtype),
+        packed_key.astype(qkv_dtype),
+        packed_value.astype(qkv_dtype),
+        packed_gate.astype(jnp.float32),
+        packed_beta.astype(jnp.float32),
+        valid,
+    )
 
 
 class InferenceBackend(Protocol):
@@ -323,6 +540,11 @@ class InferenceBackend(Protocol):
         seq_lens: jnp.ndarray,
         block_size: int,
         is_prefill: bool,
+        query_start_loc: jnp.ndarray | None = None,
+        num_prefill_tokens: int | None = None,
+        num_decode_tokens: int | None = None,
+        token_row_ids: jnp.ndarray | None = None,
+        max_query_len: int | None = None,
     ) -> AttentionMetadata:
         ...
 
@@ -381,6 +603,26 @@ class InferenceBackend(Protocol):
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         ...
 
+    def gated_delta_packed_prefill_post_conv(
+        self,
+        conv_out: jnp.ndarray,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        query_start_loc: jnp.ndarray,
+        *,
+        num_key_heads: int,
+        num_value_heads: int,
+        key_head_dim: int,
+        value_head_dim: int,
+        chunk_size: int,
+        initial_state: jnp.ndarray | None,
+        use_qk_l2norm_in_kernel: bool,
+        max_row_tokens: int | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        ...
+
     def gated_delta_decode(
         self,
         query: jnp.ndarray,
@@ -426,8 +668,9 @@ class PureJAXBackend:
 
     name = "pure_jax"
 
-    def __init__(self, kernel_backend: KernelBackendStatus | None = None):
+    def __init__(self, kernel_backend: KernelBackendStatus | None = None, config=None):
         self.kernel_backend = kernel_backend or select_kernel_backend("pure_jax")
+        self.config = config
 
     def allocate_kv_cache(
         self,
@@ -435,7 +678,12 @@ class PureJAXBackend:
         max_seqs: int,
         max_blocks_per_seq: int,
     ) -> KVCacheStorage:
-        capped_spec = replace(spec, num_blocks=cap_num_kv_cache_blocks(spec))
+        cache_dtype = _full_attention_kv_cache_dtype(spec.dtype, self.config)
+        capped_spec = replace(
+            spec,
+            dtype=cache_dtype,
+            num_blocks=cap_num_kv_cache_blocks(replace(spec, dtype=cache_dtype)),
+        )
         state = init_kv_cache(
             num_blocks=capped_spec.num_blocks,
             block_size=capped_spec.block_size,
@@ -456,8 +704,13 @@ class PureJAXBackend:
     ) -> FullAttentionNHDKVCacheStorage | None:
         if os.environ.get(_NHD_FULL_ATTN_CACHE_ENV, "0") not in _TRUE_ENV_VALUES:
             return None
+        cache_dtype = _full_attention_kv_cache_dtype(spec.dtype, self.config)
         return init_full_attention_nhd_kv_cache(
-            spec=replace(spec, num_blocks=cap_num_kv_cache_blocks(spec)),
+            spec=replace(
+                spec,
+                dtype=cache_dtype,
+                num_blocks=cap_num_kv_cache_blocks(replace(spec, dtype=cache_dtype)),
+            ),
             full_attention_layers=full_attention_layers,
         )
 
@@ -471,24 +724,40 @@ class PureJAXBackend:
         query_start_loc: jnp.ndarray | None = None,
         num_prefill_tokens: int | None = None,
         num_decode_tokens: int | None = None,
+        token_row_ids: jnp.ndarray | None = None,
+        max_query_len: int | None = None,
     ) -> AttentionMetadata:
         if positions.ndim != 2:
             raise ValueError("positions must be a 2D tensor [batch, query_len]")
         if block_tables.ndim != 2:
             raise ValueError("block_tables must be a 2D tensor [batch, max_blocks_per_seq]")
-        if positions.shape[0] != block_tables.shape[0]:
-            raise ValueError(
-                "positions and block_tables batch dimensions must match"
+        packed_prefill = token_row_ids is not None
+        if packed_prefill:
+            if not is_prefill:
+                raise ValueError("token_row_ids are only supported for packed prefill")
+            if token_row_ids.shape != positions.shape:
+                raise ValueError("token_row_ids and positions must have matching shapes")
+            if seq_lens.shape[0] != block_tables.shape[0]:
+                raise ValueError("seq_lens shape must align with packed prefill rows")
+            slot_mapping = compute_packed_slot_mapping(
+                positions=positions,
+                block_table=block_tables,
+                token_row_ids=token_row_ids,
+                block_size=block_size,
             )
-        if positions.shape[0] != seq_lens.shape[0]:
-            raise ValueError("positions and seq_lens batch dimensions must match")
-
-        slot_mapping = compute_slot_mapping(
-            positions=positions,
-            block_table=block_tables,
-            block_size=block_size,
-            is_prefill=is_prefill,
-        )
+        else:
+            if positions.shape[0] != block_tables.shape[0]:
+                raise ValueError(
+                    "positions and block_tables batch dimensions must match"
+                )
+            if positions.shape[0] != seq_lens.shape[0]:
+                raise ValueError("positions and seq_lens batch dimensions must match")
+            slot_mapping = compute_slot_mapping(
+                positions=positions,
+                block_table=block_tables,
+                block_size=block_size,
+                is_prefill=is_prefill,
+            )
         batch, query_len = positions.shape
         if query_start_loc is None:
             query_lens = jnp.where(is_prefill, seq_lens, jnp.ones_like(seq_lens))
@@ -511,6 +780,8 @@ class PureJAXBackend:
             num_decode_tokens=num_decode_tokens,
             positions=positions,
             max_kv_len=block_tables.shape[1] * block_size if not is_prefill else None,
+            token_row_ids=token_row_ids,
+            max_query_len=max_query_len if max_query_len is not None else query_len,
         )
 
     def write_kv(
@@ -572,8 +843,14 @@ class PureJAXBackend:
                 cache.v_cache.at[layer_id].set(v_cache_layer),
             )
 
-        query_lens = jnp.diff(metadata.query_start_loc).astype(jnp.int32)
-        valid_mask = jnp.arange(metadata.slot_mapping.shape[1])[None, :] < query_lens[:, None]
+        if metadata.token_row_ids is not None:
+            actual_tokens = metadata.query_start_loc[-1].astype(jnp.int32)
+            valid_mask = jnp.arange(metadata.slot_mapping.size, dtype=jnp.int32).reshape(
+                metadata.slot_mapping.shape
+            ) < actual_tokens
+        else:
+            query_lens = jnp.diff(metadata.query_start_loc).astype(jnp.int32)
+            valid_mask = jnp.arange(metadata.slot_mapping.shape[1])[None, :] < query_lens[:, None]
         k_cache, v_cache = update_kv_cache(
             cache.k_cache,
             cache.v_cache,
@@ -597,6 +874,24 @@ class PureJAXBackend:
         is_prefill: bool,
     ) -> jnp.ndarray:
         if is_prefill:
+            if metadata.token_row_ids is not None:
+                if metadata.positions is None:
+                    raise ValueError("metadata.positions is required for packed prefill attention")
+                return paged_attention_prefill_packed(
+                    query=query,
+                    k_cache=cache.k_cache,
+                    v_cache=cache.v_cache,
+                    block_table=metadata.block_tables,
+                    kv_lens=metadata.seq_lens,
+                    positions=metadata.positions,
+                    token_row_ids=metadata.token_row_ids,
+                    query_start_loc=metadata.query_start_loc,
+                    block_size=block_size,
+                    scale=scale,
+                    num_key_value_groups=num_key_value_groups,
+                    layer_idx=layer_id,
+                    max_query_len=metadata.max_query_len,
+                )
             if metadata.positions is None:
                 return paged_attention(
                     query=query,
@@ -717,7 +1012,7 @@ class PureJAXBackend:
         initial_state: jnp.ndarray | None,
         use_qk_l2norm_in_kernel: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        impl = _gdn_prefill_post_conv_impl()
+        impl = _gdn_prefill_post_conv_impl(self.config)
         if impl == "off":
             raise RuntimeError(
                 f"{_GDN_PREFILL_POST_CONV_IMPL_ENV} is off; use gated_delta_prefill"
@@ -1418,6 +1713,171 @@ class PureJAXBackend:
 
         raise AssertionError(f"Unhandled GDN post-conv prefill implementation {impl!r}")
 
+    def gated_delta_packed_prefill_post_conv(
+        self,
+        conv_out: jnp.ndarray,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        query_start_loc: jnp.ndarray,
+        *,
+        num_key_heads: int,
+        num_value_heads: int,
+        key_head_dim: int,
+        value_head_dim: int,
+        chunk_size: int,
+        initial_state: jnp.ndarray | None,
+        use_qk_l2norm_in_kernel: bool,
+        max_row_tokens: int | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        impl = _gdn_prefill_post_conv_impl(self.config)
+        if impl == "off":
+            raise RuntimeError(
+                f"{_GDN_PREFILL_POST_CONV_IMPL_ENV} is off; use reference packed prefill"
+            )
+
+        token_bucket = int(conv_out.shape[1])
+        row_count = int(query_start_loc.shape[0]) - 1
+        if initial_state is None:
+            initial_state = jnp.zeros(
+                (
+                    row_count,
+                    num_value_heads,
+                    value_head_dim,
+                    key_head_dim,
+                ),
+                dtype=jnp.float32,
+            )
+
+        (
+            packed_query,
+            packed_key,
+            packed_value,
+            packed_gate,
+            packed_beta,
+            valid_tokens,
+        ) = _prepare_packed_gdn_post_conv_inputs_from_decay(
+            conv_out,
+            a,
+            b,
+            decay,
+            dt_bias,
+            query_start_loc,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            config=self.config,
+        )
+
+        def reference_scan() -> tuple[jnp.ndarray, jnp.ndarray]:
+            token_positions = jnp.arange(token_bucket, dtype=jnp.int32)
+            cu = query_start_loc.astype(jnp.int32)
+            row_ids = jnp.sum(
+                token_positions[:, None] >= cu[1:][None, :],
+                axis=1,
+            ).astype(jnp.int32)
+            safe_rows = jnp.clip(row_ids, 0, row_count - 1)
+            query_tokens = packed_query.astype(jnp.float32) * (
+                1.0 / jnp.sqrt(key_head_dim)
+            )
+            key_tokens = packed_key.astype(jnp.float32)
+            value_tokens = packed_value.astype(jnp.float32)
+            gate_tokens = packed_gate.astype(jnp.float32)
+            beta_tokens = packed_beta.astype(jnp.float32)
+
+            def recurrent_scan(state, inputs):
+                row, valid, q_t, k_t, v_t, gate_t, beta_t = inputs
+                previous_row_state = state[row]
+                decay_t = jnp.exp(gate_t)[:, None, None]
+                decayed_state = previous_row_state * decay_t
+                kv_mem = jnp.einsum("hvk,hk->hv", decayed_state, k_t)
+                delta = (v_t - kv_mem) * beta_t[:, None]
+                next_row_state = decayed_state + delta[:, :, None] * k_t[:, None, :]
+                out_t = jnp.einsum("hvk,hk->hv", next_row_state, q_t)
+                next_row_state = jnp.where(valid, next_row_state, previous_row_state)
+                state = state.at[row].set(next_row_state)
+                out_t = jnp.where(valid, out_t, jnp.zeros_like(out_t))
+                return state, out_t
+
+            final_state, output_tokens = jax.lax.scan(
+                recurrent_scan,
+                initial_state.astype(jnp.float32),
+                (
+                    safe_rows,
+                    valid_tokens,
+                    query_tokens,
+                    key_tokens,
+                    value_tokens,
+                    gate_tokens,
+                    beta_tokens,
+                ),
+            )
+            output = _cast_gdn_prefill_post_conv_output(output_tokens, self.config)
+            return output[None, :, :, :], final_state
+
+        if impl in {
+            "reference",
+            "reference_fla_chunk32",
+            "reference_fla_packed",
+        }:
+            return reference_scan()
+
+        if impl not in {
+            "triton_fla_packed",
+            "triton_fla_wrapper",
+            "triton_fla_padded",
+            "triton_fla_prep_bf16",
+        }:
+            _raise_if_gdn_fallback_disabled(
+                f"{impl!r} does not support packed GDN prefill ABI",
+                self.config,
+            )
+            return reference_scan()
+
+        try:
+            from nanovllm_jax.kernels.gdn_fla_triton import (
+                gdn_fla_chunk_gated_delta_rule_packed_triton,
+            )
+        except (ImportError, ModuleNotFoundError, AttributeError):
+            gdn_fla_chunk_gated_delta_rule_packed_triton = None
+
+        if gdn_fla_chunk_gated_delta_rule_packed_triton is None:
+            _raise_if_gdn_fallback_disabled(
+                "Triton FLA packed prefill kernel is unavailable",
+                self.config,
+            )
+            return reference_scan()
+
+        chunk_indices, chunk_offsets, max_row_chunks = (
+            _static_packed_gdn_chunk_metadata(
+                row_count=row_count,
+                token_bucket=token_bucket,
+                chunk_size=chunk_size,
+                max_row_tokens=max_row_tokens,
+            )
+        )
+        output, final_state = gdn_fla_chunk_gated_delta_rule_packed_triton(
+            packed_query,
+            packed_key,
+            packed_value,
+            packed_gate,
+            packed_beta,
+            query_start_loc.astype(jnp.int32),
+            initial_state.astype(jnp.float32),
+            chunk_size=chunk_size,
+            # Q/K normalization is applied above when requested.
+            use_qk_l2norm_in_kernel=False,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            max_row_chunks=max_row_chunks,
+        )
+        output = jnp.where(valid_tokens[:, None, None], output, 0.0)
+        output = _cast_gdn_prefill_post_conv_output(output, self.config)
+        return output[None, :, :, :], final_state
+
     def gated_delta_decode(
         self,
         query: jnp.ndarray,
@@ -1484,8 +1944,8 @@ class PureJAXBackend:
         initial_state: jnp.ndarray,
         use_qk_l2norm_in_kernel: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        impl = _gdn_packed_decode_impl()
-        packed_qkv_dtype = _gdn_packed_decode_qkv_activation_jnp_dtype()
+        impl = _gdn_packed_decode_impl(self.config)
+        packed_qkv_dtype = _gdn_packed_decode_qkv_activation_jnp_dtype(self.config)
         if impl == "off":
             raise RuntimeError(
                 f"{_GDN_PACKED_DECODE_IMPL_ENV} is off; use gated_delta_decode"
@@ -1575,7 +2035,7 @@ class PureJAXBackend:
             )
 
         if impl in {"triton_fla", "triton_fla_raw_gates"}:
-            pre_normalize_qk = _gdn_packed_decode_pre_normalize_qk()
+            pre_normalize_qk = _gdn_packed_decode_pre_normalize_qk(self.config)
             if pre_normalize_qk and use_qk_l2norm_in_kernel:
                 # q/k are already normalized before entering the kernel. Leave the
                 # argument False so triton avoids redundant reductions.
@@ -1620,7 +2080,8 @@ class PureJAXBackend:
                     )
             except (ImportError, ModuleNotFoundError, AttributeError):
                 _raise_if_gdn_fallback_disabled(
-                    "Triton FLA packed decode kernel is unavailable"
+                    "Triton FLA packed decode kernel is unavailable",
+                    self.config,
                 )
                 return gdn_packed_decode_reference_from_decay(
                     mixed_qkv,
@@ -1669,7 +2130,7 @@ class PureJAXBackend:
         recurrent_state: jnp.ndarray,
         use_qk_l2norm_in_kernel: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        impl = _gdn_packed_decode_impl()
+        impl = _gdn_packed_decode_impl(self.config)
         if impl != "triton_fla_conv_raw_gates":
             raise RuntimeError(
                 "gated_delta_conv_packed_decode is only enabled by "
@@ -1714,7 +2175,8 @@ class PureJAXBackend:
             )
         except (ImportError, ModuleNotFoundError, AttributeError):
             _raise_if_gdn_fallback_disabled(
-                "Triton FLA conv+packed decode kernel is unavailable"
+                "Triton FLA conv+packed decode kernel is unavailable",
+                self.config,
             )
             return reference()
 
@@ -1734,7 +2196,8 @@ class PureJAXBackend:
             )
         except Exception:
             _raise_if_gdn_fallback_disabled(
-                "Triton FLA conv+packed decode kernel cannot handle this shape"
+                "Triton FLA conv+packed decode kernel cannot handle this shape",
+                self.config,
             )
             return reference()
 
@@ -1742,12 +2205,12 @@ class PureJAXBackend:
 class KernelBackendPlaceholder(PureJAXBackend):
     """Explicit placeholder until GPU/TPU kernels are implemented."""
 
-    def __init__(self, name: str, kernel_backend: KernelBackendStatus):
-        super().__init__(kernel_backend=kernel_backend)
+    def __init__(self, name: str, kernel_backend: KernelBackendStatus, config=None):
+        super().__init__(kernel_backend=kernel_backend, config=config)
         self.name = name
 
 
-def select_backend(name: str = "auto") -> InferenceBackend:
+def select_backend(name: str = "auto", *, config=None) -> InferenceBackend:
     """Select an inference backend.
 
     `auto` currently returns the pure JAX correctness backend even on GPU/TPU.
@@ -1762,9 +2225,9 @@ def select_backend(name: str = "auto") -> InferenceBackend:
             and not kernel_backend.external_kernels_enabled
         ):
             raise KernelBackendUnavailable(kernel_backend.reason)
-        return PureJAXBackend(kernel_backend=kernel_backend)
+        return PureJAXBackend(kernel_backend=kernel_backend, config=config)
     if normalized in {"pure_jax", "jax"}:
-        return PureJAXBackend()
+        return PureJAXBackend(config=config)
     if normalized in {"gpu", "cuda", "tpu"}:
         platform = jax.default_backend()
         if normalized == "gpu" and platform != "gpu":
@@ -1777,5 +2240,5 @@ def select_backend(name: str = "auto") -> InferenceBackend:
             and not kernel_backend.external_kernels_enabled
         ):
             raise KernelBackendUnavailable(kernel_backend.reason)
-        return KernelBackendPlaceholder(normalized, kernel_backend)
+        return KernelBackendPlaceholder(normalized, kernel_backend, config=config)
     raise ValueError(f"Unknown backend {name!r}; expected auto, pure_jax, gpu, or tpu")

@@ -22,6 +22,7 @@
     "NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z": "1",
     "NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ": "1",
     "NANO_VLLM_JAX_COMPACT_PREFILL_MLP": "1",
+    "NANO_VLLM_JAX_COMPACT_PREFILL_TOKEN_COUNT_MODE": "bucket",
     "NANO_VLLM_JAX_KERNEL_BACKEND": "pure_jax",
     "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY": "1"
   },
@@ -40,8 +41,14 @@
     "max_num_seqs": 8,
     "max_num_batched_tokens": 4096,
     "prefill_buckets": "64,128,256,384,512",
+    "prefill_token_buckets": "64,128,256,512,1024,2048,4096",
+    "prefill_layout": "packed",
     "batch_size_buckets": "1,2,4,8",
     "max_blocks_per_seq": 40,
+    "greedy_token_fastpath": true,
+    "device_token_carry": true,
+    "static_decode_metadata": false,
+    "static_decode_seq_lens_carry": false,
     "top_k": 5,
     "warmup": true,
     "profile": true

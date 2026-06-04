@@ -14,6 +14,11 @@ class ScheduledBatch:
 
     `tokens` and `positions` are padded to rectangular arrays, while
     `query_start_loc` preserves the true ragged query lengths.
+
+    Dense prefill/decode uses `tokens.shape[0]` rows.  Packed prefill keeps
+    query tokens in a single row (`tokens.shape == [1, token_bucket]`) and uses
+    `token_row_ids` plus the paged row metadata (`block_tables`, `seq_lens`,
+    `query_start_loc`) to map each token back to its request.
     """
 
     tokens: jnp.ndarray
@@ -32,9 +37,13 @@ class ScheduledBatch:
     hybrid_slot_ids_host: tuple[int, ...] | None = None
     decode_step_count_host: int = 1
     uses_static_decode_metadata: bool = False
+    packed_prefill: bool = False
+    token_row_ids: jnp.ndarray | None = None
 
     @property
     def batch_size(self) -> int:
+        if self.packed_prefill:
+            return int(self.block_tables.shape[0])
         return int(self.tokens.shape[0])
 
     @property

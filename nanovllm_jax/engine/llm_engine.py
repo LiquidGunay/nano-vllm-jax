@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.kv_cache import KVCacheSpec, cap_num_kv_cache_blocks
-from nanovllm_jax.engine.sequence import Sequence, SamplingParams
+from nanovllm_jax.engine.sequence import DeviceTokenSlot, Sequence, SamplingParams
 from nanovllm_jax.engine.scheduler import Scheduler
 from nanovllm_jax.engine.model_runner import ModelRunner
 from nanovllm_jax.model import ModelParams
@@ -25,8 +25,10 @@ except ImportError:
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
 
 
-def _device_token_carry_enabled() -> bool:
-    return os.environ.get("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "0") in _TRUE_ENV_VALUES
+def _config_or_env_flag(config: Qwen3_5Config | None, attr: str, env_name: str, *, default: bool = False) -> bool:
+    if config is not None and hasattr(config, attr):
+        return bool(getattr(config, attr))
+    return os.environ.get(env_name, "1" if default else "0") in _TRUE_ENV_VALUES
 
 
 def _overlapped_streaming_token_prefetch_enabled() -> bool:
@@ -35,6 +37,10 @@ def _overlapped_streaming_token_prefetch_enabled() -> bool:
 
 def _offline_streaming_token_events_enabled() -> bool:
     return os.environ.get("NANO_VLLM_JAX_OFFLINE_STREAMING_TOKEN_EVENTS", "0") in _TRUE_ENV_VALUES
+
+
+def _trace_token_prefetch_enabled() -> bool:
+    return os.environ.get("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "0") in _TRUE_ENV_VALUES
 
 
 @dataclass(frozen=True)
@@ -125,6 +131,58 @@ class LLMEngine:
         # Register cleanup
         atexit.register(self.exit)
 
+    def warmup_compilation(
+        self,
+        *,
+        max_prefill_len: int | None = None,
+        max_batch: int | None = None,
+    ) -> dict[str, object]:
+        """Compile configured serving buckets without using live request data."""
+        if max_prefill_len is None:
+            max_prefill_len = max(
+                tuple(getattr(self.config, "prefill_token_buckets", ()) or ())
+                or
+                tuple(getattr(self.config, "prefill_buckets", ()) or ())
+                or (int(getattr(self.config, "max_num_batched_tokens", 64) or 64),)
+            )
+        if max_batch is None:
+            max_batch = max(
+                tuple(getattr(self.config, "batch_size_buckets", ()) or ())
+                or (int(getattr(self.config, "max_num_seqs", 1) or 1),)
+            )
+
+        runner = self.model_runner
+        executor = getattr(runner, "executor", None)
+        cache = getattr(executor, "_jit_cache", None)
+        cache_entries_before = len(cache) if cache is not None else None
+        started = perf_counter()
+        runner_summary = runner.warmup_compilation(
+            max_prefill_len=int(max_prefill_len),
+            max_batch=int(max_batch),
+        )
+        elapsed = perf_counter() - started
+        cache_entries_after = len(cache) if cache is not None else None
+        return {
+            "enabled": True,
+            "mode": "generic_bucket_startup",
+            "seconds": elapsed,
+            "max_prefill_len": int(max_prefill_len),
+            "max_batch": int(max_batch),
+            "prefill_buckets": list(getattr(self.config, "prefill_buckets", ()) or ()),
+            "prefill_token_buckets": list(getattr(self.config, "prefill_token_buckets", ()) or ()),
+            "prefill_layout": str(getattr(self.config, "prefill_layout", "packed")),
+            "batch_size_buckets": list(getattr(self.config, "batch_size_buckets", ()) or ()),
+            "decode_block_table_buckets": list(getattr(self.config, "decode_block_table_buckets", ()) or ()),
+            "jit_cache_entries_before": cache_entries_before,
+            "jit_cache_entries_after": cache_entries_after,
+            "jit_cache_entries_added": (
+                cache_entries_after - cache_entries_before
+                if cache_entries_before is not None and cache_entries_after is not None
+                else None
+            ),
+            "runner": runner_summary,
+        }
+
     def exit(self):
         """Cleanup on exit."""
         del self.model_runner
@@ -158,7 +216,42 @@ class LLMEngine:
         self.scheduler.add(seq)
         return seq
 
-    def step(self) -> tuple[List[tuple], int]:
+    def _prepare_generation_sequences(
+        self,
+        prompts: List[Union[str, List[int]]],
+        sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
+        *,
+        require_greedy_ignore_eos: bool = False,
+    ) -> List[Sequence]:
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+        elif len(sampling_params) != len(prompts):
+            raise ValueError("sampling_params length must match prompts length")
+
+        request_inputs: List[List[int]] = []
+        for prompt in prompts:
+            token_ids = self._tokenize(prompt) if isinstance(prompt, str) else list(prompt)
+            if not token_ids:
+                raise ValueError("prompt must contain at least one token")
+            request_inputs.append(token_ids)
+
+        for sp in sampling_params:
+            if sp.max_tokens <= 0:
+                raise ValueError("max_tokens must be positive")
+            if sp.temperature < 0:
+                raise ValueError("temperature must be non-negative")
+            if require_greedy_ignore_eos and (sp.temperature != 0 or not sp.ignore_eos):
+                raise ValueError(
+                    "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY requires greedy sampling "
+                    "with ignore_eos=True"
+                )
+
+        return [self.add_request(prompt, sp) for prompt, sp in zip(request_inputs, sampling_params)]
+
+    def step(self, *, materialize_finished_outputs: bool = True) -> tuple[List[tuple], int]:
         """Execute one scheduling step.
         
         Returns:
@@ -198,11 +291,14 @@ class LLMEngine:
         )
         
         # Collect outputs
-        outputs = [
-            (seq.seq_id, seq.completion_token_ids) 
-            for seq in seqs 
-            if seq.is_finished
-        ]
+        if materialize_finished_outputs:
+            outputs = [
+                (seq.seq_id, seq.completion_token_ids)
+                for seq in seqs
+                if seq.is_finished
+            ]
+        else:
+            outputs = [(seq.seq_id, []) for seq in seqs if seq.is_finished]
         
         # Track throughput
         if scheduled_batch.is_prefill:
@@ -211,6 +307,15 @@ class LLMEngine:
             num_tokens = -getattr(self.scheduler, "last_num_generated_tokens", scheduled_batch.num_decode_tokens)
         
         return outputs, num_tokens
+
+    def _step_without_finished_output_materialization(self) -> tuple[List[tuple], int]:
+        """Run one step without pulling final deferred token IDs to host."""
+        try:
+            return self.step(materialize_finished_outputs=False)
+        except TypeError as exc:
+            if "materialize_finished_outputs" not in str(exc):
+                raise
+            return self.step()
 
     def is_finished(self) -> bool:
         """Check if all requests are complete."""
@@ -339,7 +444,12 @@ class LLMEngine:
                 include_text=include_text,
             )
             return
-        if _device_token_carry_enabled() and _overlapped_streaming_token_prefetch_enabled():
+        device_token_carry = _config_or_env_flag(
+            getattr(self, "config", None),
+            "device_token_carry",
+            "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+        )
+        if device_token_carry and _overlapped_streaming_token_prefetch_enabled():
             yield from self._iter_generate_deferred_tokens(
                 seqs,
                 include_text=include_text,
@@ -420,7 +530,7 @@ class LLMEngine:
 
         while not self.is_finished():
             step_start = perf_counter()
-            _, num_tokens = self.step()
+            _, num_tokens = self._step_without_finished_output_materialization()
             step_end = perf_counter()
 
             for seq in seqs:
@@ -493,7 +603,7 @@ class LLMEngine:
 
         while not self.is_finished():
             step_start = perf_counter()
-            _, num_tokens = self.step()
+            _, num_tokens = self._step_without_finished_output_materialization()
             step_end = perf_counter()
 
             slots = Sequence.snapshot_new_device_token_slots_for_sequences(
@@ -637,7 +747,30 @@ class LLMEngine:
         include_text: bool = True,
     ) -> dict:
         """Generate requests and return server-side per-token timing events."""
-        if _device_token_carry_enabled():
+        device_token_carry = _config_or_env_flag(
+            getattr(self, "config", None),
+            "device_token_carry",
+            "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+        )
+        if device_token_carry and _trace_token_prefetch_enabled():
+            events = []
+            results = []
+            for event in self._iter_generate_deferred_tokens(
+                self._prepare_generation_sequences(
+                    prompts,
+                    sampling_params,
+                    require_greedy_ignore_eos=True,
+                ),
+                include_text=include_text,
+            ):
+                events.append(event)
+                if event.get("event") == "done":
+                    results = event.get("results", [])
+            return {
+                "results": results,
+                "events": events,
+            }
+        if device_token_carry:
             return self._generate_with_trace_deferred_tokens(
                 prompts,
                 sampling_params=sampling_params,
@@ -698,11 +831,28 @@ class LLMEngine:
         emitted_finish = set()
         stream_start = perf_counter()
         events = []
+        prefetch_trace_tokens = _trace_token_prefetch_enabled()
+        snapshotted_completion_lengths = {seq.seq_id: 0 for seq in seqs}
+        pending_prefetch_slots: tuple[DeviceTokenSlot, ...] = ()
 
         while not self.is_finished():
             step_start = perf_counter()
-            _, num_tokens = self.step()
+            _, num_tokens = self._step_without_finished_output_materialization()
             step_end = perf_counter()
+            if prefetch_trace_tokens:
+                if pending_prefetch_slots:
+                    Sequence.prefetch_device_token_slots(pending_prefetch_slots)
+                slots = Sequence.snapshot_new_device_token_slots_for_sequences(
+                    seqs,
+                    snapshotted_completion_lengths,
+                )
+                pending_prefetch_slots = slots
+                snapshotted_completion_lengths.update(
+                    {
+                        int(seq.seq_id): int(seq.num_completion_tokens)
+                        for seq in seqs
+                    }
+                )
             for seq in seqs:
                 request_index = seq_to_request[seq.seq_id]
                 previous_length = seen_completion_lengths[seq.seq_id]
@@ -736,15 +886,19 @@ class LLMEngine:
                         }
                     )
 
+        if prefetch_trace_tokens and pending_prefetch_slots:
+            Sequence.prefetch_device_token_slots(pending_prefetch_slots)
         Sequence.materialize_device_tokens_for_sequences(seqs)
-        results = [
-            {
-                "request_index": index,
-                "text": self._detokenize(seq.completion_token_ids) if include_text else "",
-                "token_ids": [int(token) for token in seq.completion_token_ids],
-            }
-            for index, seq in enumerate(seqs)
-        ]
+        results = []
+        for index, seq in enumerate(seqs):
+            token_ids = [int(token) for token in seq.completion_token_ids]
+            results.append(
+                {
+                    "request_index": index,
+                    "text": self._detokenize(token_ids) if include_text else "",
+                    "token_ids": token_ids,
+                }
+            )
         tokens_by_request = {
             int(result["request_index"]): list(result["token_ids"])
             for result in results

@@ -59,8 +59,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-seqs", type=int, default=4)
     parser.add_argument("--max-num-batched-tokens", type=int, default=512)
     parser.add_argument("--prefill-buckets", default="16,32,64,128")
+    parser.add_argument("--prefill-token-buckets", default="")
+    parser.add_argument("--prefill-layout", choices=["packed", "dense"], default="packed")
     parser.add_argument("--batch-size-buckets", default="1,2,4")
     parser.add_argument("--max-blocks-per-seq", type=int, default=16)
+    parser.add_argument("--decode-block-table-buckets", default="")
+    parser.add_argument("--greedy-token-fastpath", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--greedy-decode-burst-steps", type=int, default=1)
+    parser.add_argument("--device-token-carry", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--static-decode-metadata", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--static-decode-seq-lens-carry", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--materialize-tied-lm-head", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compact-prefill-in-proj-qkv", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compact-prefill-gdn-z", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compact-prefill-full-attn-proj", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compact-prefill-mlp", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compact-prefill-token-count-mode", default="exact")
+    parser.add_argument("--lm-head-decode-act-dtype", default="fp32")
+    parser.add_argument("--decode-proj-act-dtype", default="fp32")
+    parser.add_argument("--decode-padded-gemm", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--decode-padded-gemm-gate-up", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--decode-padded-gemm-rows", type=int, default=8)
+    parser.add_argument("--decode-padded-gemm-max-out-dim", type=int, default=8192)
+    parser.add_argument("--full-attention-kv-cache-dtype", default="default")
+    parser.add_argument("--gdn-disable-fallbacks", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--gdn-prefill-post-conv-impl", default="off")
+    parser.add_argument("--gdn-prefill-qkv-dtype", default="fp32")
+    parser.add_argument("--gdn-prefill-post-conv-output-dtype", default="fp32")
+    parser.add_argument("--gdn-packed-decode-impl", default="off")
+    parser.add_argument("--gdn-packed-decode-qkv-dtype", default="fp32")
+    parser.add_argument("--gdn-packed-decode-pre-normalize-qk", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--gdn-packed-decode-max-batch", type=int, default=0)
     parser.add_argument(
         "--linear-chunk-size",
         type=int,
@@ -69,6 +98,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup", action="store_true", default=True)
     parser.add_argument("--no-warmup", dest="warmup", action="store_false")
+    parser.add_argument(
+        "--warmup-mode",
+        choices=["generic", "request"],
+        default="generic",
+        help="generic compiles configured server buckets; request replays the measured prompt list for diagnostics only.",
+    )
+    parser.add_argument(
+        "--fail-on-jit-cache-growth",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fail if new executor JIT keys are created during the measured generation phase.",
+    )
     parser.add_argument("--reference-json", default="")
     parser.add_argument("--output-json", default="results/qwen08_jax_server_trace.json")
     parser.add_argument(
@@ -122,6 +163,12 @@ def _block_until_ready(value: Any) -> None:
             _block_until_ready(item)
 
 
+def _jit_cache_key_snapshot(cache: Any) -> set[str] | None:
+    if cache is None:
+        return None
+    return {repr(key) for key in cache.keys()}
+
+
 def _percentile(values: list[float], percentile: float) -> float | None:
     if not values:
         return None
@@ -135,20 +182,36 @@ def _percentile(values: list[float], percentile: float) -> float | None:
 
 def _timing_metrics(events: list[dict[str, Any]], elapsed: float, total_tokens: int) -> dict[str, Any]:
     by_request: dict[int, list[float]] = {}
+    token_elapsed_seconds: list[float] = []
     for event in events:
         if event.get("event") != "token":
             continue
-        by_request.setdefault(int(event["request_index"]), []).append(float(event["elapsed_seconds"]))
+        event_elapsed = float(event["elapsed_seconds"])
+        token_elapsed_seconds.append(event_elapsed)
+        by_request.setdefault(int(event["request_index"]), []).append(event_elapsed)
     ttfts = []
     itls = []
     for timestamps in by_request.values():
         if timestamps:
             ttfts.append(1000.0 * timestamps[0])
             itls.extend(1000.0 * (right - left) for left, right in zip(timestamps, timestamps[1:]))
+    last_token_elapsed = max(token_elapsed_seconds) if token_elapsed_seconds else None
+    post_last_token_drain_seconds = (
+        max(0.0, elapsed - last_token_elapsed)
+        if last_token_elapsed is not None
+        else None
+    )
     return {
         "seconds": elapsed,
+        "last_token_elapsed_seconds": last_token_elapsed,
+        "post_last_token_drain_seconds": post_last_token_drain_seconds,
         "generated_tokens": total_tokens,
         "tokens_per_second": total_tokens / max(elapsed, 1e-9),
+        "token_event_tokens_per_second": (
+            total_tokens / max(last_token_elapsed, 1e-9)
+            if last_token_elapsed is not None
+            else None
+        ),
         "ttft_ms_mean": float(sum(ttfts) / len(ttfts)) if ttfts else None,
         "ttft_ms_p50": _percentile(ttfts, 50),
         "ttft_ms_p95": _percentile(ttfts, 95),
@@ -170,6 +233,7 @@ def _performance_with_token_scopes(rows: list[dict[str, Any]], performance: dict
             "total_output_tokens": total_output_tokens,
             "request_throughput": request_count / max(elapsed, 1e-9),
             "output_token_throughput": total_output_tokens / max(elapsed, 1e-9),
+            "token_event_output_token_throughput": performance.get("token_event_tokens_per_second"),
             "total_token_throughput": (total_input_tokens + total_output_tokens) / max(elapsed, 1e-9),
         }
     )
@@ -289,10 +353,47 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "max_num_seqs": args.max_num_seqs,
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "prefill_buckets": tuple(_parse_ints(args.prefill_buckets)),
+        "prefill_token_buckets": (
+            tuple(_parse_ints(args.prefill_token_buckets))
+            if args.prefill_token_buckets
+            else tuple(_parse_ints(args.prefill_buckets))
+        ),
+        "prefill_layout": args.prefill_layout,
         "batch_size_buckets": tuple(_parse_ints(args.batch_size_buckets)),
         "max_blocks_per_seq": args.max_blocks_per_seq,
+        "decode_block_table_buckets": tuple(_parse_ints(args.decode_block_table_buckets)),
         "jax_execution": args.jax_execution,
         "num_speculative_tokens": args.num_speculative_tokens,
+        "greedy_token_fastpath": args.greedy_token_fastpath,
+        "greedy_decode_burst_steps": max(1, int(args.greedy_decode_burst_steps or 1)),
+        "device_token_carry": args.device_token_carry,
+        "static_decode_metadata": args.static_decode_metadata,
+        "static_decode_seq_lens_carry": args.static_decode_seq_lens_carry,
+        "materialize_tied_lm_head": args.materialize_tied_lm_head,
+        "compact_prefill_in_proj_qkv": args.compact_prefill_in_proj_qkv,
+        "compact_prefill_gdn_z": args.compact_prefill_gdn_z,
+        "compact_prefill_full_attn_proj": args.compact_prefill_full_attn_proj,
+        "compact_prefill_mlp": args.compact_prefill_mlp,
+        "compact_prefill_token_count_mode": args.compact_prefill_token_count_mode,
+        "lm_head_decode_act_dtype": args.lm_head_decode_act_dtype,
+        "decode_proj_act_dtype": args.decode_proj_act_dtype,
+        "decode_padded_gemm": args.decode_padded_gemm,
+        "decode_padded_gemm_gate_up": args.decode_padded_gemm_gate_up,
+        "decode_padded_gemm_rows": args.decode_padded_gemm_rows,
+        "decode_padded_gemm_max_out_dim": args.decode_padded_gemm_max_out_dim,
+        "full_attention_kv_cache_dtype": args.full_attention_kv_cache_dtype,
+        "gdn_disable_fallbacks": args.gdn_disable_fallbacks,
+        "gdn_prefill_post_conv_impl": args.gdn_prefill_post_conv_impl,
+        "gdn_prefill_qkv_dtype": args.gdn_prefill_qkv_dtype,
+        "gdn_prefill_post_conv_output_dtype": args.gdn_prefill_post_conv_output_dtype,
+        "gdn_packed_decode_impl": args.gdn_packed_decode_impl,
+        "gdn_packed_decode_qkv_dtype": args.gdn_packed_decode_qkv_dtype,
+        "gdn_packed_decode_pre_normalize_qk": args.gdn_packed_decode_pre_normalize_qk,
+        "gdn_packed_decode_max_batch": (
+            args.gdn_packed_decode_max_batch
+            if args.gdn_packed_decode_max_batch > 0
+            else None
+        ),
     }
     if args.linear_chunk_size:
         engine_kwargs["linear_chunk_size"] = args.linear_chunk_size
@@ -304,10 +405,47 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     kernel_backend = getattr(engine.model_runner.backend, "kernel_backend", None)
     kernel_backend_dict = kernel_backend.as_dict() if kernel_backend is not None else None
     nhd_cache = getattr(engine.model_runner, "full_attention_nhd_cache", None)
+    executor = getattr(engine.model_runner, "executor", None)
+    jit_cache = getattr(executor, "_jit_cache", None)
+    warmup_summary: dict[str, Any] = {
+        "enabled": bool(args.warmup),
+        "mode": args.warmup_mode if args.warmup else "disabled",
+        "seconds": 0.0,
+        "jit_cache_entries_before": len(jit_cache) if jit_cache is not None else None,
+        "jit_cache_entries_after": len(jit_cache) if jit_cache is not None else None,
+        "request_specific": False,
+    }
     if args.warmup:
-        warmup_params = _build_sampling_params([], min(2, args.output_len))
-        warmup_trace = engine.generate_with_trace(prompts, sampling_params=warmup_params, include_text=False)
-        _block_until_ready(warmup_trace)
+        warmup_started = time.perf_counter()
+        if args.warmup_mode == "generic":
+            warmup_summary = engine.warmup_compilation(
+                max_prefill_len=max(
+                    tuple(getattr(engine.config, "prefill_token_buckets", ()) or ())
+                    or
+                    tuple(getattr(engine.config, "prefill_buckets", ()) or ())
+                    or (int(args.max_num_batched_tokens),)
+                ),
+                max_batch=max(
+                    tuple(getattr(engine.config, "batch_size_buckets", ()) or ())
+                    or (int(args.max_num_seqs),)
+                ),
+            )
+        else:
+            burst_steps = max(1, int(getattr(engine.config, "greedy_decode_burst_steps", 1) or 1))
+            warmup_output_len = min(max(2, burst_steps + 1), args.output_len)
+            warmup_params = _build_sampling_params([], warmup_output_len)
+            warmup_trace = engine.generate_with_trace(prompts, sampling_params=warmup_params, include_text=False)
+            _block_until_ready(warmup_trace)
+            warmup_summary.update(
+                {
+                    "mode": "request_specific",
+                    "seconds": time.perf_counter() - warmup_started,
+                    "jit_cache_entries_after": len(jit_cache) if jit_cache is not None else None,
+                    "request_specific": True,
+                }
+            )
+    jit_cache_entries_before_measurement = len(jit_cache) if jit_cache is not None else None
+    jit_cache_keys_before_measurement = _jit_cache_key_snapshot(jit_cache)
 
     sampling_params = _build_sampling_params(output_lengths, args.output_len)
     recorder.start_jax_profile(enabled=args.profile)
@@ -317,6 +455,23 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     elapsed = time.perf_counter() - started
     recorder.stop_jax_profile()
     profile_counters = _profile_counters(recorder.profile_path) if args.profile else None
+    jit_cache_entries_after_measurement = len(jit_cache) if jit_cache is not None else None
+    jit_cache_keys_after_measurement = _jit_cache_key_snapshot(jit_cache)
+    jit_cache_growth = (
+        jit_cache_entries_after_measurement - jit_cache_entries_before_measurement
+        if jit_cache_entries_before_measurement is not None
+        and jit_cache_entries_after_measurement is not None
+        else None
+    )
+    jit_cache_new_keys = None
+    if jit_cache_keys_before_measurement is not None and jit_cache_keys_after_measurement is not None:
+        jit_cache_new_keys = sorted(jit_cache_keys_after_measurement - jit_cache_keys_before_measurement)
+    if args.fail_on_jit_cache_growth and jit_cache_growth and jit_cache_growth > 0:
+        detail = f" new_keys={jit_cache_new_keys!r}" if jit_cache_new_keys else ""
+        raise RuntimeError(
+            "Executor JIT cache grew during measured generation: "
+            f"{jit_cache_entries_before_measurement} -> {jit_cache_entries_after_measurement}.{detail}"
+        )
 
     rows = []
     total_tokens = 0
@@ -355,28 +510,19 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 "flashinfer_kv_append": _env_flag("NANO_VLLM_JAX_FLASHINFER_KV_APPEND"),
                 "cuda_fp32_kv_append": _env_flag("NANO_VLLM_JAX_CUDA_FP32_KV_APPEND"),
                 "cuda_fp32_decode_attention": _env_flag("NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"),
+                "kv_cache_dtype": str(engine.config.full_attention_kv_cache_dtype),
             },
             "gdn_kernel_flags": {
                 "allow_local_cuda_probes": _env_flag(
                     "NANO_VLLM_JAX_ALLOW_LOCAL_CUDA_PROBES"
                 ),
                 "cuda_fp32_gdn_decode": _env_flag("NANO_VLLM_JAX_CUDA_FP32_GDN_DECODE"),
-                "disable_fallbacks": _env_flag("NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS"),
-                "packed_decode_impl": os.environ.get(
-                    "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
-                    "off",
-                ),
-                "packed_decode_pre_normalize_qk": _env_flag(
-                    "NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK"
-                ),
-                "packed_decode_qkv_dtype": os.environ.get(
-                    "NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE",
-                    "fp32",
-                ),
-                "prefill_post_conv_impl": os.environ.get(
-                    "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
-                    "off",
-                ),
+                "disable_fallbacks": bool(engine.config.gdn_disable_fallbacks),
+                "packed_decode_impl": str(engine.config.gdn_packed_decode_impl),
+                "packed_decode_pre_normalize_qk": bool(engine.config.gdn_packed_decode_pre_normalize_qk),
+                "packed_decode_qkv_dtype": str(engine.config.gdn_packed_decode_qkv_dtype),
+                "packed_decode_max_batch": engine.config.gdn_packed_decode_max_batch,
+                "prefill_post_conv_impl": str(engine.config.gdn_prefill_post_conv_impl),
                 "prefill_kkt_block_dot": _env_flag(
                     "NANO_VLLM_JAX_GDN_KKT_BLOCK_DOT"
                 ),
@@ -389,36 +535,50 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 "prefill_recompute_block_dot": _env_flag(
                     "NANO_VLLM_JAX_GDN_RECOMPUTE_BLOCK_DOT"
                 ),
-                "prefill_qkv_dtype": os.environ.get(
-                    "NANO_VLLM_JAX_GDN_PREFILL_QKV_DTYPE",
-                    os.environ.get("NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE", "fp32"),
-                ),
+                "prefill_qkv_dtype": str(engine.config.gdn_prefill_qkv_dtype),
                 "prefill_act_dtype": os.environ.get(
                     "NANO_VLLM_JAX_GDN_PREFILL_ACT_DTYPE",
                     "fp32",
                 ),
-                "prefill_post_conv_output_dtype": os.environ.get(
-                    "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE",
-                    "fp32",
-                ),
+                "prefill_post_conv_output_dtype": str(engine.config.gdn_prefill_post_conv_output_dtype),
             },
             "jax_execution": args.jax_execution,
+            "prefill_layout": str(engine.config.prefill_layout),
+            "prefill_buckets": list(engine.config.prefill_buckets),
+            "prefill_token_buckets": list(engine.config.prefill_token_buckets),
+            "batch_size_buckets": list(engine.config.batch_size_buckets),
+            "max_blocks_per_seq": int(engine.config.max_blocks_per_seq),
+            "decode_block_table_buckets": list(engine.config.decode_block_table_buckets),
             "linear_chunk_size": int(engine.config.linear_chunk_size),
             "num_speculative_tokens": args.num_speculative_tokens,
             **prompt_info,
-            "greedy_token_fastpath": _env_flag("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH"),
+            "greedy_token_fastpath": bool(engine.config.greedy_token_fastpath),
+            "warmup": warmup_summary,
+            "jit_cache_audit": {
+                "entries_before_measurement": jit_cache_entries_before_measurement,
+                "entries_after_measurement": jit_cache_entries_after_measurement,
+                "growth_during_measurement": jit_cache_growth,
+                "new_keys": jit_cache_new_keys,
+                "fail_on_growth": bool(args.fail_on_jit_cache_growth),
+            },
             "serving_fastpath_flags": {
-                "greedy_token_fastpath": _env_flag("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH"),
-                "materialize_tied_lm_head": _env_flag("NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD"),
-                "compact_prefill_in_proj_qkv": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV"),
-                "compact_prefill_gdn_z": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z"),
-                "compact_prefill_full_attn_proj": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ"),
-                "compact_prefill_mlp": _env_flag("NANO_VLLM_JAX_COMPACT_PREFILL_MLP"),
-                "device_token_carry": _env_flag("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY"),
-                "greedy_decode_burst_steps": os.environ.get(
-                    "NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS",
-                    "1",
-                ),
+                "greedy_token_fastpath": bool(engine.config.greedy_token_fastpath),
+                "materialize_tied_lm_head": bool(engine.config.materialize_tied_lm_head),
+                "compact_prefill_in_proj_qkv": bool(engine.config.compact_prefill_in_proj_qkv),
+                "compact_prefill_gdn_z": bool(engine.config.compact_prefill_gdn_z),
+                "compact_prefill_full_attn_proj": bool(engine.config.compact_prefill_full_attn_proj),
+                "compact_prefill_mlp": bool(engine.config.compact_prefill_mlp),
+                "compact_prefill_token_count_mode": str(engine.config.compact_prefill_token_count_mode),
+                "lm_head_decode_act_dtype": str(engine.config.lm_head_decode_act_dtype),
+                "decode_proj_act_dtype": str(engine.config.decode_proj_act_dtype),
+                "decode_padded_gemm": bool(engine.config.decode_padded_gemm),
+                "decode_padded_gemm_gate_up": bool(engine.config.decode_padded_gemm_gate_up),
+                "decode_padded_gemm_rows": int(engine.config.decode_padded_gemm_rows),
+                "decode_padded_gemm_max_out_dim": int(engine.config.decode_padded_gemm_max_out_dim),
+                "device_token_carry": bool(engine.config.device_token_carry),
+                "static_decode_metadata": bool(engine.config.static_decode_metadata),
+                "static_decode_seq_lens_carry": bool(engine.config.static_decode_seq_lens_carry),
+                "greedy_decode_burst_steps": int(engine.config.greedy_decode_burst_steps),
             },
         },
         "performance": _performance_with_token_scopes(

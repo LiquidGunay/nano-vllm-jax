@@ -1,6 +1,6 @@
 {
   "name": "gpu_paged_gdn_fla_decode_static_metadata",
-  "description": "Strict block-dot FLA prefill route plus explicit BF16-QKV packed-reference GDN decode, padded-GEMM decode projections, and opt-in static decode metadata reuse.",
+  "description": "Strict block-dot FLA prefill route plus packed prefill/decode projections, BF16 model compute, BF16 full-attention KV cache, BF16-QKV conv-fused Triton FLA GDN decode, canonical packed MLP gate/up weights, no-Triton-GEMM XLA lowering, and static decode metadata reuse.",
   "benchmark_script": "benchmarks/benchmark_jax_server_trace.py",
   "reference_json": "results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json",
   "vllm_reference_json": "",
@@ -18,6 +18,9 @@
   "allow_live_jax_default_if_reference_missing": true,
   "runtime": {
     "platform": "cuda",
+    "xla": {
+      "flags": "--xla_gpu_autotune_level=4 --xla_gpu_enable_triton_gemm=false"
+    },
     "fastpaths": {
       "greedy_token": true,
       "materialize_tied_lm_head": true,
@@ -25,10 +28,11 @@
       "compact_prefill_gdn_z": true,
       "compact_prefill_full_attn_proj": true,
       "compact_prefill_mlp": true,
+      "compact_prefill_token_count_mode": "bucket",
       "device_token_carry": true,
       "static_decode_metadata": true,
       "lm_head_decode_act_dtype": "bf16",
-      "decode_proj_act_dtype": "bf16_single_seq",
+      "decode_proj_act_dtype": "bf16",
       "decode_padded_gemm": true,
       "decode_padded_gemm_gate_up": true,
       "decode_padded_gemm_rows": 8,
@@ -38,12 +42,15 @@
   "kernels": {
     "backend": "pure_jax",
     "allow_local_cuda_probes": false,
+    "full_attention": {
+      "kv_cache_dtype": "bf16"
+    },
     "gdn": {
       "disable_fallbacks": true,
       "prefill_post_conv_impl": "triton_fla_padded",
       "prefill_block_dot": true,
       "packed_decode": {
-        "impl": "reference",
+        "impl": "triton_fla_conv_raw_gates",
         "qkv_dtype": "bf16"
       }
     }
@@ -51,10 +58,10 @@
   "args": {
     "model": "Qwen/Qwen3.5-0.8B",
     "backend": "gpu",
-    "dtype": "float32",
+    "dtype": "bfloat16",
     "weight_dtype": "bfloat16",
     "jax_execution": "jit",
-    "input_lens": "64,128,192,256,320,384,512",
+    "input_lens": "64,128,192,256,320,384,448,512",
     "output_len": 32,
     "prompt_suite": "mixed",
     "num_speculative_tokens": 0,
@@ -63,10 +70,18 @@
     "max_num_seqs": 8,
     "max_num_batched_tokens": 4096,
     "prefill_buckets": "64,128,256,384,512",
+    "prefill_token_buckets": "64,128,256,512,1024,2048,4096",
+    "prefill_layout": "packed",
     "batch_size_buckets": "1,2,4,8",
     "max_blocks_per_seq": 40,
+    "greedy_token_fastpath": true,
+    "device_token_carry": true,
+    "static_decode_metadata": true,
+    "static_decode_seq_lens_carry": false,
     "top_k": 5,
     "warmup": true,
-    "profile": true
+    "warmup_mode": "generic",
+    "fail_on_jit_cache_growth": true,
+    "profile": false
   }
 }

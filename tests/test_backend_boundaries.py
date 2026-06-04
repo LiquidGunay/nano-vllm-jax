@@ -1,5 +1,6 @@
 """Backend/cache boundary tests that do not require model weights."""
 
+import importlib.util
 import os
 import sys
 
@@ -21,10 +22,41 @@ from nanovllm_jax.engine.model_runner import ModelRunner
 from nanovllm_jax.engine.scheduler import Scheduler
 from nanovllm_jax.engine.sequence import SamplingParams, Sequence, SequenceStatus
 from nanovllm_jax.engine.scheduled_batch import ScheduledBatch
-from nanovllm_jax.kv_cache import HybridLayerState, KVCacheSpec, cap_num_kv_cache_blocks
-from nanovllm_jax.layers import rms_norm
-from nanovllm_jax.model import forward, init_params
+from nanovllm_jax.kv_cache import (
+    HybridLayerState,
+    KVCacheSpec,
+    cap_num_kv_cache_blocks,
+    init_hybrid_state,
+    init_kv_cache,
+    paged_attention_decode,
+    paged_attention_prefill,
+    paged_attention_prefill_packed,
+)
+from nanovllm_jax.kernels.paged_attention import (
+    dense_block_tables_to_kv_indptr,
+    kv_last_page_len_from_seq_lens,
+    paged_decode_attention_gqa_nhd_reference,
+)
+from nanovllm_jax.layers import causal_conv1d_update, rms_norm
+from nanovllm_jax.model import (
+    _can_use_decode_padded_gemm,
+    _decode_padded_gemm_dot,
+    _packed_causal_conv1d_prefill,
+    forward,
+    init_params,
+)
 from nanovllm_jax.mtp.mtp_layer import init_mtp_params, mtp_forward
+
+
+def _has_cuda_backend() -> bool:
+    try:
+        return bool(jax.devices("gpu"))
+    except Exception:
+        return False
+
+
+def _has_jax_triton() -> bool:
+    return importlib.util.find_spec("jax_triton") is not None
 
 
 def _dense_decode_attention(query, keys, values, seq_lens, scale):
@@ -57,6 +89,7 @@ def _tiny_full_attention_config() -> Qwen3_5Config:
         layer_types=("full_attention",),
         linear_attn_layers=(),
         max_kv_cache_bytes=4 * 2 * 2 * 1 * 8 * 4 * 2,
+        prefill_layout="dense",
     )
 
 
@@ -82,6 +115,7 @@ def _tiny_linear_attention_config() -> Qwen3_5Config:
         layer_types=("linear_attention",),
         linear_attn_layers=(0,),
         max_kv_cache_bytes=4 * 2 * 2 * 1 * 8 * 4 * 2,
+        prefill_layout="dense",
     )
 
 
@@ -142,6 +176,45 @@ def test_kv_cache_block_count_is_capped_by_bytes():
     )
 
     assert cap_num_kv_cache_blocks(spec) == 2
+
+
+def test_full_attention_kv_cache_dtype_override(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_FULL_ATTN_KV_CACHE_DTYPE", "bf16")
+    backend = PureJAXBackend()
+    spec = KVCacheSpec(
+        num_layers=2,
+        num_blocks=4,
+        block_size=2,
+        num_kv_heads=1,
+        head_dim=8,
+        dtype=jnp.float32,
+        max_kv_cache_bytes=4096,
+    )
+
+    cache = backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=4)
+
+    assert cache.k_cache.dtype == jnp.bfloat16
+    assert cache.v_cache.dtype == jnp.bfloat16
+
+
+def test_full_attention_kv_cache_dtype_default_config_uses_spec_dtype(monkeypatch):
+    monkeypatch.delenv("NANO_VLLM_JAX_FULL_ATTN_KV_CACHE_DTYPE", raising=False)
+    config = Qwen3_5Config(full_attention_kv_cache_dtype="default")
+    backend = PureJAXBackend(config)
+    spec = KVCacheSpec(
+        num_layers=2,
+        num_blocks=4,
+        block_size=2,
+        num_kv_heads=1,
+        head_dim=8,
+        dtype=jnp.float32,
+        max_kv_cache_bytes=4096,
+    )
+
+    cache = backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=4)
+
+    assert cache.k_cache.dtype == jnp.float32
+    assert cache.v_cache.dtype == jnp.float32
 
 
 def test_pure_jax_metadata_uses_non_identity_block_tables():
@@ -309,7 +382,7 @@ def _hybrid_state_batch(seq_ids, query_lens) -> ScheduledBatch:
 
 def test_model_runner_hybrid_state_uses_full_table_fast_path():
     runner = _hybrid_state_runner_with_two_slots()
-    batch = _hybrid_state_batch([0, 1], [1, 1])
+    batch = _hybrid_state_batch([8, 1], [1, 1])
 
     batched_state = runner._batch_hybrid_state(batch)
 
@@ -333,7 +406,7 @@ def test_model_runner_hybrid_state_prefers_physical_row_slots_for_new_sequences(
 
     batched_state = runner._batch_hybrid_state(batch)
 
-    assert batched_state is not runner._hybrid_state_table
+    assert batched_state is runner._hybrid_state_table
     assert runner._hybrid_slots == {8: 0, 9: 1}
     assert batch.hybrid_slot_ids_host == (0, 1)
     np.testing.assert_array_equal(np.array(batched_state.conv_state), np.zeros((2, 1, 3, 4), dtype=np.float32))
@@ -374,7 +447,7 @@ def test_model_runner_hybrid_state_zeroes_reused_slot_on_allocation_not_release(
     runner.hybrid_states = {0: object()}
     runner._mtp1_drafts = {0: 123}
     zeroed_slots: list[int] = []
-    runner._zero_hybrid_slot = lambda slot: zeroed_slots.append(slot)
+    runner._zero_hybrid_slots = lambda slots: zeroed_slots.extend(slots)
 
     runner.release([0])
 
@@ -536,6 +609,575 @@ def test_scheduler_chunks_prefill_by_max_batched_tokens_budget():
     assert second_batch_seqs[0].status == SequenceStatus.FINISHED
     assert second_batch_seqs[0].num_cached_tokens == 0
     assert second_batch_seqs[0].block_table == []
+
+
+def test_scheduler_continues_running_prefill_when_waiting_head_needs_kv():
+    config = _tiny_full_attention_config()
+    config.max_num_seqs = 2
+    config.num_kvcache_blocks = 4
+    config.max_blocks_per_seq = 4
+    config.max_num_batched_tokens = 3
+    scheduler = Scheduler(config)
+
+    running = Sequence([1, 2, 3, 4, 5, 6], SamplingParams(temperature=0.0, max_tokens=1), seq_id=0)
+    waiting = Sequence([11, 12, 13, 14], SamplingParams(temperature=0.0, max_tokens=1), seq_id=1)
+    scheduler.add(running)
+    scheduler.add(waiting)
+
+    first_batch_seqs, first_batch = scheduler.schedule()
+    assert first_batch.is_prefill
+    assert [seq.seq_id for seq in first_batch_seqs] == [0]
+    assert int(first_batch.query_lens[0]) == 3
+    assert len(scheduler.block_manager.free_block_ids) == 1
+
+    finished = scheduler.postprocess(first_batch_seqs, [[]], prefill_chunk_lengths=[3])
+    assert finished == [False]
+    assert [seq.seq_id for seq in scheduler.running] == [0]
+    assert [seq.seq_id for seq in scheduler.waiting] == [1]
+
+    second_batch_seqs, second_batch = scheduler.schedule()
+    assert second_batch.is_prefill
+    assert [seq.seq_id for seq in second_batch_seqs] == [0]
+    assert int(second_batch.query_lens[0]) == 3
+    assert second_batch.prefill_final_flags == [True]
+    assert [seq.seq_id for seq in scheduler.waiting] == [1]
+    assert waiting.block_table == []
+
+
+def test_scheduler_prefill_packing_respects_padded_bucket_budget():
+    config = _tiny_full_attention_config()
+    config.max_num_seqs = 2
+    config.num_kvcache_blocks = 20
+    config.max_blocks_per_seq = 8
+    config.max_num_batched_tokens = 8
+    config.prefill_buckets = (4, 8)
+    config.batch_size_buckets = (1, 2)
+    scheduler = Scheduler(config)
+
+    long = Sequence([1, 2, 3, 4, 5], SamplingParams(temperature=0.0, max_tokens=1), seq_id=0)
+    short = Sequence([9], SamplingParams(temperature=0.0, max_tokens=1), seq_id=1)
+    scheduler.add(long)
+    scheduler.add(short)
+
+    seqs, batch = scheduler.schedule()
+
+    assert [seq.seq_id for seq in seqs] == [0]
+    assert batch.tokens.shape == (1, 8)
+    assert int(batch.num_prefill_tokens) == 5
+    assert [seq.seq_id for seq in scheduler.waiting] == [1]
+    assert short.block_table == []
+
+
+def test_scheduler_builds_packed_prefill_token_bucket():
+    config = _tiny_full_attention_config()
+    config.prefill_layout = "packed"
+    config.max_num_seqs = 4
+    config.num_kvcache_blocks = 20
+    config.max_blocks_per_seq = 8
+    config.max_num_batched_tokens = 8
+    config.prefill_token_buckets = (8,)
+    config.batch_size_buckets = (4,)
+    scheduler = Scheduler(config)
+
+    seq_a = Sequence([1, 2, 3, 4, 5], SamplingParams(temperature=0.0, max_tokens=1), seq_id=10)
+    seq_b = Sequence([6, 7], SamplingParams(temperature=0.0, max_tokens=1), seq_id=11)
+    scheduler.add(seq_a)
+    scheduler.add(seq_b)
+
+    seqs, batch = scheduler.schedule()
+
+    assert [seq.seq_id for seq in seqs] == [10, 11]
+    assert batch.packed_prefill
+    assert batch.tokens.shape == (1, 8)
+    assert batch.positions.shape == (1, 8)
+    assert batch.token_row_ids.shape == (1, 8)
+    assert batch.block_tables.shape == (4, 8)
+    assert batch.seq_ids_host == (10, 11, -1, -1)
+    assert batch.query_lens_host == (5, 2, 0, 0)
+    assert int(batch.num_prefill_tokens) == 7
+    np.testing.assert_array_equal(np.array(batch.query_start_loc), np.array([0, 5, 7, 7, 7]))
+    np.testing.assert_array_equal(np.array(batch.token_row_ids), np.array([[0, 0, 0, 0, 0, 1, 1, 0]]))
+
+
+def test_scheduler_packed_prefill_uses_prefill_bucket_as_row_chunk_budget():
+    config = _tiny_full_attention_config()
+    config.prefill_layout = "packed"
+    config.max_num_seqs = 4
+    config.num_kvcache_blocks = 20
+    config.max_blocks_per_seq = 8
+    config.max_num_batched_tokens = 8
+    config.prefill_buckets = (4,)
+    config.prefill_token_buckets = (8,)
+    config.batch_size_buckets = (2,)
+    scheduler = Scheduler(config)
+
+    seq_a = Sequence([1, 2, 3, 4, 5], SamplingParams(temperature=0.0, max_tokens=1), seq_id=10)
+    seq_b = Sequence([6, 7, 8, 9, 10], SamplingParams(temperature=0.0, max_tokens=1), seq_id=11)
+    scheduler.add(seq_a)
+    scheduler.add(seq_b)
+
+    seqs, batch = scheduler.schedule()
+
+    assert [seq.seq_id for seq in seqs] == [10, 11]
+    assert batch.packed_prefill
+    assert batch.query_lens_host == (4, 4)
+    assert int(batch.num_prefill_tokens) == 8
+    np.testing.assert_array_equal(np.array(batch.query_start_loc), np.array([0, 4, 8]))
+
+
+def test_packed_prefill_metadata_uses_paged_slot_mapping():
+    backend = PureJAXBackend()
+    positions = jnp.array([[0, 1, 2, 0]], dtype=jnp.int32)
+    token_row_ids = jnp.array([[0, 0, 1, 0]], dtype=jnp.int32)
+    block_tables = jnp.array([[3, 4], [5, 6]], dtype=jnp.int32)
+    metadata = backend.build_attention_metadata(
+        positions=positions,
+        block_tables=block_tables,
+        seq_lens=jnp.array([2, 3], dtype=jnp.int32),
+        block_size=2,
+        is_prefill=True,
+        query_start_loc=jnp.array([0, 2, 3], dtype=jnp.int32),
+        num_prefill_tokens=3,
+        num_decode_tokens=0,
+        token_row_ids=token_row_ids,
+    )
+
+    np.testing.assert_array_equal(np.array(metadata.slot_mapping), np.array([[6, 7, 12, 6]]))
+    assert metadata.token_row_ids is token_row_ids
+
+
+def test_packed_full_attention_prefill_matches_dense_rows():
+    key = jax.random.PRNGKey(29)
+    block_size = 2
+    num_kv_heads = 1
+    num_heads = 2
+    head_dim = 4
+    num_groups = num_heads // num_kv_heads
+    max_blocks = 3
+    max_kv_len = max_blocks * block_size
+    block_table = jnp.array([[0, 1, 2], [3, 4, 5]], dtype=jnp.int32)
+    k_cache = jax.random.normal(
+        key,
+        (1, 6 * block_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    )
+    v_cache = jax.random.normal(
+        jax.random.fold_in(key, 1),
+        (1, 6 * block_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    )
+    query_packed = jax.random.normal(
+        jax.random.fold_in(key, 2),
+        (1, 6, num_heads, head_dim),
+        dtype=jnp.float32,
+    )
+    positions_packed = jnp.array([[0, 1, 2, 0, 1, 0]], dtype=jnp.int32)
+    token_row_ids = jnp.array([[0, 0, 0, 1, 1, 0]], dtype=jnp.int32)
+    query_start_loc = jnp.array([0, 3, 5], dtype=jnp.int32)
+    seq_lens = jnp.array([3, 2], dtype=jnp.int32)
+
+    actual = paged_attention_prefill_packed(
+        query=query_packed,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_table=block_table,
+        kv_lens=seq_lens,
+        positions=positions_packed,
+        token_row_ids=token_row_ids,
+        query_start_loc=query_start_loc,
+        block_size=block_size,
+        scale=1.0 / np.sqrt(head_dim),
+        num_key_value_groups=num_groups,
+        layer_idx=0,
+        max_query_len=3,
+    )
+
+    query_dense = jnp.zeros((2, 3, num_heads, head_dim), dtype=jnp.float32)
+    query_dense = query_dense.at[0, :3].set(query_packed[0, :3])
+    query_dense = query_dense.at[1, :2].set(query_packed[0, 3:5])
+    positions_dense = jnp.array([[0, 1, 2], [0, 1, 0]], dtype=jnp.int32)
+    dense = paged_attention_prefill(
+        query=query_dense,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_table=block_table,
+        kv_lens=seq_lens,
+        positions=positions_dense,
+        block_size=block_size,
+        scale=1.0 / np.sqrt(head_dim),
+        num_key_value_groups=num_groups,
+        layer_idx=0,
+    )
+    expected = jnp.zeros((1, 6, num_heads * head_dim), dtype=jnp.float32)
+    expected = expected.at[0, :3].set(dense[0, :3])
+    expected = expected.at[0, 3:5].set(dense[1, :2])
+
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=0, atol=1e-6)
+
+
+def test_packed_causal_conv1d_prefill_matches_token_scan():
+    key = jax.random.PRNGKey(37)
+    token_bucket = 8
+    conv_dim = 5
+    kernel_size = 3
+    row_count = 2
+    mixed_qkv = jax.random.normal(
+        key,
+        (1, token_bucket, conv_dim),
+        dtype=jnp.float32,
+    )
+    initial_state = jax.random.normal(
+        jax.random.fold_in(key, 1),
+        (row_count, conv_dim, kernel_size),
+        dtype=jnp.float32,
+    )
+    weight = jax.random.normal(
+        jax.random.fold_in(key, 2),
+        (conv_dim, kernel_size),
+        dtype=jnp.float32,
+    )
+    bias = jax.random.normal(jax.random.fold_in(key, 3), (conv_dim,), dtype=jnp.float32)
+    token_row_ids = jnp.array([[0, 0, 0, 1, 1, 0, 0, 0]], dtype=jnp.int32)
+    query_start_loc = jnp.array([0, 3, 5], dtype=jnp.int32)
+
+    actual_out, actual_state = _packed_causal_conv1d_prefill(
+        mixed_qkv,
+        initial_state,
+        weight,
+        bias,
+        token_row_ids,
+        query_start_loc,
+        max_row_tokens=4,
+    )
+
+    state = initial_state
+    expected_tokens = []
+    safe_rows = token_row_ids.reshape(-1)
+    valid = jnp.arange(token_bucket, dtype=jnp.int32) < query_start_loc[-1]
+    for token_idx in range(token_bucket):
+        row = int(safe_rows[token_idx])
+        previous = state[row]
+        conv_t, next_state = causal_conv1d_update(
+            mixed_qkv[:, token_idx, :].reshape(1, conv_dim, 1),
+            previous[None, :, :],
+            weight,
+            bias,
+            "silu",
+        )
+        if bool(valid[token_idx]):
+            state = state.at[row].set(next_state[0])
+            expected_tokens.append(conv_t[0, :, 0])
+        else:
+            expected_tokens.append(jnp.zeros((conv_dim,), dtype=jnp.float32))
+    expected_out = jnp.stack(expected_tokens, axis=0)[None, :, :]
+
+    np.testing.assert_allclose(np.asarray(actual_out), np.asarray(expected_out), rtol=0, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(actual_state), np.asarray(state), rtol=0, atol=1e-6)
+
+
+def test_decode_padded_gemm_supports_small_decode_batches(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_DECODE_PADDED_GEMM", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS", "8")
+    monkeypatch.setenv("NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM", "16")
+    x = (jnp.arange(4 * 1 * 3, dtype=jnp.float32).reshape(4, 1, 3) / 10.0).astype(jnp.bfloat16)
+    weight = (jnp.arange(3 * 5, dtype=jnp.float32).reshape(3, 5) / 7.0).astype(jnp.bfloat16)
+
+    assert _can_use_decode_padded_gemm(x, weight)
+    actual = _decode_padded_gemm_dot(x, weight)
+    expected = jnp.dot(x.reshape(4, 3), weight).reshape(4, 1, 5)
+
+    np.testing.assert_allclose(
+        np.asarray(actual, dtype=np.float32),
+        np.asarray(expected, dtype=np.float32),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_packed_full_attention_prefill_triton_matches_dense_rows_bf16_cache():
+    key = jax.random.PRNGKey(31)
+    block_size = 2
+    num_kv_heads = 1
+    num_heads = 2
+    head_dim = 8
+    num_groups = num_heads // num_kv_heads
+    block_table = jnp.array([[2, 0, 4], [3, 1, 5]], dtype=jnp.int32)
+    k_cache = jax.random.normal(
+        key,
+        (1, 6, block_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    v_cache = jax.random.normal(
+        jax.random.fold_in(key, 1),
+        (1, 6, block_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    query_packed = jax.random.normal(
+        jax.random.fold_in(key, 2),
+        (1, 8, num_heads, head_dim),
+        dtype=jnp.float32,
+    )
+    positions_packed = jnp.array([[0, 1, 2, 0, 1, 0, 0, 0]], dtype=jnp.int32)
+    token_row_ids = jnp.array([[0, 0, 0, 1, 1, 0, 0, 0]], dtype=jnp.int32)
+    query_start_loc = jnp.array([0, 3, 5], dtype=jnp.int32)
+    seq_lens = jnp.array([3, 2], dtype=jnp.int32)
+
+    actual = paged_attention_prefill_packed(
+        query=query_packed,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_table=block_table,
+        kv_lens=seq_lens,
+        positions=positions_packed,
+        token_row_ids=token_row_ids,
+        query_start_loc=query_start_loc,
+        block_size=block_size,
+        scale=1.0 / np.sqrt(head_dim),
+        num_key_value_groups=num_groups,
+        layer_idx=0,
+        max_query_len=3,
+    )
+
+    query_dense = jnp.zeros((2, 3, num_heads, head_dim), dtype=jnp.float32)
+    query_dense = query_dense.at[0, :3].set(query_packed[0, :3])
+    query_dense = query_dense.at[1, :2].set(query_packed[0, 3:5])
+    positions_dense = jnp.array([[0, 1, 2], [0, 1, 0]], dtype=jnp.int32)
+    dense = paged_attention_prefill(
+        query=query_dense.astype(jnp.bfloat16),
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_table=block_table,
+        kv_lens=seq_lens,
+        positions=positions_dense,
+        block_size=block_size,
+        scale=1.0 / np.sqrt(head_dim),
+        num_key_value_groups=num_groups,
+        layer_idx=0,
+    )
+    expected = jnp.zeros((1, 8, num_heads * head_dim), dtype=dense.dtype)
+    expected = expected.at[0, :3].set(dense[0, :3])
+    expected = expected.at[0, 3:5].set(dense[1, :2])
+
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_paged_decode_attention_triton_matches_reference_bf16_cache():
+    from nanovllm_jax.kernels.full_attention_triton import paged_decode_attention_triton
+
+    key = jax.random.PRNGKey(41)
+    block_size = 2
+    num_kv_heads = 1
+    num_heads = 2
+    head_dim = 16
+    num_groups = num_heads // num_kv_heads
+    block_table = jnp.array([[2, 0, 4], [3, 1, 5], [0, 0, 0]], dtype=jnp.int32)
+    seq_lens = jnp.array([5, 3, 0], dtype=jnp.int32)
+    k_cache = jax.random.normal(
+        key,
+        (1, 6, block_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    v_cache = jax.random.normal(
+        jax.random.fold_in(key, 1),
+        (1, 6, block_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    query = jax.random.normal(
+        jax.random.fold_in(key, 2),
+        (3, 1, num_heads, head_dim),
+        dtype=jnp.float32,
+    )
+
+    actual = paged_decode_attention_triton(
+        query=query,
+        k_cache_layer=k_cache[0],
+        v_cache_layer=v_cache[0],
+        block_table=block_table,
+        seq_lens=seq_lens,
+        block_size=block_size,
+        scale=1.0 / np.sqrt(head_dim),
+        num_key_value_groups=num_groups,
+    )
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(block_table)
+    expected = paged_decode_attention_gqa_nhd_reference(
+        query[:, 0],
+        k_cache[0],
+        v_cache[0],
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len_from_seq_lens(seq_lens, block_size),
+        seq_lens,
+        1.0 / np.sqrt(head_dim),
+        max_pages_per_sequence=block_table.shape[1],
+    ).reshape(3, 1, num_heads * head_dim)
+
+    np.testing.assert_allclose(
+        np.asarray(actual[:2], dtype=np.float32),
+        np.asarray(expected[:2], dtype=np.float32),
+        rtol=3e-2,
+        atol=3e-2,
+    )
+
+
+def test_packed_prefill_gdn_reference_updates_rows_independently():
+    config = _tiny_linear_attention_config()
+    config.prefill_layout = "packed"
+    config.num_kvcache_blocks = 8
+    params = init_params(jax.random.PRNGKey(17), config)
+    executor = ModelExecutor(config, params, backend="pure_jax")
+    cache = init_kv_cache(
+        config.num_kvcache_blocks,
+        config.block_size,
+        config.num_key_value_heads,
+        config.head_dim,
+        max_seqs=2,
+        max_blocks_per_seq=4,
+        dtype=jnp.float32,
+    ).storage
+    hybrid = init_hybrid_state(config, batch_size=2, dtype=jnp.float32)
+    batch = ScheduledBatch(
+        tokens=jnp.array([[1, 2, 3, 4, 5, 0]], dtype=jnp.int32),
+        positions=jnp.array([[0, 1, 2, 0, 1, 0]], dtype=jnp.int32),
+        seq_ids=jnp.array([10, 11], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 3, 5], dtype=jnp.int32),
+        is_prefill=True,
+        num_prefill_tokens=5,
+        num_decode_tokens=0,
+        block_tables=jnp.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=jnp.int32),
+        seq_lens=jnp.array([3, 2], dtype=jnp.int32),
+        seq_ids_host=(10, 11),
+        query_lens_host=(3, 2),
+        seq_lens_host=(3, 2),
+        packed_prefill=True,
+        token_row_ids=jnp.array([[0, 0, 0, 1, 1, 0]], dtype=jnp.int32),
+    )
+
+    out = executor.forward_step(
+        batch,
+        cache_storage=cache,
+        hybrid_state=hybrid,
+        last_logits_only=True,
+    )
+
+    assert out.activations.shape == (2, 1, config.vocab_size)
+    assert out.hybrid_state.conv_state.shape[0] == 2
+    assert out.hybrid_state.recurrent_state.shape[0] == 2
+    assert float(jnp.max(jnp.abs(out.hybrid_state.conv_state[0] - out.hybrid_state.conv_state[1]))) > 0.0
+
+
+def test_packed_prefill_gdn_post_conv_reference_matches_scan(monkeypatch):
+    config = _tiny_linear_attention_config()
+    config.prefill_layout = "packed"
+    config.num_kvcache_blocks = 8
+    params = init_params(jax.random.PRNGKey(23), config)
+
+    def make_batch():
+        return ScheduledBatch(
+            tokens=jnp.array([[1, 2, 3, 4, 5, 0]], dtype=jnp.int32),
+            positions=jnp.array([[0, 1, 2, 0, 1, 0]], dtype=jnp.int32),
+            seq_ids=jnp.array([10, 11], dtype=jnp.int32),
+            query_start_loc=jnp.array([0, 3, 5], dtype=jnp.int32),
+            is_prefill=True,
+            num_prefill_tokens=5,
+            num_decode_tokens=0,
+            block_tables=jnp.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=jnp.int32),
+            seq_lens=jnp.array([3, 2], dtype=jnp.int32),
+            seq_ids_host=(10, 11),
+            query_lens_host=(3, 2),
+            seq_lens_host=(3, 2),
+            packed_prefill=True,
+            token_row_ids=jnp.array([[0, 0, 0, 1, 1, 0]], dtype=jnp.int32),
+        )
+
+    def run_once():
+        executor = ModelExecutor(config, params, backend="pure_jax")
+        cache = init_kv_cache(
+            config.num_kvcache_blocks,
+            config.block_size,
+            config.num_key_value_heads,
+            config.head_dim,
+            max_seqs=2,
+            max_blocks_per_seq=4,
+            dtype=jnp.float32,
+        ).storage
+        hybrid = init_hybrid_state(config, batch_size=2, dtype=jnp.float32)
+        return executor.forward_step(
+            make_batch(),
+            cache_storage=cache,
+            hybrid_state=hybrid,
+            last_logits_only=True,
+        )
+
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL", raising=False)
+    scan_out = run_once()
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL", "reference")
+    backend_out = run_once()
+
+    np.testing.assert_allclose(
+        np.asarray(backend_out.activations),
+        np.asarray(scan_out.activations),
+        rtol=0,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(backend_out.hybrid_state.conv_state),
+        np.asarray(scan_out.hybrid_state.conv_state),
+        rtol=0,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(backend_out.hybrid_state.recurrent_state),
+        np.asarray(scan_out.hybrid_state.recurrent_state),
+        rtol=0,
+        atol=1e-5,
+    )
+
+
+def test_packed_prefill_greedy_token_jit_returns_row_tokens():
+    config = _tiny_linear_attention_config()
+    config.prefill_layout = "packed"
+    config.num_kvcache_blocks = 8
+    params = init_params(jax.random.PRNGKey(19), config)
+    executor = ModelExecutor(config, params, backend="pure_jax")
+    cache = init_kv_cache(
+        config.num_kvcache_blocks,
+        config.block_size,
+        config.num_key_value_heads,
+        config.head_dim,
+        max_seqs=2,
+        max_blocks_per_seq=4,
+        dtype=jnp.float32,
+    ).storage
+    hybrid = init_hybrid_state(config, batch_size=2, dtype=jnp.float32)
+    batch = ScheduledBatch(
+        tokens=jnp.array([[1, 2, 3, 4, 5, 0]], dtype=jnp.int32),
+        positions=jnp.array([[0, 1, 2, 0, 1, 0]], dtype=jnp.int32),
+        seq_ids=jnp.array([10, 11], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 3, 5], dtype=jnp.int32),
+        is_prefill=True,
+        num_prefill_tokens=5,
+        num_decode_tokens=0,
+        block_tables=jnp.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=jnp.int32),
+        seq_lens=jnp.array([3, 2], dtype=jnp.int32),
+        seq_ids_host=(10, 11),
+        query_lens_host=(3, 2),
+        seq_lens_host=(3, 2),
+        packed_prefill=True,
+        token_row_ids=jnp.array([[0, 0, 0, 1, 1, 0]], dtype=jnp.int32),
+    )
+
+    out = executor.forward_step_token_ids_jit(
+        batch,
+        cache_storage=cache,
+        hybrid_state=hybrid,
+    )
+
+    assert out.activations.shape == (2,)
+    assert out.activations.dtype == jnp.int32
 
 
 def test_scheduler_does_not_admit_waiting_prompts_when_active_slots_are_full():
@@ -957,8 +1599,13 @@ def test_executor_table_hybrid_decode_matches_sliced_decode():
         cache_storage=executor.backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=3),
         hybrid_state=base_hybrid,
     )
+    ref_prompt_tokens = (
+        ref_prompt.activations[:, None]
+        if ref_prompt.activations.ndim == 1
+        else ref_prompt.activations
+    )
     decode_batch = ScheduledBatch(
-        tokens=ref_prompt.activations[:, None],
+        tokens=ref_prompt_tokens,
         positions=jnp.array([[3]], dtype=jnp.int32),
         seq_ids=jnp.array([0], dtype=jnp.int32),
         query_start_loc=jnp.array([0, 1], dtype=jnp.int32),
@@ -1245,6 +1892,253 @@ def test_model_runner_warmup_uses_requested_prefill_len_without_buckets():
     runner.warmup_compilation(max_prefill_len=3, max_batch=1)
 
     assert runner.executor.calls == [((1, 3), True), ((1, 1), False)]
+
+
+def test_model_runner_warmup_uses_greedy_token_fastpath_without_mtp(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH", "1")
+    config = _tiny_full_attention_config()
+    config.jax_execution = "jit"
+    config.prefill_buckets = (4,)
+    config.batch_size_buckets = (2,)
+    config.max_blocks_per_seq = 2
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = config
+    runner.block_size = config.block_size
+    runner.max_blocks_per_seq = 2
+    runner.execution = "jit"
+    runner.cache_storage = object()
+    runner._warmup_compiled = False
+    runner.mtp1_enabled = False
+    runner._hybrid_state_table = None
+
+    class Ready:
+        def block_until_ready(self):
+            return self
+
+    class FakeExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def forward_step_jit(self, batch, **kwargs):
+            self.calls.append(("logits", tuple(batch.tokens.shape), batch.is_prefill))
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                },
+            )()
+
+        def forward_step_token_ids_jit(self, batch, **kwargs):
+            self.calls.append(("token_ids", tuple(batch.tokens.shape), batch.is_prefill))
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                },
+            )()
+
+    runner.executor = FakeExecutor()
+    runner._sample_fn = lambda logits, temperatures: Ready()
+
+    summary = runner.warmup_compilation(max_prefill_len=4, max_batch=2)
+
+    assert runner.executor.calls == [
+        ("token_ids", (2, 4), True),
+        ("token_ids", (2, 1), False),
+    ]
+    assert summary["prefill_runs"][0]["route"] == "forward_step_token_ids_jit:prefill"
+    assert summary["decode_runs"][0]["route"] == "forward_step_token_ids_jit:decode"
+
+
+def test_model_runner_warmup_compiles_decode_block_table_buckets(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH", "1")
+    config = _tiny_full_attention_config()
+    config.jax_execution = "jit"
+    config.prefill_buckets = (4,)
+    config.batch_size_buckets = (2,)
+    config.max_blocks_per_seq = 4
+    config.decode_block_table_buckets = (2, 4)
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = config
+    runner.block_size = config.block_size
+    runner.max_blocks_per_seq = 4
+    runner.execution = "jit"
+    runner.cache_storage = object()
+    runner._warmup_compiled = False
+    runner.mtp1_enabled = False
+    runner._hybrid_state_table = None
+
+    class Ready:
+        def block_until_ready(self):
+            return self
+
+    class FakeExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def forward_step_token_ids_jit(self, batch, **kwargs):
+            self.calls.append(
+                (
+                    tuple(batch.tokens.shape),
+                    tuple(batch.block_tables.shape),
+                    batch.is_prefill,
+                )
+            )
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                },
+            )()
+
+    runner.executor = FakeExecutor()
+    runner._sample_fn = lambda logits, temperatures: Ready()
+
+    summary = runner.warmup_compilation(max_prefill_len=4, max_batch=2)
+
+    assert runner.executor.calls == [
+        ((2, 4), (2, 4), True),
+        ((2, 1), (2, 2), False),
+        ((2, 1), (2, 4), False),
+    ]
+    assert summary["decode_block_table_buckets"] == [2, 4]
+    assert [run["block_tables_shape"] for run in summary["decode_runs"]] == [[2, 2], [2, 4]]
+
+
+def test_model_runner_warmup_compiles_greedy_decode_burst(monkeypatch):
+    monkeypatch.delenv("NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS", raising=False)
+    config = _tiny_full_attention_config()
+    config.jax_execution = "jit"
+    config.prefill_buckets = (4,)
+    config.batch_size_buckets = (2,)
+    config.max_blocks_per_seq = 2
+    config.greedy_token_fastpath = True
+    config.greedy_decode_burst_steps = 2
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = config
+    runner.block_size = config.block_size
+    runner.max_blocks_per_seq = 2
+    runner.execution = "jit"
+    runner.cache_storage = object()
+    runner._warmup_compiled = False
+    runner.mtp1_enabled = False
+    runner._hybrid_state_table = None
+
+    class Ready:
+        def block_until_ready(self):
+            return self
+
+    class FakeExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def forward_step_token_ids_jit(self, batch, **kwargs):
+            self.calls.append(("token_ids", tuple(batch.tokens.shape), batch.is_prefill))
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                },
+            )()
+
+        def forward_greedy_decode_burst_jit(self, batch, **kwargs):
+            self.calls.append(
+                (
+                    "burst",
+                    tuple(batch.tokens.shape),
+                    batch.is_prefill,
+                    int(kwargs["decode_steps"]),
+                )
+            )
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                    "hybrid_state": kwargs["hybrid_state"],
+                },
+            )()
+
+    runner.executor = FakeExecutor()
+    runner._sample_fn = lambda logits, temperatures: Ready()
+
+    summary = runner.warmup_compilation(max_prefill_len=4, max_batch=2)
+
+    assert runner.executor.calls == [
+        ("token_ids", (2, 4), True),
+        ("burst", (2, 1), False, 2),
+        ("token_ids", (2, 1), False),
+    ]
+    assert summary["decode_runs"][0]["route"] == "forward_greedy_decode_burst_jit:decode"
+    assert summary["decode_runs"][0]["decode_steps"] == 2
+    assert summary["decode_runs"][1]["route"] == "forward_step_token_ids_jit:decode"
+    assert summary["decode_runs"][1]["decode_steps"] == 1
+
+
+def test_model_runner_batch_hybrid_state_reuses_fresh_full_slot_table():
+    config = _tiny_linear_attention_config()
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = config
+    runner._hybrid_state_table = init_hybrid_state(config, batch_size=2, dtype=config.get_dtype())
+    runner._max_hybrid_slots = 2
+    runner._hybrid_slots = {}
+    runner._free_hybrid_slots = [0, 1]
+    batch = ScheduledBatch(
+        tokens=jnp.zeros((2, 1), dtype=jnp.int32),
+        positions=jnp.zeros((2, 1), dtype=jnp.int32),
+        seq_ids=jnp.array([7, 8], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 2], dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=2,
+        block_tables=jnp.zeros((2, 2), dtype=jnp.int32),
+        seq_lens=jnp.ones((2,), dtype=jnp.int32),
+        seq_ids_host=(7, 8),
+        query_lens_host=(1, 1),
+    )
+
+    state = runner._batch_hybrid_state(batch)
+
+    assert state is runner._hybrid_state_table
+    assert batch.hybrid_slot_ids_host == (0, 1)
+    assert runner._hybrid_slots == {7: 0, 8: 1}
+    assert runner._free_hybrid_slots == []
+
+
+def test_compact_prefill_token_count_can_use_bucket_mode(monkeypatch):
+    from nanovllm_jax.engine.model_executor import _static_prefill_token_count_for_batch
+
+    batch = ScheduledBatch(
+        tokens=jnp.zeros((2, 4), dtype=jnp.int32),
+        positions=jnp.zeros((2, 4), dtype=jnp.int32),
+        seq_ids=jnp.array([0, 1], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 3, 5], dtype=jnp.int32),
+        is_prefill=True,
+        num_prefill_tokens=5,
+        num_decode_tokens=0,
+        block_tables=jnp.zeros((2, 2), dtype=jnp.int32),
+        seq_lens=jnp.array([3, 2], dtype=jnp.int32),
+        query_lens_host=(3, 2),
+        seq_ids_host=(0, 1),
+        seq_lens_host=(3, 2),
+    )
+
+    monkeypatch.setenv("NANO_VLLM_JAX_COMPACT_PREFILL_MLP", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_COMPACT_PREFILL_TOKEN_COUNT_MODE", "exact")
+    assert _static_prefill_token_count_for_batch(batch) == 5
+
+    monkeypatch.setenv("NANO_VLLM_JAX_COMPACT_PREFILL_TOKEN_COUNT_MODE", "bucket")
+    assert _static_prefill_token_count_for_batch(batch) == 8
+    assert _static_prefill_token_count_for_batch(batch, max_num_batched_tokens=6) == 6
 
 
 def test_model_runner_direct_batch_builder_uses_static_buckets():
@@ -1786,6 +2680,15 @@ def test_executor_greedy_decode_burst_matches_iterative_token_path():
         ),
         hybrid_state=empty_hybrid,
     )
+    table_burst_prompt = executor.forward_step_token_ids_jit(
+        prompt_batch,
+        cache_storage=executor.backend.allocate_kv_cache(
+            spec,
+            max_seqs=1,
+            max_blocks_per_seq=3,
+        ),
+        hybrid_state=empty_hybrid,
+    )
     def decode_batch(tokens, positions, seq_lens, *, decode_steps=1):
         return ScheduledBatch(
             tokens=tokens,
@@ -1805,7 +2708,11 @@ def test_executor_greedy_decode_burst_matches_iterative_token_path():
 
     ref_cache = ref_prompt.cache_storage
     ref_hybrid = ref_prompt.hybrid_state
-    ref_tokens_in = ref_prompt.activations[:, None]
+    ref_tokens_in = (
+        ref_prompt.activations[:, None]
+        if ref_prompt.activations.ndim == 1
+        else ref_prompt.activations
+    )
     ref_positions = jnp.array([[3]], dtype=jnp.int32)
     ref_seq_lens = jnp.array([4], dtype=jnp.int32)
     ref_generated = []
@@ -1815,8 +2722,16 @@ def test_executor_greedy_decode_burst_matches_iterative_token_path():
             cache_storage=ref_cache,
             hybrid_state=ref_hybrid,
         )
-        ref_generated.append(ref_out.activations)
-        ref_tokens_in = ref_out.activations[:, None]
+        ref_generated.append(
+            ref_out.activations[:, 0]
+            if ref_out.activations.ndim == 2
+            else ref_out.activations
+        )
+        ref_tokens_in = (
+            ref_out.activations[:, None]
+            if ref_out.activations.ndim == 1
+            else ref_out.activations
+        )
         ref_positions = ref_positions + 1
         ref_seq_lens = ref_seq_lens + 1
         ref_cache = ref_out.cache_storage
@@ -1825,7 +2740,9 @@ def test_executor_greedy_decode_burst_matches_iterative_token_path():
 
     burst_out = executor.forward_greedy_decode_burst_jit(
         decode_batch(
-            burst_prompt.activations[:, None],
+            burst_prompt.activations[:, None]
+            if burst_prompt.activations.ndim == 1
+            else burst_prompt.activations,
             jnp.array([[3]], dtype=jnp.int32),
             jnp.array([4], dtype=jnp.int32),
             decode_steps=3,
@@ -1834,9 +2751,27 @@ def test_executor_greedy_decode_burst_matches_iterative_token_path():
         hybrid_state=burst_prompt.hybrid_state,
         decode_steps=3,
     )
+    table_burst_out = executor.forward_greedy_decode_burst_table_jit(
+        decode_batch(
+            table_burst_prompt.activations[:, None]
+            if table_burst_prompt.activations.ndim == 1
+            else table_burst_prompt.activations,
+            jnp.array([[3]], dtype=jnp.int32),
+            jnp.array([4], dtype=jnp.int32),
+            decode_steps=3,
+        ),
+        cache_storage=table_burst_prompt.cache_storage,
+        hybrid_state_table=table_burst_prompt.hybrid_state,
+        hybrid_slot_ids=jnp.array([0], dtype=jnp.int32),
+        decode_steps=3,
+    )
 
     np.testing.assert_array_equal(
         np.asarray(burst_out.activations),
+        np.asarray(ref_generated),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(table_burst_out.activations),
         np.asarray(ref_generated),
     )
     np.testing.assert_allclose(
@@ -1847,6 +2782,18 @@ def test_executor_greedy_decode_burst_matches_iterative_token_path():
     )
     np.testing.assert_allclose(
         np.asarray(burst_out.cache_storage.v_cache),
+        np.asarray(ref_cache.v_cache),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(table_burst_out.cache_storage.k_cache),
+        np.asarray(ref_cache.k_cache),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(table_burst_out.cache_storage.v_cache),
         np.asarray(ref_cache.v_cache),
         rtol=1e-5,
         atol=1e-5,
@@ -1994,6 +2941,23 @@ def test_no_prefix_cache_allocation_requires_free_blocks_for_repeated_prompts():
 
     assert len(block_manager.free_block_ids) == 0
     assert not block_manager.can_allocate(seq_b, use_prefix_cache=False)
+
+
+def test_block_manager_hashes_completed_prompt_tail_before_next_block():
+    block_manager = BlockManager(num_blocks=3, block_size=2)
+    seq = Sequence([1], SamplingParams(temperature=0.0), seq_id=1)
+    block_manager.allocate(seq, use_prefix_cache=False)
+    assert block_manager.blocks[seq.block_table[-1]].hash == -1
+
+    seq.append_token(2)
+    block_manager.may_append_slots(seq, 1)
+    completed_block = seq.block_table[-1]
+    assert block_manager.blocks[completed_block].hash != -1
+
+    seq.append_token(3)
+    block_manager.may_append_slots(seq, 1)
+    assert len(seq.block_table) == 2
+    assert seq.block_table[0] == completed_block
 
 
 def test_server_generate_accepts_batched_prompts(monkeypatch):

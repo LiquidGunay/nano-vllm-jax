@@ -53,12 +53,13 @@ def _parse_buckets(value: str) -> tuple[int, ...]:
 
 def _validate_server_args(args):
     prefill_buckets = _parse_buckets(args.prefill_buckets)
+    prefill_token_buckets = _parse_buckets(args.prefill_token_buckets)
     batch_size_buckets = _parse_buckets(args.batch_size_buckets)
     if batch_size_buckets and max(batch_size_buckets) > args.max_num_seqs:
         raise ValueError("--batch-size-buckets cannot exceed --max-num-seqs")
     if getattr(args, "max_tokens_default", app.config["MAX_TOKENS_DEFAULT"]) <= 0:
         raise ValueError("--max-tokens-default must be positive")
-    return prefill_buckets, batch_size_buckets
+    return prefill_buckets, prefill_token_buckets, batch_size_buckets
 
 
 def _is_token_ids(value: Any) -> bool:
@@ -184,7 +185,7 @@ def _sampling_params_for_inputs(data: dict, inputs: list[str | list[int]]) -> tu
 
 def load_engine(args) -> LLMEngine:
     global engine
-    prefill_buckets, batch_size_buckets = _validate_server_args(args)
+    prefill_buckets, prefill_token_buckets, batch_size_buckets = _validate_server_args(args)
     max_kv_cache_bytes = int(args.max_kv_cache_mb * 1024 * 1024)
     engine = LLMEngine(
         args.model,
@@ -196,14 +197,25 @@ def load_engine(args) -> LLMEngine:
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
         prefill_buckets=prefill_buckets,
+        prefill_token_buckets=prefill_token_buckets,
+        prefill_layout=args.prefill_layout,
         batch_size_buckets=batch_size_buckets,
         jax_execution=args.jax_execution,
         num_speculative_tokens=args.num_speculative_tokens,
+        greedy_token_fastpath=args.greedy_token_fastpath,
+        device_token_carry=args.device_token_carry,
+        static_decode_metadata=args.static_decode_metadata,
+        static_decode_seq_lens_carry=args.static_decode_seq_lens_carry,
     )
     if not args.skip_compile:
-        engine.model_runner.warmup_compilation(
-            max_prefill_len=max(prefill_buckets or (args.max_prefill,)),
+        warmup_summary = engine.warmup_compilation(
+            max_prefill_len=max(prefill_token_buckets or prefill_buckets or (args.max_prefill,)),
             max_batch=max(batch_size_buckets or (args.max_num_seqs,)),
+        )
+        print(
+            "Generic startup warmup complete: "
+            f"{warmup_summary.get('seconds', 0.0):.2f}s, "
+            f"jit_cache_entries={warmup_summary.get('jit_cache_entries_after')}"
         )
     return engine
 
@@ -448,6 +460,8 @@ def main():
     parser.add_argument("--weight-dtype", choices=["float16", "bfloat16", "float32"], default=cfg.engine.get("weight_dtype"))
     parser.add_argument("--jax-execution", choices=["eager", "decode-jit", "jit"], default=cfg.engine["jax_execution"])
     parser.add_argument("--prefill-buckets", default=cfg.engine["prefill_buckets"])
+    parser.add_argument("--prefill-token-buckets", default=cfg.engine["prefill_token_buckets"])
+    parser.add_argument("--prefill-layout", choices=["packed", "dense"], default=cfg.engine["prefill_layout"])
     parser.add_argument("--batch-size-buckets", default=cfg.engine["batch_size_buckets"])
     parser.add_argument("--max-prefill", type=int, default=cfg.engine["max_prefill"])
     parser.add_argument("--max-kv-cache-mb", type=int, default=cfg.engine["max_kv_cache_mb"])
@@ -456,6 +470,10 @@ def main():
     parser.add_argument("--max-num-batched-tokens", type=int, default=cfg.engine["max_num_batched_tokens"])
     parser.add_argument("--max-tokens-default", type=int, default=cfg.server["max_tokens_default"])
     parser.add_argument("--num-speculative-tokens", type=int, choices=[0, 1], default=cfg.engine["num_speculative_tokens"])
+    parser.add_argument("--greedy-token-fastpath", action=argparse.BooleanOptionalAction, default=cfg.engine["greedy_token_fastpath"])
+    parser.add_argument("--device-token-carry", action=argparse.BooleanOptionalAction, default=cfg.engine["device_token_carry"])
+    parser.add_argument("--static-decode-metadata", action=argparse.BooleanOptionalAction, default=cfg.engine["static_decode_metadata"])
+    parser.add_argument("--static-decode-seq-lens-carry", action=argparse.BooleanOptionalAction, default=cfg.engine["static_decode_seq_lens_carry"])
     parser.add_argument("--skip-compile", action="store_true", default=cfg.engine.get("skip_compile", False))
     parser.add_argument("--config", default=None, help="Path to server_config.yaml (overrides NANO_VLLM_JAX_SERVER_CONFIG)")
     args = parser.parse_args()
@@ -465,7 +483,16 @@ def main():
     print("nano-vllm-jax LLMEngine server")
     print(f"config_source={_server_cfg.source}")
     print(f"model={args.model} dtype={args.dtype} weight_dtype={args.weight_dtype or args.dtype} execution={args.jax_execution}")
-    print(f"prefill_buckets={args.prefill_buckets} batch_size_buckets={args.batch_size_buckets}")
+    print(
+        f"prefill_layout={args.prefill_layout} prefill_token_buckets={args.prefill_token_buckets} "
+        f"prefill_buckets={args.prefill_buckets} batch_size_buckets={args.batch_size_buckets}"
+    )
+    print(
+        f"serving_fastpaths=greedy_token:{args.greedy_token_fastpath} "
+        f"device_token_carry:{args.device_token_carry} "
+        f"static_decode_metadata:{args.static_decode_metadata} "
+        f"static_decode_seq_lens_carry:{args.static_decode_seq_lens_carry}"
+    )
     load_engine(args)
     print(f"server_ready=http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, threaded=False)
