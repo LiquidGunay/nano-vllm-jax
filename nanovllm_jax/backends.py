@@ -192,6 +192,12 @@ def _gdn_disable_fallbacks(config=None) -> bool:
     )
 
 
+def gdn_disable_fallbacks_enabled(config=None) -> bool:
+    """Return whether GDN kernel requests must fail instead of falling back."""
+
+    return _gdn_disable_fallbacks(config)
+
+
 def _raise_if_gdn_fallback_disabled(reason: str, config=None) -> None:
     if _gdn_disable_fallbacks(config):
         raise RuntimeError(
@@ -247,13 +253,27 @@ def _gdn_packed_decode_impl(config=None) -> str:
         "triton_fla_conv",
     }:
         return "triton_fla_conv_raw_gates"
+    if normalized in {
+        "triton_fla_conv_raw_gates_tail",
+        "triton_conv_raw_gates_tail",
+        "fla_triton_conv_raw_gates_tail",
+        "triton_fla_conv_tail",
+        "triton_fla_conv_tail_fused",
+    }:
+        return "triton_fla_conv_raw_gates_tail"
     if normalized in {"cuda", "cuda_fp32", "fast"}:
         return "cuda_fp32"
     raise ValueError(
         f"Unknown {_GDN_PACKED_DECODE_IMPL_ENV}={value!r}; "
         "expected off, reference, triton_fla, triton_fla_raw_gates, "
-        "triton_fla_conv_raw_gates, or cuda_fp32"
+        "triton_fla_conv_raw_gates, triton_fla_conv_raw_gates_tail, or cuda_fp32"
     )
+
+
+def gdn_packed_decode_impl(config=None) -> str:
+    """Return the normalized packed GDN decode implementation name."""
+
+    return _gdn_packed_decode_impl(config)
 
 
 def gdn_packed_decode_enabled(config=None) -> bool:
@@ -261,7 +281,14 @@ def gdn_packed_decode_enabled(config=None) -> bool:
 
 
 def gdn_packed_decode_conv_enabled(config=None) -> bool:
-    return _gdn_packed_decode_impl(config) == "triton_fla_conv_raw_gates"
+    return _gdn_packed_decode_impl(config) in {
+        "triton_fla_conv_raw_gates",
+        "triton_fla_conv_raw_gates_tail",
+    }
+
+
+def gdn_packed_decode_tail_fused_enabled(config=None) -> bool:
+    return _gdn_packed_decode_impl(config) == "triton_fla_conv_raw_gates_tail"
 
 
 def gdn_packed_decode_max_batch(config=None) -> int | None:
@@ -755,6 +782,8 @@ class InferenceBackend(Protocol):
         *,
         qkv_dim: int,
         use_qk_l2norm_in_kernel: bool,
+        norm_weight: jnp.ndarray | None = None,
+        rms_norm_eps: float = 1.0e-6,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         ...
 
@@ -2331,10 +2360,11 @@ class PureJAXBackend:
         use_qk_l2norm_in_kernel: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         impl = _gdn_packed_decode_impl(self.config)
-        if impl != "triton_fla_conv_raw_gates":
+        if impl not in {"triton_fla_conv_raw_gates", "triton_fla_conv_raw_gates_tail"}:
             raise RuntimeError(
                 "gated_delta_conv_packed_decode is only enabled by "
-                f"{_GDN_PACKED_DECODE_IMPL_ENV}=triton_fla_conv_raw_gates"
+                f"{_GDN_PACKED_DECODE_IMPL_ENV}=triton_fla_conv_raw_gates or "
+                "triton_fla_conv_raw_gates_tail"
             )
         if not use_qk_l2norm_in_kernel:
             raise ValueError("conv packed GDN decode requires q/k l2norm")
@@ -2413,38 +2443,89 @@ class PureJAXBackend:
         *,
         qkv_dim: int,
         use_qk_l2norm_in_kernel: bool,
+        norm_weight: jnp.ndarray | None = None,
+        rms_norm_eps: float = 1.0e-6,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         impl = _gdn_packed_decode_impl(self.config)
-        if impl != "triton_fla_conv_raw_gates":
+        if impl not in {"triton_fla_conv_raw_gates", "triton_fla_conv_raw_gates_tail"}:
             raise RuntimeError(
                 "gated_delta_conv_packed_projection_decode is only enabled by "
-                f"{_GDN_PACKED_DECODE_IMPL_ENV}=triton_fla_conv_raw_gates"
+                f"{_GDN_PACKED_DECODE_IMPL_ENV}=triton_fla_conv_raw_gates or "
+                "triton_fla_conv_raw_gates_tail"
             )
         if not use_qk_l2norm_in_kernel:
             raise ValueError("conv packed GDN decode requires q/k l2norm")
+        tail_fused = impl == "triton_fla_conv_raw_gates_tail"
+        if tail_fused and norm_weight is None:
+            raise ValueError("tail-fused packed-projection GDN decode requires norm_weight")
 
-        def reference() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        def reference_core() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+            from nanovllm_jax.layers import causal_conv1d_update
+            from nanovllm_jax.kernels.gdn_fla import (
+                gdn_packed_decode_pre_normalize_qk,
+                gdn_packed_decode_reference_from_decay,
+            )
+
             mixed_qkv = packed_proj[:, :qkv_dim]
             value_heads = recurrent_state.shape[1]
             a = packed_proj[:, qkv_dim : qkv_dim + value_heads].astype(jnp.float32)
             b = packed_proj[:, qkv_dim + value_heads : qkv_dim + 2 * value_heads].astype(jnp.float32)
-            return self.gated_delta_conv_packed_decode(
-                mixed_qkv,
+            conv_out_t, new_conv_state = causal_conv1d_update(
+                mixed_qkv[:, :, None],
+                conv_state,
+                conv_weight,
+                conv_bias,
+                "silu",
+            )
+            conv_out = gdn_packed_decode_pre_normalize_qk(
+                conv_out_t[:, :, 0].astype(jnp.float32),
+                recurrent_state,
+            )
+            out, new_recurrent_state = gdn_packed_decode_reference_from_decay(
+                conv_out,
                 a,
                 b,
                 decay,
                 dt_bias,
-                conv_state,
-                conv_weight,
-                conv_bias,
                 recurrent_state,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                qkv_dtype=jnp.bfloat16,
+                use_qk_l2norm_in_kernel=False,
             )
+            return out, new_conv_state, new_recurrent_state
+
+        def reference() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+            core_out, new_conv_state, new_recurrent_state = reference_core()
+            if not tail_fused:
+                return core_out, new_conv_state, new_recurrent_state
+            assert norm_weight is not None
+            batch = packed_proj.shape[0]
+            value_heads = recurrent_state.shape[1]
+            value_dim = recurrent_state.shape[2]
+            z_offset = qkv_dim + 2 * value_heads
+            if packed_proj.shape[1] < z_offset + value_heads * value_dim:
+                raise ValueError("tail-fused packed-projection GDN decode requires full z region")
+            z = packed_proj[:, z_offset : z_offset + value_heads * value_dim].reshape(
+                batch,
+                value_heads,
+                value_dim,
+            )
+            tail = core_out.transpose(0, 2, 1, 3).reshape(batch, value_heads, value_dim)
+            tail = tail.astype(jnp.float32)
+            variance = jnp.mean(jnp.square(tail), axis=-1, keepdims=True)
+            tail = tail * jax.lax.rsqrt(variance + float(rms_norm_eps))
+            tail = tail * norm_weight.astype(jnp.float32)
+            tail = tail * jax.nn.silu(z.astype(jnp.float32))
+            return tail.reshape(batch, 1, value_heads * value_dim), new_conv_state, new_recurrent_state
 
         try:
-            from nanovllm_jax.kernels.gdn_fla_triton import (
-                gdn_conv_packed_projection_decode_step_bf16_raw_gates,
-            )
+            if tail_fused:
+                from nanovllm_jax.kernels.gdn_fla_triton import (
+                    gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail,
+                )
+            else:
+                from nanovllm_jax.kernels.gdn_fla_triton import (
+                    gdn_conv_packed_projection_decode_step_bf16_raw_gates,
+                )
         except (ImportError, ModuleNotFoundError, AttributeError):
             _raise_if_gdn_fallback_disabled(
                 "Triton FLA packed-projection conv+decode kernel is unavailable",
@@ -2455,6 +2536,20 @@ class PureJAXBackend:
         if conv_bias is None:
             conv_bias = jnp.zeros((conv_weight.shape[0],), dtype=conv_weight.dtype)
         try:
+            if tail_fused:
+                assert norm_weight is not None
+                return gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail(
+                    packed_proj.astype(jnp.bfloat16),
+                    decay.astype(jnp.float32),
+                    dt_bias.astype(jnp.float32),
+                    conv_state.astype(jnp.float32),
+                    conv_weight.astype(jnp.float32),
+                    conv_bias.astype(jnp.float32),
+                    recurrent_state.astype(jnp.float32),
+                    norm_weight.astype(jnp.float32),
+                    qkv_dim=int(qkv_dim),
+                    rms_norm_eps=float(rms_norm_eps),
+                )
             return gdn_conv_packed_projection_decode_step_bf16_raw_gates(
                 packed_proj.astype(jnp.bfloat16),
                 decay.astype(jnp.float32),

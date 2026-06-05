@@ -690,7 +690,7 @@ def _hybrid_state_batch(seq_ids, query_lens) -> ScheduledBatch:
 
 def test_model_runner_hybrid_state_uses_full_table_fast_path():
     runner = _hybrid_state_runner_with_two_slots()
-    batch = _hybrid_state_batch([8, 1], [1, 1])
+    batch = _hybrid_state_batch([0, 1], [1, 1])
 
     batched_state = runner._batch_hybrid_state(batch)
 
@@ -2114,11 +2114,37 @@ def test_executor_table_hybrid_decode_matches_sliced_decode():
             dtype=jnp.int32,
         ),
     )
+    resident_dense_prompt = executor.forward_step_token_ids_jit(
+        prompt_batch,
+        cache_storage=executor.backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=3),
+        hybrid_state=base_hybrid,
+    )
+    resident_dense_conv_table = jnp.zeros(
+        (2,) + resident_dense_prompt.hybrid_state.conv_state.shape[1:],
+        dtype=resident_dense_prompt.hybrid_state.conv_state.dtype,
+    ).at[1].set(resident_dense_prompt.hybrid_state.conv_state[0])
+    resident_dense_recurrent_table = jnp.zeros(
+        (2,) + resident_dense_prompt.hybrid_state.recurrent_state.shape[1:],
+        dtype=resident_dense_prompt.hybrid_state.recurrent_state.dtype,
+    ).at[1].set(resident_dense_prompt.hybrid_state.recurrent_state[0])
+    resident_dense = executor.forward_step_token_ids_resident_dense_slot_carry_jit(
+        decode_batch,
+        cache_storage=resident_dense_prompt.cache_storage,
+        hybrid_state_table=HybridLayerState(resident_dense_conv_table, resident_dense_recurrent_table),
+        hybrid_slot_ids=jnp.array([1], dtype=jnp.int32),
+        resident_block_tables=jnp.array([[0, 0, 0], [0, 1, 2]], dtype=jnp.int32),
+        resident_seq_lens=jnp.array([0, 4], dtype=jnp.int32),
+        resident_last_tokens=jnp.array(
+            [0, int(np.asarray(ref_prompt.activations).reshape(-1)[0])],
+            dtype=jnp.int32,
+        ),
+    )
 
     np.testing.assert_array_equal(np.array(actual.activations), np.array(ref.activations))
     np.testing.assert_array_equal(np.array(slot_carry.activations), np.array(ref.activations))
     np.testing.assert_array_equal(np.array(resident.activations), np.array(ref.activations))
     np.testing.assert_array_equal(np.array(resident_slot.activations), np.array(ref.activations))
+    np.testing.assert_array_equal(np.array(resident_dense.activations), np.array(ref.activations))
     np.testing.assert_allclose(
         np.array(actual.hybrid_state.conv_state[1:2]),
         np.array(ref.hybrid_state.conv_state),
@@ -2167,6 +2193,18 @@ def test_executor_table_hybrid_decode_matches_sliced_decode():
         rtol=1e-5,
         atol=1e-5,
     )
+    np.testing.assert_allclose(
+        np.array(resident_dense.hybrid_state.conv_state[1:2]),
+        np.array(ref.hybrid_state.conv_state),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.array(resident_dense.hybrid_state.recurrent_state[1:2]),
+        np.array(ref.hybrid_state.recurrent_state),
+        rtol=1e-5,
+        atol=1e-5,
+    )
     np.testing.assert_array_equal(
         np.array(resident.resident_seq_lens),
         np.array([0, 5], dtype=np.int32),
@@ -2176,11 +2214,19 @@ def test_executor_table_hybrid_decode_matches_sliced_decode():
         np.array([0, 5], dtype=np.int32),
     )
     np.testing.assert_array_equal(
+        np.array(resident_dense.resident_seq_lens),
+        np.array([0, 5], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
         np.array(slot_carry.resident_last_tokens),
         np.array([0, int(np.asarray(ref.activations).reshape(-1)[0])], dtype=np.int32),
     )
     np.testing.assert_array_equal(
         np.array(resident_slot.resident_last_tokens),
+        np.array([0, int(np.asarray(ref.activations).reshape(-1)[0])], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.array(resident_dense.resident_last_tokens),
         np.array([0, int(np.asarray(ref.activations).reshape(-1)[0])], dtype=np.int32),
     )
     np.testing.assert_array_equal(

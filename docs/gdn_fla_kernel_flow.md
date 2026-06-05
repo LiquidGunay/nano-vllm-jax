@@ -46,10 +46,11 @@ The route is controlled in typed configs with:
 "kernels": {
   "gdn": {
     "prefill_post_conv_impl": "triton_fla_padded",
+    "disable_fallbacks": true,
     "prefill_block_dot": true,
     "packed_decode": {
-      "impl": "triton_fla",
-      "max_batch": 1
+      "impl": "reference",
+      "qkv_dtype": "bf16"
     }
   }
 }
@@ -59,12 +60,32 @@ The older per-stage keys remain available for narrow ablations, but benchmark
 configs should prefer the single `prefill_block_dot` knob to avoid config/env
 sprawl.
 
-`packed_decode.max_batch` limits the Triton packed GDN decode route by static
-decode batch size. On the current A10G evidence, the route is useful for the
-single-sequence decode-heavy target, but it adds overhead on multi-sequence
-`hetero8`. The block-dot benchmark config therefore keeps Triton packed decode
-available only for `batch <= 1` and uses the pure-JAX recurrent GDN decode path
-for wider decode batches.
+With `disable_fallbacks=true`, a requested packed GDN decode kernel must run or
+the model raises before entering the recurrent JAX path. Do not use
+`packed_decode.max_batch` in promoted benchmark configs; it can make wider
+random/heterogeneous decode silently select reference recurrence unless strict
+fallback checks catch it.
+
+The promoted random-serving config currently uses explicit packed `reference`
+GDN decode with BF16 QKV because integrated large-random repeats beat the
+standalone Triton GDN decode route. The widest current diagnostic decode kernel
+boundary is
+`triton_fla_conv_raw_gates`: packed projection output `[qkv, a, b, z]` feeds a
+single Triton call for causal-conv update, SiLU on Q/K/V, Q/K L2 normalization,
+raw gate/softplus/sigmoid math, recurrent-state read/update, and per-head
+linear-attention output. The projection matmul before it and the output
+normalization/projection after it are still separate JAX/XLA operations.
+
+`triton_fla_conv_raw_gates_tail` is an opt-in diagnostic route that additionally
+loads `z` and `norm_weight`, computes per-head RMSNorm plus `silu(z)` inside the
+same Triton call, and returns `[batch, 1, value_heads * value_dim]` ready for the
+existing output projection. It is not the promoted serving route: medium random
+A/B on 2026-06-05 regressed from `407.54` to `362.07` output tok/s, likely
+because full-head value tiles and the extra custom-call contract cost more than
+the removed XLA tail ops. The stored-vLLM denominator in that diagnostic is only
+a rough reference because the regenerated JAX envelope had a different output
+token count from the earlier vLLM artifact; the raw-vs-tail comparison is the
+decision signal.
 
 ## Model-Specific Assumptions
 

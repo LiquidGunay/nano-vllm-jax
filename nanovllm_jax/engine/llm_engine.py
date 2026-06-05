@@ -757,24 +757,6 @@ class LLMEngine:
             "device_token_carry",
             "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
         )
-        if device_token_carry and _trace_token_prefetch_enabled():
-            events = []
-            results = []
-            for event in self._iter_generate_deferred_tokens(
-                self._prepare_generation_sequences(
-                    prompts,
-                    sampling_params,
-                    require_greedy_ignore_eos=True,
-                ),
-                include_text=include_text,
-            ):
-                events.append(event)
-                if event.get("event") == "done":
-                    results = event.get("results", [])
-            return {
-                "results": results,
-                "events": events,
-            }
         if device_token_carry:
             return self._generate_with_trace_deferred_tokens(
                 prompts,

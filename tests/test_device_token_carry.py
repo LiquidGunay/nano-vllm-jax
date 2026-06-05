@@ -1049,8 +1049,8 @@ def test_generate_with_trace_prefetches_when_trace_prefetch_enabled(monkeypatch)
     assert trace["results"][0]["token_ids"] == [202, 203]
     assert events == [
         "step-0",
-        "prefetch-202",
         "step-1",
+        "prefetch-202",
         "prefetch-203",
         "materialize-202",
         "materialize-203",

@@ -296,6 +296,23 @@ cost. Do not retry full-model JAX scan bursts as the main coarsening route.
 The next coarsening attempt needs a backend/library fused sublayer or block
 boundary that reduces real device work, not only PJRT call count.
 
+Status note, 2026-06-05 r11: Entry 272 promoted the compact dense resident
+decode boundary and direct small-array device-put cleanup for large random.
+`forward_step_token_ids_resident_dense_slot_carry_jit` now gathers arbitrary
+resident slots for compact active decode rows, owns block-table/seq-len/token,
+hybrid-state, KV, model forward, and greedy LM-head token updates in one decode
+boundary, and returns updated resident seq-len/token tables. Scheduler static
+decode placeholders are cached by active-row shape, block-table host mirrors skip
+unchanged rows between KV-page crossings, and hot slot/update arrays use
+`jax.device_put(np.asarray(...))` instead of `jnp.asarray(...)`. Large random
+reached `757.24 output tok/s`, `0.857x` of the stored vLLM denominator
+(`884.03 output tok/s`), with `1582` generated tokens and zero measured-phase
+JIT growth (`24 -> 24`). The profiled accepted route reduced PJRT execute count
+from `619` to `406` versus the prior dense profile and cut `MemcpyD2D` from
+about `294.63 ms` to `13.74 ms`. Token-event throughput was `794.77 tok/s`,
+about `0.899x` stored vLLM, so the remaining wall-clock gap is now final drain
+plus model-side GPU work, not benchmark-specific recompilation.
+
 First implementation slice: `full_attention.prefill_impl` now controls reference
 versus packed Triton prefill routing, `server_config.yaml` and the FA/GDN
 benchmark config select `prefill_impl=triton_packed`, and the random sidecar
@@ -355,6 +372,28 @@ GDN/GEMM boundary audit, 2026-06-05:
   model-family-general greedy LM-head matmul+argmax epilogue. Do not spend the
   next pass sweeping padded-GEMM rows or narrow GDN launch parameters.
 
+Strict GDN decode kernel pass, 2026-06-05:
+
+- the promoted random-serving config stays on explicit
+  `kernels.gdn.packed_decode.impl = reference` with BF16 QKV and
+  `kernels.gdn.disable_fallbacks = true`. This is not a silent fallback: the
+  selected implementation is explicit in the typed config.
+- model-level decode routing raises before the recurrent JAX path if a
+  non-reference packed GDN decode kernel was requested but cannot run because
+  of `packed_decode.max_batch`, width > 1 decode, prefix-state outputs, or
+  missing recurrent state.
+- the widest diagnostic GDN decode boundary is projection-output to GDN output:
+  packed `[qkv, a, b, z]` enters a Triton call that fuses causal conv update,
+  SiLU Q/K/V, Q/K normalization, raw gate/beta math, recurrent state update,
+  and the per-head linear-attention output. Projection GEMM, GDN output norm,
+  output projection, residual/MLP, full-attention layers, and LM-head top-1
+  remain outside this kernel.
+- Entries 266 and 270 show that raw packed GDN and tail-fused GDN lose when
+  promoted as standalone random-serving defaults. Keep them as diagnostic
+  evidence only; the next useful expansion must be a broader backend-owned
+  layer/model boundary or a true library epilogue, not another one-layer-type
+  tail fusion.
+
 Random benchmark policy, 2026-06-05:
 
 - use the medium and large random envelopes as the normal hill-climb lanes.
@@ -379,11 +418,32 @@ Random benchmark policy, 2026-06-05:
   `random_config_table_prefill_token_carry_large_with_vllm_r1`: `8` requests,
   `6240` input tokens, `1351` output tokens, vLLM `884.03 output tok/s`, JAX
   `400.42 output tok/s`, JAX/vLLM `0.453x`, zero measured-phase JIT growth.
-- current accepted large JAX route, after resident slot-token prefill seeding
-  and FA/FLA policy promotion:
-  `random_large_fa_prefill_fused_decode_r1`, `8` requests, `6240` input
-  tokens, `1582` output tokens, JAX `484.18 output tok/s`, JAX/stored-vLLM
-  `0.548x`, zero measured-phase JIT growth (`20 -> 20`).
+- current accepted large JAX route is Entry 272:
+  `random_large_dense_direct_device_put_r1`, `8` requests, `6240` input tokens,
+  `1582` output tokens, JAX `757.24 output tok/s`, JAX/stored-vLLM `0.857x`,
+  token-event throughput `794.77 tok/s`, and zero measured-phase JIT growth
+  (`24 -> 24`).
+
+GDN decode tail-fusion result, 2026-06-05:
+
+- Implemented an opt-in `triton_fla_conv_raw_gates_tail` route that extends the
+  packed-projection GDN decode custom call through per-head RMSNorm and
+  `silu(z)` gating, returning the vector consumed by the existing output
+  projection.
+- Medium random same-envelope A/B, both with generic warmup and zero measured
+  JIT growth, showed the tail-fused route is slower:
+  - tail-fused: `362.07 output tok/s`, `0.769x` stored-vLLM denominator,
+    `15 -> 15` measured JIT entries;
+  - raw packed GDN control: `407.54 output tok/s`, `0.865x` stored-vLLM
+    denominator, `15 -> 15` measured JIT entries.
+- Treat the stored-vLLM ratios above as rough reference only: the regenerated
+  JAX medium envelope emitted `372` output tokens, while the earlier stored vLLM
+  artifact emitted `290`. The decision signal is the direct raw-vs-tail A/B on
+  the same regenerated JAX request envelope.
+- Keep the active random-serving config on explicit `reference` GDN decode. The
+  raw and tail routes are useful evidence, not the next hill-climb direction.
+  The likely issue is that full-head value tiles and the extra custom-call ABI
+  pressure outweigh the separate XLA RMSNorm/silu materialization they remove.
 
 Micro-burst selection model:
 

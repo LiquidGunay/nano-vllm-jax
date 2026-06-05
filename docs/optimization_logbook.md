@@ -10420,3 +10420,186 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - all benchmark runs used generic warmup, `--jax-fail-on-jit-cache-growth`,
     the 70% RAM guard, and four CPU cores at nice level `10`;
   - the rejected code was fully reverted before documenting the result.
+
+### Entry 270 - Rejected Packed-Projection GDN Tail Fusion
+
+- date: 2026-06-05
+- purpose:
+  - test whether the accepted packed-projection GDN decode boundary should also
+    absorb the remaining post-core GDN tail: per-head RMSNorm, `silu(z)` gating,
+    and the reshape into the output projection input;
+  - avoid repeating Entry 261's rejected out-projection fusion by leaving the
+    final `out_proj` GEMM on the existing XLA/CUTLASS path.
+- implementation:
+  - added opt-in `gdn_packed_decode_impl=triton_fla_conv_raw_gates_tail`;
+  - extended the existing packed-projection Triton kernel with a compile-time
+    tail-fused mode that loads `z` and `norm_weight`, computes per-head RMSNorm
+    plus `silu(z)`, and returns `[batch, 1, value_heads * value_dim]`;
+  - routed model output processing to skip the JAX tail only for this opt-in
+    implementation;
+  - allowed the tail-fused route to use the packed decode projection for
+    batch-one warmup buckets, while preserving the older batch>1 packed
+    projection policy for the active raw route.
+- artifacts:
+  - tail-fused medium smoke:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_gdn_tail_fused_r3.json`;
+  - nested tail-fused JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_gdn_tail_fused_r3_jax.json`;
+  - raw packed-GDN same-envelope control:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_gdn_raw_control_r2.json`;
+  - nested raw-control JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_gdn_raw_control_r2_jax.json`.
+- result:
+  - both runs used the regenerated medium random envelope:
+    `4` requests, `1787` input tokens, `372` output tokens, input lengths
+    `[507, 400, 450, 430]`, output lengths `[126, 58, 70, 118]`;
+  - tail-fused route reached `362.07 output tok/s`, stored-vLLM ratio `0.769x`,
+    and zero measured-phase JIT growth (`15 -> 15`);
+  - raw packed-GDN control reached `407.54 output tok/s`, stored-vLLM ratio
+    `0.865x`, and zero measured-phase JIT growth (`15 -> 15`);
+  - tail fusion therefore regressed the medium lane by about `11.2%` against
+    the same request envelope.
+  - the stored-vLLM ratios are only rough context because the regenerated JAX
+    envelope emitted `372` output tokens while the older stored vLLM artifact
+    emitted `290`; the raw-vs-tail same-envelope A/B is the decision signal.
+- decision:
+  - reject tail fusion for promotion and keep
+    `benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata.json` on
+    explicit packed GDN `reference` for the active random-serving lane;
+  - keep the opt-in implementation and focused test as diagnostic evidence so
+    this exact boundary is not retried blindly;
+  - likely explanation: the fused branch forces full-head value tiles and a
+    larger custom-call ABI, which costs more than the separate XLA
+    RMSNorm/silu/reshape tail it removes. The next GDN decode win needs a
+    broader backend-owned layer/model boundary, not only this tail.
+- validation:
+  - `python -m py_compile nanovllm_jax/model.py nanovllm_jax/backends.py nanovllm_jax/kernels/gdn_fla_triton.py tests/test_gdn_packed_decode_reference.py`;
+  - `pytest -q tests/test_gdn_packed_decode_reference.py`;
+  - `pytest -q tests/test_server_config.py`;
+  - medium random sidecar runs used stored vLLM denominator, generic warmup,
+    `--jax-fail-on-jit-cache-growth`, the 70% RAM guard, and four CPU cores at
+    nice level `10`.
+
+### Entry 271 - Rejected Direct Compiled-Executable Replay Prototype
+
+- date: 2026-06-05
+- purpose:
+  - test whether caching lowered JAX executables manually can approximate
+    decode graph replay and reduce per-step PJRT overhead without changing the
+    serving ABI;
+  - keep the active reference-GDN random route and generic warmup discipline.
+- implementation:
+  - prototyped a `_compiled_jit_cache` in `ModelExecutor`;
+  - changed profiled JIT calls to run `fn.lower(*args).compile()` on first use
+    and then call the compiled executable directly for later invocations of the
+    same cache key;
+  - reverted the prototype after the guarded smoke because it was not viable.
+- artifacts:
+  - no timing artifact was accepted for the prototype because the smoke did not
+    reach measurement;
+  - post-revert reference-GDN small validation:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_small_reference_gdn_post_replay_reject_r1.json`;
+  - nested post-revert JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_small_reference_gdn_post_replay_reject_r1_jax.json`.
+- result:
+  - the scaled four-request random smoke stayed CPU-bound in compile/warmup for
+    more than six minutes under the resource guard, so it was terminated before
+    measurement;
+  - after reverting the executable-cache prototype, the reference-GDN small
+    validation completed at `330.21 output tok/s`, `137` output tokens,
+    `832` input tokens, and zero measured-phase JIT growth (`68 -> 68`).
+- decision:
+  - reject direct `.lower().compile()` executable caching as the graph-replay
+    lever for this stack;
+  - it front-loads compilation too aggressively and does not resemble vLLM's
+    CUDA graph replay, which captures/replays already-built GPU command
+    sequences inside the runtime rather than recompiling Python-level JAX
+    callables on demand;
+  - future replay work must happen through XLA/runtime command-buffer support
+    or a backend-owned decode boundary, not by manually lowering every JIT
+    cache key in the serving loop.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/model.py nanovllm_jax/backends.py nanovllm_jax/kernels/gdn_fla_triton.py`;
+  - `python -m json.tool benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata.json`;
+  - `pytest -q tests/test_server_config.py tests/test_gdn_packed_decode_reference.py`.
+
+### Entry 272 - Accepted Dense Resident Decode And Small-Array DevicePut Cleanup
+
+- date: 2026-06-05
+- purpose:
+  - reduce large-random decode PJRT/host-transfer overhead without specializing
+    to the seed, request lengths, Qwen3.5-0.8B dimensions, or the A10G;
+  - keep paged attention, packed chunked prefill, resident GDN state, generic
+    warmup, stored vLLM denominator, and zero measured-phase JIT growth.
+- accepted implementation:
+  - added `forward_step_token_ids_resident_dense_slot_carry_jit` for compact
+    active decode rows with arbitrary resident slots. The boundary gathers
+    block tables, seq lengths, last tokens, KV/GDN state, runs the model and
+    greedy LM-head token selection, then scatters updated state, seq lengths,
+    and last tokens back to resident tables;
+  - cached resident static-decode placeholder metadata by shape instead of
+    keeping only the most recent batch shape;
+  - skipped release-time resident-last-token clearing because prefill reseeds
+    slots before reuse;
+  - tracked resident block counts so decode metadata sync only rebuilds block
+    rows on KV-page crossings;
+  - replaced hot `jnp.asarray(...)` construction of slot/update tensors with
+    direct `jax.device_put(np.asarray(...))`, removing the extra
+    `convert_element_type` executable from the resident metadata path.
+- accepted artifacts:
+  - dense resident-slot first large run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_dense_resident_slot_r1.json`;
+  - stacked-materialization/no-trace-preferred intermediate:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_dense_blockcount_stacked_materialize_r1.json`;
+  - trace-prefetch route with corrected trace boundary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_dense_blockcount_deferred_trace_prefetch_r1.json`;
+  - current accepted best:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_dense_direct_device_put_r1.json`;
+  - current accepted profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_dense_direct_device_put_profile_r1.json`.
+- result:
+  - dense resident-slot first large run reached `709.55 output tok/s`,
+    `0.803x` stored vLLM, zero JIT growth;
+  - trace-prefetch corrected boundary reached `746.95 output tok/s`,
+    `0.845x` stored vLLM, zero JIT growth;
+  - current accepted best reached `757.24 output tok/s`, `0.857x` stored
+    vLLM (`884.03 output tok/s`), `1582` generated tokens, and zero
+    measured-phase JIT growth (`24 -> 24`);
+  - token-event throughput in the best run was `794.77 tok/s`, about `0.899x`
+    the stored vLLM denominator, while final output materialization/drain kept
+    wall-clock output throughput below the `0.9x` target.
+- profile movement:
+  - accepted profile throughput was `729.30 output tok/s` under profiler;
+  - versus the prior dense profile, `PjRtCApiLoadedExecutable::Execute` count
+    fell `619 -> 406`;
+  - `MemcpyD2D` fell from about `294.63 ms` to `13.74 ms`;
+  - `_sync_resident_decode_metadata` fell from about `578.63 ms` to
+    `398.40 ms`;
+  - remaining top GPU buckets are model-side BF16 GEMMs, paged decode
+    attention, LM-head/argmax reductions, and many small fusion kernels.
+- rejected subexperiments:
+  - resident prefix-slot compaction regressed large random to
+    `453.57 output tok/s`; keep arbitrary resident slots and gather by slot id;
+  - decode block-table buckets `32,64,128` regressed to
+    `708.36 output tok/s`; keep fixed `128` for this large lane;
+  - scalar block-entry scatter regressed profile health by increasing PJRT
+    execute count (`619 -> 708`) and D2D time, so full-row page-crossing
+    scatter remains the selected resident-table sync path for now;
+  - in-JIT resident metadata delta application reached only
+    `746.78 output tok/s`, below the cache-only/direct-device-put route;
+  - per-shape grouped final token materialization exploded final drain to about
+    `0.90 s` and regressed large random to `546.79 output tok/s`.
+- decision:
+  - promote dense resident-slot decode, per-shape resident static metadata
+    cache, release-clear removal, block-count skip, and direct device-put update
+    tensors;
+  - reject scalar entry scatter, in-JIT metadata deltas, and per-shape grouped
+    materialization for the current serving path;
+  - the next target should be model-side device work or a true runtime graph /
+    backend-owned layer boundary. Host/PJRT cleanup is now smaller but not gone.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/sequence.py`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'table_hybrid_decode_matches_sliced_decode or warmup_compiles_resident_slot_carry_decode or resident_decode_metadata or resident_decode_replay or model_runner_warmup_compiles_greedy_decode_burst' tests/test_device_token_carry.py tests/test_server_config.py`;
+  - large random runs used stored vLLM denominator, generic warmup,
+    `--jax-fail-on-jit-cache-growth`, the 70% RAM guard, and four CPU cores at
+    nice level `10`.

@@ -1063,6 +1063,7 @@ class CanonicalModelRunner:
             tuple(0 for _ in range(self.max_blocks_per_seq))
             for _ in range(max_seqs)
         ]
+        self._resident_block_counts_host: list[int] = [0 for _ in range(max_seqs)]
         self._resident_seq_lens_host: list[int] = [0 for _ in range(max_seqs)]
         self._resident_last_tokens = jnp.zeros((max_seqs,), dtype=jnp.int32)
         self._sample_fn = jax.jit(self._sample_logits)
@@ -1194,6 +1195,7 @@ class CanonicalModelRunner:
             "prefill_skipped": [],
             "decode_runs": [],
             "decode_block_table_buckets": [],
+            "resident_metadata_scatter_runs": [],
             "jit_cache_entries_before": _cache_entries(),
             "jit_cache_entries_after": None,
             "already_warmed": bool(self._warmup_compiled),
@@ -1437,6 +1439,34 @@ class CanonicalModelRunner:
                     batch.hybrid_slot_ids_host = tuple(range(batch_size))
                     if (
                         self.resident_decode_metadata
+                        and hasattr(self.executor, "forward_step_token_ids_resident_dense_slot_carry_jit")
+                    ):
+                        self._sync_resident_decode_metadata(
+                            batch,
+                            list(batch.hybrid_slot_ids_host),
+                            sync_seq_lens=True,
+                        )
+                        output = self.executor.forward_step_token_ids_resident_dense_slot_carry_jit(
+                            batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state_table=self._hybrid_state_table,
+                            hybrid_slot_ids=hybrid_slot_ids,
+                            resident_block_tables=self._resident_block_tables,
+                            resident_seq_lens=self._resident_seq_lens,
+                            resident_last_tokens=self._resident_last_tokens,
+                        )
+                        if output.resident_seq_lens is not None:
+                            self._resident_seq_lens = output.resident_seq_lens
+                            self._advance_resident_seq_lens_host(
+                                list(batch.hybrid_slot_ids_host),
+                                active_rows=list(range(batch_size)),
+                                steps=1,
+                            )
+                        if output.resident_last_tokens is not None:
+                            self._resident_last_tokens = output.resident_last_tokens
+                        route = "forward_step_token_ids_resident_dense_slot_carry_jit:decode"
+                    elif (
+                        self.resident_decode_metadata
                         and hasattr(self.executor, "forward_step_token_ids_resident_slot_carry_jit")
                     ):
                         self._sync_resident_decode_metadata(
@@ -1525,6 +1555,35 @@ class CanonicalModelRunner:
                             last_logits_only=True,
                         )
                         _record_decode_warmup(output, "forward_step_jit:decode")
+        if bool(getattr(self, "resident_decode_metadata", False)):
+            for row_count in range(1, int(max(batch_buckets)) + 1):
+                if row_count > int(self._resident_block_tables.shape[0]):
+                    break
+                slots = jnp.arange(row_count, dtype=jnp.int32)
+                block_rows = jnp.zeros(
+                    (row_count, int(self._resident_block_tables.shape[1])),
+                    dtype=jnp.int32,
+                )
+                seq_lens = jnp.zeros((row_count,), dtype=jnp.int32)
+                self._resident_block_tables = self._scatter_resident_block_table_rows(
+                    self._resident_block_tables,
+                    slots,
+                    block_rows,
+                )
+                self._resident_seq_lens = self._scatter_resident_seq_lens(
+                    self._resident_seq_lens,
+                    slots,
+                    seq_lens,
+                )
+                _block_until_ready(self._resident_block_tables)
+                _block_until_ready(self._resident_seq_lens)
+                summary["resident_metadata_scatter_runs"].append(
+                    {
+                        "row_count": int(row_count),
+                        "block_rows_shape": list(block_rows.shape),
+                        "seq_lens_shape": list(seq_lens.shape),
+                    }
+                )
         self._warmup_compiled = True
         summary["jit_cache_entries_after"] = _cache_entries()
         return summary
@@ -1612,13 +1671,11 @@ class CanonicalModelRunner:
                     self._resident_block_tables_host[slot] = tuple(
                         0 for _ in range(self.max_blocks_per_seq)
                     )
+                if hasattr(self, "_resident_block_counts_host"):
+                    self._resident_block_counts_host[slot] = 0
                 if hasattr(self, "_resident_seq_lens_host"):
                     self._resident_seq_lens_host[slot] = 0
             self._mtp1_drafts.pop(seq_id, None)
-        if released_slots and hasattr(self, "_resident_last_tokens"):
-            self._resident_last_tokens = self._resident_last_tokens.at[
-                jnp.asarray(released_slots, dtype=jnp.int32)
-            ].set(jnp.zeros((len(released_slots),), dtype=jnp.int32))
         carry_by_seq_id = getattr(self, "_device_token_carry_by_seq_id", {})
         if carry_by_seq_id and any(seq_id in carry_by_seq_id for seq_id in seq_ids):
             finished_seq_ids = {int(seq_id) for seq_id in seq_ids}
@@ -1826,6 +1883,31 @@ class CanonicalModelRunner:
                 return False
         return True
 
+    def _resident_slot_token_dense_decode_ready(
+        self,
+        batch: ScheduledBatch,
+        *,
+        active_rows: list[int],
+    ) -> bool:
+        if not self._resident_slot_token_decode_ready(batch, active_rows=active_rows):
+            return False
+        batch_size = int(batch.tokens.shape[0])
+        if active_rows != list(range(batch_size)):
+            return False
+        query_lens = (
+            list(batch.query_lens_host)
+            if batch.query_lens_host is not None
+            else [int(x) for x in batch.query_lens[:batch_size].tolist()]
+        )
+        if len(query_lens) < batch_size or any(int(query_lens[row]) != 1 for row in range(batch_size)):
+            return False
+        seq_ids = list(batch.seq_ids_host or ())
+        if len(seq_ids) != batch_size:
+            return False
+        hybrid_slots = getattr(self, "_hybrid_slots", {})
+        slot_values = [int(hybrid_slots.get(int(seq_id), -1)) for seq_id in seq_ids]
+        return all(slot >= 0 for slot in slot_values) and len(set(slot_values)) == len(slot_values)
+
     def _record_resident_last_tokens(
         self,
         batch: ScheduledBatch,
@@ -1847,7 +1929,7 @@ class CanonicalModelRunner:
                 self._hybrid_slots.get(int(seq_id), -1)
                 for seq_id in batch.seq_ids_host
             ]
-        token_vector = _int32_device_vector(token_ids.astype(jnp.int32))
+        token_vector = _int32_device_vector(token_ids)
         slots: list[int] = []
         token_rows: list[int] = []
         for row in eligible_rows:
@@ -1902,7 +1984,8 @@ class CanonicalModelRunner:
             ]
             if not eligible_rows:
                 return
-        token_ids = token_ids.astype(jnp.int32)
+        if getattr(token_ids, "dtype", None) != jnp.dtype(jnp.int32):
+            token_ids = jnp.asarray(token_ids, dtype=jnp.int32)
         full_batch_tokens = int(token_ids.shape[0]) == int(batch.tokens.shape[0])
         active_row_to_token_row = {row: index for index, row in enumerate(active_rows)}
         carry_by_seq_id: dict[int, DeviceTokenRef] = dict(
@@ -2423,7 +2506,7 @@ class CanonicalModelRunner:
             self._hybrid_slot_ids_device_cache = cache
         cached = cache.get(slot_key)
         if cached is None:
-            cached = jnp.asarray(slot_key, dtype=jnp.int32)
+            cached = jax.device_put(np.asarray(slot_key, dtype=np.int32))
             cache[slot_key] = cached
         return cached
 
@@ -2439,9 +2522,61 @@ class CanonicalModelRunner:
             self._prefill_final_flags_device_cache = cache
         cached = cache.get(key)
         if cached is None:
-            cached = jnp.asarray(key, dtype=bool)
+            cached = jax.device_put(np.asarray(key, dtype=bool))
             cache[key] = cached
         return cached
+
+    def _resident_metadata_scatter_fn(self, kind: str, table_shape: tuple[int, ...], update_shape: tuple[int, ...]):
+        cache = getattr(self, "_resident_metadata_scatter_cache", None)
+        if cache is None:
+            cache = {}
+            self._resident_metadata_scatter_cache = cache
+        key = (kind, tuple(int(x) for x in table_shape), tuple(int(x) for x in update_shape))
+        fn = cache.get(key)
+        if fn is None:
+
+            def scatter_rows(table, slots, rows):
+                return table.at[slots].set(rows)
+
+            fn = jax.jit(scatter_rows, donate_argnums=(0,))
+            cache[key] = fn
+        return fn
+
+    def _scatter_resident_block_table_rows(
+        self,
+        table: jnp.ndarray,
+        slots: jnp.ndarray,
+        rows: jnp.ndarray,
+    ) -> jnp.ndarray:
+        rows = jnp.asarray(rows, dtype=jnp.int32)
+        slots = _int32_device_vector(slots)
+        if rows.ndim != 2:
+            raise ValueError("resident block-table row updates must be rank-2")
+        if int(rows.shape[1]) != int(table.shape[1]):
+            raise ValueError(
+                "resident block-table update width must match the resident table width"
+            )
+        fn = self._resident_metadata_scatter_fn(
+            "block_tables",
+            tuple(int(x) for x in table.shape),
+            tuple(int(x) for x in rows.shape),
+        )
+        return fn(table, slots, rows)
+
+    def _scatter_resident_seq_lens(
+        self,
+        table: jnp.ndarray,
+        slots: jnp.ndarray,
+        seq_lens: jnp.ndarray,
+    ) -> jnp.ndarray:
+        seq_lens = _int32_device_vector(seq_lens)
+        slots = _int32_device_vector(slots)
+        fn = self._resident_metadata_scatter_fn(
+            "seq_lens",
+            tuple(int(x) for x in table.shape),
+            tuple(int(x) for x in seq_lens.shape),
+        )
+        return fn(table, slots, seq_lens)
 
     def _sync_resident_decode_metadata(
         self,
@@ -2474,8 +2609,21 @@ class CanonicalModelRunner:
             if batch.seq_lens_host is not None
             else [int(seq_len) for seq_len in batch.seq_lens.tolist()]
         )
-        block_changed = False
-        seq_lens_changed = False
+        if not hasattr(self, "_resident_block_counts_host"):
+            self._resident_block_counts_host = [
+                0 for _ in range(len(self._resident_block_tables_host))
+            ]
+        block_size = int(
+            getattr(
+                self,
+                "block_size",
+                getattr(getattr(self, "config", None), "block_size", 16),
+            )
+        )
+        changed_block_slots: list[int] = []
+        changed_block_rows: list[tuple[int, ...]] = []
+        changed_seq_lens_slots: list[int] = []
+        changed_seq_lens: list[int] = []
         for row, slot in enumerate(slot_values):
             slot = int(slot)
             if slot < 0 or row >= len(seq_ids) or int(seq_ids[row]) < 0:
@@ -2483,28 +2631,48 @@ class CanonicalModelRunner:
             if (not batch.is_prefill) and row < len(query_lens) and int(query_lens[row]) <= 0:
                 continue
 
-            source_row = tuple(int(block) for block in batch.block_tables_host[row])
-            if len(source_row) < self.max_blocks_per_seq:
-                source_row = source_row + tuple(0 for _ in range(self.max_blocks_per_seq - len(source_row)))
-            elif len(source_row) > self.max_blocks_per_seq:
-                source_row = source_row[: self.max_blocks_per_seq]
-            if self._resident_block_tables_host[slot] != source_row:
-                self._resident_block_tables_host[slot] = source_row
-                block_changed = True
+            next_block_count = None
+            if row < len(seq_lens):
+                seq_len_for_blocks = max(0, int(seq_lens[row]))
+                next_block_count = (seq_len_for_blocks + block_size - 1) // block_size
+            skip_block_row_check = (
+                not batch.is_prefill
+                and next_block_count is not None
+                and self._resident_block_counts_host[slot] == next_block_count
+            )
+            if not skip_block_row_check:
+                source_row = tuple(int(block) for block in batch.block_tables_host[row])
+                if len(source_row) < self.max_blocks_per_seq:
+                    source_row = source_row + tuple(
+                        0 for _ in range(self.max_blocks_per_seq - len(source_row))
+                    )
+                elif len(source_row) > self.max_blocks_per_seq:
+                    source_row = source_row[: self.max_blocks_per_seq]
+                if self._resident_block_tables_host[slot] != source_row:
+                    self._resident_block_tables_host[slot] = source_row
+                    changed_block_slots.append(slot)
+                    changed_block_rows.append(source_row)
+                if next_block_count is not None:
+                    self._resident_block_counts_host[slot] = next_block_count
 
             if sync_seq_lens and row < len(seq_lens):
                 seq_len = int(seq_lens[row])
                 if self._resident_seq_lens_host[slot] != seq_len:
                     self._resident_seq_lens_host[slot] = seq_len
-                    seq_lens_changed = True
+                    changed_seq_lens_slots.append(slot)
+                    changed_seq_lens.append(seq_len)
 
-        if block_changed:
-            self._resident_block_tables = jax.device_put(
-                np.asarray(self._resident_block_tables_host, dtype=np.int32)
+        if changed_block_slots:
+            self._resident_block_tables = self._scatter_resident_block_table_rows(
+                self._resident_block_tables,
+                jax.device_put(np.asarray(changed_block_slots, dtype=np.int32)),
+                jax.device_put(np.asarray(changed_block_rows, dtype=np.int32)),
             )
-        if seq_lens_changed:
-            self._resident_seq_lens = jax.device_put(
-                np.asarray(self._resident_seq_lens_host, dtype=np.int32)
+        if changed_seq_lens_slots:
+            self._resident_seq_lens = self._scatter_resident_seq_lens(
+                self._resident_seq_lens,
+                jax.device_put(np.asarray(changed_seq_lens_slots, dtype=np.int32)),
+                jax.device_put(np.asarray(changed_seq_lens, dtype=np.int32)),
             )
 
     def _advance_resident_seq_lens_host(
@@ -2943,6 +3111,14 @@ class CanonicalModelRunner:
                 active_rows=self._active_decode_rows_host(batch),
             )
         )
+        resident_dense_slot_token_metadata_decode = (
+            resident_slot_token_metadata_decode
+            and hasattr(self.executor, "forward_step_token_ids_resident_dense_slot_carry_jit")
+            and self._resident_slot_token_dense_decode_ready(
+                batch,
+                active_rows=self._active_decode_rows_host(batch),
+            )
+        )
         if not (resident_slot_token_decode or resident_slot_token_metadata_decode):
             batch = self._maybe_apply_device_token_carry(batch)
         if batch.query_lens_host is not None:
@@ -3017,6 +3193,18 @@ class CanonicalModelRunner:
                     hybrid_state_table=hybrid_state,
                     hybrid_slot_ids=hybrid_slot_ids,
                 )
+            elif resident_dense_slot_token_metadata_decode:
+                output = self.executor.forward_step_token_ids_resident_dense_slot_carry_jit(
+                    batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state_table=hybrid_state,
+                    hybrid_slot_ids=hybrid_slot_ids,
+                    resident_block_tables=self._resident_block_tables,
+                    resident_seq_lens=self._resident_seq_lens,
+                    resident_last_tokens=self._resident_last_tokens,
+                )
+                if output.resident_last_tokens is not None:
+                    self._resident_last_tokens = output.resident_last_tokens
             elif resident_slot_token_metadata_decode:
                 output = self.executor.forward_step_token_ids_resident_slot_carry_jit(
                     batch,

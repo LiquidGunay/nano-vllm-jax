@@ -8,9 +8,12 @@ from typing import Optional, List, Dict
 from dataclasses import dataclass, replace
 from nanovllm_jax.backends import (
     InferenceBackend,
+    gdn_disable_fallbacks_enabled,
     gdn_packed_decode_conv_enabled,
     gdn_packed_decode_enabled,
+    gdn_packed_decode_impl,
     gdn_packed_decode_max_batch,
+    gdn_packed_decode_tail_fused_enabled,
     gdn_prefill_post_conv_enabled,
     select_backend,
 )
@@ -386,12 +389,13 @@ def _use_gdn_decode_packed_in_proj(
     is_prefill: bool,
     batch: int,
     seq_len: int,
+    config: Optional[Qwen3_5Config] = None,
 ) -> bool:
     return (
         not is_prefill
-        and batch > 1
         and seq_len == 1
         and _GDN_DECODE_IN_PROJ_PACKED_KEY in params
+        and (batch > 1 or gdn_packed_decode_tail_fused_enabled(config))
     )
 
 
@@ -1204,6 +1208,7 @@ def gated_deltanet_block(
         is_prefill=is_prefill,
         batch=batch,
         seq_len=seq_len,
+        config=config,
     )
     use_packed_prefill_in_proj = _use_gdn_prefill_packed_in_proj(
         params,
@@ -1278,7 +1283,8 @@ def gated_deltanet_block(
             params["in_proj_b"],
             force_width1=force_width1_dot,
         ).reshape(batch, seq_len, config.linear_num_value_heads)
-    
+    tail_fused_gdn_decode = False
+
     if use_cached:
         # === DECODE MODE ===
         # 1. Convolution update - use per-layer conv_state
@@ -1305,17 +1311,54 @@ def gated_deltanet_block(
             initial_recurrent = None
 
         packed_decode_max_batch = gdn_packed_decode_max_batch(config)
+        packed_decode_requested = gdn_packed_decode_enabled(config)
         use_packed_decode = (
-            gdn_packed_decode_enabled(config)
+            packed_decode_requested
             and (packed_decode_max_batch is None or batch <= packed_decode_max_batch)
             and seq_len == 1
             and not return_prefix_state
             and not return_first_prefix_state
             and initial_recurrent is not None
         )
+        if (
+            packed_decode_requested
+            and not use_packed_decode
+            and gdn_disable_fallbacks_enabled(config)
+        ):
+            reasons = []
+            if packed_decode_max_batch is not None and batch > packed_decode_max_batch:
+                reasons.append(
+                    f"batch {batch} exceeds packed_decode.max_batch {packed_decode_max_batch}"
+                )
+            if seq_len != 1:
+                reasons.append(f"sequence width {seq_len} is not width-1 decode")
+            if return_prefix_state:
+                reasons.append("return_prefix_state needs state-sequence output")
+            if return_first_prefix_state:
+                reasons.append("return_first_prefix_state needs prefix-state output")
+            if initial_recurrent is None:
+                reasons.append("initial recurrent state is missing")
+            if not reasons:
+                reasons.append("the packed decode predicate was false")
+            raise RuntimeError(
+                "GDN packed decode kernel fallback is disabled, but "
+                f"{gdn_packed_decode_impl(config)!r} cannot run for this decode batch: "
+                + "; ".join(reasons)
+            )
         use_conv_packed_decode = use_packed_decode and gdn_packed_decode_conv_enabled(config)
+        tail_fused_requested = use_packed_decode and gdn_packed_decode_tail_fused_enabled(config)
+        if (
+            tail_fused_requested
+            and packed_decode_projection is None
+            and gdn_disable_fallbacks_enabled(config)
+        ):
+            raise RuntimeError(
+                "GDN tail-fused packed decode requires the packed qkv/ab/z "
+                "projection route; strict GDN fallback mode is enabled."
+            )
         if use_conv_packed_decode:
             if packed_decode_projection is not None:
+                tail_fused_gdn_decode = gdn_packed_decode_tail_fused_enabled(config)
                 core_attn_out, new_layer_conv_state, new_recurrent_state_single = (
                     backend.gated_delta_conv_packed_projection_decode(
                         packed_decode_projection[:, 0, :],
@@ -1327,6 +1370,8 @@ def gated_deltanet_block(
                         initial_recurrent.astype(jnp.float32),
                         qkv_dim=conv_dim,
                         use_qk_l2norm_in_kernel=True,
+                        norm_weight=params["norm_weight"].astype(jnp.float32),
+                        rms_norm_eps=float(config.rms_norm_eps),
                     )
                 )
             else:
@@ -1528,8 +1573,9 @@ def gated_deltanet_block(
             else None
         )
         
-        # core_attn_out is [B, H, T, D_v] - transpose to [B, T, H, D_v] for reshaping
-        core_attn_out = core_attn_out.transpose(0, 2, 1, 3)  # [B, T, H, D_v]
+        if not tail_fused_gdn_decode:
+            # core_attn_out is [B, H, T, D_v] - transpose to [B, T, H, D_v] for reshaping.
+            core_attn_out = core_attn_out.transpose(0, 2, 1, 3)
         
     else:
         # === PREFILL MODE (Metal-compatible implementation) ===
@@ -1928,17 +1974,20 @@ def gated_deltanet_block(
         core_attn_out = core_attn_out.transpose(0, 2, 1, 3)  # [B, H, T, D] -> [B, T, H, D]
     
     # === OUTPUT PROCESSING (same for both modes) ===
-    # Reshape to apply per-head gated norm
-    core_attn_out = core_attn_out.reshape(batch * seq_len, -1, config.linear_value_head_dim)  # [B*T, H, D]
-    z = z.reshape(batch * seq_len, -1, config.linear_value_head_dim)  # [B*T, H, D]
-    
-    # Apply gated RMSNorm per head. HF-style RMSNorm computes the reduction in
-    # fp32, which also removes one source of width-dependent TPU bf16 drift.
-    core_attn_out = _stable_rmsnorm_fp32(core_attn_out, params["norm_weight"], config.rms_norm_eps)
-    core_attn_out = core_attn_out * nn.silu(z)
-    
-    # Reshape back and project
-    core_attn_out = core_attn_out.reshape(batch, seq_len, -1)
+    if tail_fused_gdn_decode:
+        core_attn_out = core_attn_out.reshape(batch, seq_len, -1)
+    else:
+        # Reshape to apply per-head gated norm.
+        core_attn_out = core_attn_out.reshape(batch * seq_len, -1, config.linear_value_head_dim)
+        z = z.reshape(batch * seq_len, -1, config.linear_value_head_dim)
+
+        # Apply gated RMSNorm per head. HF-style RMSNorm computes the reduction in
+        # fp32, which also removes one source of width-dependent TPU bf16 drift.
+        core_attn_out = _stable_rmsnorm_fp32(core_attn_out, params["norm_weight"], config.rms_norm_eps)
+        core_attn_out = core_attn_out * nn.silu(z)
+
+        # Reshape back and project.
+        core_attn_out = core_attn_out.reshape(batch, seq_len, -1)
     core_attn_out_proj = core_attn_out.astype(
         _decode_projection_activation_dtype(batch, config) if not is_prefill else dtype
     )

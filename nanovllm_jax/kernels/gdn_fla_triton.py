@@ -3148,6 +3148,7 @@ def _gdn_conv_packed_projection_decode_raw_gate_kernel(
     conv_weight,
     conv_bias,
     state,
+    norm_weight,
     out,
     new_conv_state,
     new_state,
@@ -3164,6 +3165,8 @@ def _gdn_conv_packed_projection_decode_raw_gate_kernel(
     FULL_K: tl.constexpr,
     FULL_V: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
+    RMS_NORM_EPS: tl.constexpr,
+    TAIL_FUSED: tl.constexpr,
 ):
     i_v = tl.program_id(0)
     i_nh = tl.program_id(1)
@@ -3348,6 +3351,17 @@ def _gdn_conv_packed_projection_decode_raw_gate_kernel(
     delta = (v - kv_mem) * beta_val
     o = state_dot_q + delta * qk_dot
     h = h + delta[:, None] * k[None, :]
+
+    if TAIL_FUSED:
+        z_offset = qkv_dim + 2 * HV
+        z_val = tl.load(
+            packed_proj + i_n * input_dim + z_offset + i_hv * V + offs_v,
+            mask=mask_v,
+            other=0.0,
+        ).to(tl.float32)
+        norm = tl.load(norm_weight + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+        rms_scale = tl.rsqrt(tl.sum(o * o, axis=0) / V + RMS_NORM_EPS)
+        o = o * rms_scale * norm * (z_val * tl.sigmoid(z_val))
 
     p_out = out + ((i_n * HV + i_hv) * V) + offs_v
     if FULL_V:
@@ -3710,6 +3724,7 @@ def gdn_conv_packed_projection_decode_step_bf16_raw_gates(
         conv_weight,
         conv_bias,
         recurrent_state,
+        decay,
         kernel=_gdn_conv_packed_projection_decode_raw_gate_kernel,
         out_shape=out_shape,
         grid=(jt.cdiv(value_dim, block_v), batch * value_heads),
@@ -3726,6 +3741,111 @@ def gdn_conv_packed_projection_decode_step_bf16_raw_gates(
         FULL_V=value_dim % block_v == 0,
         SCALE=1.0 / (key_dim**0.5),
         SOFTPLUS_THRESHOLD=20.0,
+        RMS_NORM_EPS=1.0e-6,
+        TAIL_FUSED=False,
+        num_warps=num_warps,
+        num_stages=_decode_triton_num_stages(),
+    )
+
+
+def gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail(
+    packed_proj: jax.Array,
+    decay: jax.Array,
+    dt_bias: jax.Array,
+    conv_state: jax.Array,
+    conv_weight: jax.Array,
+    conv_bias: jax.Array,
+    recurrent_state: jax.Array,
+    norm_weight: jax.Array,
+    *,
+    qkv_dim: int,
+    rms_norm_eps: float = 1.0e-6,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Run fused conv+GDN decode and emit the post-RMSNorm/silu tail vector."""
+
+    if packed_proj.ndim != 2:
+        raise ValueError("packed_proj must have shape [batch, packed_dim]")
+    if decay.ndim != 1 or dt_bias.ndim != 1:
+        raise ValueError("decay and dt_bias must have shape [value_heads]")
+    if conv_state.ndim != 3:
+        raise ValueError("conv_state must have shape [batch, conv_dim, kernel_size]")
+    if conv_weight.ndim != 2 or conv_bias.ndim != 1:
+        raise ValueError("conv_weight/conv_bias must have shape [conv_dim, kernel_size]/[conv_dim]")
+    if recurrent_state.ndim != 4:
+        raise ValueError("recurrent_state must have shape [batch, value_heads, value_dim, key_dim]")
+    if norm_weight.ndim != 1:
+        raise ValueError("norm_weight must have shape [value_dim]")
+    if packed_proj.dtype != jnp.bfloat16:
+        raise ValueError("gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail requires BF16 packed_proj")
+    for name, array in (
+        ("decay", decay),
+        ("dt_bias", dt_bias),
+        ("conv_state", conv_state),
+        ("conv_weight", conv_weight),
+        ("conv_bias", conv_bias),
+        ("recurrent_state", recurrent_state),
+        ("norm_weight", norm_weight),
+    ):
+        if array.dtype != jnp.float32:
+            raise ValueError(f"{name} must be float32")
+
+    batch, packed_dim = packed_proj.shape
+    conv_dim = int(qkv_dim)
+    state_batch, value_heads, value_dim, key_dim = recurrent_state.shape
+    if state_batch != batch or conv_state.shape[0] != batch:
+        raise ValueError("state batch dimensions must match packed_proj batch")
+    if conv_state.shape[1] != conv_dim or conv_weight.shape[0] != conv_dim or conv_bias.shape[0] != conv_dim:
+        raise ValueError("conv dimensions must match qkv_dim")
+    if conv_weight.shape[1] != conv_state.shape[2]:
+        raise ValueError("conv kernel sizes must match")
+    if decay.shape != (value_heads,) or dt_bias.shape != (value_heads,):
+        raise ValueError("decay and dt_bias must have shape [value_heads]")
+    if norm_weight.shape != (value_dim,):
+        raise ValueError("norm_weight must have shape [value_dim]")
+    if packed_dim < conv_dim + 2 * value_heads + value_heads * value_dim:
+        raise ValueError("packed_proj must contain qkv, a, b, and full z regions")
+    qk_dim = conv_dim - value_heads * value_dim
+    if qk_dim <= 0 or qk_dim % (2 * key_dim) != 0:
+        raise ValueError("qkv_dim has an invalid packed Q/K dimension")
+    num_q_heads = qk_dim // (2 * key_dim)
+    if value_heads % num_q_heads != 0:
+        raise ValueError("value_heads must be divisible by num_q_heads")
+
+    block_k = jt.next_power_of_2(key_dim)
+    block_v = jt.next_power_of_2(value_dim)
+    num_warps = _decode_triton_num_warps(value_dim)
+    out_shape = (
+        jax.ShapeDtypeStruct((batch, 1, value_heads * value_dim), jnp.float32),
+        jax.ShapeDtypeStruct(conv_state.shape, jnp.float32),
+        jax.ShapeDtypeStruct(recurrent_state.shape, jnp.float32),
+    )
+    return jt.triton_call(
+        packed_proj,
+        decay,
+        dt_bias,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        recurrent_state,
+        norm_weight,
+        kernel=_gdn_conv_packed_projection_decode_raw_gate_kernel,
+        out_shape=out_shape,
+        grid=(1, batch * value_heads),
+        input_dim=packed_dim,
+        qkv_dim=conv_dim,
+        H=num_q_heads,
+        HV=value_heads,
+        K=key_dim,
+        V=value_dim,
+        CONV_KERNEL=conv_state.shape[2],
+        BK=block_k,
+        BV=block_v,
+        FULL_K=key_dim == block_k,
+        FULL_V=value_dim % block_v == 0,
+        SCALE=1.0 / (key_dim**0.5),
+        SOFTPLUS_THRESHOLD=20.0,
+        RMS_NORM_EPS=float(rms_norm_eps),
+        TAIL_FUSED=True,
         num_warps=num_warps,
         num_stages=_decode_triton_num_stages(),
     )
@@ -3752,5 +3872,6 @@ __all__ = [
     "gdn_packed_decode_step_bf16_raw_gates",
     "gdn_conv_packed_decode_step_bf16_raw_gates",
     "gdn_conv_packed_projection_decode_step_bf16_raw_gates",
+    "gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail",
     "gdn_post_conv_prep_bf16",
 ]

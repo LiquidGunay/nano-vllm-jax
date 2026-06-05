@@ -425,6 +425,72 @@ def test_model_packed_gdn_decode_reference_matches_default(monkeypatch):
     )
 
 
+def test_strict_gdn_packed_decode_rejects_model_level_fallback(monkeypatch):
+    for env_name in (
+        "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS",
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_MAX_BATCH",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    config = Qwen3_5Config(
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_size=4,
+        layer_types=("linear_attention",),
+        linear_attn_layers=(0,),
+        dtype="float32",
+        gdn_disable_fallbacks=True,
+        gdn_packed_decode_impl="triton_fla_conv_raw_gates",
+        gdn_packed_decode_qkv_dtype="bf16",
+        gdn_packed_decode_max_batch=1,
+    )
+    params = init_transformer_block(jax.random.PRNGKey(0), config, layer_idx=0)
+    batch = 2
+    seq_len = 1
+    key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+    value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+    conv_dim = 2 * key_dim + value_dim
+    x = jnp.zeros((batch, seq_len, config.hidden_size), dtype=jnp.float32)
+    hybrid_state = HybridLayerState(
+        conv_state=jnp.zeros(
+            (batch, 1, conv_dim, config.linear_conv_kernel_size),
+            dtype=jnp.float32,
+        ),
+        recurrent_state=jnp.zeros(
+            (
+                batch,
+                1,
+                config.linear_num_value_heads,
+                config.linear_value_head_dim,
+                config.linear_key_head_dim,
+            ),
+            dtype=jnp.float32,
+        ),
+    )
+    positions = jnp.zeros((batch, seq_len), dtype=jnp.int32)
+
+    with pytest.raises(RuntimeError, match="batch 2 exceeds packed_decode.max_batch 1"):
+        gated_deltanet_block(
+            x,
+            params,
+            positions,
+            config,
+            layer_idx=0,
+            is_prefill=False,
+            hybrid_state=hybrid_state,
+        )
+
+
 def _packed_decode_expected(
     mixed_qkv: jnp.ndarray,
     a: jnp.ndarray,
@@ -1013,6 +1079,135 @@ def test_gdn_conv_packed_projection_decode_matches_split_kernel(monkeypatch):
     )
 
     np.testing.assert_allclose(np.asarray(actual_out), np.asarray(expected_out), atol=2e-5)
+    np.testing.assert_allclose(
+        np.asarray(actual_conv_state),
+        np.asarray(expected_conv_state),
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
+        atol=2e-5,
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_gdn_conv_packed_projection_tail_decode_matches_split_tail(monkeypatch):
+    batch = 2
+    num_key_heads = 2
+    num_value_heads = 4
+    key_dim = 8
+    value_dim = 16
+    conv_kernel = 4
+    conv_dim = num_key_heads * key_dim * 2 + num_value_heads * value_dim
+    key = jax.random.PRNGKey(71)
+    keys = jax.random.split(key, 10)
+    mixed_qkv = jax.random.normal(keys[0], (batch, conv_dim), dtype=jnp.float32).astype(jnp.bfloat16)
+    a_bf16 = jax.random.normal(keys[1], (batch, num_value_heads), dtype=jnp.float32).astype(jnp.bfloat16)
+    b_bf16 = jax.random.normal(keys[2], (batch, num_value_heads), dtype=jnp.float32).astype(jnp.bfloat16)
+    z = jax.random.normal(
+        keys[3],
+        (batch, num_value_heads * value_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    packed_proj = jnp.concatenate([mixed_qkv, a_bf16, b_bf16, z], axis=-1)
+    decay = jnp.linspace(0.5, 1.2, num_value_heads, dtype=jnp.float32)
+    dt_bias = jnp.linspace(-0.1, 0.2, num_value_heads, dtype=jnp.float32)
+    conv_state = jax.random.normal(
+        keys[4],
+        (batch, conv_dim, conv_kernel),
+        dtype=jnp.float32,
+    )
+    conv_weight = jax.random.normal(keys[5], (conv_dim, conv_kernel), dtype=jnp.float32) * 0.05
+    conv_bias = jax.random.normal(keys[6], (conv_dim,), dtype=jnp.float32) * 0.02
+    state = jax.random.normal(
+        keys[7],
+        (batch, num_value_heads, value_dim, key_dim),
+        dtype=jnp.float32,
+    ) * 0.025
+    norm_weight = jnp.linspace(0.6, 1.4, value_dim, dtype=jnp.float32)
+
+    backend = PureJAXBackend()
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
+        "triton_fla_conv_raw_gates",
+    )
+    expected_core, expected_conv_state, expected_state = jax.jit(
+        lambda mixed, a_in, b_in, decay_in, dt_bias_in, conv_s, conv_w, conv_b, state_in: (
+            backend.gated_delta_conv_packed_decode(
+                mixed,
+                a_in,
+                b_in,
+                decay_in,
+                dt_bias_in,
+                conv_s,
+                conv_w,
+                conv_b,
+                state_in,
+                use_qk_l2norm_in_kernel=True,
+            )
+        )
+    )(
+        mixed_qkv,
+        a_bf16.astype(jnp.float32),
+        b_bf16.astype(jnp.float32),
+        decay,
+        dt_bias,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        state,
+    )
+    expected_tail = expected_core.transpose(0, 2, 1, 3).reshape(
+        batch,
+        num_value_heads,
+        value_dim,
+    )
+    expected_tail = expected_tail.astype(jnp.float32)
+    variance = jnp.mean(jnp.square(expected_tail), axis=-1, keepdims=True)
+    expected_tail = expected_tail * jax.lax.rsqrt(variance + 1.0e-6)
+    expected_tail = expected_tail * norm_weight
+    expected_tail = expected_tail * jax.nn.silu(z.astype(jnp.float32).reshape(batch, num_value_heads, value_dim))
+    expected_tail = expected_tail.reshape(batch, 1, num_value_heads * value_dim)
+
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
+        "triton_fla_conv_raw_gates_tail",
+    )
+    actual_tail, actual_conv_state, actual_state = jax.jit(
+        lambda packed, decay_in, dt_bias_in, conv_s, conv_w, conv_b, state_in, norm_in: (
+            backend.gated_delta_conv_packed_projection_decode(
+                packed,
+                decay_in,
+                dt_bias_in,
+                conv_s,
+                conv_w,
+                conv_b,
+                state_in,
+                qkv_dim=conv_dim,
+                use_qk_l2norm_in_kernel=True,
+                norm_weight=norm_in,
+                rms_norm_eps=1.0e-6,
+            )
+        )
+    )(
+        packed_proj,
+        decay,
+        dt_bias,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        state,
+        norm_weight,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_tail),
+        np.asarray(expected_tail),
+        rtol=1e-4,
+        atol=5e-4,
+    )
     np.testing.assert_allclose(
         np.asarray(actual_conv_state),
         np.asarray(expected_conv_state),

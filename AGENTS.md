@@ -51,6 +51,11 @@
 - Keep benchmark artifacts under `/mountpoint/.exp/diagnostics` or another
   mountpoint path, but commit only summaries, configs, docs, and tests. Do not
   stage `results/*` or full profile/artifact dumps.
+- Do not pass an existing diagnostic `*.prompts.jsonl` file back into the
+  random sidecar unless it has first been copied to a throwaway path. The
+  sidecar may regenerate/rewrite prompt manifests, so exact-envelope A/B runs
+  should either call the JAX trace benchmark directly or use a fresh unique
+  sidecar output prefix.
 - Push checkpoint commits to the remote periodically while working on long GPU
   optimization passes so the current best state is not only local.
 
@@ -73,11 +78,11 @@
   that reduces model work instead of scanning the full model in JAX.
 - Current accepted large-random token-carry boundary: packed prefill seeds
   resident slot tokens inside `forward_prefill_token_ids_slot_carry_table_jit`,
-  and static decode carries them inside
-  `forward_step_token_ids_slot_carry_table_jit`. The runner keeps immutable
-  generated-token refs for final materialization, but the resident per-slot
-  table owns the next decode input state. This is the preferred route unless a
-  broader resident metadata/kernel boundary replaces it.
+  and compact active decode rows use
+  `forward_step_token_ids_resident_dense_slot_carry_jit`. The runner keeps
+  immutable generated-token refs for final materialization, but resident
+  per-slot tables own next-token, seq-len, block-table, and hybrid-state decode
+  state.
 - Current accepted FA/FLA kernel policy: GDN keeps strict
   `triton_fla_padded` prefill plus explicit packed-projection `reference`
   decode, while full-attention uses
@@ -85,14 +90,26 @@
   FA decode remains rejected; the accepted FA route is the broader
   packed-prefill plus fused append/decode boundary.
 - Current accepted resident metadata route: static decode placeholders are
-  shape/active-row keyed, resident block/seq tables are synchronized from host
-  mirrors with full-table `device_put` on actual changes, and
-  `forward_step_token_ids_resident_slot_carry_jit` owns block table, seq-len,
-  token, hybrid-state, KV, and greedy-token updates inside the decode boundary.
-- Latest accepted large-random hill-climb result: row-padded decode GEMMs now
-  cover the LM head as well as hidden/intermediate projections. Repeats reached
-  `516.35` and `519.16 output tok/s` against the stored vLLM denominator
-  (`0.584x` and `0.587x`), with zero measured-phase JIT growth. This is a
-  small accepted win, not the target-closing leap; the next bottleneck is still
-  model-side decode GPU work (many small GEMMs/attention/GDN) plus remaining
-  PJRT execution overhead.
+  shape/active-row keyed, resident block/seq host mirrors only synchronize rows
+  on actual KV-page/seq changes, small update tensors are built with direct
+  `jax.device_put(np.asarray(...))`, and
+  `forward_step_token_ids_resident_dense_slot_carry_jit` owns block-table,
+  seq-len, token, hybrid-state, KV, and greedy-token updates inside the decode
+  boundary.
+- Latest accepted large-random hill-climb result: the dense resident decode
+  boundary plus direct small-array device-put cleanup reached
+  `757.24 output tok/s`, `0.857x` of the stored vLLM denominator
+  (`884.03 output tok/s`), with zero measured-phase JIT growth (`24 -> 24`).
+  Token-event throughput was `794.77 tok/s`, about `0.899x` of the same
+  denominator; the remaining gap is final output drain plus model-side decode
+  GPU work (BF16 GEMMs, paged decode attention, LM-head reductions, and small
+  fusions).
+- Do not retry direct JAX `.lower().compile()` executable caching as "graph
+  replay". The 2026-06-05 guarded smoke stayed CPU-bound in compile/warmup for
+  more than six minutes before measurement. Use XLA/runtime graph replay or a
+  backend-owned decode boundary if replay is revisited.
+- Do not retry Entry 272 rejected branches as primary routes: resident
+  prefix-slot compaction, decode block-table buckets `32,64,128`, scalar
+  block-entry scatter, in-JIT resident metadata delta application, and
+  per-shape grouped final token materialization all lost integrated large-random
+  throughput or profile health.

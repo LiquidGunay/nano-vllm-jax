@@ -338,7 +338,7 @@ class ModelExecutor:
         args: tuple,
         call_stage: str,
     ):
-        if os.environ.get("NANO_VLLM_JAX_PROFILE_JIT", "0") not in {"1", "true", "yes", "on", "True"}:
+        if os.environ.get("NANO_VLLM_JAX_PROFILE_JIT", "0") not in _TRUE_ENV_VALUES:
             return fn(*args)
 
         metrics = self._jit_metric(cache_key)
@@ -2026,6 +2026,186 @@ class ModelExecutor:
                 resident_last_tokens,
             ),
             "forward_step_token_ids_resident_slot_carry_jit:decode",
+        )
+        return ExecutorOutput(
+            activations=token_ids,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            attention_metadata=None,
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+            resident_seq_lens=seq_lens_table,
+            resident_last_tokens=last_tokens_table,
+        )
+
+    def forward_step_token_ids_resident_dense_slot_carry_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state_table: HybridLayerState,
+        hybrid_slot_ids: jnp.ndarray,
+        resident_block_tables: jnp.ndarray,
+        resident_seq_lens: jnp.ndarray,
+        resident_last_tokens: jnp.ndarray,
+    ) -> ExecutorOutput:
+        """Dense decode path for compact active rows with arbitrary slots.
+
+        Random serving emits compact decode batches: every row in the shaped
+        decode batch is active, but the resident hybrid-state slot can still be
+        an arbitrary scheduler slot. This boundary keeps the resident metadata
+        table contract while avoiding the invalid-row masking and cumsum needed
+        by the more general resident slot-carry entry point.
+        """
+
+        if batch.is_prefill:
+            raise ValueError("forward_step_token_ids_resident_dense_slot_carry_jit is decode-only")
+        if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
+            raise ValueError(
+                "forward_step_token_ids_resident_dense_slot_carry_jit requires initialized "
+                "hybrid state tables"
+            )
+        self._log_step(
+            "forward_step_token_ids_resident_dense_slot_carry_jit",
+            batch,
+            return_hidden=True,
+            last_logits_only=False,
+        )
+        self._validate_batch_contract(batch)
+
+        batch_size = int(batch.tokens.shape[0])
+        static_block_table_width = int(batch.block_tables.shape[1])
+        key = (
+            "token-ids-resident-dense-slot-carry",
+            tuple(batch.tokens.shape),
+            static_block_table_width,
+            tuple(hybrid_state_table.conv_state.shape),
+            tuple(hybrid_state_table.recurrent_state.shape),
+            tuple(resident_block_tables.shape),
+            tuple(resident_seq_lens.shape),
+            tuple(resident_last_tokens.shape),
+        )
+        if key not in self._jit_cache:
+
+            def compiled(
+                params_leaves,
+                k_cache,
+                v_cache,
+                conv_state_table,
+                recurrent_state_table,
+                slot_ids,
+                block_table_table,
+                seq_lens_table,
+                last_tokens_table,
+            ):
+                params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
+                slot_ids = slot_ids.astype(jnp.int32)
+                seq_lens = seq_lens_table[slot_ids]
+                tokens = last_tokens_table[slot_ids].astype(jnp.int32)[:, None]
+                block_tables = block_table_table[slot_ids, :static_block_table_width]
+                positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
+                query_start_loc = jnp.arange(batch_size + 1, dtype=jnp.int32)
+
+                conv_state = conv_state_table[slot_ids]
+                recurrent_state = recurrent_state_table[slot_ids]
+                step_batch = ScheduledBatch(
+                    tokens=tokens,
+                    positions=positions,
+                    seq_ids=slot_ids,
+                    query_start_loc=query_start_loc,
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=jnp.asarray(batch_size, dtype=jnp.int32),
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                )
+                attention_metadata = self.backend.build_attention_metadata(
+                    positions=step_batch.positions,
+                    block_tables=step_batch.block_tables,
+                    seq_lens=step_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=False,
+                    query_start_loc=step_batch.query_start_loc,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=step_batch.num_decode_tokens,
+                )
+                kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=step_batch.block_tables,
+                    kv_lens=step_batch.seq_lens,
+                    slot_mapping=attention_metadata.slot_mapping,
+                )
+                hidden, updated_kv_state, updated_hybrid_state = model_forward_step(
+                    step_batch.tokens,
+                    params,
+                    self.config,
+                    positions=step_batch.positions,
+                    kv_cache_state=kv_state,
+                    attention_metadata=attention_metadata,
+                    hybrid_state=HybridLayerState(conv_state, recurrent_state),
+                    is_prefill=False,
+                    return_hidden=True,
+                    return_hidden_with_logits=False,
+                    last_logits_only=False,
+                    backend=self.backend,
+                    hybrid_state_layerwise=True,
+                )
+                token_ids, _, _ = lm_head_token_ids_and_topk(
+                    hidden[:, :1, :],
+                    params,
+                    self.config,
+                    hidden_is_normed=False,
+                    is_prefill=False,
+                    top_k=0,
+                )
+                token_ids = token_ids[:, 0].astype(jnp.int32)
+                updated_conv = updated_hybrid_state.conv_state.astype(conv_state_table.dtype)
+                updated_recurrent = updated_hybrid_state.recurrent_state.astype(
+                    recurrent_state_table.dtype
+                )
+                updated_conv_table = conv_state_table.at[slot_ids].set(updated_conv)
+                updated_recurrent_table = recurrent_state_table.at[slot_ids].set(
+                    updated_recurrent
+                )
+                updated_seq_lens_table = seq_lens_table.at[slot_ids].set(seq_lens + 1)
+                updated_last_tokens = last_tokens_table.at[slot_ids].set(token_ids)
+                return (
+                    token_ids,
+                    updated_kv_state.k_cache,
+                    updated_kv_state.v_cache,
+                    updated_conv_table,
+                    updated_recurrent_table,
+                    updated_seq_lens_table,
+                    updated_last_tokens,
+                )
+
+            self._jit_cache[key] = jax.jit(
+                compiled,
+                donate_argnums=(1, 2, 3, 4, 7, 8),
+            )
+
+        (
+            token_ids,
+            k_cache,
+            v_cache,
+            conv_state,
+            recurrent_state,
+            seq_lens_table,
+            last_tokens_table,
+        ) = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self._params_leaves,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state_table.conv_state,
+                hybrid_state_table.recurrent_state,
+                hybrid_slot_ids,
+                resident_block_tables,
+                resident_seq_lens,
+                resident_last_tokens,
+            ),
+            "forward_step_token_ids_resident_dense_slot_carry_jit:decode",
         )
         return ExecutorOutput(
             activations=token_ids,

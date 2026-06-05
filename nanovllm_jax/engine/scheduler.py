@@ -155,6 +155,7 @@ class Scheduler:
         self.mtp_spec_latency_steps = 0
         self.max_blocks_per_seq = getattr(config, "max_blocks_per_seq", None)
         self._static_decode_metadata_cache: dict[str, object] | None = None
+        self._static_decode_metadata_cache_by_key: dict[tuple[object, ...], dict[str, object]] = {}
         self._static_decode_constant_cache: dict[tuple[object, ...], dict[str, object]] = {}
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, 
@@ -928,6 +929,8 @@ class Scheduler:
                 tuple(tuple(row) for row in block_tables),
             )
         cache = self._static_decode_metadata_cache
+        if resident_decode_metadata:
+            cache = self._static_decode_metadata_cache_by_key.get(key)
         if cache is None or cache.get("key") != key:
             if resident_decode_metadata:
                 block_tables_array = jax.device_put(np.zeros(block_table_shape, dtype=np.int32))
@@ -944,7 +947,10 @@ class Scheduler:
                 "block_tables": block_tables_array,
                 "seq_lens": seq_lens_array,
             }
-            self._static_decode_metadata_cache = cache
+            if resident_decode_metadata:
+                self._static_decode_metadata_cache_by_key[key] = cache
+            else:
+                self._static_decode_metadata_cache = cache
         else:
             if self.static_decode_seq_lens_carry or resident_decode_metadata:
                 seq_lens_array = cache["seq_lens"]
