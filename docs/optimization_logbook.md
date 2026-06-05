@@ -9904,3 +9904,66 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
 - validation:
   - `python -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py tests/test_backend_boundaries.py`;
   - `pytest -q tests/test_backend_boundaries.py -k 'table_hybrid_decode_matches_sliced_decode or warmup_compiles_resident_slot_carry_decode_when_available or warmup_compiles_prefill_slot_carry_table_when_available'`.
+
+### Entry 259 - Accepted Fixed-ABI FA/FLA Policy
+
+- date: 2026-06-05
+- purpose:
+  - finish the FA/FLA integration pass after the packed/ragged ABI and
+    resident slot-token carry boundary stabilized;
+  - retest the existing full-attention Triton routes under the current random
+    decode graph instead of relying on the older pre-ABI rejection;
+  - keep the GDN FLA route unchanged and promote only an integrated
+    full-attention route that improves random decode with generic warmup.
+- implementation:
+  - promoted `full_attention.prefill_impl=triton_packed` and
+    `full_attention.decode_impl=triton_paged_fused_append` in
+    `benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata.json`;
+  - retained BF16 full-attention KV cache, strict GDN no-fallback policy,
+    `gdn.prefill_post_conv_impl=triton_fla_padded`, and
+    `gdn.packed_decode.impl=triton_fla_conv_raw_gates`;
+  - left standalone `full_attention.decode_impl=triton_paged` rejected for
+    random serving because it still replaces too narrow a boundary.
+- artifacts:
+  - medium same-code control:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_current_control_r1.json`;
+  - medium FA prefill-only:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_fa_prefill_triton_r1.json`;
+  - medium FA decode-only:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_fa_decode_triton_r1.json`;
+  - medium FA fused append/decode-only:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_fa_decode_fused_append_r1.json`;
+  - medium combined FA route:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_fa_prefill_fused_decode_r1.json`;
+  - large combined FA route:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_fa_prefill_fused_decode_r1.json`;
+  - nested large JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_fa_prefill_fused_decode_r1_jax.json`.
+- result:
+  - focused GPU correctness passed for Triton packed FA prefill, Triton FA
+    decode, fused FA append/decode, and Triton FLA GDN prefill;
+  - medium current control: `337.12 output tok/s`, stored-vLLM ratio `0.716x`;
+  - medium FA prefill-only: `350.17 output tok/s`, `0.743x`;
+  - medium FA decode-only: `332.30 output tok/s`, `0.705x`;
+  - medium FA fused append/decode-only: `349.70 output tok/s`, `0.742x`;
+  - medium combined FA prefill plus fused append/decode:
+    `359.60 output tok/s`, `0.763x`;
+  - large accepted Entry 257 control:
+    `470.14 output tok/s`, stored-vLLM ratio `0.532x`;
+  - large combined FA prefill plus fused append/decode:
+    `484.18 output tok/s`, stored-vLLM ratio `0.548x`;
+  - measured-phase JIT cache growth stayed zero on the large run (`20 -> 20`),
+    and the artifact reports `prefill_impl=triton_packed`,
+    `decode_impl=triton_paged_fused_append`,
+    `gdn_prefill_post_conv_impl=triton_fla_padded`, and
+    `gdn_packed_decode_impl=triton_fla_conv_raw_gates`.
+- decision:
+  - promote the combined FA route in the main GPU config;
+  - do not promote standalone FA decode or prefill-only as independent routes;
+  - treat FA/FLA as now integrated enough for the next pass to return to
+    scheduler/static metadata movement, PJRT bubbles, and broader decode graph
+    fusion.
+- validation:
+  - `JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m pytest -q tests/test_backend_boundaries.py::test_packed_full_attention_prefill_triton_matches_dense_rows_bf16_cache tests/test_backend_boundaries.py::test_paged_decode_attention_triton_matches_reference_bf16_cache tests/test_backend_boundaries.py::test_configured_triton_decode_attention_matches_reference_non_contiguous_blocks tests/test_backend_boundaries.py::test_configured_fused_triton_decode_attention_appends_kv_and_matches_reference tests/test_gdn_post_conv_prefill_reference.py::test_model_post_conv_prepared_fla_triton_packed_matches_reference`;
+  - medium and large random sidecar runs above used stored vLLM denominators,
+    generic warmup, `--jax-fail-on-jit-cache-growth`, and the 70% RAM guard.

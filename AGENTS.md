@@ -59,10 +59,9 @@
 - Stay on the random decode graph as the main hill-climb target. Do not switch to
   shape-specific microbench tuning unless it is needed to debug a random-graph
   regression.
-- Keep these work items in order: explicit attention kernel policy, integrated
-  paged decode attention validation, broader resident decode metadata boundary,
-  coarse GDN decode/prefill kernels, and model-family-general batched
-  GEMM/fusion improvements.
+- Keep these work items in order: accepted FA/FLA policy validation, broader
+  resident/scheduler decode metadata reduction, coarse GDN decode/prefill
+  kernels, and model-family-general batched GEMM/fusion improvements.
 - Treat standalone attention, append, GDN, and GEMM probes as diagnostic only
   until they improve integrated random decode throughput with correctness and no
   measured-phase JIT growth.
@@ -79,8 +78,14 @@
   generated-token refs for final materialization, but the resident per-slot
   table owns the next decode input state. This is the preferred route unless a
   broader resident metadata/kernel boundary replaces it.
-- Latest accepted large-random hill-climb result: `470.14 output tok/s` against
-  the stored vLLM denominator (`0.532x`), zero measured-phase JIT growth, and
+- Current accepted FA/FLA kernel policy: GDN keeps strict
+  `triton_fla_padded` prefill plus `triton_fla_conv_raw_gates` packed decode,
+  while full-attention uses `triton_packed` prefill and
+  `triton_paged_fused_append` decode. Standalone FA decode remains rejected;
+  the accepted FA route is the broader packed-prefill plus fused append/decode
+  boundary.
+- Latest accepted large-random hill-climb result: `484.18 output tok/s` against
+  the stored vLLM denominator (`0.548x`), zero measured-phase JIT growth, and
   no `_record_resident_last_tokens` top-profile bucket. The next bottleneck is
   scheduler/static decode metadata movement plus PJRT/GPU execution, not another
-  token-carry rewrite.
+  token-carry or standalone attention rewrite.

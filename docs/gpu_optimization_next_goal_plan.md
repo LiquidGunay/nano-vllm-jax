@@ -329,6 +329,11 @@ Random benchmark policy, 2026-06-05:
   `random_config_table_prefill_token_carry_large_with_vllm_r1`: `8` requests,
   `6240` input tokens, `1351` output tokens, vLLM `884.03 output tok/s`, JAX
   `400.42 output tok/s`, JAX/vLLM `0.453x`, zero measured-phase JIT growth.
+- current accepted large JAX route, after resident slot-token prefill seeding
+  and FA/FLA policy promotion:
+  `random_large_fa_prefill_fused_decode_r1`, `8` requests, `6240` input
+  tokens, `1582` output tokens, JAX `484.18 output tok/s`, JAX/stored-vLLM
+  `0.548x`, zero measured-phase JIT growth (`20 -> 20`).
 
 Micro-burst selection model:
 
@@ -1480,15 +1485,16 @@ top-k.
 
 ### Current Execution Plan - FA/FLA Integration
 
-As of 2026-06-04, the next speed path is the FA/FLA kernel integration plan:
+As of 2026-06-05, the accepted FA/FLA kernel policy is:
 
 1. Make full-attention and GDN kernel policy first-class config, not loose
    benchmark environment. Artifacts must report the selected FA KV append,
    FA decode, FA prefill, GDN prefill, and GDN decode implementations.
-2. Promote the existing paged full-attention decode boundary into a typed route:
-   `full_attention.decode_impl=triton_paged`. This must consume the current
-   NHD paged cache directly and fail loudly when the shape/dtype contract is not
-   supported, instead of silently falling back to JAX.
+2. Promote the full-attention route as the broader fixed-ABI boundary:
+   `full_attention.prefill_impl=triton_packed` and
+   `full_attention.decode_impl=triton_paged_fused_append`. This consumes the
+   current paged cache directly and fails loudly when the shape/dtype contract
+   is not supported, instead of silently falling back to JAX.
 3. Keep `full_attention.kv_append_impl=reference` until a matching FlashInfer or
    Triton append path is paired with the paged decode reader. Standalone append
    kernels have already regressed integrated serving.
@@ -1502,12 +1508,18 @@ As of 2026-06-04, the next speed path is the FA/FLA kernel integration plan:
    measured-phase JIT growth after generic warmup, and a real integrated
    throughput improvement against the accepted JAX baseline and vLLM.
 
-Status after the first execution pass: the config route and focused parity
-tests are implemented, but the narrow FA decode routes are rejected for
-promotion. `full_attention.decode_impl=triton_paged` was exact but slower than
-the current static route on `decode_heavy_128x128`; fused append+decode and B1
-packed-QKV probes also regressed. Continue with broader decode graph work
-rather than retrying standalone FA attention replacement.
+Status after the fixed-ABI execution pass: focused FA/FLA parity tests pass,
+and the combined FA route is promoted in
+`gpu_paged_gdn_fla_decode_static_metadata`. The single-route FA diagnostics are
+still rejected for promotion on the medium random lane:
+`full_attention.decode_impl=triton_paged` reached only `332.30 output tok/s`;
+`full_attention.prefill_impl=triton_packed` reached `350.17 output tok/s`; and
+`full_attention.decode_impl=triton_paged_fused_append` reached
+`349.70 output tok/s`. The combined route reached `359.60 output tok/s` on
+medium and `484.18 output tok/s` on large, improving the accepted large route
+from `470.14` to `484.18 output tok/s` with zero measured-phase JIT growth
+(`20 -> 20`). Continue with scheduler/static metadata movement and broader
+decode graph work rather than retrying standalone FA attention replacement.
 
 ## P0.1 - `kv_append_paged_nhd`
 
