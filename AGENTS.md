@@ -68,8 +68,10 @@
   measured-phase JIT growth.
 - Current rejected random-speed routes: standalone FA decode Triton, resident
   decode metadata v1/placeholders, static seq-lens carry, shared-gather
-  token-carry fallback, and source-level greedy decode bursts. Reopen any of
-  these only with a broader boundary that removes a whole per-step operation.
+  token-carry fallback, combined resident metadata plus slot-token decode
+  (`forward_step_token_ids_resident_slot_carry_jit`), and source-level greedy
+  decode bursts. Reopen any of these only with a broader boundary that removes a
+  whole per-step operation.
 - Current accepted large-random token-carry boundary: packed prefill seeds
   resident slot tokens inside `forward_prefill_token_ids_slot_carry_table_jit`,
   and static decode carries them inside

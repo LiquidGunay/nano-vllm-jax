@@ -1434,7 +1434,35 @@ class CanonicalModelRunner:
                 if use_hybrid_table_decode:
                     hybrid_slot_ids = jnp.arange(batch_size, dtype=jnp.int32)
                     batch.hybrid_slot_ids_host = tuple(range(batch_size))
-                    if self.resident_decode_metadata and hasattr(self.executor, "forward_step_token_ids_resident_jit"):
+                    if (
+                        self.resident_decode_metadata
+                        and hasattr(self.executor, "forward_step_token_ids_resident_slot_carry_jit")
+                    ):
+                        self._sync_resident_decode_metadata(
+                            batch,
+                            list(batch.hybrid_slot_ids_host),
+                            sync_seq_lens=True,
+                        )
+                        output = self.executor.forward_step_token_ids_resident_slot_carry_jit(
+                            batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state_table=self._hybrid_state_table,
+                            hybrid_slot_ids=hybrid_slot_ids,
+                            resident_block_tables=self._resident_block_tables,
+                            resident_seq_lens=self._resident_seq_lens,
+                            resident_last_tokens=self._resident_last_tokens,
+                        )
+                        if output.resident_seq_lens is not None:
+                            self._resident_seq_lens = output.resident_seq_lens
+                            self._advance_resident_seq_lens_host(
+                                list(batch.hybrid_slot_ids_host),
+                                active_rows=list(range(batch_size)),
+                                steps=1,
+                            )
+                        if output.resident_last_tokens is not None:
+                            self._resident_last_tokens = output.resident_last_tokens
+                        route = "forward_step_token_ids_resident_slot_carry_jit:decode"
+                    elif self.resident_decode_metadata and hasattr(self.executor, "forward_step_token_ids_resident_jit"):
                         self._sync_resident_decode_metadata(
                             batch,
                             list(batch.hybrid_slot_ids_host),
@@ -2903,7 +2931,17 @@ class CanonicalModelRunner:
                 active_rows=self._active_decode_rows_host(batch),
             )
         )
-        if not resident_slot_token_decode:
+        resident_slot_token_metadata_decode = (
+            use_hybrid_table_decode
+            and decode_burst_steps <= 1
+            and bool(getattr(self, "resident_decode_metadata", False))
+            and hasattr(self.executor, "forward_step_token_ids_resident_slot_carry_jit")
+            and self._resident_slot_token_decode_ready(
+                batch,
+                active_rows=self._active_decode_rows_host(batch),
+            )
+        )
+        if not (resident_slot_token_decode or resident_slot_token_metadata_decode):
             batch = self._maybe_apply_device_token_carry(batch)
         if batch.query_lens_host is not None:
             query_lens = [int(x) for x in batch.query_lens_host[: len(seqs)]]
@@ -2931,9 +2969,10 @@ class CanonicalModelRunner:
             use_hybrid_table_decode
             and decode_burst_steps <= 1
             and bool(getattr(self, "resident_decode_metadata", False))
+            and not resident_slot_token_metadata_decode
             and hasattr(self.executor, "forward_step_token_ids_resident_jit")
         )
-        if use_resident_slot_decode:
+        if use_resident_slot_decode or resident_slot_token_metadata_decode:
             self._sync_resident_decode_metadata(
                 batch,
                 hybrid_slot_values,
@@ -2976,6 +3015,18 @@ class CanonicalModelRunner:
                     hybrid_state_table=hybrid_state,
                     hybrid_slot_ids=hybrid_slot_ids,
                 )
+            elif resident_slot_token_metadata_decode:
+                output = self.executor.forward_step_token_ids_resident_slot_carry_jit(
+                    batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state_table=hybrid_state,
+                    hybrid_slot_ids=hybrid_slot_ids,
+                    resident_block_tables=self._resident_block_tables,
+                    resident_seq_lens=self._resident_seq_lens,
+                    resident_last_tokens=self._resident_last_tokens,
+                )
+                if output.resident_last_tokens is not None:
+                    self._resident_last_tokens = output.resident_last_tokens
             elif use_resident_slot_decode:
                 output = self.executor.forward_step_token_ids_resident_jit(
                     batch,
@@ -3021,7 +3072,10 @@ class CanonicalModelRunner:
         if use_hybrid_table_decode or use_hybrid_table_prefill:
             self._hybrid_state_table = output.hybrid_state
             self._mark_hybrid_slots_written(list(batch.hybrid_slot_ids_host or ()))
-            if use_resident_slot_decode and output.resident_seq_lens is not None:
+            if (
+                (use_resident_slot_decode or resident_slot_token_metadata_decode)
+                and output.resident_seq_lens is not None
+            ):
                 self._resident_seq_lens = output.resident_seq_lens
                 self._advance_resident_seq_lens_host(
                     hybrid_slot_values,
@@ -3102,7 +3156,9 @@ class CanonicalModelRunner:
                 prefill_final_flags=prefill_final_flags,
                 seqs=seqs,
                 update_resident_tokens=not (
-                    resident_slot_token_decode or prefill_resident_tokens_seeded
+                    resident_slot_token_decode
+                    or resident_slot_token_metadata_decode
+                    or prefill_resident_tokens_seeded
                 ),
             )
         elif use_greedy_token_fastpath and decode_burst_steps > 1 and carry_device_tokens:

@@ -9864,3 +9864,43 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - `python -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py tests/test_backend_boundaries.py tests/test_device_token_carry.py`;
   - `pytest -q tests/test_backend_boundaries.py -k 'packed_prefill_greedy_token_jit_returns_row_tokens or warmup_compiles_table_prefill_when_available or warmup_compiles_prefill_slot_carry_table_when_available or warmup_compiles_decode_block_table_buckets'`;
   - `pytest -q tests/test_device_token_carry.py -k 'updates_resident_last_tokens or records_full_static_decode_rows or static_decode_metadata_requires_token_carry or survives_nonfinal_prefill_chunk or release_preserves_carry'`.
+
+### Entry 258 - Combined Resident Metadata And Slot-Token Decode Rejection
+
+- date: 2026-06-05
+- purpose:
+  - test the next scheduler/static-metadata checklist item after Entry 257;
+  - combine the existing resident metadata table path with the accepted
+    resident slot-token carry path, so decode gathers input token, block table,
+    seq-len, and hybrid state by resident slot inside one compiled boundary.
+- implementation:
+  - added `ModelExecutor.forward_step_token_ids_resident_slot_carry_jit` as an
+    opt-in diagnostic path;
+  - when `resident_decode_metadata=True`, generic warmup and serving prefer the
+    combined route over the older resident-metadata-only decode route;
+  - the route returns both updated `resident_seq_lens` and
+    `resident_last_tokens`, while preserving immutable generated-token refs in
+    the runner.
+- artifact:
+  - medium random diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_resident_slot_carry_decode_r1.json`;
+  - nested JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_resident_slot_carry_decode_r1_jax.json`.
+- result:
+  - JAX `323.28 output tok/s`, `290` generated tokens, `0.8971 s`;
+  - stored medium vLLM denominator `471.06 output tok/s`, ratio `0.686x`;
+  - accepted medium anchors were `355.77` to `359.34 output tok/s`, so this is
+    a clear regression despite zero measured-phase JIT growth (`20 -> 20`);
+  - generic warmup correctly used
+    `forward_prefill_token_ids_slot_carry_table_jit:prefill` for all prefill
+    buckets and `forward_step_token_ids_resident_slot_carry_jit:decode` for all
+    decode buckets.
+- decision:
+  - reject this as the next promoted random route and do not run the large lane;
+  - keep it as opt-in diagnostic scaffolding behind the existing
+    `resident_decode_metadata` config only;
+  - the scheduler/static-metadata bottleneck needs a different boundary or
+    scheduler-side reduction, not the current resident metadata decode route.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py tests/test_backend_boundaries.py`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'table_hybrid_decode_matches_sliced_decode or warmup_compiles_resident_slot_carry_decode_when_available or warmup_compiles_prefill_slot_carry_table_when_available'`.

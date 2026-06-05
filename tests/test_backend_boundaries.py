@@ -2015,6 +2015,11 @@ def test_executor_table_hybrid_decode_matches_sliced_decode():
         cache_storage=executor.backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=3),
         hybrid_state=base_hybrid,
     )
+    resident_slot_prompt = executor.forward_step_token_ids_jit(
+        prompt_batch,
+        cache_storage=executor.backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=3),
+        hybrid_state=base_hybrid,
+    )
     ref_prompt_tokens = (
         ref_prompt.activations[:, None]
         if ref_prompt.activations.ndim == 1
@@ -2089,10 +2094,31 @@ def test_executor_table_hybrid_decode_matches_sliced_decode():
         resident_block_tables=jnp.array([[0, 0, 0], [0, 1, 2]], dtype=jnp.int32),
         resident_seq_lens=jnp.array([0, 4], dtype=jnp.int32),
     )
+    resident_slot_conv_table = jnp.zeros(
+        (2,) + resident_slot_prompt.hybrid_state.conv_state.shape[1:],
+        dtype=resident_slot_prompt.hybrid_state.conv_state.dtype,
+    ).at[1].set(resident_slot_prompt.hybrid_state.conv_state[0])
+    resident_slot_recurrent_table = jnp.zeros(
+        (2,) + resident_slot_prompt.hybrid_state.recurrent_state.shape[1:],
+        dtype=resident_slot_prompt.hybrid_state.recurrent_state.dtype,
+    ).at[1].set(resident_slot_prompt.hybrid_state.recurrent_state[0])
+    resident_slot = executor.forward_step_token_ids_resident_slot_carry_jit(
+        decode_batch,
+        cache_storage=resident_slot_prompt.cache_storage,
+        hybrid_state_table=HybridLayerState(resident_slot_conv_table, resident_slot_recurrent_table),
+        hybrid_slot_ids=jnp.array([1], dtype=jnp.int32),
+        resident_block_tables=jnp.array([[0, 0, 0], [0, 1, 2]], dtype=jnp.int32),
+        resident_seq_lens=jnp.array([0, 4], dtype=jnp.int32),
+        resident_last_tokens=jnp.array(
+            [0, int(np.asarray(ref_prompt.activations).reshape(-1)[0])],
+            dtype=jnp.int32,
+        ),
+    )
 
     np.testing.assert_array_equal(np.array(actual.activations), np.array(ref.activations))
     np.testing.assert_array_equal(np.array(slot_carry.activations), np.array(ref.activations))
     np.testing.assert_array_equal(np.array(resident.activations), np.array(ref.activations))
+    np.testing.assert_array_equal(np.array(resident_slot.activations), np.array(ref.activations))
     np.testing.assert_allclose(
         np.array(actual.hybrid_state.conv_state[1:2]),
         np.array(ref.hybrid_state.conv_state),
@@ -2129,12 +2155,32 @@ def test_executor_table_hybrid_decode_matches_sliced_decode():
         rtol=1e-5,
         atol=1e-5,
     )
+    np.testing.assert_allclose(
+        np.array(resident_slot.hybrid_state.conv_state[1:2]),
+        np.array(ref.hybrid_state.conv_state),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.array(resident_slot.hybrid_state.recurrent_state[1:2]),
+        np.array(ref.hybrid_state.recurrent_state),
+        rtol=1e-5,
+        atol=1e-5,
+    )
     np.testing.assert_array_equal(
         np.array(resident.resident_seq_lens),
         np.array([0, 5], dtype=np.int32),
     )
     np.testing.assert_array_equal(
+        np.array(resident_slot.resident_seq_lens),
+        np.array([0, 5], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
         np.array(slot_carry.resident_last_tokens),
+        np.array([0, int(np.asarray(ref.activations).reshape(-1)[0])], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.array(resident_slot.resident_last_tokens),
         np.array([0, int(np.asarray(ref.activations).reshape(-1)[0])], dtype=np.int32),
     )
     np.testing.assert_array_equal(
@@ -2649,6 +2695,135 @@ def test_model_runner_warmup_compiles_prefill_slot_carry_table_when_available(mo
     assert summary["prefill_runs"][0]["route"] == "forward_prefill_token_ids_slot_carry_table_jit:prefill"
     assert summary["prefill_runs"][0]["tokens_shape"] == [1, 4]
     assert summary["prefill_runs"][0]["block_tables_shape"] == [2, 2]
+
+
+def test_model_runner_warmup_compiles_resident_slot_carry_decode_when_available(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH", "1")
+    config = _tiny_full_attention_config()
+    config.jax_execution = "jit"
+    config.prefill_layout = "packed"
+    config.prefill_buckets = (4,)
+    config.prefill_token_buckets = (4,)
+    config.batch_size_buckets = (2,)
+    config.max_blocks_per_seq = 2
+    config.device_token_carry = True
+    config.static_decode_metadata = True
+    config.resident_decode_metadata = True
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = config
+    runner.block_size = config.block_size
+    runner.max_blocks_per_seq = 2
+    runner.execution = "jit"
+    runner.cache_storage = object()
+    runner._warmup_compiled = False
+    runner.mtp1_enabled = False
+    runner.device_token_carry = True
+    runner.static_decode_metadata = True
+    runner.resident_decode_metadata = True
+    runner._hybrid_state_table = HybridLayerState(
+        conv_state=jnp.zeros((2, 1, 1, 1), dtype=jnp.float32),
+        recurrent_state=jnp.zeros((2, 1, 1, 1, 1), dtype=jnp.float32),
+    )
+    runner._resident_block_tables = jnp.zeros((2, 2), dtype=jnp.int32)
+    runner._resident_seq_lens = jnp.zeros((2,), dtype=jnp.int32)
+    runner._resident_block_tables_host = [(0, 0), (0, 0)]
+    runner._resident_seq_lens_host = [0, 0]
+    runner._resident_last_tokens = jnp.zeros((2,), dtype=jnp.int32)
+    runner._prefill_final_flags_device_cache = {}
+
+    class Ready:
+        def block_until_ready(self):
+            return self
+
+    class FakeExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def forward_step_token_ids_jit(self, batch, **kwargs):
+            self.calls.append(("sliced", tuple(batch.tokens.shape), batch.is_prefill))
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                    "hybrid_state": kwargs["hybrid_state"],
+                },
+            )()
+
+        def forward_prefill_token_ids_table_jit(self, batch, **kwargs):
+            self.calls.append(("old_table_prefill", tuple(batch.tokens.shape)))
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                    "hybrid_state": kwargs["hybrid_state_table"],
+                    "resident_last_tokens": None,
+                },
+            )()
+
+        def forward_prefill_token_ids_slot_carry_table_jit(self, batch, **kwargs):
+            self.calls.append(("slot_carry_prefill", tuple(batch.tokens.shape)))
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                    "hybrid_state": kwargs["hybrid_state_table"],
+                    "resident_last_tokens": kwargs["resident_last_tokens"],
+                },
+            )()
+
+        def forward_step_token_ids_table_jit(self, batch, **kwargs):
+            self.calls.append(("table_decode", tuple(batch.tokens.shape)))
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                    "hybrid_state": kwargs["hybrid_state_table"],
+                    "resident_last_tokens": None,
+                },
+            )()
+
+        def forward_step_token_ids_resident_slot_carry_jit(self, batch, **kwargs):
+            self.calls.append(
+                (
+                    "resident_slot_carry_decode",
+                    tuple(batch.tokens.shape),
+                    tuple(batch.block_tables.shape),
+                    tuple(int(x) for x in kwargs["hybrid_slot_ids"].tolist()),
+                    tuple(kwargs["resident_block_tables"].shape),
+                    tuple(kwargs["resident_seq_lens"].shape),
+                    tuple(kwargs["resident_last_tokens"].shape),
+                )
+            )
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                    "hybrid_state": kwargs["hybrid_state_table"],
+                    "resident_seq_lens": kwargs["resident_seq_lens"],
+                    "resident_last_tokens": kwargs["resident_last_tokens"],
+                },
+            )()
+
+    runner.executor = FakeExecutor()
+    runner._sample_fn = lambda logits, temperatures: Ready()
+
+    summary = runner.warmup_compilation(max_prefill_len=4, max_batch=2)
+
+    assert runner.executor.calls == [
+        ("slot_carry_prefill", (1, 4)),
+        ("resident_slot_carry_decode", (2, 1), (2, 2), (0, 1), (2, 2), (2,), (2,)),
+    ]
+    assert summary["decode_runs"][0]["route"] == "forward_step_token_ids_resident_slot_carry_jit:decode"
 
 
 def test_model_runner_warmup_compiles_decode_block_table_buckets(monkeypatch):

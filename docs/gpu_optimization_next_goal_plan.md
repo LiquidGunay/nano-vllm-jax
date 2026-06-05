@@ -2834,7 +2834,9 @@ Random-request sidecar status as of Entry 240:
      profile still spends about `761.71 ms` in `schedule`, `726.87 ms` in
      `build_scheduled_batch`, `543.76 ms` in `_static_decode_device_arrays`, and
      `532.76 ms` in `device_put`. Any change here must preserve paged attention,
-     generic warmup, and arbitrary random request shapes.
+     generic warmup, and arbitrary random request shapes. Do not retry the
+     Entry 258 combined resident-metadata + slot-token route as the promoted
+     path; it regressed medium random to `323.28 output tok/s`.
   3. In parallel with metadata-boundary work, design the next broader decode
      execution boundary that reduces PJRT launches or command-buffer work
      without source-level greedy bursts. The current profile still spends about
@@ -2930,6 +2932,12 @@ Current validation:
   same stored vLLM denominator (`0.532x`), with zero measured-phase JIT growth.
   The profile removed `_record_resident_last_tokens` from the top events and
   reduced total `gather` time from `1216.23 ms` to `293.55 ms`.
+- Entry 258 tested the obvious resident-metadata follow-up by combining
+  resident block/seq tables with resident slot-token carry in
+  `forward_step_token_ids_resident_slot_carry_jit`. It compiled and ran cleanly
+  but regressed medium random to `323.28 output tok/s` versus the accepted
+  `355-359 output tok/s` medium anchors, so it is diagnostic-only and not the
+  next promoted route.
 
 Model-specific assumptions to track:
 
