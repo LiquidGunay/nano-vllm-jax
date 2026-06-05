@@ -10027,3 +10027,91 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - `pytest -q tests/test_gdn_packed_decode_reference.py -k 'conv_packed_projection_decode_matches_split_kernel or conv_packed_decode_matches_reference'`;
   - large random sidecar runs used stored vLLM denominator, generic warmup,
     `--jax-fail-on-jit-cache-growth`, and the 70% RAM guard.
+
+### Entry 261 - Rejected Resident Replay And Narrow GDN Out-Projection Fusion
+
+- date: 2026-06-05
+- purpose:
+  - test whether the remaining random-decode gap is mostly scheduler shell work
+    by replaying a resident static decode descriptor when the live request set
+    and bucket shape stay unchanged;
+  - test a wider GDN decode custom boundary by fusing post-core gating with the
+    output projection after the accepted packed-projection conv+GDN kernel.
+- implementation:
+  - prototype-only resident decode replay reused the previous static
+    `ScheduledBatch` for eligible all-greedy decode steps and bypassed the
+    normal scheduler/build path;
+  - prototype-only GDN out-projection fusion routed the post-core gated output
+    and layer output projection through a Triton custom call;
+  - both prototypes were reverted after integrated benchmarks.
+- artifacts:
+  - GDN out-projection fusion large run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_fused_gdn_outproj_r1.json`;
+  - resident decode replay large run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_decode_replay_r1.json`;
+  - resident decode replay profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_decode_replay_profile_r1.json`;
+  - nested replay JAX profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_decode_replay_profile_r1_jax.json`.
+- result:
+  - GDN out-projection fusion passed focused correctness but regressed large
+    random to `441.92 output tok/s`, `0.500x` of the stored vLLM denominator;
+  - resident decode replay reduced profiled scheduler/build calls from `300` to
+    `230`, but the no-profile large run reached only `494.35 output tok/s`,
+    `0.559x`, below the accepted Entry 260 `495.10 output tok/s`;
+  - the replay profile shows scheduler time moved in the right direction
+    (`schedule` `355.83 ms / 300` to `337.51 ms / 230`,
+    `build_scheduled_batch` `323.29 ms / 300` to `310.60 ms / 230`), while PJRT
+    and GPU model work moved the wrong way (`PjRT Execute` `1424.72 ms / 548`
+    to `1435.30 ms / 554`, top BF16 GEMM `503.33 ms` to `509.48 ms`, fused
+    attention `212.02 ms` to `214.68 ms`);
+  - the active GDN recurrent state is already in the kernel-native `[V,K]`
+    layout, so a separate state-layout migration is not a pending big lever.
+- decision:
+  - reject and revert resident decode replay; it confirms that scheduler
+    replay alone is not the remaining large random bottleneck;
+  - reject and revert narrow GDN out-projection fusion; replacing the tail of
+    one layer type in many small calls loses to the existing XLA/CUTLASS plan;
+  - do not retry these as primary random-decode optimizations unless a broader
+    model-owned decode boundary removes substantial GEMM/scatter/attention work
+    at the same time.
+- validation:
+  - `python -m py_compile nanovllm_jax/config.py nanovllm_jax/server_config.py nanovllm_jax/llm_engine.py benchmarks/benchmark_random_request_sidecar.py`;
+  - `pytest -q tests/test_device_token_carry.py -k 'resident_decode_replay or resident_decode_metadata_reuses_placeholders or resident_decode_metadata_uses_device_placeholders'`;
+  - `pytest -q tests/test_server_config.py -k 'runtime_and_kernel_sections_translate_to_env or runtime_fastpaths or overrides_from_config'`.
+
+### Entry 262 - Accepted Exact Small-Batch Decode Buckets
+
+- date: 2026-06-05
+- purpose:
+  - test whether the random-decode gap is partly padded model work from
+    power-of-two batch buckets;
+  - make the standard random-serving warmup closer to vLLM-style dynamic
+    batching without benchmark-specific measured-phase compilation.
+- implementation:
+  - changed the active GPU config `batch_size_buckets` from `1,2,4,8` to
+    `1,2,3,4,5,6,7,8`;
+  - changed the random sidecar default to the same exact small-batch bucket list
+    so random runs get this policy unless explicitly overridden.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_exact_decode_batch_buckets_r1.json`;
+  - nested JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_exact_decode_batch_buckets_r1_jax.json`.
+- result:
+  - large random improved to `503.66 output tok/s`, `0.570x` of the stored
+    vLLM denominator, versus Entry 260 `495.10 output tok/s`, `0.560x`;
+  - measured-phase JIT cache growth stayed zero (`40 -> 40`);
+  - generic warmup compiled `40` entries, with `24` decode warmup runs covering
+    B=1 through B=8 and `16` packed-prefill warmup runs;
+  - peak system RAM stayed within the guard (`53.3%`, process tree RSS
+    `5.27 GB`).
+- decision:
+  - promote exact small-batch decode buckets for the random-serving lane;
+  - this is not model/GPU tile tuning. It is a general serving policy that
+    avoids doing B=8 model work for common B=5/6/7 random decode steps;
+  - keep the 70% RAM guard and generic warmup requirement because the policy
+    intentionally trades more startup compilation for less measured decode
+    padding.
+- validation:
+  - large random sidecar run above used stored vLLM denominator, generic warmup,
+    `--jax-fail-on-jit-cache-growth`, and the 70% RAM guard.

@@ -326,7 +326,7 @@ shape/range pressure than `hetero8` and feeds the exact same prompts to both
   --max-num-seqs 8 \
   --max-num-batched-tokens 2048 \
   --prefill-buckets 128,256,512,1024,2048 \
-  --batch-size-buckets 1,2,4,8 \
+  --batch-size-buckets 1,2,3,4,5,6,7,8 \
   --max-blocks-per-seq 512 \
   --jax-num-kvcache-blocks 2048 \
   --jax-max-kv-cache-mb 8192 \

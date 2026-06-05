@@ -2966,6 +2966,23 @@ Current validation:
   scatter-free resident best. Do not re-run that as a primary optimization
   unless a broader output-materialization boundary removes a whole host/device
   operation.
+- Entry 261 rejected two broadening candidates after the Entry 260 best:
+  resident decode replay reduced scheduler/build calls from `300` to `230` but
+  still ran slightly slower (`494.35 output tok/s` versus `495.10`), and a
+  narrow GDN gated-out-projection Triton fusion regressed to
+  `441.92 output tok/s`. Treat this as evidence that the next large-random leap
+  must remove or fuse substantial model-side decode work, especially GEMMs,
+  scatter/loop-slice fusions, full-attention decode, or LM-head epilogue work.
+  Do not retry scheduler-only replay or a one-layer-type post-core custom call
+  as primary routes.
+- Entry 262 promoted exact small-batch decode buckets for the random lane:
+  `batch_size_buckets=1,2,3,4,5,6,7,8` improved large random to
+  `503.66 output tok/s`, `0.570x` of the stored vLLM denominator, with zero
+  measured-phase JIT growth (`40 -> 40`). This is a general serving policy, not
+  model/GPU tile tuning: random decode frequently runs at B=5/6/7, and
+  power-of-two buckets were doing padded B=8 model work. Keep the RAM guard and
+  generic warmup requirement because this intentionally trades more startup
+  compilation for less measured decode padding.
 
 Model-specific assumptions to track:
 

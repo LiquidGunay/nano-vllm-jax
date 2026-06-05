@@ -137,7 +137,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefill-buckets", default="128,256,512,1024,2048,4096")
     parser.add_argument("--prefill-token-buckets", default="")
     parser.add_argument("--prefill-layout", choices=["packed", "dense"], default="packed")
-    parser.add_argument("--batch-size-buckets", default="1,2,4,8")
+    parser.add_argument("--batch-size-buckets", default="1,2,3,4,5,6,7,8")
     parser.add_argument("--max-blocks-per-seq", type=int, default=256)
     parser.add_argument("--decode-block-table-buckets", default="")
     parser.add_argument("--resident-decode-metadata", action=argparse.BooleanOptionalAction, default=False)
