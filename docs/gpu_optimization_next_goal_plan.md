@@ -268,6 +268,43 @@ not promote it as the default. The next decode-attention attempt must broaden
 the boundary so cache append, metadata ownership, and attention read/setup are
 not paid as separate per-layer/per-step work.
 
+Resident boundary A/B, 2026-06-05:
+
+- implementation slice: when `resident_decode_metadata=true`, static decode
+  metadata now keeps true block tables and sequence lengths in host mirrors for
+  resident-table synchronization, but passes reusable zero placeholders for the
+  device `ScheduledBatch.block_tables` and `ScheduledBatch.seq_lens` fields
+  ignored by `forward_step_token_ids_resident_jit`.
+- medium random result:
+  `random_resident_placeholder_medium_r1` completed the same `4`-request,
+  `1787` input-token, `290` output-token envelope at `354.32 output tok/s`,
+  zero measured-phase JIT growth, and `45.0%` peak system RAM.
+- comparison: the current promoted medium route,
+  `random_fa_prefill_triton_medium_r1`, reached `360.10 output tok/s` on the
+  same envelope.
+- decision: keep the placeholder behavior as safer resident-path scaffolding,
+  but do not promote `resident_decode_metadata` for the random serving path.
+  The old resident route's main cost is not just the ignored device metadata
+  arrays; its gather/scatter/table-update boundary must remove a larger
+  per-step operation before it can beat table/static metadata.
+
+GDN/GEMM boundary audit, 2026-06-05:
+
+- the larger random profile still shows real GPU work: `fusion` plus `cutlass`
+  totals about `1064 ms`; `_gdn_conv_packed_decode_raw_gate_kernel` is
+  `112.35 ms` over `4983` calls, matching one fused GDN decode kernel per GDN
+  layer per decode step.
+- the active GDN decode route already fuses conv update, q/k normalization,
+  raw gate/beta math, and recurrent-state update inside the Triton
+  `triton_fla_conv_raw_gates` boundary.
+- do not repeat the previously rejected source-level greedy decode-burst path:
+  burst-16 and burst-2 were exact but much slower because a full-model JAX scan
+  increased gather/transpose/PJRT overhead.
+- next GDN/GEMM work must be structurally coarser, for example
+  projection-plus-GDN or a backend-owned multi-layer/decode boundary, or a
+  model-family-general greedy LM-head matmul+argmax epilogue. Do not spend the
+  next pass sweeping padded-GEMM rows or narrow GDN launch parameters.
+
 Micro-burst selection model:
 
 - A width-`K` greedy burst replaces `K` host/PJRT scheduler executions with one

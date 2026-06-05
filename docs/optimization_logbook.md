@@ -9626,3 +9626,51 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - keep the resource guard and safety ladder;
   - do not replace the prior full-random performance anchor with this capped
     safety result.
+
+### Entry 253 - Resident Placeholder And GDN Boundary Audit
+
+- date: 2026-06-05
+- purpose:
+  - continue the six-item random decode plan without retrying rejected
+    metadata-carry or decode-burst variants;
+  - test whether the resident decode path can stop rebuilding device metadata
+    arrays that its compiled executor ignores;
+  - inspect whether the active GDN/GEMM route has a safe small promotion left,
+    or whether the next useful work needs a coarser boundary.
+- implementation:
+  - `Scheduler` now carries `resident_decode_metadata` directly from config;
+  - when static decode metadata and resident decode metadata are both enabled,
+    `_static_decode_device_arrays()` uses stable zero placeholders for device
+    `block_tables` and `seq_lens`, while preserving true `block_tables_host`
+    and `seq_lens_host` for resident-table synchronization;
+  - added a scheduler regression test that changes sequence lengths and block
+    tables across decode steps and verifies placeholder reuse plus host-metadata
+    preservation.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_resident_placeholder_medium_r1.json`.
+- result:
+  - medium resident-placeholder run: `4` requests, `1787` input tokens,
+    `290` output tokens, `354.32 output tok/s`, zero measured-phase JIT growth,
+    peak system RAM `45.0%`;
+  - same-envelope promoted control with packed Triton prefill and reference FA
+    decode: `360.10 output tok/s`;
+  - therefore the resident placeholder route is still slower than the current
+    table/static metadata route.
+- GDN/GEMM audit:
+  - current larger-rung profile has real GPU cost, with `fusion + cutlass`
+    around `1064 ms`;
+  - `_gdn_conv_packed_decode_raw_gate_kernel` is `112.35 ms` over `4983` calls,
+    which matches one fused GDN decode kernel per GDN layer per decode step;
+  - that active Triton route already owns conv update, q/k normalization, raw
+    gate/beta math, and recurrent-state update. A safe next GDN win is not a
+    flag flip or launch-parameter sweep; it needs a coarser projection+GDN,
+    multi-layer/backend-owned decode, or greedy LM-head matmul+argmax boundary.
+- decision:
+  - keep resident device placeholders as opt-in scaffolding, but do not enable
+    `resident_decode_metadata` on the random serving path;
+  - do not retry source-level greedy decode bursts, which Entry 122 already
+    rejected badly;
+  - do not spend the next pass on padded-GEMM row or narrow GDN launch sweeps.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/scheduler.py tests/test_device_token_carry.py`;
+  - `pytest -q tests/test_device_token_carry.py -k 'static_decode_metadata_reuses_fixed_device_arrays or static_decode_metadata_can_reuse_seq_lens_placeholder or resident_decode_metadata_uses_device_placeholders'`.

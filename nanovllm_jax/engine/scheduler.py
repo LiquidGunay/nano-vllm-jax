@@ -80,6 +80,11 @@ class Scheduler:
             "static_decode_metadata",
             "NANO_VLLM_JAX_STATIC_DECODE_METADATA",
         )
+        self.resident_decode_metadata = _config_or_env_flag(
+            config,
+            "resident_decode_metadata",
+            "NANO_VLLM_JAX_RESIDENT_DECODE_METADATA",
+        )
         self.static_decode_seq_lens_carry = _config_or_env_flag(
             config,
             "static_decode_seq_lens_carry",
@@ -658,6 +663,7 @@ class Scheduler:
                 block_tables=block_tables,
                 seq_lens=seq_lens,
                 query_lens_host=query_lens_host,
+                resident_decode_metadata=self.resident_decode_metadata,
             )
         else:
             if not is_prefill:
@@ -882,6 +888,7 @@ class Scheduler:
         block_tables: List[List[int]],
         seq_lens: List[int],
         query_lens_host: tuple[int, ...],
+        resident_decode_metadata: bool = False,
     ):
         constant_key = (
             tuple((len(padded_tokens), len(padded_tokens[0]) if padded_tokens else 0)),
@@ -909,12 +916,20 @@ class Scheduler:
             tuple((len(block_tables), len(block_tables[0]) if block_tables else 0)),
             seq_ids_host,
             query_lens_host,
-            tuple(tuple(row) for row in block_tables),
+            "resident" if resident_decode_metadata else tuple(tuple(row) for row in block_tables),
         )
         cache = self._static_decode_metadata_cache
         if cache is None or cache.get("key") != key:
-            block_tables_array = jax.device_put(np.asarray(block_tables, dtype=np.int32))
-            seq_lens_array = jax.device_put(np.asarray(seq_lens, dtype=np.int32))
+            if resident_decode_metadata:
+                block_table_shape = (
+                    len(block_tables),
+                    len(block_tables[0]) if block_tables else 0,
+                )
+                block_tables_array = jax.device_put(np.zeros(block_table_shape, dtype=np.int32))
+                seq_lens_array = jax.device_put(np.zeros((len(seq_lens),), dtype=np.int32))
+            else:
+                block_tables_array = jax.device_put(np.asarray(block_tables, dtype=np.int32))
+                seq_lens_array = jax.device_put(np.asarray(seq_lens, dtype=np.int32))
             cache = {
                 "key": key,
                 "tokens": constant_cache["tokens"],
@@ -926,7 +941,7 @@ class Scheduler:
             }
             self._static_decode_metadata_cache = cache
         else:
-            if self.static_decode_seq_lens_carry:
+            if self.static_decode_seq_lens_carry or resident_decode_metadata:
                 seq_lens_array = cache["seq_lens"]
             else:
                 seq_lens_array = jax.device_put(np.asarray(seq_lens, dtype=np.int32))

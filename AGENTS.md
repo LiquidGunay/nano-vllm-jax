@@ -58,3 +58,7 @@
 - Treat standalone attention, append, GDN, and GEMM probes as diagnostic only
   until they improve integrated random decode throughput with correctness and no
   measured-phase JIT growth.
+- Current rejected random-speed routes: standalone FA decode Triton, resident
+  decode metadata v1/placeholders, static seq-lens carry, shared-gather
+  token-carry fallback, and source-level greedy decode bursts. Reopen any of
+  these only with a broader boundary that removes a whole per-step operation.
