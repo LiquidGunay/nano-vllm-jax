@@ -228,8 +228,8 @@ safe RAM (`53%` peak system RAM). With `--worker-cpu-cores 2`, JAX measured
 performance baseline: the two-core cap likely depresses measured serving
 throughput because scheduler/PJRT work remains CPU-visible.
 
-Status note, 2026-06-05 r6: the random decode speed work is now constrained to
-five non-negotiable items until the `0.9x` vLLM target is reached:
+Status note, 2026-06-05 r6/r8: the random decode speed work is now constrained
+to these non-negotiable items until the `0.9x` vLLM target is reached:
 
 1. Make full-attention kernel policy explicit and prevent silent fallback in
    benchmark/perf configs. Packed prefill should select a production paged
@@ -238,13 +238,37 @@ five non-negotiable items until the `0.9x` vLLM target is reached:
 2. Validate and repair paged decode attention on the integrated random workload.
    Standalone exactness is not enough; promotion requires random-graph
    throughput improvement, correctness, and zero measured-phase JIT growth.
-3. Reduce per-step host/PJRT metadata overhead with a broader resident decode
+3. Replace the serving LM-head dense+argmax with a true fused greedy epilogue
+   or library-backed single-call top-1 path. Two-stage Pallas/Triton and
+   source-level `top_k(1)` remain rejected.
+4. Move multiple decode sublayers behind a backend-owned boundary so the many
+   small BF16 GEMMs and per-layer command-buffer/PJRT work are coarsened
+   together. Single-sublayer GDN or attention-only swaps are not enough.
+5. Reduce per-step host/PJRT metadata overhead with a broader resident decode
    boundary. Do not repeat rejected seq-lens-carry or shared-gather variants
    unless the new design removes an entire per-step host/device operation.
-4. Advance coarse GDN decode/prefill kernels using vLLM/FLA-like boundaries that
+6. Advance coarse GDN decode/prefill kernels using vLLM/FLA-like boundaries that
    own conv, gates, q/k norm, recurrent-state update, and layout together.
-5. Improve batched decode GEMM/fusion in a Qwen3.5-dense-family-general way.
+7. Improve batched decode GEMM/fusion in a Qwen3.5-dense-family-general way.
    Avoid GPU/model-specific tile hand tuning as the primary path.
+
+Status note, 2026-06-05 r8: Entry 266 is the current accepted large-random
+anchor. Switching the active random-serving config from
+`triton_fla_conv_raw_gates` to explicit reference packed GDN decode produced
+two winning repeats: `514.25` and `508.85 output tok/s` (`0.582x` and `0.576x`
+the stored vLLM denominator), both with zero measured-phase JIT growth. Entry
+262 remains the previous accepted anchor at `503.66 output tok/s` (`0.570x`)
+with exact decode buckets. Entry 263 rejected lowering padded GEMM rows to `5`
+because it selected a much slower compiled GEMM plan (`240.16 output tok/s`).
+Entry 264 rejected two narrow full-attention decode probes: a separate
+packed-QKV prep custom call (`499.13 output tok/s`) and in-kernel duplicate K/V
+append-store elimination (`502.29` then `497.96 output tok/s`). Entry 265 then
+rejected the broader integrated packed-QKV fused append+decode attention route
+(`499.81 output tok/s`): even moving Q/K RMSNorm, RoPE, append, and attention
+into one launch did not beat Entry 262. The implication is that full-attention
+decode materialization is not the large lever; the next candidate must remove a
+larger serving boundary across many decode sublayers or replace a shared dense
+operation with a true backend-owned single call.
 
 First implementation slice: `full_attention.prefill_impl` now controls reference
 versus packed Triton prefill routing, `server_config.yaml` and the FA/GDN
@@ -2989,6 +3013,21 @@ Current validation:
   `decode_padded_gemm_rows=8`; it is selecting a faster compiled GEMM path, not
   merely wasting rows. Do not pursue dynamic padded-GEMM row source policy as
   the next large-leap route.
+- Entries 264 and 265 rejected full-attention-only decode fusion routes on the
+  large-random graph. A separate packed-QKV prep custom call reached
+  `499.13 output tok/s`; duplicate append-store elimination reached
+  `502.29` then `497.96 output tok/s`; integrated packed-QKV fused
+  append+decode attention reached `499.81 output tok/s`. All kept zero JIT
+  growth, but all lost to Entry 262. Do not keep spending primary work on
+  attention-only materialization unless the boundary also absorbs larger
+  model-side work.
+- Entry 266 promoted explicit reference packed GDN decode for the active
+  random-serving config. Large-random repeats reached `514.25` and
+  `508.85 output tok/s` (`0.582x` and `0.576x` stored vLLM), with zero
+  measured-phase JIT growth and `1582` generated tokens. The conv-fused Triton
+  FLA GDN decode route remains correct, but in this graph it adds many small
+  calls and loses integrated wall time. Revisit it only as part of a coarser
+  GDN/model boundary.
 
 Model-specific assumptions to track:
 

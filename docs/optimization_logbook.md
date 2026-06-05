@@ -10145,3 +10145,138 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
 - validation:
   - direct JAX run used the same prompt manifest as Entry 262, generic warmup,
     exact decode buckets, and `--fail-on-jit-cache-growth`.
+
+### Entry 264 - Rejected Narrow Full-Attention Decode Kernel Tweaks
+
+- date: 2026-06-05
+- purpose:
+  - test whether the large-random gap can be reduced by removing visible
+    materialization around full-attention decode without changing the broader
+    decode scheduler ABI;
+  - check whether duplicate K/V append stores inside the fused paged decode
+    attention kernel are a meaningful bucket.
+- implementation:
+  - prototype A added a Triton full-attention decode QKV-prep custom call that
+    split packed Q/G/K/V, applied q/k RMSNorm and RoPE, and produced query,
+    key, value, and gate tensors before the existing fused append+attention
+    kernel;
+  - prototype B changed the fused append+attention Triton kernel so only the
+    first query head in each KV group wrote the appended K/V cache row, while
+    all query heads substituted the just-appended K/V locally for the current
+    decode position.
+- artifacts:
+  - QKV-prep run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_fa_decode_qkv_prep_r1.json`;
+  - duplicate-store run r1:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_fa_dedup_append_store_r1.json`;
+  - duplicate-store repeat r2:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_fa_dedup_append_store_r2.json`.
+- result:
+  - QKV-prep regressed to `499.13 output tok/s`, `0.565x` of the stored vLLM
+    denominator, versus Entry 262 `503.66 output tok/s`;
+  - duplicate-store r1 reached `502.29 output tok/s`, `0.568x`; repeat r2
+    reached `497.96 output tok/s`, `0.563x`;
+  - all runs kept zero measured-phase JIT cache growth and the same generated
+    token count as Entry 262.
+- decision:
+  - reject and revert both probes;
+  - a separate prep-only custom call adds a launch without removing enough work
+    from the attention boundary;
+  - duplicate K/V append stores are not a dominant bucket on the integrated
+    random graph;
+  - the next large step must remove a larger boundary, such as integrating
+    packed QKV prep into the existing append+attention launch, replacing the
+    LM-head dense+argmax with a true fused greedy epilogue, or moving multiple
+    decode sublayers behind a coarser backend-owned boundary.
+- validation:
+  - focused CUDA/full-attention tests passed for each prototype before
+    benchmarking;
+  - large random sidecar runs used stored vLLM denominator, generic warmup,
+    exact decode buckets, `--jax-fail-on-jit-cache-growth`, and the 70% RAM
+    guard.
+
+### Entry 265 - Rejected Integrated Packed-QKV Full-Attention Decode
+
+- date: 2026-06-05
+- purpose:
+  - test a coarser full-attention decode boundary that does not add a separate
+    prep launch;
+  - consume the packed QKV projection directly in the fused append+attention
+    Triton call, perform Q/K RMSNorm and RoPE inside that launch, return the
+    gate for the existing output projection path, and keep the BF16 paged KV
+    cache contract.
+- implementation:
+  - added a prototype backend method and Triton wrapper for packed-QKV fused
+    append+decode attention;
+  - routed it automatically for the existing packed full-attention decode,
+    BF16 cache, width-1, `triton_paged_fused_append` policy;
+  - added a focused CUDA test that compared attention output and appended K/V
+    against the reference Q/K RMSNorm + RoPE + paged decode path.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_integrated_packed_fa_decode_r1.json`;
+  - nested JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_integrated_packed_fa_decode_r1_jax.json`.
+- result:
+  - large random reached `499.81 output tok/s`, `0.565x` of the stored vLLM
+    denominator, versus Entry 262 `503.66 output tok/s`;
+  - measured-phase JIT cache growth stayed zero (`40 -> 40`);
+  - generated token count stayed `1582`, matching the Entry 262 JAX run.
+- decision:
+  - reject and revert the prototype;
+  - moving Q/K norm, RoPE, K/V append, and attention into one call still does
+    not reduce the integrated random-decode wall time;
+  - full-attention decode alone is not the next large lever. The next useful
+    implementation needs to coarsen many decode sublayer calls, reduce the
+    small-GEMM/PJRT boundary, or replace a shared dense operation with a true
+    single-call backend.
+- validation:
+  - focused CUDA fused-attention tests passed before benchmarking;
+  - large random sidecar used stored vLLM denominator, generic warmup, exact
+    decode buckets, `--jax-fail-on-jit-cache-growth`, and the 70% RAM guard.
+
+### Entry 266 - Accepted Reference GDN Decode Route For Random Serving
+
+- date: 2026-06-05
+- purpose:
+  - test whether the active random-serving config should keep using the
+    conv-fused Triton FLA packed GDN decode route after the large-random profile
+    showed `_gdn_conv_packed_projection_decode_raw_gate_kernel` as thousands of
+    small GPU calls;
+  - compare against the existing packed BF16-QKV `reference` GDN decode route
+    under the same exact decode buckets, resident metadata, generic warmup, and
+    stored vLLM denominator.
+- implementation:
+  - copied `gpu_paged_gdn_fla_decode_static_metadata` to a diagnostic config
+    and changed only `kernels.gdn.packed_decode.impl` from
+    `triton_fla_conv_raw_gates` to `reference`;
+  - after two winning repeats, promoted the same setting in
+    `benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata.json`.
+- artifacts:
+  - r1 sidecar:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_gdn_reference_decode_r1.json`;
+  - r1 nested JAX:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_gdn_reference_decode_r1_jax.json`;
+  - r2 sidecar:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_gdn_reference_decode_r2.json`;
+  - r2 nested JAX:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_gdn_reference_decode_r2_jax.json`.
+- result:
+  - r1 reached `514.25 output tok/s`, `0.582x` of the stored vLLM denominator;
+  - r2 reached `508.85 output tok/s`, `0.576x` of the stored vLLM denominator;
+  - both runs generated `1582` tokens and kept zero measured-phase JIT cache
+    growth (`40 -> 40`);
+  - Entry 262, the previous accepted anchor with
+    `triton_fla_conv_raw_gates`, reached `503.66 output tok/s`, `0.570x`.
+- decision:
+  - promote `kernels.gdn.packed_decode.impl=reference` for the active random
+    serving config;
+  - treat the conv-fused Triton FLA GDN decode route as rejected for this
+    integrated random graph until it is part of a much coarser boundary. It is
+    correct, but the current shape adds too many small calls and loses wall
+    time;
+  - this is not enabling a fallback: fallbacks remain disabled, and the selected
+    GDN decode implementation is explicit in the config.
+- validation:
+  - both large random sidecar runs used the stored vLLM denominator, generic
+    warmup, exact decode buckets, `--jax-fail-on-jit-cache-growth`, and the 70%
+    RAM guard.

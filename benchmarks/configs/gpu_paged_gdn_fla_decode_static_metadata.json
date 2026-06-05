@@ -1,6 +1,6 @@
 {
   "name": "gpu_paged_gdn_fla_decode_static_metadata",
-  "description": "Strict block-dot FLA prefill route plus packed prefill/decode projections, BF16 model compute, BF16 full-attention KV cache, Triton packed full-attention prefill, fused Triton full-attention append/decode, packed-projection BF16-QKV conv-fused Triton FLA GDN decode, resident static decode metadata, canonical packed MLP gate/up weights, and no-Triton-GEMM XLA lowering.",
+  "description": "Strict block-dot FLA prefill route plus packed prefill/decode projections, BF16 model compute, BF16 full-attention KV cache, Triton packed full-attention prefill, fused Triton full-attention append/decode, reference packed BF16-QKV GDN decode, resident static decode metadata, canonical packed MLP gate/up weights, and no-Triton-GEMM XLA lowering.",
   "benchmark_script": "benchmarks/benchmark_jax_server_trace.py",
   "reference_json": "results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json",
   "vllm_reference_json": "",
@@ -53,7 +53,7 @@
       "prefill_post_conv_impl": "triton_fla_padded",
       "prefill_block_dot": true,
       "packed_decode": {
-        "impl": "triton_fla_conv_raw_gates",
+        "impl": "reference",
         "qkv_dtype": "bf16"
       }
     }
