@@ -78,14 +78,40 @@ class BlockManager:
         end = (block_idx + 1) * self.block_size
         return seq.token_ids[start:end]
 
-    def can_allocate(self, seq: Sequence, *, use_prefix_cache: bool = True) -> bool:
+    def _record_completed_block_hash(self, seq: Sequence, block_idx: int) -> None:
+        if block_idx < 0 or block_idx >= len(seq.block_table):
+            return
+        if seq.block_has_unmaterialized_device_tokens(block_idx):
+            return
+        token_ids = self._block_tokens(seq, block_idx)
+        if len(token_ids) != self.block_size:
+            return
+        block = self.blocks[seq.block_table[block_idx]]
+        if block.hash != -1:
+            return
+        prefix = self.blocks[seq.block_table[block_idx - 1]].hash if block_idx > 0 else -1
+        h = self.compute_hash(token_ids, prefix)
+        block.update(h, token_ids)
+        self.hash_to_block_id[h] = block.block_id
+
+    def can_allocate(
+        self,
+        seq: Sequence,
+        *,
+        use_prefix_cache: bool = True,
+    ) -> bool:
         """Check if we can allocate blocks for sequence."""
         return len(self.free_block_ids) >= self._num_required_blocks(
             seq,
             use_prefix_cache=use_prefix_cache,
         )
 
-    def _num_required_blocks(self, seq: Sequence, *, use_prefix_cache: bool = True) -> int:
+    def _num_required_blocks(
+        self,
+        seq: Sequence,
+        *,
+        use_prefix_cache: bool = True,
+    ) -> int:
         """Count physical free blocks needed for allocation.
 
         Full-block prefix-cache hits that are already in use do not consume a
@@ -96,7 +122,8 @@ class BlockManager:
 
         h = -1
         required = 0
-        for i in range(self._num_blocks(seq)):
+        prompt_blocks = self._num_blocks(seq)
+        for i in range(prompt_blocks):
             token_ids = self._block_tokens(seq, i)
             if len(token_ids) != self.block_size:
                 required += 1
@@ -109,7 +136,12 @@ class BlockManager:
                 required += 1
         return required
 
-    def allocate(self, seq: Sequence, *, use_prefix_cache: bool = True):
+    def allocate(
+        self,
+        seq: Sequence,
+        *,
+        use_prefix_cache: bool = True,
+    ):
         """Allocate blocks for a sequence.
         
         Implements prefix caching:
@@ -163,7 +195,7 @@ class BlockManager:
                 block.update(h, token_ids)
                 if use_prefix_cache:
                     self.hash_to_block_id[h] = block_id
-            
+
             seq.block_table.append(block_id)
 
     def deallocate(self, seq: Sequence):
@@ -220,8 +252,10 @@ class BlockManager:
         
         if current_required_blocks > len(block_table):
             # Just crossed block boundary - allocate new block
+            last_block_idx = len(block_table) - 1
+            self._record_completed_block_hash(seq, last_block_idx)
             last_block = self.blocks[block_table[-1]]
-            if last_block.hash == -1 and not getattr(seq, "has_unmaterialized_device_tokens", False):
+            if last_block.hash == -1 and not seq.block_has_unmaterialized_device_tokens(last_block_idx):
                 raise AssertionError("completed block hash was not recorded")
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
@@ -230,14 +264,7 @@ class BlockManager:
         if len(seq) % self.block_size == 0:
             # Completed a block - update its hash
             block_idx = len(seq) // self.block_size - 1
-            if not seq.block_has_unmaterialized_device_tokens(block_idx):
-                block = self.blocks[block_table[block_idx]]
-                if block.hash == -1:
-                    token_ids = self._block_tokens(seq, block_idx)
-                    prefix = self.blocks[block_table[block_idx - 1]].hash if block_idx > 0 else -1
-                    h = self.compute_hash(token_ids, prefix)
-                    block.update(h, token_ids)
-                    self.hash_to_block_id[h] = block.block_id
+            self._record_completed_block_hash(seq, block_idx)
 
         target_tokens = len(seq) + max(0, int(num_slots) - 1)
         required_blocks = (target_tokens + self.block_size - 1) // self.block_size
@@ -257,14 +284,4 @@ class BlockManager:
         if len(seq) % self.block_size != 0:
             return
         block_idx = len(seq) // self.block_size - 1
-        if seq.block_has_unmaterialized_device_tokens(block_idx):
-            return
-        block_id = seq.block_table[block_idx]
-        block = self.blocks[block_id]
-        if block.hash != -1:
-            return
-        token_ids = self._block_tokens(seq, block_idx)
-        prefix = self.blocks[seq.block_table[block_idx - 1]].hash if block_idx > 0 else -1
-        h = self.compute_hash(token_ids, prefix)
-        block.update(h, token_ids)
-        self.hash_to_block_id[h] = block.block_id
+        self._record_completed_block_hash(seq, block_idx)

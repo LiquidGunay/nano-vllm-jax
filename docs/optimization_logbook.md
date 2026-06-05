@@ -7525,3 +7525,2898 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - update the PR with the target-hit result and the broader sanity caveat;
   - keep future speed work focused on hetero8/broader serving rather than
     re-opening the decode-heavy composition unless it regresses below target.
+
+### Entry 212 - Hetero8 BF16 Decode Projections And cuBLAS GEMM Route
+
+- date: 2026-06-02
+- purpose:
+  - hill-climb `hetero8` as the primary mixed-serving metric after Entry 211
+    showed decode-heavy and long-prefill were target-clean but hetero8 was not.
+- accepted source/config changes:
+  - broaden `runtime.fastpaths.decode_proj_act_dtype` from
+    `bf16_single_seq` to `bf16`, so B>1 decode projections use BF16
+    activations under the same explicit runtime policy as B=1;
+  - apply that decode projection dtype policy to GDN `out_proj` and full
+    attention `o_proj` activations before their decode output projections;
+  - set the selected config's XLA flags to
+    `--xla_gpu_autotune_level=4 --xla_gpu_enable_triton_gemm=false`.
+- direct no-profile results:
+  - B>1 BF16 decode projections, exact over two repeats:
+    `341.14`, `340.13 tok/s`, median `340.63 tok/s`;
+  - BF16 output projections plus static metadata, exact over two repeats:
+    `346.10`, `344.59 tok/s`, median `345.35 tok/s`;
+  - BF16 output projections plus no Triton GEMM, exact over two repeats:
+    `441.10`, `438.98 tok/s`, median `440.04 tok/s`.
+- canonical profiled matrix:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260602/gpu_matrix_hetero8_no_triton_gemm_r2_20260602.json`;
+  - report:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260602/gpu_matrix_hetero8_no_triton_gemm_r2_20260602.md`;
+  - exact generated-token parity in both repeats;
+  - median profiled throughput: `414.45 tok/s`;
+  - ratio: `1.127x` stored Entry 045 JAX reference, `0.480x` stored vLLM
+    hetero8 reference (`864.18 tok/s`);
+  - scheduler split: one prefill step about `0.03 s`; 31 decode steps about
+    `0.58 s`.
+- profile movement:
+  - no-Triton-GEMM route replaces the worst `gemm_fusion` lowering with CUTLASS
+    events; top GPU rows include `cutlass_80_tensorop_s1688gemm...`
+    `68.2 ms / 72` and `ampere_bf16_s16816gemm...sliced1x2...`
+    `61.5 ms / 1488`;
+  - `PjRtCApiLoadedExecutable::Execute` median falls to about
+    `361.96 ms / 91` in the profiled matrix, from about `543 ms` on the
+    BF16-output-projection profile and `575.87 ms` on the original hetero8
+    profile;
+  - visible token materialization remains large:
+    `np.asarray(jax.Array)` about `120.90 ms / 256`;
+  - transpose/concatenate remain visible, with GPU transpose about
+    `40.40 ms / 1221`.
+- rejected or not-promoted probes:
+  - `packed_decode.max_batch=1` with B>1 BF16 projections was exact but noisy
+    and slower by median (`337.97 tok/s`) than all-batch packed reference;
+  - `packed_decode=off` with static metadata off was exact but slightly slower
+    (`340.33 tok/s`) than keeping packed reference;
+  - disabling static decode metadata was exact and throughput-neutral
+    (`340.69 tok/s` before output casts), while lowering ITL p95; keep it as a
+    tail-latency diagnostic, not the throughput-selected route;
+  - after no-Triton-GEMM, disabling static decode metadata remained exact and
+    lowered ITL p95 (`65.64 ms` versus about `148 ms`) but slightly regressed
+    throughput to `438.11 tok/s`, so it is still not the throughput route;
+  - explicit rank-2 spelling for single-token `_tokenwise_decode_dot` was exact
+    but neutral/slower (`344.60 tok/s`) after output casts.
+- interpretation:
+  - the main hetero8 speedup did not come from more hand tuning of GEMM tile
+    values; it came from selecting the better XLA GEMM backend for this small-M
+    decode workload. XLA's Triton GEMM fusion was the wrong lowering here,
+    while the no-Triton route gets faster CUTLASS/cuBLAS-style kernels;
+  - hetero8 is improved materially but remains far from the `0.9x` vLLM target.
+    The remaining gap is still decode dominated, with host token materialization
+    and transpose/concat/layout work now prominent after GEMM backend selection.
+- decision:
+  - keep the BF16 projection broadening, output-projection casts, and selected
+    config XLA flags;
+  - continue hetero8 work from the new `414-440 tok/s` anchor, targeting token
+    materialization scheduling and transpose/concat/layout bubbles next.
+
+### Entry 213 - Accepted Layerwise Hybrid-State Table Decode
+
+- date: 2026-06-03
+- purpose:
+  - reduce hetero8 decode table gather/scatter and whole-table state update work
+    without changing the public functional state contract.
+- accepted change:
+  - `forward_step(..., hybrid_state_layerwise=True)` gathers each GDN layer's
+    conv/recurrent state into per-layer lists, passes only the per-layer state
+    through `gated_deltanet_block`, and stacks the updated layers once at the
+    end of the decode step;
+  - `forward_step_token_ids_table_jit` enables this layerwise path for table
+    decode.
+- validation:
+  - `python -m py_compile nanovllm_jax/model.py nanovllm_jax/engine/model_executor.py`
+  - `pytest -q tests/test_backend_boundaries.py -k 'table_hybrid_decode_matches_sliced_decode or executor_jit_matches_eager_cached_decode or executor_greedy_decode_burst_matches_iterative_token_path'`
+    - 3 passed, 45 deselected.
+- result:
+  - profiled hetero8 artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260603/gpu_matrix_hetero8_layerwise_hybrid_state_r1_20260603.json`;
+  - exact generated-token parity;
+  - profiled throughput `442.58 tok/s`;
+  - no-profile throughput `457.56 tok/s`, about `0.529x` stored vLLM
+    hetero8 (`864.18 tok/s`).
+- rejected follow-ups from the same pass:
+  - layerwise KV-cache internal path: exact but `395.06 tok/s`;
+  - generalized B<=rows padded GEMM: exact but `454.07 tok/s`;
+  - `packed_decode=off`: exact but `455.90 tok/s`;
+  - RoPE duplicate-embedding removal: exact but no-profile `456.62 tok/s`
+    and profiled `443.36 tok/s`, not a meaningful improvement;
+  - closing over all model params for decode: focused tests passed, but
+    lowering captured about `2.01 GB` of constants and the benchmark process was
+    killed. Do not retry the naive closed-params route.
+
+### Entry 214 - Accepted Canonical Packed Decode Projections And Conv-Fused GDN Decode
+
+- date: 2026-06-03
+- purpose:
+  - remove the newly dominant hetero8 decode materialization buckets after
+    Entry 213: GDN input-projection weight concat, full-attention Q/K/V concat,
+    MLP gate/up concat, and GDN conv/recurrent decode source fusions.
+- accepted changes:
+  - add loader/init packed decode weights:
+    - GDN `in_proj_qkv_abz = [in_proj_qkv, in_proj_a, in_proj_b, in_proj_z]`;
+    - full-attention `qkv_proj_decode = [q_proj, k_proj, v_proj]`;
+    - MLP `gate_up_proj = [gate_proj, up_proj]`;
+  - use the packed GDN and full-attention projection weights for B>1,
+    width-1 decode only;
+  - use canonical packed MLP gate/up in prefill and decode when present;
+  - make `ModelParams` flattening omit separate `gate_proj`/`up_proj` leaves
+    when `gate_up_proj` exists, avoiding the duplicate-large-leaf failure mode
+    from earlier packed-MLP rejections;
+  - promote `packed_decode.impl=triton_fla_conv_raw_gates` in
+    `benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata.json`;
+  - fix the selected config's hetero8 `input_lens` to the canonical eight rows:
+    `64,128,192,256,320,384,448,512`.
+- validation:
+  - `python -m py_compile nanovllm_jax/model.py nanovllm_jax/load_weights.py nanovllm_jax/engine/model_executor.py`
+  - `pytest -q tests/test_backend_boundaries.py -k 'table_hybrid_decode_matches_sliced_decode or executor_jit_matches_eager_cached_decode or executor_greedy_decode_burst_matches_iterative_token_path'`
+    - 3 passed, 45 deselected.
+  - `python -m json.tool benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata.json`
+- results:
+  - GDN packed input projection only:
+    `493.08 tok/s`, exact, artifact
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260603/jax_hetero8_gdn_decode_in_proj_prepack_b8_noprofile_20260603.json`;
+  - plus full-attention Q/K/V packed decode:
+    `497.28 tok/s`, exact, artifact
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260603/jax_hetero8_gdn_fullattn_decode_prepack_b8_noprofile_20260603.json`;
+  - plus canonical packed MLP gate/up:
+    `543.27 tok/s`, exact, artifact
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260603/jax_hetero8_packed_mlp_canonical_b8_noprofile_20260603.json`;
+  - plus conv-fused Triton FLA GDN decode:
+    exact over two no-profile repeats, `552.86` and `552.59 tok/s`, median
+    `552.72 tok/s`;
+  - current hetero8 ratio: `0.640x` stored vLLM hetero8 (`864.18 tok/s`);
+  - profiled selected artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260603/gpu_matrix_hetero8_packed_mlp_triton_fla_conv_raw_gates_r1_20260603.json`,
+    `530.23 tok/s`, exact.
+- profile movement:
+  - the GDN/full-attention/MLP runtime weight-concat buckets disappear from the
+    decode top rows;
+  - canonical packed MLP reduces `PjRtCApiLoadedExecutable::Execute` from about
+    `320.84 ms / 91` in the full-attention packed profile to about
+    `296.68 ms / 91` before the conv-fused GDN switch;
+  - conv-fused GDN decode replaces the reference GDN decode fusions with
+    `_gdn_conv_packed_decode_raw_gate_kernel` at about `20.52 ms / 558`.
+- rejected or not-promoted probes:
+  - invalid early GDN prepack run used seven prompt lengths by mistake and must
+    not be used as hetero8 evidence;
+  - `triton_fla_raw_gates` non-conv decode is exact but neutral/slower at
+    `543.04 tok/s` versus the canonical packed-MLP reference route's
+    `543.27 tok/s`;
+  - the earlier duplicate-leaf packed MLP rejections still stand. Only the
+    canonical representation with separate gate/up leaves omitted from the JIT
+    parameter tree is accepted.
+- decision:
+  - promote canonical packed MLP plus conv-fused Triton FLA GDN decode as the
+    current hetero8 anchor;
+  - continue from `552.72 tok/s`, not from the older `457.56` or `497.28`
+    anchors;
+  - remaining dominant buckets are GEMM-heavy decode work and LM-head/vocab
+    reduction, not simple runtime weight concatenation.
+
+### Entry 215 - Accepted BF16 Full-Attention KV Cache For Hetero8
+
+- date: 2026-06-03
+- purpose:
+  - reduce full-attention decode cache bandwidth and cache-write materialization
+    after Entry 214 removed the simpler runtime weight-concat buckets.
+- accepted changes:
+  - add typed config key `kernels.full_attention.kv_cache_dtype`, translated to
+    `NANO_VLLM_JAX_FULL_ATTN_KV_CACHE_DTYPE`;
+  - allocate full-attention KV storage in BF16 when this key is set to `bf16`;
+  - cast K/V explicitly to the physical cache dtype inside `update_kv_cache`,
+    avoiding implicit JAX scatter casts;
+  - promote `"full_attention": {"kv_cache_dtype": "bf16"}` in
+    `benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata.json`.
+- validation:
+  - `python -m py_compile nanovllm_jax/backends.py nanovllm_jax/kv_cache.py nanovllm_jax/server_config.py`
+  - `pytest -q tests/test_server_config.py tests/test_backend_boundaries.py -k 'full_attention_kv_cache_dtype_override or pure_jax_decode_attention_matches_dense_reference_non_contiguous_blocks or table_hybrid_decode_matches_sliced_decode or executor_jit_matches_eager_cached_decode or executor_greedy_decode_burst_matches_iterative_token_path'`
+    - 5 passed, 50 deselected.
+- no-profile results:
+  - artifacts:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260603/kv_cache_bf16/jax_hetero8_full_attn_kv_bf16_noprofile_20260603.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260603/kv_cache_bf16/jax_hetero8_full_attn_kv_bf16_noprofile_r2_20260603.json`;
+  - exact generated-token parity on all eight rows;
+  - throughputs `585.81` and `589.24 tok/s`, median `587.53 tok/s`;
+  - ratio versus stored vLLM hetero8 `864.18 tok/s`: `0.680x`;
+  - improvement versus Entry 214 median `552.72 tok/s`: `1.063x`.
+- profiled result:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260603/kv_cache_bf16/gpu_matrix_hetero8_full_attn_kv_bf16_r1_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity;
+  - profiled throughput `556.66 tok/s`;
+  - root `MemcpyD2D` fell from `55.10 ms / 872` in Entry 214's profile to
+    `12.32 ms / 872`; scoped GPU `MemcpyD2D` fell from `17.13 ms / 445` to
+    `7.62 ms / 445`;
+  - `PjRtCApiLoadedExecutable::Execute` fell from `296.06 ms / 91` to
+    `269.17 ms / 91`, and `np.asarray(jax.Array)` fell from `77.70 ms / 32`
+    to `69.37 ms / 32`.
+- rejected or not-promoted probes from the same pass:
+  - `all_rows_valid` sentinel-skip for KV writes: exact and slightly faster
+    under profile (`534.14 tok/s` versus `530.23`), but slower in the
+    no-profile acceptance lane (`547.59 tok/s` versus `552.72`), so the source
+    patch was reverted;
+  - `runtime.fastpaths.trace_token_prefetch=true`: exact but slower at
+    `548.44 tok/s`, so leave it off;
+  - compacting the full-attention cache layer dimension from 24 logical layers
+    to the six full-attention layers was exact at `586.70 tok/s`, essentially
+    neutral versus the BF16-cache median, so the compact-cache code/config key
+    was reverted;
+  - FlashInfer KV append after BF16 cache unblocked the dtype guard and passed
+    the focused backend boundary test, but the integrated hetero8 run was exact
+    and slower at `578.89 tok/s`, so the temporary serving-path changes were
+    reverted and `flashinfer_kv_append` remains off;
+  - FlashInfer decode attention is not a ready JAX drop-in in the current
+    stack. The installed FlashInfer decode path is Torch custom-op oriented;
+    this repo's JAX FlashInfer FFI currently only covers paged KV append.
+- interpretation:
+  - this is a real integrated cache-bandwidth win, not a broad BF16 activation
+    change. GDN recurrent state and model residual math remain on the existing
+    dtype contract;
+  - the remaining hetero8 gap is still decode dominated. After BF16 KV cache,
+    top GPU buckets are GEMMs (`68.26 ms / 72`, `55.63 ms / 1488`,
+    `31.29 ms / 31`, `24.54 ms / 1488`), full-attention/cache fusions
+    (`loop_slice_fusion_23` `22.20 ms / 32`, `input_scatter_fusion_15`
+    `19.18 ms / 31`), and the conv-fused GDN decode kernel
+    (`20.64 ms / 558`).
+- decision:
+  - promote BF16 full-attention KV cache as the current hetero8 anchor;
+  - continue from no-profile median `587.53 tok/s` (`0.680x` vLLM);
+  - do not retry compact-cache layer packing unless a future profile shows
+    layer-dimension copies are again dominant.
+
+### Entry 216 - Accepted Packed Prefill Projection Reuse
+
+- date: 2026-06-03
+- purpose:
+  - test whether the already-loaded packed projection weights can remove
+    same-input prefill projection work without adding model-specific tile
+    tuning or new runtime knobs.
+- accepted change:
+  - reuse GDN `in_proj_qkv_abz = [in_proj_qkv, in_proj_a, in_proj_b, in_proj_z]`
+    during prefill when the existing compact GDN QKV and Z prefill controls are
+    enabled;
+  - reuse full-attention `qkv_proj_decode = [q_proj, k_proj, v_proj]` during
+    prefill when the existing compact full-attention projection control is
+    enabled;
+  - keep the packed paths behind the existing compact-prefill switches and
+    packed-weight presence checks. No new env/config key was added.
+- validation:
+  - `python -m py_compile nanovllm_jax/model.py`
+  - `pytest -q tests/test_lm_head_helpers.py tests/test_backend_boundaries.py -k 'compact_prefill_dot_matches_dense_on_valid_tokens or compact_prefill_mlp_matches_dense_on_valid_tokens or bucketed_prefill_last_logits_match_exact_prefill or bucketed_linear_prefill_preserves_hybrid_state_for_decode or ragged_prefill_and_padded_multiseq_decode_match_dense_recompute or executor_jit_matches_eager_cached_decode'`
+    - 6 passed, 46 deselected.
+- no-profile results:
+  - artifacts:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260603/packed_prefill_proj/jax_hetero8_packed_prefill_proj_noprofile_20260603.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260603/packed_prefill_proj/jax_hetero8_packed_prefill_proj_noprofile_r2_20260603.json`;
+  - exact generated-token parity in both repeats;
+  - throughputs `593.98` and `588.51 tok/s`, median `591.24 tok/s`;
+  - ratio versus stored vLLM hetero8 `864.18 tok/s`: `0.684x`;
+  - improvement versus Entry 215 median `587.53 tok/s`: `1.006x`.
+- profiled result:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/hetero8_hillclimb_20260603/packed_prefill_proj/gpu_matrix_hetero8_packed_prefill_proj_r1_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity;
+  - profiled throughput `562.02 tok/s`;
+  - `PjRtCApiLoadedExecutable::Execute` moved from `269.17 ms / 91` in Entry
+    215 to `260.48 ms / 91`;
+  - scoped GPU `MemcpyD2D` moved from `7.62 ms / 445` to `5.29 ms / 428`.
+- interpretation:
+  - this is a small structural win and generalizes across Qwen 3.5 dense sizes
+    because it only concatenates projections that already share the same input;
+  - it does not reduce the dominant decode projection GEMM counts. The main
+    decode GEMM buckets remain essentially unchanged (`68.42 ms / 72`,
+    `55.62 ms / 1488`, `31.28 ms / 31`, and `24.56 ms / 1488` in the new
+    profile);
+  - do not treat this as evidence that the `0.9x` hetero8 target is solved.
+    The remaining gap is still decode-dominated.
+- decision:
+  - keep packed prefill projection reuse as part of the selected
+    `gpu_paged_gdn_fla_decode_static_metadata` route;
+  - continue from no-profile median `591.24 tok/s` (`0.684x` vLLM);
+  - next work should target a real decode-side structural boundary, not another
+    prefill-only projection cleanup.
+
+### Entry 217 - Random Sidecar Harness Findings
+
+- date: 2026-06-03
+- purpose:
+  - run the new random-request sidecar on the harder request distribution:
+    input tokens `512-4096`, output tokens `256-1024`, request count `5-15`,
+    seed `1234`.
+- accepted harness/server fixes:
+  - `benchmark_random_request_sidecar.py` now passes BF16 to vLLM by default
+    when JAX uses FP32 activations, because vLLM's Qwen3.5 GDN path rejects
+    FP32 chunked GDN;
+  - `Sequence.materialize_device_token_slots` gathers only referenced
+    `DeviceTokenRef` rows instead of copying whole token vectors;
+  - `generate_with_trace` can use the existing typed
+    `runtime.fastpaths.trace_token_prefetch` route to collect trace events via
+    one-step-lag deferred token materialization;
+  - `_record_device_token_carry` now preserves existing carries across
+    non-final prefill chunks and merges only rows that actually emitted tokens,
+    fixing chunked-prefill/static-metadata scheduling.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/llm_engine.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/sequence.py benchmarks/benchmark_random_request_sidecar.py tests/test_device_token_carry.py tests/test_benchmark_random_request_sidecar.py`
+  - `pytest -q tests/test_device_token_carry.py tests/test_benchmark_random_request_sidecar.py`
+    - 23 passed, 2 warnings.
+  - `git diff --check`
+- random-suite metadata:
+  - manifest seed `1234`, `15` requests;
+  - prompt length min/mean/max: `1077 / 2033.73 / 4022`;
+  - output length min/mean/max: `425 / 773.47 / 1007`;
+  - total input/output tokens in the vLLM lane: `30506 / 11602`.
+- vLLM result:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_request_sidecar_seed1234_20260603_r2_vllm.json`;
+  - throughput `1337.00 output tok/s`, total token throughput
+    `4852.47 tok/s`;
+  - TTFT p50 `584.33 ms`, ITL p50 `6.96 ms`;
+  - note: vLLM did runtime Triton JIT for this random shape, so the first run
+    includes some cold-kernel latency.
+- JAX result:
+  - no completed JAX artifact for this full random suite yet.
+  - default JAX sidecar failed during warmup token materialization with
+    `RESOURCE_EXHAUSTED` allocating `12.98 GiB`;
+  - lowering JAX `max_num_batched_tokens` to `4096` fixed the immediate prefill
+    OOM and exposed the static-metadata carry bug fixed above;
+  - the suite also needs `max_blocks_per_seq=512`, because one request needs
+    `5029` prompt+output tokens and the default `256` blocks only covers
+    `4096` tokens;
+  - capacity-correct attempts with `max_blocks_per_seq=512` and
+    `num_kvcache_blocks=2048` still fail during warmup token materialization
+    with about `9.46-9.50 GiB` requested, including with
+    `trace_token_prefetch=true` and BF16 activations.
+- interpretation:
+  - the random sidecar is materially harder than `hetero8`: it combines much
+    longer prefills, much longer outputs, and per-request capacity above the
+    default JAX block budget;
+  - current JAX cannot yet produce a fair full-suite random comparison at the
+    requested range on this GPU. The blocker is not just decode speed; it is
+    warmup/prefill execution plus token materialization under large cache
+    shapes;
+  - do not quote a JAX/vLLM random ratio until the JAX lane completes with exact
+    generated-token parity.
+- next actions:
+  - make the sidecar derive JAX capacity settings from the generated manifest
+    before launch;
+  - add a low-memory trace-output mode that avoids forcing large outstanding
+    prefill executions through final token materialization;
+  - continue hetero8 speed work separately from this harness blocker.
+
+### Entry 218 - Working Random Sidecar Baseline And Memory Check
+
+- date: 2026-06-03
+- purpose:
+  - make the seed-`1234` random sidecar complete on the A10G and measure vLLM
+    memory on the same manifest.
+- accepted fixes:
+  - scheduler now continues already-admitted running prompt tails when the
+    waiting head cannot yet fit in KV cache, instead of turning blocked
+    admission into a false global capacity failure;
+  - canonical model-runner compatibility `kv_state` now references the backend
+    cache storage instead of allocating a second full K/V cache snapshot;
+  - block manager records the hash for a prompt-tail block that becomes full
+    during decode before allocating the next block;
+  - `ModelRunner.release()` removes finished sequence IDs from the device-token
+    carry map instead of clearing carries for still-running rows.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/block_manager.py nanovllm_jax/engine/scheduler.py`
+  - focused scheduler/block tests:
+    `pytest -q tests/test_backend_boundaries.py -k 'block_manager_hashes_completed_prompt_tail_before_next_block or scheduler_continues_running_prefill_when_waiting_head_needs_kv or scheduler_chunks_prefill_by_max_batched_tokens_budget or no_prefix_cache_allocation'`
+    - 5 passed, 46 deselected;
+  - focused carry/static-metadata tests:
+    `pytest -q tests/test_device_token_carry.py -k 'release_preserves_carry_for_still_running_rows or survives_nonfinal_prefill_chunk or static_decode_metadata'`
+    - 6 passed, 12 deselected;
+  - full sidecar completed:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_request_sidecar_seed1234_20260603_r19_full_bf16_2048cap_2048blocks_fixed.json`.
+- working random result:
+  - manifest seed `1234`, `15` requests, `30506` input tokens, `11602`
+    output tokens;
+  - JAX route: BF16 activations/weights, `max_num_batched_tokens=2048`,
+    `num_kvcache_blocks=2048`, `max_blocks_per_seq=512`;
+  - JAX throughput `204.61 output tok/s`, total token throughput
+    `742.62 tok/s`, TTFT p50 `1361.02 ms`, ITL p50 `17.03 ms`;
+  - live vLLM BF16 throughput `1531.33 output tok/s`, total token throughput
+    `5557.75 tok/s`, TTFT p50 `587.22 ms`, ITL p50 `6.95 ms`;
+  - ratio: `0.134x` vLLM.
+- correctness status:
+  - generated lengths match on all `15` rows;
+  - generated tokens are not an exact parity pass: 4 of 15 rows diverge in the
+    r19 sidecar comparison; first divergence is request `12`, generated index
+    `32`, JAX token `1599` versus vLLM token `9032`;
+  - vLLM is also not bit-identical across the earlier r2 and r13 random runs
+    on this manifest, so use random token parity as a diagnostic, not as the
+    sole correctness oracle.
+- memory:
+  - vLLM r13 memory monitor peak:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_request_sidecar_seed1234_20260603_r13_vllm_memmon_memory.json`,
+    sampled peak `15880 MiB`;
+  - vLLM log breakdown: model load `1.72 GiB`, available KV cache memory
+    `12.55 GiB`, GPU KV cache size `868783` tokens, CUDA graph pool
+    `0.27 GiB`;
+  - failed JAX FP32/3072-block r15 peak was `16670 MiB` and then OOMed when a
+    pending prefill execution needed another `8.51 GiB`;
+  - working JAX BF16/2048-block r18 monitor peak was `16714 MiB`.
+- interpretation:
+  - vLLM's peak is mostly intentional KV reservation under
+    `gpu_memory_utilization=0.72`;
+  - JAX still reaches a similar peak while exposing far less KV capacity
+    (`2048 * 16 = 32768` block tokens), so memory efficiency remains a real
+    optimization target;
+  - the random sidecar is now usable as a stress benchmark, but its current
+    throughput gap is decode-dominated and much worse than hetero8.
+
+### Entry 219 - Random Correctness Diagnostics
+
+- date: 2026-06-03
+- purpose:
+  - clarify whether the random-sidecar generated-token differences are broad
+    correctness failures or low-margin branch sensitivity.
+- artifact labels:
+  - `r2` is the first successful vLLM-only random sidecar artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_request_sidecar_seed1234_20260603_r2_vllm.json`;
+  - `r13` is a later vLLM-only rerun on the same r2 manifest with a memory
+    sampler:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_request_sidecar_seed1234_20260603_r13_vllm_memmon.json`;
+  - `r19` is the full sidecar where JAX and live vLLM both completed:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_request_sidecar_seed1234_20260603_r19_full_bf16_2048cap_2048blocks_fixed.json`.
+- full-artifact comparison:
+  - vLLM `r19` and vLLM `r13` are exactly identical on all 15 rows;
+  - old vLLM `r2` differs from stable vLLM `r13/r19` on 4 rows;
+  - JAX `r19` versus stable vLLM `r19`: 11 of 15 rows exact, generated lengths
+    match on all rows, same-position token equality `8616/11602` (`74.26%`);
+  - first JAX/stable-vLLM diffs are request `12` at generated index `32`,
+    request `13` at index `0`, request `6` at index `1`, and request `7` at
+    index `1`;
+  - JAX matches old vLLM `r2` on requests `6`, `7`, and `12`; JAX matches
+    stable vLLM `r13/r19` on request `1`.
+- HF diagnostic subset:
+  - diagnostic manifest:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_correctness_rows_1_6_7_12_13_64.prompts.jsonl`;
+  - HF BF16 artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_correctness_rows_1_6_7_12_13_64_hf_bf16.json`;
+  - HF FP32-activation artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_correctness_rows_1_6_7_12_13_64_hf_fp32act.json`;
+  - summary artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_correctness_diag_rows_1_6_7_12_13_64_summary.json`.
+- HF BF16 results over first 64 generated tokens:
+  - request `1`: JAX and stable vLLM match HF BF16; old vLLM `r2` diverges at
+    index `8`, where HF BF16 top-2 is tied (`198` and `271`);
+  - request `6`: JAX and old vLLM `r2` match HF BF16; stable vLLM diverges at
+    index `1`, where HF BF16 top-2 margin is `0.0625` logprob;
+  - request `7`: JAX and old vLLM `r2` match HF BF16; stable vLLM diverges at
+    index `1`, where HF BF16 top-2 margin is `0.0625` logprob;
+  - request `12`: stable vLLM matches HF BF16; JAX and old vLLM `r2` diverge at
+    index `32`, selecting HF BF16 second-best token `1599` instead of top token
+    `9032`; top-2 margin is `0.125` logprob;
+  - request `13`: JAX matches HF BF16; stable vLLM and old vLLM `r2` diverge at
+    index `0`, where HF BF16 top-2 is exactly tied (`220` and `12434`).
+- HF FP32-activation note:
+  - HF FP32 changes branches on requests `1`, `12`, and `13`, confirming that
+    this random subset contains low-margin numerically sensitive branches;
+  - JAX FP32 subset diagnostic completed but is not a pure FP32 oracle because
+    the selected runtime config still carries accepted BF16 serving fastpaths.
+- interpretation:
+  - hetero exact generated-token parity remains a valid workload-specific gate;
+  - random sidecar is not yet exact generated-token parity against stable vLLM,
+    but most observed differences are near ties or branch choices also seen
+    across vLLM/HF precision variants;
+  - the clearest JAX-side random discrepancy under HF BF16 is request `12`
+    index `32`, where JAX chooses the second-best token by a small margin.
+- request-12 follow-up:
+  - request-only manifest:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_correctness_req12_64.prompts.jsonl`;
+  - clean/default JAX FP32 artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_correctness_req12_64_jax_default_fp32.json`;
+  - clean/default JAX FP32 matches HF FP32 exactly for all first 64 generated
+    tokens on request `12`;
+  - selected JAX BF16 serving route, HF BF16, and stable vLLM all take the BF16
+    branch at generated index `6`; at generated index `32`, stable vLLM and HF
+    BF16 select token `9032`, while selected JAX BF16 and old vLLM `r2` select
+    token `1599`;
+  - HF BF16 top-k at that step has token `9032` first and token `1599` second
+    with top-2 logprob margin `0.125`, so this is a narrow BF16/fastpath branch
+    difference rather than evidence that the default JAX model state is corrupt.
+
+### Entry 220 - Packed Paged Chunked-Prefill ABI Becomes Main Path
+
+- date: 2026-06-03
+- purpose:
+  - stop treating chunked prefill as dense `[batch, max_query]` padding and
+    move the serving ABI toward packed ragged query tokens with paged KV
+    metadata, matching the vLLM-style chunked-prefill direction and MaxText's
+    paged/ragged inference attention design.
+- accepted plan:
+  - prefill tensors become `[1, token_bucket]` for `tokens`, `positions`, and
+    `token_row_ids`;
+  - request-row metadata remains paged and row-shaped:
+    `query_start_loc=[request_bucket + 1]`,
+    `block_tables=[request_bucket, max_blocks_per_seq]`, and
+    `seq_lens=[request_bucket]`;
+  - decode remains the fixed-width paged path (`[batch_bucket, 1]`) with the
+    current block tables, KV cache layout, greedy token fastpath, and GDN
+    hybrid-state table.
+- implementation direction:
+  - keep `BlockManager`, paged KV allocation, physical cache layout, and decode
+    paths intact;
+  - add reference packed full-attention prefill first, then swap to a packed
+    paged-attention kernel behind the same ABI;
+  - use the existing packed varlen FLA/GDN references and Triton composition as
+    the GDN kernel target;
+  - make generic warmup cover finite `prefill_token_buckets` and
+    `batch_size_buckets`, not benchmark-specific prompt shapes.
+- correctness gate:
+  - mixed-length prefills must match the dense reference before performance
+    claims;
+  - runtime JIT cache growth during a warmed benchmark should fail the
+    benchmark harness.
+- note:
+  - dense prefill remains as a comparison/reference path, but it is no longer
+    the target serving ABI. The old Cartesian `batch_bucket * query_bucket`
+    warmup surface is the thing being removed.
+
+### Entry 221 - Packed ABI GPU Smoke and Config-First Serving Controls
+
+- date: 2026-06-03
+- artifacts:
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/packed_prefill_abi_smoke/packed_prefill_gpu_smoke_20260603.json`
+  and
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/packed_prefill_abi_smoke/packed_prefill_gpu_smoke_config_first_20260603.json`
+- purpose:
+  - verify that the new packed-prefill grammar can be warmed generically and
+    measured without creating benchmark-specific JIT entries;
+  - start moving accepted serving-path controls out of direct hot-path
+    environment-variable checks and into `Qwen3_5Config`.
+- smoke setup:
+  - two synthetic prompts with input lengths `8,12` and output length `2`;
+  - `prefill_layout=packed`, `prefill_token_buckets=8,16,32`,
+    `batch_size_buckets=1,2`, generic warmup, no profile;
+  - `--fail-on-jit-cache-growth` enabled.
+- result:
+  - first smoke: generic warmup compiled `8` JIT entries; measured generation
+    started with `8` entries and ended with `8` entries, so runtime JIT cache
+    growth was `0`; measured prefill processed `20` scheduled tokens in about
+    `309 ms`, and decode processed the two generated tokens in about `14 ms`;
+  - config-first smoke: `--greedy-token-fastpath` and `--device-token-carry`
+    were passed as normal CLI/config fields; warmup again compiled `8` entries,
+    measured generation had `0` JIT cache growth, TTFT was about `137 ms`, and
+    decode ITL was about `6.2 ms`;
+  - this is an ABI/warmup smoke only, not a performance claim, because packed
+    GDN and full-attention prefill still use reference bodies.
+- config cleanup:
+  - `greedy_token_fastpath`, `device_token_carry`,
+    `static_decode_metadata`, and `static_decode_seq_lens_carry` are now
+    first-class engine config fields;
+  - `server_config.yaml`, `server.py`, and the JAX benchmark harness can pass
+    these controls as config/CLI values;
+  - legacy env vars still work as compatibility overrides, but the accepted
+    path should use config fields going forward.
+
+### Entry 222 - Packed Generic Hetero8 Anchor And Rejected Decode Plumbing Probes
+
+- date: 2026-06-03
+- purpose:
+  - validate the packed/ragged ABI on the canonical hetero8 workload with
+    generic warmup and no runtime JIT-cache growth;
+  - test whether the profiled device-token carry broadcast and full-attention
+    decode materialization buckets were real end-to-end throughput wins.
+- current valid packed/generic anchor:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/packed_gdn_kernel_route/isolation/jax_hetero8_packed_generic_static_vector_token_output_20260603.json`;
+  - exact generated-token parity and full generated lengths;
+  - generic warmup, `prefill_layout=packed`, static decode metadata, device
+    token carry, and `--fail-on-jit-cache-growth`;
+  - output throughput `512.56 tok/s`, total seconds `0.49945`;
+  - prefill step about `18.60 ms`, 31 decode steps sum about `399.84 ms`,
+    final done/materialization gap about `79.40 ms`;
+  - JIT cache growth during measurement was `0`.
+- rejected token-carry variants:
+  - returning an extra column-shaped carry token from the executor was exact but
+    slower:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/packed_gdn_kernel_route/isolation/jax_hetero8_packed_generic_static_carry_column_20260603.json`,
+    `508.41 tok/s`;
+  - passing a 1D carried token vector into table decode and expanding it inside
+    the main JIT was exact but slower:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/packed_gdn_kernel_route/isolation/jax_hetero8_packed_generic_static_table_token_vector_20260603.json`,
+    `507.66 tok/s`;
+  - both lowered the recorded decode-step sum to about `380-381 ms` but raised
+    TTFT and the final done/materialization gap, so the end-to-end hetero8
+    metric regressed. Do not retry token-carry shape movement unless the final
+    materialization strategy changes materially.
+- rejected full-attention decode Triton probe:
+  - a focused CUDA/JAX-Triton parity test matched the dense reference for
+    width-1 paged decode attention, but the integrated hetero8 run was exact
+    and slower:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/packed_gdn_kernel_route/decode_attention/jax_hetero8_packed_generic_static_triton_decode_attention_20260603.json`,
+    `503.32 tok/s`;
+  - generic warmup still had zero measurement-time JIT growth, but first compile
+    was long and the runtime did not beat the JAX decode attention path;
+  - the experimental kernel, switch, and test were reverted rather than adding
+    another slower environment-variable path.
+- interpretation:
+  - the CPU-profile `jit_broadcast_in_dim` attribution was not a standalone
+    removable throughput bucket in the measured end-to-end hetero8 run;
+  - replacing full-attention decode with a small custom streaming Triton kernel
+    did not beat XLA's existing lowered path on this A10G workload;
+  - continue from the `512.56 tok/s` packed/generic/static anchor, not from the
+    rejected variants.
+
+### Entry 223 - Config-First Packed ABI Promotion Check
+
+- date: 2026-06-03
+- purpose:
+  - move the accepted packed/ragged serving controls into typed
+    `Qwen3_5Config` and `server_config.yaml` fields instead of relying on a
+    growing set of hot-path environment variables;
+  - remeasure hetero8 after the refactor to make sure the large ABI/config
+    change did not change correctness, warmup discipline, or the current
+    performance anchor.
+- code/config changes:
+  - promoted accepted fastpaths and kernel policy to config fields:
+    materialized tied LM head, compact packed prefill projections/MLP,
+    BF16 decode projection and LM-head activations, padded decode GEMMs,
+    BF16 full-attention KV cache, strict GDN no-fallback policy,
+    Triton FLA padded GDN prefill, and conv-fused Triton FLA packed decode;
+  - `server_config.yaml` and the GPU matrix config now select the accepted
+    route through config/runtime sections, with env vars kept only as
+    compatibility overrides;
+  - the benchmark config uses generic warmup and `--fail-on-jit-cache-growth`
+    by default.
+- correctness/tests:
+  - focused pytest slice passed:
+    `16 passed, 78 deselected`;
+  - `tests/test_server_config.py` passed standalone:
+    `8 passed`;
+  - `py_compile` passed for the touched config, model, backend, loader, and
+    executor/runner modules;
+  - `git diff --check` passed.
+- fair hetero8 result:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/config_refactor/matrix_runs_generic/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity and full generated lengths;
+  - generic bucket startup warmup compiled `26` entries, measurement started
+    and ended at `26` entries, so runtime JIT cache growth was `0`;
+  - output throughput `512.19 tok/s`, total seconds `0.49982`;
+  - stored vLLM reference `864.18 tok/s`, ratio `0.593x`, so the hetero8
+    `0.9x` target remains open.
+- profile sanity:
+  - profiled/request-warmed run was exact but slower at `479.71 tok/s`; do not
+    use that as the fair anchor;
+  - the current GPU trace still shows launch-heavy decode: Cutlass GEMMs about
+    `165 ms / 1957`, fusion kernels about `155 ms / 7369`, transposes about
+    `23 ms / 595`, LM-head GEMM about `31 ms / 31`, and conv-fused GDN decode
+    about `20.6 ms / 558`;
+  - CPU-side `broadcast_in_dim`/materialization labels remain visible, but
+    Entry 222 showed token-carry shape movement alone is not an integrated
+    throughput win. Treat those labels as synchronization/serving-boundary
+    evidence, not as a reason to retry the rejected token-carry variants.
+- interpretation:
+  - the config refactor is promoted as the current fair generic-warmup anchor
+    because it preserves the packed/generic/static route and removes env-var
+    sprawl from the accepted path; do not read this as a `0.9x` win or as the
+    fastest historical no-profile diagnostic lane;
+  - the next speed work must change the decode computation boundary
+    materially: reducing GEMM/reduction launch count, LM-head top-1
+    materialization, or a broader production-kernel boundary. Do not repeat
+    greedy decode burst, token-carry shape movement, single-query Triton
+    full-attention decode, or source-level gate/up packing probes already
+    rejected above.
+
+### Entry 224 - Typed Config Projection And Boundary Ablations
+
+- date: 2026-06-03
+- purpose:
+  - finish the config-first replacement by making the GPU matrix runner pass
+    typed runtime fastpaths and kernel policy into the benchmark/server process
+    explicitly instead of depending on inherited environment variables;
+  - rerun the correctness gate after this large routing change;
+  - record the latest small boundary ablations so they are not retried as
+    apparent wins.
+- code changes:
+  - added `engine_overrides_from_config()` to `server_config.py` and used it
+    from `load_server_config()` and `benchmarks/run_gpu_matrix.py`;
+  - `benchmarks/benchmark_jax_server_trace.py` now accepts the promoted
+    runtime/kernel fields as CLI arguments and passes them into `LLMEngine` /
+    `Qwen3_5Config`;
+  - benchmark artifacts now report promoted full-attention and GDN kernel
+    policy from `engine.config`, not just from environment variables;
+  - fixed `_full_attention_kv_cache_dtype()` so explicit config value
+    `"default"` means “use the cache spec dtype,” matching the typed config
+    default.
+- correctness/tests:
+  - `py_compile` passed for `server_config.py`, `run_gpu_matrix.py`,
+    `benchmark_jax_server_trace.py`, the touched tests, and the backend dtype
+    fix;
+  - config/matrix-focused tests passed: `54 passed`;
+  - broader correctness slice passed:
+    `57 passed, 125 deselected, 2 warnings`;
+  - dry-run command projection confirmed the selected matrix config now emits
+    the expected typed flags, including BF16 decode projection/LM-head
+    activations, padded decode GEMMs, BF16 full-attention KV cache, strict GDN
+    fallbacks disabled, Triton FLA padded GDN prefill, and conv-fused Triton
+    FLA packed decode.
+- fair hetero8 typed-projection validation:
+  - matrix summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/config_refactor/gpu_matrix_typed_projection_hetero8_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/config_refactor/typed_projection_matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity and full generated lengths;
+  - generic bucket startup warmup compiled `26` entries, measurement started
+    and ended at `26` entries, so runtime JIT cache growth was `0`;
+  - output throughput `514.16 tok/s`, total seconds `0.49790`;
+  - stored vLLM reference `864.18 tok/s`, ratio `0.595x`; the `0.9x` target
+    still needs about `1.51x` improvement from this anchor.
+- rejected/not-promoted ablations:
+  - disabling static decode metadata remained exact with zero JIT growth but
+    was neutral:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/static_metadata_ablation/hetero8_generic_no_static_metadata_20260603.json`,
+    `512.96 tok/s`; do not promote it as a speed path;
+  - trace-token prefetch accounting remained exact with zero JIT growth and
+    reached `514.34 tok/s`:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/config_refactor/gpu_matrix_hetero8_trace_token_prefetch_r1_20260603.json`;
+    the end-to-end movement versus `512-514 tok/s` is too small to treat as a
+    material win, and the per-repeat artifact landed under the default
+    `results/gpu_matrix_runs/...` directory because no explicit run directory
+    was supplied.
+- interpretation:
+  - the config-first replacement is correctness-clean and measurement-clean,
+    but it is a maintainability/benchmark-discipline change, not the speedup;
+  - static metadata and token-prefetch/accounting changes are not the dominant
+    hetero8 lever;
+  - continue from the `514 tok/s` fair generic-warmup anchor and focus on a
+    broader decode computation boundary that reduces launch count or fuses
+    model-side decode GEMMs/reductions without shape-specific tuning.
+
+### Entry 225 - Rejected Hetero8 Metadata Warmup Variants
+
+- date: 2026-06-03
+- purpose:
+  - investigate the large hetero8 decode outlier visible after the typed-config
+    anchor without changing the correctness contract or allowing measured-phase
+    JIT growth;
+  - determine whether the host metadata/device-put profile bucket can be removed
+    by warming or carrying existing static decode metadata.
+- diagnostics and rejected results:
+  - default XLA Triton GEMM emitter ablation:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/xla_gemm_ablation/hetero8_xla_default_direct_20260603.json`,
+    exact with zero JIT growth but `141.27 tok/s`; reject;
+  - long-context decode warmup:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/long_context_warmup/gpu_matrix_hetero8_long_context_warmup_r1_20260603.json`,
+    exact with zero JIT growth but `494.60 tok/s`; reject;
+  - long-context profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/long_context_warmup/hetero8_long_context_profile_20260603.json`,
+    showed `_static_decode_device_arrays`/`device_put`/`s32[8]` host metadata
+    work as a large profiled bucket, but the integrated fixes below moved cost
+    rather than improving throughput;
+  - static decode seq-lens carry:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/seq_lens_carry/gpu_matrix_hetero8_seq_lens_carry_r1_20260603.json`,
+    exact with zero JIT growth but `469.79 tok/s`; reject;
+  - scheduler static-metadata warmup:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/scheduler_metadata_warmup/gpu_matrix_hetero8_scheduler_metadata_warmup_r1_20260603.json`,
+    exact with zero JIT growth but `460.25 tok/s`; reject;
+  - seq-lens placeholder plus prefill-seeded seq-lens carry:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/seq_lens_placeholder/gpu_matrix_hetero8_seq_lens_placeholder_r1_20260603.json`,
+    exact with zero JIT growth but `416.32 tok/s`; reject.
+- decision:
+  - revert all long-context warmup, scheduler metadata warmup, and prefill
+    seq-lens seeding code;
+  - keep the fair typed-config anchor from Entry 224 at `514.16 tok/s` as the
+    current baseline.
+- interpretation:
+  - the host metadata/device-put bubble is real, but cache-miss warmups and
+    seq-lens carry toggles are not sufficient; they shift latency into first
+    decode or final prefill instead of eliminating it;
+  - do not retry these variants. The next structural route should make request
+    metadata/block tables device-owned across prefill and decode, or broaden
+    the compiled decode boundary so the scheduler stops rebuilding hot-path
+    metadata on the host.
+
+### Entry 226 - Rejected Stacked Device-Token Materialization
+
+- date: 2026-06-03
+- purpose:
+  - test whether grouping same-shaped deferred `DeviceTokenRef` vectors into one
+    stacked host transfer reduces the final hetero8 completion-token
+    materialization gap.
+- baseline:
+  - restored Entry 224 anchor rerun:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/config_refactor/gpu_matrix_hetero8_restored_anchor_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/config_refactor/restored_anchor_matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity, full generated lengths, zero measured-phase
+    JIT growth, `514.96 tok/s`;
+  - final output gap: done elapsed `0.49630 s`, last token step end
+    `0.41685 s`, gap `79.44 ms`.
+- rejected experiment:
+  - summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/materialize_stack/gpu_matrix_hetero8_materialize_stack_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/materialize_stack/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity, full generated lengths, zero measured-phase
+    JIT growth, but throughput fell to `496.33 tok/s`;
+  - final output gap worsened to `95.94 ms`.
+- decision:
+  - revert the stacked materialization code and its focused test;
+  - keep the original vector-list `jax.device_get` materialization path.
+- interpretation:
+  - final token materialization is visible, but adding a `jnp.stack` launch and
+    grouped transfer does not eliminate the synchronization cost in the
+    integrated server path;
+  - do not retry host-side stacking as a speed route. A future materialization
+    change needs a broader serving-boundary change, such as device-owned output
+    tables or a decode boundary that produces directly reusable host-visible
+    request results.
+
+### Entry 227 - Rejected Graph-Returned Seq-Lens Carry
+
+- date: 2026-06-03
+- purpose:
+  - test a materially different seq-lens carry route from Entry 225 by returning
+    the next decode `seq_lens` vector from the compiled greedy token-id decode
+    graph, instead of computing `batch.seq_lens + 1` as a separate JAX operation
+    in the runner.
+- experiment:
+  - enabled the existing `static_decode_seq_lens_carry` config field in
+    `gpu_paged_gdn_fla_decode_static_metadata`;
+  - temporarily extended `ExecutorOutput` so `forward_step_token_ids_jit` and
+    `forward_step_token_ids_table_jit` returned `next_seq_lens` alongside token
+    ids, cache storage, and hybrid state;
+  - wired the runner carry map to prefer the graph-returned `next_seq_lens`.
+- correctness/tests:
+  - syntax checks passed for the touched executor and runner modules;
+  - focused static-decode seq-lens tests passed before the benchmark:
+    `4 passed, 16 deselected`;
+  - broader focused slice passed with the experiment enabled:
+    `14 passed, 73 deselected`.
+- hetero8 result:
+  - summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/seq_lens_graph_carry/gpu_matrix_hetero8_seq_lens_graph_carry_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/seq_lens_graph_carry/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity and full generated lengths;
+  - generic warmup compiled `26` entries, and the measured phase had zero JIT
+    cache growth (`26 -> 26`);
+  - throughput `508.89 tok/s`, ratio `0.589x` stored vLLM;
+  - final output gap worsened to about `105.01 ms` versus about `79.44 ms` on
+    the restored Entry 224 anchor.
+- decision:
+  - reject and revert the executor output extension, runner wiring, and config
+    enablement;
+  - keep `static_decode_seq_lens_carry` disabled in the selected hetero8 config.
+- interpretation:
+  - returning `next_seq_lens` from the decode graph avoids one obvious external
+    `seq_lens + 1` operation, but it adds an extra decode-graph output and does
+    not reduce the integrated serving latency;
+  - do not retry seq-lens carry variants unless the boundary changes more
+    substantially, for example a device-owned request metadata table that also
+    removes host block-table/query metadata rebuilds.
+
+### Entry 228 - Rejected Direct Full-Active Table Decode Specialization
+
+- date: 2026-06-03
+- purpose:
+  - test whether the full-active `B=8` hetero8 decode lane benefits from a
+    narrower table-state decode boundary that assumes hybrid slots are already
+    row-aligned `[0, B)`;
+  - unlike the older full-active valid-mask skip, this temporary route removed
+    hybrid table gather/scatter and built direct decode metadata inside the JIT.
+- experiment:
+  - temporarily added `forward_step_token_ids_table_direct_jit`, a decode-only
+    greedy token-id path that accepted token rows, block tables, seq_lens,
+    cache storage, and full hybrid state tables, without a slot-id vector;
+  - runtime used it only when the batch was fully active, every query length
+    was `1`, there were no padded rows, and the hybrid table row count matched
+    the physical token row count;
+  - generic table decode remained warmed for ragged/tail buckets.
+- correctness/tests:
+  - syntax and diff checks passed;
+  - focused table-state parity test was extended during the experiment and
+    passed after avoiding donated-buffer reuse;
+  - after reverting, the focused table-state slice still passed:
+    `2 passed, 65 deselected`.
+- hetero8 result:
+  - summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/direct_table_decode/gpu_matrix_hetero8_direct_table_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/direct_table_decode/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity and full generated lengths;
+  - generic warmup compiled `27` entries and the measured phase had zero JIT
+    cache growth (`27 -> 27`);
+  - throughput fell to `493.29 tok/s`, ratio `0.571x` stored vLLM;
+  - decode-step total worsened to about `0.41 s` versus about `0.37 s` in the
+    run report, despite a slightly smaller final materialization gap.
+- decision:
+  - reject and revert the direct table decode method, runner route, warmup hook,
+    and focused direct-route test assertions;
+  - keep the generic `forward_step_token_ids_table_jit` path as the selected
+    table-state decode route.
+- interpretation:
+  - removing visible source-level gather/scatter did not produce a better
+    lowered decode plan; it added another compiled variant and regressed
+    end-to-end throughput;
+  - do not retry full-active decode source specializations unless a profile
+    shows a specific lowered GPU/CPU bucket removed by the proposed boundary.
+
+### Entry 229 - Accepted BF16 Model Compute Diagnostic
+
+- date: 2026-06-03
+- purpose:
+  - test a model-family-wide numeric policy change instead of hand tuning:
+    keep BF16 checkpoint weights and FP32 GDN state-sensitive kernels, but make
+    the model activation compute dtype BF16.
+- rejected preliminary run:
+  - direct benchmark artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/bf16_compute_hetero8/hetero8_bf16_compute_direct_20260603.json`;
+  - exact and zero-JIT, but not comparable because the direct command skipped
+    config-derived GDN block-dot env flags; do not use this as a speed result.
+- accepted hetero8 result:
+  - summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/bf16_compute_hetero8/gpu_matrix_hetero8_bf16_compute_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/bf16_compute_hetero8/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_bf16_compute_repeat1.json`;
+  - exact generated-token parity and full generated lengths;
+  - generic warmup compiled `26` entries, and the measured phase had zero JIT
+    cache growth (`26 -> 26`);
+  - throughput `651.18 tok/s`, ratio `0.754x` stored vLLM (`864.18 tok/s`);
+  - scheduler timing: one prefill step `0.0167 s`, thirty-one decode steps
+    `0.2942 s`.
+- decision:
+  - promote `args.dtype` in `gpu_paged_gdn_fla_decode_static_metadata` from
+    `float32` to `bfloat16`;
+  - remove the temporary BF16 diagnostic config to avoid benchmark-config
+    sprawl;
+  - continue to require exact generated-token parity and zero measured-phase
+    JIT growth for follow-up changes.
+- interpretation:
+  - broad BF16 compute gives a meaningful integrated decode win and is more
+    general than GEMM tile tuning;
+  - the run is still only one repeat and below the `0.9x` vLLM target
+    (`777.76 tok/s`), so the next step is to profile the BF16 route and target
+    the remaining decode buckets.
+
+### Entry 230 - Rejected BF16 Trace-Token Prefetch
+
+- date: 2026-06-03
+- purpose:
+  - retest the existing overlapped trace-token prefetch route under the new
+    BF16 compute baseline because final device-token materialization still
+    leaves about an `80 ms` done-vs-last-token gap.
+- baseline:
+  - Entry 229 BF16 compute artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/bf16_compute_hetero8/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_bf16_compute_repeat1.json`;
+  - exact and zero-JIT, `651.18 tok/s`, final gap about `80.47 ms`.
+- experiment:
+  - direct artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/bf16_trace_prefetch_hetero8/hetero8_bf16_trace_prefetch_20260603.json`;
+  - enabled existing `NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH=1` while keeping the
+    same BF16 config and GDN block-dot env flags.
+- result:
+  - exact generated-token parity, full generated lengths, and zero measured
+    JIT growth;
+  - throughput was effectively unchanged/slightly worse: `651.06 tok/s`;
+  - final gap shrank to about `11.66 ms`, but the last token timestamp moved
+    later, so total wall time did not improve.
+- decision:
+  - reject for promotion and keep trace-token prefetch off in the selected
+    config;
+  - do not retry token prefetch/materialization movement alone. A future output
+    route needs to remove total step work or produce a device-owned output table
+    as part of a broader compiled boundary.
+
+### Entry 231 - Rejected Decode Output-Projection Padded GEMM
+
+- date: 2026-06-03
+- purpose:
+  - test whether routing GDN/full-attention decode output projections through
+    the already accepted padded-GEMM helper reduces the high-count decode
+    output-projection GEMM buckets without hand-tuned tile parameters.
+- experiment:
+  - temporarily added a helper that used `_decode_padded_gemm_dot()` for
+    decode-only `B <= decode_padded_gemm_rows`, `seq_len == 1` output
+    projections, and routed GDN `out_proj` plus full-attention `o_proj`
+    through it.
+- correctness/tests:
+  - `py_compile` passed for `nanovllm_jax/model.py`;
+  - focused tests passed:
+    `3 passed, 64 deselected` for decode padded-GEMM/table decode;
+  - decode reduction tests passed: `8 passed`.
+- result:
+  - summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/output_proj_padded_gemm/gpu_matrix_hetero8_output_proj_padded_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/output_proj_padded_gemm/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity, full generated lengths, zero measured-phase
+    JIT growth;
+  - throughput regressed slightly to `650.19 tok/s` versus the Entry 229
+    `651.18 tok/s` baseline.
+- decision:
+  - reject and revert the output-projection padded-GEMM helper and call sites;
+  - keep padded GEMM limited to the currently accepted decode projection/MLP
+    uses.
+- interpretation:
+  - reshaping output projection GEMMs through the row-padded helper does not
+    reduce integrated wall time on hetero8; the next attempt must change a
+    broader decode boundary or use a production kernel, not simply repad the
+    same output-projection matmuls.
+
+### Entry 232 - Rejected FP32 GDN Conv-State Storage
+
+- date: 2026-06-03
+- purpose:
+  - test whether keeping the GDN convolution state table in FP32 under BF16
+    model compute avoids per-step casts/scatter warnings and aligns the runtime
+    state policy with the desired BF16-activation/FP32-state contract.
+- experiment:
+  - temporarily changed `init_hybrid_state()` so `conv_state` was allocated in
+    FP32 regardless of the model compute dtype. `recurrent_state` was already
+    FP32.
+- correctness/tests:
+  - `py_compile` passed for `kv_cache.py`, `model.py`, and `model_runner.py`;
+  - focused GDN packed-decode tests passed: `3 passed, 18 deselected`;
+  - focused backend decode/prefill tests passed: `3 passed, 64 deselected`.
+- result:
+  - summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fp32_conv_state/gpu_matrix_hetero8_fp32_conv_state_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fp32_conv_state/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity, full generated lengths, zero measured-phase
+    JIT growth;
+  - throughput regressed to `628.66 tok/s` from the Entry 229 BF16 baseline
+    `651.18 tok/s`;
+  - decode-step total increased from about `0.294 s` to `0.308 s`.
+- decision:
+  - reject and revert FP32 conv-state storage;
+  - keep recurrent state FP32 and conv state in the model compute dtype for the
+    selected route.
+- interpretation:
+  - the scatter warning reflects an implicit cast boundary, but storing the
+    full conv-state table in FP32 makes the integrated decode graph slower.
+    Future cleanup should cast the specific returned conv-state value before
+    scatter if needed for warning hygiene, not change the table dtype.
+
+### Entry 233 - Rejected BF16 Lowered Decode Reductions
+
+- date: 2026-06-03
+- purpose:
+  - retest existing lowered reduction fastpaths under the promoted BF16 compute
+    route: Triton decode RMSNorm plus Pallas GDN Q/K pre-normalization.
+- experiment:
+  - direct artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/bf16_reductions_hetero8/hetero8_bf16_triton_rms_pallas_qk_prenorm_20260603.json`;
+  - enabled:
+    `NANO_VLLM_JAX_TRITON_DECODE_RMSNORM=1`,
+    `NANO_VLLM_JAX_PALLAS_GDN_QK_PRENORM=1`, and
+    `NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK=1`;
+  - kept the same BF16 model compute config, GDN block-dot prefill env flags,
+    exact reference, and zero-JIT-growth gate.
+- result:
+  - exact generated-token parity, full generated lengths, zero measured-phase
+    JIT growth;
+  - throughput regressed to `637.34 tok/s` from the Entry 229 BF16 baseline
+    `651.18 tok/s`;
+  - final materialization gap shrank, but total wall time increased.
+- decision:
+  - reject for hetero8 BF16 promotion;
+  - keep lowered decode reductions default-off. They remain useful focused
+    diagnostics, but do not improve this integrated serving target.
+
+### Entry 234 - Token-Carry Reshape Cleanup And Lazy Hybrid Slot Zeroing
+
+- date: 2026-06-03
+- purpose:
+  - remove redundant hot-path device-token slicing/expansion seen in the BF16
+    profile, and fix a correctness edge where newly assigned hybrid-state table
+    slots could reuse stale GDN state if a freed physical slot was allocated to
+    a new sequence.
+- implementation:
+  - replaced the full-bucket greedy-token slice with direct reuse of
+    `output.activations` when the returned token vector already has the active
+    batch shape;
+  - replaced `token_vector[:, None]` with `jnp.reshape(token_vector,
+    tokens.shape)` in the device-token carry path;
+  - added lazy hybrid-slot zero tracking so fresh all-zero tables are not
+    rewritten on first allocation, while stale freed slots are zeroed on reuse
+    through the batched zeroing helper.
+- correctness/tests:
+  - `py_compile` passed for `model_runner.py` and the updated backend-boundary
+    tests;
+  - focused tests passed:
+    `27 passed, 60 deselected` across device-token carry, static decode
+    metadata, table decode, hybrid slot ids, and hybrid-state table reuse.
+- result:
+  - rejected eager-zero variant:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/token_carry_reshape/gpu_matrix_hetero8_token_carry_reshape_r1_20260603.json`;
+    it was exact but regressed to `312.86 tok/s` because first-prefill TTFT
+    included eager zeroing of the full hybrid-state table;
+  - lazy-zero rerun:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/token_carry_reshape_lazy_zero/gpu_matrix_hetero8_token_carry_reshape_lazy_zero_r1_20260603.json`;
+    run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/token_carry_reshape_lazy_zero/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity, full generated lengths, zero measured-phase
+    JIT growth (`26 -> 26`);
+  - throughput was `647.58 tok/s`, below the Entry 229 BF16 best
+    `651.18 tok/s`.
+- decision:
+  - keep the lazy hybrid-slot zeroing correctness fix;
+  - do not count token-carry reshape cleanup as a speed win, and do not retry
+    eager allocation-time table zeroing;
+  - current best speed anchor remains Entry 229 BF16 model compute at
+    `651.18 tok/s` (`0.754x` stored vLLM).
+
+### Entry 235 - Rejected Per-Step Trace Output Table
+
+- date: 2026-06-03
+- purpose:
+  - test whether writing deferred device-token outputs into a device-owned
+    `[requests, max_completion_tokens]` trace table can remove the final
+    last-token-to-done materialization gap without changing model numerics.
+- experiment:
+  - temporarily scattered newly generated `DeviceTokenRef` values into a JAX
+    trace table after every scheduler step, then copied the full table once at
+    trace completion.
+- correctness/tests:
+  - `py_compile` passed for `llm_engine.py`, `sequence.py`, and
+    `model_runner.py`;
+  - focused tests passed:
+    `27 passed, 60 deselected` across device-token carry, static decode
+    metadata, table decode, hybrid slot ids, and hybrid-state table reuse.
+- result:
+  - summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/trace_output_table/gpu_matrix_hetero8_trace_output_table_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/trace_output_table/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity and zero measured-phase JIT growth;
+  - throughput regressed to `454.91 tok/s` (`0.526x` stored vLLM);
+  - final last-token-to-done gap shrank from about `80 ms` to about `11 ms`,
+    but inter-step gaps grew from about `0.6 ms` total to about `419 ms` total.
+- decision:
+  - reject and remove the trace output table path;
+  - do not retry per-step host-side JAX scatters for trace output accounting.
+- interpretation:
+  - the table removed the final materialization cliff by serializing the
+    generation loop after each model step. The right fix needs output tracking
+    fused into the already-jitted decode boundary or avoided during timing,
+    not a separate host-orchestrated scatter per token step.
+
+### Entry 236 - Rejected Admission-Time Output Block Reservation
+
+- date: 2026-06-03
+- purpose:
+  - test whether reserving each request's full max-output KV block capacity at
+    admission keeps decode block-table metadata stable enough to reduce
+    hetero8 CPU/PjRT overhead.
+- experiment:
+  - temporarily added a typed `reserve_output_blocks` engine/benchmark config
+    and passed `prompt_tokens + max_tokens` capacity into block allocation;
+  - enabled it for the selected
+    `gpu_paged_gdn_fla_decode_static_metadata` hetero8 route.
+- correctness/tests:
+  - JSON and `py_compile` checks passed for the changed config, scheduler,
+    block manager, server config, benchmark, and focused tests;
+  - focused correctness/config tests passed:
+    `10 passed, 68 deselected`;
+  - broader backend/device-carry/config run still has existing dense/cached
+    prefill numeric and old shape-cache expectation failures, so serving-path
+    correctness was gated by the benchmark artifact below.
+- result:
+  - summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/reserve_output_blocks/gpu_matrix_hetero8_reserve_output_blocks_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/reserve_output_blocks/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity for all 8 rows, full generated lengths, and
+    zero measured-phase JIT growth (`26 -> 26`);
+  - throughput regressed to `634.55 tok/s` (`0.734x` stored vLLM), below the
+    Entry 229 BF16 best `651.18 tok/s`.
+- decision:
+  - reject and remove the reservation config/plumbing;
+  - do not retry admission-time full-output KV reservation for hetero8 unless a
+    later profile shows block-table device_put specifically dominates again.
+- interpretation:
+  - stabilizing future block-table values did not outweigh the added upfront
+    allocation/capacity pressure. The hot path still needs boundary/fusion work
+    inside decode rather than request-wide KV over-reservation.
+
+### Entry 237 - Rejected Fused Device-Token Carry Override
+
+- date: 2026-06-03
+- purpose:
+  - remove the visible `_maybe_apply_device_token_carry` reshape/PJRT boundary
+    by passing the carried token vector as an argument to the existing jitted
+    greedy decode call and reshaping it inside the compiled function.
+- experiment:
+  - temporarily added an optional `input_tokens_override` to
+    `forward_step_token_ids_jit` and `forward_step_token_ids_table_jit`;
+  - updated generic warmup so the override decode key was compiled before
+    measurement;
+  - routed only the single-step static-decode-metadata path through the
+    override; all burst/speculative/non-static paths stayed on the old carry
+    application.
+- correctness/tests:
+  - `py_compile` passed for the executor, runner, benchmark, and focused
+    tests;
+  - focused correctness passed:
+    `24 passed, 63 deselected` across device-token carry, static decode
+    metadata, warmup, greedy burst, and table-hybrid decode.
+- result:
+  - summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fused_token_carry_override/gpu_matrix_hetero8_fused_token_carry_override_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fused_token_carry_override/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity, full generated lengths, and zero
+    measured-phase JIT growth (`26 -> 26`);
+  - throughput was `650.05 tok/s` (`0.752x` stored vLLM), effectively tied but
+    still below the Entry 229 BF16 best `651.18 tok/s`.
+- decision:
+  - reject and remove the override API/warmup/test changes;
+  - do not retry token-carry reshape movement unless it is part of a larger
+    decode boundary that also removes meaningful model launches or
+    materialization.
+- interpretation:
+  - fusing this one host-dispatched reshape into the decode JIT is not enough
+    to move the end-to-end hetero8 target. The profile bucket is partly
+    synchronization/accounting around the already-running decode graph, not an
+    isolated win by itself.
+
+### Entry 238 - Rejected Delayed Trace-Token Prefetch
+
+- date: 2026-06-03
+- purpose:
+  - test whether delaying trace-token D2H prefetch until after the following
+    decode step dispatch reduces the final token-to-done drain without putting
+    the copy ahead of useful decode work.
+- experiment:
+  - temporarily changed the deferred trace iterator to prefetch each token
+    snapshot after the next scheduler step and emit materialized tokens after a
+    two-step lag when possible;
+  - added timing fields that separate end-to-end throughput from token-event
+    timestamps:
+    `last_token_elapsed_seconds`, `post_last_token_drain_seconds`,
+    `token_event_tokens_per_second`, and
+    `token_event_output_token_throughput`.
+- correctness/tests:
+  - focused syntax checks passed for the trace benchmark, matrix runner, engine,
+    and updated tests;
+  - focused correctness/config/timing slice passed after restoring the rejected
+    iterator change:
+    `31 passed, 67 deselected`.
+- result:
+  - summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/delayed_trace_prefetch/gpu_matrix_hetero8_delayed_trace_prefetch_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/delayed_trace_prefetch/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - exact generated-token parity, full generated lengths, and zero
+    measured-phase JIT growth (`26 -> 26`);
+  - throughput was `648.66 tok/s` (`0.751x` stored vLLM), effectively unchanged
+    from the current `~649 tok/s` rebaseline and below the Entry 229 best
+    `651.18 tok/s`;
+  - `post_last_token_drain_seconds` dropped to about `20 ms`, but
+    `last_token_elapsed_seconds` moved later, so the end-to-end target metric
+    did not improve.
+- decision:
+  - reject and remove the delayed iterator ordering change;
+  - keep the timing metric instrumentation because it prevents mistaking
+    token-event throughput for accepted end-to-end throughput.
+- interpretation:
+  - this confirms the final trace drain is mostly queued GPU completion and
+    synchronization accounting, not a standalone D2H copy cliff that can be
+    fixed by rescheduling token prefetch alone.
+
+### Entry 239 - Decode Cleanup Tie And MTP Current-Route Diagnostic
+
+- date: 2026-06-03
+- purpose:
+  - remove unused final RMSNorm work from the greedy hidden-return decode path;
+  - re-check whether the non-conv/reference GDN decode route or current BF16
+    MTP1 path can beat the Entry 229 hetero8 anchor without changing
+    correctness.
+- experiment:
+  - changed `forward_step(return_hidden=True, return_hidden_with_logits=False)`
+    to return the pre-final-norm hidden before computing the final model norm.
+    The greedy token fast path already applies the final RMSNorm inside
+    `lm_head_token_ids_and_topk`, so the earlier norm result was unused;
+  - compared no-profile hetero8 direct runs for reference GDN decode versus the
+    selected conv-fused Triton FLA GDN decode;
+  - attempted a current-BF16 MTP1 hetero8 diagnostic with the selected packed
+    prefill/decode runtime and the same exact-token reference gate.
+- correctness/tests:
+  - syntax check passed:
+    `python -m py_compile nanovllm_jax/model.py nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py`;
+  - focused correctness passed:
+    `27 passed, 63 deselected` across backend boundaries, LM-head helpers, and
+    device-token carry tests;
+  - hetero8 cleanup artifact is exact for all rows, full generated lengths, and
+    zero measured-phase JIT growth (`26 -> 26`).
+- result:
+  - cleanup hetero8 matrix:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/skip_unused_final_norm/gpu_matrix_hetero8_skip_unused_final_norm_r1_20260603.json`;
+  - run artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/skip_unused_final_norm/matrix_runs_20260603/hetero8_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - throughput was `650.62 tok/s`, effectively tied with but slightly below
+    the Entry 229 best `651.18 tok/s`;
+  - no-profile GDN decode check:
+    reference decode reached `651.95 tok/s` and conv-fused Triton decode reached
+    `650.25 tok/s` on direct runs, so this is a noise-level tie rather than a
+    material route to `0.9x`;
+  - current BF16 MTP1 diagnostic did not reach measurement after about three
+    minutes of warmup/compilation and was stopped.
+- decision:
+  - keep the final-norm cleanup because it removes provably unused work and is
+    correctness-clean, but do not count it as a speed win;
+  - keep the selected conv-fused Triton GDN decode config unchanged until a
+    repeated matrix shows a real median win for reference GDN decode;
+  - do not use MTP1 as the near-term hetero8 route. It still needs a dedicated
+    speculative warmup/acceptance redesign before it can be a fair speed path.
+- interpretation:
+  - GDN-only changes are now too small to close the remaining gap. The selected
+    route already spends most completed decode time in broad per-layer GEMM and
+    replay work: roughly two dense projections per layer plus LM head for every
+    token step.
+  - The next credible speedup must either reduce full-model decode executions,
+    introduce a better small-batch GEMM/decode projection backend, or rewrite
+    the regular `3 x GDN + 1 x full-attention` layer pattern into a broader
+    grouped compiled boundary. Narrow token materialization, seq-lens carry,
+    GDN core, and isolated RMSNorm changes should not be retried as primary
+    hetero8 levers.
+
+### Entry 240 - Random Stress Anchor And Rejected Capacity/Metadata Routes
+
+- date: 2026-06-04
+- purpose:
+  - promote the seed-`1234` random request suite to the active broad serving
+    stress target;
+  - record the first failed random-specific hill-climb routes so they are not
+    retried as apparent fixes for the CPU metadata bubble.
+- current random anchor:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/current_all_bench_20260604/random/random_current_optimized_r1_20260604.json`;
+  - manifest:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_request_sidecar_seed1234_20260603_r19_full_bf16_2048cap_2048blocks_fixed.prompts.jsonl`;
+  - workload: `15` requests, `30506` input tokens, `11602` output tokens,
+    prompt lengths `1077..4022`, output lengths `425..1007`;
+  - selected route: BF16 activations and weights, packed paged prefill,
+    generic warmup, `max_num_batched_tokens=2048`,
+    `num_kvcache_blocks=2048`, `max_blocks_per_seq=512`,
+    `batch_size_buckets=1,2,4,8`, static decode metadata, device token carry,
+    BF16 decode projections/LM head, BF16 full-attention KV cache, strict GDN
+    no-fallbacks, Triton FLA padded prefill, and conv-fused Triton FLA packed
+    decode;
+  - throughput `383.96 output tok/s`, total wall time `30.22 s`, generated
+    lengths complete, and zero measured-phase JIT growth (`24 -> 24`);
+  - live vLLM BF16 on the same manifest reaches `1531.33 output tok/s`, so the
+    current random ratio is `0.251x`.
+- timing attribution from token-event step grouping:
+  - `13` prefill steps total about `2.35 s`;
+  - `1809` decode steps total about `26.62 s`;
+  - B8 decode contributes `1006` steps and `8048` output tokens at about
+    `572 tok/s` inside the bucket;
+  - B1/B2 tail decode contributes fewer tokens but much worse per-token
+    throughput (`~105` and `~221 tok/s`);
+  - final drain is about `0.51 s`.
+- rejected device block-table table route:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_block_table_table_r1_20260604.json`;
+  - temporary change kept a device-side block-table table and passed slot ids
+    into decode to avoid rebuilding full `[B,max_blocks]` block-table rows on
+    the host every step;
+  - focused CPU tests and a CUDA smoke passed, and measured-phase JIT growth
+    stayed zero;
+  - throughput regressed to `255.11 output tok/s` (`0.166x` live vLLM and
+    `0.664x` the current random anchor);
+  - decision: reject and revert. Do not retry device block-table table routing
+    unless a new lowered profile shows that it removes a dominant GPU bucket
+    rather than merely moving host metadata cost into the compiled graph.
+- rejected B16 capacity route:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_b16_3072blocks_320width_r1_20260604.json`;
+  - setup used `max_num_seqs=16`, `batch_size_buckets=1,2,4,8,16`,
+    `num_kvcache_blocks=3072`, and `max_blocks_per_seq=320` so all `15`
+    requests could fit concurrently under a model-family request-capacity
+    envelope;
+  - generic warmup compiled `30` entries, measured-phase JIT growth was zero,
+    and full output lengths completed;
+  - throughput regressed to `229.87 output tok/s` (`0.150x` live vLLM and
+    `0.599x` the current random anchor);
+  - decision: reject B16 as a current default. Fewer waves do not compensate
+    for the larger decode graph/capacity footprint on this path. Future
+    concurrency work must improve arbitrary-batch decode cost first rather
+    than simply widening the batch bucket.
+- rejected waiting-admission reordering routes:
+  - LPT/longest-declared-output-first artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_lpt_admission_r1_20260604.json`;
+  - the temporary scheduler policy selected waiting prompts with the largest
+    remaining declared generation budget first. A simple offline schedule
+    predicted fewer decode steps, and the integrated run did reduce decode
+    steps from `1809` to `1568`, but prefill grew to about `7.78 s`, decode
+    grew to about `31.82 s`, and throughput regressed to
+    `267.57 output tok/s`;
+  - SPT/shortest-declared-output-first artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_spt_admission_r1_20260604.json`;
+  - the opposite policy also kept measured-phase JIT growth at zero and full
+    lengths complete, but prefill grew to about `11.15 s`, decode to about
+    `32.18 s`, and throughput regressed to `249.39 output tok/s`;
+  - both policies were reverted and the focused scheduler tests passed after
+    restoring FIFO admission;
+  - decision: keep FIFO waiting admission for now. Request ordering is not a
+    reliable random-throughput lever because context length and chunked-prefill
+    timing dominate the apparent decode-step-count win.
+- rejected cached full-attention `BTHD` layout:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_cached_attention_bthd_r1_20260604.json`;
+  - temporary change kept cached full-attention Q/K/V in backend-native
+    `[B,T,H,D]` layout through RoPE, KV write, and paged attention, instead of
+    transposing to `[B,H,T,D]` for RoPE and back for the cache/backend;
+  - focused cached prefill/decode and paged-attention tests passed before the
+    benchmark, and measured-phase JIT growth stayed zero;
+  - integrated random throughput regressed to `259.21 output tok/s`; prefill
+    step time grew to about `11.42 s`, decode grew to about `30.44 s`, and B8
+    decode throughput dropped to about `444.5 tok/s`;
+  - decision: reject and revert. Source-level transpose removal does not imply
+    a faster XLA layout; keep the current full-attention layout until a profile
+    proves a concrete lowered transpose or copy bucket disappears.
+- next action:
+  - continue from the B8 random anchor and target the actual decode buckets:
+    broad decode fusion, small-batch projection/LM-head lowering, and
+    scheduler/backfill changes that keep decode batches full without
+    specializing to seed `1234`, exact request lengths, or Qwen3.5-0.8B
+    dimensions.
+
+### Entry 241 - Accepted Random Width/Static-Metadata Improvements
+
+- date: 2026-06-04
+- purpose:
+  - record the first accepted random-request improvements after the Entry 240
+    stress anchor;
+  - keep the benchmark evidence in summaries rather than committing full run
+    artifacts.
+- changes:
+  - selected the random serving-envelope width `max_blocks_per_seq=320`, which
+    corresponds to the declared random lane envelope
+    `(max_input 4096 + max_output 1024) / block_size 16`;
+  - split static decode metadata caching so constant width-1 decode tensors
+    (`tokens`, placeholder `positions`, `seq_ids`, and `query_start_loc`) are
+    cached independently from dynamic `block_tables` and `seq_lens`;
+  - added first-class `decode_block_table_buckets` config/benchmark support and
+    warmed all configured decode block-table widths generically before
+    measurement. The accepted random run used buckets `128,256,320`.
+- artifacts:
+  - clean width-320 control:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_b8_320width_blockdot_r1_20260604.json`;
+  - static metadata split repeat:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_b8_320width_static_cache_split_r2_20260604.json`;
+  - decode block-table bucket run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_b8_320width_static_cache_split_decode_block_buckets_128_256_320_r1_20260604.json`.
+- result:
+  - Entry 240 anchor: `383.96 output tok/s`, `30.22 s`, `0.251x` live vLLM;
+  - clean width-320 control: `422.03 output tok/s`, `27.49 s`, zero
+    measured-phase JIT growth (`24 -> 24`);
+  - static metadata split repeat: `431.99 output tok/s`, `26.86 s`, zero
+    measured-phase JIT growth (`24 -> 24`);
+  - decode block-table buckets: `436.24 output tok/s`, `26.60 s`, zero
+    measured-phase JIT growth (`32 -> 32`);
+  - against the live vLLM reference `1531.33 output tok/s`, the current random
+    ratio is `0.285x`.
+- timing interpretation:
+  - the accepted bucketed run still spends most time in B8 decode: `1006`
+    steps, `8048` tokens, about `11.84 s`, or `~680 tok/s` inside that bucket;
+  - B6/B7 and tail buckets improved modestly from smaller block-table metadata
+    shapes, but B8 barely moved, so metadata width is a real but minor bucket;
+  - the next material win must reduce full decode-step cost itself: production
+    paged decode attention, broader model-side decode fusion, or another
+    structural route that reduces per-token model executions.
+- validation:
+  - `python -m py_compile nanovllm_jax/config.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/llm_engine.py benchmarks/benchmark_jax_server_trace.py nanovllm_jax/server_config.py`;
+  - `.venv/bin/pytest -q tests/test_device_token_carry.py tests/test_backend_boundaries.py -k 'decode_block_table_buckets or static_decode_metadata or warmup_uses_greedy_token_fastpath_without_mtp or warmup_compiles_decode_block_table_buckets or warmup_uses_requested_prefill_len_without_buckets'`
+    -> `9 passed, 80 deselected`;
+  - full random runs completed all output lengths and had zero measured-phase
+    JIT cache growth under generic warmup.
+- current blocker:
+  - after the sandbox transition, the local GPU became unavailable to the
+    process: `nvidia-smi` cannot communicate with the driver and JAX reports
+    CPU only. Do not promote the draft width-1 Triton decode-attention
+    prototype until GPU parity and integrated random throughput are measured.
+
+### Entry 242 - Driver Repair And Fresh Random Gap Diagnosis
+
+- date: 2026-06-04
+- purpose:
+  - merge the completed block-dot FLA prefill PR and keep the random hill-climb
+    branch readable after the squash merge;
+  - repair the local A10G CUDA runtime so random/vLLM diagnostics can run
+    again;
+  - remeasure the active random stress target and explain why its vLLM gap is
+    much larger than the smaller fixed-shape benchmark gaps.
+- GitHub state:
+  - PR #1 (`[codex] Hit decode-heavy target with block-dot FLA prefill`) was
+    squash-merged into `main` at merge commit
+    `eca56449f21ee27ecaad9cc7bfb39569ecd23b12`;
+  - PR #2 was rebuilt from the merged `origin/main` with only the random
+    checkpoint commit and force-pushed with lease. It is now one commit ahead
+    of `main`, mergeable, and remains a draft:
+    `ef10494d6476442cbe7d773bf47cd3bb40b70e53`.
+- driver diagnosis and fix:
+  - `nvcc --version` worked because the CUDA toolkit was installed, but
+    `nvidia-smi` and JAX CUDA failed because the running kernel
+    `6.17.0-1017-aws` had no loadable NVIDIA module;
+  - PCI enumeration showed the GPU was present as NVIDIA A10G
+    (`10de:2237`), while `modinfo nvidia` failed and DKMS only had
+    `nvidia-srv/580.159.03` installed for older AWS kernels
+    (`6.17.0-1010-aws` and `6.17.0-1015-aws`);
+  - installing `linux-headers-6.17.0-1017-aws`,
+    `linux-modules-nvidia-580-server-6.17.0-1017-aws`, and
+    `linux-modules-nvidia-580-server-aws` built/installed the matching DKMS
+    module;
+  - after `modprobe nvidia` and `modprobe nvidia_uvm`, `nvidia-smi` reported
+    driver `580.159.03` on NVIDIA A10G and JAX reported `CudaDevice(id=0)`.
+- fresh random measurements:
+  - fresh JAX no-profile artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_noprofile_after_driver_fix_20260604.json`;
+  - fresh vLLM artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_vllm_after_driver_fix_20260604.json`;
+  - workload: `15` requests, `30506` input tokens, `11602` output tokens;
+  - JAX: `437.63 output tok/s`, `26.51 s`, full lengths, and zero
+    measured-phase JIT growth (`32 -> 32`);
+  - vLLM: `1541.89 output tok/s`, `7.52 s`;
+  - current random ratio: `0.284x`, consistent with Entry 241's accepted
+    `436.24 tok/s` run.
+- timing diagnosis:
+  - random remains decode dominated: the accepted no-profile run has `13`
+    prefill steps and `1759` decode steps inferred from token events;
+  - B8 decode is the largest single bucket: `1006` steps, `8048` output
+    tokens, `11.84 s`, about `680 tok/s` inside that bucket;
+  - B7 and B6 decode add another `7.47 s` for `2717` tokens, and the smaller
+    tails are much less efficient (`B1` about `115 tok/s`, `B2` about
+    `253 tok/s`);
+  - the profiling rerun is diagnostic only because profiling slows the run to
+    `370.06 tok/s`, but it still confirms zero measured JIT growth and shows
+    CPU/PJRT/scheduler overhead plus many fine-grained GPU launches rather than
+    one missing compile bucket.
+- why random is much worse than the fixed-shape tests:
+  - random has `15` long requests while the current JAX serving envelope is
+    `max_num_seqs=8`, so it necessarily runs multiple admission waves and then
+    spends substantial time in underfilled B7/B6/B2/B1 tails;
+  - vLLM's fresh run uses chunked prefill, async scheduling, persistent
+    torch.compile cache, and CUDA graph capture sizes up to `256`. It can keep
+    more of the random workload resident and execute mixed prefill/decode and
+    decode graphs with much lower per-step overhead;
+  - the fixed non-random targets hide much of this serving scheduler gap:
+    `decode_heavy_128x128` is single-request/B1, so vLLM cannot exploit high
+    concurrency; `long_prefill_512_2048` is prefill dominated, where the
+    block-dot/FLA route is already close; canonical `hetero8` fits exactly in
+    the B8 envelope and avoids the second-wave random tail;
+  - the current random gap should therefore be read as a structural serving
+    gap: better arbitrary-batch decode, production paged decode attention, and
+    vLLM-like chunked-prefill/backfill are needed before further narrow
+    metadata tweaks can move the `0.9x` target.
+- decision:
+  - keep the current random branch as the best checkpoint, but do not interpret
+    the `0.284x` result as a kernel-only loss. It is exposing a broader ABI and
+    serving-policy deficit relative to vLLM.
+
+### Entry 243 - Resident Capacity Groundwork And Rejected Resident-Only Route
+
+- date: 2026-06-04
+- purpose:
+  - start the vLLM-like serving ABI path by separating resident request
+    capacity from compiled execution batch width;
+  - test whether widening resident capacity alone reduces the random workload
+    gap without benchmark-specific warmup.
+- changes:
+  - added `max_num_resident_seqs` to the model config, server config, and random
+    benchmark CLIs. `max_num_seqs` remains the compiled execution batch cap;
+    `None`/`0` keeps old behavior;
+  - widened persistent KV/GDN resident bookkeeping to the resident capacity
+    while keeping warmup keyed to execution buckets;
+  - added a scheduler guard so, when resident capacity exceeds execution
+    capacity, a full ready decode batch is not delayed behind another waiting
+    prefill wave;
+  - added focused tests for resident/execution separation, config/env loading,
+    and random sidecar command forwarding.
+- artifacts:
+  - unguarded resident16/B8 diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_resident16_exec8_r1_20260604.json`;
+  - guarded resident16/B8 diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_resident16_exec8_guard_r2_20260604.json`.
+- result:
+  - previous B8 anchor:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_noprofile_after_driver_fix_20260604.json`,
+    `437.63 output tok/s`, `26.51 s`, mean TTFT `5894 ms`;
+  - unguarded resident16/B8: `263.39 output tok/s`, `44.05 s`, mean TTFT
+    `11619 ms`, zero measured-phase JIT growth (`32 -> 32`);
+  - guarded resident16/B8: `278.97 output tok/s`, `41.59 s`, mean TTFT
+    `10760 ms`, zero measured-phase JIT growth (`32 -> 32`);
+  - fresh vLLM reference remains `1541.89 output tok/s`, so the guarded
+    resident-only route is only `0.181x` vLLM and is worse than the B8 anchor.
+- interpretation:
+  - resident capacity is necessary groundwork, but not sufficient. The current
+    executor ABI still runs prefill-only or decode-only steps, so widening
+    resident admission lets long prompt chunks consume many scheduler steps
+    before useful decode;
+  - the protective decode guard reduces the worst regression but does not
+    restore the B8 anchor, because the system still lacks true mixed
+    chunked-prefill/decode backfill;
+  - do not retry resident-only widening as a performance optimization. The next
+    material step is a mixed packed scheduler/executor boundary where decode
+    rows and bounded prefill chunks can share a warmed serving bucket.
+- validation:
+  - `python -m py_compile nanovllm_jax/config.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/llm_engine.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/chunked_model_runner.py nanovllm_jax/server_config.py benchmarks/benchmark_jax_server_trace.py benchmarks/benchmark_random_request_sidecar.py`;
+  - `pytest -q tests/test_device_token_carry.py tests/test_server_config.py tests/test_benchmark_random_request_sidecar.py tests/test_benchmark_jax_server_trace.py`
+    -> `41 passed`.
+
+### Entry 244 - Mixed Backfill And Decode Burst Diagnostics
+
+- date: 2026-06-04
+- purpose:
+  - test the next proposed random-workload serving steps under the same
+    seed-`1234` manifest and generic warmup discipline:
+    mixed packed prefill/decode backfill and greedy decode micro-bursts.
+- changes:
+  - added a `ScheduledBatch.mixed_prefill_decode` marker plus explicit mixed
+    packed batch construction for one-token decode rows and bounded prefill
+    rows;
+  - taught device-token carry to replace placeholder packed decode tokens in
+    mixed packed batches;
+  - kept the mixed route out of automatic scheduling after integrated
+    measurements showed it regressed output throughput;
+  - fixed greedy decode burst scans so KV/hybrid carry dtypes remain stable
+    across `lax.scan`;
+  - changed generic warmup to compile every burst length from `2` through the
+    configured burst size, because request tails can choose shorter legal burst
+    lengths during serving.
+- artifacts:
+  - full-budget mixed resident16/B8:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_mixed_resident16_exec8_r1_20260604.json`;
+  - min-bucket mixed resident16/B8:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_mixed_minbucket_resident16_exec8_r1_20260604.json`;
+  - burst4 resident16/B8:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_burst4_resident16_exec8_r3_20260604.json`;
+  - burst8 resident16/B8:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_burst8_resident16_exec8_r1_20260604.json`;
+  - burst4 resident8/B8:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_burst4_resident8_exec8_r1_20260604.json`.
+- results:
+  - mixed full-budget: `165.24 output tok/s`, mean TTFT `26098 ms`,
+    zero measured-phase JIT growth (`32 -> 32`);
+  - mixed min-bucket: `113.64 output tok/s`, mean TTFT `42291 ms`,
+    zero measured-phase JIT growth (`32 -> 32`);
+  - burst4 resident16: `282.37 output tok/s`, mean TTFT `10793 ms`,
+    zero measured-phase JIT growth (`68 -> 68`);
+  - burst8 resident16: `284.73 output tok/s`, mean TTFT `10801 ms`,
+    zero measured-phase JIT growth (`116 -> 116`);
+  - burst4 resident8: `283.15 output tok/s`, mean TTFT `14786 ms`,
+    zero measured-phase JIT growth (`68 -> 68`);
+  - the B8 no-burst random anchor from Entry 242 remains better at
+    `437.63 output tok/s`, and fresh vLLM remains `1541.89 output tok/s`.
+- interpretation:
+  - automatic mixed packed backfill is rejected for this workload. It performs
+    useful prefill work, but it makes live decode rows wait behind prompt
+    chunks and harms the output-throughput/TTFT objective;
+  - smaller mixed chunks reduce worst individual stalls but increase the number
+    of mixed steps enough to lose even more overall;
+  - greedy burst now has correct dtype-stable scans and honest generic warmup,
+    but source-level full-model burst scans are still not a promotion route:
+    burst8 halves decode call count relative to burst4, yet only improves
+    output throughput by `0.8%` while adding `48` more warmup compile entries;
+  - resident8 and resident16 burst4 are effectively tied, so the current random
+    gap is not mainly resident capacity. The remaining gap is decode compute
+    inside the compiled graph plus the lack of production paged decode/GDN
+    kernels.
+- decision:
+  - keep the explicit mixed packed ABI and burst warmup/dtype fixes as
+    groundwork and diagnostics;
+  - do not enable automatic mixed backfill or increase default greedy burst
+    width as a promoted optimization;
+  - next material work should replace the decode kernels/boundaries rather than
+    further tuning scheduler burst width.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/scheduled_batch.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/llm_engine.py nanovllm_jax/engine/model_executor.py tests/test_device_token_carry.py`;
+  - `pytest -q tests/test_backend_boundaries.py::test_model_runner_warmup_compiles_greedy_decode_burst tests/test_backend_boundaries.py::test_executor_greedy_decode_burst_matches_iterative_token_path tests/test_device_token_carry.py tests/test_server_config.py tests/test_benchmark_random_request_sidecar.py tests/test_benchmark_jax_server_trace.py`
+    -> `45 passed`.
+
+### Entry 245 - Rejected Narrow FA Decode Triton Routes
+
+- date: 2026-06-04
+- purpose:
+  - execute the FA/FLA integration plan's first full-attention decode slice
+    with config-selected kernel policy instead of environment-variable sprawl;
+  - test whether replacing the width-1 paged full-attention decode alone is
+    enough to move the decode-heavy target toward `0.9x` vLLM.
+- changes:
+  - added `kernels.full_attention.{kv_cache_dtype,kv_append_impl,decode_impl,prefill_impl}`
+    server config projection and benchmark CLI forwarding;
+  - routed `full_attention.decode_impl=triton_paged` through the JAX-Triton
+    paged decode attention wrapper over the existing NHD paged KV cache;
+  - added a broader diagnostic `triton_paged_fused_append` path that stores the
+    current K/V token and computes paged decode attention in one Triton call;
+  - kept accepted configs on `decode_impl=reference` because the measured
+    Triton routes regressed.
+- artifacts:
+  - A/B matrix:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/20260604_decode_heavy_ab_matrix.json`;
+  - current static profile artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_current_profile_direct_r1.json`;
+  - current static profile summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_current_profile_summary.md`;
+  - fused append diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fused_append_direct_r1.json`;
+  - B1 packed-QKV diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_b1_packed_qkv_direct_r1.json`.
+- results:
+  - current static route: exact, `178.93 output tok/s`, `0.838x` stored vLLM
+    (`213.54 tok/s`);
+  - `full_attention.decode_impl=triton_paged`: exact, `175.79 output tok/s`,
+    `0.823x` stored vLLM;
+  - `full_attention.decode_impl=triton_paged_fused_append`: exact,
+    `161.59 output tok/s`;
+  - B1 packed full-attention QKV diagnostic: exact, `161.11 output tok/s`;
+  - profiled current-static rerun was diagnostic only and slowed to
+    `154.76 output tok/s`.
+- profile interpretation:
+  - the profiled current route still shows the dominant decode-heavy work in
+    model GEMM/fusion buckets rather than full-attention paged decode alone:
+    `gemm 386.44 ms`, `fusion 267.38 ms`, `cutlass 193.08 ms`,
+    `_gdn 125.99 ms`, and `MemcpyD2D 102.71 ms`;
+  - the largest single HLO op is `command_buffer_436` cutlass GEMM with ReLU
+    (`127.20 ms / 127`), so a narrow FA attention replacement cannot explain
+    or close the remaining gap;
+  - standalone append+attention fusion added custom-call overhead and did not
+    remove the larger model-side launch/GEMM buckets.
+- decision:
+  - reject promotion of `triton_paged`, `triton_paged_fused_append`, and B1
+    packed-QKV decode for the serving defaults;
+  - keep the config-level FA policy and focused correctness tests as scaffolding
+    for future production-kernel integration, but do not add extra knobs for
+    failed threshold probes;
+  - next work should identify the largest model-side decode GEMM/fusion source
+    and target a broader, model-family-general boundary rather than hand tuning
+    kernel parameters.
+
+### Entry 246 - Decode-Heavy B1 Dtype And Final-Sync Diagnostics
+
+- date: 2026-06-04
+- purpose:
+  - explain why the current hetero8-oriented BF16 config no longer reaches the
+    old decode-heavy `0.9x` result;
+  - test route-selection, dtype-policy, and final materialization hypotheses
+    without keeping failed benchmark-specific changes.
+- artifacts:
+  - BF16 current-control matrix artifact:
+    `/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260604_144131/decode_heavy_128x128_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - BF16 reference-GDN direct:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_bf16_reference_gdn_direct_r1.json`;
+  - FP32 reference-GDN direct repeats:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_reference_gdn_direct_r1.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_reference_gdn_direct_r2_after_reverts.json`;
+  - FP32 reference-GDN profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_reference_gdn_profile_direct_r1.json`;
+  - FP32 profile summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_reference_profile_summary.md`;
+  - rejected probes:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_triton_fla_gdn_direct_r1.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_conv_raw_gdn_direct_r1.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_reference_gdn_trace_prefetch_direct_r1.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_reference_gdn_stacked_final_direct_r1.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_bf16_single_seq_fp32_policy_reference_direct_r1.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_bf16_single_seq_fp32_policy_conv_direct_r1.json`.
+- results:
+  - BF16 current config with conv-fused GDN decode: exact,
+    `178.93 output tok/s`;
+  - BF16 with reference GDN decode: exact, `179.10 output tok/s`;
+  - FP32 activations with reference GDN decode: exact repeats at `191.32` and
+    `189.94 output tok/s`; profiled repeat was exact at `191.90 output tok/s`;
+  - FP32 activations with non-conv Triton GDN decode: exact but
+    `169.76 output tok/s`;
+  - FP32 activations with conv-fused Triton GDN decode: exact but
+    `169.38 output tok/s`;
+  - trace-token prefetch: exact but regressed to `187.73 output tok/s`;
+  - final stacked `DeviceTokenRef` materialization: exact but regressed to
+    `161.15 output tok/s`;
+  - temporary BF16-server/single-seq-FP32 internal dtype policy: exact but
+    unchanged with reference GDN (`178.93 output tok/s`) and worse with
+    conv-fused GDN (`169.60 output tok/s`).
+- profile interpretation:
+  - the B1 decode-heavy gap is not fixed by the FA decode kernel or GDN Triton
+    decode kernels. The best B1 route is the pure reference GDN decode boundary
+    with FP32 model activations;
+  - the FP32 profile collapses decode execution into far fewer command-buffer
+    buckets than the BF16/conv-fused current route: `PjRt Execute` is about
+    `389 ms / 263` in the FP32 reference profile versus about
+    `570 ms / 263` in the BF16 current profile;
+  - the measured output-throughput gap to `0.9x` is mostly a real final
+    synchronization, not accounting noise. The best FP32 run emits the last
+    token at about `0.609 s` (`~210 output tok/s` by token events), but full
+    wall time is about `0.669 s` after final token materialization;
+  - prefetch and stacked final materialization both move synchronization around
+    or add extra JAX work; neither reduces full wall time.
+- decision:
+  - reject B1 Triton GDN decode, trace prefetch promotion, final stacked
+    materialization, and the internal BF16-server/single-seq-FP32 dtype policy;
+  - keep the current BF16 route for hetero8/random work, but do not claim the
+    BF16 current config is still the best B1 decode-heavy route;
+  - the best safe B1 decode-heavy diagnostic is FP32 activations with reference
+    GDN decode, median `191.32 tok/s` (`0.896x` the stored `213.54 tok/s` vLLM
+    reference), which is near but below the `0.9x` line;
+  - next material work should return to the broader random/hetero8 decode graph
+    or a production fused decode boundary. Further final-token sync reshaping is
+    not a promising route.
+
+### Entry 247 - Guarded Resident Decode Boundary Groundwork
+
+- date: 2026-06-05
+- purpose:
+  - continue the random decode hill-climb by expanding the decode JIT boundary
+    around resident slot metadata;
+  - avoid repeating the unsafe full random compile path after a boundary-changing
+    edit.
+- implementation:
+  - added an opt-in `resident_decode_metadata` config/CLI/server-config field;
+  - added a resident-slot greedy decode executor path that gathers block tables,
+    sequence lengths, and GDN state by compact slot ids inside the JIT boundary,
+    then scatters updated GDN state and resident sequence lengths back to the
+    resident tables;
+  - mirrored scheduler-owned block tables and sequence lengths into
+    device-resident runner tables;
+  - cast updated table-scattered GDN state back to the resident table dtypes to
+    avoid future JAX scatter dtype failures;
+  - updated `AGENTS.md` and the active plan so new random decode JIT boundaries
+    must pass scaled JAX-only diagnostics before full seed-`1234` random runs.
+- current status:
+  - resident decode metadata remains default-off. It is a guarded probe, not an
+    accepted speedup;
+  - no full random artifact is recorded for the resident-slot path yet because
+    the previous full compile attempt did not complete safely.
+- validation:
+  - `python -m py_compile nanovllm_jax/config.py nanovllm_jax/server_config.py nanovllm_jax/engine/scheduled_batch.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py benchmarks/benchmark_jax_server_trace.py benchmarks/benchmark_random_request_sidecar.py tests/test_backend_boundaries.py tests/test_server_config.py tests/test_benchmark_random_request_sidecar.py`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'table_hybrid_decode_matches_sliced_decode or syncs_resident_decode_metadata_by_slot or hybrid_slot_ids_zero or scheduler_pads_scheduled_batch_to_static_buckets'`;
+  - `pytest -q tests/test_device_token_carry.py tests/test_server_config.py tests/test_benchmark_random_request_sidecar.py tests/test_benchmark_jax_server_trace.py`;
+  - `git diff --check`.
+- next:
+  - checkpoint and push the branch;
+  - run a scaled JAX-only random diagnostic with `resident_decode_metadata`
+    enabled before trying medium or full random sidecar runs.
+
+### Entry 248 - Config-Driven Random Sidecar And Resident-Metadata A/B
+
+- date: 2026-06-05
+- purpose:
+  - avoid another unsafe full random compile after the resident decode boundary
+    change;
+  - make the random sidecar consume the same typed config policy as the server
+    and GPU matrix runner;
+  - test the resident decode metadata path on a scaled random envelope before
+    any medium/full random run.
+- implementation:
+  - added `--jax-config` to `benchmark_random_request_sidecar.py`;
+  - the sidecar now projects config `runtime`/`kernels` into JAX subprocess env
+    and accepted engine fastpath/kernel CLI args using
+    `runtime_env_from_config()` and `engine_overrides_from_config()`;
+  - fixed `CanonicalModelRunner` initialization so it carries
+    `resident_decode_metadata` and related serving flags before generic warmup.
+- artifacts:
+  - unsafe/default sidecar probe:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_resident_scaled_safety_r1.json`;
+  - missing canonical flag probe:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_resident_scaled_safety_r2.json`;
+  - tiny resident metadata smoke:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_resident_scaled_safety_r3.json`;
+  - accepted-config resident-on A/B:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_resident_config_scaled_r1.json`;
+  - accepted-config resident-off control:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_scaled_control_r1.json`.
+- results:
+  - r1 failed during prefill warmup with a GPU custom-call shared-memory request
+    of `152064 B`, above the A10G limit of about `101376 B`. This happened
+    before decode and used sidecar defaults instead of the accepted BF16/XLA
+    config policy;
+  - r2 reached optimized warmup setup but failed because
+    `CanonicalModelRunner` lacked `resident_decode_metadata`;
+  - r3 completed the tiny resident metadata path with zero measured-phase JIT
+    cache growth, but it did not use the accepted fastpath/kernel config;
+  - accepted-config resident-on: `67.75 output tok/s`, `59` output tokens,
+    zero measured-phase JIT growth;
+  - accepted-config resident-off control: `104.33 output tok/s`, same `59`
+    output tokens, zero measured-phase JIT growth;
+  - generated token prefixes were identical between resident-on and control for
+    both requests in the tiny A/B.
+- decision:
+  - do not promote the resident decode metadata v1 path. It is correct and
+    cache-stable on the tiny envelope, but it is slower than the current
+    table/static metadata path;
+  - keep the path opt-in as scaffolding only. Do not scale it to medium/full
+    random runs unless the gather/scatter/table-update overhead is first
+    reduced or folded into a larger useful decode boundary;
+  - use the config-driven sidecar for future random runs so the benchmark
+    cannot silently fall back to sidecar defaults.
+- validation:
+  - `python -m py_compile benchmarks/benchmark_random_request_sidecar.py tests/test_benchmark_random_request_sidecar.py`;
+  - `pytest -q tests/test_benchmark_random_request_sidecar.py`;
+  - `python -m py_compile nanovllm_jax/engine/model_runner.py tests/test_backend_boundaries.py`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'initializes_resident_decode_metadata_flag or table_hybrid_decode_matches_sliced_decode or syncs_resident_decode_metadata_by_slot'`;
+  - `git diff --check`.
+
+### Entry 249 - Guarded Random Sidecar And Table-Prefill Warmup
+
+- date: 2026-06-05
+- purpose:
+  - prevent another machine-stressing random compile/run by adding resource
+    limits at the benchmark subprocess boundary;
+  - finish the table-prefill boundary promotion check by ensuring generic
+    warmup compiles the same packed table-prefill ABI that serving uses.
+- implementation:
+  - replaced the random sidecar's blocking `subprocess.run()` helper with a
+    monitored `Popen` loop;
+  - added a default `--max-system-ram-percent 70` guard that terminates the
+    JAX/vLLM subprocess group if system RAM crosses the threshold;
+  - added worker CPU controls: `--worker-cpu-cores`,
+    `--worker-cpu-core-offset`, `--worker-nice`, and
+    `--resource-poll-seconds`;
+  - the sidecar records the configured resource limits, peak system RAM, and
+    peak subprocess-tree RSS in benchmark summaries;
+  - moved packed prefill GDN table gather/scatter into
+    `forward_prefill_token_ids_table_jit`;
+  - updated `CanonicalModelRunner.warmup_compilation()` so generic startup
+    warmup compiles `forward_prefill_token_ids_table_jit` for packed prefill
+    token buckets and row-count buckets when the table path is available.
+- artifacts:
+  - guard dry run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_sidecar_resource_guard_dryrun.json`;
+  - guarded scaled table-prefill run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_guarded_scaled_r1.json`;
+  - JAX child artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_guarded_scaled_r1_jax.json`.
+- results:
+  - the guarded scaled run completed normally; the watchdog did not fire;
+  - resource telemetry recorded peak system RAM `40.8%` and peak process-tree
+    RSS about `3.82 GB`;
+  - generic warmup compiled table-prefill routes for packed token buckets
+    `128,256` and row buckets `1,2`, with block-table shapes `[1,32]` and
+    `[2,32]`;
+  - measured-phase JIT growth stayed zero (`10 -> 10`);
+  - scaled throughput improved from the prior accepted-config tiny control
+    (`104.33 output tok/s`) to `132.48 output tok/s` on the same `2`-request,
+    `59`-output-token envelope.
+- decision:
+  - promote the table-prefill boundary to the next medium random diagnostic;
+  - keep the resource guard enabled for future random sidecar runs;
+  - do not treat the tiny scaled result as a full random claim or a vLLM-ratio
+    update.
+- validation:
+  - `python -m py_compile benchmarks/benchmark_random_request_sidecar.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/model_executor.py tests/test_benchmark_random_request_sidecar.py tests/test_backend_boundaries.py`;
+  - `pytest -q tests/test_benchmark_random_request_sidecar.py`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'warmup_compiles_table_prefill_when_available or warmup_uses_greedy_token_fastpath_without_mtp or packed_prefill_greedy_token_jit_returns_row_tokens'`;
+  - `pytest -q tests/test_benchmark_random_request_sidecar.py tests/test_backend_boundaries.py -k 'benchmark_random_request_sidecar or warmup_compiles_table_prefill_when_available or warmup_uses_greedy_token_fastpath_without_mtp or warmup_compiles_decode_block_table_buckets or packed_prefill_greedy_token_jit_returns_row_tokens or table_hybrid_decode_matches_sliced_decode or initializes_resident_decode_metadata_flag or syncs_resident_decode_metadata_by_slot'`;
+  - `git diff --check`.
+
+### Entry 250 - Static Decode Carry Row Alignment
+
+- date: 2026-06-05
+- purpose:
+  - attack the largest remaining medium-random profile bucket after table
+    prefill promotion: CPU-side JAX gather/scatter and extra PJRT executions in
+    `_maybe_apply_device_token_carry`;
+  - keep the optimization model-family general by reducing serving-boundary
+    array rewrites rather than tuning kernels or dimensions.
+- implementation:
+  - when greedy decode returns a full static-bucket token array, record the full
+    `batch.seq_ids_host` tuple, including padded rows, as the fast-path carry
+    alignment key;
+  - keep `_device_token_carry_by_seq_id` active-row-only so correctness for
+    row-order changes still uses logical sequence IDs;
+  - skip prefill resident-metadata sync unless `resident_decode_metadata` is
+    enabled. The accepted random path has resident metadata disabled, so the
+    previous unconditional sync was dead work.
+- artifacts:
+  - guarded medium JAX-only before:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_guarded_medium_r1.json`;
+  - guarded medium live-vLLM comparison:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_guarded_medium_with_vllm_r1.json`;
+  - guarded medium JAX-only after:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_token_carry_medium_r1.json`;
+  - medium profile before:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_guarded_medium_profile_r1.json`;
+  - medium profile after:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_token_carry_medium_profile_r1.json`.
+- results:
+  - medium live comparison before this change: JAX `313.31 output tok/s`, vLLM
+    `511.94 output tok/s`, ratio `0.612x`, zero measured-phase JIT growth;
+  - medium after this change: JAX `355.14 output tok/s`, same `290` output
+    tokens, zero measured-phase JIT growth. Against the live medium vLLM
+    denominator this is about `0.69x`;
+  - profile before/after:
+    - CPU `gather`: `376.6 ms` -> `50.9 ms`;
+    - `PjRtCApiLoadedExecutable::Execute` count: `557` -> `321`;
+    - `_run_main_and_sample`: `808.0 ms` -> `646.0 ms`;
+    - GPU `cutlass` and `fusion` totals were effectively unchanged, so the
+      win came from host/PJRT boundary cleanup, not GPU-kernel changes.
+- decision:
+  - keep this change and promote it to the next larger guarded random rung;
+  - the next optimization should target the remaining per-step PJRT/device-token
+    carry overhead or a broader fused decode boundary. The GPU GEMM/fusion work
+    is now a more visible share of time, but host overhead is not fully gone.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_runner.py tests/test_device_token_carry.py`;
+  - `pytest -q tests/test_device_token_carry.py -k 'records_full_static_decode_rows or whole_vector_when_seq_ids_match or follows_seq_ids_after_row_order_change or static_decode_metadata_applies_carried_seq_lens or first_static_decode_can_use_scheduler_seq_lens'`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'warmup_compiles_table_prefill_when_available or packed_prefill_greedy_token_jit_returns_row_tokens'`.
+
+### Entry 251 - Larger Random Rung And Metadata-Carry Rejections
+
+- date: 2026-06-05
+- purpose:
+  - promote the safe random ladder beyond the medium `4`-request envelope;
+  - test whether the now-visible scheduler/static metadata buckets can be
+    reduced without changing the serving ABI or specializing to a shape.
+- artifacts:
+  - larger guarded JAX-only:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_token_carry_large_guarded_r1.json`;
+  - larger live-vLLM comparison:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_token_carry_large_with_vllm_r1.json`;
+  - larger profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_token_carry_large_profile_r1.json`;
+  - seq-lens carry diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_seq_lens_carry_large_guarded_r1.json`;
+  - shared-gather carry diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_shared_gather_large_guarded_r1.json`.
+- results:
+  - larger JAX-only rung: `8` requests, `6240` input tokens, `1351` output
+    tokens, `397.84 output tok/s`, zero measured-phase JIT growth (`20 -> 20`),
+    peak system RAM `44.2%`;
+  - larger live comparison: JAX `400.42 output tok/s`, vLLM
+    `884.03 output tok/s`, ratio `0.453x`, same input/output token counts,
+    zero JIT growth, peak system RAM below `47%`;
+  - larger profile: `_run_main_and_sample` `1817 ms`,
+    `PjRtCApiLoadedExecutable::Execute` `1398 ms`, `_maybe_apply_device_token_carry`
+    `741 ms`, scheduler `build_scheduled_batch` `557 ms`, and GPU `fusion`
+    plus `cutlass` totals about `1064 ms`;
+  - `static_decode_seq_lens_carry=true` stayed cache-stable but regressed to
+    `341.31 output tok/s` on the larger rung;
+  - a shared-gather fallback for row-reordered device-token carry stayed
+    cache-stable but regressed to `370.84 output tok/s`.
+- decision:
+  - keep Entry 250's full-row static decode carry alignment;
+  - reject seq-lens carry promotion on the current random path;
+  - reject the shared-gather token-carry fallback and keep the previous
+    per-row fallback for row-reordered/finishing requests;
+  - next work should target a broader decode/scheduler boundary or production
+    kernel integration. Source-level metadata micro rewrites are now likely to
+    trade one PJRT bucket for another unless they remove an entire per-step
+    call.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_runner.py tests/test_device_token_carry.py`;
+  - `pytest -q tests/test_device_token_carry.py -k 'records_full_static_decode_rows or whole_vector_when_seq_ids_match or follows_seq_ids_after_row_order_change or survives_nonfinal_prefill_chunk or applies_device_token_carry_to_mixed_packed_decode_rows or static_decode_metadata_requires_token_carry'`;
+  - `git diff --check`.
+
+### Entry 252 - Full Random Resource-Guard Safety Validation
+
+- date: 2026-06-05
+- purpose:
+  - verify the full seed-`1234` random sidecar can run under the new watchdog
+    and finite generic warmup after the table-prefill/token-carry changes;
+  - avoid another unbounded compile/run while still checking the full request
+    graph.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_token_carry_full_guarded_r1.json`.
+- workload:
+  - `15` requests;
+  - prompt lengths `1077..4022`, total input tokens `30506`;
+  - output lengths `425..1007`, total output tokens `11602`.
+- result:
+  - completed successfully under `--max-system-ram-percent 70` and
+    `--worker-cpu-cores 2`;
+  - peak system RAM `53.0%`, peak process-tree RSS about `5.72 GB`;
+  - generic warmup compiled `36` entries: `24` packed table-prefill shapes and
+    `12` decode shapes;
+  - measured-phase JIT growth stayed zero (`36 -> 36`);
+  - measured JAX throughput was `239.35 output tok/s`.
+- interpretation:
+  - this is a safety validation, not a new accepted performance baseline. The
+    two-core CPU affinity cap intentionally protects the machine, but it also
+    likely depresses measured throughput because the random path still has
+    CPU-visible scheduler/PJRT work;
+  - for fair performance comparisons, either cap both JAX and vLLM identically
+    or run an uncapped/niceness-only comparison after the next structural
+    optimization.
+- decision:
+  - keep the resource guard and safety ladder;
+  - do not replace the prior full-random performance anchor with this capped
+    safety result.
+
+### Entry 253 - Resident Placeholder And GDN Boundary Audit
+
+- date: 2026-06-05
+- purpose:
+  - continue the six-item random decode plan without retrying rejected
+    metadata-carry or decode-burst variants;
+  - test whether the resident decode path can stop rebuilding device metadata
+    arrays that its compiled executor ignores;
+  - inspect whether the active GDN/GEMM route has a safe small promotion left,
+    or whether the next useful work needs a coarser boundary.
+- implementation:
+  - `Scheduler` now carries `resident_decode_metadata` directly from config;
+  - when static decode metadata and resident decode metadata are both enabled,
+    `_static_decode_device_arrays()` uses stable zero placeholders for device
+    `block_tables` and `seq_lens`, while preserving true `block_tables_host`
+    and `seq_lens_host` for resident-table synchronization;
+  - added a scheduler regression test that changes sequence lengths and block
+    tables across decode steps and verifies placeholder reuse plus host-metadata
+    preservation.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_resident_placeholder_medium_r1.json`.
+- result:
+  - medium resident-placeholder run: `4` requests, `1787` input tokens,
+    `290` output tokens, `354.32 output tok/s`, zero measured-phase JIT growth,
+    peak system RAM `45.0%`;
+  - same-envelope promoted control with packed Triton prefill and reference FA
+    decode: `360.10 output tok/s`;
+  - therefore the resident placeholder route is still slower than the current
+    table/static metadata route.
+- GDN/GEMM audit:
+  - current larger-rung profile has real GPU cost, with `fusion + cutlass`
+    around `1064 ms`;
+  - `_gdn_conv_packed_decode_raw_gate_kernel` is `112.35 ms` over `4983` calls,
+    which matches one fused GDN decode kernel per GDN layer per decode step;
+  - that active Triton route already owns conv update, q/k normalization, raw
+    gate/beta math, and recurrent-state update. A safe next GDN win is not a
+    flag flip or launch-parameter sweep; it needs a coarser projection+GDN,
+    multi-layer/backend-owned decode, or greedy LM-head matmul+argmax boundary.
+- decision:
+  - keep resident device placeholders as opt-in scaffolding, but do not enable
+    `resident_decode_metadata` on the random serving path;
+  - do not retry source-level greedy decode bursts, which Entry 122 already
+    rejected badly;
+  - do not spend the next pass on padded-GEMM row or narrow GDN launch sweeps.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/scheduler.py tests/test_device_token_carry.py`;
+  - `pytest -q tests/test_device_token_carry.py -k 'static_decode_metadata_reuses_fixed_device_arrays or static_decode_metadata_can_reuse_seq_lens_placeholder or resident_decode_metadata_uses_device_placeholders'`.
+
+### Entry 254 - Random Iteration Lanes And Stored vLLM Denominators
+
+- date: 2026-06-05
+- purpose:
+  - keep future random hill-climbing fast and comparable;
+  - avoid paying live-vLLM startup on every JAX-only implementation attempt;
+  - avoid using the full seed-`1234` random graph as the default edit/measure
+    loop when medium and large random already exercise the same serving paths.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_promoted_medium_with_vllm_r1.json`.
+- result:
+  - medium random live comparison: `4` requests, `1787` input tokens,
+    `290` output tokens;
+  - JAX `355.77 output tok/s`;
+  - vLLM `471.06 output tok/s`;
+  - JAX/vLLM ratio `0.755x`;
+  - zero measured-phase JIT growth (`15 -> 15`);
+  - peak system RAM: JAX `45.2%`, vLLM `46.5%`.
+- correctness note:
+  - one request matched fully, while the other rows diverged early from vLLM.
+    This remains acceptable for the random lane under the current approximate
+    correctness policy because earlier diagnostics showed close logits around
+    tie-sensitive early tokens.
+- decision:
+  - use medium and large random as the normal optimization lanes;
+  - treat the full seed-`1234` random graph as an occasional safety/release
+    validation;
+  - use stored same-envelope vLLM denominators for JAX-only A/B work. Rerun
+    live vLLM only after benchmark-contract changes, runtime/library/hardware
+    changes, or before promoting a new best result.
+
+### Entry 255 - Stored vLLM Denominator Support
+
+- date: 2026-06-05
+- purpose:
+  - make the random sidecar policy executable, not only documented;
+  - allow normal JAX-only medium/large iterations to report a JAX/vLLM ratio
+    without launching vLLM every time.
+- implementation:
+  - added `--vllm-reference-json` to
+    `benchmarks/benchmark_random_request_sidecar.py`;
+  - the reference path may point to a raw vLLM benchmark JSON or a prior random
+    sidecar JSON. For sidecar JSONs, the tool loads the nested
+    `runs.vllm.artifact` when available and falls back to the sidecar's vLLM
+    performance summary otherwise;
+  - sidecar output records vLLM run status `stored_reference`, the reference
+    source/kind/artifact, and `performance.jax_over_vllm` ratios.
+- artifacts:
+  - dry-run schema check:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/dry_run_stored_vllm_reference.json`;
+  - JAX-only medium check using the stored live-vLLM denominator:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_promoted_medium_stored_vllm_r1.json`.
+- result:
+  - stored-reference run used
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_promoted_medium_with_vllm_r1_vllm.json`;
+  - JAX `359.34 output tok/s`;
+  - stored vLLM `471.06 output tok/s`;
+  - JAX/vLLM `0.763x`;
+  - zero measured-phase JIT growth (`15 -> 15`);
+  - vLLM elapsed time recorded as `0.0` because no vLLM subprocess was launched.
+- validation:
+  - `python -m py_compile benchmarks/benchmark_random_request_sidecar.py tests/test_benchmark_random_request_sidecar.py`;
+  - `pytest -q tests/test_benchmark_random_request_sidecar.py`.
+
+### Entry 256 - Resident Slot-Token Decode Boundary
+
+- date: 2026-06-05
+- purpose:
+  - remove the remaining hot decode path that rewrote `batch.tokens` from
+    `DeviceTokenRef` rows in Python/JAX before every static decode step;
+  - keep final generated-token materialization correct by preserving immutable
+    per-step `DeviceTokenRef` vectors, rather than using a mutable table as the
+    output history;
+  - move the next-token input carry into the compiled decode boundary, matching
+    the broader serving-framework pattern where resident request slots own the
+    mutable decode input/state.
+- implementation:
+  - added `ExecutorOutput.resident_last_tokens`;
+  - added `ModelExecutor.forward_step_token_ids_slot_carry_table_jit`;
+  - the new JIT gathers `tokens = resident_last_tokens[hybrid_slot_ids]`,
+    runs the existing table-hybrid greedy decode path, scatters updated hybrid
+    state, and scatters sampled token IDs back into `resident_last_tokens`;
+  - `CanonicalModelRunner` now maintains `_resident_last_tokens` per hybrid
+    slot, seeds it from `_record_device_token_carry`, resets released slots, and
+    skips `_maybe_apply_device_token_carry` only when every active static-decode
+    row has both a device-token carry and an assigned hybrid slot;
+  - `_record_device_token_carry` still records immutable output token refs for
+    correctness/final materialization. On the resident slot-token route, it does
+    not issue a second post-JIT resident-token scatter.
+- artifacts:
+  - first comparable large random capacity fix attempt:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_slot_carry_table_r2.json`;
+  - post-guard accepted large random run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_slot_carry_table_r3.json`;
+  - nested JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_slot_carry_table_r3_jax.json`.
+- result:
+  - large random post-patch JAX: `460.45 output tok/s`, `1582` generated
+    tokens, `3.4358 s`, ITL mean `7.36 ms`;
+  - stored vLLM denominator: `884.03 output tok/s`;
+  - JAX/stored-vLLM output-token ratio: `0.521x`;
+  - previous large live-comparison JAX anchor:
+    `400.42 output tok/s`, `1351` generated tokens, `3.3740 s`, ITL mean
+    `8.03 ms`;
+  - measured-phase JIT cache growth remained zero (`20 -> 20`);
+  - generic warmup compiled `20` entries, and all decode warmup routes were
+    `forward_step_token_ids_slot_carry_table_jit:decode` rather than the older
+    `forward_step_token_ids_table_jit:decode`.
+- benchmark caveat:
+  - random generated token text is allowed to diverge under the current random
+    correctness policy;
+  - the sidecar stored-vLLM ratio reuses the prior vLLM denominator, so treat
+    `0.521x` as the current hill-climb signal rather than a final promotion
+    ratio. Rerun live vLLM before declaring a release baseline.
+- interpretation:
+  - this is a concrete structural fix: it removes a whole per-step token-carry
+    rewrite/slice boundary from static decode and folds that state update into
+    useful decode work;
+  - the gain is real but not enough for the `0.9x` target. The next profile
+    should start from this route and attack the remaining model/GEMM,
+    GDN/full-attention, and PjRT/command-buffer buckets.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py tests/test_backend_boundaries.py tests/test_device_token_carry.py`;
+  - `pytest -q tests/test_device_token_carry.py -k 'updates_resident_last_tokens or records_full_static_decode_rows or whole_vector_when_seq_ids_match or follows_seq_ids_after_row_order_change or static_decode_metadata_requires_token_carry'`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'table_hybrid_decode_matches_sliced_decode or warmup_compiles_decode_block_table_buckets'`.
+
+### Entry 257 - Prefill Slot-Token Seeding Boundary
+
+- date: 2026-06-05
+- purpose:
+  - continue the random decode checklist from Entry 256 by removing the next
+    host-visible resident-token update;
+  - keep chunked/ragged prefill semantics exact: only final prefill chunks seed
+    the resident decode token table.
+- implementation:
+  - added `ModelExecutor.forward_prefill_token_ids_slot_carry_table_jit`;
+  - the compiled packed-prefill boundary now gathers/scatters hybrid state as
+    before, samples greedy token IDs, and scatters those token IDs into
+    `resident_last_tokens[hybrid_slot_ids]` only where
+    `prefill_final_flags` is true;
+  - `CanonicalModelRunner` caches device prefill-final flag vectors, routes
+    generic warmup and serving prefill through the new boundary when device
+    token carry is enabled, and suppresses the old post-prefill
+    `_record_resident_last_tokens` scatter when the compiled boundary already
+    seeded the resident table.
+- artifacts:
+  - large random benchmark:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_prefill_slot_carry_table_r1.json`;
+  - nested JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_prefill_slot_carry_table_r1_jax.json`;
+  - profiled large random benchmark:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_prefill_slot_carry_table_profile_r1.json`;
+  - nested profiled JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_prefill_slot_carry_table_profile_r1_jax.json`;
+  - profile trace:
+    `/mountpoint/.exp/profiles/20260605-073625-101290-random_large_prefill_slot_carry_table_profile_r1_jax`.
+- result:
+  - large random post-patch JAX: `470.14 output tok/s`, `1582` generated
+    tokens, `3.3649 s`, ITL mean `7.84 ms`;
+  - previous accepted Entry 256 large random: `460.45 output tok/s`, `1582`
+    generated tokens, `3.4358 s`;
+  - stored vLLM denominator remains `884.03 output tok/s`, so the JAX/stored
+    vLLM ratio moved from `0.521x` to `0.532x`;
+  - measured-phase JIT cache growth remained zero (`20 -> 20`);
+  - generic warmup compiled all 8 packed prefill bucket routes as
+    `forward_prefill_token_ids_slot_carry_table_jit:prefill` and all 12 decode
+    bucket routes as `forward_step_token_ids_slot_carry_table_jit:decode`.
+- profile delta:
+  - old Entry 256 profile had `_record_resident_last_tokens` at `439.35 ms / 7`
+    calls and total `gather` at `1216.23 ms`;
+  - new profile no longer has `_record_resident_last_tokens` or
+    `_record_device_token_carry` in the top events, and total `gather` dropped
+    to `293.55 ms`;
+  - `_run_main_and_sample` dropped from `1917.86 ms / 315` to
+    `1664.43 ms / 338` in the profiled run;
+  - remaining visible buckets are `PjRtCApiLoadedExecutable::Execute`
+    (`1535.04 ms / 626`), scheduler/build metadata (`schedule`
+    `761.71 ms`, `_static_decode_device_arrays` `543.76 ms`, `device_put`
+    `532.76 ms`), and GPU model work (BF16 GEMMs, GDN decode kernel, and
+    fusion/cutlass).
+- interpretation:
+  - this accepted fix removes the final known host-visible resident-token seed
+    on the current static decode route;
+  - the next general target should be scheduler/static-decode metadata movement
+    and broader decode execution fusion, not another token-carry rewrite.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py tests/test_backend_boundaries.py tests/test_device_token_carry.py`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'packed_prefill_greedy_token_jit_returns_row_tokens or warmup_compiles_table_prefill_when_available or warmup_compiles_prefill_slot_carry_table_when_available or warmup_compiles_decode_block_table_buckets'`;
+  - `pytest -q tests/test_device_token_carry.py -k 'updates_resident_last_tokens or records_full_static_decode_rows or static_decode_metadata_requires_token_carry or survives_nonfinal_prefill_chunk or release_preserves_carry'`.
+
+### Entry 258 - Combined Resident Metadata And Slot-Token Decode Rejection
+
+- date: 2026-06-05
+- purpose:
+  - test the next scheduler/static-metadata checklist item after Entry 257;
+  - combine the existing resident metadata table path with the accepted
+    resident slot-token carry path, so decode gathers input token, block table,
+    seq-len, and hybrid state by resident slot inside one compiled boundary.
+- implementation:
+  - added `ModelExecutor.forward_step_token_ids_resident_slot_carry_jit` as an
+    opt-in diagnostic path;
+  - when `resident_decode_metadata=True`, generic warmup and serving prefer the
+    combined route over the older resident-metadata-only decode route;
+  - the route returns both updated `resident_seq_lens` and
+    `resident_last_tokens`, while preserving immutable generated-token refs in
+    the runner.
+- artifact:
+  - medium random diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_resident_slot_carry_decode_r1.json`;
+  - nested JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_resident_slot_carry_decode_r1_jax.json`.
+- result:
+  - JAX `323.28 output tok/s`, `290` generated tokens, `0.8971 s`;
+  - stored medium vLLM denominator `471.06 output tok/s`, ratio `0.686x`;
+  - accepted medium anchors were `355.77` to `359.34 output tok/s`, so this is
+    a clear regression despite zero measured-phase JIT growth (`20 -> 20`);
+  - generic warmup correctly used
+    `forward_prefill_token_ids_slot_carry_table_jit:prefill` for all prefill
+    buckets and `forward_step_token_ids_resident_slot_carry_jit:decode` for all
+    decode buckets.
+- decision:
+  - reject this as the next promoted random route and do not run the large lane;
+  - keep it as opt-in diagnostic scaffolding behind the existing
+    `resident_decode_metadata` config only;
+  - the scheduler/static-metadata bottleneck needs a different boundary or
+    scheduler-side reduction, not the current resident metadata decode route.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py tests/test_backend_boundaries.py`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'table_hybrid_decode_matches_sliced_decode or warmup_compiles_resident_slot_carry_decode_when_available or warmup_compiles_prefill_slot_carry_table_when_available'`.
+
+### Entry 259 - Accepted Fixed-ABI FA/FLA Policy
+
+- date: 2026-06-05
+- purpose:
+  - finish the FA/FLA integration pass after the packed/ragged ABI and
+    resident slot-token carry boundary stabilized;
+  - retest the existing full-attention Triton routes under the current random
+    decode graph instead of relying on the older pre-ABI rejection;
+  - keep the GDN FLA route unchanged and promote only an integrated
+    full-attention route that improves random decode with generic warmup.
+- implementation:
+  - promoted `full_attention.prefill_impl=triton_packed` and
+    `full_attention.decode_impl=triton_paged_fused_append` in
+    `benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata.json`;
+  - retained BF16 full-attention KV cache, strict GDN no-fallback policy,
+    `gdn.prefill_post_conv_impl=triton_fla_padded`, and
+    `gdn.packed_decode.impl=triton_fla_conv_raw_gates`;
+  - left standalone `full_attention.decode_impl=triton_paged` rejected for
+    random serving because it still replaces too narrow a boundary.
+- artifacts:
+  - medium same-code control:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_current_control_r1.json`;
+  - medium FA prefill-only:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_fa_prefill_triton_r1.json`;
+  - medium FA decode-only:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_fa_decode_triton_r1.json`;
+  - medium FA fused append/decode-only:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_fa_decode_fused_append_r1.json`;
+  - medium combined FA route:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_fa_prefill_fused_decode_r1.json`;
+  - large combined FA route:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_fa_prefill_fused_decode_r1.json`;
+  - nested large JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_fa_prefill_fused_decode_r1_jax.json`.
+- result:
+  - focused GPU correctness passed for Triton packed FA prefill, Triton FA
+    decode, fused FA append/decode, and Triton FLA GDN prefill;
+  - medium current control: `337.12 output tok/s`, stored-vLLM ratio `0.716x`;
+  - medium FA prefill-only: `350.17 output tok/s`, `0.743x`;
+  - medium FA decode-only: `332.30 output tok/s`, `0.705x`;
+  - medium FA fused append/decode-only: `349.70 output tok/s`, `0.742x`;
+  - medium combined FA prefill plus fused append/decode:
+    `359.60 output tok/s`, `0.763x`;
+  - large accepted Entry 257 control:
+    `470.14 output tok/s`, stored-vLLM ratio `0.532x`;
+  - large combined FA prefill plus fused append/decode:
+    `484.18 output tok/s`, stored-vLLM ratio `0.548x`;
+  - measured-phase JIT cache growth stayed zero on the large run (`20 -> 20`),
+    and the artifact reports `prefill_impl=triton_packed`,
+    `decode_impl=triton_paged_fused_append`,
+    `gdn_prefill_post_conv_impl=triton_fla_padded`, and
+    `gdn_packed_decode_impl=triton_fla_conv_raw_gates`.
+- decision:
+  - promote the combined FA route in the main GPU config;
+  - do not promote standalone FA decode or prefill-only as independent routes;
+  - treat FA/FLA as now integrated enough for the next pass to return to
+    scheduler/static metadata movement, PJRT bubbles, and broader decode graph
+    fusion.
+- validation:
+  - `JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m pytest -q tests/test_backend_boundaries.py::test_packed_full_attention_prefill_triton_matches_dense_rows_bf16_cache tests/test_backend_boundaries.py::test_paged_decode_attention_triton_matches_reference_bf16_cache tests/test_backend_boundaries.py::test_configured_triton_decode_attention_matches_reference_non_contiguous_blocks tests/test_backend_boundaries.py::test_configured_fused_triton_decode_attention_appends_kv_and_matches_reference tests/test_gdn_post_conv_prefill_reference.py::test_model_post_conv_prepared_fla_triton_packed_matches_reference`;
+  - medium and large random sidecar runs above used stored vLLM denominators,
+    generic warmup, `--jax-fail-on-jit-cache-growth`, and the 70% RAM guard.
+
+### Entry 260 - Accepted Broadened Resident Metadata And Packed-Projection GDN Decode
+
+- date: 2026-06-05
+- purpose:
+  - continue the random-decode broadening/coarsening path after Entry 259;
+  - reopen resident metadata only if it removes a whole host/device operation,
+    not as the Entry 258 scatter-sync route;
+  - broaden GDN decode so the conv+recurrent FLA kernel consumes the packed
+    decode projection instead of separate `qkv`, `a`, and `b` arrays.
+- implementation:
+  - changed resident static decode placeholders to be keyed by physical shape
+    and active-row pattern instead of real sequence IDs;
+  - promoted `resident_decode_metadata=true` in the main GPU config;
+  - changed resident block/seq metadata synchronization to refresh the tiny
+    full host mirrors with `device_put` on actual changes instead of executing
+    JAX `.at[...]` scatter updates;
+  - added `gdn_conv_packed_projection_decode_step_bf16_raw_gates`, which loads
+    `qkv`, `a`, and `b` from the concatenated `[qkv, a, b, z]` packed
+    projection inside the Triton conv+raw-gate GDN decode kernel.
+- artifacts:
+  - first resident packed-GDN large run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_packed_gdn_boundary_r1.json`;
+  - accepted scatter-free resident large run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_deviceput_sync_packed_gdn_r1.json`;
+  - accepted profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_deviceput_sync_packed_gdn_profile_r1.json`;
+  - rejected physical-row token-ref diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_physical_token_refs_packed_gdn_r1.json`.
+- result:
+  - scatter-sync resident route regressed large random to
+    `476.41 output tok/s`, `0.539x` of stored vLLM;
+  - scatter-free resident sync plus packed-projection GDN reached
+    `495.10 output tok/s`, `0.560x` of stored vLLM, with zero measured-phase
+    JIT growth (`20 -> 20`);
+  - this improves the Entry 259 large accepted route
+    (`485.11 output tok/s`, `0.549x`) by `~2.1%`;
+  - profiled scatter-free resident route shows `_sync_resident_decode_metadata`
+    at `140.40 ms / 300` versus `689.15 ms / 231` on the scatter-sync profile,
+    and PJRT execute count drops from `1159` to `548`;
+  - GPU profile confirms the new
+    `_gdn_conv_packed_projection_decode_raw_gate_kernel` path is used
+    (`115.55 ms / 5051` in the profiled run);
+  - physical-row token refs for the full greedy token vector reached only
+    `493.47 output tok/s`, so that subchange is rejected.
+- decision:
+  - promote resident decode metadata only with the shape-stable descriptor and
+    full-table host-mirror sync;
+  - promote packed-projection GDN decode as the active FLA decode boundary;
+  - do not re-run the old scatter-sync resident route or physical-row token
+    refs as primary random-decode optimizations;
+  - next broadening target should be model-side decode GPU work
+    (GEMMs/full-attention/GDN post-core) plus remaining PJRT execution overhead.
+- validation:
+  - `python -m py_compile nanovllm_jax/model.py nanovllm_jax/backends.py nanovllm_jax/kernels/gdn_fla_triton.py`;
+  - `pytest -q tests/test_device_token_carry.py -k 'resident_decode_metadata or static_decode_metadata_reuses_fixed_device_arrays'`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'resident_decode_metadata_flag or syncs_resident_decode_metadata_by_slot or warmup_compiles_resident_slot_carry_decode_when_available'`;
+  - `pytest -q tests/test_gdn_packed_decode_reference.py -k 'conv_packed_projection_decode_matches_split_kernel or conv_packed_decode_matches_reference'`;
+  - large random sidecar runs used stored vLLM denominator, generic warmup,
+    `--jax-fail-on-jit-cache-growth`, and the 70% RAM guard.
+
+### Entry 261 - Rejected Resident Replay And Narrow GDN Out-Projection Fusion
+
+- date: 2026-06-05
+- purpose:
+  - test whether the remaining random-decode gap is mostly scheduler shell work
+    by replaying a resident static decode descriptor when the live request set
+    and bucket shape stay unchanged;
+  - test a wider GDN decode custom boundary by fusing post-core gating with the
+    output projection after the accepted packed-projection conv+GDN kernel.
+- implementation:
+  - prototype-only resident decode replay reused the previous static
+    `ScheduledBatch` for eligible all-greedy decode steps and bypassed the
+    normal scheduler/build path;
+  - prototype-only GDN out-projection fusion routed the post-core gated output
+    and layer output projection through a Triton custom call;
+  - both prototypes were reverted after integrated benchmarks.
+- artifacts:
+  - GDN out-projection fusion large run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_fused_gdn_outproj_r1.json`;
+  - resident decode replay large run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_decode_replay_r1.json`;
+  - resident decode replay profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_decode_replay_profile_r1.json`;
+  - nested replay JAX profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_decode_replay_profile_r1_jax.json`.
+- result:
+  - GDN out-projection fusion passed focused correctness but regressed large
+    random to `441.92 output tok/s`, `0.500x` of the stored vLLM denominator;
+  - resident decode replay reduced profiled scheduler/build calls from `300` to
+    `230`, but the no-profile large run reached only `494.35 output tok/s`,
+    `0.559x`, below the accepted Entry 260 `495.10 output tok/s`;
+  - the replay profile shows scheduler time moved in the right direction
+    (`schedule` `355.83 ms / 300` to `337.51 ms / 230`,
+    `build_scheduled_batch` `323.29 ms / 300` to `310.60 ms / 230`), while PJRT
+    and GPU model work moved the wrong way (`PjRT Execute` `1424.72 ms / 548`
+    to `1435.30 ms / 554`, top BF16 GEMM `503.33 ms` to `509.48 ms`, fused
+    attention `212.02 ms` to `214.68 ms`);
+  - the active GDN recurrent state is already in the kernel-native `[V,K]`
+    layout, so a separate state-layout migration is not a pending big lever.
+- decision:
+  - reject and revert resident decode replay; it confirms that scheduler
+    replay alone is not the remaining large random bottleneck;
+  - reject and revert narrow GDN out-projection fusion; replacing the tail of
+    one layer type in many small calls loses to the existing XLA/CUTLASS plan;
+  - do not retry these as primary random-decode optimizations unless a broader
+    model-owned decode boundary removes substantial GEMM/scatter/attention work
+    at the same time.
+- validation:
+  - `python -m py_compile nanovllm_jax/config.py nanovllm_jax/server_config.py nanovllm_jax/llm_engine.py benchmarks/benchmark_random_request_sidecar.py`;
+  - `pytest -q tests/test_device_token_carry.py -k 'resident_decode_replay or resident_decode_metadata_reuses_placeholders or resident_decode_metadata_uses_device_placeholders'`;
+  - `pytest -q tests/test_server_config.py -k 'runtime_and_kernel_sections_translate_to_env or runtime_fastpaths or overrides_from_config'`.
+
+### Entry 262 - Accepted Exact Small-Batch Decode Buckets
+
+- date: 2026-06-05
+- purpose:
+  - test whether the random-decode gap is partly padded model work from
+    power-of-two batch buckets;
+  - make the standard random-serving warmup closer to vLLM-style dynamic
+    batching without benchmark-specific measured-phase compilation.
+- implementation:
+  - changed the active GPU config `batch_size_buckets` from `1,2,4,8` to
+    `1,2,3,4,5,6,7,8`;
+  - changed the random sidecar default to the same exact small-batch bucket list
+    so random runs get this policy unless explicitly overridden.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_exact_decode_batch_buckets_r1.json`;
+  - nested JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_exact_decode_batch_buckets_r1_jax.json`.
+- result:
+  - large random improved to `503.66 output tok/s`, `0.570x` of the stored
+    vLLM denominator, versus Entry 260 `495.10 output tok/s`, `0.560x`;
+  - measured-phase JIT cache growth stayed zero (`40 -> 40`);
+  - generic warmup compiled `40` entries, with `24` decode warmup runs covering
+    B=1 through B=8 and `16` packed-prefill warmup runs;
+  - peak system RAM stayed within the guard (`53.3%`, process tree RSS
+    `5.27 GB`).
+- decision:
+  - promote exact small-batch decode buckets for the random-serving lane;
+  - this is not model/GPU tile tuning. It is a general serving policy that
+    avoids doing B=8 model work for common B=5/6/7 random decode steps;
+  - keep the 70% RAM guard and generic warmup requirement because the policy
+    intentionally trades more startup compilation for less measured decode
+    padding.
+- validation:
+  - large random sidecar run above used stored vLLM denominator, generic warmup,
+    `--jax-fail-on-jit-cache-growth`, and the 70% RAM guard.
+
+### Entry 263 - Rejected Lower Padded-GEMM Row Count With Exact Buckets
+
+- date: 2026-06-05
+- purpose:
+  - test whether Entry 262's exact B=5/6/7 scheduler buckets were being
+    partially cancelled by `decode_padded_gemm_rows=8`;
+  - check whether lowering the padded-GEMM row count lets exact smaller decode
+    batches reduce model GEMM work.
+- implementation:
+  - direct JAX large-random run on the Entry 262 manifest;
+  - kept exact decode batch buckets `1,2,3,4,5,6,7,8`;
+  - changed only `--decode-padded-gemm-rows` from `8` to `5`.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_exact_buckets_padded_rows5_r1_jax.json`.
+- result:
+  - large random regressed to `240.16 output tok/s` versus Entry 262
+    `503.66 output tok/s`;
+  - measured-phase JIT cache growth stayed zero (`40 -> 40`);
+  - ITL p95 regressed to `72.67 ms` and TTFT p50 to `574.70 ms`.
+- decision:
+  - reject lowering fixed padded-GEMM rows as a primary route;
+  - keep `decode_padded_gemm_rows=8`. It is not just wasted padding: on this
+    XLA/CUDA graph it selects a much faster compiled GEMM path;
+  - the next large model-side target should be a genuinely better small-batch
+    decode backend or epilogue/fusion path, not dynamic row-count source
+    policy.
+- validation:
+  - direct JAX run used the same prompt manifest as Entry 262, generic warmup,
+    exact decode buckets, and `--fail-on-jit-cache-growth`.
+
+### Entry 264 - Rejected Narrow Full-Attention Decode Kernel Tweaks
+
+- date: 2026-06-05
+- purpose:
+  - test whether the large-random gap can be reduced by removing visible
+    materialization around full-attention decode without changing the broader
+    decode scheduler ABI;
+  - check whether duplicate K/V append stores inside the fused paged decode
+    attention kernel are a meaningful bucket.
+- implementation:
+  - prototype A added a Triton full-attention decode QKV-prep custom call that
+    split packed Q/G/K/V, applied q/k RMSNorm and RoPE, and produced query,
+    key, value, and gate tensors before the existing fused append+attention
+    kernel;
+  - prototype B changed the fused append+attention Triton kernel so only the
+    first query head in each KV group wrote the appended K/V cache row, while
+    all query heads substituted the just-appended K/V locally for the current
+    decode position.
+- artifacts:
+  - QKV-prep run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_fa_decode_qkv_prep_r1.json`;
+  - duplicate-store run r1:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_fa_dedup_append_store_r1.json`;
+  - duplicate-store repeat r2:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_fa_dedup_append_store_r2.json`.
+- result:
+  - QKV-prep regressed to `499.13 output tok/s`, `0.565x` of the stored vLLM
+    denominator, versus Entry 262 `503.66 output tok/s`;
+  - duplicate-store r1 reached `502.29 output tok/s`, `0.568x`; repeat r2
+    reached `497.96 output tok/s`, `0.563x`;
+  - all runs kept zero measured-phase JIT cache growth and the same generated
+    token count as Entry 262.
+- decision:
+  - reject and revert both probes;
+  - a separate prep-only custom call adds a launch without removing enough work
+    from the attention boundary;
+  - duplicate K/V append stores are not a dominant bucket on the integrated
+    random graph;
+  - the next large step must remove a larger boundary, such as integrating
+    packed QKV prep into the existing append+attention launch, replacing the
+    LM-head dense+argmax with a true fused greedy epilogue, or moving multiple
+    decode sublayers behind a coarser backend-owned boundary.
+- validation:
+  - focused CUDA/full-attention tests passed for each prototype before
+    benchmarking;
+  - large random sidecar runs used stored vLLM denominator, generic warmup,
+    exact decode buckets, `--jax-fail-on-jit-cache-growth`, and the 70% RAM
+    guard.
+
+### Entry 265 - Rejected Integrated Packed-QKV Full-Attention Decode
+
+- date: 2026-06-05
+- purpose:
+  - test a coarser full-attention decode boundary that does not add a separate
+    prep launch;
+  - consume the packed QKV projection directly in the fused append+attention
+    Triton call, perform Q/K RMSNorm and RoPE inside that launch, return the
+    gate for the existing output projection path, and keep the BF16 paged KV
+    cache contract.
+- implementation:
+  - added a prototype backend method and Triton wrapper for packed-QKV fused
+    append+decode attention;
+  - routed it automatically for the existing packed full-attention decode,
+    BF16 cache, width-1, `triton_paged_fused_append` policy;
+  - added a focused CUDA test that compared attention output and appended K/V
+    against the reference Q/K RMSNorm + RoPE + paged decode path.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_integrated_packed_fa_decode_r1.json`;
+  - nested JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_integrated_packed_fa_decode_r1_jax.json`.
+- result:
+  - large random reached `499.81 output tok/s`, `0.565x` of the stored vLLM
+    denominator, versus Entry 262 `503.66 output tok/s`;
+  - measured-phase JIT cache growth stayed zero (`40 -> 40`);
+  - generated token count stayed `1582`, matching the Entry 262 JAX run.
+- decision:
+  - reject and revert the prototype;
+  - moving Q/K norm, RoPE, K/V append, and attention into one call still does
+    not reduce the integrated random-decode wall time;
+  - full-attention decode alone is not the next large lever. The next useful
+    implementation needs to coarsen many decode sublayer calls, reduce the
+    small-GEMM/PJRT boundary, or replace a shared dense operation with a true
+    single-call backend.
+- validation:
+  - focused CUDA fused-attention tests passed before benchmarking;
+  - large random sidecar used stored vLLM denominator, generic warmup, exact
+    decode buckets, `--jax-fail-on-jit-cache-growth`, and the 70% RAM guard.
+
+### Entry 266 - Accepted Reference GDN Decode Route For Random Serving
+
+- date: 2026-06-05
+- purpose:
+  - test whether the active random-serving config should keep using the
+    conv-fused Triton FLA packed GDN decode route after the large-random profile
+    showed `_gdn_conv_packed_projection_decode_raw_gate_kernel` as thousands of
+    small GPU calls;
+  - compare against the existing packed BF16-QKV `reference` GDN decode route
+    under the same exact decode buckets, resident metadata, generic warmup, and
+    stored vLLM denominator.
+- implementation:
+  - copied `gpu_paged_gdn_fla_decode_static_metadata` to a diagnostic config
+    and changed only `kernels.gdn.packed_decode.impl` from
+    `triton_fla_conv_raw_gates` to `reference`;
+  - after two winning repeats, promoted the same setting in
+    `benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata.json`.
+- artifacts:
+  - r1 sidecar:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_gdn_reference_decode_r1.json`;
+  - r1 nested JAX:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_gdn_reference_decode_r1_jax.json`;
+  - r2 sidecar:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_gdn_reference_decode_r2.json`;
+  - r2 nested JAX:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_gdn_reference_decode_r2_jax.json`.
+- result:
+  - r1 reached `514.25 output tok/s`, `0.582x` of the stored vLLM denominator;
+  - r2 reached `508.85 output tok/s`, `0.576x` of the stored vLLM denominator;
+  - both runs generated `1582` tokens and kept zero measured-phase JIT cache
+    growth (`40 -> 40`);
+  - Entry 262, the previous accepted anchor with
+    `triton_fla_conv_raw_gates`, reached `503.66 output tok/s`, `0.570x`.
+- decision:
+  - promote `kernels.gdn.packed_decode.impl=reference` for the active random
+    serving config;
+  - treat the conv-fused Triton FLA GDN decode route as rejected for this
+    integrated random graph until it is part of a much coarser boundary. It is
+    correct, but the current shape adds too many small calls and loses wall
+    time;
+  - this is not enabling a fallback: fallbacks remain disabled, and the selected
+    GDN decode implementation is explicit in the config.
+- validation:
+  - both large random sidecar runs used the stored vLLM denominator, generic
+    warmup, exact decode buckets, `--jax-fail-on-jit-cache-growth`, and the 70%
+    RAM guard.
+
+### Entry 267 - Rejected Two-Stage Triton LM-Head Greedy Argmax
+
+- date: 2026-06-05
+- purpose:
+  - test whether the large-random gap can be reduced by replacing the decode
+    LM-head dense-logits materialization plus `argmax` with a token-id-only
+    Triton path;
+  - keep the active GDN reference decode route, exact decode buckets, resident
+    metadata, generic warmup, stored vLLM denominator, and resource guards.
+- implementation:
+  - prototyped a two-stage Triton LM-head greedy path: stage 1 computed
+    per-vocab-block max logits from hidden state, RMSNorm weight, and
+    materialized tied LM-head weight without writing full `[B, vocab]` logits;
+    stage 2 reduced the per-block maxima to one token ID per row;
+  - threaded the prototype through `lm_head_token_ids_and_topk` behind a
+    config-driven `lm_head_decode_impl=triton_argmax` selector;
+  - kept prefill final-token sampling on the reference LM-head path because the
+    selector was decode-only.
+- artifacts:
+  - failed first warmup attempt, rejected before timing:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_triton_argmax_r1.json`;
+  - corrected guarded sidecar run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_triton_argmax_r2.json`;
+  - corrected nested JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_triton_argmax_r2_jax.json`.
+- result:
+  - corrected run reached `508.38 output tok/s`, `0.575x` of the stored vLLM
+    denominator;
+  - this lost to the active-config repeat at `513.60 output tok/s` and the best
+    Entry 266 repeat at `514.25 output tok/s`;
+  - measured-phase JIT cache growth stayed zero (`40 -> 40`) and generated
+    token count stayed `1582`;
+  - the run took `250.31 s` end to end, materially higher than the active-config
+    run, so the custom LM-head path also worsened iteration cost.
+- decision:
+  - reject and revert the prototype;
+  - do not keep a `lm_head_decode_impl` config knob or the two-stage Triton
+    kernel. It removes the full-logit write but gives up the highly optimized
+    GEMM path and adds custom-call/reduction overhead;
+  - the next LM-head attempt must be a true GEMM epilogue or library-backed
+    fused matmul+top-1 path, not a separate blockwise reduction kernel.
+- validation:
+  - focused GPU tests passed after the Triton syntax fix before benchmarking;
+  - large random sidecar used stored vLLM denominator, generic warmup, exact
+    decode buckets, `--jax-fail-on-jit-cache-growth`, the 70% RAM guard, and
+    four CPU cores at nice level `10`.
+
+### Entry 268 - Accepted Row-Padded Decode GEMM For LM Head
+
+- date: 2026-06-05
+- purpose:
+  - test whether the accepted row-padded decode GEMM path should also cover the
+    greedy LM-head dot instead of only hidden/intermediate projections;
+  - keep the active reference GDN decode route, exact decode buckets, resident
+    metadata, generic warmup, stored vLLM denominator, and resource guards.
+- implementation:
+  - routed `lm_head_token_ids_and_topk` through `_decode_padded_gemm_dot` when
+    `decode_padded_gemm=true`, the decode width is `1`, the batch fits the
+    configured padded row count, and the output dimension is admitted by
+    `decode_padded_gemm_max_out_dim`;
+  - promoted the active config's output-dimension guard high enough to include
+    the Qwen3.5-family vocabulary, so the same XLA/CUTLASS GEMM-shaped path is
+    used for LM-head decode selection;
+  - left top-k diagnostics and argmax semantics unchanged.
+- artifacts:
+  - r1 sidecar:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_padded_gemm_r1.json`;
+  - r1 nested JAX:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_padded_gemm_r1_jax.json`;
+  - r2 sidecar:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_padded_gemm_r2.json`;
+  - r2 nested JAX:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_padded_gemm_r2_jax.json`.
+- result:
+  - r1 reached `516.35 output tok/s`, `0.584x` of the stored vLLM denominator;
+  - r2 reached `519.16 output tok/s`, `0.587x` of the stored vLLM denominator;
+  - both runs generated `1582` tokens and kept zero measured-phase JIT cache
+    growth (`40 -> 40`);
+  - the prior active-config sanity reached `513.60 output tok/s`, and Entry 266
+    reference-GDN repeats reached `514.25` and `508.85 output tok/s`.
+- decision:
+  - promote LM-head coverage for the row-padded GEMM route;
+  - count this as an incremental GEMM-shape improvement, not the main route to
+    `0.9x` vLLM. The larger LM-head lesson from Entry 267 still stands:
+    token-id-only reductions lose unless they preserve the optimized GEMM path
+    or become a true backend/library GEMM epilogue.
+- validation:
+  - focused LM-head helper tests passed;
+  - both large random sidecar runs used the stored vLLM denominator, generic
+    warmup, exact decode buckets, `--jax-fail-on-jit-cache-growth`, the 70% RAM
+    guard, and four CPU cores at nice level `10`.
+
+### Entry 269 - Rejected Resident Slot-Carry Greedy Decode Burst
+
+- date: 2026-06-05
+- purpose:
+  - test a coarse decode boundary that keeps the accepted resident last-token
+    table while emitting two greedy tokens per scheduled decode step;
+  - reduce Python/PJRT step count without dropping paged attention, resident
+    metadata, static decode metadata, KV cache updates, or GDN table updates.
+- implementation:
+  - prototyped resident slot-carry burst JIT boundaries for both static
+    metadata and resident metadata;
+  - the resident path gathered last tokens, block tables, sequence lengths, and
+    GDN state by slot id, scanned two full model decode steps, returned all
+    emitted token IDs, and scattered the final last token plus updated state
+    back to resident tables;
+  - the prototype was reverted after benchmarking because it was not promoted.
+- artifacts:
+  - first small burst-2 sidecar before the resident-specific route:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_small_burst2_slot_carry_r1.json`;
+  - resident-route small burst-2 sidecar:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_small_burst2_resident_slot_carry_r2.json`;
+  - small burst-1 active control:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_small_active_burst1_control_r1.json`;
+  - medium resident-route burst-2 sidecar:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_burst2_resident_slot_carry_r1.json`.
+- result:
+  - small active burst-1 control reached `199.74 output tok/s`, zero measured
+    JIT growth (`11 -> 11`);
+  - small resident burst-2 reached `136.99 output tok/s`, zero measured JIT
+    growth (`17 -> 17`);
+  - medium resident burst-2 reached `277.27 output tok/s`, zero measured JIT
+    growth (`24 -> 24`), below the current medium history around
+    `355+ output tok/s`;
+  - compile/warmup time was materially worse than the active burst-1 path even
+    on the small and medium rungs.
+- decision:
+  - reject and revert the prototype;
+  - do not retry source-level full-model JAX scan bursts as the main
+    coarsening strategy. Reducing PJRT calls is not enough when each fused call
+    runs a worse compiled full-model plan;
+  - the next coarse-boundary attempt should target backend/library-owned fused
+    sublayers or decode-block kernels that reduce actual GEMM/attention/GDN
+    device work.
+- validation:
+  - all benchmark runs used generic warmup, `--jax-fail-on-jit-cache-growth`,
+    the 70% RAM guard, and four CPU cores at nice level `10`;
+  - the rejected code was fully reverted before documenting the result.

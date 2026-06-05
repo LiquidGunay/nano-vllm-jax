@@ -250,10 +250,13 @@ class Sequence:
             for entry_index, value in zip(scalar_entries, scalar_values):
                 values_by_entry[entry_index] = int(value)
         if vector_arrays:
-            vector_arrays = [jnp.asarray(tokens, dtype=jnp.int32).reshape(-1) for tokens in vector_arrays]
-            vector_values = jax.device_get(tuple(vector_arrays))
+            vector_arrays = [
+                jnp.asarray(tokens, dtype=jnp.int32).reshape(-1)
+                for tokens in vector_arrays
+            ]
+            host_vectors = jax.device_get(vector_arrays)
             for entry_index, vector_slot, row in vector_entries:
-                values_by_entry[entry_index] = int(vector_values[vector_slot][row])
+                values_by_entry[entry_index] = int(host_vectors[vector_slot][row])
 
         touched: List["Sequence"] = []
         seen: set[int] = set()

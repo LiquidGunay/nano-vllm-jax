@@ -60,6 +60,8 @@ class AttentionMetadata:
     num_decode_tokens: int
     positions: Optional[jnp.ndarray] = None
     max_kv_len: Optional[int] = None
+    token_row_ids: Optional[jnp.ndarray] = None
+    max_query_len: Optional[int] = None
 
 
 @dataclass
@@ -367,6 +369,13 @@ def _resolve_kv_layer(
     raise ValueError(f"Unsupported KV cache rank: {cache.ndim}")
 
 
+def _default_backend_is_gpu() -> bool:
+    try:
+        return jax.default_backend() == "gpu"
+    except RuntimeError:
+        return False
+
+
 def init_hybrid_state(
     config,
     batch_size: int = 1,
@@ -437,6 +446,33 @@ def compute_slot_mapping(
     return slot_mapping
 
 
+def compute_packed_slot_mapping(
+    positions: jnp.ndarray,
+    block_table: jnp.ndarray,
+    token_row_ids: jnp.ndarray,
+    block_size: int,
+) -> jnp.ndarray:
+    """Compute physical cache slots for packed prefill tokens.
+
+    `positions` and `token_row_ids` have the same packed token shape, commonly
+    `[1, token_bucket]`.  `token_row_ids` maps each packed token to a request row
+    in `block_table`; padded tokens may use any in-range row and should be
+    masked by the caller.
+    """
+    if positions.shape != token_row_ids.shape:
+        raise ValueError("positions and token_row_ids must have matching shapes")
+    if block_table.ndim != 2:
+        raise ValueError("block_table must be a 2D tensor [batch, max_blocks_per_seq]")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+
+    block_indices = positions // block_size
+    slot_indices = positions % block_size
+    safe_rows = jnp.clip(token_row_ids, 0, block_table.shape[0] - 1)
+    physical_blocks = block_table[safe_rows, block_indices]
+    return physical_blocks * block_size + slot_indices
+
+
 def update_kv_cache(
     k_cache: jnp.ndarray,
     v_cache: jnp.ndarray,
@@ -483,8 +519,8 @@ def update_kv_cache(
     
     # Flatten slot_mapping and new_k/v
     slot_flat = slot_mapping.reshape(-1)
-    k_flat = new_k.reshape(-1, num_kv_heads, head_dim)
-    v_flat = new_v.reshape(-1, num_kv_heads, head_dim)
+    k_flat = new_k.astype(k_cache_flat.dtype).reshape(-1, num_kv_heads, head_dim)
+    v_flat = new_v.astype(v_cache_flat.dtype).reshape(-1, num_kv_heads, head_dim)
     if valid_mask is not None:
         # Preserve invalid padded entries by redirecting them to a sentinel
         # slot that is removed before returning to cache shape.
@@ -682,6 +718,137 @@ def paged_attention_prefill(
     return out.reshape(batch, query_len, num_heads * head_dim)
 
 
+def paged_attention_prefill_packed(
+    query: jnp.ndarray,
+    k_cache: jnp.ndarray,
+    v_cache: jnp.ndarray,
+    block_table: jnp.ndarray,
+    kv_lens: jnp.ndarray,
+    positions: jnp.ndarray,
+    token_row_ids: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    block_size: int,
+    scale: float,
+    num_key_value_groups: int,
+    layer_idx: int = 0,
+    max_query_len: int | None = None,
+    use_triton: bool | None = None,
+) -> jnp.ndarray:
+    """Reference paged attention for packed/ragged prefill.
+
+    The query tokens are packed into one static token bucket while keys and
+    values are fetched through each request's paged block table.  This keeps the
+    serving ABI aligned with chunked prefill without requiring dense
+    `[batch, max_query_len]` materialization.
+    """
+    if query.ndim != 4 or query.shape[0] != 1:
+        raise ValueError("packed prefill query must have shape [1, token_bucket, heads, head_dim]")
+    if positions.shape != token_row_ids.shape or positions.shape[0] != 1:
+        raise ValueError("packed positions and token_row_ids must have shape [1, token_bucket]")
+    if block_table.ndim != 2:
+        raise ValueError("block_table must be a 2D tensor [batch, max_blocks_per_seq]")
+    if kv_lens.shape[0] != block_table.shape[0]:
+        raise ValueError("kv_lens shape must align with block_table rows")
+
+    _, token_bucket, num_heads, head_dim = query.shape
+    k_cache_layer, cache_is_flat = _resolve_kv_layer(k_cache, layer_idx)
+    v_cache_layer, _ = _resolve_kv_layer(v_cache, layer_idx)
+    num_kv_heads = k_cache_layer.shape[-2]
+    head_dim = k_cache_layer.shape[-1]
+
+    if use_triton is None:
+        use_triton = _default_backend_is_gpu() and not cache_is_flat
+    if use_triton:
+        if cache_is_flat:
+            raise ValueError("packed prefill Triton attention requires a paged cache layer")
+        from nanovllm_jax.kernels.full_attention_triton import (
+            packed_paged_prefill_attention_triton,
+        )
+
+        return packed_paged_prefill_attention_triton(
+            query=query,
+            k_cache_layer=k_cache_layer,
+            v_cache_layer=v_cache_layer,
+            block_table=block_table,
+            kv_lens=kv_lens,
+            positions=positions,
+            query_start_loc=query_start_loc,
+            block_size=block_size,
+            scale=scale,
+            num_key_value_groups=num_key_value_groups,
+            max_query_len=max_query_len if max_query_len is not None else token_bucket,
+        )
+
+    k_flat = (
+        k_cache_layer
+        if cache_is_flat
+        else k_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    )
+    v_flat = (
+        v_cache_layer
+        if cache_is_flat
+        else v_cache_layer.reshape(-1, num_kv_heads, head_dim)
+    )
+
+    max_kv_len = block_table.shape[1] * block_size
+    key_positions = jnp.arange(max_kv_len, dtype=jnp.int32)
+    block_indices = key_positions // block_size
+    slot_indices = key_positions % block_size
+    row_count = block_table.shape[0]
+    row_query_len = int(max_query_len) if max_query_len is not None else token_bucket
+    row_query_len = max(1, min(row_query_len, token_bucket))
+    row_offsets = jnp.arange(row_query_len, dtype=jnp.int32)
+    query_flat_all = query.reshape(token_bucket, num_heads, head_dim)
+    positions_flat = positions.reshape(-1)
+    row_starts = query_start_loc[:-1].astype(jnp.int32)
+    row_lens = (query_start_loc[1:] - query_start_loc[:-1]).astype(jnp.int32)
+    token_indices = row_starts[:, None] + row_offsets[None, :]
+    valid_queries = row_offsets[None, :] < row_lens[:, None]
+    safe_token_indices = jnp.clip(token_indices, 0, token_bucket - 1)
+
+    query_rows = query_flat_all[safe_token_indices].reshape(
+        row_count,
+        row_query_len,
+        num_kv_heads,
+        num_key_value_groups,
+        head_dim,
+    )
+    token_positions = positions_flat[safe_token_indices]
+    physical_blocks = block_table[:, block_indices]
+    slot_mapping = physical_blocks * block_size + slot_indices
+    k_gathered = k_flat[slot_mapping.reshape(-1)].reshape(
+        row_count,
+        max_kv_len,
+        num_kv_heads,
+        head_dim,
+    )
+    v_gathered = v_flat[slot_mapping.reshape(-1)].reshape(
+        row_count,
+        max_kv_len,
+        num_kv_heads,
+        head_dim,
+    )
+    valid_keys = key_positions[None, :] < kv_lens[:, None]
+    causal_keys = key_positions[None, None, :] <= token_positions[:, :, None]
+    attn_mask = valid_queries[:, :, None] & valid_keys[:, None, :] & causal_keys
+    out_rows = jax.nn.dot_product_attention(
+        query_rows.reshape(row_count, row_query_len, num_heads, head_dim).astype(
+            k_gathered.dtype
+        ),
+        k_gathered,
+        v_gathered,
+        mask=attn_mask[:, None, :, :],
+        scale=scale,
+    )
+    out_rows = out_rows.reshape(row_count, row_query_len, num_heads * head_dim)
+    out_rows = jnp.where(valid_queries[:, :, None], out_rows, 0.0)
+    out = jnp.zeros((token_bucket, num_heads * head_dim), dtype=out_rows.dtype)
+    out = out.at[safe_token_indices.reshape(-1)].add(
+        out_rows.reshape(-1, num_heads * head_dim)
+    )
+    return out.reshape(1, token_bucket, num_heads * head_dim)
+
+
 def paged_attention_decode(
     query: jnp.ndarray,  # [batch, query_len, num_heads, head_dim]
     k_cache: jnp.ndarray,  # [num_layers, num_blocks, block_size, num_kv_heads, head_dim] or [num_blocks, block_size, num_kv_heads, head_dim]
@@ -764,7 +931,7 @@ def paged_attention_decode(
         raise ValueError("max_kv_len exceeds the physical cache span covered by block_tables")
     if max_kv_len > num_slots:
         raise ValueError("max_kv_len exceeds the physical cache slot capacity")
-    
+
     # Positions: [batch, max_seq_len] - all positions 0 to max_seq_len-1
     positions_2d = jnp.arange(max_kv_len)[None, :]  # [1, max_kv_len]
     positions_2d = jnp.broadcast_to(positions_2d, (batch, max_kv_len))

@@ -27,6 +27,45 @@ Attention-shaped GDN kernels with pure-JAX fallbacks.
 | P3 | `topk_logits` / sampling / logprob | Feature and diagnostics kernels after decode is closer to vLLM. |
 | P3 | `silu_and_mul` / RMSNorm smoke kernels | Optional FFI validation helpers only if needed. |
 
+## Active FA/FLA Integration Contract
+
+The current implementation target is not a one-off environment-flag experiment.
+Kernel selection should flow through config:
+
+```json
+"kernels": {
+  "full_attention": {
+    "kv_cache_dtype": "bf16",
+    "kv_append_impl": "reference",
+    "decode_impl": "triton_paged",
+    "prefill_impl": "reference"
+  },
+  "gdn": {
+    "prefill_post_conv_impl": "triton_fla_padded",
+    "prefill_block_dot": true,
+    "packed_decode": {
+      "impl": "triton_fla_conv_raw_gates",
+      "qkv_dtype": "bf16"
+    }
+  }
+}
+```
+
+Initial FA promotion work should route decode attention to the existing paged
+Triton boundary and keep KV append on the reference path. FlashInfer append or
+decode is only useful after append and attention share the same NHD page-table
+contract with no hot-path layout conversion or FFI planning.
+
+2026-06-04 result: the route is implemented and correctness-tested, but it is
+not promoted. On `decode_heavy_128x128`, `triton_paged` was exact and slower
+than the current static route; the fused append+decode diagnostic was also
+exact and slower. Keep this as scaffold for a broader production boundary, not
+as a selected serving default.
+
+Initial FLA promotion work should keep the block-dot prefill path and selected
+conv-fused packed decode route, but the next material decode win requires a
+larger GDN boundary than the recurrent core alone.
+
 ## P0.1 - `kv_append_paged_nhd`
 
 - motivation: define the full-attention paged KV layout so later attention

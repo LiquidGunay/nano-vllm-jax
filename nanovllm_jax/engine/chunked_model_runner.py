@@ -37,7 +37,10 @@ class ChunkedModelRunner:
         self.params = params
         self.chunk_size = chunk_size
         
-        max_seqs = getattr(config, 'max_num_seqs', 16)
+        max_seqs = int(
+            getattr(config, "max_num_resident_seqs", None)
+            or getattr(config, "max_num_seqs", 16)
+        )
         self.max_blocks_per_seq = config.num_kvcache_blocks // max_seqs
         
         self.kv_state = init_kv_cache(

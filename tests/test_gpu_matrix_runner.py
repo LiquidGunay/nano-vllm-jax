@@ -722,6 +722,25 @@ def _flag_value(command, flag):
 
 def test_jax_command_applies_workload_overrides_and_reference(tmp_path):
     config = json.loads((CONFIG_DIR / "gpu_paged_default.json").read_text(encoding="utf-8"))
+    config["runtime"] = {
+        "fastpaths": {
+            "materialize_tied_lm_head": True,
+            "compact_prefill_in_proj_qkv": True,
+            "lm_head_decode_act_dtype": "bf16",
+            "decode_padded_gemm": True,
+        }
+    }
+    config["kernels"] = {
+        "full_attention": {"kv_cache_dtype": "bf16"},
+        "gdn": {
+            "disable_fallbacks": True,
+            "prefill_post_conv_impl": "triton_fla_padded",
+            "packed_decode": {
+                "impl": "triton_fla_conv_raw_gates",
+                "qkv_dtype": "bf16",
+            },
+        },
+    }
     workload = WORKLOADS["long_prefill_512_2048"]
     output_json = tmp_path / "out.json"
     reference_json = tmp_path / "ref.json"
@@ -749,6 +768,15 @@ def test_jax_command_applies_workload_overrides_and_reference(tmp_path):
     assert _flag_value(command, "--run-label") == "matrix_label"
     assert "--warmup" in command
     assert "--profile" in command
+    assert "--materialize-tied-lm-head" in command
+    assert "--compact-prefill-in-proj-qkv" in command
+    assert _flag_value(command, "--lm-head-decode-act-dtype") == "bf16"
+    assert "--decode-padded-gemm" in command
+    assert _flag_value(command, "--full-attention-kv-cache-dtype") == "bf16"
+    assert "--gdn-disable-fallbacks" in command
+    assert _flag_value(command, "--gdn-prefill-post-conv-impl") == "triton_fla_padded"
+    assert _flag_value(command, "--gdn-packed-decode-impl") == "triton_fla_conv_raw_gates"
+    assert _flag_value(command, "--gdn-packed-decode-qkv-dtype") == "bf16"
 
 
 def test_jax_command_wires_vllm_random_sidecar_args(tmp_path):

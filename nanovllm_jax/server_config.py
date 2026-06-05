@@ -73,13 +73,44 @@ _ENGINE_ENV_MAP: dict[str, tuple[str, type]] = {
     "weight_dtype": ("NANO_VLLM_JAX_WEIGHT_DTYPE", str),
     "jax_execution": ("NANO_VLLM_JAX_JAX_EXECUTION", str),
     "prefill_buckets": ("NANO_VLLM_JAX_PREFILL_BUCKETS", str),
+    "prefill_token_buckets": ("NANO_VLLM_JAX_PREFILL_TOKEN_BUCKETS", str),
+    "prefill_layout": ("NANO_VLLM_JAX_PREFILL_LAYOUT", str),
     "batch_size_buckets": ("NANO_VLLM_JAX_BATCH_SIZE_BUCKETS", str),
+    "decode_block_table_buckets": ("NANO_VLLM_JAX_DECODE_BLOCK_TABLE_BUCKETS", str),
     "max_prefill": ("NANO_VLLM_JAX_MAX_PREFILL", int),
     "max_kv_cache_mb": ("NANO_VLLM_JAX_MAX_KV_CACHE_MB", int),
     "num_kvcache_blocks": ("NANO_VLLM_JAX_NUM_KVCACHE_BLOCKS", int),
     "max_num_seqs": ("NANO_VLLM_JAX_MAX_NUM_SEQS", int),
+    "max_num_resident_seqs": ("NANO_VLLM_JAX_MAX_NUM_RESIDENT_SEQS", int),
     "max_num_batched_tokens": ("NANO_VLLM_JAX_MAX_NUM_BATCHED_TOKENS", int),
     "num_speculative_tokens": ("NANO_VLLM_JAX_NUM_SPECULATIVE_TOKENS", int),
+    "greedy_token_fastpath": ("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH", bool),
+    "device_token_carry": ("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", bool),
+    "static_decode_metadata": ("NANO_VLLM_JAX_STATIC_DECODE_METADATA", bool),
+    "static_decode_seq_lens_carry": ("NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY", bool),
+    "resident_decode_metadata": ("NANO_VLLM_JAX_RESIDENT_DECODE_METADATA", bool),
+    "greedy_decode_burst_steps": ("NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS", int),
+    "materialize_tied_lm_head": ("NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD", bool),
+    "compact_prefill_in_proj_qkv": ("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", bool),
+    "compact_prefill_gdn_z": ("NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z", bool),
+    "compact_prefill_full_attn_proj": ("NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ", bool),
+    "compact_prefill_mlp": ("NANO_VLLM_JAX_COMPACT_PREFILL_MLP", bool),
+    "compact_prefill_token_count_mode": ("NANO_VLLM_JAX_COMPACT_PREFILL_TOKEN_COUNT_MODE", str),
+    "lm_head_decode_act_dtype": ("NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE", str),
+    "decode_proj_act_dtype": ("NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE", str),
+    "decode_padded_gemm": ("NANO_VLLM_JAX_DECODE_PADDED_GEMM", bool),
+    "decode_padded_gemm_gate_up": ("NANO_VLLM_JAX_DECODE_PADDED_GEMM_GATE_UP", bool),
+    "decode_padded_gemm_rows": ("NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS", int),
+    "decode_padded_gemm_max_out_dim": ("NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM", int),
+    "full_attention_kv_cache_dtype": ("NANO_VLLM_JAX_FULL_ATTN_KV_CACHE_DTYPE", str),
+    "gdn_disable_fallbacks": ("NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS", bool),
+    "gdn_prefill_post_conv_impl": ("NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL", str),
+    "gdn_prefill_qkv_dtype": ("NANO_VLLM_JAX_GDN_PREFILL_QKV_DTYPE", str),
+    "gdn_prefill_post_conv_output_dtype": ("NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_OUTPUT_DTYPE", str),
+    "gdn_packed_decode_impl": ("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", str),
+    "gdn_packed_decode_qkv_dtype": ("NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE", str),
+    "gdn_packed_decode_pre_normalize_qk": ("NANO_VLLM_JAX_GDN_PACKED_DECODE_PRENORMALIZE_QK", bool),
+    "gdn_packed_decode_max_batch": ("NANO_VLLM_JAX_GDN_PACKED_DECODE_MAX_BATCH", int),
     "skip_compile": ("NANO_VLLM_JAX_SKIP_COMPILE", bool),
 }
 
@@ -176,6 +207,76 @@ def _env_section_to_env(env_section: dict) -> dict[str, str]:
     return env
 
 
+def _runtime_fastpaths_to_engine(runtime_section: dict) -> dict[str, Any]:
+    """Project accepted serving fastpaths into engine config fields."""
+    fastpaths = runtime_section.get("fastpaths", {}) or {}
+    mapping = {
+        "greedy_token": "greedy_token_fastpath",
+        "device_token_carry": "device_token_carry",
+        "static_decode_metadata": "static_decode_metadata",
+        "static_decode_seq_lens_carry": "static_decode_seq_lens_carry",
+        "resident_decode_metadata": "resident_decode_metadata",
+        "greedy_decode_burst_steps": "greedy_decode_burst_steps",
+        "decode_block_table_buckets": "decode_block_table_buckets",
+        "materialize_tied_lm_head": "materialize_tied_lm_head",
+        "compact_prefill_in_proj_qkv": "compact_prefill_in_proj_qkv",
+        "compact_prefill_gdn_z": "compact_prefill_gdn_z",
+        "compact_prefill_full_attn_proj": "compact_prefill_full_attn_proj",
+        "compact_prefill_mlp": "compact_prefill_mlp",
+        "compact_prefill_token_count_mode": "compact_prefill_token_count_mode",
+        "lm_head_decode_act_dtype": "lm_head_decode_act_dtype",
+        "decode_proj_act_dtype": "decode_proj_act_dtype",
+        "decode_padded_gemm": "decode_padded_gemm",
+        "decode_padded_gemm_gate_up": "decode_padded_gemm_gate_up",
+        "decode_padded_gemm_rows": "decode_padded_gemm_rows",
+        "decode_padded_gemm_max_out_dim": "decode_padded_gemm_max_out_dim",
+    }
+    return {
+        engine_key: fastpaths[fastpath_key]
+        for fastpath_key, engine_key in mapping.items()
+        if fastpath_key in fastpaths and fastpaths[fastpath_key] is not None
+    }
+
+
+def _kernels_to_engine_config(kernels_section: dict) -> dict[str, Any]:
+    """Project accepted kernel policy into engine/model config fields."""
+    engine: dict[str, Any] = {}
+    full_attention = kernels_section.get("full_attention", {}) or {}
+    if full_attention.get("kv_cache_dtype") is not None:
+        engine["full_attention_kv_cache_dtype"] = full_attention["kv_cache_dtype"]
+    full_attention_mapping = {
+        "kv_append_impl": "full_attention_kv_append_impl",
+        "decode_impl": "full_attention_decode_impl",
+        "prefill_impl": "full_attention_prefill_impl",
+    }
+    for source, target in full_attention_mapping.items():
+        if full_attention.get(source) is not None:
+            engine[target] = full_attention[source]
+
+    gdn = kernels_section.get("gdn", {}) or {}
+    mapping = {
+        "disable_fallbacks": "gdn_disable_fallbacks",
+        "prefill_post_conv_impl": "gdn_prefill_post_conv_impl",
+        "prefill_qkv_dtype": "gdn_prefill_qkv_dtype",
+        "prefill_post_conv_output_dtype": "gdn_prefill_post_conv_output_dtype",
+    }
+    for source, target in mapping.items():
+        if gdn.get(source) is not None:
+            engine[target] = gdn[source]
+
+    packed_decode = gdn.get("packed_decode", {}) or {}
+    packed_mapping = {
+        "impl": "gdn_packed_decode_impl",
+        "qkv_dtype": "gdn_packed_decode_qkv_dtype",
+        "pre_normalize_qk": "gdn_packed_decode_pre_normalize_qk",
+        "max_batch": "gdn_packed_decode_max_batch",
+    }
+    for source, target in packed_mapping.items():
+        if packed_decode.get(source) is not None:
+            engine[target] = packed_decode[source]
+    return engine
+
+
 def _runtime_section_to_env(runtime_section: dict) -> dict[str, str]:
     env: dict[str, str] = {}
     _put_env(env, "JAX_PLATFORMS", runtime_section.get("platform"))
@@ -210,8 +311,13 @@ def _runtime_section_to_env(runtime_section: dict) -> dict[str, str]:
         "compact_prefill_gdn_z": "NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z",
         "compact_prefill_full_attn_proj": "NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ",
         "compact_prefill_mlp": "NANO_VLLM_JAX_COMPACT_PREFILL_MLP",
+        "compact_prefill_token_count_mode": "NANO_VLLM_JAX_COMPACT_PREFILL_TOKEN_COUNT_MODE",
         "device_token_carry": "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
         "static_decode_metadata": "NANO_VLLM_JAX_STATIC_DECODE_METADATA",
+        "static_decode_seq_lens_carry": "NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY",
+        "resident_decode_metadata": "NANO_VLLM_JAX_RESIDENT_DECODE_METADATA",
+        "greedy_decode_burst_steps": "NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS",
+        "trace_token_prefetch": "NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH",
         "lm_head_decode_act_dtype": "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE",
         "decode_proj_act_dtype": "NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE",
         "decode_padded_gemm": "NANO_VLLM_JAX_DECODE_PADDED_GEMM",
@@ -239,6 +345,7 @@ def _kernels_section_to_env(kernels_section: dict) -> dict[str, str]:
     full_attention = kernels_section.get("full_attention", {}) or {}
     full_attention_map = {
         "nhd_full_attention_kv_cache": "NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE",
+        "kv_cache_dtype": "NANO_VLLM_JAX_FULL_ATTN_KV_CACHE_DTYPE",
         "flashinfer_kv_append": "NANO_VLLM_JAX_FLASHINFER_KV_APPEND",
         "cuda_fp32_kv_append": "NANO_VLLM_JAX_CUDA_FP32_KV_APPEND",
         "cuda_fp32_decode_attention": "NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN",
@@ -357,6 +464,15 @@ def runtime_env_from_config(config: dict) -> dict[str, str]:
     return env
 
 
+def engine_overrides_from_config(config: dict) -> dict[str, Any]:
+    """Return engine/config fields implied by typed runtime and kernel policy."""
+
+    return {
+        **_runtime_fastpaths_to_engine(config.get("runtime", {}) or {}),
+        **_kernels_to_engine_config(config.get("kernels", {}) or {}),
+    }
+
+
 def _apply_runtime_env(env: dict[str, str]) -> None:
     """Set os.environ from resolved runtime config; existing env vars still win."""
     for key, value in env.items():
@@ -437,20 +553,59 @@ def load_server_config(path: str | Path | None = None) -> ServerConfig:
         "weight_dtype": None,
         "jax_execution": "jit",
         "prefill_buckets": "16",
+        "prefill_token_buckets": "16",
+        "prefill_layout": "packed",
         "batch_size_buckets": "1",
         "max_prefill": 16,
         "max_kv_cache_mb": 64,
         "num_kvcache_blocks": 8,
         "max_num_seqs": 1,
+        "max_num_resident_seqs": None,
         "max_num_batched_tokens": 16,
         "num_speculative_tokens": 0,
+        "greedy_token_fastpath": True,
+        "device_token_carry": False,
+        "static_decode_metadata": False,
+        "static_decode_seq_lens_carry": False,
+        "resident_decode_metadata": False,
+        "greedy_decode_burst_steps": 1,
+        "materialize_tied_lm_head": False,
+        "compact_prefill_in_proj_qkv": False,
+        "compact_prefill_gdn_z": False,
+        "compact_prefill_full_attn_proj": False,
+        "compact_prefill_mlp": False,
+        "compact_prefill_token_count_mode": "exact",
+        "lm_head_decode_act_dtype": "fp32",
+        "decode_proj_act_dtype": "fp32",
+        "decode_padded_gemm": False,
+        "decode_padded_gemm_gate_up": False,
+        "decode_padded_gemm_rows": 8,
+        "decode_padded_gemm_max_out_dim": 8192,
+        "full_attention_kv_cache_dtype": "default",
+        "full_attention_kv_append_impl": "reference",
+        "full_attention_decode_impl": "reference",
+        "full_attention_prefill_impl": "reference",
+        "gdn_disable_fallbacks": False,
+        "gdn_prefill_post_conv_impl": "off",
+        "gdn_prefill_qkv_dtype": "fp32",
+        "gdn_prefill_post_conv_output_dtype": "fp32",
+        "gdn_packed_decode_impl": "off",
+        "gdn_packed_decode_qkv_dtype": "fp32",
+        "gdn_packed_decode_pre_normalize_qk": False,
+        "gdn_packed_decode_max_batch": None,
         "skip_compile": False,
     }
 
     server = _apply_env_overrides({**server_defaults, **raw.get("server", {})}, _SERVER_ENV_MAP)
-    engine = _apply_env_overrides({**engine_defaults, **raw.get("engine", {})}, _ENGINE_ENV_MAP)
-
     runtime = dict(raw.get("runtime", {}) or {})
+    explicit_engine = dict(raw.get("engine", {}) or {})
+    engine_raw = {
+        **engine_defaults,
+        **engine_overrides_from_config(raw),
+        **explicit_engine,
+    }
+    engine = _apply_env_overrides(engine_raw, _ENGINE_ENV_MAP)
+
     kernels = dict(raw.get("kernels", {}) or {})
     env = runtime_env_from_config(raw)
     _apply_runtime_env(env)

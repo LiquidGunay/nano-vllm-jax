@@ -302,6 +302,74 @@ Current GPU artifacts:
 | `batch4_16_32_64_128x24` | vLLM async baseline | diverges on `len_64` at generated index 6 | 549.03 | 63.09 | 4.87 | first-step top-1 matches all rows; correctness issue is logged in the run journal. |
 | `batch4_16_32_64_128x24` | vLLM offline MTP1 | same `len_64` divergence as vLLM baseline | 32.08 | n/a | n/a | slower than vLLM offline baseline; offline API has no true ITL. |
 
+## Random-request JAX/vLLM sidecar
+
+Use this sidecar when you want one randomized request suite that exercises harder
+shape/range pressure than `hetero8` and feeds the exact same prompts to both
+`benchmark_jax_server_trace.py` and `benchmark_vllm_qwen35.py` via manifest:
+
+```bash
+/mountpoint/.exp/.venv/bin/python benchmarks/benchmark_random_request_sidecar.py \
+  --model Qwen/Qwen3.5-0.8B \
+  --backend gpu \
+  --dtype bfloat16 \
+  --weight-dtype bfloat16 \
+  --jax-execution jit \
+  --vllm-execution async \
+  --min-input-tokens 512 \
+  --max-input-tokens 4096 \
+  --min-output-tokens 256 \
+  --max-output-tokens 1024 \
+  --min-request-count 5 \
+  --max-request-count 15 \
+  --seed 1234 \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 2048 \
+  --prefill-buckets 128,256,512,1024,2048 \
+  --batch-size-buckets 1,2,3,4,5,6,7,8 \
+  --max-blocks-per-seq 512 \
+  --jax-num-kvcache-blocks 2048 \
+  --jax-max-kv-cache-mb 8192 \
+  --output-json /mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_request_sidecar.json \
+  --run-label random_qwen08_vs_vllm
+```
+
+Differences versus the current `hetero8` anchor:
+
+- Fixed counts are replaced with random request counts (`--min-request-count`/`--max-request-count`) and random input/output lengths.
+- Outputs include token-bucket stress (`256-1024`) and input stress (`512-4096`) that are larger than `hetero8`.
+- The sidecar saves the manifest and SHA (`prompt_manifest_jsonl` + `prompt_manifest_sha256`) so the generated suite can be rerun exactly.
+- Artifacts include per-run throughput, `ttft_ms_p50`, `itl_ms_p50`, request throughput, and cross-run generated-token comparison rows (`jax_vs_vllm`).
+- vLLM defaults to BF16 when JAX runs FP32 activations, because Qwen3.5's vLLM
+  GDN path does not support FP32 chunked GDN execution.
+
+The final artifact is full JSON written to `--output-json`; keep it under
+`/mountpoint/.exp/diagnostics` and record only summary numbers and artifact
+paths in repo docs. Pass `--reference-json` only when the reference artifact was
+generated from the same random manifest.
+
+For the `512-4096` input and `256-1024` output range, JAX must be launched with
+per-sequence capacity above the largest prompt+output request in the manifest.
+For seed `1234`, one request needs `5029` total tokens, so
+`--max-blocks-per-seq 256` is insufficient; use at least
+`--max-blocks-per-seq 512` and size `--jax-num-kvcache-blocks` for the active
+concurrency.
+
+Current working seed-`1234` A10G baseline:
+
+- artifact:
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_request_sidecar_seed1234_20260603_r19_full_bf16_2048cap_2048blocks_fixed.json`;
+- JAX BF16, `max_num_batched_tokens=2048`, `num_kvcache_blocks=2048`,
+  `max_blocks_per_seq=512`: `204.61 output tok/s`, `742.62 total tok/s`,
+  TTFT p50 `1361.02 ms`, ITL p50 `17.03 ms`;
+- live vLLM BF16 on the same manifest: `1531.33 output tok/s`,
+  `5557.75 total tok/s`, TTFT p50 `587.22 ms`, ITL p50 `6.95 ms`;
+- ratio: `0.134x` vLLM for both output and total token throughput;
+- generated lengths match, but generated tokens are not an exact parity pass:
+  4 of 15 rows diverge, first at request `12`, generated index `32`
+  (`1599` versus `9032`). Treat this as a working stress benchmark and speed
+  baseline, not as correctness proof.
+
 ## HF long-prefill reference generation
 
 Use `benchmarks/precompute_hf_prompt_reference.py` when a benchmark needs a

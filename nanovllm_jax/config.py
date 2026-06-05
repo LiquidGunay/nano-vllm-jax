@@ -68,13 +68,53 @@ class Qwen3_5Config:
     
     # Scheduler config
     max_num_seqs: int = 16
+    max_num_resident_seqs: Optional[int] = None
     max_num_batched_tokens: int = 2048
     eos: Optional[int] = None
     prefill_buckets: tuple = field(default_factory=tuple)
+    prefill_token_buckets: tuple = field(default_factory=tuple)
+    prefill_layout: str = "packed"
     batch_size_buckets: tuple = field(default_factory=tuple)
     max_blocks_per_seq: Optional[int] = None
+    decode_block_table_buckets: tuple = field(default_factory=tuple)
     jax_execution: str = "eager"
+    greedy_token_fastpath: bool = True
+    device_token_carry: bool = False
     static_decode_metadata: bool = False
+    static_decode_seq_lens_carry: bool = False
+    resident_decode_metadata: bool = False
+    greedy_decode_burst_steps: int = 1
+
+    # Accepted serving fast paths. Environment variables remain supported as
+    # compatibility overrides, but server/benchmark configs should set these
+    # fields directly.
+    materialize_tied_lm_head: bool = False
+    compact_prefill_in_proj_qkv: bool = False
+    compact_prefill_gdn_z: bool = False
+    compact_prefill_full_attn_proj: bool = False
+    compact_prefill_mlp: bool = False
+    compact_prefill_token_count_mode: str = "exact"
+    lm_head_decode_act_dtype: str = "fp32"
+    decode_proj_act_dtype: str = "fp32"
+    decode_padded_gemm: bool = False
+    decode_padded_gemm_gate_up: bool = False
+    decode_padded_gemm_rows: int = 8
+    decode_padded_gemm_max_out_dim: int = 8192
+
+    # Kernel policy carried by config. Low-level diagnostic CUDA switches stay
+    # env-only; accepted serving kernels should flow through these fields.
+    full_attention_kv_cache_dtype: str = "default"
+    full_attention_kv_append_impl: str = "reference"
+    full_attention_decode_impl: str = "reference"
+    full_attention_prefill_impl: str = "reference"
+    gdn_disable_fallbacks: bool = False
+    gdn_prefill_post_conv_impl: str = "off"
+    gdn_prefill_qkv_dtype: str = "fp32"
+    gdn_prefill_post_conv_output_dtype: str = "fp32"
+    gdn_packed_decode_impl: str = "off"
+    gdn_packed_decode_qkv_dtype: str = "fp32"
+    gdn_packed_decode_pre_normalize_qk: bool = False
+    gdn_packed_decode_max_batch: Optional[int] = None
     
     # Vision config (for multimodal)
     vision_depth: int = 12
@@ -85,6 +125,118 @@ class Qwen3_5Config:
     
     def __post_init__(self):
         """Initialize layer_types if not provided."""
+        max_num_seqs = max(1, int(self.max_num_seqs or 1))
+        object.__setattr__(self, "max_num_seqs", max_num_seqs)
+        resident_raw = self.max_num_resident_seqs
+        if resident_raw is None or int(resident_raw) <= 0:
+            max_num_resident_seqs = max_num_seqs
+        else:
+            max_num_resident_seqs = int(resident_raw)
+        if max_num_resident_seqs < max_num_seqs:
+            raise ValueError("max_num_resident_seqs must be >= max_num_seqs")
+        object.__setattr__(self, "max_num_resident_seqs", max_num_resident_seqs)
+
+        for field_name in (
+            "prefill_buckets",
+            "prefill_token_buckets",
+            "batch_size_buckets",
+            "decode_block_table_buckets",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, str):
+                parsed = tuple(int(part) for part in value.split(",") if part.strip())
+                object.__setattr__(self, field_name, parsed)
+            elif value is None:
+                object.__setattr__(self, field_name, ())
+            elif not isinstance(value, tuple):
+                object.__setattr__(self, field_name, tuple(value))
+        prefill_layout = str(self.prefill_layout or "packed").strip().lower()
+        if prefill_layout not in {"packed", "dense"}:
+            raise ValueError("prefill_layout must be 'packed' or 'dense'")
+        object.__setattr__(self, "prefill_layout", prefill_layout)
+        object.__setattr__(
+            self,
+            "greedy_decode_burst_steps",
+            max(1, int(self.greedy_decode_burst_steps or 1)),
+        )
+        object.__setattr__(
+            self,
+            "compact_prefill_token_count_mode",
+            str(self.compact_prefill_token_count_mode or "exact").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "lm_head_decode_act_dtype",
+            str(self.lm_head_decode_act_dtype or "fp32").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "decode_proj_act_dtype",
+            str(self.decode_proj_act_dtype or "fp32").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "decode_padded_gemm_rows",
+            max(1, int(self.decode_padded_gemm_rows or 1)),
+        )
+        object.__setattr__(
+            self,
+            "decode_padded_gemm_max_out_dim",
+            max(1, int(self.decode_padded_gemm_max_out_dim or 1)),
+        )
+        object.__setattr__(
+            self,
+            "full_attention_kv_cache_dtype",
+            str(self.full_attention_kv_cache_dtype or "default").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "full_attention_kv_append_impl",
+            str(self.full_attention_kv_append_impl or "reference").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "full_attention_decode_impl",
+            str(self.full_attention_decode_impl or "reference").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "full_attention_prefill_impl",
+            str(self.full_attention_prefill_impl or "reference").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "gdn_prefill_post_conv_impl",
+            str(self.gdn_prefill_post_conv_impl or "off").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "gdn_prefill_qkv_dtype",
+            str(self.gdn_prefill_qkv_dtype or "fp32").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "gdn_prefill_post_conv_output_dtype",
+            str(self.gdn_prefill_post_conv_output_dtype or "fp32").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "gdn_packed_decode_impl",
+            str(self.gdn_packed_decode_impl or "off").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "gdn_packed_decode_qkv_dtype",
+            str(self.gdn_packed_decode_qkv_dtype or "fp32").strip().lower(),
+        )
+        if self.gdn_packed_decode_max_batch is not None:
+            max_batch = int(self.gdn_packed_decode_max_batch)
+            object.__setattr__(
+                self,
+                "gdn_packed_decode_max_batch",
+                max_batch if max_batch > 0 else None,
+            )
+
         if self.layer_types is None:
             # Default pattern: 3 linear + 1 full attention
             interval = 4
@@ -135,6 +287,39 @@ class Qwen3_5Config:
             self.num_speculative_tokens,
             self.block_size,
             self.max_kv_cache_bytes,
+            self.prefill_token_buckets,
+            self.prefill_layout,
+            self.decode_block_table_buckets,
+            self.greedy_token_fastpath,
+            self.device_token_carry,
+            self.static_decode_metadata,
+            self.static_decode_seq_lens_carry,
+            self.resident_decode_metadata,
+            self.greedy_decode_burst_steps,
+            self.materialize_tied_lm_head,
+            self.compact_prefill_in_proj_qkv,
+            self.compact_prefill_gdn_z,
+            self.compact_prefill_full_attn_proj,
+            self.compact_prefill_mlp,
+            self.compact_prefill_token_count_mode,
+            self.lm_head_decode_act_dtype,
+            self.decode_proj_act_dtype,
+            self.decode_padded_gemm,
+            self.decode_padded_gemm_gate_up,
+            self.decode_padded_gemm_rows,
+            self.decode_padded_gemm_max_out_dim,
+            self.full_attention_kv_cache_dtype,
+            self.full_attention_kv_append_impl,
+            self.full_attention_decode_impl,
+            self.full_attention_prefill_impl,
+            self.gdn_disable_fallbacks,
+            self.gdn_prefill_post_conv_impl,
+            self.gdn_prefill_qkv_dtype,
+            self.gdn_prefill_post_conv_output_dtype,
+            self.gdn_packed_decode_impl,
+            self.gdn_packed_decode_qkv_dtype,
+            self.gdn_packed_decode_pre_normalize_qk,
+            self.gdn_packed_decode_max_batch,
         ))
     
     def get_dtype(self):
@@ -249,11 +434,46 @@ class Qwen3_5Config:
             "mtp_use_dedicated_embeddings": self.mtp_use_dedicated_embeddings,
             "num_speculative_tokens": self.num_speculative_tokens,
             "max_kv_cache_bytes": self.max_kv_cache_bytes,
+            "max_num_seqs": self.max_num_seqs,
+            "max_num_resident_seqs": self.max_num_resident_seqs,
+            "max_num_batched_tokens": self.max_num_batched_tokens,
             "prefill_buckets": self.prefill_buckets,
+            "prefill_token_buckets": self.prefill_token_buckets,
+            "prefill_layout": self.prefill_layout,
             "batch_size_buckets": self.batch_size_buckets,
             "max_blocks_per_seq": self.max_blocks_per_seq,
+            "decode_block_table_buckets": self.decode_block_table_buckets,
             "jax_execution": self.jax_execution,
+            "greedy_token_fastpath": self.greedy_token_fastpath,
+            "device_token_carry": self.device_token_carry,
             "static_decode_metadata": self.static_decode_metadata,
+            "static_decode_seq_lens_carry": self.static_decode_seq_lens_carry,
+            "resident_decode_metadata": self.resident_decode_metadata,
+            "greedy_decode_burst_steps": self.greedy_decode_burst_steps,
+            "materialize_tied_lm_head": self.materialize_tied_lm_head,
+            "compact_prefill_in_proj_qkv": self.compact_prefill_in_proj_qkv,
+            "compact_prefill_gdn_z": self.compact_prefill_gdn_z,
+            "compact_prefill_full_attn_proj": self.compact_prefill_full_attn_proj,
+            "compact_prefill_mlp": self.compact_prefill_mlp,
+            "compact_prefill_token_count_mode": self.compact_prefill_token_count_mode,
+            "lm_head_decode_act_dtype": self.lm_head_decode_act_dtype,
+            "decode_proj_act_dtype": self.decode_proj_act_dtype,
+            "decode_padded_gemm": self.decode_padded_gemm,
+            "decode_padded_gemm_gate_up": self.decode_padded_gemm_gate_up,
+            "decode_padded_gemm_rows": self.decode_padded_gemm_rows,
+            "decode_padded_gemm_max_out_dim": self.decode_padded_gemm_max_out_dim,
+            "full_attention_kv_cache_dtype": self.full_attention_kv_cache_dtype,
+            "full_attention_kv_append_impl": self.full_attention_kv_append_impl,
+            "full_attention_decode_impl": self.full_attention_decode_impl,
+            "full_attention_prefill_impl": self.full_attention_prefill_impl,
+            "gdn_disable_fallbacks": self.gdn_disable_fallbacks,
+            "gdn_prefill_post_conv_impl": self.gdn_prefill_post_conv_impl,
+            "gdn_prefill_qkv_dtype": self.gdn_prefill_qkv_dtype,
+            "gdn_prefill_post_conv_output_dtype": self.gdn_prefill_post_conv_output_dtype,
+            "gdn_packed_decode_impl": self.gdn_packed_decode_impl,
+            "gdn_packed_decode_qkv_dtype": self.gdn_packed_decode_qkv_dtype,
+            "gdn_packed_decode_pre_normalize_qk": self.gdn_packed_decode_pre_normalize_qk,
+            "gdn_packed_decode_max_batch": self.gdn_packed_decode_max_batch,
         }
     
     @classmethod

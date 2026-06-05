@@ -13,6 +13,7 @@ import pytest
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
+from nanovllm_jax.backends import _static_packed_gdn_chunk_metadata
 from nanovllm_jax.kernels.gdn_fla import (
     gdn_fla_chunk_delta_h_packed_reference,
     gdn_fla_chunk_fwd_o_packed_reference,
@@ -1651,6 +1652,110 @@ def test_gdn_fla_chunk_gated_delta_rule_packed_triton_block_dot_mixed_lengths(
         actual_state,
         expected_state,
         atol=5e-3,
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_gdn_fla_packed_triton_static_bucket_metadata_matches_reference(monkeypatch):
+    from nanovllm_jax.kernels.gdn_fla_triton import (
+        gdn_fla_chunk_gated_delta_rule_packed_triton,
+    )
+
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS", "1")
+    chunk_size = 8
+    token_bucket = 48
+    cu_seqlens = jnp.array([0, 0, 7, 29, 31], dtype=jnp.int32)
+    total_tokens = int(cu_seqlens[-1])
+    row_count = int(cu_seqlens.shape[0] - 1)
+    num_heads = 2
+    key_dim = 8
+    value_dim = 8
+    keys = jax.random.split(jax.random.PRNGKey(20260605), 6)
+    query = jax.random.normal(
+        keys[0],
+        (token_bucket, num_heads, key_dim),
+        dtype=jnp.float32,
+    ) * 0.02
+    key = jax.random.normal(
+        keys[1],
+        (token_bucket, num_heads, key_dim),
+        dtype=jnp.float32,
+    ) * 0.02
+    value = jax.random.normal(
+        keys[2],
+        (token_bucket, num_heads, value_dim),
+        dtype=jnp.float32,
+    ) * 0.03
+    gate = jax.random.normal(
+        keys[3],
+        (token_bucket, num_heads),
+        dtype=jnp.float32,
+    ) * 0.01
+    beta = jax.random.uniform(
+        keys[4],
+        (token_bucket, num_heads),
+        dtype=jnp.float32,
+        minval=0.2,
+        maxval=0.7,
+    )
+    initial_state = jax.random.normal(
+        keys[5],
+        (row_count, num_heads, value_dim, key_dim),
+        dtype=jnp.float32,
+    ) * 0.01
+    valid = jnp.arange(token_bucket, dtype=jnp.int32) < cu_seqlens[-1]
+    query = jnp.where(valid[:, None, None], query, 0.0)
+    key = jnp.where(valid[:, None, None], key, 0.0)
+    value = jnp.where(valid[:, None, None], value, 0.0)
+    gate = jnp.where(valid[:, None], gate, 0.0)
+    beta = jnp.where(valid[:, None], beta, 0.0)
+    chunk_indices, chunk_offsets, max_row_chunks = (
+        _static_packed_gdn_chunk_metadata(
+            row_count=row_count,
+            token_bucket=token_bucket,
+            chunk_size=chunk_size,
+            max_row_tokens=24,
+        )
+    )
+
+    actual_out, actual_state = gdn_fla_chunk_gated_delta_rule_packed_triton(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        cu_seqlens,
+        initial_state,
+        chunk_size=chunk_size,
+        use_qk_l2norm_in_kernel=False,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        max_row_chunks=max_row_chunks,
+    )
+    expected_out, expected_state = gdn_fla_chunk_gated_delta_rule_packed_reference(
+        query[:total_tokens],
+        key[:total_tokens],
+        value[:total_tokens],
+        gate[:total_tokens],
+        beta[:total_tokens],
+        cu_seqlens,
+        initial_state,
+        chunk_size=chunk_size,
+        use_qk_l2norm_in_kernel=False,
+    )
+
+    _assert_allclose_with_nan_counts(
+        "static_bucket_metadata_output",
+        actual_out[:total_tokens],
+        expected_out,
+        atol=2e-6,
+    )
+    _assert_allclose_with_nan_counts(
+        "static_bucket_metadata_state",
+        actual_state,
+        expected_state,
+        atol=4e-6,
     )
 
 

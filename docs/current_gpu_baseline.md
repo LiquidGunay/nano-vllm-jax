@@ -35,7 +35,7 @@ optimization plan in `docs/gpu_optimization_next_goal_plan.md`.
   - `max_num_seqs=8`
   - `max_blocks_per_seq=40`
   - `prefill_buckets=64,128,256,384,512`
-  - `batch_size_buckets=1,2,4,8`
+  - `batch_size_buckets=1,2,3,4,5,6,7,8` for the active random-serving lane
 
 ## Metrics
 
