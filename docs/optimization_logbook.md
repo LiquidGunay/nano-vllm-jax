@@ -9493,3 +9493,54 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - `pytest -q tests/test_backend_boundaries.py -k 'warmup_compiles_table_prefill_when_available or warmup_uses_greedy_token_fastpath_without_mtp or packed_prefill_greedy_token_jit_returns_row_tokens'`;
   - `pytest -q tests/test_benchmark_random_request_sidecar.py tests/test_backend_boundaries.py -k 'benchmark_random_request_sidecar or warmup_compiles_table_prefill_when_available or warmup_uses_greedy_token_fastpath_without_mtp or warmup_compiles_decode_block_table_buckets or packed_prefill_greedy_token_jit_returns_row_tokens or table_hybrid_decode_matches_sliced_decode or initializes_resident_decode_metadata_flag or syncs_resident_decode_metadata_by_slot'`;
   - `git diff --check`.
+
+### Entry 250 - Static Decode Carry Row Alignment
+
+- date: 2026-06-05
+- purpose:
+  - attack the largest remaining medium-random profile bucket after table
+    prefill promotion: CPU-side JAX gather/scatter and extra PJRT executions in
+    `_maybe_apply_device_token_carry`;
+  - keep the optimization model-family general by reducing serving-boundary
+    array rewrites rather than tuning kernels or dimensions.
+- implementation:
+  - when greedy decode returns a full static-bucket token array, record the full
+    `batch.seq_ids_host` tuple, including padded rows, as the fast-path carry
+    alignment key;
+  - keep `_device_token_carry_by_seq_id` active-row-only so correctness for
+    row-order changes still uses logical sequence IDs;
+  - skip prefill resident-metadata sync unless `resident_decode_metadata` is
+    enabled. The accepted random path has resident metadata disabled, so the
+    previous unconditional sync was dead work.
+- artifacts:
+  - guarded medium JAX-only before:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_guarded_medium_r1.json`;
+  - guarded medium live-vLLM comparison:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_guarded_medium_with_vllm_r1.json`;
+  - guarded medium JAX-only after:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_token_carry_medium_r1.json`;
+  - medium profile before:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_guarded_medium_profile_r1.json`;
+  - medium profile after:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_token_carry_medium_profile_r1.json`.
+- results:
+  - medium live comparison before this change: JAX `313.31 output tok/s`, vLLM
+    `511.94 output tok/s`, ratio `0.612x`, zero measured-phase JIT growth;
+  - medium after this change: JAX `355.14 output tok/s`, same `290` output
+    tokens, zero measured-phase JIT growth. Against the live medium vLLM
+    denominator this is about `0.69x`;
+  - profile before/after:
+    - CPU `gather`: `376.6 ms` -> `50.9 ms`;
+    - `PjRtCApiLoadedExecutable::Execute` count: `557` -> `321`;
+    - `_run_main_and_sample`: `808.0 ms` -> `646.0 ms`;
+    - GPU `cutlass` and `fusion` totals were effectively unchanged, so the
+      win came from host/PJRT boundary cleanup, not GPU-kernel changes.
+- decision:
+  - keep this change and promote it to the next larger guarded random rung;
+  - the next optimization should target the remaining per-step PJRT/device-token
+    carry overhead or a broader fused decode boundary. The GPU GEMM/fusion work
+    is now a more visible share of time, but host overhead is not fully gone.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_runner.py tests/test_device_token_carry.py`;
+  - `pytest -q tests/test_device_token_carry.py -k 'records_full_static_decode_rows or whole_vector_when_seq_ids_match or follows_seq_ids_after_row_order_change or static_decode_metadata_applies_carried_seq_lens or first_static_decode_can_use_scheduler_seq_lens'`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'warmup_compiles_table_prefill_when_available or packed_prefill_greedy_token_jit_returns_row_tokens'`.

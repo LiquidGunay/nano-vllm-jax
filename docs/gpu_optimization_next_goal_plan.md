@@ -200,6 +200,16 @@ same tiny accepted-config control at `104.33 output tok/s`. This is only a
 promotion signal for the next medium run, not a replacement for the full random
 anchor above.
 
+Status note, 2026-06-05 r3: the first guarded medium rung
+(`4` requests, `1787` input tokens, `290` output tokens) completed with zero
+measured-phase JIT growth. Live same-envelope vLLM measured
+`511.94 output tok/s`. After preserving full static decode row alignment in
+the device-token carry and avoiding prefill resident-metadata sync when the
+resident path is disabled, the JAX medium rung reached `355.14 output tok/s`
+without profiling, about `0.69x` that vLLM denominator. The follow-up profile
+confirmed CPU `gather` fell from `376.6 ms` to `50.9 ms`; remaining work is
+per-step PJRT/device-token carry overhead plus real GPU GEMM/fusion time.
+
 Micro-burst selection model:
 
 - A width-`K` greedy burst replaces `K` host/PJRT scheduler executions with one

@@ -1763,7 +1763,11 @@ class CanonicalModelRunner:
             new_carry_by_seq_id[seq_id] = token_ref
         if not new_carry_by_seq_id:
             return
-        self._device_token_carry_seq_ids = tuple(new_carry_by_seq_id)
+        self._device_token_carry_seq_ids = (
+            tuple(int(seq_id) for seq_id in batch.seq_ids_host)
+            if full_batch_tokens
+            else tuple(new_carry_by_seq_id)
+        )
         self._device_token_carry_tokens = token_ids
         self._device_token_carry_by_seq_id = carry_by_seq_id
         use_seq_lens_carry = bool(
@@ -2841,7 +2845,7 @@ class CanonicalModelRunner:
                 )
         else:
             self._store_batch_hybrid_state(batch, output.hybrid_state)
-        if batch.is_prefill:
+        if batch.is_prefill and bool(getattr(self, "resident_decode_metadata", False)):
             self._sync_resident_decode_metadata(
                 batch,
                 list(batch.hybrid_slot_ids_host or ()),
