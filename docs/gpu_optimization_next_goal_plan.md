@@ -305,6 +305,26 @@ GDN/GEMM boundary audit, 2026-06-05:
   model-family-general greedy LM-head matmul+argmax epilogue. Do not spend the
   next pass sweeping padded-GEMM rows or narrow GDN launch parameters.
 
+Random benchmark policy, 2026-06-05:
+
+- use the medium and large random envelopes as the normal hill-climb lanes.
+  They exercise the same serving mechanisms that matter for the full random
+  graph, but keep compile/run time low enough for iteration.
+- the full seed-`1234` random graph remains a safety/release validation, not
+  the default benchmark after every edit.
+- use stored same-envelope vLLM denominators for JAX-only A/B work. Rerun live
+  vLLM only after benchmark-contract changes, runtime/library/hardware changes,
+  or before promoting a new best result.
+- current stored medium denominator:
+  `random_promoted_medium_with_vllm_r1`, `4` requests, `1787` input tokens,
+  `290` output tokens, vLLM `471.06 output tok/s`, JAX
+  `355.77 output tok/s`, JAX/vLLM `0.755x`, zero measured-phase JIT growth
+  (`15 -> 15`).
+- current stored large denominator remains
+  `random_config_table_prefill_token_carry_large_with_vllm_r1`: `8` requests,
+  `6240` input tokens, `1351` output tokens, vLLM `884.03 output tok/s`, JAX
+  `400.42 output tok/s`, JAX/vLLM `0.453x`, zero measured-phase JIT growth.
+
 Micro-burst selection model:
 
 - A width-`K` greedy burst replaces `K` host/PJRT scheduler executions with one

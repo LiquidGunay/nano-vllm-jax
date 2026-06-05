@@ -9674,3 +9674,34 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
 - validation:
   - `python -m py_compile nanovllm_jax/engine/scheduler.py tests/test_device_token_carry.py`;
   - `pytest -q tests/test_device_token_carry.py -k 'static_decode_metadata_reuses_fixed_device_arrays or static_decode_metadata_can_reuse_seq_lens_placeholder or resident_decode_metadata_uses_device_placeholders'`.
+
+### Entry 254 - Random Iteration Lanes And Stored vLLM Denominators
+
+- date: 2026-06-05
+- purpose:
+  - keep future random hill-climbing fast and comparable;
+  - avoid paying live-vLLM startup on every JAX-only implementation attempt;
+  - avoid using the full seed-`1234` random graph as the default edit/measure
+    loop when medium and large random already exercise the same serving paths.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_promoted_medium_with_vllm_r1.json`.
+- result:
+  - medium random live comparison: `4` requests, `1787` input tokens,
+    `290` output tokens;
+  - JAX `355.77 output tok/s`;
+  - vLLM `471.06 output tok/s`;
+  - JAX/vLLM ratio `0.755x`;
+  - zero measured-phase JIT growth (`15 -> 15`);
+  - peak system RAM: JAX `45.2%`, vLLM `46.5%`.
+- correctness note:
+  - one request matched fully, while the other rows diverged early from vLLM.
+    This remains acceptable for the random lane under the current approximate
+    correctness policy because earlier diagnostics showed close logits around
+    tie-sensitive early tokens.
+- decision:
+  - use medium and large random as the normal optimization lanes;
+  - treat the full seed-`1234` random graph as an occasional safety/release
+    validation;
+  - use stored same-envelope vLLM denominators for JAX-only A/B work. Rerun
+    live vLLM only after benchmark-contract changes, runtime/library/hardware
+    changes, or before promoting a new best result.

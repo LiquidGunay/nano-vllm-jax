@@ -40,6 +40,14 @@
   full seed-1234 random decode graph. Do not run the full graph after a
   boundary-changing edit unless the smaller run shows acceptable correctness,
   no measured-phase JIT cache growth, and reasonable memory behavior.
+- Use the medium and large random envelopes as the normal optimization lanes.
+  They are representative enough for hill climbing and run much faster than the
+  full seed-1234 graph. Treat the full random graph as an occasional safety or
+  release validation, not the default iteration benchmark.
+- Do not run live vLLM on every iteration. Use stored same-envelope vLLM
+  denominators for JAX-only A/B work, and rerun live vLLM only after benchmark
+  contract changes, runtime/library/hardware changes, or before promoting a
+  new best result.
 - Keep benchmark artifacts under `/mountpoint/.exp/diagnostics` or another
   mountpoint path, but commit only summaries, configs, docs, and tests. Do not
   stage `results/*` or full profile/artifact dumps.
