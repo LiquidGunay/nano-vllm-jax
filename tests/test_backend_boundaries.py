@@ -553,6 +553,18 @@ def test_scheduler_pads_scheduled_batch_to_static_buckets():
     assert batch.num_prefill_tokens == 4
 
 
+def test_model_runner_initializes_resident_decode_metadata_flag():
+    config = _tiny_full_attention_config()
+    config.resident_decode_metadata = True
+    params = init_params(jax.random.PRNGKey(31), config)
+
+    runner = ModelRunner(config, params, backend="pure_jax")
+
+    assert runner.resident_decode_metadata is True
+    assert runner.greedy_token_fastpath is True
+    assert runner.device_token_carry is False
+
+
 def _hybrid_state_runner_with_two_slots() -> ModelRunner:
     runner = ModelRunner.__new__(ModelRunner)
     runner._max_hybrid_slots = 2

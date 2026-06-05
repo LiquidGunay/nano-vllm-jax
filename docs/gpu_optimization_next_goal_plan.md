@@ -175,10 +175,19 @@ Next implementation order:
    - after any new decode JIT boundary, run a scaled JAX-only random diagnostic
      before the full seed-`1234` sidecar to avoid repeating the unsafe full
      compile path;
+   - run random sidecar experiments through `--jax-config` so the sidecar uses
+     the same typed runtime/kernel policy as the server and GPU matrix runner;
    - promoted random runs must keep full output lengths, acceptable correctness,
      and zero measured-phase JIT cache growth;
    - reprofile only after a structural change and compare against the fresh
      random anchor, the Entry 240 anchor, and the live vLLM reference.
+
+Status note, 2026-06-05: resident decode metadata v1 is correct and
+cache-stable on a tiny random A/B, but it is slower than the current
+table/static metadata path (`67.75` vs `104.33 output tok/s`). Keep it opt-in
+as scaffolding only; do not scale it to medium/full random runs until the
+gather/scatter/table-update overhead is folded into a larger useful decode
+boundary or removed.
 
 Micro-burst selection model:
 

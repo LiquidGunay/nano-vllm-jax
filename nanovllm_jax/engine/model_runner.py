@@ -984,6 +984,25 @@ class CanonicalModelRunner:
             self.max_blocks_per_seq = max(1, effective_num_blocks // max_seqs)
             config.max_blocks_per_seq = self.max_blocks_per_seq
         self.execution = getattr(config, "jax_execution", "eager")
+        self.greedy_token_fastpath = _config_or_env_flag(
+            config,
+            "greedy_token_fastpath",
+            "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH",
+            default=True,
+        )
+        self.device_token_carry = _config_or_env_flag(
+            config,
+            "device_token_carry",
+            "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+        )
+        self.resident_decode_metadata = bool(
+            getattr(config, "resident_decode_metadata", False)
+        )
+        self.static_decode_seq_lens_carry = _config_or_env_flag(
+            config,
+            "static_decode_seq_lens_carry",
+            "NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY",
+        )
 
         self.cache_storage = self.backend.allocate_kv_cache(
             replace(kv_spec, num_blocks=effective_num_blocks),

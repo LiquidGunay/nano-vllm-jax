@@ -18,6 +18,13 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
+try:
+    sys.path.remove(str(REPO_ROOT))
+except ValueError:
+    pass
+sys.path.insert(0, str(REPO_ROOT))
+from nanovllm_jax.server_config import engine_overrides_from_config, runtime_env_from_config
+
 DEFAULT_OUTPUT_JSON = str(
     REPO_ROOT.parent
     / "diagnostics"
@@ -65,6 +72,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-jsonl", default="")
     parser.add_argument("--prompt-manifest-output-jsonl", default="")
     parser.add_argument("--jax-python", default=DEFAULT_JAX_PYTHON)
+    parser.add_argument(
+        "--jax-config",
+        default="",
+        help=(
+            "Optional JSON/YAML config whose runtime/kernels sections supply "
+            "JAX subprocess env plus accepted engine fastpath/kernel args."
+        ),
+    )
     parser.add_argument("--vllm-python", default=DEFAULT_VLLM_PYTHON)
     parser.add_argument("--run-log", default="")
 
@@ -144,6 +159,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if not (0.0 < args.vllm_gpu_memory_utilization < 1.0):
         parser.error("--vllm-gpu-memory-utilization must be in (0.0, 1.0)")
     return args
+
+
+def _load_jax_config(path: str) -> dict[str, Any]:
+    if not path:
+        return {"source": "", "raw": {}, "engine_overrides": {}, "env": {}}
+    import yaml
+
+    config_path = Path(path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    return {
+        "source": str(config_path),
+        "raw": raw,
+        "engine_overrides": engine_overrides_from_config(raw),
+        "env": runtime_env_from_config(raw),
+    }
 
 
 def _effective_vllm_dtype(args: argparse.Namespace) -> str:
@@ -296,11 +326,22 @@ def _append_cli_arg(command: list[str], key: str, value: Any) -> None:
     command.extend([flag, str(value)])
 
 
-def _run_command(command: list[str], *, timeout_seconds: int) -> dict[str, Any]:
+def _run_command(
+    command: list[str],
+    *,
+    timeout_seconds: int,
+    env_overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    env = None
+    if env_overrides:
+        env = os.environ.copy()
+        for key, value in env_overrides.items():
+            env.setdefault(key, value)
     started = time.perf_counter()
     completed = subprocess.run(
         command,
         cwd=REPO_ROOT,
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -321,24 +362,31 @@ def _run_benchmark(
     *,
     dry_run: bool,
     timeout_seconds: int,
+    env_overrides: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if dry_run:
         return {
             "status": "dry_run",
             "returncode": None,
             "command": command,
+            "env_overrides": dict(env_overrides or {}),
             "elapsed_seconds": 0.0,
             "output_tail": "",
         }, {}
 
-    run_result = _run_command(command, timeout_seconds=timeout_seconds)
+    run_result = _run_command(
+        command,
+        timeout_seconds=timeout_seconds,
+        env_overrides=env_overrides,
+    )
     if run_result["status"] != "ok":
-        return run_result, {}
+        return {**run_result, "env_overrides": dict(env_overrides or {})}, {}
     if not artifact_path.exists():
         return {
             "status": "failed",
             "returncode": -1,
             "command": command,
+            "env_overrides": dict(env_overrides or {}),
             "elapsed_seconds": run_result["elapsed_seconds"],
             "output_tail": f"{artifact_path} was not generated despite successful return code.\n" + run_result["output_tail"],
         }, {}
@@ -346,6 +394,7 @@ def _run_benchmark(
     return {
         **run_result,
         "command": command,
+        "env_overrides": dict(env_overrides or {}),
     }, artifact
 
 
@@ -402,7 +451,13 @@ def compare_generated_tokens(jax_rows: list[dict[str, Any]], vllm_rows: list[dic
     }
 
 
-def _build_jax_command(args: argparse.Namespace, manifest_jsonl: Path, output_json: Path) -> list[str]:
+def _build_jax_command(
+    args: argparse.Namespace,
+    manifest_jsonl: Path,
+    output_json: Path,
+    *,
+    config_engine_overrides: dict[str, Any] | None = None,
+) -> list[str]:
     command = [args.jax_python, str(SCRIPT_DIR / "benchmark_jax_server_trace.py")]
     command_args = {
         "model": args.model,
@@ -431,16 +486,23 @@ def _build_jax_command(args: argparse.Namespace, manifest_jsonl: Path, output_js
         "prefill_layout": args.prefill_layout,
         "batch_size_buckets": args.batch_size_buckets,
         "max_blocks_per_seq": args.max_blocks_per_seq,
-        "decode_block_table_buckets": args.decode_block_table_buckets,
-        "resident_decode_metadata": args.resident_decode_metadata,
-        "full_attention_kv_cache_dtype": args.full_attention_kv_cache_dtype,
-        "full_attention_kv_append_impl": args.full_attention_kv_append_impl,
-        "full_attention_decode_impl": args.full_attention_decode_impl,
-        "full_attention_prefill_impl": args.full_attention_prefill_impl,
         "num_speculative_tokens": args.jax_num_speculative_tokens,
         "dataset_name": args.dataset_name or "random",
         "output_json": str(output_json),
     }
+    command_args.update(config_engine_overrides or {})
+    if args.decode_block_table_buckets:
+        command_args["decode_block_table_buckets"] = args.decode_block_table_buckets
+    if args.resident_decode_metadata:
+        command_args["resident_decode_metadata"] = True
+    if args.full_attention_kv_cache_dtype != "default":
+        command_args["full_attention_kv_cache_dtype"] = args.full_attention_kv_cache_dtype
+    if args.full_attention_kv_append_impl != "reference":
+        command_args["full_attention_kv_append_impl"] = args.full_attention_kv_append_impl
+    if args.full_attention_decode_impl != "reference":
+        command_args["full_attention_decode_impl"] = args.full_attention_decode_impl
+    if args.full_attention_prefill_impl != "reference":
+        command_args["full_attention_prefill_impl"] = args.full_attention_prefill_impl
     if args.reference_json:
         command_args["reference_json"] = args.reference_json
     for key, value in command_args.items():
@@ -499,6 +561,7 @@ def _run() -> None:
     rows, suite_metadata = build_random_request_suite(args, token_vocab_size, eos_token_id)
     manifest_path = _build_manifest_path(args.output_json, args.manifest_jsonl or args.prompt_manifest_output_jsonl)
     manifest_sha = write_prompt_manifest(rows, manifest_path)
+    jax_config = _load_jax_config(args.jax_config)
 
     jax_output_json = _build_artifact_path(args.output_json, "jax")
     if args.output_json_jax:
@@ -507,7 +570,12 @@ def _run() -> None:
     if args.output_json_vllm:
         vllm_output_json = Path(args.output_json_vllm)
 
-    jax_command = _build_jax_command(args, manifest_jsonl=manifest_path, output_json=jax_output_json)
+    jax_command = _build_jax_command(
+        args,
+        manifest_jsonl=manifest_path,
+        output_json=jax_output_json,
+        config_engine_overrides=jax_config["engine_overrides"],
+    )
     vllm_command = _build_vllm_command(args, manifest_jsonl=manifest_path, output_json=vllm_output_json)
 
     jax_run, jax_artifact = _run_benchmark(
@@ -515,6 +583,7 @@ def _run() -> None:
         artifact_path=jax_output_json,
         dry_run=args.dry_run,
         timeout_seconds=args.command_timeout_seconds,
+        env_overrides=jax_config["env"],
     )
 
     if args.skip_vllm:
@@ -587,7 +656,18 @@ def _run() -> None:
                 "prefill_layout": args.prefill_layout,
                 "batch_size_buckets": args.batch_size_buckets,
                 "max_blocks_per_seq": args.max_blocks_per_seq,
+                "decode_block_table_buckets": args.decode_block_table_buckets,
+                "resident_decode_metadata": args.resident_decode_metadata,
+                "full_attention_kv_cache_dtype": args.full_attention_kv_cache_dtype,
+                "full_attention_kv_append_impl": args.full_attention_kv_append_impl,
+                "full_attention_decode_impl": args.full_attention_decode_impl,
+                "full_attention_prefill_impl": args.full_attention_prefill_impl,
                 "num_speculative_tokens": args.jax_num_speculative_tokens,
+                "config": {
+                    "source": jax_config["source"],
+                    "engine_overrides": jax_config["engine_overrides"],
+                    "env": jax_config["env"],
+                },
             },
             "vllm_args": {
                 "dtype": _effective_vllm_dtype(args),

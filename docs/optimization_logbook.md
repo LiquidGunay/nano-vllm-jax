@@ -9381,3 +9381,62 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - checkpoint and push the branch;
   - run a scaled JAX-only random diagnostic with `resident_decode_metadata`
     enabled before trying medium or full random sidecar runs.
+
+### Entry 248 - Config-Driven Random Sidecar And Resident-Metadata A/B
+
+- date: 2026-06-05
+- purpose:
+  - avoid another unsafe full random compile after the resident decode boundary
+    change;
+  - make the random sidecar consume the same typed config policy as the server
+    and GPU matrix runner;
+  - test the resident decode metadata path on a scaled random envelope before
+    any medium/full random run.
+- implementation:
+  - added `--jax-config` to `benchmark_random_request_sidecar.py`;
+  - the sidecar now projects config `runtime`/`kernels` into JAX subprocess env
+    and accepted engine fastpath/kernel CLI args using
+    `runtime_env_from_config()` and `engine_overrides_from_config()`;
+  - fixed `CanonicalModelRunner` initialization so it carries
+    `resident_decode_metadata` and related serving flags before generic warmup.
+- artifacts:
+  - unsafe/default sidecar probe:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_resident_scaled_safety_r1.json`;
+  - missing canonical flag probe:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_resident_scaled_safety_r2.json`;
+  - tiny resident metadata smoke:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_resident_scaled_safety_r3.json`;
+  - accepted-config resident-on A/B:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_resident_config_scaled_r1.json`;
+  - accepted-config resident-off control:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_scaled_control_r1.json`.
+- results:
+  - r1 failed during prefill warmup with a GPU custom-call shared-memory request
+    of `152064 B`, above the A10G limit of about `101376 B`. This happened
+    before decode and used sidecar defaults instead of the accepted BF16/XLA
+    config policy;
+  - r2 reached optimized warmup setup but failed because
+    `CanonicalModelRunner` lacked `resident_decode_metadata`;
+  - r3 completed the tiny resident metadata path with zero measured-phase JIT
+    cache growth, but it did not use the accepted fastpath/kernel config;
+  - accepted-config resident-on: `67.75 output tok/s`, `59` output tokens,
+    zero measured-phase JIT growth;
+  - accepted-config resident-off control: `104.33 output tok/s`, same `59`
+    output tokens, zero measured-phase JIT growth;
+  - generated token prefixes were identical between resident-on and control for
+    both requests in the tiny A/B.
+- decision:
+  - do not promote the resident decode metadata v1 path. It is correct and
+    cache-stable on the tiny envelope, but it is slower than the current
+    table/static metadata path;
+  - keep the path opt-in as scaffolding only. Do not scale it to medium/full
+    random runs unless the gather/scatter/table-update overhead is first
+    reduced or folded into a larger useful decode boundary;
+  - use the config-driven sidecar for future random runs so the benchmark
+    cannot silently fall back to sidecar defaults.
+- validation:
+  - `python -m py_compile benchmarks/benchmark_random_request_sidecar.py tests/test_benchmark_random_request_sidecar.py`;
+  - `pytest -q tests/test_benchmark_random_request_sidecar.py`;
+  - `python -m py_compile nanovllm_jax/engine/model_runner.py tests/test_backend_boundaries.py`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'initializes_resident_decode_metadata_flag or table_hybrid_decode_matches_sliced_decode or syncs_resident_decode_metadata_by_slot'`;
+  - `git diff --check`.

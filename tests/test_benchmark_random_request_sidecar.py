@@ -23,6 +23,7 @@ def test_parse_args_defaults_set_random_ranges():
     assert args.jax_profile is False
     assert args.jax_warmup_mode == "generic"
     assert args.jax_fail_on_jit_cache_growth is False
+    assert args.jax_config == ""
     assert args.max_num_resident_seqs == 0
     assert args.decode_block_table_buckets == ""
     assert args.resident_decode_metadata is False
@@ -148,8 +149,6 @@ def test_jax_command_uses_generic_warmup_controls():
             "flashinfer",
             "--full-attention-decode-impl",
             "triton_paged",
-            "--full-attention-prefill-impl",
-            "reference",
         ]
     )
     command = sidecar._build_jax_command(
@@ -169,4 +168,55 @@ def test_jax_command_uses_generic_warmup_controls():
     assert command[command.index("--full-attention-kv-cache-dtype") + 1] == "bf16"
     assert command[command.index("--full-attention-kv-append-impl") + 1] == "flashinfer"
     assert command[command.index("--full-attention-decode-impl") + 1] == "triton_paged"
-    assert command[command.index("--full-attention-prefill-impl") + 1] == "reference"
+
+
+def test_jax_config_projects_runtime_kernel_policy(tmp_path):
+    config_path = tmp_path / "random_jax_config.yaml"
+    config_path.write_text(
+        """
+runtime:
+  platform: cuda
+  xla:
+    flags: --xla_gpu_autotune_level=4 --xla_gpu_enable_triton_gemm=false
+  fastpaths:
+    device_token_carry: true
+    static_decode_metadata: true
+    compact_prefill_token_count_mode: bucket
+kernels:
+  full_attention:
+    kv_cache_dtype: bf16
+    decode_impl: triton_paged
+  gdn:
+    disable_fallbacks: true
+    packed_decode:
+      impl: triton_fla_conv_raw_gates
+      qkv_dtype: bf16
+""".strip()
+    )
+    args = sidecar.parse_args(
+        [
+            "--output-json",
+            "/tmp/sidecar.json",
+            "--jax-config",
+            str(config_path),
+        ]
+    )
+
+    loaded = sidecar._load_jax_config(args.jax_config)
+    command = sidecar._build_jax_command(
+        args,
+        manifest_jsonl=sidecar.Path("/tmp/prompts.jsonl"),
+        output_json=sidecar.Path("/tmp/jax.json"),
+        config_engine_overrides=loaded["engine_overrides"],
+    )
+
+    assert loaded["env"]["JAX_PLATFORMS"] == "cuda"
+    assert loaded["env"]["XLA_FLAGS"] == "--xla_gpu_autotune_level=4 --xla_gpu_enable_triton_gemm=false"
+    assert "--device-token-carry" in command
+    assert "--static-decode-metadata" in command
+    assert command[command.index("--compact-prefill-token-count-mode") + 1] == "bucket"
+    assert command[command.index("--full-attention-kv-cache-dtype") + 1] == "bf16"
+    assert command[command.index("--full-attention-decode-impl") + 1] == "triton_paged"
+    assert "--gdn-disable-fallbacks" in command
+    assert command[command.index("--gdn-packed-decode-impl") + 1] == "triton_fla_conv_raw_gates"
+    assert command[command.index("--gdn-packed-decode-qkv-dtype") + 1] == "bf16"
