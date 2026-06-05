@@ -925,6 +925,107 @@ def test_conv_packed_gdn_decode_triton_matches_reference(monkeypatch):
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_gdn_conv_packed_projection_decode_matches_split_kernel(monkeypatch):
+    batch = 2
+    num_key_heads = 2
+    num_value_heads = 4
+    key_dim = 8
+    value_dim = 16
+    conv_kernel = 4
+    conv_dim = num_key_heads * key_dim * 2 + num_value_heads * value_dim
+    z_dim = 32
+    key = jax.random.PRNGKey(67)
+    keys = jax.random.split(key, 10)
+    mixed_qkv = jax.random.normal(keys[0], (batch, conv_dim), dtype=jnp.float32).astype(jnp.bfloat16)
+    a_bf16 = jax.random.normal(keys[1], (batch, num_value_heads), dtype=jnp.float32).astype(jnp.bfloat16)
+    b_bf16 = jax.random.normal(keys[2], (batch, num_value_heads), dtype=jnp.float32).astype(jnp.bfloat16)
+    z = jax.random.normal(keys[3], (batch, z_dim), dtype=jnp.float32).astype(jnp.bfloat16)
+    packed_proj = jnp.concatenate([mixed_qkv, a_bf16, b_bf16, z], axis=-1)
+    decay = jnp.linspace(0.5, 1.2, num_value_heads, dtype=jnp.float32)
+    dt_bias = jnp.linspace(-0.1, 0.2, num_value_heads, dtype=jnp.float32)
+    conv_state = jax.random.normal(
+        keys[4],
+        (batch, conv_dim, conv_kernel),
+        dtype=jnp.float32,
+    )
+    conv_weight = jax.random.normal(keys[5], (conv_dim, conv_kernel), dtype=jnp.float32) * 0.05
+    conv_bias = jax.random.normal(keys[6], (conv_dim,), dtype=jnp.float32) * 0.02
+    state = jax.random.normal(
+        keys[7],
+        (batch, num_value_heads, value_dim, key_dim),
+        dtype=jnp.float32,
+    ) * 0.025
+
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
+        "triton_fla_conv_raw_gates",
+    )
+    backend = PureJAXBackend()
+    expected_out, expected_conv_state, expected_state = jax.jit(
+        lambda mixed, a_in, b_in, decay_in, dt_bias_in, conv_s, conv_w, conv_b, state_in: (
+            backend.gated_delta_conv_packed_decode(
+                mixed,
+                a_in,
+                b_in,
+                decay_in,
+                dt_bias_in,
+                conv_s,
+                conv_w,
+                conv_b,
+                state_in,
+                use_qk_l2norm_in_kernel=True,
+            )
+        )
+    )(
+        mixed_qkv,
+        a_bf16.astype(jnp.float32),
+        b_bf16.astype(jnp.float32),
+        decay,
+        dt_bias,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        state,
+    )
+    actual_out, actual_conv_state, actual_state = jax.jit(
+        lambda packed, decay_in, dt_bias_in, conv_s, conv_w, conv_b, state_in: (
+            backend.gated_delta_conv_packed_projection_decode(
+                packed,
+                decay_in,
+                dt_bias_in,
+                conv_s,
+                conv_w,
+                conv_b,
+                state_in,
+                qkv_dim=conv_dim,
+                use_qk_l2norm_in_kernel=True,
+            )
+        )
+    )(
+        packed_proj,
+        decay,
+        dt_bias,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        state,
+    )
+
+    np.testing.assert_allclose(np.asarray(actual_out), np.asarray(expected_out), atol=2e-5)
+    np.testing.assert_allclose(
+        np.asarray(actual_conv_state),
+        np.asarray(expected_conv_state),
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual_state),
+        np.asarray(expected_state),
+        atol=2e-5,
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 def test_gdn_state_k_last_roundtrip_preserves_local_layout():
     state = jnp.arange(2 * 3 * 4 * 5, dtype=jnp.float32).reshape(2, 3, 4, 5)
 

@@ -639,6 +639,59 @@ def test_scheduler_resident_decode_metadata_uses_device_placeholders(monkeypatch
     assert second.seq_lens_host == (3, 3)
 
 
+def test_scheduler_resident_decode_metadata_reuses_placeholders_across_seq_ids(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_METADATA", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_RESIDENT_DECODE_METADATA", "1")
+    token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
+    scheduler = Scheduler(
+        Qwen3_5Config(
+            max_num_seqs=2,
+            batch_size_buckets=(2,),
+            max_blocks_per_seq=3,
+            num_kvcache_blocks=6,
+            jax_execution="jit",
+            device_token_carry=True,
+            static_decode_metadata=True,
+            resident_decode_metadata=True,
+        )
+    )
+    seq_a = Sequence([1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7)
+    seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
+    seq_a.block_table = [1]
+    seq_b.block_table = [2]
+    seq_a.last_token = 0
+    seq_b.last_token = 0
+    seq_a.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
+    seq_b.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
+
+    first = scheduler.build_scheduled_batch([seq_a, seq_b], is_prefill=False)
+
+    seq_c = Sequence([5, 6], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=17)
+    seq_d = Sequence([7, 8], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=18)
+    seq_c.block_table = [3]
+    seq_d.block_table = [4]
+    seq_c.last_token = 0
+    seq_d.last_token = 0
+    seq_c.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
+    seq_d.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
+
+    second = scheduler.build_scheduled_batch([seq_c, seq_d], is_prefill=False)
+
+    assert first.uses_static_decode_metadata
+    assert second.uses_static_decode_metadata
+    assert first.seq_ids_host == (7, 8)
+    assert second.seq_ids_host == (17, 18)
+    assert second.tokens is first.tokens
+    assert second.positions is first.positions
+    assert second.seq_ids is first.seq_ids
+    assert second.query_start_loc is first.query_start_loc
+    assert second.block_tables is first.block_tables
+    assert second.seq_lens is first.seq_lens
+    np.testing.assert_array_equal(np.asarray(first.seq_ids), np.asarray([0, 1], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(second.block_tables), np.zeros((2, 3), dtype=np.int32))
+
+
 def test_scheduler_static_decode_metadata_allows_greedy_burst(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_METADATA", "1")

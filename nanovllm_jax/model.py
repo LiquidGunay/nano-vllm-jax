@@ -1207,6 +1207,7 @@ def gated_deltanet_block(
         is_prefill=is_prefill,
         config=config,
     )
+    packed_decode_projection = None
     if use_packed_decode_in_proj or use_packed_prefill_in_proj:
         if is_prefill:
             packed_proj = _compact_prefill_dot_if_enabled(
@@ -1225,10 +1226,17 @@ def gated_deltanet_block(
         qkv_end = conv_dim
         a_end = qkv_end + config.linear_num_value_heads
         b_end = a_end + config.linear_num_value_heads
-        mixed_qkv, a, b, z = jnp.split(packed_proj, [qkv_end, a_end, b_end], axis=-1)
-        z = z.reshape(batch, seq_len, -1)
-        a = a.reshape(batch, seq_len, config.linear_num_value_heads)
-        b = b.reshape(batch, seq_len, config.linear_num_value_heads)
+        if use_packed_decode_in_proj and not is_prefill:
+            packed_decode_projection = packed_proj
+            mixed_qkv = packed_proj[:, :, :qkv_end]
+            a = None
+            b = None
+            z = packed_proj[:, :, b_end:].reshape(batch, seq_len, -1)
+        else:
+            mixed_qkv, a, b, z = jnp.split(packed_proj, [qkv_end, a_end, b_end], axis=-1)
+            z = z.reshape(batch, seq_len, -1)
+            a = a.reshape(batch, seq_len, config.linear_num_value_heads)
+            b = b.reshape(batch, seq_len, config.linear_num_value_heads)
     else:
         if is_prefill:
             mixed_qkv = _compact_prefill_tokenwise_dot(
@@ -1270,8 +1278,6 @@ def gated_deltanet_block(
     
     if use_cached:
         # === DECODE MODE ===
-        mixed_qkv_t = mixed_qkv.transpose(0, 2, 1)  # [B, D, T]
-        
         # 1. Convolution update - use per-layer conv_state
         # Table mode stores [batch, num_linear_layers, conv_dim, kernel_size].
         # Layerwise mode stores only [batch, conv_dim, kernel_size].
@@ -1306,23 +1312,42 @@ def gated_deltanet_block(
         )
         use_conv_packed_decode = use_packed_decode and gdn_packed_decode_conv_enabled(config)
         if use_conv_packed_decode:
-            core_attn_out, new_layer_conv_state, new_recurrent_state_single = (
-                backend.gated_delta_conv_packed_decode(
-                    mixed_qkv[:, 0, :],
-                    a[:, 0, :].astype(jnp.float32),
-                    b[:, 0, :].astype(jnp.float32),
-                    params["A"].astype(jnp.float32),
-                    params["dt_bias"].astype(jnp.float32),
-                    layer_conv_state,
-                    conv_weight,
-                    conv_bias,
-                    initial_recurrent.astype(jnp.float32),
-                    use_qk_l2norm_in_kernel=True,
+            if packed_decode_projection is not None:
+                core_attn_out, new_layer_conv_state, new_recurrent_state_single = (
+                    backend.gated_delta_conv_packed_projection_decode(
+                        packed_decode_projection[:, 0, :],
+                        params["A"].astype(jnp.float32),
+                        params["dt_bias"].astype(jnp.float32),
+                        layer_conv_state,
+                        conv_weight,
+                        conv_bias,
+                        initial_recurrent.astype(jnp.float32),
+                        qkv_dim=conv_dim,
+                        use_qk_l2norm_in_kernel=True,
+                    )
                 )
-            )
+            else:
+                core_attn_out, new_layer_conv_state, new_recurrent_state_single = (
+                    backend.gated_delta_conv_packed_decode(
+                        mixed_qkv[:, 0, :],
+                        a[:, 0, :].astype(jnp.float32),
+                        b[:, 0, :].astype(jnp.float32),
+                        params["A"].astype(jnp.float32),
+                        params["dt_bias"].astype(jnp.float32),
+                        layer_conv_state,
+                        conv_weight,
+                        conv_bias,
+                        initial_recurrent.astype(jnp.float32),
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
             prefix_layer_conv_state = None
             prefix_recurrent_state_single = None
         else:
+            if a is None or b is None:
+                a = packed_decode_projection[:, :, qkv_end:a_end].reshape(batch, seq_len, config.linear_num_value_heads)
+                b = packed_decode_projection[:, :, a_end:b_end].reshape(batch, seq_len, config.linear_num_value_heads)
+            mixed_qkv_t = mixed_qkv.transpose(0, 2, 1)  # [B, D, T]
             def conv_step(state, mixed_qkv_t_step):
                 conv_out_t, next_state = causal_conv1d_update(
                     mixed_qkv_t_step,

@@ -9967,3 +9967,63 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - `JAX_PLATFORMS=cuda NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp .venv/bin/python -m pytest -q tests/test_backend_boundaries.py::test_packed_full_attention_prefill_triton_matches_dense_rows_bf16_cache tests/test_backend_boundaries.py::test_paged_decode_attention_triton_matches_reference_bf16_cache tests/test_backend_boundaries.py::test_configured_triton_decode_attention_matches_reference_non_contiguous_blocks tests/test_backend_boundaries.py::test_configured_fused_triton_decode_attention_appends_kv_and_matches_reference tests/test_gdn_post_conv_prefill_reference.py::test_model_post_conv_prepared_fla_triton_packed_matches_reference`;
   - medium and large random sidecar runs above used stored vLLM denominators,
     generic warmup, `--jax-fail-on-jit-cache-growth`, and the 70% RAM guard.
+
+### Entry 260 - Accepted Broadened Resident Metadata And Packed-Projection GDN Decode
+
+- date: 2026-06-05
+- purpose:
+  - continue the random-decode broadening/coarsening path after Entry 259;
+  - reopen resident metadata only if it removes a whole host/device operation,
+    not as the Entry 258 scatter-sync route;
+  - broaden GDN decode so the conv+recurrent FLA kernel consumes the packed
+    decode projection instead of separate `qkv`, `a`, and `b` arrays.
+- implementation:
+  - changed resident static decode placeholders to be keyed by physical shape
+    and active-row pattern instead of real sequence IDs;
+  - promoted `resident_decode_metadata=true` in the main GPU config;
+  - changed resident block/seq metadata synchronization to refresh the tiny
+    full host mirrors with `device_put` on actual changes instead of executing
+    JAX `.at[...]` scatter updates;
+  - added `gdn_conv_packed_projection_decode_step_bf16_raw_gates`, which loads
+    `qkv`, `a`, and `b` from the concatenated `[qkv, a, b, z]` packed
+    projection inside the Triton conv+raw-gate GDN decode kernel.
+- artifacts:
+  - first resident packed-GDN large run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_packed_gdn_boundary_r1.json`;
+  - accepted scatter-free resident large run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_deviceput_sync_packed_gdn_r1.json`;
+  - accepted profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_deviceput_sync_packed_gdn_profile_r1.json`;
+  - rejected physical-row token-ref diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_resident_physical_token_refs_packed_gdn_r1.json`.
+- result:
+  - scatter-sync resident route regressed large random to
+    `476.41 output tok/s`, `0.539x` of stored vLLM;
+  - scatter-free resident sync plus packed-projection GDN reached
+    `495.10 output tok/s`, `0.560x` of stored vLLM, with zero measured-phase
+    JIT growth (`20 -> 20`);
+  - this improves the Entry 259 large accepted route
+    (`485.11 output tok/s`, `0.549x`) by `~2.1%`;
+  - profiled scatter-free resident route shows `_sync_resident_decode_metadata`
+    at `140.40 ms / 300` versus `689.15 ms / 231` on the scatter-sync profile,
+    and PJRT execute count drops from `1159` to `548`;
+  - GPU profile confirms the new
+    `_gdn_conv_packed_projection_decode_raw_gate_kernel` path is used
+    (`115.55 ms / 5051` in the profiled run);
+  - physical-row token refs for the full greedy token vector reached only
+    `493.47 output tok/s`, so that subchange is rejected.
+- decision:
+  - promote resident decode metadata only with the shape-stable descriptor and
+    full-table host-mirror sync;
+  - promote packed-projection GDN decode as the active FLA decode boundary;
+  - do not re-run the old scatter-sync resident route or physical-row token
+    refs as primary random-decode optimizations;
+  - next broadening target should be model-side decode GPU work
+    (GEMMs/full-attention/GDN post-core) plus remaining PJRT execution overhead.
+- validation:
+  - `python -m py_compile nanovllm_jax/model.py nanovllm_jax/backends.py nanovllm_jax/kernels/gdn_fla_triton.py`;
+  - `pytest -q tests/test_device_token_carry.py -k 'resident_decode_metadata or static_decode_metadata_reuses_fixed_device_arrays'`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'resident_decode_metadata_flag or syncs_resident_decode_metadata_by_slot or warmup_compiles_resident_slot_carry_decode_when_available'`;
+  - `pytest -q tests/test_gdn_packed_decode_reference.py -k 'conv_packed_projection_decode_matches_split_kernel or conv_packed_decode_matches_reference'`;
+  - large random sidecar runs used stored vLLM denominator, generic warmup,
+    `--jax-fail-on-jit-cache-growth`, and the 70% RAM guard.

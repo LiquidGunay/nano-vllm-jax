@@ -1,6 +1,6 @@
 {
   "name": "gpu_paged_gdn_fla_decode_static_metadata",
-  "description": "Strict block-dot FLA prefill route plus packed prefill/decode projections, BF16 model compute, BF16 full-attention KV cache, Triton packed full-attention prefill, fused Triton full-attention append/decode, BF16-QKV conv-fused Triton FLA GDN decode, canonical packed MLP gate/up weights, no-Triton-GEMM XLA lowering, and static decode metadata reuse.",
+  "description": "Strict block-dot FLA prefill route plus packed prefill/decode projections, BF16 model compute, BF16 full-attention KV cache, Triton packed full-attention prefill, fused Triton full-attention append/decode, packed-projection BF16-QKV conv-fused Triton FLA GDN decode, resident static decode metadata, canonical packed MLP gate/up weights, and no-Triton-GEMM XLA lowering.",
   "benchmark_script": "benchmarks/benchmark_jax_server_trace.py",
   "reference_json": "results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json",
   "vllm_reference_json": "",
@@ -31,6 +31,7 @@
       "compact_prefill_token_count_mode": "bucket",
       "device_token_carry": true,
       "static_decode_metadata": true,
+      "resident_decode_metadata": true,
       "lm_head_decode_act_dtype": "bf16",
       "decode_proj_act_dtype": "bf16",
       "decode_padded_gemm": true,
@@ -79,6 +80,7 @@
     "greedy_token_fastpath": true,
     "device_token_carry": true,
     "static_decode_metadata": true,
+    "resident_decode_metadata": true,
     "static_decode_seq_lens_carry": false,
     "top_k": 5,
     "warmup": true,

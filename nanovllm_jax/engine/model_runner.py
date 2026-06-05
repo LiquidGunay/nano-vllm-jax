@@ -4,6 +4,7 @@ import time
 import os
 import jax
 import jax.numpy as jnp
+import numpy as np
 import sys
 from typing import List, Tuple, Dict, Optional, Any
 from functools import partial
@@ -1801,13 +1802,18 @@ class CanonicalModelRunner:
         *,
         active_rows: list[int],
     ) -> bool:
+        required_method = (
+            "forward_step_token_ids_resident_slot_carry_jit"
+            if bool(getattr(self, "resident_decode_metadata", False))
+            else "forward_step_token_ids_slot_carry_table_jit"
+        )
         if (
             batch.is_prefill
             or not bool(getattr(batch, "uses_static_decode_metadata", False))
             or batch.seq_ids_host is None
             or not active_rows
             or not hasattr(self, "_resident_last_tokens")
-            or not hasattr(self.executor, "forward_step_token_ids_slot_carry_table_jit")
+            or not hasattr(self.executor, required_method)
         ):
             return False
         carry_by_seq_id = getattr(self, "_device_token_carry_by_seq_id", {})
@@ -2468,10 +2474,8 @@ class CanonicalModelRunner:
             if batch.seq_lens_host is not None
             else [int(seq_len) for seq_len in batch.seq_lens.tolist()]
         )
-        block_slots: list[int] = []
-        block_rows: list[tuple[int, ...]] = []
-        len_slots: list[int] = []
-        len_values: list[int] = []
+        block_changed = False
+        seq_lens_changed = False
         for row, slot in enumerate(slot_values):
             slot = int(slot)
             if slot < 0 or row >= len(seq_ids) or int(seq_ids[row]) < 0:
@@ -2486,24 +2490,22 @@ class CanonicalModelRunner:
                 source_row = source_row[: self.max_blocks_per_seq]
             if self._resident_block_tables_host[slot] != source_row:
                 self._resident_block_tables_host[slot] = source_row
-                block_slots.append(slot)
-                block_rows.append(source_row)
+                block_changed = True
 
             if sync_seq_lens and row < len(seq_lens):
                 seq_len = int(seq_lens[row])
                 if self._resident_seq_lens_host[slot] != seq_len:
                     self._resident_seq_lens_host[slot] = seq_len
-                    len_slots.append(slot)
-                    len_values.append(seq_len)
+                    seq_lens_changed = True
 
-        if block_slots:
-            self._resident_block_tables = self._resident_block_tables.at[
-                jnp.asarray(block_slots, dtype=jnp.int32)
-            ].set(jnp.asarray(block_rows, dtype=jnp.int32))
-        if len_slots:
-            self._resident_seq_lens = self._resident_seq_lens.at[
-                jnp.asarray(len_slots, dtype=jnp.int32)
-            ].set(jnp.asarray(len_values, dtype=jnp.int32))
+        if block_changed:
+            self._resident_block_tables = jax.device_put(
+                np.asarray(self._resident_block_tables_host, dtype=np.int32)
+            )
+        if seq_lens_changed:
+            self._resident_seq_lens = jax.device_put(
+                np.asarray(self._resident_seq_lens_host, dtype=np.int32)
+            )
 
     def _advance_resident_seq_lens_host(
         self,

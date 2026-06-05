@@ -743,6 +743,21 @@ class InferenceBackend(Protocol):
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         ...
 
+    def gated_delta_conv_packed_projection_decode(
+        self,
+        packed_proj: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        conv_state: jnp.ndarray,
+        conv_weight: jnp.ndarray,
+        conv_bias: jnp.ndarray | None,
+        recurrent_state: jnp.ndarray,
+        *,
+        qkv_dim: int,
+        use_qk_l2norm_in_kernel: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        ...
+
 
 class PureJAXBackend:
     """Reference backend implemented with ordinary JAX operations."""
@@ -2382,6 +2397,77 @@ class PureJAXBackend:
         except Exception:
             _raise_if_gdn_fallback_disabled(
                 "Triton FLA conv+packed decode kernel cannot handle this shape",
+                self.config,
+            )
+            return reference()
+
+    def gated_delta_conv_packed_projection_decode(
+        self,
+        packed_proj: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        conv_state: jnp.ndarray,
+        conv_weight: jnp.ndarray,
+        conv_bias: jnp.ndarray | None,
+        recurrent_state: jnp.ndarray,
+        *,
+        qkv_dim: int,
+        use_qk_l2norm_in_kernel: bool,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        impl = _gdn_packed_decode_impl(self.config)
+        if impl != "triton_fla_conv_raw_gates":
+            raise RuntimeError(
+                "gated_delta_conv_packed_projection_decode is only enabled by "
+                f"{_GDN_PACKED_DECODE_IMPL_ENV}=triton_fla_conv_raw_gates"
+            )
+        if not use_qk_l2norm_in_kernel:
+            raise ValueError("conv packed GDN decode requires q/k l2norm")
+
+        def reference() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+            mixed_qkv = packed_proj[:, :qkv_dim]
+            value_heads = recurrent_state.shape[1]
+            a = packed_proj[:, qkv_dim : qkv_dim + value_heads].astype(jnp.float32)
+            b = packed_proj[:, qkv_dim + value_heads : qkv_dim + 2 * value_heads].astype(jnp.float32)
+            return self.gated_delta_conv_packed_decode(
+                mixed_qkv,
+                a,
+                b,
+                decay,
+                dt_bias,
+                conv_state,
+                conv_weight,
+                conv_bias,
+                recurrent_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+
+        try:
+            from nanovllm_jax.kernels.gdn_fla_triton import (
+                gdn_conv_packed_projection_decode_step_bf16_raw_gates,
+            )
+        except (ImportError, ModuleNotFoundError, AttributeError):
+            _raise_if_gdn_fallback_disabled(
+                "Triton FLA packed-projection conv+decode kernel is unavailable",
+                self.config,
+            )
+            return reference()
+
+        if conv_bias is None:
+            conv_bias = jnp.zeros((conv_weight.shape[0],), dtype=conv_weight.dtype)
+        try:
+            return gdn_conv_packed_projection_decode_step_bf16_raw_gates(
+                packed_proj.astype(jnp.bfloat16),
+                decay.astype(jnp.float32),
+                dt_bias.astype(jnp.float32),
+                conv_state.astype(jnp.float32),
+                conv_weight.astype(jnp.float32),
+                conv_bias.astype(jnp.float32),
+                recurrent_state.astype(jnp.float32),
+                qkv_dim=int(qkv_dim),
+            )
+        except Exception:
+            _raise_if_gdn_fallback_disabled(
+                "Triton FLA packed-projection conv+decode kernel cannot handle this shape",
                 self.config,
             )
             return reference()

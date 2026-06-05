@@ -890,11 +890,17 @@ class Scheduler:
         query_lens_host: tuple[int, ...],
         resident_decode_metadata: bool = False,
     ):
-        constant_key = (
-            tuple((len(padded_tokens), len(padded_tokens[0]) if padded_tokens else 0)),
-            seq_ids_host,
-            query_lens_host,
-        )
+        token_shape = tuple((len(padded_tokens), len(padded_tokens[0]) if padded_tokens else 0))
+        block_table_shape = tuple((len(block_tables), len(block_tables[0]) if block_tables else 0))
+        if resident_decode_metadata:
+            device_seq_ids_host = tuple(
+                row if int(query_len) > 0 else -1
+                for row, query_len in enumerate(query_lens_host)
+            )
+            constant_key = (token_shape, query_lens_host, "resident")
+        else:
+            device_seq_ids_host = seq_ids_host
+            constant_key = (token_shape, seq_ids_host, query_lens_host)
         constant_cache = self._static_decode_constant_cache.get(constant_key)
         if constant_cache is None:
             query_start_loc_array = jax.device_put(np.asarray(query_start_loc, dtype=np.int32))
@@ -903,7 +909,7 @@ class Scheduler:
             # block-table cache misses do not rebuild an unused host array.
             positions_array = jax.device_put(np.zeros_like(np.asarray(padded_positions, dtype=np.int32)))
             tokens_array = jax.device_put(np.asarray(padded_tokens, dtype=np.int32))
-            seq_ids_array = jax.device_put(np.asarray(seq_ids_host, dtype=np.int32))
+            seq_ids_array = jax.device_put(np.asarray(device_seq_ids_host, dtype=np.int32))
             constant_cache = {
                 "tokens": tokens_array,
                 "positions": positions_array,
@@ -911,20 +917,19 @@ class Scheduler:
                 "query_start_loc": query_start_loc_array,
             }
             self._static_decode_constant_cache[constant_key] = constant_cache
-        key = (
-            tuple((len(padded_tokens), len(padded_tokens[0]) if padded_tokens else 0)),
-            tuple((len(block_tables), len(block_tables[0]) if block_tables else 0)),
-            seq_ids_host,
-            query_lens_host,
-            "resident" if resident_decode_metadata else tuple(tuple(row) for row in block_tables),
-        )
+        if resident_decode_metadata:
+            key = (token_shape, block_table_shape, query_lens_host, "resident")
+        else:
+            key = (
+                token_shape,
+                block_table_shape,
+                seq_ids_host,
+                query_lens_host,
+                tuple(tuple(row) for row in block_tables),
+            )
         cache = self._static_decode_metadata_cache
         if cache is None or cache.get("key") != key:
             if resident_decode_metadata:
-                block_table_shape = (
-                    len(block_tables),
-                    len(block_tables[0]) if block_tables else 0,
-                )
                 block_tables_array = jax.device_put(np.zeros(block_table_shape, dtype=np.int32))
                 seq_lens_array = jax.device_put(np.zeros((len(seq_lens),), dtype=np.int32))
             else:

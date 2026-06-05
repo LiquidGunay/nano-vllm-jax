@@ -66,11 +66,10 @@
   until they improve integrated random decode throughput with correctness and no
   measured-phase JIT growth.
 - Current rejected random-speed routes: standalone FA decode Triton, resident
-  decode metadata v1/placeholders, static seq-lens carry, shared-gather
-  token-carry fallback, combined resident metadata plus slot-token decode
-  (`forward_step_token_ids_resident_slot_carry_jit`), and source-level greedy
-  decode bursts. Reopen any of these only with a broader boundary that removes a
-  whole per-step operation.
+  decode metadata v1/placeholders with scatter sync, static seq-lens carry,
+  shared-gather token-carry fallback, physical-row token refs for the full
+  greedy vector, and source-level greedy decode bursts. Reopen any of these
+  only with a broader boundary that removes a whole per-step operation.
 - Current accepted large-random token-carry boundary: packed prefill seeds
   resident slot tokens inside `forward_prefill_token_ids_slot_carry_table_jit`,
   and static decode carries them inside
@@ -79,13 +78,19 @@
   table owns the next decode input state. This is the preferred route unless a
   broader resident metadata/kernel boundary replaces it.
 - Current accepted FA/FLA kernel policy: GDN keeps strict
-  `triton_fla_padded` prefill plus `triton_fla_conv_raw_gates` packed decode,
-  while full-attention uses `triton_packed` prefill and
-  `triton_paged_fused_append` decode. Standalone FA decode remains rejected;
-  the accepted FA route is the broader packed-prefill plus fused append/decode
-  boundary.
-- Latest accepted large-random hill-climb result: `484.18 output tok/s` against
-  the stored vLLM denominator (`0.548x`), zero measured-phase JIT growth, and
-  no `_record_resident_last_tokens` top-profile bucket. The next bottleneck is
-  scheduler/static decode metadata movement plus PJRT/GPU execution, not another
-  token-carry or standalone attention rewrite.
+  `triton_fla_padded` prefill plus packed-projection
+  `triton_fla_conv_raw_gates` decode, while full-attention uses
+  `triton_packed` prefill and `triton_paged_fused_append` decode. Standalone
+  FA decode remains rejected; the accepted FA route is the broader
+  packed-prefill plus fused append/decode boundary.
+- Current accepted resident metadata route: static decode placeholders are
+  shape/active-row keyed, resident block/seq tables are synchronized from host
+  mirrors with full-table `device_put` on actual changes, and
+  `forward_step_token_ids_resident_slot_carry_jit` owns block table, seq-len,
+  token, hybrid-state, KV, and greedy-token updates inside the decode boundary.
+- Latest accepted large-random hill-climb result: `495.10 output tok/s` against
+  the stored vLLM denominator (`0.560x`), zero measured-phase JIT growth, with
+  `_sync_resident_decode_metadata` reduced from `689 ms` to `140 ms` in the
+  profiled route. The next bottleneck is model-side decode GPU work
+  (GEMMs/attention/GDN) plus remaining PJRT execution overhead, not another
+  token-carry rewrite.

@@ -2950,6 +2950,22 @@ Current validation:
   but regressed medium random to `323.28 output tok/s` versus the accepted
   `355-359 output tok/s` medium anchors, so it is diagnostic-only and not the
   next promoted route.
+- Entry 260 reopened that resident route with a broader descriptor and cheaper
+  synchronization policy. Resident static decode placeholders are now
+  shape/active-row keyed instead of sequence-ID keyed, and resident block/seq
+  mirrors use full-table `device_put` on actual host-mirror changes instead of
+  per-slot JAX scatter updates. GDN decode also has a packed-projection FLA
+  boundary that consumes the concatenated `[qkv, a, b, z]` projection for the
+  conv+recurrent kernel. Large random reached `495.10 output tok/s`,
+  `0.560x` of the stored vLLM denominator, with zero measured-phase JIT growth.
+  The profiled route reduced `_sync_resident_decode_metadata` from `689 ms` to
+  `140 ms` and PJRT execute count from `1159` to `548` versus the scatter-sync
+  resident profile.
+- Entry 260 also rejected physical-row token refs for the full greedy output
+  vector: the large random run reached `493.47 output tok/s`, below the
+  scatter-free resident best. Do not re-run that as a primary optimization
+  unless a broader output-materialization boundary removes a whole host/device
+  operation.
 
 Model-specific assumptions to track:
 
