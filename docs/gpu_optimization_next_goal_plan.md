@@ -2825,19 +2825,29 @@ Random-request sidecar status as of Entry 240:
   them through a model/hardware-independent selection policy with safe fallback
   diagnostics, not benchmark-specific flags.
 - Next execution order:
-  1. Profile the latest random route with generic warmup and no measured-phase
-     JIT growth. The current route is the resident slot-token decode boundary
-     from Entry 256, not the older Python/JAX `_maybe_apply_device_token_carry`
-     rewrite.
-  2. Attribute the latest decode bucket into model GEMMs, GDN decode,
-     full-attention decode, LM head, scheduler/table movement, and PjRT/CPU
-     gaps.
-  3. Implement the largest general decode-side change first. Candidate classes
-     are broader decode fusion/grouped layer boundaries, better small-batch
-     projection/LM-head lowering, and scheduler/backfill changes that keep
-     active decode batches fuller without specializing to a manifest.
-  4. Re-run the random stress target plus `hetero8`/`decode_heavy_128x128` to
-     catch regressions on deterministic lanes.
+  1. Start from the accepted Entry 257 boundary: packed prefill seeds
+     resident slot tokens inside
+     `forward_prefill_token_ids_slot_carry_table_jit`, and static decode
+     gathers/scatters resident slot tokens inside
+     `forward_step_token_ids_slot_carry_table_jit`.
+  2. Attack the remaining scheduler/static-metadata movement bucket. The latest
+     profile still spends about `761.71 ms` in `schedule`, `726.87 ms` in
+     `build_scheduled_batch`, `543.76 ms` in `_static_decode_device_arrays`, and
+     `532.76 ms` in `device_put`. Any change here must preserve paged attention,
+     generic warmup, and arbitrary random request shapes.
+  3. In parallel with metadata-boundary work, design the next broader decode
+     execution boundary that reduces PJRT launches or command-buffer work
+     without source-level greedy bursts. The current profile still spends about
+     `1535.04 ms / 626` in `PjRtCApiLoadedExecutable::Execute`.
+  4. Re-profile model-side GPU work after metadata movement is reduced. The
+     remaining GPU buckets are BF16 projection/LM-head GEMMs, the
+     `_gdn_conv_packed_decode_raw_gate_kernel`, fusion/cutlass, and reference
+     full-attention decode.
+  5. Re-run large random with stored vLLM after each accepted structural change;
+     rerun live vLLM only before promoting a release baseline or after changing
+     the benchmark contract/runtime.
+  6. Re-run `hetero8` and `decode_heavy_128x128` after any change that touches
+     deterministic output paths or kernel numerics.
 
 ## Current Main Path: Packed Paged Chunked Prefill
 
@@ -2913,6 +2923,13 @@ Current validation:
   `460.45 output tok/s` against the stored vLLM denominator, with zero
   measured-phase JIT growth and warmup routes entirely on the new slot-carry
   decode boundary.
+- Entry 257 promoted the matching prefill seed boundary:
+  `forward_prefill_token_ids_slot_carry_table_jit` now seeds the same resident
+  per-slot token table from final packed prefill chunks inside the compiled
+  prefill executable. Large random reached `470.14 output tok/s` against the
+  same stored vLLM denominator (`0.532x`), with zero measured-phase JIT growth.
+  The profile removed `_record_resident_last_tokens` from the top events and
+  reduced total `gather` time from `1216.23 ms` to `293.55 ms`.
 
 Model-specific assumptions to track:
 

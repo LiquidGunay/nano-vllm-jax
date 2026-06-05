@@ -70,10 +70,15 @@
   decode metadata v1/placeholders, static seq-lens carry, shared-gather
   token-carry fallback, and source-level greedy decode bursts. Reopen any of
   these only with a broader boundary that removes a whole per-step operation.
-- Current accepted large-random decode boundary: resident slot-token carry
-  inside `forward_step_token_ids_slot_carry_table_jit`. It keeps immutable
-  generated-token refs for final materialization, but gathers the next decode
-  input from a device-resident per-slot token table and scatters the newly
-  sampled token back inside the compiled decode boundary. This is the preferred
-  static decode route unless a broader resident metadata/kernel boundary
-  replaces it.
+- Current accepted large-random token-carry boundary: packed prefill seeds
+  resident slot tokens inside `forward_prefill_token_ids_slot_carry_table_jit`,
+  and static decode carries them inside
+  `forward_step_token_ids_slot_carry_table_jit`. The runner keeps immutable
+  generated-token refs for final materialization, but the resident per-slot
+  table owns the next decode input state. This is the preferred route unless a
+  broader resident metadata/kernel boundary replaces it.
+- Latest accepted large-random hill-climb result: `470.14 output tok/s` against
+  the stored vLLM denominator (`0.532x`), zero measured-phase JIT growth, and
+  no `_record_resident_last_tokens` top-profile bucket. The next bottleneck is
+  scheduler/static decode metadata movement plus PJRT/GPU execution, not another
+  token-carry rewrite.

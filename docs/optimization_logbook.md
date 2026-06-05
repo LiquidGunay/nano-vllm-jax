@@ -9800,3 +9800,67 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - `python -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py tests/test_backend_boundaries.py tests/test_device_token_carry.py`;
   - `pytest -q tests/test_device_token_carry.py -k 'updates_resident_last_tokens or records_full_static_decode_rows or whole_vector_when_seq_ids_match or follows_seq_ids_after_row_order_change or static_decode_metadata_requires_token_carry'`;
   - `pytest -q tests/test_backend_boundaries.py -k 'table_hybrid_decode_matches_sliced_decode or warmup_compiles_decode_block_table_buckets'`.
+
+### Entry 257 - Prefill Slot-Token Seeding Boundary
+
+- date: 2026-06-05
+- purpose:
+  - continue the random decode checklist from Entry 256 by removing the next
+    host-visible resident-token update;
+  - keep chunked/ragged prefill semantics exact: only final prefill chunks seed
+    the resident decode token table.
+- implementation:
+  - added `ModelExecutor.forward_prefill_token_ids_slot_carry_table_jit`;
+  - the compiled packed-prefill boundary now gathers/scatters hybrid state as
+    before, samples greedy token IDs, and scatters those token IDs into
+    `resident_last_tokens[hybrid_slot_ids]` only where
+    `prefill_final_flags` is true;
+  - `CanonicalModelRunner` caches device prefill-final flag vectors, routes
+    generic warmup and serving prefill through the new boundary when device
+    token carry is enabled, and suppresses the old post-prefill
+    `_record_resident_last_tokens` scatter when the compiled boundary already
+    seeded the resident table.
+- artifacts:
+  - large random benchmark:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_prefill_slot_carry_table_r1.json`;
+  - nested JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_prefill_slot_carry_table_r1_jax.json`;
+  - profiled large random benchmark:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_prefill_slot_carry_table_profile_r1.json`;
+  - nested profiled JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_prefill_slot_carry_table_profile_r1_jax.json`;
+  - profile trace:
+    `/mountpoint/.exp/profiles/20260605-073625-101290-random_large_prefill_slot_carry_table_profile_r1_jax`.
+- result:
+  - large random post-patch JAX: `470.14 output tok/s`, `1582` generated
+    tokens, `3.3649 s`, ITL mean `7.84 ms`;
+  - previous accepted Entry 256 large random: `460.45 output tok/s`, `1582`
+    generated tokens, `3.4358 s`;
+  - stored vLLM denominator remains `884.03 output tok/s`, so the JAX/stored
+    vLLM ratio moved from `0.521x` to `0.532x`;
+  - measured-phase JIT cache growth remained zero (`20 -> 20`);
+  - generic warmup compiled all 8 packed prefill bucket routes as
+    `forward_prefill_token_ids_slot_carry_table_jit:prefill` and all 12 decode
+    bucket routes as `forward_step_token_ids_slot_carry_table_jit:decode`.
+- profile delta:
+  - old Entry 256 profile had `_record_resident_last_tokens` at `439.35 ms / 7`
+    calls and total `gather` at `1216.23 ms`;
+  - new profile no longer has `_record_resident_last_tokens` or
+    `_record_device_token_carry` in the top events, and total `gather` dropped
+    to `293.55 ms`;
+  - `_run_main_and_sample` dropped from `1917.86 ms / 315` to
+    `1664.43 ms / 338` in the profiled run;
+  - remaining visible buckets are `PjRtCApiLoadedExecutable::Execute`
+    (`1535.04 ms / 626`), scheduler/build metadata (`schedule`
+    `761.71 ms`, `_static_decode_device_arrays` `543.76 ms`, `device_put`
+    `532.76 ms`), and GPU model work (BF16 GEMMs, GDN decode kernel, and
+    fusion/cutlass).
+- interpretation:
+  - this accepted fix removes the final known host-visible resident-token seed
+    on the current static decode route;
+  - the next general target should be scheduler/static-decode metadata movement
+    and broader decode execution fusion, not another token-carry rewrite.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py tests/test_backend_boundaries.py tests/test_device_token_carry.py`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'packed_prefill_greedy_token_jit_returns_row_tokens or warmup_compiles_table_prefill_when_available or warmup_compiles_prefill_slot_carry_table_when_available or warmup_compiles_decode_block_table_buckets'`;
+  - `pytest -q tests/test_device_token_carry.py -k 'updates_resident_last_tokens or records_full_static_decode_rows or static_decode_metadata_requires_token_carry or survives_nonfinal_prefill_chunk or release_preserves_carry'`.
