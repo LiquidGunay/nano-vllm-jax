@@ -9544,3 +9544,50 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - `python -m py_compile nanovllm_jax/engine/model_runner.py tests/test_device_token_carry.py`;
   - `pytest -q tests/test_device_token_carry.py -k 'records_full_static_decode_rows or whole_vector_when_seq_ids_match or follows_seq_ids_after_row_order_change or static_decode_metadata_applies_carried_seq_lens or first_static_decode_can_use_scheduler_seq_lens'`;
   - `pytest -q tests/test_backend_boundaries.py -k 'warmup_compiles_table_prefill_when_available or packed_prefill_greedy_token_jit_returns_row_tokens'`.
+
+### Entry 251 - Larger Random Rung And Metadata-Carry Rejections
+
+- date: 2026-06-05
+- purpose:
+  - promote the safe random ladder beyond the medium `4`-request envelope;
+  - test whether the now-visible scheduler/static metadata buckets can be
+    reduced without changing the serving ABI or specializing to a shape.
+- artifacts:
+  - larger guarded JAX-only:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_token_carry_large_guarded_r1.json`;
+  - larger live-vLLM comparison:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_token_carry_large_with_vllm_r1.json`;
+  - larger profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_token_carry_large_profile_r1.json`;
+  - seq-lens carry diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_seq_lens_carry_large_guarded_r1.json`;
+  - shared-gather carry diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_shared_gather_large_guarded_r1.json`.
+- results:
+  - larger JAX-only rung: `8` requests, `6240` input tokens, `1351` output
+    tokens, `397.84 output tok/s`, zero measured-phase JIT growth (`20 -> 20`),
+    peak system RAM `44.2%`;
+  - larger live comparison: JAX `400.42 output tok/s`, vLLM
+    `884.03 output tok/s`, ratio `0.453x`, same input/output token counts,
+    zero JIT growth, peak system RAM below `47%`;
+  - larger profile: `_run_main_and_sample` `1817 ms`,
+    `PjRtCApiLoadedExecutable::Execute` `1398 ms`, `_maybe_apply_device_token_carry`
+    `741 ms`, scheduler `build_scheduled_batch` `557 ms`, and GPU `fusion`
+    plus `cutlass` totals about `1064 ms`;
+  - `static_decode_seq_lens_carry=true` stayed cache-stable but regressed to
+    `341.31 output tok/s` on the larger rung;
+  - a shared-gather fallback for row-reordered device-token carry stayed
+    cache-stable but regressed to `370.84 output tok/s`.
+- decision:
+  - keep Entry 250's full-row static decode carry alignment;
+  - reject seq-lens carry promotion on the current random path;
+  - reject the shared-gather token-carry fallback and keep the previous
+    per-row fallback for row-reordered/finishing requests;
+  - next work should target a broader decode/scheduler boundary or production
+    kernel integration. Source-level metadata micro rewrites are now likely to
+    trade one PJRT bucket for another unless they remove an entire per-step
+    call.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_runner.py tests/test_device_token_carry.py`;
+  - `pytest -q tests/test_device_token_carry.py -k 'records_full_static_decode_rows or whole_vector_when_seq_ids_match or follows_seq_ids_after_row_order_change or survives_nonfinal_prefill_chunk or applies_device_token_carry_to_mixed_packed_decode_rows or static_decode_metadata_requires_token_carry'`;
+  - `git diff --check`.

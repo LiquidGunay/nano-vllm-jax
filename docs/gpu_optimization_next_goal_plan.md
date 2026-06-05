@@ -210,6 +210,16 @@ without profiling, about `0.69x` that vLLM denominator. The follow-up profile
 confirmed CPU `gather` fell from `376.6 ms` to `50.9 ms`; remaining work is
 per-step PJRT/device-token carry overhead plus real GPU GEMM/fusion time.
 
+Status note, 2026-06-05 r4: the larger guarded rung
+(`8` requests, `6240` input tokens, `1351` output tokens) completed with zero
+measured-phase JIT growth and `400.42 output tok/s`; live same-envelope vLLM
+was `884.03 output tok/s`, so this rung is `0.453x`. Resource pressure stayed
+safe (`<47%` system RAM for the live comparison). Large-rung profiling shows
+the next gap is mixed: per-step PJRT/device-token carry/scheduler metadata plus
+real GPU GEMM/fusion time. Two follow-ups were rejected on this path:
+`static_decode_seq_lens_carry=true` regressed to `341.31 output tok/s`, and a
+shared-gather token-carry fallback regressed to `370.84 output tok/s`.
+
 Micro-burst selection model:
 
 - A width-`K` greedy burst replaces `K` host/PJRT scheduler executions with one
