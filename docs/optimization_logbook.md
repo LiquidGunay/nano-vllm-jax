@@ -9738,3 +9738,65 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
 - validation:
   - `python -m py_compile benchmarks/benchmark_random_request_sidecar.py tests/test_benchmark_random_request_sidecar.py`;
   - `pytest -q tests/test_benchmark_random_request_sidecar.py`.
+
+### Entry 256 - Resident Slot-Token Decode Boundary
+
+- date: 2026-06-05
+- purpose:
+  - remove the remaining hot decode path that rewrote `batch.tokens` from
+    `DeviceTokenRef` rows in Python/JAX before every static decode step;
+  - keep final generated-token materialization correct by preserving immutable
+    per-step `DeviceTokenRef` vectors, rather than using a mutable table as the
+    output history;
+  - move the next-token input carry into the compiled decode boundary, matching
+    the broader serving-framework pattern where resident request slots own the
+    mutable decode input/state.
+- implementation:
+  - added `ExecutorOutput.resident_last_tokens`;
+  - added `ModelExecutor.forward_step_token_ids_slot_carry_table_jit`;
+  - the new JIT gathers `tokens = resident_last_tokens[hybrid_slot_ids]`,
+    runs the existing table-hybrid greedy decode path, scatters updated hybrid
+    state, and scatters sampled token IDs back into `resident_last_tokens`;
+  - `CanonicalModelRunner` now maintains `_resident_last_tokens` per hybrid
+    slot, seeds it from `_record_device_token_carry`, resets released slots, and
+    skips `_maybe_apply_device_token_carry` only when every active static-decode
+    row has both a device-token carry and an assigned hybrid slot;
+  - `_record_device_token_carry` still records immutable output token refs for
+    correctness/final materialization. On the resident slot-token route, it does
+    not issue a second post-JIT resident-token scatter.
+- artifacts:
+  - first comparable large random capacity fix attempt:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_slot_carry_table_r2.json`;
+  - post-guard accepted large random run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_slot_carry_table_r3.json`;
+  - nested JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_slot_carry_table_r3_jax.json`.
+- result:
+  - large random post-patch JAX: `460.45 output tok/s`, `1582` generated
+    tokens, `3.4358 s`, ITL mean `7.36 ms`;
+  - stored vLLM denominator: `884.03 output tok/s`;
+  - JAX/stored-vLLM output-token ratio: `0.521x`;
+  - previous large live-comparison JAX anchor:
+    `400.42 output tok/s`, `1351` generated tokens, `3.3740 s`, ITL mean
+    `8.03 ms`;
+  - measured-phase JIT cache growth remained zero (`20 -> 20`);
+  - generic warmup compiled `20` entries, and all decode warmup routes were
+    `forward_step_token_ids_slot_carry_table_jit:decode` rather than the older
+    `forward_step_token_ids_table_jit:decode`.
+- benchmark caveat:
+  - random generated token text is allowed to diverge under the current random
+    correctness policy;
+  - the sidecar stored-vLLM ratio reuses the prior vLLM denominator, so treat
+    `0.521x` as the current hill-climb signal rather than a final promotion
+    ratio. Rerun live vLLM before declaring a release baseline.
+- interpretation:
+  - this is a concrete structural fix: it removes a whole per-step token-carry
+    rewrite/slice boundary from static decode and folds that state update into
+    useful decode work;
+  - the gain is real but not enough for the `0.9x` target. The next profile
+    should start from this route and attack the remaining model/GEMM,
+    GDN/full-attention, and PjRT/command-buffer buckets.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py tests/test_backend_boundaries.py tests/test_device_token_carry.py`;
+  - `pytest -q tests/test_device_token_carry.py -k 'updates_resident_last_tokens or records_full_static_decode_rows or whole_vector_when_seq_ids_match or follows_seq_ids_after_row_order_change or static_decode_metadata_requires_token_carry'`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'table_hybrid_decode_matches_sliced_decode or warmup_compiles_decode_block_table_buckets'`.

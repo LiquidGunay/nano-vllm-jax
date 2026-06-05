@@ -110,6 +110,11 @@ class _LegacyModelRunner:
             "device_token_carry",
             "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
         )
+        self.static_decode_metadata = _config_or_env_flag(
+            config,
+            "static_decode_metadata",
+            "NANO_VLLM_JAX_STATIC_DECODE_METADATA",
+        )
         self.resident_decode_metadata = bool(
             getattr(config, "resident_decode_metadata", False)
         )
@@ -995,6 +1000,11 @@ class CanonicalModelRunner:
             "device_token_carry",
             "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
         )
+        self.static_decode_metadata = _config_or_env_flag(
+            config,
+            "static_decode_metadata",
+            "NANO_VLLM_JAX_STATIC_DECODE_METADATA",
+        )
         self.resident_decode_metadata = bool(
             getattr(config, "resident_decode_metadata", False)
         )
@@ -1053,6 +1063,7 @@ class CanonicalModelRunner:
             for _ in range(max_seqs)
         ]
         self._resident_seq_lens_host: list[int] = [0 for _ in range(max_seqs)]
+        self._resident_last_tokens = jnp.zeros((max_seqs,), dtype=jnp.int32)
         self._sample_fn = jax.jit(self._sample_logits)
         self.mtp_enabled = hasattr(params, "mtp_params") and params.mtp_params is not None
         self.num_speculative_tokens = int(getattr(config, "num_speculative_tokens", 0) or 0)
@@ -1237,6 +1248,13 @@ class CanonicalModelRunner:
             and hybrid_state_table.recurrent_state is not None
             and hasattr(self.executor, "forward_prefill_token_ids_table_jit")
         )
+        use_slot_carry_table_decode = (
+            use_hybrid_table_decode
+            and bool(getattr(self, "device_token_carry", False))
+            and bool(getattr(self, "static_decode_metadata", False))
+            and not bool(getattr(self, "resident_decode_metadata", False))
+            and hasattr(self.executor, "forward_step_token_ids_slot_carry_table_jit")
+        )
         seed_mtp1 = bool(getattr(self, "mtp1_enabled", False))
         greedy_decode_burst_steps = max(
             1,
@@ -1416,6 +1434,17 @@ class CanonicalModelRunner:
                                 steps=1,
                             )
                         route = "forward_step_token_ids_resident_jit:decode"
+                    elif use_slot_carry_table_decode:
+                        output = self.executor.forward_step_token_ids_slot_carry_table_jit(
+                            batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state_table=self._hybrid_state_table,
+                            hybrid_slot_ids=hybrid_slot_ids,
+                            resident_last_tokens=self._resident_last_tokens,
+                        )
+                        if output.resident_last_tokens is not None:
+                            self._resident_last_tokens = output.resident_last_tokens
+                        route = "forward_step_token_ids_slot_carry_table_jit:decode"
                     else:
                         output = self.executor.forward_step_token_ids_table_jit(
                             batch,
@@ -1521,11 +1550,13 @@ class CanonicalModelRunner:
 
     def release(self, seq_ids: List[int]):
         """Release per-sequence hybrid state once a request is finished."""
+        released_slots: list[int] = []
         for seq_id in seq_ids:
             self.hybrid_states.pop(seq_id, None)
             slot = self._hybrid_slots.pop(seq_id, None)
             if slot is not None:
                 self._free_hybrid_slots.append(slot)
+                released_slots.append(int(slot))
                 if hasattr(self, "_resident_block_tables_host"):
                     self._resident_block_tables_host[slot] = tuple(
                         0 for _ in range(self.max_blocks_per_seq)
@@ -1533,6 +1564,10 @@ class CanonicalModelRunner:
                 if hasattr(self, "_resident_seq_lens_host"):
                     self._resident_seq_lens_host[slot] = 0
             self._mtp1_drafts.pop(seq_id, None)
+        if released_slots and hasattr(self, "_resident_last_tokens"):
+            self._resident_last_tokens = self._resident_last_tokens.at[
+                jnp.asarray(released_slots, dtype=jnp.int32)
+            ].set(jnp.zeros((len(released_slots),), dtype=jnp.int32))
         carry_by_seq_id = getattr(self, "_device_token_carry_by_seq_id", {})
         if carry_by_seq_id and any(seq_id in carry_by_seq_id for seq_id in seq_ids):
             finished_seq_ids = {int(seq_id) for seq_id in seq_ids}
@@ -1710,6 +1745,70 @@ class CanonicalModelRunner:
             raise RuntimeError("static decode metadata requires carried device seq_lens")
         return replace(batch, tokens=tokens, seq_lens=seq_lens)
 
+    def _resident_slot_token_decode_ready(
+        self,
+        batch: ScheduledBatch,
+        *,
+        active_rows: list[int],
+    ) -> bool:
+        if (
+            batch.is_prefill
+            or not bool(getattr(batch, "uses_static_decode_metadata", False))
+            or batch.seq_ids_host is None
+            or not active_rows
+            or not hasattr(self, "_resident_last_tokens")
+            or not hasattr(self.executor, "forward_step_token_ids_slot_carry_table_jit")
+        ):
+            return False
+        carry_by_seq_id = getattr(self, "_device_token_carry_by_seq_id", {})
+        if not carry_by_seq_id:
+            return False
+        hybrid_slots = getattr(self, "_hybrid_slots", {})
+        for row in active_rows:
+            seq_id = int(batch.seq_ids_host[row])
+            if seq_id < 0 or seq_id not in carry_by_seq_id or seq_id not in hybrid_slots:
+                return False
+        return True
+
+    def _record_resident_last_tokens(
+        self,
+        batch: ScheduledBatch,
+        token_ids: jnp.ndarray,
+        *,
+        eligible_rows: list[int],
+        active_row_to_token_row: dict[int, int],
+        full_batch_tokens: bool,
+    ) -> None:
+        if (
+            not eligible_rows
+            or not hasattr(self, "_resident_last_tokens")
+            or batch.seq_ids_host is None
+        ):
+            return
+        slot_values = list(batch.hybrid_slot_ids_host or ())
+        if not slot_values:
+            slot_values = [
+                self._hybrid_slots.get(int(seq_id), -1)
+                for seq_id in batch.seq_ids_host
+            ]
+        token_vector = _int32_device_vector(token_ids.astype(jnp.int32))
+        slots: list[int] = []
+        token_rows: list[int] = []
+        for row in eligible_rows:
+            if row >= len(slot_values):
+                continue
+            slot = int(slot_values[row])
+            if slot < 0:
+                continue
+            token_row = row if full_batch_tokens else active_row_to_token_row[row]
+            slots.append(slot)
+            token_rows.append(int(token_row))
+        if not slots:
+            return
+        self._resident_last_tokens = self._resident_last_tokens.at[
+            jnp.asarray(slots, dtype=jnp.int32)
+        ].set(token_vector[jnp.asarray(token_rows, dtype=jnp.int32)])
+
     def _record_device_token_carry(
         self,
         batch: ScheduledBatch,
@@ -1718,6 +1817,7 @@ class CanonicalModelRunner:
         active_rows: list[int],
         prefill_final_flags: list[bool],
         seqs: List[Sequence],
+        update_resident_tokens: bool = True,
     ) -> None:
         if (
             not bool(
@@ -1763,6 +1863,14 @@ class CanonicalModelRunner:
             new_carry_by_seq_id[seq_id] = token_ref
         if not new_carry_by_seq_id:
             return
+        if update_resident_tokens:
+            self._record_resident_last_tokens(
+                batch,
+                token_ids,
+                eligible_rows=eligible_rows,
+                active_row_to_token_row=active_row_to_token_row,
+                full_batch_tokens=full_batch_tokens,
+            )
         self._device_token_carry_seq_ids = (
             tuple(int(seq_id) for seq_id in batch.seq_ids_host)
             if full_batch_tokens
@@ -2722,20 +2830,6 @@ class CanonicalModelRunner:
             if use_greedy_token_fastpath
             else 1
         )
-        batch = self._maybe_apply_device_token_carry(batch)
-        if batch.query_lens_host is not None:
-            query_lens = [int(x) for x in batch.query_lens_host[: len(seqs)]]
-        else:
-            query_lens = [int(x) for x in batch.query_lens[: len(seqs)].tolist()]
-        if batch.seq_ids_host is not None:
-            seq_ids_host = [int(x) for x in batch.seq_ids_host[: len(seqs)]]
-        else:
-            seq_ids_host = [int(batch.seq_ids[row]) for row in range(len(seqs))]
-        active_rows = [
-            row
-            for row, query_len in enumerate(query_lens)
-            if query_len > 0 and seq_ids_host[row] >= 0
-        ]
         use_hybrid_table_decode = (
             use_greedy_token_fastpath
             and not batch.is_prefill
@@ -2756,6 +2850,30 @@ class CanonicalModelRunner:
             and self._hybrid_state_table.recurrent_state is not None
             and hasattr(self.executor, "forward_prefill_token_ids_table_jit")
         )
+        resident_slot_token_decode = (
+            use_hybrid_table_decode
+            and decode_burst_steps <= 1
+            and not bool(getattr(self, "resident_decode_metadata", False))
+            and self._resident_slot_token_decode_ready(
+                batch,
+                active_rows=self._active_decode_rows_host(batch),
+            )
+        )
+        if not resident_slot_token_decode:
+            batch = self._maybe_apply_device_token_carry(batch)
+        if batch.query_lens_host is not None:
+            query_lens = [int(x) for x in batch.query_lens_host[: len(seqs)]]
+        else:
+            query_lens = [int(x) for x in batch.query_lens[: len(seqs)].tolist()]
+        if batch.seq_ids_host is not None:
+            seq_ids_host = [int(x) for x in batch.seq_ids_host[: len(seqs)]]
+        else:
+            seq_ids_host = [int(batch.seq_ids[row]) for row in range(len(seqs))]
+        active_rows = [
+            row
+            for row, query_len in enumerate(query_lens)
+            if query_len > 0 and seq_ids_host[row] >= 0
+        ]
         if use_hybrid_table_decode or use_hybrid_table_prefill:
             hybrid_slot_ids = self._batch_hybrid_slot_ids(batch)
             hybrid_slot_values = list(batch.hybrid_slot_ids_host or ())
@@ -2810,6 +2928,16 @@ class CanonicalModelRunner:
                     resident_block_tables=self._resident_block_tables,
                     resident_seq_lens=self._resident_seq_lens,
                 )
+            elif resident_slot_token_decode:
+                output = self.executor.forward_step_token_ids_slot_carry_table_jit(
+                    batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state_table=hybrid_state,
+                    hybrid_slot_ids=hybrid_slot_ids,
+                    resident_last_tokens=self._resident_last_tokens,
+                )
+                if output.resident_last_tokens is not None:
+                    self._resident_last_tokens = output.resident_last_tokens
             elif use_hybrid_table_decode:
                 output = self.executor.forward_step_token_ids_table_jit(
                     batch,
@@ -2916,6 +3044,7 @@ class CanonicalModelRunner:
                 active_rows=active_rows,
                 prefill_final_flags=prefill_final_flags,
                 seqs=seqs,
+                update_resident_tokens=not resident_slot_token_decode,
             )
         elif use_greedy_token_fastpath and decode_burst_steps > 1 and carry_device_tokens:
             self._record_device_token_carry(

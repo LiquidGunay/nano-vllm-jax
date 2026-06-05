@@ -233,6 +233,33 @@ def test_model_runner_device_token_carry_records_full_static_decode_rows(monkeyp
     assert carried_batch.tokens is token_matrix
 
 
+def test_model_runner_device_token_carry_updates_resident_last_tokens(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    runner = ModelRunner.__new__(ModelRunner)
+    runner._device_token_carry_seq_ids = None
+    runner._device_token_carry_tokens = None
+    runner._device_token_carry_by_seq_id = {}
+    runner._resident_last_tokens = jnp.zeros((4,), dtype=jnp.int32)
+    runner._hybrid_slots = {7: 2, 8: 1}
+    seq_a = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
+    seq_b = Sequence([2], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=8)
+    batch = _decode_batch((7, 8, -1, -1), [0, 0, 0, 0], seq_lens=[4, 5, 0, 0])
+    batch.hybrid_slot_ids_host = (2, 1, -1, -1)
+
+    runner._record_device_token_carry(
+        batch,
+        jnp.asarray([[70], [80], [0], [0]], dtype=jnp.int32),
+        active_rows=[0, 1],
+        prefill_final_flags=[True, True],
+        seqs=[seq_a, seq_b],
+    )
+
+    np.testing.assert_array_equal(
+        np.asarray(runner._resident_last_tokens),
+        np.asarray([0, 80, 70, 0], dtype=np.int32),
+    )
+
+
 def test_model_runner_device_token_carry_follows_seq_ids_after_row_order_change(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     runner = ModelRunner.__new__(ModelRunner)

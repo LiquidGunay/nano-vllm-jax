@@ -2826,8 +2826,10 @@ Random-request sidecar status as of Entry 240:
   diagnostics, not benchmark-specific flags.
 - Next execution order:
   1. Profile the latest random route with generic warmup and no measured-phase
-     JIT growth.
-  2. Attribute the `26.62 s` decode bucket into model GEMMs, GDN decode,
+     JIT growth. The current route is the resident slot-token decode boundary
+     from Entry 256, not the older Python/JAX `_maybe_apply_device_token_carry`
+     rewrite.
+  2. Attribute the latest decode bucket into model GEMMs, GDN decode,
      full-attention decode, LM head, scheduler/table movement, and PjRT/CPU
      gaps.
   3. Implement the largest general decode-side change first. Candidate classes
@@ -2902,6 +2904,15 @@ Current validation:
   (`greedy_token_fastpath`, `device_token_carry`, `static_decode_metadata`,
   `static_decode_seq_lens_carry`) rather than new hot-path env gates. Legacy env
   overrides remain only for compatibility and diagnostics.
+- Entry 256 promoted a broader token-carry boundary for the random decode lane:
+  `forward_step_token_ids_slot_carry_table_jit` gathers decode input tokens from
+  a device-resident per-slot token table and scatters sampled tokens back inside
+  the compiled decode executable. The runner still records immutable
+  `DeviceTokenRef` vectors for output materialization, so the resident table is
+  only the next-token input state. Large random post-patch reached
+  `460.45 output tok/s` against the stored vLLM denominator, with zero
+  measured-phase JIT growth and warmup routes entirely on the new slot-carry
+  decode boundary.
 
 Model-specific assumptions to track:
 

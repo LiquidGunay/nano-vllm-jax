@@ -70,3 +70,10 @@
   decode metadata v1/placeholders, static seq-lens carry, shared-gather
   token-carry fallback, and source-level greedy decode bursts. Reopen any of
   these only with a broader boundary that removes a whole per-step operation.
+- Current accepted large-random decode boundary: resident slot-token carry
+  inside `forward_step_token_ids_slot_carry_table_jit`. It keeps immutable
+  generated-token refs for final materialization, but gathers the next decode
+  input from a device-resident per-slot token table and scatters the newly
+  sampled token back inside the compiled decode boundary. This is the preferred
+  static decode route unless a broader resident metadata/kernel boundary
+  replaces it.
