@@ -623,11 +623,14 @@ def lm_head_token_ids_and_topk(
         _lm_head_decode_activation_dtype(config) if not is_prefill else jnp.float32
     )
     output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
-    logits = _tokenwise_decode_dot(
-        hidden_norm,
-        output_weight,
-        force_width1=(not is_prefill) and hidden_norm.ndim == 3 and hidden_norm.shape[1] > 1 and _force_width1_decode_math(),
-    )
+    if _can_use_decode_padded_gemm(hidden_norm, output_weight, config):
+        logits = _decode_padded_gemm_dot(hidden_norm, output_weight, config)
+    else:
+        logits = _tokenwise_decode_dot(
+            hidden_norm,
+            output_weight,
+            force_width1=(not is_prefill) and hidden_norm.ndim == 3 and hidden_norm.shape[1] > 1 and _force_width1_decode_math(),
+        )
     token_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
     if top_k > 0:
         top_values, top_indices = jax.lax.top_k(logits.astype(jnp.float32), top_k)

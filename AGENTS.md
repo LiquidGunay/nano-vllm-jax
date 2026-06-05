@@ -78,8 +78,8 @@
   table owns the next decode input state. This is the preferred route unless a
   broader resident metadata/kernel boundary replaces it.
 - Current accepted FA/FLA kernel policy: GDN keeps strict
-  `triton_fla_padded` prefill plus packed-projection
-  `triton_fla_conv_raw_gates` decode, while full-attention uses
+  `triton_fla_padded` prefill plus explicit packed-projection `reference`
+  decode, while full-attention uses
   `triton_packed` prefill and `triton_paged_fused_append` decode. Standalone
   FA decode remains rejected; the accepted FA route is the broader
   packed-prefill plus fused append/decode boundary.
@@ -88,9 +88,10 @@
   mirrors with full-table `device_put` on actual changes, and
   `forward_step_token_ids_resident_slot_carry_jit` owns block table, seq-len,
   token, hybrid-state, KV, and greedy-token updates inside the decode boundary.
-- Latest accepted large-random hill-climb result: `495.10 output tok/s` against
-  the stored vLLM denominator (`0.560x`), zero measured-phase JIT growth, with
-  `_sync_resident_decode_metadata` reduced from `689 ms` to `140 ms` in the
-  profiled route. The next bottleneck is model-side decode GPU work
-  (GEMMs/attention/GDN) plus remaining PJRT execution overhead, not another
-  token-carry rewrite.
+- Latest accepted large-random hill-climb result: row-padded decode GEMMs now
+  cover the LM head as well as hidden/intermediate projections. Repeats reached
+  `516.35` and `519.16 output tok/s` against the stored vLLM denominator
+  (`0.584x` and `0.587x`), with zero measured-phase JIT growth. This is a
+  small accepted win, not the target-closing leap; the next bottleneck is still
+  model-side decode GPU work (many small GEMMs/attention/GDN) plus remaining
+  PJRT execution overhead.

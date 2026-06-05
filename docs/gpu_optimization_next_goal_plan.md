@@ -274,6 +274,17 @@ reduction are not the large levers; the next candidate must remove a larger
 serving boundary across many decode sublayers or use a true backend/library
 GEMM epilogue.
 
+Status note, 2026-06-05 r9: the existing row-padded decode GEMM route now also
+covers the LM head when the configured output-dimension guard admits the model
+vocabulary. Two large-random repeats reached `516.35` and `519.16 output tok/s`
+(`0.584x` and `0.587x` the stored vLLM denominator), both with zero
+measured-phase JIT growth and full generated-token count (`1582`). This is
+promoted as a small robust GEMM-shape win because it keeps XLA/CUTLASS on the
+dense LM-head dot while avoiding the slower tokenwise width-1 spelling. It does
+not change the larger conclusion from Entry 267: standalone token-id-only
+LM-head reductions are rejected, and the next real LM-head route must be a
+backend/library fused GEMM epilogue if we revisit this bucket.
+
 First implementation slice: `full_attention.prefill_impl` now controls reference
 versus packed Triton prefill routing, `server_config.yaml` and the FA/GDN
 benchmark config select `prefill_impl=triton_packed`, and the random sidecar

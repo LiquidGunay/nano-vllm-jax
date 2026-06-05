@@ -10327,3 +10327,48 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - large random sidecar used stored vLLM denominator, generic warmup, exact
     decode buckets, `--jax-fail-on-jit-cache-growth`, the 70% RAM guard, and
     four CPU cores at nice level `10`.
+
+### Entry 268 - Accepted Row-Padded Decode GEMM For LM Head
+
+- date: 2026-06-05
+- purpose:
+  - test whether the accepted row-padded decode GEMM path should also cover the
+    greedy LM-head dot instead of only hidden/intermediate projections;
+  - keep the active reference GDN decode route, exact decode buckets, resident
+    metadata, generic warmup, stored vLLM denominator, and resource guards.
+- implementation:
+  - routed `lm_head_token_ids_and_topk` through `_decode_padded_gemm_dot` when
+    `decode_padded_gemm=true`, the decode width is `1`, the batch fits the
+    configured padded row count, and the output dimension is admitted by
+    `decode_padded_gemm_max_out_dim`;
+  - promoted the active config's output-dimension guard high enough to include
+    the Qwen3.5-family vocabulary, so the same XLA/CUTLASS GEMM-shaped path is
+    used for LM-head decode selection;
+  - left top-k diagnostics and argmax semantics unchanged.
+- artifacts:
+  - r1 sidecar:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_padded_gemm_r1.json`;
+  - r1 nested JAX:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_padded_gemm_r1_jax.json`;
+  - r2 sidecar:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_padded_gemm_r2.json`;
+  - r2 nested JAX:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_padded_gemm_r2_jax.json`.
+- result:
+  - r1 reached `516.35 output tok/s`, `0.584x` of the stored vLLM denominator;
+  - r2 reached `519.16 output tok/s`, `0.587x` of the stored vLLM denominator;
+  - both runs generated `1582` tokens and kept zero measured-phase JIT cache
+    growth (`40 -> 40`);
+  - the prior active-config sanity reached `513.60 output tok/s`, and Entry 266
+    reference-GDN repeats reached `514.25` and `508.85 output tok/s`.
+- decision:
+  - promote LM-head coverage for the row-padded GEMM route;
+  - count this as an incremental GEMM-shape improvement, not the main route to
+    `0.9x` vLLM. The larger LM-head lesson from Entry 267 still stands:
+    token-id-only reductions lose unless they preserve the optimized GEMM path
+    or become a true backend/library GEMM epilogue.
+- validation:
+  - focused LM-head helper tests passed;
+  - both large random sidecar runs used the stored vLLM denominator, generic
+    warmup, exact decode buckets, `--jax-fail-on-jit-cache-growth`, the 70% RAM
+    guard, and four CPU cores at nice level `10`.

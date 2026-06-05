@@ -59,6 +59,54 @@ def test_lm_head_token_ids_and_topk_matches_full_logits():
     np.testing.assert_array_equal(np.array(normed_token_ids), np.array(token_ids))
 
 
+def test_lm_head_can_use_decode_padded_gemm_when_vocab_allowed():
+    hidden = jnp.array(
+        [
+            [[0.2, -0.4, 0.7, 1.0]],
+            [[-0.5, 0.8, 0.4, -0.1]],
+        ],
+        dtype=jnp.float32,
+    )
+    embed_tokens = jnp.linspace(-0.7, 0.9, 28, dtype=jnp.float32).reshape(7, 4)
+    params = ModelParams(
+        embed_tokens=embed_tokens,
+        layers=[],
+        norm_weight=jnp.array([1.0, 0.8, 1.2, 0.6], dtype=jnp.float32),
+        lm_head=None,
+    )
+    reference_config = SimpleNamespace(
+        rms_norm_eps=1e-6,
+        decode_padded_gemm=False,
+        lm_head_decode_act_dtype="fp32",
+    )
+    padded_config = SimpleNamespace(
+        rms_norm_eps=1e-6,
+        decode_padded_gemm=True,
+        decode_padded_gemm_rows=4,
+        decode_padded_gemm_max_out_dim=7,
+        lm_head_decode_act_dtype="fp32",
+    )
+
+    expected = lm_head_token_ids_and_topk(
+        hidden,
+        params,
+        reference_config,
+        is_prefill=False,
+        top_k=2,
+    )
+    actual = lm_head_token_ids_and_topk(
+        hidden,
+        params,
+        padded_config,
+        is_prefill=False,
+        top_k=2,
+    )
+
+    np.testing.assert_array_equal(np.array(actual[0]), np.array(expected[0]))
+    np.testing.assert_allclose(np.array(actual[1]), np.array(expected[1]), rtol=0, atol=1e-6)
+    np.testing.assert_array_equal(np.array(actual[2]), np.array(expected[2]))
+
+
 def test_compact_prefill_mlp_matches_dense_on_valid_tokens(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_COMPACT_PREFILL_MLP", "1")
     x = jnp.array(
