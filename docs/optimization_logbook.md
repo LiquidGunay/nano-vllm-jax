@@ -9591,3 +9591,38 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - `python -m py_compile nanovllm_jax/engine/model_runner.py tests/test_device_token_carry.py`;
   - `pytest -q tests/test_device_token_carry.py -k 'records_full_static_decode_rows or whole_vector_when_seq_ids_match or follows_seq_ids_after_row_order_change or survives_nonfinal_prefill_chunk or applies_device_token_carry_to_mixed_packed_decode_rows or static_decode_metadata_requires_token_carry'`;
   - `git diff --check`.
+
+### Entry 252 - Full Random Resource-Guard Safety Validation
+
+- date: 2026-06-05
+- purpose:
+  - verify the full seed-`1234` random sidecar can run under the new watchdog
+    and finite generic warmup after the table-prefill/token-carry changes;
+  - avoid another unbounded compile/run while still checking the full request
+    graph.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_token_carry_full_guarded_r1.json`.
+- workload:
+  - `15` requests;
+  - prompt lengths `1077..4022`, total input tokens `30506`;
+  - output lengths `425..1007`, total output tokens `11602`.
+- result:
+  - completed successfully under `--max-system-ram-percent 70` and
+    `--worker-cpu-cores 2`;
+  - peak system RAM `53.0%`, peak process-tree RSS about `5.72 GB`;
+  - generic warmup compiled `36` entries: `24` packed table-prefill shapes and
+    `12` decode shapes;
+  - measured-phase JIT growth stayed zero (`36 -> 36`);
+  - measured JAX throughput was `239.35 output tok/s`.
+- interpretation:
+  - this is a safety validation, not a new accepted performance baseline. The
+    two-core CPU affinity cap intentionally protects the machine, but it also
+    likely depresses measured throughput because the random path still has
+    CPU-visible scheduler/PJRT work;
+  - for fair performance comparisons, either cap both JAX and vLLM identically
+    or run an uncapped/niceness-only comparison after the next structural
+    optimization.
+- decision:
+  - keep the resource guard and safety ladder;
+  - do not replace the prior full-random performance anchor with this capped
+    safety result.

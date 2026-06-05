@@ -220,6 +220,14 @@ real GPU GEMM/fusion time. Two follow-ups were rejected on this path:
 `static_decode_seq_lens_carry=true` regressed to `341.31 output tok/s`, and a
 shared-gather token-carry fallback regressed to `370.84 output tok/s`.
 
+Status note, 2026-06-05 r5: the full seed-`1234` random graph now completes
+under the resource guard with zero measured-phase JIT growth (`36 -> 36`) and
+safe RAM (`53%` peak system RAM). With `--worker-cpu-cores 2`, JAX measured
+`239.35 output tok/s` for the full `15`-request, `30506` input-token,
+`11602` output-token workload. Treat this as a safety validation, not a new
+performance baseline: the two-core cap likely depresses measured serving
+throughput because scheduler/PJRT work remains CPU-visible.
+
 Micro-burst selection model:
 
 - A width-`K` greedy burst replaces `K` host/PJRT scheduler executions with one
