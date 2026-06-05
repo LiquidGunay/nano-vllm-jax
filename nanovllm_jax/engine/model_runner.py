@@ -1230,6 +1230,13 @@ class CanonicalModelRunner:
                 or hasattr(self.executor, "forward_greedy_decode_burst_table_jit")
             )
         )
+        use_hybrid_table_prefill = (
+            use_greedy_token_fastpath
+            and hybrid_state_table is not None
+            and hybrid_state_table.conv_state is not None
+            and hybrid_state_table.recurrent_state is not None
+            and hasattr(self.executor, "forward_prefill_token_ids_table_jit")
+        )
         seed_mtp1 = bool(getattr(self, "mtp1_enabled", False))
         greedy_decode_burst_steps = max(
             1,
@@ -1282,7 +1289,18 @@ class CanonicalModelRunner:
                         continue
                 batch = self._dummy_batch(batch_size=batch_size, query_len=prefill_len, is_prefill=True)
                 hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
-                if use_greedy_token_fastpath and not seed_mtp1:
+                if use_hybrid_table_prefill and not seed_mtp1:
+                    hybrid_slot_ids = jnp.arange(int(batch_size), dtype=jnp.int32)
+                    batch.hybrid_slot_ids_host = tuple(range(int(batch_size)))
+                    output = self.executor.forward_prefill_token_ids_table_jit(
+                        batch,
+                        cache_storage=self.cache_storage,
+                        hybrid_state_table=self._hybrid_state_table,
+                        hybrid_slot_ids=hybrid_slot_ids,
+                    )
+                    self._hybrid_state_table = output.hybrid_state
+                    route = "forward_prefill_token_ids_table_jit:prefill"
+                elif use_greedy_token_fastpath and not seed_mtp1:
                     output = self.executor.forward_step_token_ids_jit(
                         batch,
                         cache_storage=self.cache_storage,
@@ -1306,6 +1324,7 @@ class CanonicalModelRunner:
                         "batch_size": int(batch_size),
                         "query_len": int(prefill_len),
                         "tokens_shape": list(batch.tokens.shape),
+                        "block_tables_shape": list(batch.block_tables.shape),
                         "num_prefill_tokens": int(batch.num_prefill_tokens),
                         "route": route,
                     }
@@ -2726,7 +2745,14 @@ class CanonicalModelRunner:
                 )
             )
         )
-        if use_hybrid_table_decode:
+        use_hybrid_table_prefill = (
+            use_greedy_token_fastpath
+            and batch.is_prefill
+            and self._hybrid_state_table.conv_state is not None
+            and self._hybrid_state_table.recurrent_state is not None
+            and hasattr(self.executor, "forward_prefill_token_ids_table_jit")
+        )
+        if use_hybrid_table_decode or use_hybrid_table_prefill:
             hybrid_slot_ids = self._batch_hybrid_slot_ids(batch)
             hybrid_slot_values = list(batch.hybrid_slot_ids_host or ())
             hybrid_state = self._hybrid_state_table
@@ -2764,7 +2790,14 @@ class CanonicalModelRunner:
                     decode_steps=decode_burst_steps,
                 )
         elif use_greedy_token_fastpath:
-            if use_resident_slot_decode:
+            if use_hybrid_table_prefill:
+                output = self.executor.forward_prefill_token_ids_table_jit(
+                    batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state_table=hybrid_state,
+                    hybrid_slot_ids=hybrid_slot_ids,
+                )
+            elif use_resident_slot_decode:
                 output = self.executor.forward_step_token_ids_resident_jit(
                     batch,
                     cache_storage=self.cache_storage,
@@ -2796,7 +2829,7 @@ class CanonicalModelRunner:
                 last_logits_only=True,
             )
         self.cache_storage = output.cache_storage
-        if use_hybrid_table_decode:
+        if use_hybrid_table_decode or use_hybrid_table_prefill:
             self._hybrid_state_table = output.hybrid_state
             self._mark_hybrid_slots_written(list(batch.hybrid_slot_ids_host or ()))
             if use_resident_slot_decode and output.resident_seq_lens is not None:

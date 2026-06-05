@@ -1431,9 +1431,36 @@ def test_packed_prefill_greedy_token_jit_returns_row_tokens():
         cache_storage=cache,
         hybrid_state=hybrid,
     )
+    table_out = executor.forward_prefill_token_ids_table_jit(
+        batch,
+        cache_storage=init_kv_cache(
+            config.num_kvcache_blocks,
+            config.block_size,
+            config.num_key_value_heads,
+            config.head_dim,
+            max_seqs=2,
+            max_blocks_per_seq=4,
+            dtype=jnp.float32,
+        ).storage,
+        hybrid_state_table=hybrid,
+        hybrid_slot_ids=jnp.array([0, 1], dtype=jnp.int32),
+    )
 
     assert out.activations.shape == (2,)
     assert out.activations.dtype == jnp.int32
+    np.testing.assert_array_equal(np.asarray(table_out.activations), np.asarray(out.activations))
+    np.testing.assert_allclose(
+        np.asarray(table_out.hybrid_state.conv_state),
+        np.asarray(out.hybrid_state.conv_state),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(table_out.hybrid_state.recurrent_state),
+        np.asarray(out.hybrid_state.recurrent_state),
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 def test_scheduler_does_not_admit_waiting_prompts_when_active_slots_are_full():
@@ -2247,6 +2274,101 @@ def test_model_runner_warmup_uses_greedy_token_fastpath_without_mtp(monkeypatch)
     ]
     assert summary["prefill_runs"][0]["route"] == "forward_step_token_ids_jit:prefill"
     assert summary["decode_runs"][0]["route"] == "forward_step_token_ids_jit:decode"
+
+
+def test_model_runner_warmup_compiles_table_prefill_when_available(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH", "1")
+    config = _tiny_full_attention_config()
+    config.jax_execution = "jit"
+    config.prefill_layout = "packed"
+    config.prefill_buckets = (4,)
+    config.prefill_token_buckets = (4,)
+    config.batch_size_buckets = (2,)
+    config.max_blocks_per_seq = 2
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = config
+    runner.block_size = config.block_size
+    runner.max_blocks_per_seq = 2
+    runner.execution = "jit"
+    runner.cache_storage = object()
+    runner._warmup_compiled = False
+    runner.mtp1_enabled = False
+    runner._hybrid_state_table = HybridLayerState(
+        conv_state=jnp.zeros((2, 1, 1, 1), dtype=jnp.float32),
+        recurrent_state=jnp.zeros((2, 1, 1, 1, 1), dtype=jnp.float32),
+    )
+    runner.resident_decode_metadata = False
+
+    class Ready:
+        def block_until_ready(self):
+            return self
+
+    class FakeExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def forward_step_token_ids_jit(self, batch, **kwargs):
+            self.calls.append(("sliced", tuple(batch.tokens.shape), batch.is_prefill))
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                    "hybrid_state": kwargs["hybrid_state"],
+                },
+            )()
+
+        def forward_prefill_token_ids_table_jit(self, batch, **kwargs):
+            self.calls.append(
+                (
+                    "table_prefill",
+                    tuple(batch.tokens.shape),
+                    tuple(batch.block_tables.shape),
+                    tuple(int(x) for x in kwargs["hybrid_slot_ids"].tolist()),
+                )
+            )
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                    "hybrid_state": kwargs["hybrid_state_table"],
+                },
+            )()
+
+        def forward_step_token_ids_table_jit(self, batch, **kwargs):
+            self.calls.append(
+                (
+                    "table_decode",
+                    tuple(batch.tokens.shape),
+                    tuple(batch.block_tables.shape),
+                    tuple(int(x) for x in kwargs["hybrid_slot_ids"].tolist()),
+                )
+            )
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                    "hybrid_state": kwargs["hybrid_state_table"],
+                },
+            )()
+
+    runner.executor = FakeExecutor()
+    runner._sample_fn = lambda logits, temperatures: Ready()
+
+    summary = runner.warmup_compilation(max_prefill_len=4, max_batch=2)
+
+    assert runner.executor.calls == [
+        ("table_prefill", (1, 4), (2, 2), (0, 1)),
+        ("table_decode", (2, 1), (2, 2), (0, 1)),
+    ]
+    assert summary["prefill_runs"][0]["route"] == "forward_prefill_token_ids_table_jit:prefill"
+    assert summary["prefill_runs"][0]["tokens_shape"] == [1, 4]
+    assert summary["prefill_runs"][0]["block_tables_shape"] == [2, 2]
 
 
 def test_model_runner_warmup_compiles_decode_block_table_buckets(monkeypatch):

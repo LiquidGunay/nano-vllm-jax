@@ -9440,3 +9440,56 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - `python -m py_compile nanovllm_jax/engine/model_runner.py tests/test_backend_boundaries.py`;
   - `pytest -q tests/test_backend_boundaries.py -k 'initializes_resident_decode_metadata_flag or table_hybrid_decode_matches_sliced_decode or syncs_resident_decode_metadata_by_slot'`;
   - `git diff --check`.
+
+### Entry 249 - Guarded Random Sidecar And Table-Prefill Warmup
+
+- date: 2026-06-05
+- purpose:
+  - prevent another machine-stressing random compile/run by adding resource
+    limits at the benchmark subprocess boundary;
+  - finish the table-prefill boundary promotion check by ensuring generic
+    warmup compiles the same packed table-prefill ABI that serving uses.
+- implementation:
+  - replaced the random sidecar's blocking `subprocess.run()` helper with a
+    monitored `Popen` loop;
+  - added a default `--max-system-ram-percent 70` guard that terminates the
+    JAX/vLLM subprocess group if system RAM crosses the threshold;
+  - added worker CPU controls: `--worker-cpu-cores`,
+    `--worker-cpu-core-offset`, `--worker-nice`, and
+    `--resource-poll-seconds`;
+  - the sidecar records the configured resource limits, peak system RAM, and
+    peak subprocess-tree RSS in benchmark summaries;
+  - moved packed prefill GDN table gather/scatter into
+    `forward_prefill_token_ids_table_jit`;
+  - updated `CanonicalModelRunner.warmup_compilation()` so generic startup
+    warmup compiles `forward_prefill_token_ids_table_jit` for packed prefill
+    token buckets and row-count buckets when the table path is available.
+- artifacts:
+  - guard dry run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_sidecar_resource_guard_dryrun.json`;
+  - guarded scaled table-prefill run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_guarded_scaled_r1.json`;
+  - JAX child artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_config_table_prefill_guarded_scaled_r1_jax.json`.
+- results:
+  - the guarded scaled run completed normally; the watchdog did not fire;
+  - resource telemetry recorded peak system RAM `40.8%` and peak process-tree
+    RSS about `3.82 GB`;
+  - generic warmup compiled table-prefill routes for packed token buckets
+    `128,256` and row buckets `1,2`, with block-table shapes `[1,32]` and
+    `[2,32]`;
+  - measured-phase JIT growth stayed zero (`10 -> 10`);
+  - scaled throughput improved from the prior accepted-config tiny control
+    (`104.33 output tok/s`) to `132.48 output tok/s` on the same `2`-request,
+    `59`-output-token envelope.
+- decision:
+  - promote the table-prefill boundary to the next medium random diagnostic;
+  - keep the resource guard enabled for future random sidecar runs;
+  - do not treat the tiny scaled result as a full random claim or a vLLM-ratio
+    update.
+- validation:
+  - `python -m py_compile benchmarks/benchmark_random_request_sidecar.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/model_executor.py tests/test_benchmark_random_request_sidecar.py tests/test_backend_boundaries.py`;
+  - `pytest -q tests/test_benchmark_random_request_sidecar.py`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'warmup_compiles_table_prefill_when_available or warmup_uses_greedy_token_fastpath_without_mtp or packed_prefill_greedy_token_jit_returns_row_tokens'`;
+  - `pytest -q tests/test_benchmark_random_request_sidecar.py tests/test_backend_boundaries.py -k 'benchmark_random_request_sidecar or warmup_compiles_table_prefill_when_available or warmup_uses_greedy_token_fastpath_without_mtp or warmup_compiles_decode_block_table_buckets or packed_prefill_greedy_token_jit_returns_row_tokens or table_hybrid_decode_matches_sliced_decode or initializes_resident_decode_metadata_flag or syncs_resident_decode_metadata_by_slot'`;
+  - `git diff --check`.

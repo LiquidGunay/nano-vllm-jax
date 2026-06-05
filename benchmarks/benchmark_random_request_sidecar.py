@@ -7,8 +7,10 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,16 @@ DEFAULT_VLLM_PYTHON = (
 )
 if (REPO_ROOT.parent / "vllm-venv" / "bin" / "python").exists():
     DEFAULT_VLLM_PYTHON = str(REPO_ROOT.parent / "vllm-venv" / "bin" / "python")
+DEFAULT_WORKER_CPU_CORES = int(
+    os.environ.get(
+        "NANO_VLLM_JAX_RANDOM_WORKER_CPU_CORES",
+        str(min(8, max(1, (os.cpu_count() or 2) // 2))),
+    )
+)
+DEFAULT_WORKER_NICE = int(os.environ.get("NANO_VLLM_JAX_RANDOM_WORKER_NICE", "10"))
+DEFAULT_MAX_SYSTEM_RAM_PERCENT = float(
+    os.environ.get("NANO_VLLM_JAX_RANDOM_MAX_SYSTEM_RAM_PERCENT", "70")
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -143,6 +155,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="0 disables timeout.",
     )
+    parser.add_argument(
+        "--max-system-ram-percent",
+        type=float,
+        default=DEFAULT_MAX_SYSTEM_RAM_PERCENT,
+        help="Kill benchmark subprocesses when system RAM usage exceeds this percentage; 0 disables.",
+    )
+    parser.add_argument(
+        "--worker-cpu-cores",
+        type=int,
+        default=DEFAULT_WORKER_CPU_CORES,
+        help="CPU affinity core cap for JAX/vLLM subprocesses; 0 disables affinity limiting.",
+    )
+    parser.add_argument(
+        "--worker-cpu-core-offset",
+        type=int,
+        default=0,
+        help="Offset into the current affinity mask when choosing worker CPU cores.",
+    )
+    parser.add_argument(
+        "--worker-nice",
+        type=int,
+        default=DEFAULT_WORKER_NICE,
+        help="Positive niceness applied to benchmark subprocesses; 0 leaves priority unchanged.",
+    )
+    parser.add_argument(
+        "--resource-poll-seconds",
+        type=float,
+        default=1.0,
+        help="Watchdog polling interval for timeout/RAM checks.",
+    )
     return parser
 
 
@@ -158,6 +200,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-request-count must be >= --min-request-count and both > 0")
     if not (0.0 < args.vllm_gpu_memory_utilization < 1.0):
         parser.error("--vllm-gpu-memory-utilization must be in (0.0, 1.0)")
+    if args.max_system_ram_percent < 0 or args.max_system_ram_percent >= 100:
+        parser.error("--max-system-ram-percent must be in [0, 100)")
+    if args.worker_cpu_cores < 0:
+        parser.error("--worker-cpu-cores must be >= 0")
+    if args.worker_nice < -20 or args.worker_nice > 19:
+        parser.error("--worker-nice must be between -20 and 19")
+    if args.resource_poll_seconds <= 0:
+        parser.error("--resource-poll-seconds must be > 0")
     return args
 
 
@@ -326,33 +376,213 @@ def _append_cli_arg(command: list[str], key: str, value: Any) -> None:
     command.extend([flag, str(value)])
 
 
+def _system_ram_percent() -> float | None:
+    try:
+        import psutil  # type: ignore
+
+        return float(psutil.virtual_memory().percent)
+    except Exception:
+        pass
+
+    meminfo: dict[str, int] = {}
+    try:
+        with Path("/proc/meminfo").open("r", encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(":"):
+                    meminfo[parts[0][:-1]] = int(parts[1])
+    except OSError:
+        return None
+    total = meminfo.get("MemTotal", 0)
+    available = meminfo.get("MemAvailable", 0)
+    if total <= 0:
+        return None
+    return 100.0 * float(total - available) / float(total)
+
+
+def _current_affinity() -> list[int]:
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            return sorted(int(core) for core in os.sched_getaffinity(0))
+        except OSError:
+            pass
+    return list(range(max(1, os.cpu_count() or 1)))
+
+
+def _selected_worker_cores(worker_cpu_cores: int, worker_cpu_core_offset: int) -> list[int]:
+    available = _current_affinity()
+    if worker_cpu_cores <= 0 or worker_cpu_cores >= len(available):
+        return []
+    offset = int(worker_cpu_core_offset) % len(available)
+    rotated = available[offset:] + available[:offset]
+    return rotated[:worker_cpu_cores]
+
+
+def _thread_env_for_cpu_cap(worker_cpu_cores: int) -> dict[str, str]:
+    if worker_cpu_cores <= 0:
+        return {}
+    value = str(max(1, worker_cpu_cores))
+    return {
+        "OMP_NUM_THREADS": value,
+        "OPENBLAS_NUM_THREADS": value,
+        "MKL_NUM_THREADS": value,
+        "NUMEXPR_NUM_THREADS": value,
+        "VECLIB_MAXIMUM_THREADS": value,
+        "BLIS_NUM_THREADS": value,
+    }
+
+
+def _process_tree_rss_bytes(pid: int) -> int | None:
+    try:
+        import psutil  # type: ignore
+
+        root = psutil.Process(pid)
+        processes = [root] + root.children(recursive=True)
+        return int(sum(proc.memory_info().rss for proc in processes if proc.is_running()))
+    except Exception:
+        return None
+
+
+def _apply_affinity_to_tree(pid: int, cores: list[int]) -> None:
+    if not cores:
+        return
+    try:
+        import psutil  # type: ignore
+
+        root = psutil.Process(pid)
+        for proc in [root] + root.children(recursive=True):
+            try:
+                proc.cpu_affinity(cores)
+            except Exception:
+                continue
+    except Exception:
+        return
+
+
+def _terminate_process_group(process: subprocess.Popen[Any], *, grace_seconds: float = 5.0) -> int | None:
+    if process.poll() is not None:
+        return process.returncode
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return process.poll()
+    except OSError:
+        process.terminate()
+    deadline = time.perf_counter() + grace_seconds
+    while process.poll() is None and time.perf_counter() < deadline:
+        time.sleep(0.1)
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            process.kill()
+        process.wait()
+    return process.returncode
+
+
 def _run_command(
     command: list[str],
     *,
     timeout_seconds: int,
     env_overrides: dict[str, str] | None = None,
+    max_system_ram_percent: float = 0.0,
+    worker_cpu_cores: int = 0,
+    worker_cpu_core_offset: int = 0,
+    worker_nice: int = 0,
+    resource_poll_seconds: float = 1.0,
 ) -> dict[str, Any]:
-    env = None
-    if env_overrides:
-        env = os.environ.copy()
-        for key, value in env_overrides.items():
-            env.setdefault(key, value)
-    started = time.perf_counter()
-    completed = subprocess.run(
-        command,
-        cwd=REPO_ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-        timeout=timeout_seconds if timeout_seconds > 0 else None,
+    env = os.environ.copy()
+    selected_cores = _selected_worker_cores(worker_cpu_cores, worker_cpu_core_offset)
+    thread_env_cores = (
+        len(selected_cores)
+        if selected_cores
+        else (0 if worker_cpu_cores <= 0 else min(worker_cpu_cores, len(_current_affinity())))
     )
+    for key, value in _thread_env_for_cpu_cap(thread_env_cores).items():
+        env.setdefault(key, value)
+    for key, value in (env_overrides or {}).items():
+        env.setdefault(key, value)
+
+    def _limit_child_process() -> None:
+        if selected_cores and hasattr(os, "sched_setaffinity"):
+            try:
+                os.sched_setaffinity(0, selected_cores)
+            except OSError:
+                pass
+        if worker_nice:
+            try:
+                os.nice(worker_nice)
+            except OSError:
+                pass
+
+    started = time.perf_counter()
+    limit_reason: dict[str, Any] | None = None
+    peak_system_ram_percent: float | None = None
+    peak_process_tree_rss_bytes: int | None = None
+    with tempfile.TemporaryFile(mode="w+b") as output_file:
+        process = subprocess.Popen(
+            command,
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=output_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            preexec_fn=_limit_child_process if (selected_cores or worker_nice) else None,
+        )
+        while process.poll() is None:
+            elapsed = time.perf_counter() - started
+            if timeout_seconds > 0 and elapsed > timeout_seconds:
+                limit_reason = {
+                    "kind": "timeout",
+                    "elapsed_seconds": elapsed,
+                    "limit_seconds": int(timeout_seconds),
+                }
+                _terminate_process_group(process)
+                break
+            ram_percent = _system_ram_percent()
+            if ram_percent is not None:
+                peak_system_ram_percent = max(peak_system_ram_percent or 0.0, ram_percent)
+                if max_system_ram_percent > 0 and ram_percent >= max_system_ram_percent:
+                    limit_reason = {
+                        "kind": "system_ram_percent",
+                        "observed_percent": ram_percent,
+                        "limit_percent": float(max_system_ram_percent),
+                    }
+                    _terminate_process_group(process)
+                    break
+            rss_bytes = _process_tree_rss_bytes(process.pid)
+            if rss_bytes is not None:
+                peak_process_tree_rss_bytes = max(peak_process_tree_rss_bytes or 0, rss_bytes)
+            _apply_affinity_to_tree(process.pid, selected_cores)
+            time.sleep(float(resource_poll_seconds))
+        returncode = process.wait()
+        output_file.flush()
+        output_file.seek(0, os.SEEK_END)
+        output_size = output_file.tell()
+        output_file.seek(max(0, output_size - 24_000), os.SEEK_SET)
+        output_tail = output_file.read().decode("utf-8", errors="replace")[-12_000:]
+
+    status = "ok" if returncode == 0 else "failed"
+    if limit_reason:
+        status = "timeout" if limit_reason["kind"] == "timeout" else "killed_resource_limit"
     return {
-        "status": "ok" if completed.returncode == 0 else "failed",
-        "returncode": completed.returncode,
+        "status": status,
+        "returncode": returncode,
         "elapsed_seconds": time.perf_counter() - started,
-        "output_tail": (completed.stdout or "")[-12_000:],
+        "output_tail": output_tail,
+        "resource_limits": {
+            "max_system_ram_percent": float(max_system_ram_percent),
+            "worker_cpu_cores": int(worker_cpu_cores),
+            "worker_cpu_core_offset": int(worker_cpu_core_offset),
+            "worker_cpu_affinity": selected_cores,
+            "worker_nice": int(worker_nice),
+            "resource_poll_seconds": float(resource_poll_seconds),
+        },
+        "resource_limit_reason": limit_reason,
+        "peak_system_ram_percent": peak_system_ram_percent,
+        "peak_process_tree_rss_bytes": peak_process_tree_rss_bytes,
     }
 
 
@@ -363,7 +593,19 @@ def _run_benchmark(
     dry_run: bool,
     timeout_seconds: int,
     env_overrides: dict[str, str] | None = None,
+    max_system_ram_percent: float = 0.0,
+    worker_cpu_cores: int = 0,
+    worker_cpu_core_offset: int = 0,
+    worker_nice: int = 0,
+    resource_poll_seconds: float = 1.0,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    resource_limits = {
+        "max_system_ram_percent": float(max_system_ram_percent),
+        "worker_cpu_cores": int(worker_cpu_cores),
+        "worker_cpu_core_offset": int(worker_cpu_core_offset),
+        "worker_nice": int(worker_nice),
+        "resource_poll_seconds": float(resource_poll_seconds),
+    }
     if dry_run:
         return {
             "status": "dry_run",
@@ -372,12 +614,18 @@ def _run_benchmark(
             "env_overrides": dict(env_overrides or {}),
             "elapsed_seconds": 0.0,
             "output_tail": "",
+            "resource_limits": resource_limits,
         }, {}
 
     run_result = _run_command(
         command,
         timeout_seconds=timeout_seconds,
         env_overrides=env_overrides,
+        max_system_ram_percent=max_system_ram_percent,
+        worker_cpu_cores=worker_cpu_cores,
+        worker_cpu_core_offset=worker_cpu_core_offset,
+        worker_nice=worker_nice,
+        resource_poll_seconds=resource_poll_seconds,
     )
     if run_result["status"] != "ok":
         return {**run_result, "env_overrides": dict(env_overrides or {})}, {}
@@ -584,6 +832,11 @@ def _run() -> None:
         dry_run=args.dry_run,
         timeout_seconds=args.command_timeout_seconds,
         env_overrides=jax_config["env"],
+        max_system_ram_percent=args.max_system_ram_percent,
+        worker_cpu_cores=args.worker_cpu_cores,
+        worker_cpu_core_offset=args.worker_cpu_core_offset,
+        worker_nice=args.worker_nice,
+        resource_poll_seconds=args.resource_poll_seconds,
     )
 
     if args.skip_vllm:
@@ -593,6 +846,13 @@ def _run() -> None:
             "command": vllm_command,
             "elapsed_seconds": 0.0,
             "output_tail": "",
+            "resource_limits": {
+                "max_system_ram_percent": args.max_system_ram_percent,
+                "worker_cpu_cores": args.worker_cpu_cores,
+                "worker_cpu_core_offset": args.worker_cpu_core_offset,
+                "worker_nice": args.worker_nice,
+                "resource_poll_seconds": args.resource_poll_seconds,
+            },
         }
         vllm_artifact = {}
     else:
@@ -601,6 +861,11 @@ def _run() -> None:
             artifact_path=vllm_output_json,
             dry_run=args.dry_run,
             timeout_seconds=args.command_timeout_seconds,
+            max_system_ram_percent=args.max_system_ram_percent,
+            worker_cpu_cores=args.worker_cpu_cores,
+            worker_cpu_core_offset=args.worker_cpu_core_offset,
+            worker_nice=args.worker_nice,
+            resource_poll_seconds=args.resource_poll_seconds,
         )
 
     comparison = (
@@ -631,6 +896,13 @@ def _run() -> None:
                 "max_request_count": args.max_request_count,
             },
             "suite_metadata": suite_metadata,
+            "resource_limits": {
+                "max_system_ram_percent": args.max_system_ram_percent,
+                "worker_cpu_cores": args.worker_cpu_cores,
+                "worker_cpu_core_offset": args.worker_cpu_core_offset,
+                "worker_nice": args.worker_nice,
+                "resource_poll_seconds": args.resource_poll_seconds,
+            },
             "manifest": {
                 "prompt_manifest_jsonl": str(manifest_path),
                 "prompt_manifest_sha256": manifest_sha,

@@ -34,6 +34,9 @@ def test_parse_args_defaults_set_random_ranges():
     assert args.vllm_dtype == ""
     assert sidecar._effective_vllm_dtype(args) == "bfloat16"
     assert args.vllm_num_speculative_tokens == 0
+    assert args.max_system_ram_percent == 70.0
+    assert args.worker_cpu_cores >= 1
+    assert args.worker_nice == 10
 
 
 def test_parse_args_rejects_invalid_ranges():
@@ -42,6 +45,12 @@ def test_parse_args_rejects_invalid_ranges():
 
     with pytest.raises(SystemExit):
         sidecar.parse_args(["--min-request-count", "16", "--max-request-count", "15"])
+
+    with pytest.raises(SystemExit):
+        sidecar.parse_args(["--max-system-ram-percent", "100"])
+
+    with pytest.raises(SystemExit):
+        sidecar.parse_args(["--worker-cpu-cores", "-1"])
 
 
 def test_deterministic_request_rows_have_same_contents():
@@ -220,3 +229,24 @@ kernels:
     assert "--gdn-disable-fallbacks" in command
     assert command[command.index("--gdn-packed-decode-impl") + 1] == "triton_fla_conv_raw_gates"
     assert command[command.index("--gdn-packed-decode-qkv-dtype") + 1] == "bf16"
+
+
+def test_run_command_kills_process_when_ram_guard_trips(monkeypatch):
+    monkeypatch.setattr(sidecar, "_system_ram_percent", lambda: 71.0)
+
+    result = sidecar._run_command(
+        [
+            sys.executable,
+            "-c",
+            "import time; print('started', flush=True); time.sleep(30)",
+        ],
+        timeout_seconds=10,
+        max_system_ram_percent=70.0,
+        worker_cpu_cores=0,
+        worker_nice=0,
+        resource_poll_seconds=0.05,
+    )
+
+    assert result["status"] == "killed_resource_limit"
+    assert result["resource_limit_reason"]["kind"] == "system_ram_percent"
+    assert result["resource_limit_reason"]["observed_percent"] == 71.0

@@ -32,6 +32,10 @@
   otherwise. Run a scaled JAX-only diagnostic first with small request and token
   ranges, a finite timeout, CUDA-only execution, and constrained KV/cache
   capacity.
+- Keep the random sidecar resource guard enabled for GPU benchmark subprocesses:
+  default `--max-system-ram-percent 70`, bounded `--worker-cpu-cores`, and
+  positive `--worker-nice`. If a run dies with `killed_resource_limit`, scale
+  the random ranges or cache capacity down before retrying.
 - Promote diagnostics in stages: small random run, medium random run, then the
   full seed-1234 random decode graph. Do not run the full graph after a
   boundary-changing edit unless the smaller run shows acceptable correctness,

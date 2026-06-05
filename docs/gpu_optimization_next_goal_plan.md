@@ -189,6 +189,17 @@ as scaffolding only; do not scale it to medium/full random runs until the
 gather/scatter/table-update overhead is folded into a larger useful decode
 boundary or removed.
 
+Status note, 2026-06-05 r2: the random sidecar now has a subprocess resource
+guard (`70%` system-RAM kill threshold by default, bounded worker CPU cores,
+and positive worker niceness). The table-prefill boundary now participates in
+generic warmup, so packed prefill table shapes are not first compiled during
+measurement. The scaled guarded JAX-only random run
+`random_config_table_prefill_guarded_scaled_r1` completed with zero
+measured-phase JIT growth (`10 -> 10`) and `132.48 output tok/s`, versus the
+same tiny accepted-config control at `104.33 output tok/s`. This is only a
+promotion signal for the next medium run, not a replacement for the full random
+anchor above.
+
 Micro-burst selection model:
 
 - A width-`K` greedy burst replaces `K` host/PJRT scheduler executions with one
