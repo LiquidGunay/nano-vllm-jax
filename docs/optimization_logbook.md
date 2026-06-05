@@ -10280,3 +10280,50 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - both large random sidecar runs used the stored vLLM denominator, generic
     warmup, exact decode buckets, `--jax-fail-on-jit-cache-growth`, and the 70%
     RAM guard.
+
+### Entry 267 - Rejected Two-Stage Triton LM-Head Greedy Argmax
+
+- date: 2026-06-05
+- purpose:
+  - test whether the large-random gap can be reduced by replacing the decode
+    LM-head dense-logits materialization plus `argmax` with a token-id-only
+    Triton path;
+  - keep the active GDN reference decode route, exact decode buckets, resident
+    metadata, generic warmup, stored vLLM denominator, and resource guards.
+- implementation:
+  - prototyped a two-stage Triton LM-head greedy path: stage 1 computed
+    per-vocab-block max logits from hidden state, RMSNorm weight, and
+    materialized tied LM-head weight without writing full `[B, vocab]` logits;
+    stage 2 reduced the per-block maxima to one token ID per row;
+  - threaded the prototype through `lm_head_token_ids_and_topk` behind a
+    config-driven `lm_head_decode_impl=triton_argmax` selector;
+  - kept prefill final-token sampling on the reference LM-head path because the
+    selector was decode-only.
+- artifacts:
+  - failed first warmup attempt, rejected before timing:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_triton_argmax_r1.json`;
+  - corrected guarded sidecar run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_triton_argmax_r2.json`;
+  - corrected nested JAX artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_lm_head_triton_argmax_r2_jax.json`.
+- result:
+  - corrected run reached `508.38 output tok/s`, `0.575x` of the stored vLLM
+    denominator;
+  - this lost to the active-config repeat at `513.60 output tok/s` and the best
+    Entry 266 repeat at `514.25 output tok/s`;
+  - measured-phase JIT cache growth stayed zero (`40 -> 40`) and generated
+    token count stayed `1582`;
+  - the run took `250.31 s` end to end, materially higher than the active-config
+    run, so the custom LM-head path also worsened iteration cost.
+- decision:
+  - reject and revert the prototype;
+  - do not keep a `lm_head_decode_impl` config knob or the two-stage Triton
+    kernel. It removes the full-logit write but gives up the highly optimized
+    GEMM path and adds custom-call/reduction overhead;
+  - the next LM-head attempt must be a true GEMM epilogue or library-backed
+    fused matmul+top-1 path, not a separate blockwise reduction kernel.
+- validation:
+  - focused GPU tests passed after the Triton syntax fix before benchmarking;
+  - large random sidecar used stored vLLM denominator, generic warmup, exact
+    decode buckets, `--jax-fail-on-jit-cache-growth`, the 70% RAM guard, and
+    four CPU cores at nice level `10`.

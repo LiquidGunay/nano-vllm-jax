@@ -256,19 +256,23 @@ Status note, 2026-06-05 r8: Entry 266 is the current accepted large-random
 anchor. Switching the active random-serving config from
 `triton_fla_conv_raw_gates` to explicit reference packed GDN decode produced
 two winning repeats: `514.25` and `508.85 output tok/s` (`0.582x` and `0.576x`
-the stored vLLM denominator), both with zero measured-phase JIT growth. Entry
-262 remains the previous accepted anchor at `503.66 output tok/s` (`0.570x`)
-with exact decode buckets. Entry 263 rejected lowering padded GEMM rows to `5`
-because it selected a much slower compiled GEMM plan (`240.16 output tok/s`).
-Entry 264 rejected two narrow full-attention decode probes: a separate
-packed-QKV prep custom call (`499.13 output tok/s`) and in-kernel duplicate K/V
-append-store elimination (`502.29` then `497.96 output tok/s`). Entry 265 then
-rejected the broader integrated packed-QKV fused append+decode attention route
-(`499.81 output tok/s`): even moving Q/K RMSNorm, RoPE, append, and attention
-into one launch did not beat Entry 262. The implication is that full-attention
-decode materialization is not the large lever; the next candidate must remove a
-larger serving boundary across many decode sublayers or replace a shared dense
-operation with a true backend-owned single call.
+the stored vLLM denominator), both with zero measured-phase JIT growth. A third
+active-config sanity reached `513.60 output tok/s`. Entry 262 remains the
+previous accepted anchor at `503.66 output tok/s` (`0.570x`) with exact decode
+buckets. Entry 263 rejected lowering padded GEMM rows to `5` because it
+selected a much slower compiled GEMM plan (`240.16 output tok/s`). Entry 264
+rejected two narrow full-attention decode probes: a separate packed-QKV prep
+custom call (`499.13 output tok/s`) and in-kernel duplicate K/V append-store
+elimination (`502.29` then `497.96 output tok/s`). Entry 265 then rejected the
+broader integrated packed-QKV fused append+decode attention route (`499.81
+output tok/s`): even moving Q/K RMSNorm, RoPE, append, and attention into one
+launch did not beat Entry 262. Entry 267 rejected a token-id-only two-stage
+Triton LM-head argmax route (`508.38 output tok/s`): removing the full-logit
+write is not enough if the replacement gives up the optimized GEMM path. The
+implication is that full-attention materialization and standalone LM-head
+reduction are not the large levers; the next candidate must remove a larger
+serving boundary across many decode sublayers or use a true backend/library
+GEMM epilogue.
 
 First implementation slice: `full_attention.prefill_impl` now controls reference
 versus packed Triton prefill routing, `server_config.yaml` and the FA/GDN
@@ -3028,6 +3032,12 @@ Current validation:
   FLA GDN decode route remains correct, but in this graph it adds many small
   calls and loses integrated wall time. Revisit it only as part of a coarser
   GDN/model boundary.
+- Entry 267 rejected a two-stage Triton LM-head greedy argmax route. It reached
+  `508.38 output tok/s`, below the active-config repeat at `513.60 output tok/s`
+  and best Entry 266 repeat at `514.25 output tok/s`, despite zero measured
+  JIT growth. Do not add a standalone LM-head reduction kernel; the only
+  plausible LM-head direction is a true GEMM epilogue or library-backed
+  fused matmul+top-1 path.
 
 Model-specific assumptions to track:
 
