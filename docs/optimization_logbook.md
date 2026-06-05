@@ -10372,3 +10372,51 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - both large random sidecar runs used the stored vLLM denominator, generic
     warmup, exact decode buckets, `--jax-fail-on-jit-cache-growth`, the 70% RAM
     guard, and four CPU cores at nice level `10`.
+
+### Entry 269 - Rejected Resident Slot-Carry Greedy Decode Burst
+
+- date: 2026-06-05
+- purpose:
+  - test a coarse decode boundary that keeps the accepted resident last-token
+    table while emitting two greedy tokens per scheduled decode step;
+  - reduce Python/PJRT step count without dropping paged attention, resident
+    metadata, static decode metadata, KV cache updates, or GDN table updates.
+- implementation:
+  - prototyped resident slot-carry burst JIT boundaries for both static
+    metadata and resident metadata;
+  - the resident path gathered last tokens, block tables, sequence lengths, and
+    GDN state by slot id, scanned two full model decode steps, returned all
+    emitted token IDs, and scattered the final last token plus updated state
+    back to resident tables;
+  - the prototype was reverted after benchmarking because it was not promoted.
+- artifacts:
+  - first small burst-2 sidecar before the resident-specific route:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_small_burst2_slot_carry_r1.json`;
+  - resident-route small burst-2 sidecar:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_small_burst2_resident_slot_carry_r2.json`;
+  - small burst-1 active control:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_small_active_burst1_control_r1.json`;
+  - medium resident-route burst-2 sidecar:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_medium_burst2_resident_slot_carry_r1.json`.
+- result:
+  - small active burst-1 control reached `199.74 output tok/s`, zero measured
+    JIT growth (`11 -> 11`);
+  - small resident burst-2 reached `136.99 output tok/s`, zero measured JIT
+    growth (`17 -> 17`);
+  - medium resident burst-2 reached `277.27 output tok/s`, zero measured JIT
+    growth (`24 -> 24`), below the current medium history around
+    `355+ output tok/s`;
+  - compile/warmup time was materially worse than the active burst-1 path even
+    on the small and medium rungs.
+- decision:
+  - reject and revert the prototype;
+  - do not retry source-level full-model JAX scan bursts as the main
+    coarsening strategy. Reducing PJRT calls is not enough when each fused call
+    runs a worse compiled full-model plan;
+  - the next coarse-boundary attempt should target backend/library-owned fused
+    sublayers or decode-block kernels that reduce actual GEMM/attention/GDN
+    device work.
+- validation:
+  - all benchmark runs used generic warmup, `--jax-fail-on-jit-cache-growth`,
+    the 70% RAM guard, and four CPU cores at nice level `10`;
+  - the rejected code was fully reverted before documenting the result.

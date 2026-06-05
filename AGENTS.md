@@ -68,8 +68,9 @@
 - Current rejected random-speed routes: standalone FA decode Triton, resident
   decode metadata v1/placeholders with scatter sync, static seq-lens carry,
   shared-gather token-carry fallback, physical-row token refs for the full
-  greedy vector, and source-level greedy decode bursts. Reopen any of these
-  only with a broader boundary that removes a whole per-step operation.
+  greedy vector, source-level greedy decode bursts, and resident slot-carry
+  greedy decode bursts. Reopen any of these only with a backend-owned boundary
+  that reduces model work instead of scanning the full model in JAX.
 - Current accepted large-random token-carry boundary: packed prefill seeds
   resident slot tokens inside `forward_prefill_token_ids_slot_carry_table_jit`,
   and static decode carries them inside

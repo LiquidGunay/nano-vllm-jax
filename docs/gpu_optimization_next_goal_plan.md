@@ -285,6 +285,17 @@ not change the larger conclusion from Entry 267: standalone token-id-only
 LM-head reductions are rejected, and the next real LM-head route must be a
 backend/library fused GEMM epilogue if we revisit this bucket.
 
+Status note, 2026-06-05 r10: a resident slot-carry greedy burst boundary was
+implemented and rejected. The idea was to preserve the accepted resident token
+table while scanning two greedy decode steps inside one JIT call. It was
+cache-stable, but it lost both scaled checks: small random burst-1 control
+reached `199.74 output tok/s` while burst-2 reached `136.99 output tok/s`;
+medium burst-2 reached `277.27 output tok/s`, below the current medium
+history around `355+ output tok/s`, and introduced much heavier compile/warmup
+cost. Do not retry full-model JAX scan bursts as the main coarsening route.
+The next coarsening attempt needs a backend/library fused sublayer or block
+boundary that reduces real device work, not only PJRT call count.
+
 First implementation slice: `full_attention.prefill_impl` now controls reference
 versus packed Triton prefill routing, `server_config.yaml` and the FA/GDN
 benchmark config select `prefill_impl=triton_packed`, and the random sidecar
