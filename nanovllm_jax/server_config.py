@@ -88,6 +88,7 @@ _ENGINE_ENV_MAP: dict[str, tuple[str, type]] = {
     "device_token_carry": ("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", bool),
     "static_decode_metadata": ("NANO_VLLM_JAX_STATIC_DECODE_METADATA", bool),
     "static_decode_seq_lens_carry": ("NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY", bool),
+    "resident_decode_metadata": ("NANO_VLLM_JAX_RESIDENT_DECODE_METADATA", bool),
     "greedy_decode_burst_steps": ("NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS", int),
     "materialize_tied_lm_head": ("NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD", bool),
     "compact_prefill_in_proj_qkv": ("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", bool),
@@ -214,6 +215,7 @@ def _runtime_fastpaths_to_engine(runtime_section: dict) -> dict[str, Any]:
         "device_token_carry": "device_token_carry",
         "static_decode_metadata": "static_decode_metadata",
         "static_decode_seq_lens_carry": "static_decode_seq_lens_carry",
+        "resident_decode_metadata": "resident_decode_metadata",
         "greedy_decode_burst_steps": "greedy_decode_burst_steps",
         "decode_block_table_buckets": "decode_block_table_buckets",
         "materialize_tied_lm_head": "materialize_tied_lm_head",
@@ -242,6 +244,14 @@ def _kernels_to_engine_config(kernels_section: dict) -> dict[str, Any]:
     full_attention = kernels_section.get("full_attention", {}) or {}
     if full_attention.get("kv_cache_dtype") is not None:
         engine["full_attention_kv_cache_dtype"] = full_attention["kv_cache_dtype"]
+    full_attention_mapping = {
+        "kv_append_impl": "full_attention_kv_append_impl",
+        "decode_impl": "full_attention_decode_impl",
+        "prefill_impl": "full_attention_prefill_impl",
+    }
+    for source, target in full_attention_mapping.items():
+        if full_attention.get(source) is not None:
+            engine[target] = full_attention[source]
 
     gdn = kernels_section.get("gdn", {}) or {}
     mapping = {
@@ -305,6 +315,7 @@ def _runtime_section_to_env(runtime_section: dict) -> dict[str, str]:
         "device_token_carry": "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
         "static_decode_metadata": "NANO_VLLM_JAX_STATIC_DECODE_METADATA",
         "static_decode_seq_lens_carry": "NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY",
+        "resident_decode_metadata": "NANO_VLLM_JAX_RESIDENT_DECODE_METADATA",
         "greedy_decode_burst_steps": "NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS",
         "trace_token_prefetch": "NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH",
         "lm_head_decode_act_dtype": "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE",
@@ -556,6 +567,7 @@ def load_server_config(path: str | Path | None = None) -> ServerConfig:
         "device_token_carry": False,
         "static_decode_metadata": False,
         "static_decode_seq_lens_carry": False,
+        "resident_decode_metadata": False,
         "greedy_decode_burst_steps": 1,
         "materialize_tied_lm_head": False,
         "compact_prefill_in_proj_qkv": False,
@@ -570,6 +582,9 @@ def load_server_config(path: str | Path | None = None) -> ServerConfig:
         "decode_padded_gemm_rows": 8,
         "decode_padded_gemm_max_out_dim": 8192,
         "full_attention_kv_cache_dtype": "default",
+        "full_attention_kv_append_impl": "reference",
+        "full_attention_decode_impl": "reference",
+        "full_attention_prefill_impl": "reference",
         "gdn_disable_fallbacks": False,
         "gdn_prefill_post_conv_impl": "off",
         "gdn_prefill_qkv_dtype": "fp32",

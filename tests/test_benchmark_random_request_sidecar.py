@@ -24,6 +24,12 @@ def test_parse_args_defaults_set_random_ranges():
     assert args.jax_warmup_mode == "generic"
     assert args.jax_fail_on_jit_cache_growth is False
     assert args.max_num_resident_seqs == 0
+    assert args.decode_block_table_buckets == ""
+    assert args.resident_decode_metadata is False
+    assert args.full_attention_kv_cache_dtype == "default"
+    assert args.full_attention_kv_append_impl == "reference"
+    assert args.full_attention_decode_impl == "reference"
+    assert args.full_attention_prefill_impl == "reference"
     assert args.vllm_dtype == ""
     assert sidecar._effective_vllm_dtype(args) == "bfloat16"
     assert args.vllm_num_speculative_tokens == 0
@@ -133,6 +139,17 @@ def test_jax_command_uses_generic_warmup_controls():
             "--jax-fail-on-jit-cache-growth",
             "--max-num-resident-seqs",
             "16",
+            "--decode-block-table-buckets",
+            "128,256,320",
+            "--resident-decode-metadata",
+            "--full-attention-kv-cache-dtype",
+            "bf16",
+            "--full-attention-kv-append-impl",
+            "flashinfer",
+            "--full-attention-decode-impl",
+            "triton_paged",
+            "--full-attention-prefill-impl",
+            "reference",
         ]
     )
     command = sidecar._build_jax_command(
@@ -147,3 +164,9 @@ def test_jax_command_uses_generic_warmup_controls():
     assert command[command.index("--prefill-layout") + 1] == "packed"
     assert command[command.index("--prefill-token-buckets") + 1] == args.prefill_buckets
     assert command[command.index("--max-num-resident-seqs") + 1] == "16"
+    assert command[command.index("--decode-block-table-buckets") + 1] == "128,256,320"
+    assert "--resident-decode-metadata" in command
+    assert command[command.index("--full-attention-kv-cache-dtype") + 1] == "bf16"
+    assert command[command.index("--full-attention-kv-append-impl") + 1] == "flashinfer"
+    assert command[command.index("--full-attention-decode-impl") + 1] == "triton_paged"
+    assert command[command.index("--full-attention-prefill-impl") + 1] == "reference"

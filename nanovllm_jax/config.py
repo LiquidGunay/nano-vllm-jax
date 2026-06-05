@@ -82,6 +82,7 @@ class Qwen3_5Config:
     device_token_carry: bool = False
     static_decode_metadata: bool = False
     static_decode_seq_lens_carry: bool = False
+    resident_decode_metadata: bool = False
     greedy_decode_burst_steps: int = 1
 
     # Accepted serving fast paths. Environment variables remain supported as
@@ -103,6 +104,9 @@ class Qwen3_5Config:
     # Kernel policy carried by config. Low-level diagnostic CUDA switches stay
     # env-only; accepted serving kernels should flow through these fields.
     full_attention_kv_cache_dtype: str = "default"
+    full_attention_kv_append_impl: str = "reference"
+    full_attention_decode_impl: str = "reference"
+    full_attention_prefill_impl: str = "reference"
     gdn_disable_fallbacks: bool = False
     gdn_prefill_post_conv_impl: str = "off"
     gdn_prefill_qkv_dtype: str = "fp32"
@@ -184,6 +188,21 @@ class Qwen3_5Config:
             self,
             "full_attention_kv_cache_dtype",
             str(self.full_attention_kv_cache_dtype or "default").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "full_attention_kv_append_impl",
+            str(self.full_attention_kv_append_impl or "reference").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "full_attention_decode_impl",
+            str(self.full_attention_decode_impl or "reference").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "full_attention_prefill_impl",
+            str(self.full_attention_prefill_impl or "reference").strip().lower(),
         )
         object.__setattr__(
             self,
@@ -275,6 +294,7 @@ class Qwen3_5Config:
             self.device_token_carry,
             self.static_decode_metadata,
             self.static_decode_seq_lens_carry,
+            self.resident_decode_metadata,
             self.greedy_decode_burst_steps,
             self.materialize_tied_lm_head,
             self.compact_prefill_in_proj_qkv,
@@ -289,6 +309,9 @@ class Qwen3_5Config:
             self.decode_padded_gemm_rows,
             self.decode_padded_gemm_max_out_dim,
             self.full_attention_kv_cache_dtype,
+            self.full_attention_kv_append_impl,
+            self.full_attention_decode_impl,
+            self.full_attention_prefill_impl,
             self.gdn_disable_fallbacks,
             self.gdn_prefill_post_conv_impl,
             self.gdn_prefill_qkv_dtype,
@@ -425,6 +448,7 @@ class Qwen3_5Config:
             "device_token_carry": self.device_token_carry,
             "static_decode_metadata": self.static_decode_metadata,
             "static_decode_seq_lens_carry": self.static_decode_seq_lens_carry,
+            "resident_decode_metadata": self.resident_decode_metadata,
             "greedy_decode_burst_steps": self.greedy_decode_burst_steps,
             "materialize_tied_lm_head": self.materialize_tied_lm_head,
             "compact_prefill_in_proj_qkv": self.compact_prefill_in_proj_qkv,
@@ -439,6 +463,9 @@ class Qwen3_5Config:
             "decode_padded_gemm_rows": self.decode_padded_gemm_rows,
             "decode_padded_gemm_max_out_dim": self.decode_padded_gemm_max_out_dim,
             "full_attention_kv_cache_dtype": self.full_attention_kv_cache_dtype,
+            "full_attention_kv_append_impl": self.full_attention_kv_append_impl,
+            "full_attention_decode_impl": self.full_attention_decode_impl,
+            "full_attention_prefill_impl": self.full_attention_prefill_impl,
             "gdn_disable_fallbacks": self.gdn_disable_fallbacks,
             "gdn_prefill_post_conv_impl": self.gdn_prefill_post_conv_impl,
             "gdn_prefill_qkv_dtype": self.gdn_prefill_qkv_dtype,

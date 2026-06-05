@@ -9219,3 +9219,165 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - `python -m py_compile nanovllm_jax/engine/scheduled_batch.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/llm_engine.py nanovllm_jax/engine/model_executor.py tests/test_device_token_carry.py`;
   - `pytest -q tests/test_backend_boundaries.py::test_model_runner_warmup_compiles_greedy_decode_burst tests/test_backend_boundaries.py::test_executor_greedy_decode_burst_matches_iterative_token_path tests/test_device_token_carry.py tests/test_server_config.py tests/test_benchmark_random_request_sidecar.py tests/test_benchmark_jax_server_trace.py`
     -> `45 passed`.
+
+### Entry 245 - Rejected Narrow FA Decode Triton Routes
+
+- date: 2026-06-04
+- purpose:
+  - execute the FA/FLA integration plan's first full-attention decode slice
+    with config-selected kernel policy instead of environment-variable sprawl;
+  - test whether replacing the width-1 paged full-attention decode alone is
+    enough to move the decode-heavy target toward `0.9x` vLLM.
+- changes:
+  - added `kernels.full_attention.{kv_cache_dtype,kv_append_impl,decode_impl,prefill_impl}`
+    server config projection and benchmark CLI forwarding;
+  - routed `full_attention.decode_impl=triton_paged` through the JAX-Triton
+    paged decode attention wrapper over the existing NHD paged KV cache;
+  - added a broader diagnostic `triton_paged_fused_append` path that stores the
+    current K/V token and computes paged decode attention in one Triton call;
+  - kept accepted configs on `decode_impl=reference` because the measured
+    Triton routes regressed.
+- artifacts:
+  - A/B matrix:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/20260604_decode_heavy_ab_matrix.json`;
+  - current static profile artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_current_profile_direct_r1.json`;
+  - current static profile summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_current_profile_summary.md`;
+  - fused append diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fused_append_direct_r1.json`;
+  - B1 packed-QKV diagnostic:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_b1_packed_qkv_direct_r1.json`.
+- results:
+  - current static route: exact, `178.93 output tok/s`, `0.838x` stored vLLM
+    (`213.54 tok/s`);
+  - `full_attention.decode_impl=triton_paged`: exact, `175.79 output tok/s`,
+    `0.823x` stored vLLM;
+  - `full_attention.decode_impl=triton_paged_fused_append`: exact,
+    `161.59 output tok/s`;
+  - B1 packed full-attention QKV diagnostic: exact, `161.11 output tok/s`;
+  - profiled current-static rerun was diagnostic only and slowed to
+    `154.76 output tok/s`.
+- profile interpretation:
+  - the profiled current route still shows the dominant decode-heavy work in
+    model GEMM/fusion buckets rather than full-attention paged decode alone:
+    `gemm 386.44 ms`, `fusion 267.38 ms`, `cutlass 193.08 ms`,
+    `_gdn 125.99 ms`, and `MemcpyD2D 102.71 ms`;
+  - the largest single HLO op is `command_buffer_436` cutlass GEMM with ReLU
+    (`127.20 ms / 127`), so a narrow FA attention replacement cannot explain
+    or close the remaining gap;
+  - standalone append+attention fusion added custom-call overhead and did not
+    remove the larger model-side launch/GEMM buckets.
+- decision:
+  - reject promotion of `triton_paged`, `triton_paged_fused_append`, and B1
+    packed-QKV decode for the serving defaults;
+  - keep the config-level FA policy and focused correctness tests as scaffolding
+    for future production-kernel integration, but do not add extra knobs for
+    failed threshold probes;
+  - next work should identify the largest model-side decode GEMM/fusion source
+    and target a broader, model-family-general boundary rather than hand tuning
+    kernel parameters.
+
+### Entry 246 - Decode-Heavy B1 Dtype And Final-Sync Diagnostics
+
+- date: 2026-06-04
+- purpose:
+  - explain why the current hetero8-oriented BF16 config no longer reaches the
+    old decode-heavy `0.9x` result;
+  - test route-selection, dtype-policy, and final materialization hypotheses
+    without keeping failed benchmark-specific changes.
+- artifacts:
+  - BF16 current-control matrix artifact:
+    `/mountpoint/.exp/nano-vllm-jax/results/gpu_matrix_runs/20260604_144131/decode_heavy_128x128_gpu_paged_gdn_fla_decode_static_metadata_repeat1.json`;
+  - BF16 reference-GDN direct:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_bf16_reference_gdn_direct_r1.json`;
+  - FP32 reference-GDN direct repeats:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_reference_gdn_direct_r1.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_reference_gdn_direct_r2_after_reverts.json`;
+  - FP32 reference-GDN profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_reference_gdn_profile_direct_r1.json`;
+  - FP32 profile summary:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_reference_profile_summary.md`;
+  - rejected probes:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_triton_fla_gdn_direct_r1.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_conv_raw_gdn_direct_r1.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_reference_gdn_trace_prefetch_direct_r1.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_fp32_reference_gdn_stacked_final_direct_r1.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_bf16_single_seq_fp32_policy_reference_direct_r1.json`,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/fa_triton_decode/decode_heavy_bf16_single_seq_fp32_policy_conv_direct_r1.json`.
+- results:
+  - BF16 current config with conv-fused GDN decode: exact,
+    `178.93 output tok/s`;
+  - BF16 with reference GDN decode: exact, `179.10 output tok/s`;
+  - FP32 activations with reference GDN decode: exact repeats at `191.32` and
+    `189.94 output tok/s`; profiled repeat was exact at `191.90 output tok/s`;
+  - FP32 activations with non-conv Triton GDN decode: exact but
+    `169.76 output tok/s`;
+  - FP32 activations with conv-fused Triton GDN decode: exact but
+    `169.38 output tok/s`;
+  - trace-token prefetch: exact but regressed to `187.73 output tok/s`;
+  - final stacked `DeviceTokenRef` materialization: exact but regressed to
+    `161.15 output tok/s`;
+  - temporary BF16-server/single-seq-FP32 internal dtype policy: exact but
+    unchanged with reference GDN (`178.93 output tok/s`) and worse with
+    conv-fused GDN (`169.60 output tok/s`).
+- profile interpretation:
+  - the B1 decode-heavy gap is not fixed by the FA decode kernel or GDN Triton
+    decode kernels. The best B1 route is the pure reference GDN decode boundary
+    with FP32 model activations;
+  - the FP32 profile collapses decode execution into far fewer command-buffer
+    buckets than the BF16/conv-fused current route: `PjRt Execute` is about
+    `389 ms / 263` in the FP32 reference profile versus about
+    `570 ms / 263` in the BF16 current profile;
+  - the measured output-throughput gap to `0.9x` is mostly a real final
+    synchronization, not accounting noise. The best FP32 run emits the last
+    token at about `0.609 s` (`~210 output tok/s` by token events), but full
+    wall time is about `0.669 s` after final token materialization;
+  - prefetch and stacked final materialization both move synchronization around
+    or add extra JAX work; neither reduces full wall time.
+- decision:
+  - reject B1 Triton GDN decode, trace prefetch promotion, final stacked
+    materialization, and the internal BF16-server/single-seq-FP32 dtype policy;
+  - keep the current BF16 route for hetero8/random work, but do not claim the
+    BF16 current config is still the best B1 decode-heavy route;
+  - the best safe B1 decode-heavy diagnostic is FP32 activations with reference
+    GDN decode, median `191.32 tok/s` (`0.896x` the stored `213.54 tok/s` vLLM
+    reference), which is near but below the `0.9x` line;
+  - next material work should return to the broader random/hetero8 decode graph
+    or a production fused decode boundary. Further final-token sync reshaping is
+    not a promising route.
+
+### Entry 247 - Guarded Resident Decode Boundary Groundwork
+
+- date: 2026-06-05
+- purpose:
+  - continue the random decode hill-climb by expanding the decode JIT boundary
+    around resident slot metadata;
+  - avoid repeating the unsafe full random compile path after a boundary-changing
+    edit.
+- implementation:
+  - added an opt-in `resident_decode_metadata` config/CLI/server-config field;
+  - added a resident-slot greedy decode executor path that gathers block tables,
+    sequence lengths, and GDN state by compact slot ids inside the JIT boundary,
+    then scatters updated GDN state and resident sequence lengths back to the
+    resident tables;
+  - mirrored scheduler-owned block tables and sequence lengths into
+    device-resident runner tables;
+  - cast updated table-scattered GDN state back to the resident table dtypes to
+    avoid future JAX scatter dtype failures;
+  - updated `AGENTS.md` and the active plan so new random decode JIT boundaries
+    must pass scaled JAX-only diagnostics before full seed-`1234` random runs.
+- current status:
+  - resident decode metadata remains default-off. It is a guarded probe, not an
+    accepted speedup;
+  - no full random artifact is recorded for the resident-slot path yet because
+    the previous full compile attempt did not complete safely.
+- validation:
+  - `python -m py_compile nanovllm_jax/config.py nanovllm_jax/server_config.py nanovllm_jax/engine/scheduled_batch.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py benchmarks/benchmark_jax_server_trace.py benchmarks/benchmark_random_request_sidecar.py tests/test_backend_boundaries.py tests/test_server_config.py tests/test_benchmark_random_request_sidecar.py`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'table_hybrid_decode_matches_sliced_decode or syncs_resident_decode_metadata_by_slot or hybrid_slot_ids_zero or scheduler_pads_scheduled_batch_to_static_buckets'`;
+  - `pytest -q tests/test_device_token_carry.py tests/test_server_config.py tests/test_benchmark_random_request_sidecar.py tests/test_benchmark_jax_server_trace.py`;
+  - `git diff --check`.
+- next:
+  - checkpoint and push the branch;
+  - run a scaled JAX-only random diagnostic with `resident_decode_metadata`
+    enabled before trying medium or full random sidecar runs.

@@ -88,6 +88,7 @@ class ExecutorOutput:
     cache_storage: Optional[KVCacheStorage]
     attention_metadata: Optional[AttentionMetadata]
     hybrid_state: Optional[HybridLayerState]
+    resident_seq_lens: Optional[jnp.ndarray] = None
 
 
 @dataclass
@@ -927,12 +928,16 @@ class ModelExecutor:
                     slot_ids,
                     jnp.full_like(slot_ids, conv_state_table.shape[0]),
                 )
+                updated_conv = updated_hybrid_state.conv_state.astype(conv_state_table.dtype)
+                updated_recurrent = updated_hybrid_state.recurrent_state.astype(
+                    recurrent_state_table.dtype
+                )
                 updated_conv_table = conv_state_table.at[scatter_slot_ids].set(
-                    updated_hybrid_state.conv_state,
+                    updated_conv,
                     mode="drop",
                 )
                 updated_recurrent_table = recurrent_state_table.at[scatter_slot_ids].set(
-                    updated_hybrid_state.recurrent_state,
+                    updated_recurrent,
                     mode="drop",
                 )
                 return (
@@ -971,6 +976,204 @@ class ModelExecutor:
             cache_storage=KVCacheStorage(k_cache, v_cache),
             attention_metadata=None,
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
+        )
+
+    def forward_step_token_ids_resident_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state_table: HybridLayerState,
+        hybrid_slot_ids: jnp.ndarray,
+        resident_block_tables: jnp.ndarray,
+        resident_seq_lens: jnp.ndarray,
+    ) -> ExecutorOutput:
+        """Decode greedy-token path from resident slot metadata.
+
+        The scheduler still chooses compact rows and reserves paged KV blocks.
+        The runner keeps the current per-slot block-table and sequence-length
+        tables on device. This compiled boundary gathers those tables by
+        ``hybrid_slot_ids`` so the decode call no longer needs full per-step
+        block tables or sequence lengths as dynamic inputs.
+        """
+        if batch.is_prefill:
+            raise ValueError("forward_step_token_ids_resident_jit is decode-only")
+        if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
+            raise ValueError("forward_step_token_ids_resident_jit requires initialized hybrid state tables")
+        self._log_step("forward_step_token_ids_resident_jit", batch, return_hidden=True, last_logits_only=False)
+        self._validate_batch_contract(batch)
+
+        static_block_table_width = int(batch.block_tables.shape[1])
+        key = (
+            "token-ids-resident",
+            tuple(batch.tokens.shape),
+            static_block_table_width,
+            tuple(hybrid_state_table.conv_state.shape),
+            tuple(hybrid_state_table.recurrent_state.shape),
+            tuple(resident_block_tables.shape),
+            tuple(resident_seq_lens.shape),
+        )
+        if key not in self._jit_cache:
+
+            def compiled(
+                params_leaves,
+                tokens,
+                k_cache,
+                v_cache,
+                conv_state_table,
+                recurrent_state_table,
+                slot_ids,
+                block_table_table,
+                seq_lens_table,
+            ):
+                params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
+                row_valid = slot_ids >= 0
+                safe_slot_ids = jnp.maximum(slot_ids, 0)
+                query_lens = row_valid.astype(jnp.int32)
+                query_start_loc = jnp.concatenate(
+                    [
+                        jnp.zeros((1,), dtype=jnp.int32),
+                        jnp.cumsum(query_lens),
+                    ],
+                    axis=0,
+                )
+                num_query_tokens = query_start_loc[-1].astype(jnp.int32)
+
+                block_tables = block_table_table[safe_slot_ids, :static_block_table_width]
+                block_tables = jnp.where(
+                    row_valid[:, None],
+                    block_tables,
+                    jnp.zeros_like(block_tables),
+                )
+                seq_lens = seq_lens_table[safe_slot_ids]
+                seq_lens = jnp.where(row_valid, seq_lens, jnp.zeros_like(seq_lens))
+                positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
+
+                conv_state = conv_state_table[safe_slot_ids]
+                recurrent_state = recurrent_state_table[safe_slot_ids]
+                conv_state = jnp.where(
+                    row_valid.reshape((row_valid.shape[0],) + (1,) * (conv_state.ndim - 1)),
+                    conv_state,
+                    jnp.zeros_like(conv_state),
+                )
+                recurrent_state = jnp.where(
+                    row_valid.reshape((row_valid.shape[0],) + (1,) * (recurrent_state.ndim - 1)),
+                    recurrent_state,
+                    jnp.zeros_like(recurrent_state),
+                )
+
+                step_batch = ScheduledBatch(
+                    tokens=tokens,
+                    positions=positions,
+                    seq_ids=jnp.where(
+                        row_valid,
+                        safe_slot_ids.astype(jnp.int32),
+                        jnp.full_like(safe_slot_ids, -1),
+                    ),
+                    query_start_loc=query_start_loc,
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=num_query_tokens,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                )
+                attention_metadata = self.backend.build_attention_metadata(
+                    positions=step_batch.positions,
+                    block_tables=step_batch.block_tables,
+                    seq_lens=step_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=False,
+                    query_start_loc=step_batch.query_start_loc,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=step_batch.num_decode_tokens,
+                )
+                kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=step_batch.block_tables,
+                    kv_lens=step_batch.seq_lens,
+                    slot_mapping=attention_metadata.slot_mapping,
+                )
+                hidden, updated_kv_state, updated_hybrid_state = model_forward_step(
+                    step_batch.tokens,
+                    params,
+                    self.config,
+                    positions=step_batch.positions,
+                    kv_cache_state=kv_state,
+                    attention_metadata=attention_metadata,
+                    hybrid_state=HybridLayerState(conv_state, recurrent_state),
+                    is_prefill=False,
+                    return_hidden=True,
+                    return_hidden_with_logits=False,
+                    last_logits_only=False,
+                    backend=self.backend,
+                    hybrid_state_layerwise=True,
+                )
+                token_ids, _, _ = lm_head_token_ids_and_topk(
+                    hidden[:, :1, :],
+                    params,
+                    self.config,
+                    hidden_is_normed=False,
+                    is_prefill=False,
+                    top_k=0,
+                )
+                scatter_slot_ids = jnp.where(
+                    row_valid,
+                    slot_ids,
+                    jnp.full_like(slot_ids, conv_state_table.shape[0]),
+                )
+                updated_conv = updated_hybrid_state.conv_state.astype(conv_state_table.dtype)
+                updated_recurrent = updated_hybrid_state.recurrent_state.astype(
+                    recurrent_state_table.dtype
+                )
+                updated_conv_table = conv_state_table.at[scatter_slot_ids].set(
+                    updated_conv,
+                    mode="drop",
+                )
+                updated_recurrent_table = recurrent_state_table.at[scatter_slot_ids].set(
+                    updated_recurrent,
+                    mode="drop",
+                )
+                updated_seq_lens_table = seq_lens_table.at[scatter_slot_ids].set(
+                    seq_lens + row_valid.astype(seq_lens.dtype),
+                    mode="drop",
+                )
+                return (
+                    token_ids[:, 0].astype(jnp.int32),
+                    updated_kv_state.k_cache,
+                    updated_kv_state.v_cache,
+                    updated_conv_table,
+                    updated_recurrent_table,
+                    updated_seq_lens_table,
+                )
+
+            self._jit_cache[key] = jax.jit(
+                compiled,
+                donate_argnums=(2, 3, 4, 5),
+            )
+
+        token_ids, k_cache, v_cache, conv_state, recurrent_state, seq_lens_table = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self._params_leaves,
+                batch.tokens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state_table.conv_state,
+                hybrid_state_table.recurrent_state,
+                hybrid_slot_ids,
+                resident_block_tables,
+                resident_seq_lens,
+            ),
+            "forward_step_token_ids_resident_jit:decode",
+        )
+        return ExecutorOutput(
+            activations=token_ids,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            attention_metadata=None,
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+            resident_seq_lens=seq_lens_table,
         )
 
     def forward_greedy_decode_burst_table_jit(

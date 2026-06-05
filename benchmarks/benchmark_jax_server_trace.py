@@ -75,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-token-carry", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--static-decode-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--static-decode-seq-lens-carry", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--resident-decode-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--materialize-tied-lm-head", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compact-prefill-in-proj-qkv", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compact-prefill-gdn-z", action=argparse.BooleanOptionalAction, default=False)
@@ -88,6 +89,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decode-padded-gemm-rows", type=int, default=8)
     parser.add_argument("--decode-padded-gemm-max-out-dim", type=int, default=8192)
     parser.add_argument("--full-attention-kv-cache-dtype", default="default")
+    parser.add_argument("--full-attention-kv-append-impl", default="reference")
+    parser.add_argument("--full-attention-decode-impl", default="reference")
+    parser.add_argument("--full-attention-prefill-impl", default="reference")
     parser.add_argument("--gdn-disable-fallbacks", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gdn-prefill-post-conv-impl", default="off")
     parser.add_argument("--gdn-prefill-qkv-dtype", default="fp32")
@@ -378,6 +382,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "device_token_carry": args.device_token_carry,
         "static_decode_metadata": args.static_decode_metadata,
         "static_decode_seq_lens_carry": args.static_decode_seq_lens_carry,
+        "resident_decode_metadata": args.resident_decode_metadata,
         "materialize_tied_lm_head": args.materialize_tied_lm_head,
         "compact_prefill_in_proj_qkv": args.compact_prefill_in_proj_qkv,
         "compact_prefill_gdn_z": args.compact_prefill_gdn_z,
@@ -391,6 +396,9 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "decode_padded_gemm_rows": args.decode_padded_gemm_rows,
         "decode_padded_gemm_max_out_dim": args.decode_padded_gemm_max_out_dim,
         "full_attention_kv_cache_dtype": args.full_attention_kv_cache_dtype,
+        "full_attention_kv_append_impl": args.full_attention_kv_append_impl,
+        "full_attention_decode_impl": args.full_attention_decode_impl,
+        "full_attention_prefill_impl": args.full_attention_prefill_impl,
         "gdn_disable_fallbacks": args.gdn_disable_fallbacks,
         "gdn_prefill_post_conv_impl": args.gdn_prefill_post_conv_impl,
         "gdn_prefill_qkv_dtype": args.gdn_prefill_qkv_dtype,
@@ -520,6 +528,9 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 "cuda_fp32_kv_append": _env_flag("NANO_VLLM_JAX_CUDA_FP32_KV_APPEND"),
                 "cuda_fp32_decode_attention": _env_flag("NANO_VLLM_JAX_CUDA_FP32_DECODE_ATTN"),
                 "kv_cache_dtype": str(engine.config.full_attention_kv_cache_dtype),
+                "kv_append_impl": str(engine.config.full_attention_kv_append_impl),
+                "decode_impl": str(engine.config.full_attention_decode_impl),
+                "prefill_impl": str(engine.config.full_attention_prefill_impl),
             },
             "gdn_kernel_flags": {
                 "allow_local_cuda_probes": _env_flag(
@@ -589,6 +600,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 "device_token_carry": bool(engine.config.device_token_carry),
                 "static_decode_metadata": bool(engine.config.static_decode_metadata),
                 "static_decode_seq_lens_carry": bool(engine.config.static_decode_seq_lens_carry),
+                "resident_decode_metadata": bool(engine.config.resident_decode_metadata),
                 "greedy_decode_burst_steps": int(engine.config.greedy_decode_burst_steps),
             },
         },

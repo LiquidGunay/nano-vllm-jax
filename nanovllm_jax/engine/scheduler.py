@@ -634,6 +634,7 @@ class Scheduler:
 
         query_lens_host = tuple(query_lens)
         seq_lens_host = tuple(seq_lens)
+        block_tables_host = tuple(tuple(int(block) for block in row) for row in block_tables)
         uses_static_decode_metadata = self._can_use_static_decode_metadata(
             seqs,
             is_prefill=is_prefill,
@@ -690,6 +691,7 @@ class Scheduler:
             seq_ids_host=seq_ids_host,
             query_lens_host=query_lens_host,
             seq_lens_host=seq_lens_host,
+            block_tables_host=block_tables_host,
             decode_step_count_host=1 if is_prefill else max(1, int(decode_step_count)),
             uses_static_decode_metadata=uses_static_decode_metadata,
         )
@@ -818,6 +820,7 @@ class Scheduler:
 
         query_lens_host = tuple(query_lens)
         seq_lens_host = tuple(seq_lens)
+        block_tables_host = tuple(tuple(int(block) for block in row) for row in block_tables)
         return ScheduledBatch(
             tokens=jnp.array([packed_tokens], dtype=jnp.int32),
             positions=jnp.array([packed_positions], dtype=jnp.int32),
@@ -832,6 +835,7 @@ class Scheduler:
             seq_ids_host=seq_ids_host,
             query_lens_host=query_lens_host,
             seq_lens_host=seq_lens_host,
+            block_tables_host=block_tables_host,
             packed_prefill=True,
             token_row_ids=jnp.array([token_row_ids], dtype=jnp.int32),
         )

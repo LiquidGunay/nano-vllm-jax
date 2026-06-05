@@ -2147,22 +2147,16 @@ def full_attention_block(
                 block_size=config.block_size,
                 is_prefill=is_prefill,
             )
-        cache_storage = backend.write_kv(
-            layer_id=layer_idx,
-            k=k_cache_input,
-            v=v_cache_input,
-            cache=kv_cache_state.storage,
-            metadata=metadata,
-        )
-        
         # query is currently [batch, num_heads, seq_len, head_dim] (BHTD)
         # Backend attention expects [batch, seq_len, num_heads, head_dim] (BTNH)
         query_btnh = query.transpose(0, 2, 1, 3)  # [batch, seq_len, num_heads, head_dim]
 
-        out = backend.attention(
+        cache_storage, out = backend.write_kv_and_attention(
             layer_id=layer_idx,
             query=query_btnh,
-            cache=cache_storage,
+            k=k_cache_input,
+            v=v_cache_input,
+            cache=kv_cache_state.storage,
             metadata=metadata,
             block_size=config.block_size,
             scale=1.0 / jnp.sqrt(config.head_dim),

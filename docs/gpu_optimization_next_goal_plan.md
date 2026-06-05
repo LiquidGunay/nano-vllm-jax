@@ -134,44 +134,51 @@ Rules for this lane:
 
 Next implementation order:
 
-1. Replace slow decode kernels behind the packed serving boundary:
+1. Expand the decode boundary around resident slots:
+   - keep a device-resident table for active slot metadata (`block_tables`,
+     `seq_lens`, and GDN state), keyed by logical serving slots rather than by
+     the transient scheduler row;
+   - pass compact active slot ids plus current-token references into the JIT
+     decode step, then gather paged-attention metadata, update KV/GDN state,
+     run the model, run greedy LM-head selection, and scatter updated resident
+     metadata inside that one boundary;
+   - preserve paged attention, packed chunked/ragged prefill, and normal decode
+     semantics. The generated token is cached only when it becomes a scheduled
+     input on the next step.
+2. Keep active decode rows compacted without seed-specific scheduling:
+   - use general batch buckets such as `1,2,4,8,16` when they fit memory, but do
+     not specialize to seed `1234`, exact request lengths, Qwen3.5-0.8B hidden
+     sizes, or a specific GPU;
+   - avoid widening resident/execution capacity by itself as an optimization:
+     Entry 243 showed resident16/B8 regressed because the old executor still ran
+     prefill-only or decode-only steps.
+3. Integrate production kernels only inside the wider serving boundary:
    - full-attention decode should use a production paged decode-attention path
-     rather than materializing/gathering K/V windows in JAX;
+     only when it consumes the resident-slot paged layout directly;
    - GDN decode should continue toward the vLLM/FLA-style fused boundary with
      BF16 activations and FP32 recurrent state where required;
-   - LM-head/sampling should compute only the greedy token unless top-k/logit
-     diagnostics are explicitly requested;
-   - Entry 244 shows PJRT amortization alone is not enough: burst8 halves the
-     decode call count relative to burst4, but throughput barely moves.
-2. Match vLLM's serving ABI more closely where it enables those decode kernels:
-   - resident logical concurrency above the execution batch bucket now exists
-     as config/runner groundwork (`max_num_resident_seqs`), but resident-only
-     widening is rejected as a performance route: resident16/B8 regressed to
-     `278.97 output tok/s` because the executor still runs prefill-only or
-     decode-only steps;
-   - explicit mixed packed batches now exist as ABI groundwork, but automatic
-     mixed backfill is rejected until a latency-aware policy and faster
-     decode/prefill kernels can make it win integrated output throughput;
-   - keep compile keys expressed as finite serving buckets, not exact request
-     shapes.
-3. Make arbitrary-batch decode efficient before widening the serving envelope:
-   - compact active decode rows into generic batch buckets such as
-     `1,2,4,8,16`;
-   - pass slot mapping, block tables, sequence lengths, and state handles in a
-     vLLM-shaped packed boundary;
-   - keep per-step metadata/state update work proportional to active rows and
-     scheduled tokens, not to the total resident capacity.
-4. Keep generic greedy decode micro-burst diagnostic-only until decode kernels
-   are faster:
-   - compile a small fixed set of burst buckets, for example `1,2,4,8`, during
-     normal startup warmup;
-   - choose the runtime burst from a cost model and scheduler constraints, not
-     per-GPU hand tuning;
-   - stop early per row with masks when a sequence reaches its requested output
-     length or EOS policy, and fall back to burst `1` when prefill/backfill
-     pressure would otherwise starve waiting work.
-5. Reprofile only after a structural change and compare against the fresh
-   random anchor, the Entry 240 anchor, and the live vLLM reference.
+   - do not promote attention-only or prep-only kernels if the integrated random
+     run does not improve.
+4. Fuse or narrow LM-head sampling for greedy serving:
+   - compute only the greedy token on the serving path unless diagnostics ask
+     for logits/top-k;
+   - pursue a model-family-general fused matmul/reduction path rather than
+     hand-tuned vocabulary or tile constants for this model/GPU.
+5. Re-enable chunked/ragged prefill backfill only after decode gets cheaper:
+   - keep the explicit mixed packed ABI as groundwork;
+   - automatic mixed backfill remains rejected until a latency-aware policy plus
+     faster decode/prefill kernels can improve integrated output throughput
+     without starving live decode rows.
+6. Keep generic startup warmup and benchmark discipline:
+   - warm serving-envelope buckets only: batch buckets, packed prefill token
+     buckets, and decode block-table widths;
+   - after any new decode JIT boundary, run a scaled JAX-only random diagnostic
+     before the full seed-`1234` sidecar to avoid repeating the unsafe full
+     compile path;
+   - promoted random runs must keep full output lengths, acceptable correctness,
+     and zero measured-phase JIT cache growth;
+   - reprofile only after a structural change and compare against the fresh
+     random anchor, the Entry 240 anchor, and the live vLLM reference.
 
 Micro-burst selection model:
 
@@ -1320,6 +1327,37 @@ P3:
 The important ordering is: first own KV layout and decode attention, then attack
 GDN decode/prefill using external kernel references. Do not start with MTP or
 top-k.
+
+### Current Execution Plan - FA/FLA Integration
+
+As of 2026-06-04, the next speed path is the FA/FLA kernel integration plan:
+
+1. Make full-attention and GDN kernel policy first-class config, not loose
+   benchmark environment. Artifacts must report the selected FA KV append,
+   FA decode, FA prefill, GDN prefill, and GDN decode implementations.
+2. Promote the existing paged full-attention decode boundary into a typed route:
+   `full_attention.decode_impl=triton_paged`. This must consume the current
+   NHD paged cache directly and fail loudly when the shape/dtype contract is not
+   supported, instead of silently falling back to JAX.
+3. Keep `full_attention.kv_append_impl=reference` until a matching FlashInfer or
+   Triton append path is paired with the paged decode reader. Standalone append
+   kernels have already regressed integrated serving.
+4. Use the selected GDN route as a component, but do not expect the narrow GDN
+   recurrent kernel alone to close the random/decode gap. The useful FLA work is
+   a broader GDN decode boundary that owns conv, gate/beta math, q/k norm,
+   recurrent-state read/update/write, and surrounding layout.
+5. Re-run focused parity first, then integrated `decode_heavy_128x128`,
+   `hetero8`, `long_prefill_512_2048`, and the random sidecar. Promotion still
+   requires exact generated-token parity where the reference is exact, zero
+   measured-phase JIT growth after generic warmup, and a real integrated
+   throughput improvement against the accepted JAX baseline and vLLM.
+
+Status after the first execution pass: the config route and focused parity
+tests are implemented, but the narrow FA decode routes are rejected for
+promotion. `full_attention.decode_impl=triton_paged` was exact but slower than
+the current static route on `decode_heavy_128x128`; fused append+decode and B1
+packed-QKV probes also regressed. Continue with broader decode graph work
+rather than retrying standalone FA attention replacement.
 
 ## P0.1 - `kv_append_paged_nhd`
 

@@ -34,6 +34,7 @@ class ScheduledBatch:
     seq_ids_host: tuple[int, ...] | None = None
     query_lens_host: tuple[int, ...] | None = None
     seq_lens_host: tuple[int, ...] | None = None
+    block_tables_host: tuple[tuple[int, ...], ...] | None = None
     hybrid_slot_ids_host: tuple[int, ...] | None = None
     decode_step_count_host: int = 1
     uses_static_decode_metadata: bool = False

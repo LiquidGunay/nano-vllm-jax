@@ -9,13 +9,13 @@
 ## GPU And Benchmark Commands
 
 - Run benchmark, profiling, vLLM, JAX GPU, CUDA, NVIDIA, and model-serving
-  commands outside the sandbox with elevated access. The sandbox cannot reliably
-  see `/dev/nvidia*`, so sandboxed GPU checks can report false driver/device
-  failures.
+  commands with GPU visibility verified up front. In sessions that support
+  elevated access, use it for GPU work; in unrestricted sessions where approvals
+  are disabled, do not request elevation and instead verify with `nvidia-smi`
+  plus a CUDA-only JAX smoke check.
 - Treat Python/pytest commands that initialize JAX, vLLM, CUDA, or NVIDIA
-  libraries as GPU commands. Run those outside the sandbox with elevated access
-  as well, even when the command itself looks like a normal unit-test or
-  benchmark invocation.
+  libraries as GPU commands. Apply the same visibility/elevation rule even when
+  the command itself looks like a normal unit-test or benchmark invocation.
 - Default to elevated access for any benchmark, profiling, server, model-load,
   or performance-measurement command that may touch the GPU runtime. If unsure
   whether a command will initialize GPU/JAX/vLLM/CUDA state, run it elevated.
@@ -25,3 +25,19 @@
 - Do not use `--skip-gpu-preflight` to hide missing GPU visibility. If an
   elevated run still cannot communicate with the GPU, stop and ask the user for
   help.
+
+## Random Decode Benchmark Safety
+
+- Treat new JIT boundaries on the random sidecar as crash-risk until proven
+  otherwise. Run a scaled JAX-only diagnostic first with small request and token
+  ranges, a finite timeout, CUDA-only execution, and constrained KV/cache
+  capacity.
+- Promote diagnostics in stages: small random run, medium random run, then the
+  full seed-1234 random decode graph. Do not run the full graph after a
+  boundary-changing edit unless the smaller run shows acceptable correctness,
+  no measured-phase JIT cache growth, and reasonable memory behavior.
+- Keep benchmark artifacts under `/mountpoint/.exp/diagnostics` or another
+  mountpoint path, but commit only summaries, configs, docs, and tests. Do not
+  stage `results/*` or full profile/artifact dumps.
+- Push checkpoint commits to the remote periodically while working on long GPU
+  optimization passes so the current best state is not only local.

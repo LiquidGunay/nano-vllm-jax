@@ -41,6 +41,7 @@ from nanovllm_jax.layers import causal_conv1d_update, rms_norm
 from nanovllm_jax.model import (
     _can_use_decode_padded_gemm,
     _decode_padded_gemm_dot,
+    _use_full_attention_decode_packed_qkv,
     _packed_causal_conv1d_prefill,
     forward,
     init_params,
@@ -302,6 +303,210 @@ def test_pure_jax_decode_attention_matches_dense_reference_non_contiguous_blocks
     np.testing.assert_allclose(np.array(actual), np.array(expected), rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_configured_triton_decode_attention_matches_reference_non_contiguous_blocks():
+    config = Qwen3_5Config(
+        full_attention_decode_impl="triton_paged",
+        full_attention_kv_cache_dtype="bf16",
+    )
+    backend = PureJAXBackend(config)
+    block_size = 2
+    spec = KVCacheSpec(
+        num_layers=1,
+        num_blocks=6,
+        block_size=block_size,
+        num_kv_heads=1,
+        head_dim=16,
+        dtype=jnp.float32,
+        max_kv_cache_bytes=4096,
+    )
+    cache = backend.allocate_kv_cache(spec, max_seqs=3, max_blocks_per_seq=3)
+    block_tables = jnp.array([[2, 0, 4], [3, 1, 5], [0, 0, 0]], dtype=jnp.int32)
+    seq_lens = jnp.array([5, 3, 0], dtype=jnp.int32)
+    key = jax.random.PRNGKey(220)
+    dense_k = jax.random.normal(
+        key,
+        (3, 6, 1, 16),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    dense_v = jax.random.normal(
+        jax.random.fold_in(key, 1),
+        (3, 6, 1, 16),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+
+    k_cache = cache.k_cache
+    v_cache = cache.v_cache
+    for batch_idx in range(2):
+        for pos in range(int(seq_lens[batch_idx])):
+            block = int(block_tables[batch_idx, pos // block_size])
+            slot = pos % block_size
+            k_cache = k_cache.at[0, block, slot].set(dense_k[batch_idx, pos])
+            v_cache = v_cache.at[0, block, slot].set(dense_v[batch_idx, pos])
+    cache = type(cache)(k_cache, v_cache)
+
+    query = jax.random.normal(
+        jax.random.fold_in(key, 2),
+        (3, 1, 2, 16),
+        dtype=jnp.float32,
+    )
+    metadata = backend.build_attention_metadata(
+        positions=jnp.array([[5], [3], [0]], dtype=jnp.int32),
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        block_size=block_size,
+        is_prefill=False,
+    )
+    actual = backend.attention(
+        layer_id=0,
+        query=query,
+        cache=cache,
+        metadata=metadata,
+        block_size=block_size,
+        scale=1.0 / np.sqrt(16),
+        num_key_value_groups=2,
+        is_prefill=False,
+    )
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(block_tables)
+    expected = paged_decode_attention_gqa_nhd_reference(
+        query[:, 0],
+        cache.k_cache[0],
+        cache.v_cache[0],
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len_from_seq_lens(seq_lens, block_size),
+        seq_lens,
+        1.0 / np.sqrt(16),
+        max_pages_per_sequence=block_tables.shape[1],
+    ).reshape(3, 1, 2 * 16)
+
+    np.testing.assert_allclose(
+        np.asarray(actual[:2], dtype=np.float32),
+        np.asarray(expected[:2], dtype=np.float32),
+        rtol=3e-2,
+        atol=3e-2,
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_configured_fused_triton_decode_attention_appends_kv_and_matches_reference():
+    config = Qwen3_5Config(
+        full_attention_decode_impl="triton_paged_fused_append",
+        full_attention_kv_cache_dtype="bf16",
+    )
+    backend = PureJAXBackend(config)
+    block_size = 2
+    spec = KVCacheSpec(
+        num_layers=1,
+        num_blocks=6,
+        block_size=block_size,
+        num_kv_heads=1,
+        head_dim=16,
+        dtype=jnp.float32,
+        max_kv_cache_bytes=4096,
+    )
+    cache = backend.allocate_kv_cache(spec, max_seqs=2, max_blocks_per_seq=3)
+    block_tables = jnp.array([[2, 0, 4], [3, 1, 5]], dtype=jnp.int32)
+    seq_lens = jnp.array([5, 3], dtype=jnp.int32)
+    positions = jnp.array([[4], [2]], dtype=jnp.int32)
+    key = jax.random.PRNGKey(221)
+    previous_k = jax.random.normal(
+        key,
+        (2, 5, 1, 16),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    previous_v = jax.random.normal(
+        jax.random.fold_in(key, 1),
+        (2, 5, 1, 16),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    new_k = jax.random.normal(
+        jax.random.fold_in(key, 2),
+        (2, 1, 1, 16),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    new_v = jax.random.normal(
+        jax.random.fold_in(key, 3),
+        (2, 1, 1, 16),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+
+    k_cache = cache.k_cache
+    v_cache = cache.v_cache
+    for batch_idx in range(2):
+        # Fill only the already-cached prefix; the fused kernel owns the
+        # current-token append at positions [4, 2].
+        for pos in range(int(seq_lens[batch_idx]) - 1):
+            block = int(block_tables[batch_idx, pos // block_size])
+            slot = pos % block_size
+            k_cache = k_cache.at[0, block, slot].set(previous_k[batch_idx, pos])
+            v_cache = v_cache.at[0, block, slot].set(previous_v[batch_idx, pos])
+    cache = type(cache)(k_cache, v_cache)
+
+    query = jax.random.normal(
+        jax.random.fold_in(key, 4),
+        (2, 1, 2, 16),
+        dtype=jnp.float32,
+    )
+    metadata = backend.build_attention_metadata(
+        positions=positions,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        block_size=block_size,
+        is_prefill=False,
+    )
+    actual_cache, actual = backend.write_kv_and_attention(
+        layer_id=0,
+        query=query,
+        k=new_k,
+        v=new_v,
+        cache=cache,
+        metadata=metadata,
+        block_size=block_size,
+        scale=1.0 / np.sqrt(16),
+        num_key_value_groups=2,
+        is_prefill=False,
+    )
+
+    expected_k_cache = cache.k_cache
+    expected_v_cache = cache.v_cache
+    for batch_idx in range(2):
+        pos = int(positions[batch_idx, 0])
+        block = int(block_tables[batch_idx, pos // block_size])
+        slot = pos % block_size
+        expected_k_cache = expected_k_cache.at[0, block, slot].set(new_k[batch_idx, 0])
+        expected_v_cache = expected_v_cache.at[0, block, slot].set(new_v[batch_idx, 0])
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(block_tables)
+    expected = paged_decode_attention_gqa_nhd_reference(
+        query[:, 0],
+        expected_k_cache[0],
+        expected_v_cache[0],
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len_from_seq_lens(seq_lens, block_size),
+        seq_lens,
+        1.0 / np.sqrt(16),
+        max_pages_per_sequence=block_tables.shape[1],
+    ).reshape(2, 1, 2 * 16)
+
+    np.testing.assert_allclose(
+        np.asarray(actual, dtype=np.float32),
+        np.asarray(expected, dtype=np.float32),
+        rtol=3e-2,
+        atol=3e-2,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual_cache.k_cache),
+        np.asarray(expected_k_cache),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual_cache.v_cache),
+        np.asarray(expected_v_cache),
+    )
+
+
 def test_auto_backend_selects_pure_jax_reference_path():
     assert select_backend("auto").name == "pure_jax"
 
@@ -377,6 +582,7 @@ def _hybrid_state_batch(seq_ids, query_lens) -> ScheduledBatch:
         seq_ids_host=tuple(seq_ids),
         query_lens_host=tuple(query_lens),
         seq_lens_host=tuple(1 if seq_id >= 0 else 0 for seq_id in seq_ids),
+        block_tables_host=tuple((0,) for _ in seq_ids),
     )
 
 
@@ -490,6 +696,44 @@ def test_model_runner_hybrid_state_does_not_replace_full_table_with_inactive_row
         np.array(runner._hybrid_state_table.recurrent_state[1]),
         np.array(original_state.recurrent_state[1]),
     )
+
+
+def test_model_runner_syncs_resident_decode_metadata_by_slot():
+    runner = _hybrid_state_runner_with_two_slots()
+    runner.max_blocks_per_seq = 4
+    runner._resident_block_tables = jnp.zeros((2, 4), dtype=jnp.int32)
+    runner._resident_seq_lens = jnp.zeros((2,), dtype=jnp.int32)
+    runner._resident_block_tables_host = [(0, 0, 0, 0), (0, 0, 0, 0)]
+    runner._resident_seq_lens_host = [0, 0]
+    batch = ScheduledBatch(
+        tokens=jnp.zeros((2, 1), dtype=jnp.int32),
+        positions=jnp.zeros((2, 1), dtype=jnp.int32),
+        seq_ids=jnp.array([8, -1], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 1], dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=1,
+        block_tables=jnp.array([[3, 4], [0, 0]], dtype=jnp.int32),
+        seq_lens=jnp.array([17, 0], dtype=jnp.int32),
+        seq_ids_host=(8, -1),
+        query_lens_host=(1, 0),
+        seq_lens_host=(17, 0),
+        block_tables_host=((3, 4), (0, 0)),
+        hybrid_slot_ids_host=(1, -1),
+    )
+
+    runner._sync_resident_decode_metadata(batch, (1, -1), sync_seq_lens=True)
+
+    np.testing.assert_array_equal(
+        np.asarray(runner._resident_block_tables),
+        np.array([[0, 0, 0, 0], [3, 4, 0, 0]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(runner._resident_seq_lens),
+        np.array([0, 17], dtype=np.int32),
+    )
+    runner._advance_resident_seq_lens_host((1, -1), active_rows=[0], steps=1)
+    assert runner._resident_seq_lens_host == [0, 18]
 
 
 def test_mtp_admission_gate_tracks_logical_decode_rows(monkeypatch):
@@ -1599,6 +1843,11 @@ def test_executor_table_hybrid_decode_matches_sliced_decode():
         cache_storage=executor.backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=3),
         hybrid_state=base_hybrid,
     )
+    resident_prompt = executor.forward_step_token_ids_jit(
+        prompt_batch,
+        cache_storage=executor.backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=3),
+        hybrid_state=base_hybrid,
+    )
     ref_prompt_tokens = (
         ref_prompt.activations[:, None]
         if ref_prompt.activations.ndim == 1
@@ -1617,6 +1866,7 @@ def test_executor_table_hybrid_decode_matches_sliced_decode():
         seq_ids_host=(0,),
         query_lens_host=(1,),
         seq_lens_host=(4,),
+        block_tables_host=((0, 1, 2),),
     )
 
     ref = executor.forward_step_token_ids_jit(
@@ -1638,8 +1888,25 @@ def test_executor_table_hybrid_decode_matches_sliced_decode():
         hybrid_state_table=HybridLayerState(conv_table, recurrent_table),
         hybrid_slot_ids=jnp.array([1], dtype=jnp.int32),
     )
+    resident_conv_table = jnp.zeros(
+        (2,) + resident_prompt.hybrid_state.conv_state.shape[1:],
+        dtype=resident_prompt.hybrid_state.conv_state.dtype,
+    ).at[1].set(resident_prompt.hybrid_state.conv_state[0])
+    resident_recurrent_table = jnp.zeros(
+        (2,) + resident_prompt.hybrid_state.recurrent_state.shape[1:],
+        dtype=resident_prompt.hybrid_state.recurrent_state.dtype,
+    ).at[1].set(resident_prompt.hybrid_state.recurrent_state[0])
+    resident = executor.forward_step_token_ids_resident_jit(
+        decode_batch,
+        cache_storage=resident_prompt.cache_storage,
+        hybrid_state_table=HybridLayerState(resident_conv_table, resident_recurrent_table),
+        hybrid_slot_ids=jnp.array([1], dtype=jnp.int32),
+        resident_block_tables=jnp.array([[0, 0, 0], [0, 1, 2]], dtype=jnp.int32),
+        resident_seq_lens=jnp.array([0, 4], dtype=jnp.int32),
+    )
 
     np.testing.assert_array_equal(np.array(actual.activations), np.array(ref.activations))
+    np.testing.assert_array_equal(np.array(resident.activations), np.array(ref.activations))
     np.testing.assert_allclose(
         np.array(actual.hybrid_state.conv_state[1:2]),
         np.array(ref.hybrid_state.conv_state),
@@ -1651,6 +1918,22 @@ def test_executor_table_hybrid_decode_matches_sliced_decode():
         np.array(ref.hybrid_state.recurrent_state),
         rtol=1e-5,
         atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.array(resident.hybrid_state.conv_state[1:2]),
+        np.array(ref.hybrid_state.conv_state),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.array(resident.hybrid_state.recurrent_state[1:2]),
+        np.array(ref.hybrid_state.recurrent_state),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_array_equal(
+        np.array(resident.resident_seq_lens),
+        np.array([0, 5], dtype=np.int32),
     )
     np.testing.assert_array_equal(
         np.array(actual.hybrid_state.conv_state[0]),

@@ -118,6 +118,50 @@ def _full_attention_kv_cache_dtype(default_dtype, config=None):
     )
 
 
+def _full_attention_kv_append_impl(config=None) -> str:
+    value = str(
+        getattr(config, "full_attention_kv_append_impl", "reference")
+        if config is not None
+        else "reference"
+    ).strip().lower()
+    if value in _OFF_ENV_VALUES or value in {"reference", "jax", "pure_jax"}:
+        return "reference"
+    if value in {"flashinfer", "flashinfer_paged", "paged_flashinfer"}:
+        return "flashinfer"
+    raise ValueError(
+        "Unknown full_attention_kv_append_impl="
+        f"{value!r}; expected reference or flashinfer"
+    )
+
+
+def _full_attention_decode_impl(config=None) -> str:
+    value = str(
+        getattr(config, "full_attention_decode_impl", "reference")
+        if config is not None
+        else "reference"
+    ).strip().lower()
+    if value in _OFF_ENV_VALUES or value in {"reference", "jax", "pure_jax"}:
+        return "reference"
+    if value in {
+        "triton",
+        "triton_paged",
+        "paged_triton",
+        "triton_paged_decode",
+    }:
+        return "triton_paged"
+    if value in {
+        "triton_paged_fused_append",
+        "triton_fused_append",
+        "paged_triton_fused_append",
+        "triton_paged_append",
+    }:
+        return "triton_paged_fused_append"
+    raise ValueError(
+        "Unknown full_attention_decode_impl="
+        f"{value!r}; expected reference, triton_paged, or triton_paged_fused_append"
+    )
+
+
 def _gdn_disable_fallbacks(config=None) -> bool:
     return _config_or_env_bool(
         config,
@@ -571,6 +615,21 @@ class InferenceBackend(Protocol):
     ) -> jnp.ndarray:
         ...
 
+    def write_kv_and_attention(
+        self,
+        layer_id: int,
+        query: jnp.ndarray,
+        k: jnp.ndarray,
+        v: jnp.ndarray,
+        cache: KVCacheStorage,
+        metadata: AttentionMetadata,
+        block_size: int,
+        scale: float,
+        num_key_value_groups: int,
+        is_prefill: bool,
+    ) -> tuple[KVCacheStorage, jnp.ndarray]:
+        ...
+
     def gated_delta_prefill(
         self,
         query: jnp.ndarray,
@@ -792,9 +851,14 @@ class PureJAXBackend:
         cache: KVCacheStorage,
         metadata: AttentionMetadata,
     ) -> KVCacheStorage:
+        kv_append_impl = _full_attention_kv_append_impl(self.config)
+        flashinfer_kv_append_requested = (
+            kv_append_impl == "flashinfer"
+            or os.environ.get(_FLASHINFER_KV_APPEND_ENV, "0") in _TRUE_ENV_VALUES
+        )
         if os.environ.get(_CUDA_FP32_KV_APPEND_ENV, "0") in _TRUE_ENV_VALUES:
             _require_local_cuda_probe_opt_in("CUDA FP32 KV append")
-            if os.environ.get(_FLASHINFER_KV_APPEND_ENV, "0") in _TRUE_ENV_VALUES:
+            if flashinfer_kv_append_requested:
                 raise ValueError(
                     "Set only one KV append backend: CUDA FP32 or FlashInfer"
                 )
@@ -820,7 +884,7 @@ class PureJAXBackend:
                 cache.v_cache.at[layer_id].set(v_cache_layer),
             )
 
-        if os.environ.get(_FLASHINFER_KV_APPEND_ENV, "0") in _TRUE_ENV_VALUES:
+        if flashinfer_kv_append_requested:
             if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
                 raise ValueError(
                     "FlashInfer KV append requires cache shape "
@@ -956,6 +1020,32 @@ class PureJAXBackend:
                 1,
                 query.shape[2] * query.shape[3],
             )
+        decode_impl = _full_attention_decode_impl(self.config)
+        if decode_impl == "triton_paged":
+            if query.shape[1] != 1:
+                raise ValueError(
+                    "full_attention.decode_impl=triton_paged supports only "
+                    "width-1 decode attention"
+                )
+            if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
+                raise ValueError(
+                    "full_attention.decode_impl=triton_paged requires cache "
+                    "shape [num_layers, num_pages, page_size, num_kv_heads, head_dim]"
+                )
+            from nanovllm_jax.kernels.full_attention_triton import (
+                paged_decode_attention_triton,
+            )
+
+            return paged_decode_attention_triton(
+                query=query,
+                k_cache_layer=cache.k_cache[layer_id],
+                v_cache_layer=cache.v_cache[layer_id],
+                block_table=metadata.block_tables,
+                seq_lens=metadata.seq_lens,
+                block_size=block_size,
+                scale=scale,
+                num_key_value_groups=num_key_value_groups,
+            )
         return paged_attention_decode(
             query=query,
             k_cache=cache.k_cache,
@@ -969,6 +1059,72 @@ class PureJAXBackend:
             max_kv_len=metadata.max_kv_len,
             positions=metadata.positions,
         )
+
+    def write_kv_and_attention(
+        self,
+        layer_id: int,
+        query: jnp.ndarray,
+        k: jnp.ndarray,
+        v: jnp.ndarray,
+        cache: KVCacheStorage,
+        metadata: AttentionMetadata,
+        block_size: int,
+        scale: float,
+        num_key_value_groups: int,
+        is_prefill: bool,
+    ) -> tuple[KVCacheStorage, jnp.ndarray]:
+        decode_impl = _full_attention_decode_impl(self.config)
+        if not is_prefill and decode_impl == "triton_paged_fused_append":
+            if metadata.positions is None:
+                raise ValueError("metadata.positions is required for fused decode attention")
+            if query.shape[1] != 1 or k.shape[1] != 1 or v.shape[1] != 1:
+                raise ValueError(
+                    "full_attention.decode_impl=triton_paged_fused_append "
+                    "supports only width-1 decode"
+                )
+            if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
+                raise ValueError(
+                    "full_attention.decode_impl=triton_paged_fused_append requires "
+                    "cache shape [num_layers, num_pages, page_size, num_kv_heads, head_dim]"
+                )
+            from nanovllm_jax.kernels.full_attention_triton import (
+                paged_decode_attention_with_kv_append_triton,
+            )
+
+            out, k_cache, v_cache = paged_decode_attention_with_kv_append_triton(
+                query=query,
+                new_k=k,
+                new_v=v,
+                k_cache=cache.k_cache,
+                v_cache=cache.v_cache,
+                block_table=metadata.block_tables,
+                seq_lens=metadata.seq_lens,
+                positions=metadata.positions,
+                layer_id=layer_id,
+                block_size=block_size,
+                scale=scale,
+                num_key_value_groups=num_key_value_groups,
+            )
+            return KVCacheStorage(k_cache, v_cache), out
+
+        cache_storage = self.write_kv(
+            layer_id=layer_id,
+            k=k,
+            v=v,
+            cache=cache,
+            metadata=metadata,
+        )
+        out = self.attention(
+            layer_id=layer_id,
+            query=query,
+            cache=cache_storage,
+            metadata=metadata,
+            block_size=block_size,
+            scale=scale,
+            num_key_value_groups=num_key_value_groups,
+            is_prefill=is_prefill,
+        )
+        return cache_storage, out
 
     def gated_delta_prefill(
         self,

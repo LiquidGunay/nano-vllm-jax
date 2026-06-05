@@ -104,6 +104,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefill-layout", choices=["packed", "dense"], default="packed")
     parser.add_argument("--batch-size-buckets", default="1,2,4,8")
     parser.add_argument("--max-blocks-per-seq", type=int, default=256)
+    parser.add_argument("--decode-block-table-buckets", default="")
+    parser.add_argument("--resident-decode-metadata", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--full-attention-kv-cache-dtype", default="default")
+    parser.add_argument("--full-attention-kv-append-impl", default="reference")
+    parser.add_argument("--full-attention-decode-impl", default="reference")
+    parser.add_argument("--full-attention-prefill-impl", default="reference")
     parser.add_argument("--jax-num-speculative-tokens", type=int, choices=[0, 1], default=0)
 
     parser.add_argument("--vllm-max-model-len", type=int, default=8192)
@@ -425,6 +431,12 @@ def _build_jax_command(args: argparse.Namespace, manifest_jsonl: Path, output_js
         "prefill_layout": args.prefill_layout,
         "batch_size_buckets": args.batch_size_buckets,
         "max_blocks_per_seq": args.max_blocks_per_seq,
+        "decode_block_table_buckets": args.decode_block_table_buckets,
+        "resident_decode_metadata": args.resident_decode_metadata,
+        "full_attention_kv_cache_dtype": args.full_attention_kv_cache_dtype,
+        "full_attention_kv_append_impl": args.full_attention_kv_append_impl,
+        "full_attention_decode_impl": args.full_attention_decode_impl,
+        "full_attention_prefill_impl": args.full_attention_prefill_impl,
         "num_speculative_tokens": args.jax_num_speculative_tokens,
         "dataset_name": args.dataset_name or "random",
         "output_json": str(output_json),

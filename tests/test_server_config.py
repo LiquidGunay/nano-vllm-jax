@@ -23,6 +23,7 @@ def test_runtime_and_kernel_sections_translate_to_env():
                     "device_token_carry": True,
                     "static_decode_metadata": True,
                     "static_decode_seq_lens_carry": True,
+                    "resident_decode_metadata": True,
                     "greedy_decode_burst_steps": 2,
                     "trace_token_prefetch": True,
                     "lm_head_decode_act_dtype": "bf16",
@@ -72,6 +73,7 @@ def test_runtime_and_kernel_sections_translate_to_env():
     assert env["NANO_VLLM_JAX_DEVICE_TOKEN_CARRY"] == "1"
     assert env["NANO_VLLM_JAX_STATIC_DECODE_METADATA"] == "1"
     assert env["NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY"] == "1"
+    assert env["NANO_VLLM_JAX_RESIDENT_DECODE_METADATA"] == "1"
     assert env["NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS"] == "2"
     assert env["NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH"] == "1"
     assert env["NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE"] == "bf16"
@@ -120,6 +122,7 @@ def test_runtime_fastpaths_project_to_engine_config(tmp_path, monkeypatch):
         "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
         "NANO_VLLM_JAX_STATIC_DECODE_METADATA",
         "NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY",
+        "NANO_VLLM_JAX_RESIDENT_DECODE_METADATA",
         "NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS",
         "NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD",
         "NANO_VLLM_JAX_COMPACT_PREFILL_MLP",
@@ -136,6 +139,7 @@ runtime:
     device_token_carry: true
     static_decode_metadata: true
     static_decode_seq_lens_carry: true
+    resident_decode_metadata: true
     greedy_decode_burst_steps: 3
     materialize_tied_lm_head: true
     compact_prefill_mlp: true
@@ -150,6 +154,7 @@ runtime:
     assert loaded.engine["device_token_carry"] is True
     assert loaded.engine["static_decode_metadata"] is True
     assert loaded.engine["static_decode_seq_lens_carry"] is True
+    assert loaded.engine["resident_decode_metadata"] is True
     assert loaded.engine["greedy_decode_burst_steps"] == 3
     assert loaded.engine["materialize_tied_lm_head"] is True
     assert loaded.engine["compact_prefill_mlp"] is True
@@ -191,7 +196,12 @@ def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy
                 },
             },
             "kernels": {
-                "full_attention": {"kv_cache_dtype": "bf16"},
+                "full_attention": {
+                    "kv_cache_dtype": "bf16",
+                    "kv_append_impl": "reference",
+                    "decode_impl": "triton_paged",
+                    "prefill_impl": "reference",
+                },
                 "gdn": {
                     "disable_fallbacks": True,
                     "prefill_post_conv_impl": "triton_fla_padded",
@@ -209,6 +219,9 @@ def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy
     assert overrides["lm_head_decode_act_dtype"] == "bf16"
     assert overrides["decode_padded_gemm"] is True
     assert overrides["full_attention_kv_cache_dtype"] == "bf16"
+    assert overrides["full_attention_kv_append_impl"] == "reference"
+    assert overrides["full_attention_decode_impl"] == "triton_paged"
+    assert overrides["full_attention_prefill_impl"] == "reference"
     assert overrides["gdn_disable_fallbacks"] is True
     assert overrides["gdn_prefill_post_conv_impl"] == "triton_fla_padded"
     assert overrides["gdn_packed_decode_impl"] == "triton_fla_conv_raw_gates"
@@ -230,6 +243,9 @@ def test_kernel_policy_projects_to_engine_config(tmp_path, monkeypatch):
 kernels:
   full_attention:
     kv_cache_dtype: bf16
+    kv_append_impl: reference
+    decode_impl: triton_paged
+    prefill_impl: reference
   gdn:
     disable_fallbacks: true
     prefill_post_conv_impl: triton_fla_padded
@@ -244,6 +260,9 @@ kernels:
     loaded = load_server_config(config)
 
     assert loaded.engine["full_attention_kv_cache_dtype"] == "bf16"
+    assert loaded.engine["full_attention_kv_append_impl"] == "reference"
+    assert loaded.engine["full_attention_decode_impl"] == "triton_paged"
+    assert loaded.engine["full_attention_prefill_impl"] == "reference"
     assert loaded.engine["gdn_disable_fallbacks"] is True
     assert loaded.engine["gdn_prefill_post_conv_impl"] == "triton_fla_padded"
     assert loaded.engine["gdn_prefill_qkv_dtype"] == "bf16"
