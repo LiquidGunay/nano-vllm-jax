@@ -732,6 +732,7 @@ def paged_attention_prefill_packed(
     num_key_value_groups: int,
     layer_idx: int = 0,
     max_query_len: int | None = None,
+    use_triton: bool | None = None,
 ) -> jnp.ndarray:
     """Reference paged attention for packed/ragged prefill.
 
@@ -755,7 +756,11 @@ def paged_attention_prefill_packed(
     num_kv_heads = k_cache_layer.shape[-2]
     head_dim = k_cache_layer.shape[-1]
 
-    if _default_backend_is_gpu() and not cache_is_flat:
+    if use_triton is None:
+        use_triton = _default_backend_is_gpu() and not cache_is_flat
+    if use_triton:
+        if cache_is_flat:
+            raise ValueError("packed prefill Triton attention requires a paged cache layer")
         from nanovllm_jax.kernels.full_attention_triton import (
             packed_paged_prefill_attention_triton,
         )

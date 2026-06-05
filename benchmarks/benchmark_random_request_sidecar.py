@@ -758,6 +758,33 @@ def _build_jax_command(
     return command
 
 
+def _effective_jax_kernel_policy(
+    args: argparse.Namespace,
+    config_engine_overrides: dict[str, Any],
+) -> dict[str, Any]:
+    keys = (
+        "full_attention_kv_cache_dtype",
+        "full_attention_kv_append_impl",
+        "full_attention_decode_impl",
+        "full_attention_prefill_impl",
+        "gdn_disable_fallbacks",
+        "gdn_prefill_post_conv_impl",
+        "gdn_prefill_qkv_dtype",
+        "gdn_prefill_post_conv_output_dtype",
+        "gdn_packed_decode_impl",
+        "gdn_packed_decode_qkv_dtype",
+        "gdn_packed_decode_pre_normalize_qk",
+        "gdn_packed_decode_max_batch",
+    )
+    policy: dict[str, Any] = {}
+    for key in keys:
+        if key in config_engine_overrides:
+            policy[key] = config_engine_overrides[key]
+        elif hasattr(args, key):
+            policy[key] = getattr(args, key)
+    return policy
+
+
 def _build_vllm_command(args: argparse.Namespace, manifest_jsonl: Path, output_json: Path) -> list[str]:
     command = [args.vllm_python, str(SCRIPT_DIR / "benchmark_vllm_qwen35.py")]
     command_args = {
@@ -825,6 +852,10 @@ def _run() -> None:
         config_engine_overrides=jax_config["engine_overrides"],
     )
     vllm_command = _build_vllm_command(args, manifest_jsonl=manifest_path, output_json=vllm_output_json)
+    effective_jax_kernel_policy = _effective_jax_kernel_policy(
+        args,
+        jax_config["engine_overrides"],
+    )
 
     jax_run, jax_artifact = _run_benchmark(
         jax_command,
@@ -940,6 +971,7 @@ def _run() -> None:
                     "engine_overrides": jax_config["engine_overrides"],
                     "env": jax_config["env"],
                 },
+                "effective_kernel_policy": effective_jax_kernel_policy,
             },
             "vllm_args": {
                 "dtype": _effective_vllm_dtype(args),

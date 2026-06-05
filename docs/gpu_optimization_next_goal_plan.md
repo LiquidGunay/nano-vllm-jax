@@ -228,6 +228,46 @@ safe RAM (`53%` peak system RAM). With `--worker-cpu-cores 2`, JAX measured
 performance baseline: the two-core cap likely depresses measured serving
 throughput because scheduler/PJRT work remains CPU-visible.
 
+Status note, 2026-06-05 r6: the random decode speed work is now constrained to
+five non-negotiable items until the `0.9x` vLLM target is reached:
+
+1. Make full-attention kernel policy explicit and prevent silent fallback in
+   benchmark/perf configs. Packed prefill should select a production paged
+   attention kernel instead of relying on hidden GPU auto-routing, and benchmark
+   artifacts must report the effective kernel policy.
+2. Validate and repair paged decode attention on the integrated random workload.
+   Standalone exactness is not enough; promotion requires random-graph
+   throughput improvement, correctness, and zero measured-phase JIT growth.
+3. Reduce per-step host/PJRT metadata overhead with a broader resident decode
+   boundary. Do not repeat rejected seq-lens-carry or shared-gather variants
+   unless the new design removes an entire per-step host/device operation.
+4. Advance coarse GDN decode/prefill kernels using vLLM/FLA-like boundaries that
+   own conv, gates, q/k norm, recurrent-state update, and layout together.
+5. Improve batched decode GEMM/fusion in a Qwen3.5-dense-family-general way.
+   Avoid GPU/model-specific tile hand tuning as the primary path.
+
+First implementation slice: `full_attention.prefill_impl` now controls reference
+versus packed Triton prefill routing, `server_config.yaml` and the FA/GDN
+benchmark config select `prefill_impl=triton_packed`, and the random sidecar
+records the effective kernel policy after config overrides.
+
+Medium random attention A/B, 2026-06-05:
+
+| variant | FA prefill | FA decode | output tok/s | JIT growth | decision |
+| --- | --- | --- | ---: | ---: | --- |
+| reference control | reference | reference | `358.09` | `0` | baseline |
+| prefill-only Triton | triton_packed | reference | `360.10` | `0` | keep as small win |
+| decode-only Triton | reference | triton_paged | `351.03` | `0` | reject standalone |
+| prefill+decode Triton | triton_packed | triton_paged | `347.40` | `0` | reject standalone |
+
+Interpretation: packed prefill attention is worth keeping because it removes a
+hidden fallback and slightly improves the integrated random medium rung. The
+current width-1 paged decode Triton kernel is not an integrated serving win even
+though it is algorithmically closer to vLLM than materialized JAX attention. Do
+not promote it as the default. The next decode-attention attempt must broaden
+the boundary so cache append, metadata ownership, and attention read/setup are
+not paid as separate per-layer/per-step work.
+
 Micro-burst selection model:
 
 - A width-`K` greedy burst replaces `K` host/PJRT scheduler executions with one

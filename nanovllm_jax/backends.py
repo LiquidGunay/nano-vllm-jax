@@ -162,6 +162,28 @@ def _full_attention_decode_impl(config=None) -> str:
     )
 
 
+def _full_attention_prefill_impl(config=None) -> str:
+    value = str(
+        getattr(config, "full_attention_prefill_impl", "reference")
+        if config is not None
+        else "reference"
+    ).strip().lower()
+    if value in _OFF_ENV_VALUES or value in {"reference", "jax", "pure_jax"}:
+        return "reference"
+    if value in {
+        "triton",
+        "triton_packed",
+        "packed_triton",
+        "triton_paged",
+        "packed_paged_triton",
+    }:
+        return "triton_packed"
+    raise ValueError(
+        "Unknown full_attention_prefill_impl="
+        f"{value!r}; expected reference or triton_packed"
+    )
+
+
 def _gdn_disable_fallbacks(config=None) -> bool:
     return _config_or_env_bool(
         config,
@@ -938,6 +960,7 @@ class PureJAXBackend:
         is_prefill: bool,
     ) -> jnp.ndarray:
         if is_prefill:
+            prefill_impl = _full_attention_prefill_impl(self.config)
             if metadata.token_row_ids is not None:
                 if metadata.positions is None:
                     raise ValueError("metadata.positions is required for packed prefill attention")
@@ -955,6 +978,12 @@ class PureJAXBackend:
                     num_key_value_groups=num_key_value_groups,
                     layer_idx=layer_id,
                     max_query_len=metadata.max_query_len,
+                    use_triton=prefill_impl == "triton_packed",
+                )
+            if prefill_impl != "reference":
+                raise ValueError(
+                    "full_attention.prefill_impl=triton_packed requires packed prefill "
+                    "metadata with token_row_ids"
                 )
             if metadata.positions is None:
                 return paged_attention(

@@ -200,7 +200,7 @@ def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy
                     "kv_cache_dtype": "bf16",
                     "kv_append_impl": "reference",
                     "decode_impl": "triton_paged",
-                    "prefill_impl": "reference",
+                    "prefill_impl": "triton_packed",
                 },
                 "gdn": {
                     "disable_fallbacks": True,
@@ -221,7 +221,7 @@ def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy
     assert overrides["full_attention_kv_cache_dtype"] == "bf16"
     assert overrides["full_attention_kv_append_impl"] == "reference"
     assert overrides["full_attention_decode_impl"] == "triton_paged"
-    assert overrides["full_attention_prefill_impl"] == "reference"
+    assert overrides["full_attention_prefill_impl"] == "triton_packed"
     assert overrides["gdn_disable_fallbacks"] is True
     assert overrides["gdn_prefill_post_conv_impl"] == "triton_fla_padded"
     assert overrides["gdn_packed_decode_impl"] == "triton_fla_conv_raw_gates"
@@ -245,7 +245,7 @@ kernels:
     kv_cache_dtype: bf16
     kv_append_impl: reference
     decode_impl: triton_paged
-    prefill_impl: reference
+    prefill_impl: triton_packed
   gdn:
     disable_fallbacks: true
     prefill_post_conv_impl: triton_fla_padded
@@ -262,7 +262,7 @@ kernels:
     assert loaded.engine["full_attention_kv_cache_dtype"] == "bf16"
     assert loaded.engine["full_attention_kv_append_impl"] == "reference"
     assert loaded.engine["full_attention_decode_impl"] == "triton_paged"
-    assert loaded.engine["full_attention_prefill_impl"] == "reference"
+    assert loaded.engine["full_attention_prefill_impl"] == "triton_packed"
     assert loaded.engine["gdn_disable_fallbacks"] is True
     assert loaded.engine["gdn_prefill_post_conv_impl"] == "triton_fla_padded"
     assert loaded.engine["gdn_prefill_qkv_dtype"] == "bf16"

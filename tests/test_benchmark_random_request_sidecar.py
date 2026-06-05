@@ -195,6 +195,7 @@ kernels:
   full_attention:
     kv_cache_dtype: bf16
     decode_impl: triton_paged
+    prefill_impl: triton_packed
   gdn:
     disable_fallbacks: true
     packed_decode:
@@ -226,9 +227,14 @@ kernels:
     assert command[command.index("--compact-prefill-token-count-mode") + 1] == "bucket"
     assert command[command.index("--full-attention-kv-cache-dtype") + 1] == "bf16"
     assert command[command.index("--full-attention-decode-impl") + 1] == "triton_paged"
+    assert command[command.index("--full-attention-prefill-impl") + 1] == "triton_packed"
     assert "--gdn-disable-fallbacks" in command
     assert command[command.index("--gdn-packed-decode-impl") + 1] == "triton_fla_conv_raw_gates"
     assert command[command.index("--gdn-packed-decode-qkv-dtype") + 1] == "bf16"
+    policy = sidecar._effective_jax_kernel_policy(args, loaded["engine_overrides"])
+    assert policy["full_attention_decode_impl"] == "triton_paged"
+    assert policy["full_attention_prefill_impl"] == "triton_packed"
+    assert policy["gdn_disable_fallbacks"] is True
 
 
 def test_run_command_kills_process_when_ram_guard_trips(monkeypatch):

@@ -45,3 +45,16 @@
   stage `results/*` or full profile/artifact dumps.
 - Push checkpoint commits to the remote periodically while working on long GPU
   optimization passes so the current best state is not only local.
+
+## Current Random Decode Speed Scope
+
+- Stay on the random decode graph as the main hill-climb target. Do not switch to
+  shape-specific microbench tuning unless it is needed to debug a random-graph
+  regression.
+- Keep these work items in order: explicit attention kernel policy, integrated
+  paged decode attention validation, broader resident decode metadata boundary,
+  coarse GDN decode/prefill kernels, and model-family-general batched
+  GEMM/fusion improvements.
+- Treat standalone attention, append, GDN, and GEMM probes as diagnostic only
+  until they improve integrated random decode throughput with correctness and no
+  measured-phase JIT growth.

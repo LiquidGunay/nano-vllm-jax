@@ -389,6 +389,96 @@ def test_configured_triton_decode_attention_matches_reference_non_contiguous_blo
     )
 
 
+def test_configured_packed_prefill_attention_impl_controls_triton_route(monkeypatch):
+    calls = []
+
+    def fake_packed_prefill(*, query, use_triton=None, **kwargs):
+        calls.append(use_triton)
+        return jnp.zeros(
+            (query.shape[0], query.shape[1], query.shape[2] * query.shape[3]),
+            dtype=jnp.float32,
+        )
+
+    monkeypatch.setattr(
+        "nanovllm_jax.backends.paged_attention_prefill_packed",
+        fake_packed_prefill,
+    )
+    block_size = 2
+    query = jnp.ones((1, 4, 2, 8), dtype=jnp.float32)
+    block_tables = jnp.array([[0, 1], [2, 3]], dtype=jnp.int32)
+    seq_lens = jnp.array([2, 2], dtype=jnp.int32)
+    metadata_kwargs = {
+        "positions": jnp.array([[0, 1, 0, 1]], dtype=jnp.int32),
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "block_size": block_size,
+        "is_prefill": True,
+        "query_start_loc": jnp.array([0, 2, 4], dtype=jnp.int32),
+        "num_prefill_tokens": 4,
+        "num_decode_tokens": 0,
+        "token_row_ids": jnp.array([[0, 0, 1, 1]], dtype=jnp.int32),
+        "max_query_len": 2,
+    }
+    spec = KVCacheSpec(
+        num_layers=1,
+        num_blocks=4,
+        block_size=block_size,
+        num_kv_heads=1,
+        head_dim=8,
+        dtype=jnp.float32,
+    )
+
+    for impl, expected_use_triton in (("reference", False), ("triton_packed", True)):
+        backend = PureJAXBackend(config=Qwen3_5Config(full_attention_prefill_impl=impl))
+        cache = backend.allocate_kv_cache(spec, max_seqs=2, max_blocks_per_seq=2)
+        metadata = backend.build_attention_metadata(**metadata_kwargs)
+        backend.attention(
+            layer_id=0,
+            query=query,
+            cache=cache,
+            metadata=metadata,
+            block_size=block_size,
+            scale=1.0,
+            num_key_value_groups=2,
+            is_prefill=True,
+        )
+        assert calls[-1] is expected_use_triton
+
+
+def test_triton_packed_prefill_impl_rejects_dense_prefill():
+    config = Qwen3_5Config(full_attention_prefill_impl="triton_packed")
+    backend = PureJAXBackend(config=config)
+    block_size = 2
+    spec = KVCacheSpec(
+        num_layers=1,
+        num_blocks=4,
+        block_size=block_size,
+        num_kv_heads=1,
+        head_dim=8,
+        dtype=jnp.float32,
+    )
+    cache = backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=2)
+    metadata = backend.build_attention_metadata(
+        positions=jnp.array([[0, 1]], dtype=jnp.int32),
+        block_tables=jnp.array([[0, 1]], dtype=jnp.int32),
+        seq_lens=jnp.array([2], dtype=jnp.int32),
+        block_size=block_size,
+        is_prefill=True,
+    )
+
+    with pytest.raises(ValueError, match="requires packed prefill"):
+        backend.attention(
+            layer_id=0,
+            query=jnp.ones((1, 2, 2, 8), dtype=jnp.float32),
+            cache=cache,
+            metadata=metadata,
+            block_size=block_size,
+            scale=1.0,
+            num_key_value_groups=2,
+            is_prefill=True,
+        )
+
+
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
 def test_configured_fused_triton_decode_attention_appends_kv_and_matches_reference():
