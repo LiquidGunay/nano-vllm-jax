@@ -32,6 +32,7 @@ def test_parse_args_defaults_set_random_ranges():
     assert args.full_attention_decode_impl == "reference"
     assert args.full_attention_prefill_impl == "reference"
     assert args.vllm_dtype == ""
+    assert args.vllm_reference_json == ""
     assert sidecar._effective_vllm_dtype(args) == "bfloat16"
     assert args.vllm_num_speculative_tokens == 0
     assert args.max_system_ram_percent == 70.0
@@ -137,6 +138,78 @@ def test_vllm_dtype_override_is_used():
     )
 
     assert command[command.index("--dtype") + 1] == "float16"
+
+
+def test_load_vllm_reference_artifact_accepts_raw_artifact(tmp_path):
+    artifact_path = tmp_path / "vllm.json"
+    artifact_path.write_text(
+        """
+{
+  "performance": {"output_token_throughput": 123.0},
+  "rows": [{"name": "0", "generated_token_ids": [1, 2]}]
+}
+""".strip()
+    )
+
+    artifact, info = sidecar._load_vllm_reference_artifact(str(artifact_path))
+
+    assert artifact["performance"]["output_token_throughput"] == 123.0
+    assert artifact["rows"][0]["generated_token_ids"] == [1, 2]
+    assert info["kind"] == "vllm_artifact"
+    assert info["artifact"] == str(artifact_path)
+
+
+def test_load_vllm_reference_artifact_accepts_sidecar_nested_artifact(tmp_path):
+    artifact_path = tmp_path / "nested_vllm.json"
+    artifact_path.write_text(
+        """
+{
+  "performance": {"output_token_throughput": 321.0},
+  "rows": [{"name": "0", "generated_token_ids": [3]}]
+}
+""".strip()
+    )
+    sidecar_path = tmp_path / "sidecar.json"
+    sidecar_path.write_text(
+        f"""
+{{
+  "runs": {{"vllm": {{"artifact": "{artifact_path.name}"}}}},
+  "performance": {{"vllm": {{"output_token_throughput": 111.0}}}}
+}}
+""".strip()
+    )
+
+    artifact, info = sidecar._load_vllm_reference_artifact(str(sidecar_path))
+
+    assert artifact["performance"]["output_token_throughput"] == 321.0
+    assert artifact["rows"][0]["generated_token_ids"] == [3]
+    assert info["kind"] == "sidecar_nested_vllm_artifact"
+    assert info["source"] == str(sidecar_path)
+
+
+def test_performance_ratios_use_stored_vllm_performance():
+    ratios = sidecar._performance_ratios(
+        {
+            "performance": {
+                "output_token_throughput": 40.0,
+                "total_token_throughput": 100.0,
+                "request_throughput": 2.0,
+            }
+        },
+        {
+            "performance": {
+                "output_token_throughput": 80.0,
+                "total_token_throughput": 125.0,
+                "request_throughput": 4.0,
+            }
+        },
+    )
+
+    assert ratios == {
+        "output_token_throughput": 0.5,
+        "total_token_throughput": 0.8,
+        "request_throughput": 0.5,
+    }
 
 
 def test_jax_command_uses_generic_warmup_controls():

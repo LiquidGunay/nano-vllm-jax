@@ -81,6 +81,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-json", default="", help="Optional generated-token reference for both JAX and vLLM.")
     parser.add_argument("--output-json-jax", default="")
     parser.add_argument("--output-json-vllm", default="")
+    parser.add_argument(
+        "--vllm-reference-json",
+        default="",
+        help=(
+            "Prior vLLM benchmark artifact, or prior random sidecar JSON with a "
+            "nested vLLM artifact, to use as the denominator instead of running vLLM."
+        ),
+    )
     parser.add_argument("--manifest-jsonl", default="")
     parser.add_argument("--prompt-manifest-output-jsonl", default="")
     parser.add_argument("--jax-python", default=DEFAULT_JAX_PYTHON)
@@ -232,6 +240,74 @@ def _effective_vllm_dtype(args: argparse.Namespace) -> str:
     if args.dtype == "float32":
         return "bfloat16"
     return str(args.dtype)
+
+
+def _load_vllm_reference_artifact(path: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load a stored vLLM denominator from a raw artifact or sidecar JSON."""
+
+    reference_path = Path(path)
+    data = json.loads(reference_path.read_text(encoding="utf-8"))
+    if "performance" in data and "runs" not in data:
+        return data, {
+            "source": str(reference_path),
+            "kind": "vllm_artifact",
+            "artifact": str(reference_path),
+        }
+
+    nested_artifact = (
+        data.get("runs", {})
+        .get("vllm", {})
+        .get("artifact", "")
+    )
+    if nested_artifact:
+        nested_path = Path(nested_artifact)
+        if not nested_path.is_absolute():
+            nested_path = reference_path.parent / nested_path
+        if nested_path.exists():
+            artifact = json.loads(nested_path.read_text(encoding="utf-8"))
+            return artifact, {
+                "source": str(reference_path),
+                "kind": "sidecar_nested_vllm_artifact",
+                "artifact": str(nested_path),
+            }
+
+    vllm_performance = data.get("performance", {}).get("vllm", {})
+    if vllm_performance:
+        return {
+            "performance": vllm_performance,
+            "rows": [],
+            "correctness": data.get("correctness", {}).get("vllm_vs_reference", {}),
+        }, {
+            "source": str(reference_path),
+            "kind": "sidecar_summary",
+            "artifact": str(reference_path),
+        }
+
+    raise ValueError(
+        "--vllm-reference-json must point to a raw vLLM artifact or a random "
+        f"sidecar JSON with vLLM performance, got {path!r}"
+    )
+
+
+def _performance_ratios(
+    jax_artifact: dict[str, Any],
+    vllm_artifact: dict[str, Any],
+) -> dict[str, float | None]:
+    jax_perf = jax_artifact.get("performance", {}) if jax_artifact else {}
+    vllm_perf = vllm_artifact.get("performance", {}) if vllm_artifact else {}
+
+    def ratio(key: str) -> float | None:
+        numerator = jax_perf.get(key)
+        denominator = vllm_perf.get(key)
+        if numerator is None or denominator in (None, 0):
+            return None
+        return float(numerator) / float(denominator)
+
+    return {
+        "output_token_throughput": ratio("output_token_throughput"),
+        "total_token_throughput": ratio("total_token_throughput"),
+        "request_throughput": ratio("request_throughput"),
+    }
 
 
 def _json_safe(value: Any) -> Any:
@@ -856,6 +932,7 @@ def _run() -> None:
         args,
         jax_config["engine_overrides"],
     )
+    vllm_reference_info: dict[str, Any] | None = None
 
     jax_run, jax_artifact = _run_benchmark(
         jax_command,
@@ -870,7 +947,27 @@ def _run() -> None:
         resource_poll_seconds=args.resource_poll_seconds,
     )
 
-    if args.skip_vllm:
+    if args.vllm_reference_json:
+        vllm_artifact, vllm_reference_info = _load_vllm_reference_artifact(
+            args.vllm_reference_json
+        )
+        vllm_run = {
+            "status": "stored_reference",
+            "returncode": 0,
+            "command": [],
+            "stored_reference_command": vllm_command,
+            "elapsed_seconds": 0.0,
+            "output_tail": "",
+            "reference": vllm_reference_info,
+            "resource_limits": {
+                "max_system_ram_percent": args.max_system_ram_percent,
+                "worker_cpu_cores": args.worker_cpu_cores,
+                "worker_cpu_core_offset": args.worker_cpu_core_offset,
+                "worker_nice": args.worker_nice,
+                "resource_poll_seconds": args.resource_poll_seconds,
+            },
+        }
+    elif args.skip_vllm:
         vllm_run = {
             "status": "skipped",
             "returncode": None,
@@ -983,6 +1080,8 @@ def _run() -> None:
                 "tensor_parallel_size": args.vllm_tensor_parallel_size,
                 "top_k": args.vllm_top_k,
                 "num_speculative_tokens": args.vllm_num_speculative_tokens,
+                "reference_json": args.vllm_reference_json,
+                "reference_info": vllm_reference_info,
             },
             "reference_json": args.reference_json,
         },
@@ -993,7 +1092,11 @@ def _run() -> None:
                 "run": jax_run,
             },
             "vllm": {
-                "artifact": str(vllm_output_json),
+                "artifact": (
+                    str(vllm_reference_info.get("artifact"))
+                    if vllm_reference_info
+                    else str(vllm_output_json)
+                ),
                 "command": vllm_command,
                 "run": vllm_run,
             },
@@ -1001,6 +1104,7 @@ def _run() -> None:
         "performance": {
             "jax": jax_artifact.get("performance", {}) if jax_artifact else {},
             "vllm": vllm_artifact.get("performance", {}) if vllm_artifact else {},
+            "jax_over_vllm": _performance_ratios(jax_artifact, vllm_artifact),
             "request_throughput": {
                 "jax": jax_artifact.get("performance", {}).get("request_throughput") if jax_artifact else None,
                 "vllm": vllm_artifact.get("performance", {}).get("request_throughput") if vllm_artifact else None,
@@ -1032,7 +1136,11 @@ def _run() -> None:
         return
     if jax_run.get("status") != "ok":
         raise RuntimeError(f"JAX benchmark failed: {jax_run}")
-    if not args.skip_vllm and vllm_run.get("status") != "ok":
+    if (
+        not args.skip_vllm
+        and not args.vllm_reference_json
+        and vllm_run.get("status") != "ok"
+    ):
         raise RuntimeError(f"vLLM benchmark failed: {vllm_run}")
 
 

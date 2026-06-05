@@ -9705,3 +9705,36 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - use stored same-envelope vLLM denominators for JAX-only A/B work. Rerun
     live vLLM only after benchmark-contract changes, runtime/library/hardware
     changes, or before promoting a new best result.
+
+### Entry 255 - Stored vLLM Denominator Support
+
+- date: 2026-06-05
+- purpose:
+  - make the random sidecar policy executable, not only documented;
+  - allow normal JAX-only medium/large iterations to report a JAX/vLLM ratio
+    without launching vLLM every time.
+- implementation:
+  - added `--vllm-reference-json` to
+    `benchmarks/benchmark_random_request_sidecar.py`;
+  - the reference path may point to a raw vLLM benchmark JSON or a prior random
+    sidecar JSON. For sidecar JSONs, the tool loads the nested
+    `runs.vllm.artifact` when available and falls back to the sidecar's vLLM
+    performance summary otherwise;
+  - sidecar output records vLLM run status `stored_reference`, the reference
+    source/kind/artifact, and `performance.jax_over_vllm` ratios.
+- artifacts:
+  - dry-run schema check:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/dry_run_stored_vllm_reference.json`;
+  - JAX-only medium check using the stored live-vLLM denominator:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_promoted_medium_stored_vllm_r1.json`.
+- result:
+  - stored-reference run used
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_promoted_medium_with_vllm_r1_vllm.json`;
+  - JAX `359.34 output tok/s`;
+  - stored vLLM `471.06 output tok/s`;
+  - JAX/vLLM `0.763x`;
+  - zero measured-phase JIT growth (`15 -> 15`);
+  - vLLM elapsed time recorded as `0.0` because no vLLM subprocess was launched.
+- validation:
+  - `python -m py_compile benchmarks/benchmark_random_request_sidecar.py tests/test_benchmark_random_request_sidecar.py`;
+  - `pytest -q tests/test_benchmark_random_request_sidecar.py`.

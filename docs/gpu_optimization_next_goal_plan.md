@@ -320,6 +320,11 @@ Random benchmark policy, 2026-06-05:
   `290` output tokens, vLLM `471.06 output tok/s`, JAX
   `355.77 output tok/s`, JAX/vLLM `0.755x`, zero measured-phase JIT growth
   (`15 -> 15`).
+- the random sidecar now supports `--vllm-reference-json`, which accepts either
+  a raw vLLM artifact or a prior random sidecar JSON. A JAX-only medium check
+  using the stored medium denominator completed at `359.34 output tok/s`,
+  JAX/vLLM `0.763x`, zero measured-phase JIT growth, and `stored_reference`
+  vLLM status.
 - current stored large denominator remains
   `random_config_table_prefill_token_carry_large_with_vllm_r1`: `8` requests,
   `6240` input tokens, `1351` output tokens, vLLM `884.03 output tok/s`, JAX
