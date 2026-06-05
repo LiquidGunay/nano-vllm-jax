@@ -10603,3 +10603,37 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - large random runs used stored vLLM denominator, generic warmup,
     `--jax-fail-on-jit-cache-growth`, the 70% RAM guard, and four CPU cores at
     nice level `10`.
+
+### Entry 273 - Rejected Dense Resident Seq-Lens Sync Narrowing
+
+- date: 2026-06-05
+- purpose:
+  - test whether the accepted dense resident decode route can skip pre-decode
+    resident seq-lens scatter, since
+    `forward_step_token_ids_resident_dense_slot_carry_jit` already advances the
+    resident seq-len table and the runner advances the host mirror after each
+    decode step.
+- change tested:
+  - changed the runtime pre-decode metadata sync to call
+    `_sync_resident_decode_metadata(..., sync_seq_lens=False)` only for the
+    dense resident slot-token metadata route;
+  - warmup and post-prefill seeding still used full block-table plus seq-len
+    synchronization.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_dense_block_only_seqsync_r1.json`.
+- result:
+  - large random reached `742.47 output tok/s`, `0.840x` of the stored vLLM
+    denominator, below Entry 272's accepted `757.24 output tok/s`;
+  - token-event throughput was `796.20 tok/s`, but post-last-token drain grew to
+    `143.77 ms`, so wall-clock output throughput regressed;
+  - measured-phase JIT growth stayed zero and generated-token count stayed
+    `1582`.
+- decision:
+  - reject and revert. Even if this can slightly improve measured token-event
+    time, the benchmark target is wall-clock output throughput, and the final
+    drain regression is not acceptable.
+- related neutral diagnostic:
+  - enabling `NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH=1` on the accepted Entry 272
+    route reached `757.56 output tok/s`, `0.857x` stored vLLM, with
+    `98.30 ms` drain and zero JIT growth. This is too small/noisy to promote as
+    a new default.

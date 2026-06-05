@@ -110,6 +110,7 @@ but lost integrated correctness or performance.
 | [272](optimization_logbook.md#entry-272---accepted-dense-resident-decode-and-small-array-deviceput-cleanup) | Scalar resident block-entry scatter | Yes | Profile worsened: PJRT executes `619 -> 708`, D2D rose to about `486 ms` | Reject/revert | Scalar updates added small device work; full-row page-crossing sync is better for now. |
 | [272](optimization_logbook.md#entry-272---accepted-dense-resident-decode-and-small-array-deviceput-cleanup) | In-JIT resident metadata deltas | Yes | Large random `746.78 tok/s`, below direct-device-put best `757.24` | Reject/revert | Folding metadata deltas into the decode JIT expanded the boundary without reducing integrated wall time. |
 | [272](optimization_logbook.md#entry-272---accepted-dense-resident-decode-and-small-array-deviceput-cleanup) | Per-shape grouped final token materialization | Yes | Large random `546.79 tok/s`; final drain grew to about `0.90 s` | Reject/revert | Grouped device_get changed final synchronization badly despite targeting output drain. |
+| [273](optimization_logbook.md#entry-273---rejected-dense-resident-seq-lens-sync-narrowing) | Dense resident block-only pre-decode metadata sync | Yes | Large random `742.47 tok/s`, below Entry 272 `757.24`; token-event `796.20` but drain `143.77 ms` | Reject/revert | Narrowing seq-lens sync slightly improved event timing but worsened the wall-clock metric. |
 
 ## MTP Status
 
