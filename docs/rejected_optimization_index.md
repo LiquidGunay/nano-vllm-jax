@@ -96,6 +96,7 @@ but lost integrated correctness or performance.
 | [260](optimization_logbook.md#entry-260---accepted-broadened-resident-metadata-and-packed-projection-gdn-decode) | Physical-row token refs for full greedy vector | Yes | Large random `493.47 tok/s`, below scatter-free resident best `495.10 tok/s` | Reject/revert | Avoiding the output slice this way did not improve integrated throughput; only revisit with a broader output-materialization boundary. |
 | [261](optimization_logbook.md#entry-261---rejected-resident-replay-and-narrow-gdn-out-projection-fusion) | Resident decode replay | Yes | Large random `494.35 tok/s`, below Entry 260 `495.10`; scheduler/build calls fell `300 -> 230` but PJRT/GPU buckets rose | Reject/revert | Scheduler replay alone is not the remaining large-random bottleneck. |
 | [261](optimization_logbook.md#entry-261---rejected-resident-replay-and-narrow-gdn-out-projection-fusion) | Narrow GDN out-projection fusion | Yes | Large random `441.92 tok/s`, `0.500x` stored vLLM | Reject/revert | Replacing only the GDN tail in many small calls loses to the existing XLA/CUTLASS plan. |
+| [263](optimization_logbook.md#entry-263---rejected-lower-padded-gemm-row-count-with-exact-buckets) | Lower padded-GEMM rows to 5 | Yes | Large random `240.16 tok/s` vs Entry 262 `503.66`; zero JIT growth | Reject | Fixed `decode_padded_gemm_rows=8` selects a much faster compiled GEMM path; dynamic row-count source policy is not the next route. |
 
 ## MTP Status
 

@@ -10115,3 +10115,33 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
 - validation:
   - large random sidecar run above used stored vLLM denominator, generic warmup,
     `--jax-fail-on-jit-cache-growth`, and the 70% RAM guard.
+
+### Entry 263 - Rejected Lower Padded-GEMM Row Count With Exact Buckets
+
+- date: 2026-06-05
+- purpose:
+  - test whether Entry 262's exact B=5/6/7 scheduler buckets were being
+    partially cancelled by `decode_padded_gemm_rows=8`;
+  - check whether lowering the padded-GEMM row count lets exact smaller decode
+    batches reduce model GEMM work.
+- implementation:
+  - direct JAX large-random run on the Entry 262 manifest;
+  - kept exact decode batch buckets `1,2,3,4,5,6,7,8`;
+  - changed only `--decode-padded-gemm-rows` from `8` to `5`.
+- artifact:
+  - `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260605/random_large_exact_buckets_padded_rows5_r1_jax.json`.
+- result:
+  - large random regressed to `240.16 output tok/s` versus Entry 262
+    `503.66 output tok/s`;
+  - measured-phase JIT cache growth stayed zero (`40 -> 40`);
+  - ITL p95 regressed to `72.67 ms` and TTFT p50 to `574.70 ms`.
+- decision:
+  - reject lowering fixed padded-GEMM rows as a primary route;
+  - keep `decode_padded_gemm_rows=8`. It is not just wasted padding: on this
+    XLA/CUDA graph it selects a much faster compiled GEMM path;
+  - the next large model-side target should be a genuinely better small-batch
+    decode backend or epilogue/fusion path, not dynamic row-count source
+    policy.
+- validation:
+  - direct JAX run used the same prompt manifest as Entry 262, generic warmup,
+    exact decode buckets, and `--fail-on-jit-cache-growth`.

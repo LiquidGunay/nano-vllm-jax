@@ -2983,6 +2983,12 @@ Current validation:
   power-of-two buckets were doing padded B=8 model work. Keep the RAM guard and
   generic warmup requirement because this intentionally trades more startup
   compilation for less measured decode padding.
+- Entry 263 tested the obvious follow-up of lowering
+  `decode_padded_gemm_rows` from `8` to `5` with exact buckets. It regressed
+  large random to `240.16 output tok/s` despite zero JIT growth. Keep
+  `decode_padded_gemm_rows=8`; it is selecting a faster compiled GEMM path, not
+  merely wasting rows. Do not pursue dynamic padded-GEMM row source policy as
+  the next large-leap route.
 
 Model-specific assumptions to track:
 
