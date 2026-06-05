@@ -67,6 +67,20 @@ results/gpu_matrix_*.json
 results/gpu_matrix_*.md
 results/gpu_matrix_*/
 results/gpu_matrix_runs/
+results/debug_*.json
+results/debug_*.md
+results/gdn_decode_*_microbench_*.json
+results/gdn_decode_*_microbench_*.md
+results/gdn_strict_*_202606*.json
+results/gdn_strict_*_202606*.md
+results/goal_decode_focus_*.json
+results/goal_decode_focus_*.md
+results/gpu_decode_*.json
+results/gpu_decode_*.md
+results/quick_vllm_*.json
+results/quick_vllm_*.md
+results/vllm_fla_correctness_boundary*.json
+results/vllm_fla_correctness_boundary*.md
 
 # OS
 .DS_Store

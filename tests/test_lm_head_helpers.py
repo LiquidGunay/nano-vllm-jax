@@ -13,7 +13,12 @@ from nanovllm_jax.model import (
 )
 
 
-def test_lm_head_token_ids_and_topk_matches_full_logits():
+def test_lm_head_token_ids_and_topk_matches_full_logits(monkeypatch):
+    monkeypatch.delenv("NANO_VLLM_JAX_PALLAS_DECODE_RMSNORM", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_TRITON_DECODE_RMSNORM", raising=False)
+    monkeypatch.setenv("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH", "0")
+    monkeypatch.setenv("NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE", "fp32")
+    monkeypatch.setenv("NANO_VLLM_JAX_DECODE_PADDED_GEMM", "0")
     hidden = jnp.array(
         [
             [[0.2, -0.4, 0.7, 1.0], [1.1, 0.3, -0.2, 0.5]],
@@ -28,7 +33,11 @@ def test_lm_head_token_ids_and_topk_matches_full_logits():
         norm_weight=jnp.array([1.0, 0.8, 1.2, 0.6], dtype=jnp.float32),
         lm_head=None,
     )
-    config = SimpleNamespace(rms_norm_eps=1e-6)
+    config = SimpleNamespace(
+        rms_norm_eps=1e-6,
+        decode_padded_gemm=False,
+        lm_head_decode_act_dtype="fp32",
+    )
 
     token_ids, top_values, top_indices = lm_head_token_ids_and_topk(
         hidden,
