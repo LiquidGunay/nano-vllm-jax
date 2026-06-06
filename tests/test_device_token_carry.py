@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from nanovllm_jax.config import Qwen3_5Config
-from nanovllm_jax.engine.llm_engine import LLMEngine
+from nanovllm_jax.engine.llm_engine import LLMEngine, _trace_token_prefetch_enabled
 from nanovllm_jax.engine.model_runner import ModelRunner
 from nanovllm_jax.engine.scheduled_batch import ScheduledBatch
 from nanovllm_jax.engine.scheduler import Scheduler
@@ -28,6 +28,14 @@ class _AsyncScalar:
         self.materialize_count += 1
         self.events.append(f"materialize-{self.value}")
         return np.asarray(self.value, dtype=dtype)
+
+
+def test_trace_token_prefetch_env_can_disable_config_default(monkeypatch):
+    config = Qwen3_5Config(trace_token_prefetch=True)
+
+    monkeypatch.setenv("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "0")
+
+    assert _trace_token_prefetch_enabled(config) is False
 
 
 def test_sequence_materializes_deferred_device_tokens():
@@ -935,6 +943,7 @@ def test_iter_generate_offline_events_preserve_final_tokens(monkeypatch):
 def test_generate_with_trace_disables_overlapped_prefetch(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_OVERLAPPED_STREAMING_TOKEN_PREFETCH", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "0")
     prefetch_calls: list[tuple] = []
     events: list[str] = []
     remaining_steps = {"value": 2}

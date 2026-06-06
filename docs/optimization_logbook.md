@@ -10637,3 +10637,49 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     route reached `757.56 output tok/s`, `0.857x` stored vLLM, with
     `98.30 ms` drain and zero JIT growth. This is too small/noisy to promote as
     a new default.
+
+### Entry 274 - Accepted Trace Token Prefetch Default
+
+- date: 2026-06-06
+- purpose:
+  - make the deferred trace-token prefetch path a config-backed default instead
+    of an environment-only experiment;
+  - reduce final output materialization/drain without changing the paged,
+    ragged, generic-warmup serving path.
+- accepted implementation:
+  - added `trace_token_prefetch` to `Qwen3_5Config`, server config runtime
+    fastpaths, environment projection, benchmark CLI reporting, and the GPU
+    matrix config;
+  - defaulted the option to `true` while preserving `--no-trace-token-prefetch`
+    and `NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH=0` for focused diagnostics.
+- artifacts:
+  - short fixed-shape A/B:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/comprehensive_20260606_ab/short_32_128_jax_trace_prefetch.json`;
+  - long-prefill A/B:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/comprehensive_20260606_ab/long_prefill_512_2048_jax_trace_prefetch.json`;
+  - large random default-on rerun:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260606/random_large_trace_prefetch_default_bf16_r1.json`.
+- result:
+  - short `32x128` improved from `317.5` to `542.8 output tok/s` versus the
+    same live vLLM denominator, with exact generated-token parity and no
+    measured-phase JIT growth;
+  - long prefill was neutral at `116.9 output tok/s`; its remaining gap is not
+    a final-drain issue;
+  - large random on the current live-vLLM denominator improved from
+    `740.63` to `757.58 output tok/s`, `0.742x` of vLLM `1021.59 output
+    tok/s`, with the same prompt manifest, `1582` generated tokens, generic
+    warmup, and the 70% RAM/four-core guard;
+  - large-random final drain fell from `149.13 ms` to `98.17 ms`; token-event
+    throughput stayed effectively flat (`796.22 -> 794.95 tok/s`), confirming
+    the win is final materialization overlap rather than faster model decode.
+- decision:
+  - promote trace-token prefetch as the default serving/benchmark config;
+  - keep the next large-random target on model-side decode work or a broader
+    backend-owned boundary. Rejected final-token stacking/materialization
+    variants should not be retried as the primary route.
+- validation:
+  - `python -m py_compile nanovllm_jax/config.py nanovllm_jax/server_config.py nanovllm_jax/engine/llm_engine.py benchmarks/benchmark_jax_server_trace.py benchmarks/run_gpu_matrix.py`;
+  - `pytest -q tests/test_server_config.py tests/test_device_token_carry.py tests/test_benchmark_jax_server_trace.py tests/test_gpu_matrix_runner.py`;
+  - large random used stored vLLM denominator, BF16 activations/weights,
+    generic warmup, `--jax-fail-on-jit-cache-growth`, the 70% RAM guard, and
+    four CPU cores at nice level `10`.

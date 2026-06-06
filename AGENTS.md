@@ -96,14 +96,15 @@
   `forward_step_token_ids_resident_dense_slot_carry_jit` owns block-table,
   seq-len, token, hybrid-state, KV, and greedy-token updates inside the decode
   boundary.
-- Latest accepted large-random hill-climb result: the dense resident decode
-  boundary plus direct small-array device-put cleanup reached
-  `757.24 output tok/s`, `0.857x` of the stored vLLM denominator
-  (`884.03 output tok/s`), with zero measured-phase JIT growth (`24 -> 24`).
-  Token-event throughput was `794.77 tok/s`, about `0.899x` of the same
-  denominator; the remaining gap is final output drain plus model-side decode
-  GPU work (BF16 GEMMs, paged decode attention, LM-head reductions, and small
-  fusions).
+- Latest accepted large-random hill-climb result: trace-token prefetch is now a
+  config-backed default on top of the dense resident decode boundary. The
+  current BF16 large-random rerun reached `757.58 output tok/s`, `0.742x` of
+  the current live-vLLM denominator (`1021.59 output tok/s`), with `1582`
+  generated tokens and the same prompt manifest as the comprehensive run.
+  Final drain improved from `149.13 ms` to `98.17 ms`; token-event throughput
+  stayed effectively flat near `795 tok/s`, so the remaining gap is model-side
+  decode GPU work (BF16 GEMMs, paged decode attention, LM-head reductions, and
+  small fusions), not another narrow final-token materialization tweak.
 - Do not retry direct JAX `.lower().compile()` executable caching as "graph
   replay". The 2026-06-05 guarded smoke stayed CPU-bound in compile/warmup for
   more than six minutes before measurement. Use XLA/runtime graph replay or a

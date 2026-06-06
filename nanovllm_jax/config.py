@@ -84,6 +84,7 @@ class Qwen3_5Config:
     static_decode_seq_lens_carry: bool = False
     resident_decode_metadata: bool = False
     greedy_decode_burst_steps: int = 1
+    trace_token_prefetch: bool = True
 
     # Accepted serving fast paths. Environment variables remain supported as
     # compatibility overrides, but server/benchmark configs should set these
@@ -296,6 +297,7 @@ class Qwen3_5Config:
             self.static_decode_seq_lens_carry,
             self.resident_decode_metadata,
             self.greedy_decode_burst_steps,
+            self.trace_token_prefetch,
             self.materialize_tied_lm_head,
             self.compact_prefill_in_proj_qkv,
             self.compact_prefill_gdn_z,
@@ -450,6 +452,7 @@ class Qwen3_5Config:
             "static_decode_seq_lens_carry": self.static_decode_seq_lens_carry,
             "resident_decode_metadata": self.resident_decode_metadata,
             "greedy_decode_burst_steps": self.greedy_decode_burst_steps,
+            "trace_token_prefetch": self.trace_token_prefetch,
             "materialize_tied_lm_head": self.materialize_tied_lm_head,
             "compact_prefill_in_proj_qkv": self.compact_prefill_in_proj_qkv,
             "compact_prefill_gdn_z": self.compact_prefill_gdn_z,

@@ -39,8 +39,15 @@ def _offline_streaming_token_events_enabled() -> bool:
     return os.environ.get("NANO_VLLM_JAX_OFFLINE_STREAMING_TOKEN_EVENTS", "0") in _TRUE_ENV_VALUES
 
 
-def _trace_token_prefetch_enabled() -> bool:
-    return os.environ.get("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "0") in _TRUE_ENV_VALUES
+def _trace_token_prefetch_enabled(config: Qwen3_5Config | None = None) -> bool:
+    if "NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH" in os.environ:
+        return os.environ.get("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "0") in _TRUE_ENV_VALUES
+    return _config_or_env_flag(
+        config,
+        "trace_token_prefetch",
+        "NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH",
+        default=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -818,7 +825,7 @@ class LLMEngine:
         emitted_finish = set()
         stream_start = perf_counter()
         events = []
-        prefetch_trace_tokens = _trace_token_prefetch_enabled()
+        prefetch_trace_tokens = _trace_token_prefetch_enabled(getattr(self, "config", None))
         snapshotted_completion_lengths = {seq.seq_id: 0 for seq in seqs}
         pending_prefetch_slots: tuple[DeviceTokenSlot, ...] = ()
 

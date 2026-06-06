@@ -124,6 +124,7 @@ def test_runtime_fastpaths_project_to_engine_config(tmp_path, monkeypatch):
         "NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY",
         "NANO_VLLM_JAX_RESIDENT_DECODE_METADATA",
         "NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS",
+        "NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH",
         "NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD",
         "NANO_VLLM_JAX_COMPACT_PREFILL_MLP",
         "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE",
@@ -141,6 +142,7 @@ runtime:
     static_decode_seq_lens_carry: true
     resident_decode_metadata: true
     greedy_decode_burst_steps: 3
+    trace_token_prefetch: false
     materialize_tied_lm_head: true
     compact_prefill_mlp: true
     lm_head_decode_act_dtype: bf16
@@ -156,6 +158,7 @@ runtime:
     assert loaded.engine["static_decode_seq_lens_carry"] is True
     assert loaded.engine["resident_decode_metadata"] is True
     assert loaded.engine["greedy_decode_burst_steps"] == 3
+    assert loaded.engine["trace_token_prefetch"] is False
     assert loaded.engine["materialize_tied_lm_head"] is True
     assert loaded.engine["compact_prefill_mlp"] is True
     assert loaded.engine["lm_head_decode_act_dtype"] == "bf16"
@@ -190,6 +193,7 @@ def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy
             "runtime": {
                 "fastpaths": {
                     "materialize_tied_lm_head": True,
+                    "trace_token_prefetch": False,
                     "compact_prefill_in_proj_qkv": True,
                     "lm_head_decode_act_dtype": "bf16",
                     "decode_padded_gemm": True,
@@ -215,6 +219,7 @@ def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy
     )
 
     assert overrides["materialize_tied_lm_head"] is True
+    assert overrides["trace_token_prefetch"] is False
     assert overrides["compact_prefill_in_proj_qkv"] is True
     assert overrides["lm_head_decode_act_dtype"] == "bf16"
     assert overrides["decode_padded_gemm"] is True

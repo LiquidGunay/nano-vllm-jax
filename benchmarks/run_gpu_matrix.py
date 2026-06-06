@@ -498,6 +498,8 @@ def _append_cli_arg(command: list[str], key: str, value: Any) -> None:
             "device_token_carry",
             "static_decode_metadata",
             "static_decode_seq_lens_carry",
+            "resident_decode_metadata",
+            "trace_token_prefetch",
         }:
             command.append(flag if value else f"--no-{flag[2:]}")
         elif value:

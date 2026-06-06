@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--static-decode-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--static-decode-seq-lens-carry", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--resident-decode-metadata", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--trace-token-prefetch", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--materialize-tied-lm-head", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compact-prefill-in-proj-qkv", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compact-prefill-gdn-z", action=argparse.BooleanOptionalAction, default=False)
@@ -383,6 +384,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "static_decode_metadata": args.static_decode_metadata,
         "static_decode_seq_lens_carry": args.static_decode_seq_lens_carry,
         "resident_decode_metadata": args.resident_decode_metadata,
+        "trace_token_prefetch": args.trace_token_prefetch,
         "materialize_tied_lm_head": args.materialize_tied_lm_head,
         "compact_prefill_in_proj_qkv": args.compact_prefill_in_proj_qkv,
         "compact_prefill_gdn_z": args.compact_prefill_gdn_z,
@@ -602,6 +604,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 "static_decode_seq_lens_carry": bool(engine.config.static_decode_seq_lens_carry),
                 "resident_decode_metadata": bool(engine.config.resident_decode_metadata),
                 "greedy_decode_burst_steps": int(engine.config.greedy_decode_burst_steps),
+                "trace_token_prefetch": bool(engine.config.trace_token_prefetch),
             },
         },
         "performance": _performance_with_token_scopes(
