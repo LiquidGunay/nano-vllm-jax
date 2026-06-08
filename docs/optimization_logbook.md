@@ -11643,3 +11643,59 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - the next material speed route must be structural: backend-owned grouped or
     layer-batched MLP/GDN decode work, a true runtime replay/capture path, or a
     kernel-native GDN decode boundary on compatible hardware.
+
+### Entry 292 - Fixed Packed Long-Prefill Token-Bucket Overpacking
+
+- date: 2026-06-08
+- purpose:
+  - fix the Entry 291 `long_prefill_512_2048` failure where the scheduler
+    packed `5120` prefill tokens into a batch even though the largest compiled
+    packed prefill-token bucket was `4096`;
+  - clarify why `hetero8` compile/warmup can use more host RAM than narrower
+    benchmark lanes despite generic warmup.
+- implementation:
+  - added `Scheduler._max_prefill_token_budget()`;
+  - changed the pure prefill scheduling path to cap `num_batched_tokens` by the
+    same effective token budget already used by mixed prefill/decode:
+    `min(max_num_batched_tokens, max(prefill_token_buckets))`, or
+    `prefill_buckets` when token buckets are absent;
+  - added a focused packed-prefill regression test where
+    `max_num_batched_tokens` permits `8` tokens but the compiled token bucket
+    only permits `6`, so the scheduler must emit a partial second row instead
+    of building an unwarmed oversized batch.
+- validation:
+  - `.venv/bin/pytest -q tests/test_backend_boundaries.py -k 'chunks_packed_prefill_by_token_bucket_budget or builds_packed_prefill_token_bucket or packed_prefill_uses_prefill_bucket_as_row_chunk_budget or chunks_prefill_by_max_batched_tokens_budget'`;
+  - guarded real long-prefill slice:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/long_prefill_fix_20260608/gpu_matrix_long_prefill_bucket_cap_fix_r1.json`;
+  - report:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/long_prefill_fix_20260608/gpu_matrix_long_prefill_bucket_cap_fix_r1.md`.
+- long-prefill result after fix:
+  - `long_prefill_512_2048`, one repeat, stored references only;
+  - current JAX `176.7747543980159 output tok/s`, stored vLLM
+    `116.37 output tok/s`, ratio `1.519x`;
+  - stored JAX default `78.02 output tok/s`, ratio `2.266x`;
+  - scheduler diagnostics: `2` prefill steps, `15` decode steps, max prefill
+    rows `3`, max step tokens `4096`;
+  - the old `prefill token size 5120 exceeds configured buckets` error did not
+    recur;
+  - exact token comparison still failed, so this is a bucket-coverage and speed
+    validation, not a strict correctness promotion artifact.
+- hetero8 RAM explanation:
+  - generic warmup is uniform over the configured serving buckets for a process;
+    it is not warmed from live request shapes;
+  - the matrix runner launches a fresh JAX process per workload, so compiled
+    executables and compiler heap are not shared across workload slices;
+  - `hetero8` with the promoted config still exposes a large bucket cross
+    product: packed prefill-token buckets up to `4096`, row buckets up to
+    `512`, batch-size buckets `1..8`, decode buckets for `B=1..8`, resident
+    metadata scatter keys, sampled fastpath keys, and inactive-row variants;
+  - narrower lanes such as random-large and decode-heavy compile fewer buckets,
+    so they can stay under the RAM guard even when `hetero8` does not.
+- decision:
+  - keep the scheduler fix;
+  - do not widen the default random/hetero config to an `8192` packed prefill
+    token bucket just to avoid chunking long-prefill. The safer general behavior
+    is to respect the compiled bucket budget and split prefill waves;
+  - a future matrix-runner improvement should add a built-in resource guard and
+    optionally a smaller broad-validation bucket set instead of relying on
+    manual shell guards.

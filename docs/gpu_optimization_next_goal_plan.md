@@ -3325,15 +3325,22 @@ Model-specific assumptions to track:
 27. Do not retry in-loop trace-token materialization as a final-drain fix.
     Entry 290 showed it breaks the resident slot-carry route and triggers
     measured-phase JIT growth (`56 -> 57`) on the target large-random run.
-28. Treat Entry 291 as the current broad checkpoint, not a new accepted best:
+28. Treat Entry 291 as a historical broad checkpoint, not a new accepted best:
     current checkout random-large rerun reached `812.23 output tok/s`,
     `0.795x` stored vLLM, while the accepted Entry 289 best remains
     `818.91 output tok/s`, `0.802x`. `decode_heavy_128x128` is healthier at
     `0.842x` vLLM and `1.185x` stored JAX baseline, but guarded `hetero8`
-    trips the 70% RAM guard and `long_prefill_512_2048` needs a larger
-    prefill-token bucket than the promoted random config exposes. Before the
-    next broad claim, add/fix guarded matrix execution and long-prefill bucket
-    coverage.
+    tripped the 70% RAM guard and `long_prefill_512_2048` exposed a packed
+    prefill-token overpack bug later fixed by Entry 292. Before the next broad
+    claim, add/fix guarded matrix execution.
+29. Entry 292 fixed the long-prefill bucket coverage issue by making pure
+    packed prefill respect the configured compiled token-bucket budget. The
+    current path chunks `long_prefill_512_2048` into `4096 + 1024` packed
+    prefill tokens and reaches `176.77 output tok/s`, `1.519x` stored vLLM. Do
+    not widen the default random/hetero bucket set to `8192` just to avoid this
+    chunk unless profile evidence shows the extra compile/RAM surface is worth
+    it. Hetero8's RAM pressure is from the generic bucket cross product in a
+    fresh JAX process, not from warming exact live request shapes.
 ```
 
 ## Expected Strategic Outcome

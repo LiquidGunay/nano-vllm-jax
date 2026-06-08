@@ -1086,6 +1086,34 @@ def test_scheduler_builds_packed_prefill_token_bucket():
     np.testing.assert_array_equal(np.array(batch.token_row_ids), np.array([[0, 0, 0, 0, 0, 1, 1, 0]]))
 
 
+def test_scheduler_chunks_packed_prefill_by_token_bucket_budget():
+    config = _tiny_full_attention_config()
+    config.prefill_layout = "packed"
+    config.max_num_seqs = 4
+    config.num_kvcache_blocks = 20
+    config.max_blocks_per_seq = 8
+    config.max_num_batched_tokens = 8
+    config.prefill_buckets = (4,)
+    config.prefill_token_buckets = (6,)
+    config.batch_size_buckets = (2,)
+    scheduler = Scheduler(config)
+
+    seq_a = Sequence([1, 2, 3, 4], SamplingParams(temperature=0.0, max_tokens=1), seq_id=10)
+    seq_b = Sequence([6, 7, 8, 9], SamplingParams(temperature=0.0, max_tokens=1), seq_id=11)
+    scheduler.add(seq_a)
+    scheduler.add(seq_b)
+
+    seqs, batch = scheduler.schedule()
+
+    assert [seq.seq_id for seq in seqs] == [10, 11]
+    assert batch.packed_prefill
+    assert batch.tokens.shape == (1, 6)
+    assert batch.query_lens_host == (4, 2)
+    assert batch.prefill_final_flags == [True, False]
+    assert int(batch.num_prefill_tokens) == 6
+    np.testing.assert_array_equal(np.array(batch.query_start_loc), np.array([0, 4, 6]))
+
+
 def test_scheduler_packed_prefill_uses_prefill_bucket_as_row_chunk_budget():
     config = _tiny_full_attention_config()
     config.prefill_layout = "packed"

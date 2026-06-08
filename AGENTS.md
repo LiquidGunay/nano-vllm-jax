@@ -202,9 +202,22 @@
   `decode_heavy_128x128` completed at `179.89 output tok/s`, `0.842x` vLLM and
   `1.185x` stored JAX baseline. The combined matrix and guarded `hetero8` slice
   hit the 70% RAM guard during compile/warmup, and `long_prefill_512_2048`
-  currently fails because the promoted config's packed prefill-token buckets
-  stop at `4096` while the workload needs `5120`. Treat this as a broad
-  checkpoint and coverage gap, not as a new accepted speed record.
+  exposed a packed-token overpack bug later fixed by Entry 292. Treat Entry 291
+  as a broad checkpoint and historical coverage gap, not as a new accepted speed
+  record.
+- Entry 292 fixed the long-prefill packed-token overpack by making pure prefill
+  scheduling respect the same effective compiled token budget used by mixed
+  prefill/decode. The current long-prefill slice now chunks into `4096 + 1024`
+  packed prefill tokens and completes at
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/long_prefill_fix_20260608/gpu_matrix_long_prefill_bucket_cap_fix_r1.json`,
+  `176.77 output tok/s`, `1.519x` stored vLLM. Do not widen the promoted
+  random/hetero config to `8192` token buckets unless a new profile proves that
+  the extra compile/memory surface is acceptable.
+- Hetero8 RAM pressure is bucket-surface pressure, not live-request-specific
+  compilation. Generic warmup compiles the selected process's configured
+  prefill-token, row, batch, decode, resident metadata, sampled, and inactive-row
+  buckets. The matrix runner starts a fresh JAX process per workload, so
+  `hetero8` can still hit the 70% RAM guard even if narrower lanes complete.
 - Do not retry direct JAX `.lower().compile()` executable caching as "graph
   replay". The 2026-06-05 guarded smoke stayed CPU-bound in compile/warmup for
   more than six minutes before measurement. Use XLA/runtime graph replay or a

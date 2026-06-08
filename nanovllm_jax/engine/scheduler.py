@@ -219,6 +219,7 @@ class Scheduler:
         num_batched_tokens = 0
         prefill_chunk_lens: List[int] = []
         scheduled_running: List[Sequence] = []
+        prefill_token_budget = self._max_prefill_token_budget()
         ready_decode_rows = sum(
             1
             for seq in self.running
@@ -269,10 +270,10 @@ class Scheduler:
                 continue
             chunk_len = min(remaining_tokens, self.prefill_chunk_budget)
             if (
-                self.max_num_batched_tokens > 0
-                and num_batched_tokens + chunk_len > self.max_num_batched_tokens
+                prefill_token_budget > 0
+                and num_batched_tokens + chunk_len > prefill_token_budget
             ):
-                available = self.max_num_batched_tokens - num_batched_tokens
+                available = prefill_token_budget - num_batched_tokens
                 if available <= 0:
                     if from_waiting:
                         self.waiting.appendleft(seq)
@@ -393,6 +394,20 @@ class Scheduler:
             decode_step_count=decode_step_count,
         )
 
+    def _max_prefill_token_budget(self) -> int:
+        """Largest prefill token count that the configured buckets cover."""
+        max_token_budget = max(
+            1,
+            self.max_num_batched_tokens
+            if self.max_num_batched_tokens > 0
+            else self.prefill_chunk_budget,
+        )
+        if self.prefill_token_buckets:
+            max_token_budget = min(max_token_budget, max(self.prefill_token_buckets))
+        elif self.prefill_buckets:
+            max_token_budget = min(max_token_budget, max(self.prefill_buckets))
+        return int(max_token_budget)
+
     def _schedule_mixed_prefill_decode(self) -> Tuple[List[Sequence], ScheduledBatch] | None:
         """Backfill underfull decode batches with bounded packed prefill chunks."""
         if self.prefill_layout != "packed":
@@ -414,14 +429,7 @@ class Scheduler:
         if not self.waiting and not has_running_prefill_tail:
             return None
 
-        max_token_budget = max(
-            1,
-            self.max_num_batched_tokens if self.max_num_batched_tokens > 0 else self.prefill_chunk_budget,
-        )
-        if self.prefill_token_buckets:
-            max_token_budget = min(max_token_budget, max(self.prefill_token_buckets))
-        elif self.prefill_buckets:
-            max_token_budget = min(max_token_budget, max(self.prefill_buckets))
+        max_token_budget = self._max_prefill_token_budget()
 
         decode_seqs: List[Sequence] = []
         for seq in ready_decode_rows:
