@@ -11699,3 +11699,55 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - a future matrix-runner improvement should add a built-in resource guard and
     optionally a smaller broad-validation bucket set instead of relying on
     manual shell guards.
+
+### Entry 293 - Shared Random-Large Envelope Multisuite Harness
+
+- date: 2026-06-08
+- purpose:
+  - test whether the random-large compiled bucket surface can also run
+    `hetero8` without measured-phase JIT growth when both workloads share one
+    long-lived server process;
+  - stop using a fresh JAX process as the only way to compare broad workloads.
+- implementation:
+  - added `benchmarks/benchmark_jax_server_multisuite.py`;
+  - the new harness builds one `LLMEngine`, applies the accepted kernel policy
+    from `gpu_paged_gdn_fla_decode_static_metadata.json`, overrides serving
+    shape/capacity to the random-large envelope, runs one generic warmup, then
+    measures one or more workloads sequentially in the same process;
+  - added a sidecar-compatible `random_large` pseudo-workload with seed `1234`,
+    `8` requests, input range `512..1024`, and output range `128..256`;
+  - added unit coverage for the random-large envelope override, workload-name
+    validation, and random-large prompt generation.
+- validation:
+  - `.venv/bin/python -m py_compile benchmarks/benchmark_jax_server_multisuite.py`;
+  - `.venv/bin/pytest -q tests/test_benchmark_jax_server_multisuite.py`;
+  - guarded GPU run:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/shared_envelope_20260608/random_large_then_hetero8_shared_r1.json`.
+- shared-process result:
+  - warmup compiled `56` executor keys in `134.44 s`, using
+    `prefill_token_buckets=[512,1024]` and `batch_size_buckets=[1..8]`;
+  - `random_large`: `818.3615353465699 output tok/s`, token-event
+    `861.5463279550507 output tok/s`, JIT cache `56 -> 56`;
+  - `hetero8`: `478.64073570773826 output tok/s`, token-event
+    `669.2538031283518 output tok/s`, JIT cache `56 -> 56`;
+  - peak observed system RAM stayed below the `70%` guard; GPU memory after
+    measurement was about `8.75 GB`.
+- interpretation:
+  - yes, the random-large compiled bucket surface can execute `hetero8` without
+    measured-phase JIT growth when we keep the server process and envelope
+    fixed;
+  - the old broad matrix was not testing that, because it launched a fresh JAX
+    process and changed the serving envelope per workload;
+  - this shared-envelope `hetero8` number is not a speed win. It is slower than
+    hetero-specific runs because the random-large envelope caps packed prefill
+    at `1024` tokens and chunks the `2304` hetero prompt tokens across more
+    prefill waves;
+  - exact generated-token comparison still fails for `hetero8`, so use this as
+    compile/warmup and throughput evidence, not a correctness promotion.
+- decision:
+  - keep the multisuite harness;
+  - use it for shared-envelope validation and for answering whether a workload
+    is covered by the random-large warmup surface;
+  - keep the matrix runner for per-workload specialized-envelope comparisons,
+    but do not interpret its fresh-process compile/RAM behavior as proof that a
+    long-lived warmed server would recompile.

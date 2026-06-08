@@ -218,6 +218,14 @@
   prefill-token, row, batch, decode, resident metadata, sampled, and inactive-row
   buckets. The matrix runner starts a fresh JAX process per workload, so
   `hetero8` can still hit the 70% RAM guard even if narrower lanes complete.
+- Entry 293 added `benchmarks/benchmark_jax_server_multisuite.py` for the
+  long-lived-server comparison. With the accepted config policy plus the
+  random-large serving envelope, one process warmed `56` JIT keys, then measured
+  `random_large` at `818.36 output tok/s` and `hetero8` at `478.64 output
+  tok/s`, both with JIT cache `56 -> 56`. This proves the random-large envelope
+  covers hetero8 without measured recompilation in one server process, but it is
+  not a hetero speed win because the random-large `1024` packed-token cap chunks
+  hetero prefill more than the hetero-specialized envelope.
 - Do not retry direct JAX `.lower().compile()` executable caching as "graph
   replay". The 2026-06-05 guarded smoke stayed CPU-bound in compile/warmup for
   more than six minutes before measurement. Use XLA/runtime graph replay or a

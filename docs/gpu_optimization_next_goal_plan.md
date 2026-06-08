@@ -3341,6 +3341,14 @@ Model-specific assumptions to track:
     chunk unless profile evidence shows the extra compile/RAM surface is worth
     it. Hetero8's RAM pressure is from the generic bucket cross product in a
     fresh JAX process, not from warming exact live request shapes.
+30. Entry 293 added a shared-process multisuite harness. Use
+    `benchmarks/benchmark_jax_server_multisuite.py --serving-envelope random_large`
+    to test whether workloads are covered by the random-large warmup surface in
+    one long-lived server. The first guarded `random_large,hetero8` run showed
+    `0` measured JIT-cache growth for both workloads (`56 -> 56`), proving the
+    random-large envelope covers hetero8 compilation-wise. Do not treat its
+    `478.64 output tok/s` hetero8 number as a specialized hetero speed claim;
+    it is a shared-envelope validation with smaller prefill-token caps.
 ```
 
 ## Expected Strategic Outcome
