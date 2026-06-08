@@ -32,7 +32,7 @@
       "decode_padded_gemm": true,
       "decode_padded_gemm_gate_up": true,
       "decode_padded_gemm_rows": 8,
-      "decode_padded_gemm_max_out_dim": 8192
+      "decode_padded_gemm_max_out_dim": 300000
     }
   },
   "kernels": {

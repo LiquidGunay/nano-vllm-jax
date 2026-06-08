@@ -23,6 +23,7 @@
     },
     "fastpaths": {
       "greedy_token": true,
+      "sampled_token": true,
       "materialize_tied_lm_head": true,
       "compact_prefill_in_proj_qkv": true,
       "compact_prefill_gdn_z": true,
@@ -32,11 +33,12 @@
       "device_token_carry": true,
       "static_decode_metadata": true,
       "lm_head_decode_act_dtype": "bf16",
+      "lm_head_topk_impl": "jax",
       "decode_proj_act_dtype": "bf16",
       "decode_padded_gemm": true,
       "decode_padded_gemm_gate_up": true,
       "decode_padded_gemm_rows": 8,
-      "decode_padded_gemm_max_out_dim": 8192
+      "decode_padded_gemm_max_out_dim": 300000
     }
   },
   "kernels": {

@@ -27,6 +27,8 @@ def test_runtime_and_kernel_sections_translate_to_env():
                     "greedy_decode_burst_steps": 2,
                     "trace_token_prefetch": True,
                     "lm_head_decode_act_dtype": "bf16",
+                    "lm_head_topk_impl": "flashinfer",
+                    "lm_head_greedy_top1_impl": "cutlass",
                     "decode_proj_act_dtype": "bf16_single_seq",
                     "decode_padded_gemm": True,
                     "decode_padded_gemm_gate_up": True,
@@ -77,6 +79,8 @@ def test_runtime_and_kernel_sections_translate_to_env():
     assert env["NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS"] == "2"
     assert env["NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH"] == "1"
     assert env["NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE"] == "bf16"
+    assert env["NANO_VLLM_JAX_LM_HEAD_TOPK_IMPL"] == "flashinfer"
+    assert "NANO_VLLM_JAX_LM_HEAD_GREEDY_TOP1_IMPL" not in env
     assert env["NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE"] == "bf16_single_seq"
     assert env["NANO_VLLM_JAX_DECODE_PADDED_GEMM"] == "1"
     assert env["NANO_VLLM_JAX_DECODE_PADDED_GEMM_GATE_UP"] == "1"
@@ -146,6 +150,8 @@ runtime:
     materialize_tied_lm_head: true
     compact_prefill_mlp: true
     lm_head_decode_act_dtype: bf16
+    lm_head_greedy_top1_impl: cutlass
+    decode_rms_padded_gemm: true
     decode_padded_gemm_rows: 8
 """.strip()
     )
@@ -162,6 +168,8 @@ runtime:
     assert loaded.engine["materialize_tied_lm_head"] is True
     assert loaded.engine["compact_prefill_mlp"] is True
     assert loaded.engine["lm_head_decode_act_dtype"] == "bf16"
+    assert loaded.engine["lm_head_greedy_top1_impl"] == "cutlass"
+    assert loaded.engine["decode_rms_padded_gemm"] is True
     assert loaded.engine["decode_padded_gemm_rows"] == 8
 
 
@@ -196,7 +204,10 @@ def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy
                     "trace_token_prefetch": False,
                     "compact_prefill_in_proj_qkv": True,
                     "lm_head_decode_act_dtype": "bf16",
+                    "lm_head_topk_impl": "flashinfer",
+                    "lm_head_greedy_top1_impl": "cutlass",
                     "decode_padded_gemm": True,
+                    "decode_rms_padded_gemm": True,
                 },
             },
             "kernels": {
@@ -222,7 +233,10 @@ def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy
     assert overrides["trace_token_prefetch"] is False
     assert overrides["compact_prefill_in_proj_qkv"] is True
     assert overrides["lm_head_decode_act_dtype"] == "bf16"
+    assert overrides["lm_head_topk_impl"] == "flashinfer"
+    assert overrides["lm_head_greedy_top1_impl"] == "cutlass"
     assert overrides["decode_padded_gemm"] is True
+    assert overrides["decode_rms_padded_gemm"] is True
     assert overrides["full_attention_kv_cache_dtype"] == "bf16"
     assert overrides["full_attention_kv_append_impl"] == "reference"
     assert overrides["full_attention_decode_impl"] == "triton_paged"

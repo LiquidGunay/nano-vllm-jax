@@ -6,6 +6,7 @@ import pytest
 from nanovllm_jax.kernels.decode_reductions import (
     gdn_packed_decode_pre_normalize_qk_pallas,
     pallas_decode_rms_norm,
+    triton_decode_rms_padded_gemm,
     triton_decode_rms_norm,
 )
 from nanovllm_jax.kernels.gdn_fla import gdn_packed_decode_pre_normalize_qk
@@ -53,6 +54,43 @@ def test_triton_decode_rms_norm_matches_per_head_weight():
     expected = rms_norm(x, weight, eps=1e-6)
 
     np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6, atol=1e-6)
+
+
+def test_triton_decode_rms_padded_gemm_matches_jax():
+    batch = 3
+    rows = 8
+    hidden = 128
+    out_dim = 192
+    x = jax.random.normal(jax.random.PRNGKey(13), (batch, 1, hidden), dtype=jnp.float32).astype(
+        jnp.bfloat16
+    )
+    norm_weight = jax.random.normal(jax.random.PRNGKey(14), (hidden,), dtype=jnp.float32)
+    mat_weight = jax.random.normal(
+        jax.random.PRNGKey(15), (hidden, out_dim), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
+
+    actual = triton_decode_rms_padded_gemm(
+        x,
+        norm_weight,
+        mat_weight,
+        eps=1e-6,
+        rows=rows,
+        block_n=64,
+        block_k=64,
+    )
+    hidden_norm = rms_norm(x, norm_weight, eps=1e-6).astype(jnp.bfloat16)
+    hidden_rows = hidden_norm.reshape(batch, hidden)
+    expected = jnp.dot(
+        jnp.pad(hidden_rows, ((0, rows - batch), (0, 0))),
+        mat_weight,
+    )[:batch, :].reshape(batch, 1, out_dim)
+
+    np.testing.assert_allclose(
+        np.asarray(actual, dtype=np.float32),
+        np.asarray(expected, dtype=np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
 
 
 def test_lm_head_pallas_decode_rms_norm_matches_default(monkeypatch):

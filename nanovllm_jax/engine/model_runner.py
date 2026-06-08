@@ -106,6 +106,12 @@ class _LegacyModelRunner:
             "NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH",
             default=True,
         )
+        self.sampled_token_fastpath = _config_or_env_flag(
+            config,
+            "sampled_token_fastpath",
+            "NANO_VLLM_JAX_SAMPLED_TOKEN_FASTPATH",
+            default=True,
+        )
         self.device_token_carry = _config_or_env_flag(
             config,
             "device_token_carry",
@@ -1066,6 +1072,8 @@ class CanonicalModelRunner:
         self._resident_block_counts_host: list[int] = [0 for _ in range(max_seqs)]
         self._resident_seq_lens_host: list[int] = [0 for _ in range(max_seqs)]
         self._resident_last_tokens = jnp.zeros((max_seqs,), dtype=jnp.int32)
+        self._resident_rng_counters = jnp.zeros((max_seqs,), dtype=jnp.int32)
+        self._resident_rng_counter_reset_slots: set[int] = set()
         self._sample_fn = jax.jit(self._sample_logits)
         self.mtp_enabled = hasattr(params, "mtp_params") and params.mtp_params is not None
         self.num_speculative_tokens = int(getattr(config, "num_speculative_tokens", 0) or 0)
@@ -1196,6 +1204,7 @@ class CanonicalModelRunner:
             "decode_runs": [],
             "decode_block_table_buckets": [],
             "resident_metadata_scatter_runs": [],
+            "sampled_token_fastpath_runs": [],
             "jit_cache_entries_before": _cache_entries(),
             "jit_cache_entries_after": None,
             "already_warmed": bool(self._warmup_compiled),
@@ -1218,6 +1227,12 @@ class CanonicalModelRunner:
             tuple(getattr(self.config, "decode_block_table_buckets", ()) or ())
             or (int(self.max_blocks_per_seq),)
         )
+        sorted_batch_buckets = tuple(sorted(int(bucket) for bucket in batch_buckets))
+        padded_decode_buckets = {
+            bucket
+            for index, bucket in enumerate(sorted_batch_buckets)
+            if (sorted_batch_buckets[index - 1] + 1 if index > 0 else 1) < bucket
+        }
         summary["prefill_buckets"] = list(prefill_buckets)
         summary["batch_size_buckets"] = list(batch_buckets)
         summary["decode_block_table_buckets"] = [int(width) for width in decode_block_table_buckets]
@@ -1234,6 +1249,18 @@ class CanonicalModelRunner:
                 ),
             )
         ) and hasattr(self.executor, "forward_step_token_ids_jit")
+        use_sampled_token_fastpath = bool(
+            getattr(
+                self,
+                "sampled_token_fastpath",
+                _config_or_env_flag(
+                    getattr(self, "config", None),
+                    "sampled_token_fastpath",
+                    "NANO_VLLM_JAX_SAMPLED_TOKEN_FASTPATH",
+                    default=True,
+                ),
+            )
+        ) and hasattr(self.executor, "forward_step_sampled_token_ids_jit")
         hybrid_state_table = getattr(self, "_hybrid_state_table", None)
         use_hybrid_table_decode = (
             use_greedy_token_fastpath
@@ -1257,6 +1284,17 @@ class CanonicalModelRunner:
             and bool(getattr(self, "device_token_carry", False))
             and hasattr(self, "_resident_last_tokens")
             and hasattr(self.executor, "forward_prefill_token_ids_slot_carry_table_jit")
+        )
+        use_sampled_resident_dense_decode = (
+            use_sampled_token_fastpath
+            and hybrid_state_table is not None
+            and hybrid_state_table.conv_state is not None
+            and hybrid_state_table.recurrent_state is not None
+            and bool(getattr(self, "resident_decode_metadata", False))
+            and bool(getattr(self, "device_token_carry", False))
+            and hasattr(self, "_resident_last_tokens")
+            and hasattr(self, "_resident_rng_counters")
+            and hasattr(self.executor, "forward_step_sampled_token_ids_resident_dense_slot_carry_jit")
         )
         use_slot_carry_table_decode = (
             use_hybrid_table_decode
@@ -1372,6 +1410,43 @@ class CanonicalModelRunner:
                         "route": route,
                     }
                 )
+                if use_sampled_token_fastpath and not seed_mtp1:
+                    sampled_hybrid_state = init_hybrid_state(
+                        self.config,
+                        batch_size=batch_size,
+                        dtype=self.config.get_dtype(),
+                    )
+                    temperatures = jnp.ones((int(batch_size),), dtype=jnp.float32)
+                    rng_slots = jnp.arange(int(batch_size), dtype=jnp.int32)
+                    rng_counters = jnp.zeros((int(batch_size),), dtype=jnp.int32)
+                    sampled_output = self.executor.forward_step_sampled_token_ids_jit(
+                        batch,
+                        cache_storage=self.cache_storage,
+                        hybrid_state=sampled_hybrid_state,
+                        temperatures=temperatures,
+                        rng_counters=rng_counters,
+                        rng_slots=rng_slots,
+                    )
+                    _block_until_ready(sampled_output.activations)
+                    self.cache_storage = sampled_output.cache_storage
+                    summary["prefill_runs"].append(
+                        {
+                            "batch_size": int(batch_size),
+                            "query_len": int(prefill_len),
+                            "tokens_shape": list(batch.tokens.shape),
+                            "block_tables_shape": list(batch.block_tables.shape),
+                            "num_prefill_tokens": int(batch.num_prefill_tokens),
+                            "route": "forward_step_sampled_token_ids_jit:prefill",
+                        }
+                    )
+                    summary["sampled_token_fastpath_runs"].append(
+                        {
+                            "kind": "prefill",
+                            "batch_size": int(batch_size),
+                            "query_len": int(prefill_len),
+                            "route": "forward_step_sampled_token_ids_jit:prefill",
+                        }
+                    )
 
         for batch_size in batch_buckets:
             for block_table_width in decode_block_table_buckets:
@@ -1536,6 +1611,52 @@ class CanonicalModelRunner:
                         route = "forward_step_token_ids_table_jit:decode"
                     self._hybrid_state_table = output.hybrid_state
                     _record_decode_warmup(output, route)
+                    if (
+                        int(batch_size) in padded_decode_buckets
+                        and self.resident_decode_metadata
+                        and hasattr(self.executor, "forward_step_token_ids_resident_slot_carry_jit")
+                    ):
+                        inactive_row = int(batch_size) - 1
+                        padded_slot_values = tuple(
+                            list(range(inactive_row)) + [-1]
+                        )
+                        padded_batch = self._masked_decode_batch(
+                            batch,
+                            list(range(inactive_row)),
+                        )
+                        padded_batch.hybrid_slot_ids_host = padded_slot_values
+                        padded_hybrid_slot_ids = jnp.asarray(
+                            padded_slot_values,
+                            dtype=jnp.int32,
+                        )
+                        self._sync_resident_decode_metadata(
+                            padded_batch,
+                            list(padded_batch.hybrid_slot_ids_host),
+                            sync_seq_lens=True,
+                        )
+                        padded_output = self.executor.forward_step_token_ids_resident_slot_carry_jit(
+                            padded_batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state_table=self._hybrid_state_table,
+                            hybrid_slot_ids=padded_hybrid_slot_ids,
+                            resident_block_tables=self._resident_block_tables,
+                            resident_seq_lens=self._resident_seq_lens,
+                            resident_last_tokens=self._resident_last_tokens,
+                        )
+                        self._hybrid_state_table = padded_output.hybrid_state
+                        if padded_output.resident_seq_lens is not None:
+                            self._resident_seq_lens = padded_output.resident_seq_lens
+                            self._advance_resident_seq_lens_host(
+                                list(padded_batch.hybrid_slot_ids_host),
+                                active_rows=list(range(inactive_row)),
+                                steps=1,
+                            )
+                        if padded_output.resident_last_tokens is not None:
+                            self._resident_last_tokens = padded_output.resident_last_tokens
+                        _record_decode_warmup(
+                            padded_output,
+                            "forward_step_token_ids_resident_slot_carry_jit:decode-inactive-row",
+                        )
                 else:
                     hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
                     if use_greedy_token_fastpath and not seed_mtp1:
@@ -1555,6 +1676,74 @@ class CanonicalModelRunner:
                             last_logits_only=True,
                         )
                         _record_decode_warmup(output, "forward_step_jit:decode")
+                if use_sampled_token_fastpath and not seed_mtp1:
+                    temperatures = jnp.ones((int(batch_size),), dtype=jnp.float32)
+                    sampled_hybrid_state = init_hybrid_state(
+                        self.config,
+                        batch_size=batch_size,
+                        dtype=self.config.get_dtype(),
+                    )
+                    rng_slots = jnp.arange(int(batch_size), dtype=jnp.int32)
+                    rng_counters = jnp.zeros((int(batch_size),), dtype=jnp.int32)
+                    sampled_output = self.executor.forward_step_sampled_token_ids_jit(
+                        batch,
+                        cache_storage=self.cache_storage,
+                        hybrid_state=sampled_hybrid_state,
+                        temperatures=temperatures,
+                        rng_counters=rng_counters,
+                        rng_slots=rng_slots,
+                    )
+                    sampled_route = "forward_step_sampled_token_ids_jit:decode"
+                    _record_decode_warmup(sampled_output, sampled_route)
+                    summary["sampled_token_fastpath_runs"].append(
+                        {
+                            "kind": "decode",
+                            "batch_size": int(batch_size),
+                            "block_tables_shape": list(batch.block_tables.shape),
+                            "route": sampled_route,
+                        }
+                    )
+                    if use_sampled_resident_dense_decode:
+                        hybrid_slot_ids = jnp.arange(batch_size, dtype=jnp.int32)
+                        batch.hybrid_slot_ids_host = tuple(range(batch_size))
+                        self._sync_resident_decode_metadata(
+                            batch,
+                            list(batch.hybrid_slot_ids_host),
+                            sync_seq_lens=True,
+                        )
+                        sampled_output = self.executor.forward_step_sampled_token_ids_resident_dense_slot_carry_jit(
+                            batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state_table=self._hybrid_state_table,
+                            hybrid_slot_ids=hybrid_slot_ids,
+                            resident_block_tables=self._resident_block_tables,
+                            resident_seq_lens=self._resident_seq_lens,
+                            resident_last_tokens=self._resident_last_tokens,
+                            resident_rng_counters=self._resident_rng_counters,
+                            temperatures=temperatures,
+                        )
+                        self._hybrid_state_table = sampled_output.hybrid_state
+                        if sampled_output.resident_seq_lens is not None:
+                            self._resident_seq_lens = sampled_output.resident_seq_lens
+                            self._advance_resident_seq_lens_host(
+                                list(batch.hybrid_slot_ids_host),
+                                active_rows=list(range(batch_size)),
+                                steps=1,
+                            )
+                        if sampled_output.resident_last_tokens is not None:
+                            self._resident_last_tokens = sampled_output.resident_last_tokens
+                        if sampled_output.resident_rng_counters is not None:
+                            self._resident_rng_counters = sampled_output.resident_rng_counters
+                        sampled_route = "forward_step_sampled_token_ids_resident_dense_slot_carry_jit:decode"
+                        _record_decode_warmup(sampled_output, sampled_route)
+                        summary["sampled_token_fastpath_runs"].append(
+                            {
+                                "kind": "decode",
+                                "batch_size": int(batch_size),
+                                "block_tables_shape": list(batch.block_tables.shape),
+                                "route": sampled_route,
+                            }
+                        )
         if bool(getattr(self, "resident_decode_metadata", False)):
             for row_count in range(1, int(max(batch_buckets)) + 1):
                 if row_count > int(self._resident_block_tables.shape[0]):
@@ -1675,6 +1864,16 @@ class CanonicalModelRunner:
                     self._resident_block_counts_host[slot] = 0
                 if hasattr(self, "_resident_seq_lens_host"):
                     self._resident_seq_lens_host[slot] = 0
+                if hasattr(self, "_resident_rng_counters"):
+                    reset_slots = getattr(
+                        self,
+                        "_resident_rng_counter_reset_slots",
+                        None,
+                    )
+                    if reset_slots is None:
+                        reset_slots = set()
+                        self._resident_rng_counter_reset_slots = reset_slots
+                    reset_slots.add(int(slot))
             self._mtp1_drafts.pop(seq_id, None)
         carry_by_seq_id = getattr(self, "_device_token_carry_by_seq_id", {})
         if carry_by_seq_id and any(seq_id in carry_by_seq_id for seq_id in seq_ids):
@@ -1971,7 +2170,7 @@ class CanonicalModelRunner:
             )
             or batch.seq_ids_host is None
             or not active_rows
-            or any(row >= len(seqs) or seqs[row].temperature != 0 or not seqs[row].ignore_eos for row in active_rows)
+            or any(row >= len(seqs) or not seqs[row].ignore_eos for row in active_rows)
         ):
             self._clear_device_token_carry()
             return
@@ -2578,6 +2777,18 @@ class CanonicalModelRunner:
         )
         return fn(table, slots, seq_lens)
 
+    def _resident_update_slots_device(self, slots: List[int] | Tuple[int, ...]) -> jnp.ndarray:
+        key = tuple(int(slot) for slot in slots)
+        cache = getattr(self, "_resident_update_slots_device_cache", None)
+        if cache is None:
+            cache = {}
+            self._resident_update_slots_device_cache = cache
+        cached = cache.get(key)
+        if cached is None:
+            cached = jax.device_put(np.asarray(key, dtype=np.int32))
+            cache[key] = cached
+        return cached
+
     def _sync_resident_decode_metadata(
         self,
         batch: ScheduledBatch,
@@ -2665,13 +2876,13 @@ class CanonicalModelRunner:
         if changed_block_slots:
             self._resident_block_tables = self._scatter_resident_block_table_rows(
                 self._resident_block_tables,
-                jax.device_put(np.asarray(changed_block_slots, dtype=np.int32)),
+                self._resident_update_slots_device(changed_block_slots),
                 jax.device_put(np.asarray(changed_block_rows, dtype=np.int32)),
             )
         if changed_seq_lens_slots:
             self._resident_seq_lens = self._scatter_resident_seq_lens(
                 self._resident_seq_lens,
-                jax.device_put(np.asarray(changed_seq_lens_slots, dtype=np.int32)),
+                self._resident_update_slots_device(changed_seq_lens_slots),
                 jax.device_put(np.asarray(changed_seq_lens, dtype=np.int32)),
             )
 
@@ -2777,6 +2988,120 @@ class CanonicalModelRunner:
             if float(getattr(seq, "temperature", 0.0)) != 0.0:
                 return False
         return hasattr(self.executor, "forward_step_token_ids_jit")
+
+    def _can_use_sampled_token_fastpath(self, seqs: List[Sequence], batch: ScheduledBatch, *, seed_mtp1: bool) -> bool:
+        if seed_mtp1:
+            return False
+        if not bool(
+            getattr(
+                self,
+                "sampled_token_fastpath",
+                _config_or_env_flag(
+                    getattr(self, "config", None),
+                    "sampled_token_fastpath",
+                    "NANO_VLLM_JAX_SAMPLED_TOKEN_FASTPATH",
+                    default=True,
+                ),
+            )
+        ):
+            return False
+        execution = getattr(self, "execution", "eager")
+        if execution != "jit" and not (execution == "decode-jit" and not batch.is_prefill):
+            return False
+        if batch.is_prefill and bool(getattr(self, "_capture_prefill_logits", False)):
+            return False
+        if not hasattr(self.executor, "forward_step_sampled_token_ids_jit"):
+            return False
+        has_sampling = False
+        for seq in seqs:
+            temperature = float(getattr(seq, "temperature", 0.0))
+            if temperature < 0.0:
+                return False
+            if temperature > 0.0:
+                has_sampling = True
+            if float(getattr(seq, "top_p", 1.0)) < 1.0:
+                return False
+            if int(getattr(seq, "top_k", -1)) > 0:
+                return False
+        return has_sampling
+
+    def _sample_temperatures_device(self, seqs: List[Sequence], batch: ScheduledBatch) -> jnp.ndarray:
+        row_count = len(seqs) if batch.is_prefill and batch.packed_prefill else int(batch.tokens.shape[0])
+        values = [0.0 for _ in range(row_count)]
+        active_limit = min(len(seqs), row_count)
+        for row in range(active_limit):
+            if batch.query_lens_host is not None and int(batch.query_lens_host[row]) <= 0:
+                continue
+            values[row] = float(getattr(seqs[row], "temperature", 0.0))
+        return jnp.asarray(values, dtype=jnp.float32)
+
+    def _sample_rng_slots_and_counters_device(
+        self,
+        batch: ScheduledBatch,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        self._flush_resident_rng_counter_resets()
+        row_count = (
+            len(batch.query_lens_host)
+            if batch.is_prefill and batch.packed_prefill and batch.query_lens_host is not None
+            else int(batch.tokens.shape[0])
+        )
+        slot_values = list(batch.hybrid_slot_ids_host or ())
+        if len(slot_values) < row_count:
+            slot_values.extend([-1] * (row_count - len(slot_values)))
+        safe_slots = [max(0, int(slot)) for slot in slot_values[:row_count]]
+        slot_ids = jnp.asarray(safe_slots, dtype=jnp.int32)
+        if hasattr(self, "_resident_rng_counters"):
+            counters = self._resident_rng_counters[slot_ids]
+        else:
+            counters = jnp.zeros((row_count,), dtype=jnp.int32)
+        return slot_ids, counters.astype(jnp.int32)
+
+    def _flush_resident_rng_counter_resets(self) -> None:
+        """Apply deferred sampled-RNG counter resets before sampled paths read them."""
+
+        reset_slots = getattr(self, "_resident_rng_counter_reset_slots", set())
+        if not reset_slots or not hasattr(self, "_resident_rng_counters"):
+            return
+        slots = tuple(sorted(int(slot) for slot in reset_slots if int(slot) >= 0))
+        reset_slots.clear()
+        if not slots:
+            return
+        slot_ids = jnp.asarray(slots, dtype=jnp.int32)
+        self._resident_rng_counters = self._resident_rng_counters.at[slot_ids].set(
+            jnp.zeros((len(slots),), dtype=jnp.int32)
+        )
+
+    def _record_resident_rng_counters(
+        self,
+        batch: ScheduledBatch,
+        updated_counters: jnp.ndarray | None,
+        *,
+        active_rows: list[int],
+        prefill_final_flags: list[bool],
+    ) -> None:
+        if updated_counters is None or not hasattr(self, "_resident_rng_counters"):
+            return
+        self._flush_resident_rng_counter_resets()
+        slot_values = list(batch.hybrid_slot_ids_host or ())
+        if not slot_values:
+            return
+        slots: list[int] = []
+        rows: list[int] = []
+        for row in active_rows:
+            if row >= len(slot_values):
+                continue
+            if batch.is_prefill and (row >= len(prefill_final_flags) or not prefill_final_flags[row]):
+                continue
+            slot = int(slot_values[row])
+            if slot < 0:
+                continue
+            slots.append(slot)
+            rows.append(row)
+        if not slots:
+            return
+        self._resident_rng_counters = self._resident_rng_counters.at[
+            jnp.asarray(slots, dtype=jnp.int32)
+        ].set(updated_counters[jnp.asarray(rows, dtype=jnp.int32)].astype(jnp.int32))
 
     def _greedy_decode_burst_steps(self, seqs: List[Sequence], batch: ScheduledBatch) -> int:
         if batch.is_prefill:
@@ -3061,6 +3386,14 @@ class CanonicalModelRunner:
             batch,
             seed_mtp1=return_hidden_for_seed,
         )
+        use_sampled_token_fastpath = (
+            not use_greedy_token_fastpath
+            and self._can_use_sampled_token_fastpath(
+                seqs,
+                batch,
+                seed_mtp1=return_hidden_for_seed,
+            )
+        )
         decode_burst_steps = (
             self._greedy_decode_burst_steps(seqs, batch)
             if use_greedy_token_fastpath
@@ -3085,6 +3418,14 @@ class CanonicalModelRunner:
             and self._hybrid_state_table.conv_state is not None
             and self._hybrid_state_table.recurrent_state is not None
             and hasattr(self.executor, "forward_prefill_token_ids_table_jit")
+        )
+        use_sampled_hybrid_table_decode = (
+            use_sampled_token_fastpath
+            and not batch.is_prefill
+            and self._hybrid_state_table.conv_state is not None
+            and self._hybrid_state_table.recurrent_state is not None
+            and bool(getattr(self, "resident_decode_metadata", False))
+            and hasattr(self.executor, "forward_step_sampled_token_ids_resident_dense_slot_carry_jit")
         )
         use_prefill_slot_carry_table = (
             use_hybrid_table_prefill
@@ -3119,7 +3460,21 @@ class CanonicalModelRunner:
                 active_rows=self._active_decode_rows_host(batch),
             )
         )
-        if not (resident_slot_token_decode or resident_slot_token_metadata_decode):
+        sampled_resident_dense_slot_token_metadata_decode = (
+            use_sampled_hybrid_table_decode
+            and bool(getattr(self, "device_token_carry", False))
+            and hasattr(self, "_resident_last_tokens")
+            and hasattr(self, "_resident_rng_counters")
+            and self._resident_slot_token_dense_decode_ready(
+                batch,
+                active_rows=self._active_decode_rows_host(batch),
+            )
+        )
+        if not (
+            resident_slot_token_decode
+            or resident_slot_token_metadata_decode
+            or sampled_resident_dense_slot_token_metadata_decode
+        ):
             batch = self._maybe_apply_device_token_carry(batch)
         if batch.query_lens_host is not None:
             query_lens = [int(x) for x in batch.query_lens_host[: len(seqs)]]
@@ -3134,7 +3489,7 @@ class CanonicalModelRunner:
             for row, query_len in enumerate(query_lens)
             if query_len > 0 and seq_ids_host[row] >= 0
         ]
-        if use_hybrid_table_decode or use_hybrid_table_prefill:
+        if use_hybrid_table_decode or use_hybrid_table_prefill or sampled_resident_dense_slot_token_metadata_decode:
             hybrid_slot_ids = self._batch_hybrid_slot_ids(batch)
             hybrid_slot_values = list(batch.hybrid_slot_ids_host or ())
             hybrid_state = self._hybrid_state_table
@@ -3150,12 +3505,16 @@ class CanonicalModelRunner:
             and not resident_slot_token_metadata_decode
             and hasattr(self.executor, "forward_step_token_ids_resident_jit")
         )
-        if use_resident_slot_decode or resident_slot_token_metadata_decode:
+        if (
+            use_resident_slot_decode
+            or resident_slot_token_metadata_decode
+            or sampled_resident_dense_slot_token_metadata_decode
+        ):
             self._sync_resident_decode_metadata(
                 batch,
                 hybrid_slot_values,
                 sync_seq_lens=True,
-            )
+        )
         prefill_resident_tokens_seeded = False
         if decode_burst_steps > 1:
             if use_hybrid_table_decode:
@@ -3249,6 +3608,35 @@ class CanonicalModelRunner:
                     cache_storage=self.cache_storage,
                     hybrid_state=hybrid_state,
                 )
+        elif use_sampled_token_fastpath:
+            temperatures = self._sample_temperatures_device(seqs, batch)
+            if sampled_resident_dense_slot_token_metadata_decode:
+                self._flush_resident_rng_counter_resets()
+                output = self.executor.forward_step_sampled_token_ids_resident_dense_slot_carry_jit(
+                    batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state_table=hybrid_state,
+                    hybrid_slot_ids=hybrid_slot_ids,
+                    resident_block_tables=self._resident_block_tables,
+                    resident_seq_lens=self._resident_seq_lens,
+                    resident_last_tokens=self._resident_last_tokens,
+                    resident_rng_counters=self._resident_rng_counters,
+                    temperatures=temperatures,
+                )
+                if output.resident_last_tokens is not None:
+                    self._resident_last_tokens = output.resident_last_tokens
+                if output.resident_rng_counters is not None:
+                    self._resident_rng_counters = output.resident_rng_counters
+            else:
+                rng_slots, rng_counters = self._sample_rng_slots_and_counters_device(batch)
+                output = self.executor.forward_step_sampled_token_ids_jit(
+                    batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state=hybrid_state,
+                    temperatures=temperatures,
+                    rng_counters=rng_counters,
+                    rng_slots=rng_slots,
+                )
         else:
             output = self._step_fn(batch)(
                 batch,
@@ -3259,11 +3647,15 @@ class CanonicalModelRunner:
                 last_logits_only=True,
             )
         self.cache_storage = output.cache_storage
-        if use_hybrid_table_decode or use_hybrid_table_prefill:
+        if use_hybrid_table_decode or use_hybrid_table_prefill or sampled_resident_dense_slot_token_metadata_decode:
             self._hybrid_state_table = output.hybrid_state
             self._mark_hybrid_slots_written(list(batch.hybrid_slot_ids_host or ()))
             if (
-                (use_resident_slot_decode or resident_slot_token_metadata_decode)
+                (
+                    use_resident_slot_decode
+                    or resident_slot_token_metadata_decode
+                    or sampled_resident_dense_slot_token_metadata_decode
+                )
                 and output.resident_seq_lens is not None
             ):
                 self._resident_seq_lens = output.resident_seq_lens
@@ -3274,6 +3666,13 @@ class CanonicalModelRunner:
                 )
         else:
             self._store_batch_hybrid_state(batch, output.hybrid_state)
+            if use_sampled_token_fastpath:
+                self._record_resident_rng_counters(
+                    batch,
+                    output.resident_rng_counters,
+                    active_rows=active_rows,
+                    prefill_final_flags=prefill_final_flags,
+                )
         if batch.is_prefill and bool(getattr(self, "resident_decode_metadata", False)):
             self._sync_resident_decode_metadata(
                 batch,
@@ -3311,7 +3710,7 @@ class CanonicalModelRunner:
         if decode_burst_steps > 1:
             token_ids_all = output.activations[: len(seqs), :decode_burst_steps]
             last_logits = None
-        elif use_greedy_token_fastpath:
+        elif use_greedy_token_fastpath or use_sampled_token_fastpath:
             token_ids_all = output.activations
             if int(token_ids_all.shape[0]) != len(seqs):
                 token_ids_all = token_ids_all[: len(seqs)]
@@ -3324,7 +3723,7 @@ class CanonicalModelRunner:
         else:
             last_logits = output.activations[: len(seqs), 0]
         carry_device_tokens = (
-            use_greedy_token_fastpath
+            (use_greedy_token_fastpath or use_sampled_token_fastpath)
             and bool(
                 getattr(
                     self,
@@ -3338,7 +3737,7 @@ class CanonicalModelRunner:
             )
             and all(seqs[row].ignore_eos for row in active_rows)
         )
-        if use_greedy_token_fastpath and decode_burst_steps <= 1:
+        if (use_greedy_token_fastpath or use_sampled_token_fastpath) and decode_burst_steps <= 1:
             self._record_device_token_carry(
                 batch,
                 output.activations,
@@ -3348,17 +3747,18 @@ class CanonicalModelRunner:
                 update_resident_tokens=not (
                     resident_slot_token_decode
                     or resident_slot_token_metadata_decode
+                    or sampled_resident_dense_slot_token_metadata_decode
                     or prefill_resident_tokens_seeded
                 ),
             )
         elif use_greedy_token_fastpath and decode_burst_steps > 1 and carry_device_tokens:
-            self._record_device_token_carry(
-                snapshot_batch,
-                output.activations[:, -1:],
-                active_rows=active_rows,
-                prefill_final_flags=prefill_final_flags,
-                seqs=seqs,
-            )
+                self._record_device_token_carry(
+                    snapshot_batch,
+                    output.activations[:, -1:],
+                    active_rows=active_rows,
+                    prefill_final_flags=prefill_final_flags,
+                    seqs=seqs,
+                )
         else:
             self._clear_device_token_carry()
         if batch.is_prefill and last_logits is not None:
@@ -3391,7 +3791,7 @@ class CanonicalModelRunner:
                         row: [int(token_id) for token_id in token_row]
                         for row, token_row in zip(active_rows, token_rows.tolist())
                     }
-            elif use_greedy_token_fastpath:
+            elif use_greedy_token_fastpath or use_sampled_token_fastpath:
                 if active_rows == list(range(len(seqs))):
                     token_ids = token_ids_all
                 else:

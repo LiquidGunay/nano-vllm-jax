@@ -156,9 +156,17 @@ def _full_attention_decode_impl(config=None) -> str:
         "triton_paged_append",
     }:
         return "triton_paged_fused_append"
+    if value in {
+        "flashinfer",
+        "flashinfer_paged",
+        "paged_flashinfer",
+        "flashinfer_paged_decode",
+    }:
+        return "flashinfer_paged"
     raise ValueError(
         "Unknown full_attention_decode_impl="
-        f"{value!r}; expected reference, triton_paged, or triton_paged_fused_append"
+        f"{value!r}; expected reference, triton_paged, triton_paged_fused_append, "
+        "or flashinfer_paged"
     )
 
 
@@ -951,6 +959,12 @@ class PureJAXBackend:
             )
 
         if flashinfer_kv_append_requested:
+            if metadata.token_row_ids is not None:
+                raise ValueError(
+                    "FlashInfer KV append currently supports rectangular scheduled "
+                    "K/V tensors only; packed prefill must use the reference append "
+                    "or a decode path that owns its append boundary"
+                )
             if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
                 raise ValueError(
                     "FlashInfer KV append requires cache shape "
@@ -1119,6 +1133,48 @@ class PureJAXBackend:
                 scale=scale,
                 num_key_value_groups=num_key_value_groups,
             )
+        if decode_impl == "flashinfer_paged":
+            if query.shape[1] != 1:
+                raise ValueError(
+                    "full_attention.decode_impl=flashinfer_paged supports only "
+                    "width-1 decode attention"
+                )
+            if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
+                raise ValueError(
+                    "full_attention.decode_impl=flashinfer_paged requires cache "
+                    "shape [num_layers, num_pages, page_size, num_kv_heads, head_dim]"
+                )
+            if cache.k_cache.dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
+                raise ValueError(
+                    "full_attention.decode_impl=flashinfer_paged requires BF16/FP16 "
+                    "NHD KV cache; set full_attention_kv_cache_dtype to bf16 or fp16"
+                )
+            from nanovllm_jax.kernels.flashinfer_ffi import (
+                paged_decode_attention_gqa_nhd,
+            )
+            from nanovllm_jax.kernels.paged_attention import (
+                dense_block_tables_to_kv_indptr,
+                kv_last_page_len_from_seq_lens,
+            )
+
+            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
+                metadata.block_tables,
+            )
+            query_for_kernel = query[:, 0].astype(cache.k_cache.dtype)
+            out = paged_decode_attention_gqa_nhd(
+                query_for_kernel,
+                cache.k_cache[layer_id],
+                cache.v_cache[layer_id],
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len_from_seq_lens(metadata.seq_lens, block_size),
+                scale=scale,
+            )
+            return out.reshape(
+                query.shape[0],
+                1,
+                query.shape[2] * query.shape[3],
+            )
         return paged_attention_decode(
             query=query,
             k_cache=cache.k_cache,
@@ -1147,6 +1203,51 @@ class PureJAXBackend:
         is_prefill: bool,
     ) -> tuple[KVCacheStorage, jnp.ndarray]:
         decode_impl = _full_attention_decode_impl(self.config)
+        if not is_prefill and decode_impl == "flashinfer_paged":
+            if metadata.positions is None:
+                raise ValueError("metadata.positions is required for FlashInfer decode attention")
+            if query.shape[1] != 1 or k.shape[1] != 1 or v.shape[1] != 1:
+                raise ValueError(
+                    "full_attention.decode_impl=flashinfer_paged supports only width-1 decode"
+                )
+            if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
+                raise ValueError(
+                    "full_attention.decode_impl=flashinfer_paged requires cache shape "
+                    "[num_layers, num_pages, page_size, num_kv_heads, head_dim]"
+                )
+            if cache.k_cache.dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
+                raise ValueError(
+                    "full_attention.decode_impl=flashinfer_paged requires BF16/FP16 "
+                    "NHD KV cache; set full_attention_kv_cache_dtype to bf16 or fp16"
+                )
+            from nanovllm_jax.kernels.flashinfer_ffi import (
+                paged_decode_attention_with_kv_append_gqa_nhd,
+            )
+            from nanovllm_jax.kernels.paged_attention import (
+                dense_block_tables_to_kv_indptr,
+                kv_last_page_len_from_seq_lens,
+            )
+
+            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
+                metadata.block_tables,
+            )
+            out, k_cache, v_cache = paged_decode_attention_with_kv_append_gqa_nhd(
+                query[:, 0].astype(cache.k_cache.dtype),
+                k[:, 0].astype(cache.k_cache.dtype),
+                v[:, 0].astype(cache.v_cache.dtype),
+                cache.k_cache,
+                cache.v_cache,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len_from_seq_lens(metadata.seq_lens, block_size),
+                metadata.positions.reshape(query.shape[0]).astype(jnp.int32),
+                layer_id=layer_id,
+                scale=scale,
+            )
+            return (
+                KVCacheStorage(k_cache, v_cache),
+                out.reshape(query.shape[0], 1, query.shape[2] * query.shape[3]),
+            )
         if not is_prefill and decode_impl == "triton_paged_fused_append":
             if metadata.positions is None:
                 raise ValueError("metadata.positions is required for fused decode attention")

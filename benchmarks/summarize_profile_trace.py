@@ -99,6 +99,70 @@ def _hlo_rows(totals: dict[tuple[str, str, str], list[Any]], limit: int) -> list
     return rows[: max(0, int(limit))]
 
 
+def _is_gemm_event(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        "gemm" in lowered
+        or "__cublas" in lowered
+        or "cublaslt::splitkreduce" in lowered
+        or "cutlass::kernel" in lowered
+    )
+
+
+def _kernel_grid(kernel_details: str) -> str:
+    for item in kernel_details.split():
+        if item.startswith("grid:"):
+            return item.removeprefix("grid:")
+    return ""
+
+
+def _gemm_kernel_rows(
+    totals: dict[tuple[str, str, str, str], list[float | int]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    rows = [
+        {
+            "event": event_name,
+            "hlo_op": hlo_op,
+            "grid": grid,
+            "kernel_details": kernel_details,
+            "total_ms": float(total),
+            "count": int(count),
+        }
+        for (event_name, hlo_op, grid, kernel_details), (total, count) in totals.items()
+        if float(total) > 0.0
+    ]
+    rows.sort(key=lambda row: row["total_ms"], reverse=True)
+    return rows[: max(0, int(limit))]
+
+
+def _gemm_grid_rows(
+    totals: dict[str, list[Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    rows = []
+    for grid, (total, count, events) in totals.items():
+        event_counts = sorted(
+            (
+                {"event": event_name, "count": int(event_count)}
+                for event_name, event_count in events.items()
+            ),
+            key=lambda row: row["count"],
+            reverse=True,
+        )
+        rows.append(
+            {
+                "grid": grid,
+                "total_ms": float(total),
+                "count": int(count),
+                "top_events": event_counts[:3],
+            }
+        )
+    rows = [row for row in rows if row["total_ms"] > 0.0]
+    rows.sort(key=lambda row: row["total_ms"], reverse=True)
+    return rows[: max(0, int(limit))]
+
+
 def summarize_trace(
     path: Path,
     *,
@@ -113,6 +177,8 @@ def summarize_trace(
     event_totals: dict[str, list[float | int]] = defaultdict(lambda: [0.0, 0])
     pattern_totals: dict[str, list[float | int]] = defaultdict(lambda: [0.0, 0])
     hlo_totals: dict[tuple[str, str, str], list[Any]] = defaultdict(lambda: [0.0, 0, ""])
+    gemm_kernel_totals: dict[tuple[str, str, str, str], list[float | int]] = defaultdict(lambda: [0.0, 0])
+    gemm_grid_totals: dict[str, list[Any]] = defaultdict(lambda: [0.0, 0, defaultdict(int)])
     pattern_list = tuple(dict.fromkeys(str(pattern) for pattern in patterns if str(pattern)))
 
     for event in events:
@@ -125,13 +191,22 @@ def summarize_trace(
         event_totals[name][1] += 1
         args = event.get("args") or {}
         hlo_op = str(args.get("hlo_op") or "")
+        kernel_details = str(args.get("kernel_details") or "")
+        if _is_gemm_event(name):
+            grid = _kernel_grid(kernel_details)
+            gemm_key = (name, hlo_op, grid, kernel_details)
+            gemm_kernel_totals[gemm_key][0] += duration_ms
+            gemm_kernel_totals[gemm_key][1] += 1
+            gemm_grid_totals[grid][0] += duration_ms
+            gemm_grid_totals[grid][1] += 1
+            gemm_grid_totals[grid][2][name] += 1
         if hlo_op:
             hlo_module = str(args.get("hlo_module") or "")
             hlo_key = (hlo_module, hlo_op, name)
             hlo_totals[hlo_key][0] += duration_ms
             hlo_totals[hlo_key][1] += 1
             if not hlo_totals[hlo_key][2]:
-                hlo_totals[hlo_key][2] = str(args.get("kernel_details") or "")
+                hlo_totals[hlo_key][2] = kernel_details
         for pattern in pattern_list:
             if pattern in name:
                 pattern_totals[pattern][0] += duration_ms
@@ -142,6 +217,8 @@ def summarize_trace(
         "scope": scope,
         "top_events_by_total_ms": _event_rows(event_totals, top_events),
         "top_hlo_ops_by_total_ms": _hlo_rows(hlo_totals, top_hlo_ops),
+        "top_gemm_grids_by_total_ms": _gemm_grid_rows(gemm_grid_totals, top_hlo_ops),
+        "top_gemm_kernels_by_total_ms": _gemm_kernel_rows(gemm_kernel_totals, top_hlo_ops),
         "patterns": {
             pattern: {
                 "total_ms": float(total),
@@ -197,6 +274,42 @@ def render_markdown(summary: dict[str, Any]) -> str:
                 )
         else:
             lines.append("No HLO rows.")
+        lines.extend(["", "### Top GEMM Grids", ""])
+        gemm_grid_rows = trace.get("top_gemm_grids_by_total_ms") or []
+        if gemm_grid_rows:
+            lines.extend(
+                [
+                    "| grid | total ms | count | top events |",
+                    "| --- | ---: | ---: | --- |",
+                ]
+            )
+            for row in gemm_grid_rows:
+                top_events = ", ".join(
+                    f"`{event['event']}` ({event['count']})"
+                    for event in row.get("top_events", [])
+                )
+                lines.append(
+                    f"| `{row['grid']}` | {row['total_ms']:.2f} | {row['count']} | {top_events} |"
+                )
+        else:
+            lines.append("No GEMM grid rows.")
+        lines.extend(["", "### Top GEMM Kernels", ""])
+        gemm_rows = trace.get("top_gemm_kernels_by_total_ms") or []
+        if gemm_rows:
+            lines.extend(
+                [
+                    "| event | HLO op | grid | total ms | count | kernel details |",
+                    "| --- | --- | --- | ---: | ---: | --- |",
+                ]
+            )
+            for row in gemm_rows:
+                details = str(row.get("kernel_details") or "")
+                lines.append(
+                    f"| `{row['event']}` | `{row['hlo_op']}` | `{row['grid']}` | "
+                    f"{row['total_ms']:.2f} | {row['count']} | `{details}` |"
+                )
+        else:
+            lines.append("No GEMM kernel rows.")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 

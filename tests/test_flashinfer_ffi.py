@@ -3,6 +3,7 @@
 import importlib.util
 import os
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -12,9 +13,18 @@ import numpy as np
 import pytest
 
 from nanovllm_jax.backends import PureJAXBackend
+from nanovllm_jax.model import ModelParams, lm_head_token_ids_and_topk
 from nanovllm_jax.kernels.flashinfer_ffi import (
     kv_append_paged_nhd,
     kv_append_paged_nhd_reference,
+    paged_decode_attention_gqa_nhd,
+    paged_decode_attention_with_kv_append_gqa_nhd,
+    radix_topk,
+)
+from nanovllm_jax.kernels.paged_attention import (
+    dense_block_tables_to_kv_indptr,
+    kv_last_page_len_from_seq_lens,
+    paged_decode_attention_gqa_nhd_reference,
 )
 from nanovllm_jax.kv_cache import (
     AttentionMetadata,
@@ -103,6 +113,271 @@ def test_kv_append_paged_nhd_flashinfer_matches_reference(head_dim):
 
     np.testing.assert_array_equal(np.asarray(actual_k), np.asarray(expected_k))
     np.testing.assert_array_equal(np.asarray(actual_v), np.asarray(expected_v))
+
+
+@pytest.mark.skipif(
+    not (_has_module("flashinfer") and _has_module("jax_tvm_ffi")),
+    reason="FlashInfer/JAX FFI optional dependencies are not installed",
+)
+@pytest.mark.skipif(
+    not _has_cuda_backend(),
+    reason="FlashInfer FFI test requires a CUDA JAX backend",
+)
+def test_radix_topk_flashinfer_matches_jax_top1():
+    logits = jnp.array(
+        [
+            [0.0, 1.5, -1.0, 0.5],
+            [3.0, -2.0, 8.0, 1.0],
+        ],
+        dtype=jnp.float32,
+    )
+
+    values, indices = jax.jit(lambda x: radix_topk(x, top_k=1))(logits)
+
+    np.testing.assert_allclose(
+        np.asarray(values),
+        np.asarray(jnp.max(logits, axis=-1, keepdims=True)),
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(indices),
+        np.asarray(jnp.argmax(logits, axis=-1, keepdims=True)),
+    )
+
+
+@pytest.mark.skipif(
+    not (_has_module("flashinfer") and _has_module("jax_tvm_ffi")),
+    reason="FlashInfer/JAX FFI optional dependencies are not installed",
+)
+@pytest.mark.skipif(
+    not _has_cuda_backend(),
+    reason="FlashInfer FFI test requires a CUDA JAX backend",
+)
+def test_paged_decode_attention_flashinfer_matches_reference():
+    key = jax.random.PRNGKey(0)
+    batch = 2
+    num_heads = 4
+    num_kv_heads = 2
+    head_dim = 128
+    page_size = 16
+    max_pages_per_sequence = 2
+    num_pages = batch * max_pages_per_sequence
+    scale = 1.0 / np.sqrt(head_dim)
+    block_tables = jnp.array([[2, 0], [3, 1]], dtype=jnp.int32)
+    seq_lens = jnp.array([17, 30], dtype=jnp.int32)
+    query = jax.random.normal(
+        key,
+        (batch, num_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    k_cache = jax.random.normal(
+        jax.random.fold_in(key, 1),
+        (num_pages, page_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    v_cache = jax.random.normal(
+        jax.random.fold_in(key, 2),
+        (num_pages, page_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(block_tables)
+    kv_last_page_len = kv_last_page_len_from_seq_lens(seq_lens, page_size)
+
+    actual = jax.jit(
+        lambda q, k, v: paged_decode_attention_gqa_nhd(
+            q,
+            k,
+            v,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            scale=scale,
+        )
+    )(query, k_cache, v_cache)
+    expected = paged_decode_attention_gqa_nhd_reference(
+        query,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        seq_lens,
+        scale,
+        max_pages_per_sequence=max_pages_per_sequence,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual, dtype=np.float32),
+        np.asarray(expected, dtype=np.float32),
+        rtol=5e-2,
+        atol=5e-2,
+    )
+
+
+@pytest.mark.skipif(
+    not (_has_module("flashinfer") and _has_module("jax_tvm_ffi")),
+    reason="FlashInfer/JAX FFI optional dependencies are not installed",
+)
+@pytest.mark.skipif(
+    not _has_cuda_backend(),
+    reason="FlashInfer FFI test requires a CUDA JAX backend",
+)
+def test_paged_decode_fused_append_flashinfer_matches_reference():
+    key = jax.random.PRNGKey(1)
+    batch = 2
+    num_heads = 4
+    num_kv_heads = 2
+    head_dim = 128
+    page_size = 16
+    max_pages_per_sequence = 2
+    num_pages = batch * max_pages_per_sequence
+    layer_id = 1
+    scale = 1.0 / np.sqrt(head_dim)
+    block_tables = jnp.array([[2, 0], [3, 1]], dtype=jnp.int32)
+    seq_lens = jnp.array([17, 30], dtype=jnp.int32)
+    positions = seq_lens - 1
+    query = jax.random.normal(
+        key,
+        (batch, num_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    new_k = jax.random.normal(
+        jax.random.fold_in(key, 1),
+        (batch, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    new_v = jax.random.normal(
+        jax.random.fold_in(key, 2),
+        (batch, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    k_cache = jax.random.normal(
+        jax.random.fold_in(key, 3),
+        (2, num_pages, page_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    v_cache = jax.random.normal(
+        jax.random.fold_in(key, 4),
+        (2, num_pages, page_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(block_tables)
+    kv_last_page_len = kv_last_page_len_from_seq_lens(seq_lens, page_size)
+
+    actual, actual_k, actual_v = jax.jit(
+        lambda q, nk, nv, kc, vc: paged_decode_attention_with_kv_append_gqa_nhd(
+            q,
+            nk,
+            nv,
+            kc,
+            vc,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            positions,
+            layer_id=layer_id,
+            scale=scale,
+        )
+    )(query, new_k, new_v, k_cache, v_cache)
+
+    expected_k_layer, expected_v_layer = kv_append_paged_nhd_reference(
+        new_k,
+        new_v,
+        jnp.arange(batch, dtype=jnp.int32),
+        positions.astype(jnp.int32),
+        k_cache[layer_id],
+        v_cache[layer_id],
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+    )
+    expected_k = k_cache.at[layer_id].set(expected_k_layer)
+    expected_v = v_cache.at[layer_id].set(expected_v_layer)
+    expected = paged_decode_attention_gqa_nhd_reference(
+        query,
+        expected_k[layer_id],
+        expected_v[layer_id],
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        seq_lens,
+        scale,
+        max_pages_per_sequence=max_pages_per_sequence,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual, dtype=np.float32),
+        np.asarray(expected, dtype=np.float32),
+        rtol=5e-2,
+        atol=5e-2,
+    )
+    np.testing.assert_array_equal(np.asarray(actual_k), np.asarray(expected_k))
+    np.testing.assert_array_equal(np.asarray(actual_v), np.asarray(expected_v))
+
+
+@pytest.mark.skipif(
+    not (_has_module("flashinfer") and _has_module("jax_tvm_ffi")),
+    reason="FlashInfer/JAX FFI optional dependencies are not installed",
+)
+@pytest.mark.skipif(
+    not _has_cuda_backend(),
+    reason="FlashInfer FFI test requires a CUDA JAX backend",
+)
+def test_lm_head_flashinfer_topk_matches_jax_decode_top1():
+    hidden = jnp.array(
+        [
+            [[0.2, -0.4, 0.7, 1.0]],
+            [[-0.5, 0.8, 0.4, -0.1]],
+        ],
+        dtype=jnp.float32,
+    )
+    embed_tokens = jnp.array(
+        [
+            [-0.7, 0.1, 0.2, 0.4],
+            [0.3, -0.2, 0.6, 0.1],
+            [0.4, 0.7, -0.5, 0.2],
+            [-0.3, 0.5, 0.8, -0.1],
+        ],
+        dtype=jnp.float32,
+    )
+    params = ModelParams(
+        embed_tokens=embed_tokens,
+        layers=[],
+        norm_weight=jnp.ones((4,), dtype=jnp.float32),
+        lm_head=None,
+    )
+    base_config = SimpleNamespace(
+        rms_norm_eps=1e-6,
+        decode_padded_gemm=False,
+        lm_head_decode_act_dtype="fp32",
+        lm_head_topk_impl="jax",
+    )
+    flashinfer_config = SimpleNamespace(
+        rms_norm_eps=1e-6,
+        decode_padded_gemm=False,
+        lm_head_decode_act_dtype="fp32",
+        lm_head_topk_impl="flashinfer",
+    )
+
+    expected = lm_head_token_ids_and_topk(
+        hidden,
+        params,
+        base_config,
+        is_prefill=False,
+        top_k=1,
+    )
+    actual = lm_head_token_ids_and_topk(
+        hidden,
+        params,
+        flashinfer_config,
+        is_prefill=False,
+        top_k=1,
+    )
+
+    np.testing.assert_array_equal(np.asarray(actual[0]), np.asarray(expected[0]))
+    np.testing.assert_allclose(np.asarray(actual[1]), np.asarray(expected[1]), rtol=0, atol=0)
+    np.testing.assert_array_equal(np.asarray(actual[2]), np.asarray(expected[2]))
 
 
 @pytest.mark.skipif(

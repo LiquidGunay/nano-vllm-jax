@@ -772,6 +772,30 @@ def test_model_runner_hybrid_state_zeroes_reused_slot_on_allocation_not_release(
     assert runner._hybrid_slots == {1: 1, 8: 0}
 
 
+def test_model_runner_release_defers_resident_rng_counter_reset():
+    runner = _hybrid_state_runner_with_two_slots()
+    runner.hybrid_states = {0: object()}
+    runner._mtp1_drafts = {}
+    runner._resident_rng_counters = jnp.asarray([5, 7], dtype=jnp.int32)
+    runner._resident_rng_counter_reset_slots = set()
+
+    runner.release([0])
+
+    assert runner._resident_rng_counter_reset_slots == {0}
+    np.testing.assert_array_equal(
+        np.asarray(runner._resident_rng_counters),
+        np.array([5, 7], dtype=np.int32),
+    )
+
+    runner._flush_resident_rng_counter_resets()
+
+    assert runner._resident_rng_counter_reset_slots == set()
+    np.testing.assert_array_equal(
+        np.asarray(runner._resident_rng_counters),
+        np.array([0, 7], dtype=np.int32),
+    )
+
+
 def test_model_runner_hybrid_state_does_not_replace_full_table_with_inactive_rows():
     runner = _hybrid_state_runner_with_two_slots()
     original_state = runner._hybrid_state_table
@@ -955,6 +979,23 @@ def test_scheduler_chunks_prefill_by_max_batched_tokens_budget():
     assert second_batch_seqs[0].status == SequenceStatus.FINISHED
     assert second_batch_seqs[0].num_cached_tokens == 0
     assert second_batch_seqs[0].block_table == []
+
+
+def test_scheduler_zero_max_batched_tokens_does_not_block_prefill():
+    config = _tiny_full_attention_config()
+    config.max_blocks_per_seq = 8
+    config.max_num_batched_tokens = 0
+    scheduler = Scheduler(config)
+    seq = Sequence([1, 2, 3, 4], SamplingParams(temperature=0.0, max_tokens=1), seq_id=13)
+
+    scheduler.add(seq)
+
+    scheduled_seqs, batch = scheduler.schedule()
+
+    assert scheduled_seqs == [seq]
+    assert batch.is_prefill
+    assert batch.prefill_final_flags == [True]
+    assert int(batch.query_lens[0]) == 4
 
 
 def test_scheduler_continues_running_prefill_when_waiting_head_needs_kv():
@@ -2868,8 +2909,10 @@ def test_model_runner_warmup_compiles_resident_slot_carry_decode_when_available(
     assert runner.executor.calls == [
         ("slot_carry_prefill", (1, 4)),
         ("resident_slot_carry_decode", (2, 1), (2, 2), (0, 1), (2, 2), (2,), (2,)),
+        ("resident_slot_carry_decode", (2, 1), (2, 2), (0, -1), (2, 2), (2,), (2,)),
     ]
     assert summary["decode_runs"][0]["route"] == "forward_step_token_ids_resident_slot_carry_jit:decode"
+    assert summary["decode_runs"][1]["route"] == "forward_step_token_ids_resident_slot_carry_jit:decode-inactive-row"
 
 
 def test_model_runner_warmup_compiles_decode_block_table_buckets(monkeypatch):

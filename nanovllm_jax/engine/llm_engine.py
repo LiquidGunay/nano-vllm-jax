@@ -317,7 +317,7 @@ class LLMEngine:
             num_tokens = scheduled_batch.num_prefill_tokens
         else:
             num_tokens = -getattr(self.scheduler, "last_num_generated_tokens", scheduled_batch.num_decode_tokens)
-        
+
         return outputs, num_tokens
 
     def _step_without_finished_output_materialization(self) -> tuple[List[tuple], int]:
@@ -808,16 +808,32 @@ class LLMEngine:
                 raise ValueError("prompt must contain at least one token")
             request_inputs.append(token_ids)
 
+        sampled_token_fastpath = _config_or_env_flag(
+            getattr(self, "config", None),
+            "sampled_token_fastpath",
+            "NANO_VLLM_JAX_SAMPLED_TOKEN_FASTPATH",
+            default=True,
+        )
         for sp in sampling_params:
             if sp.max_tokens <= 0:
                 raise ValueError("max_tokens must be positive")
             if sp.temperature < 0:
                 raise ValueError("temperature must be non-negative")
-            if sp.temperature != 0 or not sp.ignore_eos:
+            if not sp.ignore_eos:
                 raise ValueError(
-                    "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY requires greedy sampling "
-                    "with ignore_eos=True"
+                    "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY requires ignore_eos=True"
                 )
+            if sp.temperature != 0:
+                if not sampled_token_fastpath:
+                    raise ValueError(
+                        "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY with temperature sampling "
+                        "requires sampled_token_fastpath=True"
+                    )
+                if sp.top_p < 1.0 or sp.top_k > 0:
+                    raise ValueError(
+                        "NANO_VLLM_JAX_SAMPLED_TOKEN_FASTPATH currently supports "
+                        "full-vocab temperature sampling only; keep top_p=1.0 and top_k<=0"
+                    )
 
         seqs = [self.add_request(prompt, sp) for prompt, sp in zip(request_inputs, sampling_params)]
         seq_to_request = {seq.seq_id: index for index, seq in enumerate(seqs)}

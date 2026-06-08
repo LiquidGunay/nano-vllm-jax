@@ -112,3 +112,23 @@ It can be exact, but it is not an efficient route to remove
 GEMM/matvec-plus-argmax backend behind
 `runtime.fastpaths.lm_head_greedy_top1_impl`, with the helper and tests listed
 above.
+
+## 2026-06-08 Update
+
+Entry 278 added the config-file-only boundary as
+`lm_head_greedy_top1_impl`. The default remains `jax`; selecting `cutlass`
+fails fast instead of falling back to dense logits. This is intentional because
+Entries 267 and 276 already rejected standalone selector kernels, and the audit
+found no existing vLLM or FlashInfer projection-plus-sampler kernel to reuse.
+
+The remaining implementation work is a real CuTeDSL/CUTLASS or equivalent
+library-backed backend for `[B, H] x [H, V] -> token_ids`. Do not interpret the
+boundary itself as a speed improvement.
+
+Entry 279 tested the tempting shortcut: a CuTeDSL custom call that avoids full
+logits by scanning vocab with scalar dot loops and returning per-thread top-1
+candidates. It matched a focused token-id test but was about `~100.21 ms` on
+the representative `B=8,H=1024,V=248064` BF16 shape, versus XLA
+`dot+argmax` at `~1.04 ms`. The scalar route gives up tensor cores and must not
+be promoted. A standalone CUTLASS Ampere full-output GEMM was neutral at
+`~1035 us`, so swapping GEMM libraries without fusing top-1 is also not a win.

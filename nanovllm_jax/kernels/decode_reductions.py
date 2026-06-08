@@ -99,6 +99,67 @@ def _triton_rms_num_warps(hidden_dim: int) -> int:
     return 1
 
 
+def _triton_rms_padded_gemm_kernel():
+    _jt, triton, tl = _triton_modules()
+
+    @triton.jit
+    def _kernel(
+        x,
+        norm_weight,
+        mat_weight,
+        out,
+        batch_size: tl.constexpr,
+        hidden_dim: tl.constexpr,
+        out_dim: tl.constexpr,
+        EPS: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        rows = tl.arange(0, BLOCK_M)
+        cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        k_offsets = tl.arange(0, BLOCK_K)
+        row_mask = rows < batch_size
+
+        sum_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        for k_start in range(0, hidden_dim, BLOCK_K):
+            k = k_start + k_offsets
+            values = tl.load(
+                x + rows[:, None] * hidden_dim + k[None, :],
+                mask=row_mask[:, None] & (k[None, :] < hidden_dim),
+                other=0.0,
+            ).to(tl.float32)
+            sum_sq += tl.sum(values * values, axis=1)
+        scale = tl.rsqrt(sum_sq / hidden_dim + EPS)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_start in range(0, hidden_dim, BLOCK_K):
+            k = k_start + k_offsets
+            values = tl.load(
+                x + rows[:, None] * hidden_dim + k[None, :],
+                mask=row_mask[:, None] & (k[None, :] < hidden_dim),
+                other=0.0,
+            ).to(tl.float32)
+            weights = tl.load(norm_weight + k, mask=k < hidden_dim, other=0.0).to(tl.float32)
+            a = values * scale[:, None] * (1.0 + weights[None, :])
+            a = a.to(tl.bfloat16)
+            b = tl.load(
+                mat_weight + k[:, None] * out_dim + cols[None, :],
+                mask=(k[:, None] < hidden_dim) & (cols[None, :] < out_dim),
+                other=0.0,
+            )
+            acc += tl.dot(a, b, out_dtype=tl.float32)
+
+        tl.store(
+            out + rows[:, None] * out_dim + cols[None, :],
+            acc,
+            mask=row_mask[:, None] & (cols[None, :] < out_dim),
+        )
+
+    return _kernel
+
+
 def triton_decode_rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     """Apply Qwen RMSNorm over the last dimension using a Triton custom call."""
     if eps != 1e-6:
@@ -138,6 +199,71 @@ def triton_decode_rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-
         num_stages=3,
     )
     return jnp.reshape(out, x.shape)
+
+
+def triton_decode_rms_padded_gemm(
+    x: jnp.ndarray,
+    norm_weight: jnp.ndarray,
+    mat_weight: jnp.ndarray,
+    *,
+    eps: float = 1e-6,
+    rows: int = 8,
+    block_n: int = 128,
+    block_k: int = 64,
+) -> jnp.ndarray:
+    """Fuse decode RMSNorm and a BF16 row-padded projection.
+
+    This implements ``rms_norm(x, norm_weight).astype(bfloat16) @ mat_weight``
+    for width-1 decode tensors without materializing the normalized activation.
+    """
+
+    if eps != 1e-6:
+        raise ValueError("Triton decode RMS+padded GEMM currently supports eps=1e-6")
+    if x.ndim != 3 or int(x.shape[1]) != 1:
+        raise ValueError("Triton decode RMS+padded GEMM requires x shape [B, 1, H]")
+    if norm_weight.ndim != 1:
+        raise ValueError("Triton decode RMS+padded GEMM requires 1D norm weights")
+    if mat_weight.ndim != 2:
+        raise ValueError("Triton decode RMS+padded GEMM requires mat_weight shape [H, O]")
+    batch = int(x.shape[0])
+    hidden_dim = int(x.shape[-1])
+    out_dim = int(mat_weight.shape[1])
+    if batch <= 0 or hidden_dim <= 0 or out_dim <= 0:
+        raise ValueError("Triton decode RMS+padded GEMM requires non-empty dimensions")
+    if batch > rows:
+        raise ValueError("batch exceeds configured padded GEMM rows")
+    if int(norm_weight.shape[0]) != hidden_dim or int(mat_weight.shape[0]) != hidden_dim:
+        raise ValueError("hidden dimensions must match for Triton decode RMS+padded GEMM")
+    if mat_weight.dtype != jnp.bfloat16:
+        raise ValueError("Triton decode RMS+padded GEMM currently requires BF16 mat weights")
+    if x.dtype not in (jnp.float32, jnp.bfloat16):
+        raise ValueError(f"unsupported x dtype for Triton decode RMS+padded GEMM: {x.dtype}")
+    if norm_weight.dtype not in (jnp.float32, jnp.bfloat16):
+        raise ValueError(
+            f"unsupported norm weight dtype for Triton decode RMS+padded GEMM: {norm_weight.dtype}"
+        )
+
+    jt, _triton, _tl = _triton_modules()
+    x_2d = jnp.reshape(x, (batch, hidden_dim))
+    out = jt.triton_call(
+        x_2d,
+        norm_weight,
+        mat_weight,
+        kernel=_triton_rms_padded_gemm_kernel(),
+        out_shape=jax.ShapeDtypeStruct((batch, out_dim), jnp.bfloat16),
+        grid=(jt.cdiv(out_dim, block_n),),
+        name="decode_rms_padded_gemm_triton",
+        batch_size=batch,
+        hidden_dim=hidden_dim,
+        out_dim=out_dim,
+        EPS=float(eps),
+        BLOCK_M=int(rows),
+        BLOCK_N=int(block_n),
+        BLOCK_K=int(block_k),
+        num_warps=4,
+        num_stages=3,
+    )
+    return jnp.reshape(out, (batch, 1, out_dim))
 
 
 def decode_rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:

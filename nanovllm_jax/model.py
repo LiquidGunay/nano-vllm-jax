@@ -286,6 +286,10 @@ def _decode_padded_gemm_gate_up_enabled(config: Optional[Qwen3_5Config] = None) 
     )
 
 
+def _decode_rms_padded_gemm_enabled(config: Optional[Qwen3_5Config] = None) -> bool:
+    return bool(getattr(config, "decode_rms_padded_gemm", False))
+
+
 def _decode_padded_gemm_rows(config: Optional[Qwen3_5Config] = None) -> int:
     value = _config_or_env_int(
         config,
@@ -310,7 +314,7 @@ def _decode_padded_gemm_max_out_dim(config: Optional[Qwen3_5Config] = None) -> i
         config,
         "decode_padded_gemm_max_out_dim",
         "NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM",
-        default=8192,
+        default=300000,
     )
     try:
         out_dim = int(value)
@@ -322,6 +326,37 @@ def _decode_padded_gemm_max_out_dim(config: Optional[Qwen3_5Config] = None) -> i
     if out_dim < 1:
         raise ValueError("NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM must be positive")
     return out_dim
+
+
+def _lm_head_topk_impl(config: Optional[Qwen3_5Config] = None) -> str:
+    value = _config_or_env_str(
+        config,
+        "lm_head_topk_impl",
+        "NANO_VLLM_JAX_LM_HEAD_TOPK_IMPL",
+        default="jax",
+    )
+    if value in {"", "0", "false", "no", "off", "none", "jax", "reference"}:
+        return "jax"
+    if value in {"flashinfer", "fi", "radix_topk"}:
+        return "flashinfer"
+    raise ValueError(
+        "NANO_VLLM_JAX_LM_HEAD_TOPK_IMPL must be jax or flashinfer, "
+        f"got {value!r}"
+    )
+
+
+def _lm_head_greedy_top1_impl(config: Optional[Qwen3_5Config] = None) -> str:
+    value = str(getattr(config, "lm_head_greedy_top1_impl", "jax") or "jax").strip().lower()
+    if value in {"", "0", "false", "no", "off", "none", "jax", "reference"}:
+        return "jax"
+    if value in {"triton", "triton_tensorcore", "triton_epilogue"}:
+        return "triton"
+    if value in {"cutlass", "cutlass_top1", "cutlass_fused_gemm", "fused_gemm"}:
+        return "cutlass"
+    raise ValueError(
+        "lm_head_greedy_top1_impl must be jax, triton, or cutlass, "
+        f"got {value!r}"
+    )
 
 
 def _can_use_decode_padded_gemm(
@@ -358,6 +393,46 @@ def _decode_padded_gemm_dot(
         x_padded = x_rows
     out = jnp.dot(x_padded, weight)
     return out[:batch, :].reshape(batch, 1, out_dim)
+
+
+def _can_use_decode_rms_padded_gemm(
+    x: jnp.ndarray,
+    norm_weight: jnp.ndarray,
+    weight: jnp.ndarray,
+    config: Optional[Qwen3_5Config] = None,
+) -> bool:
+    rows = _decode_padded_gemm_rows(config)
+    return (
+        _decode_rms_padded_gemm_enabled(config)
+        and _decode_padded_gemm_gate_up_enabled(config)
+        and _decode_projection_activation_dtype(int(x.shape[0]), config) == jnp.bfloat16
+        and x.ndim == 3
+        and norm_weight.ndim == 1
+        and weight.ndim == 2
+        and int(x.shape[0]) <= rows
+        and int(x.shape[1]) == 1
+        and int(x.shape[-1]) == int(norm_weight.shape[0])
+        and int(x.shape[-1]) == int(weight.shape[0])
+        and weight.dtype == jnp.bfloat16
+        and int(weight.shape[1]) <= _decode_padded_gemm_max_out_dim(config)
+    )
+
+
+def _decode_rms_padded_gemm_dot(
+    x: jnp.ndarray,
+    norm_weight: jnp.ndarray,
+    weight: jnp.ndarray,
+    config: Optional[Qwen3_5Config] = None,
+) -> jnp.ndarray:
+    from nanovllm_jax.kernels.decode_reductions import triton_decode_rms_padded_gemm
+
+    return triton_decode_rms_padded_gemm(
+        x,
+        norm_weight,
+        weight,
+        eps=config.rms_norm_eps if config is not None else 1e-6,
+        rows=_decode_padded_gemm_rows(config),
+    )
 
 
 def _decode_projection_activation_dtype(
@@ -591,22 +666,14 @@ def _compact_prefill_mlp_packed(
     return out.at[row_idx, col_idx, :].set(compact_out)
 
 
-def lm_head_token_ids_and_topk(
+def _lm_head_normed_hidden_and_weight(
     hidden: jnp.ndarray,
     params: ModelParams,
     config,
     *,
     hidden_is_normed: bool = False,
     is_prefill: bool = True,
-    top_k: int = 0,
-):
-    """Return greedy LM-head token ids and optional top-k values on device.
-
-    Speculative verification needs exact target token ids and sometimes a
-    top-2 margin, but returning full `[B, width, vocab]` logits from the JIT
-    bloats the verifier path. Keep the dense LM-head computation inside the
-    compiled graph and return only small verifier products.
-    """
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     if hidden_is_normed:
         hidden_norm = hidden
     else:
@@ -627,6 +694,16 @@ def lm_head_token_ids_and_topk(
         _lm_head_decode_activation_dtype(config) if not is_prefill else jnp.float32
     )
     output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
+    return hidden_norm, output_weight
+
+
+def _lm_head_logits_from_normed(
+    hidden_norm: jnp.ndarray,
+    output_weight: jnp.ndarray,
+    config,
+    *,
+    is_prefill: bool = True,
+):
     if _can_use_decode_padded_gemm(hidden_norm, output_weight, config):
         logits = _decode_padded_gemm_dot(hidden_norm, output_weight, config)
     else:
@@ -635,11 +712,164 @@ def lm_head_token_ids_and_topk(
             output_weight,
             force_width1=(not is_prefill) and hidden_norm.ndim == 3 and hidden_norm.shape[1] > 1 and _force_width1_decode_math(),
         )
+    return logits
+
+
+def _lm_head_logits(
+    hidden: jnp.ndarray,
+    params: ModelParams,
+    config,
+    *,
+    hidden_is_normed: bool = False,
+    is_prefill: bool = True,
+):
+    hidden_norm, output_weight = _lm_head_normed_hidden_and_weight(
+        hidden,
+        params,
+        config,
+        hidden_is_normed=hidden_is_normed,
+        is_prefill=is_prefill,
+    )
+    return _lm_head_logits_from_normed(
+        hidden_norm,
+        output_weight,
+        config,
+        is_prefill=is_prefill,
+    )
+
+
+def _lm_head_greedy_top1_token_ids(
+    hidden_norm: jnp.ndarray,
+    output_weight: jnp.ndarray,
+    config,
+) -> jnp.ndarray:
+    impl = _lm_head_greedy_top1_impl(config)
+    if impl == "jax":
+        logits = _lm_head_logits_from_normed(
+            hidden_norm,
+            output_weight,
+            config,
+            is_prefill=False,
+        )
+        return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+    if impl == "triton":
+        from nanovllm_jax.kernels.lm_head_triton import lm_head_greedy_top1_triton
+
+        return lm_head_greedy_top1_triton(hidden_norm, output_weight)
+    if impl == "cutlass":
+        raise NotImplementedError(
+            "lm_head_greedy_top1_impl='cutlass' requires a true fused "
+            "LM-head GEMM+top1 backend. Dense-logit fallback is disabled so "
+            "benchmarks cannot accidentally report the unfused path."
+        )
+    raise AssertionError(f"unexpected LM-head greedy top1 impl: {impl!r}")
+
+
+def lm_head_token_ids_and_topk(
+    hidden: jnp.ndarray,
+    params: ModelParams,
+    config,
+    *,
+    hidden_is_normed: bool = False,
+    is_prefill: bool = True,
+    top_k: int = 0,
+):
+    """Return greedy LM-head token ids and optional top-k values on device.
+
+    Speculative verification needs exact target token ids and sometimes a
+    top-2 margin, but returning full `[B, width, vocab]` logits from the JIT
+    bloats the verifier path. Keep the dense LM-head computation inside the
+    compiled graph and return only small verifier products.
+    """
+    if (
+        (not is_prefill)
+        and top_k == 0
+        and hidden.ndim == 3
+        and int(hidden.shape[1]) == 1
+        and _lm_head_greedy_top1_impl(config) != "jax"
+    ):
+        hidden_norm, output_weight = _lm_head_normed_hidden_and_weight(
+            hidden,
+            params,
+            config,
+            hidden_is_normed=hidden_is_normed,
+            is_prefill=False,
+        )
+        token_ids = _lm_head_greedy_top1_token_ids(hidden_norm, output_weight, config)
+        return token_ids, None, None
+
+    logits = _lm_head_logits(
+        hidden,
+        params,
+        config,
+        hidden_is_normed=hidden_is_normed,
+        is_prefill=is_prefill,
+    )
+    if (
+        (not is_prefill)
+        and logits.ndim == 3
+        and int(logits.shape[1]) == 1
+        and _lm_head_topk_impl(config) == "flashinfer"
+    ):
+        from nanovllm_jax.kernels.flashinfer_ffi import radix_topk
+
+        selection_k = max(1, int(top_k))
+        top_values, top_indices = radix_topk(
+            logits[:, 0, :],
+            top_k=selection_k,
+            sorted_output=selection_k > 1,
+            deterministic=False,
+        )
+        token_ids = top_indices[:, :1].reshape(logits.shape[0], 1).astype(jnp.int32)
+        if top_k > 0:
+            return token_ids, top_values[:, None, :].astype(jnp.float32), top_indices[:, None, :]
+        return token_ids, None, None
+
     token_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
     if top_k > 0:
         top_values, top_indices = jax.lax.top_k(logits.astype(jnp.float32), top_k)
         return token_ids, top_values, top_indices.astype(jnp.int32)
     return token_ids, None, None
+
+
+def lm_head_sample_token_ids(
+    hidden: jnp.ndarray,
+    params: ModelParams,
+    config,
+    *,
+    temperatures: jnp.ndarray,
+    rng_keys: jnp.ndarray,
+    hidden_is_normed: bool = False,
+    is_prefill: bool = True,
+) -> jnp.ndarray:
+    """Sample token ids from LM-head logits without returning full logits.
+
+    This intentionally handles the hot full-vocab temperature-sampling case.
+    Top-k/top-p filtering should be provided by a dedicated sampler kernel
+    before this becomes the general sampling boundary.
+    """
+    logits = _lm_head_logits(
+        hidden,
+        params,
+        config,
+        hidden_is_normed=hidden_is_normed,
+        is_prefill=is_prefill,
+    )
+    logits = logits.astype(jnp.float32)
+    row_logits = logits[:, 0, :] if logits.ndim == 3 else logits
+    temperatures = temperatures.astype(jnp.float32)
+
+    def sample_one(key, logit, temperature):
+        def greedy(_):
+            return jnp.argmax(logit).astype(jnp.int32)
+
+        def sample(_):
+            scaled = logit / jnp.maximum(temperature, jnp.asarray(1e-6, dtype=jnp.float32))
+            return jax.random.categorical(key, scaled, axis=-1).astype(jnp.int32)
+
+        return jax.lax.cond(temperature <= 0.0, greedy, sample, operand=None)
+
+    return jax.vmap(sample_one)(rng_keys, row_logits, temperatures)
 
 
 # Register ModelParams as a JAX pytree node for JIT compatibility
@@ -2444,13 +2674,33 @@ def transformer_block(
 
     # MLP path
     residual = x
-    x = _decode_width1_rms_norm(
-        x,
-        params["ffn_norm"],
-        config.rms_norm_eps,
-        force_width1=force_width1_norm,
-    )
-    ffn_norm_out = x
+    fused_mlp_gate_up = None
+    if (
+        not is_prefill
+        and not return_layer_stages
+        and _MLP_GATE_UP_PACKED_KEY in params
+        and _can_use_decode_rms_padded_gemm(
+            x,
+            params["ffn_norm"],
+            params[_MLP_GATE_UP_PACKED_KEY],
+            config,
+        )
+    ):
+        fused_mlp_gate_up = _decode_rms_padded_gemm_dot(
+            x,
+            params["ffn_norm"],
+            params[_MLP_GATE_UP_PACKED_KEY],
+            config,
+        )
+        ffn_norm_out = x
+    else:
+        x = _decode_width1_rms_norm(
+            x,
+            params["ffn_norm"],
+            config.rms_norm_eps,
+            force_width1=force_width1_norm,
+        )
+        ffn_norm_out = x
 
     # MLP computation (stays in bfloat16)
     force_width1_dot = (not is_prefill) and x.ndim == 3 and x.shape[1] > 1 and _force_width1_decode_math()
@@ -2478,8 +2728,12 @@ def transformer_block(
                 config,
             )
     else:
-        x_proj = x.astype(_decode_projection_activation_dtype(x.shape[0], config))
-        if _MLP_GATE_UP_PACKED_KEY in params:
+        if fused_mlp_gate_up is not None:
+            gate_up = fused_mlp_gate_up
+            gate, up = jnp.split(gate_up, 2, axis=-1)
+        else:
+            x_proj = x.astype(_decode_projection_activation_dtype(x.shape[0], config))
+        if fused_mlp_gate_up is None and _MLP_GATE_UP_PACKED_KEY in params:
             if (
                 _decode_padded_gemm_gate_up_enabled(config)
                 and _can_use_decode_padded_gemm(x_proj, params[_MLP_GATE_UP_PACKED_KEY], config)
@@ -2492,7 +2746,7 @@ def transformer_block(
                     force_width1=force_width1_dot,
                 )
             gate, up = jnp.split(gate_up, 2, axis=-1)
-        else:
+        elif fused_mlp_gate_up is None:
             if (
                 _decode_padded_gemm_gate_up_enabled(config)
                 and _can_use_decode_padded_gemm(x_proj, params["gate_proj"], config)

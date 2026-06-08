@@ -79,6 +79,7 @@ class Qwen3_5Config:
     decode_block_table_buckets: tuple = field(default_factory=tuple)
     jax_execution: str = "eager"
     greedy_token_fastpath: bool = True
+    sampled_token_fastpath: bool = True
     device_token_carry: bool = False
     static_decode_metadata: bool = False
     static_decode_seq_lens_carry: bool = False
@@ -96,11 +97,14 @@ class Qwen3_5Config:
     compact_prefill_mlp: bool = False
     compact_prefill_token_count_mode: str = "exact"
     lm_head_decode_act_dtype: str = "fp32"
+    lm_head_topk_impl: str = "jax"
+    lm_head_greedy_top1_impl: str = "jax"
     decode_proj_act_dtype: str = "fp32"
     decode_padded_gemm: bool = False
     decode_padded_gemm_gate_up: bool = False
+    decode_rms_padded_gemm: bool = False
     decode_padded_gemm_rows: int = 8
-    decode_padded_gemm_max_out_dim: int = 8192
+    decode_padded_gemm_max_out_dim: int = 300000
 
     # Kernel policy carried by config. Low-level diagnostic CUDA switches stay
     # env-only; accepted serving kernels should flow through these fields.
@@ -169,6 +173,16 @@ class Qwen3_5Config:
             self,
             "lm_head_decode_act_dtype",
             str(self.lm_head_decode_act_dtype or "fp32").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "lm_head_topk_impl",
+            str(self.lm_head_topk_impl or "jax").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "lm_head_greedy_top1_impl",
+            str(self.lm_head_greedy_top1_impl or "jax").strip().lower(),
         )
         object.__setattr__(
             self,
@@ -292,6 +306,7 @@ class Qwen3_5Config:
             self.prefill_layout,
             self.decode_block_table_buckets,
             self.greedy_token_fastpath,
+            self.sampled_token_fastpath,
             self.device_token_carry,
             self.static_decode_metadata,
             self.static_decode_seq_lens_carry,
@@ -305,9 +320,12 @@ class Qwen3_5Config:
             self.compact_prefill_mlp,
             self.compact_prefill_token_count_mode,
             self.lm_head_decode_act_dtype,
+            self.lm_head_topk_impl,
+            self.lm_head_greedy_top1_impl,
             self.decode_proj_act_dtype,
             self.decode_padded_gemm,
             self.decode_padded_gemm_gate_up,
+            self.decode_rms_padded_gemm,
             self.decode_padded_gemm_rows,
             self.decode_padded_gemm_max_out_dim,
             self.full_attention_kv_cache_dtype,
@@ -447,6 +465,7 @@ class Qwen3_5Config:
             "decode_block_table_buckets": self.decode_block_table_buckets,
             "jax_execution": self.jax_execution,
             "greedy_token_fastpath": self.greedy_token_fastpath,
+            "sampled_token_fastpath": self.sampled_token_fastpath,
             "device_token_carry": self.device_token_carry,
             "static_decode_metadata": self.static_decode_metadata,
             "static_decode_seq_lens_carry": self.static_decode_seq_lens_carry,
@@ -460,9 +479,12 @@ class Qwen3_5Config:
             "compact_prefill_mlp": self.compact_prefill_mlp,
             "compact_prefill_token_count_mode": self.compact_prefill_token_count_mode,
             "lm_head_decode_act_dtype": self.lm_head_decode_act_dtype,
+            "lm_head_topk_impl": self.lm_head_topk_impl,
+            "lm_head_greedy_top1_impl": self.lm_head_greedy_top1_impl,
             "decode_proj_act_dtype": self.decode_proj_act_dtype,
             "decode_padded_gemm": self.decode_padded_gemm,
             "decode_padded_gemm_gate_up": self.decode_padded_gemm_gate_up,
+            "decode_rms_padded_gemm": self.decode_rms_padded_gemm,
             "decode_padded_gemm_rows": self.decode_padded_gemm_rows,
             "decode_padded_gemm_max_out_dim": self.decode_padded_gemm_max_out_dim,
             "full_attention_kv_cache_dtype": self.full_attention_kv_cache_dtype,

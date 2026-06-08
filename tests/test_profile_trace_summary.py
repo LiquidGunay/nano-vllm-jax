@@ -157,6 +157,93 @@ def test_summarize_trace_reports_top_hlo_ops(tmp_path):
     assert "`regs:226 occ_pct:16.6667`" in markdown
 
 
+def test_summarize_trace_reports_top_gemm_kernel_shapes(tmp_path):
+    trace = tmp_path / "trace.json.gz"
+    _write_trace(
+        trace,
+        [
+            {
+                "ph": "M",
+                "pid": 1,
+                "name": "process_name",
+                "args": {"name": "/device:GPU:0"},
+            },
+            {
+                "ph": "X",
+                "pid": 1,
+                "name": "ampere_bf16_s16816gemm_bf16_128x64_sliced1x2",
+                "dur": 2000,
+                "args": {
+                    "hlo_op": "command_buffer_1",
+                    "kernel_details": "regs:226 grid:56,1,1 block:128,1,1",
+                },
+            },
+            {
+                "ph": "X",
+                "pid": 1,
+                "name": "ampere_bf16_s16816gemm_bf16_128x64_sliced1x2",
+                "dur": 3000,
+                "args": {
+                    "hlo_op": "command_buffer_1",
+                    "kernel_details": "regs:226 grid:56,1,1 block:128,1,1",
+                },
+            },
+            {
+                "ph": "X",
+                "pid": 1,
+                "name": "void cublasLt::splitKreduce_kernel<float>",
+                "dur": 1000,
+                "args": {
+                    "hlo_op": "command_buffer_1",
+                    "kernel_details": "regs:32 grid:56,1,1 block:128,1,1",
+                },
+            },
+        ],
+    )
+
+    summary = summarize_trace(trace, scope="gpu", top_events=5, top_hlo_ops=3)
+
+    assert summary["top_gemm_grids_by_total_ms"][:1] == [
+        {
+            "grid": "56,1,1",
+            "total_ms": 6.0,
+            "count": 3,
+            "top_events": [
+                {
+                    "event": "ampere_bf16_s16816gemm_bf16_128x64_sliced1x2",
+                    "count": 2,
+                },
+                {
+                    "event": "void cublasLt::splitKreduce_kernel<float>",
+                    "count": 1,
+                },
+            ],
+        }
+    ]
+    assert summary["top_gemm_kernels_by_total_ms"][:2] == [
+        {
+            "event": "ampere_bf16_s16816gemm_bf16_128x64_sliced1x2",
+            "hlo_op": "command_buffer_1",
+            "grid": "56,1,1",
+            "kernel_details": "regs:226 grid:56,1,1 block:128,1,1",
+            "total_ms": 5.0,
+            "count": 2,
+        },
+        {
+            "event": "void cublasLt::splitKreduce_kernel<float>",
+            "hlo_op": "command_buffer_1",
+            "grid": "56,1,1",
+            "kernel_details": "regs:32 grid:56,1,1 block:128,1,1",
+            "total_ms": 1.0,
+            "count": 1,
+        },
+    ]
+    markdown = render_markdown({"traces": [summary]})
+    assert "### Top GEMM Grids" in markdown
+    assert "### Top GEMM Kernels" in markdown
+    assert "`56,1,1`" in markdown
+
+
 def test_jax_trace_profile_counters_include_scoped_gpu_cpu_rows(tmp_path):
     profile_dir = tmp_path / "plugins" / "profile" / "run"
     profile_dir.mkdir(parents=True)

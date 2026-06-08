@@ -264,6 +264,9 @@ runtime:
     device_token_carry: true
     static_decode_metadata: true
     compact_prefill_token_count_mode: bucket
+    lm_head_topk_impl: flashinfer
+    lm_head_greedy_top1_impl: cutlass
+    decode_rms_padded_gemm: true
 kernels:
   full_attention:
     kv_cache_dtype: bf16
@@ -298,6 +301,9 @@ kernels:
     assert "--device-token-carry" in command
     assert "--static-decode-metadata" in command
     assert command[command.index("--compact-prefill-token-count-mode") + 1] == "bucket"
+    assert command[command.index("--lm-head-topk-impl") + 1] == "flashinfer"
+    assert command[command.index("--lm-head-greedy-top1-impl") + 1] == "cutlass"
+    assert "--decode-rms-padded-gemm" in command
     assert command[command.index("--full-attention-kv-cache-dtype") + 1] == "bf16"
     assert command[command.index("--full-attention-decode-impl") + 1] == "triton_paged"
     assert command[command.index("--full-attention-prefill-impl") + 1] == "triton_packed"

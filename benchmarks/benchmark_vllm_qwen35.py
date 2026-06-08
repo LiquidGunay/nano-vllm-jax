@@ -68,6 +68,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--speculative-method", default="mtp")
     parser.add_argument("--num-speculative-tokens", type=int, default=1)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--sampling-top-k", type=int, default=-1)
     parser.add_argument("--input-lens", default="16,64,128")
     parser.add_argument("--output-len", type=int, default=24)
     parser.add_argument("--output-lengths", default="")
@@ -402,24 +405,62 @@ def _extract_logprob_topk(completion, top_k: int) -> list[dict[str, Any]]:
     return rows
 
 
-def _make_sampling_params(SamplingParams, *, max_tokens: int, top_k: int, output_kind: Any = None):
+def _make_sampling_params(
+    SamplingParams,
+    *,
+    max_tokens: int,
+    top_k: int,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    sampling_top_k: int = -1,
+    output_kind: Any = None,
+):
     kwargs = {
-        "temperature": 0.0,
+        "temperature": float(temperature),
         "max_tokens": int(max_tokens),
         "ignore_eos": True,
         "logprobs": int(top_k),
     }
+    if float(top_p) < 1.0:
+        kwargs["top_p"] = float(top_p)
+    if int(sampling_top_k) > 0:
+        kwargs["top_k"] = int(sampling_top_k)
     if output_kind is not None:
         kwargs["output_kind"] = output_kind
     return SamplingParams(**kwargs)
 
 
-def _sampling_params_for_rows(rows: list[dict[str, Any]], SamplingParams, top_k: int, output_kind: Any = None):
+def _sampling_params_for_rows(
+    rows: list[dict[str, Any]],
+    SamplingParams,
+    top_k: int,
+    *,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    sampling_top_k: int = -1,
+    output_kind: Any = None,
+):
     lengths = [int(row["output_len"]) for row in rows]
     if len(set(lengths)) == 1:
-        return _make_sampling_params(SamplingParams, max_tokens=lengths[0], top_k=top_k, output_kind=output_kind)
+        return _make_sampling_params(
+            SamplingParams,
+            max_tokens=lengths[0],
+            top_k=top_k,
+            temperature=temperature,
+            top_p=top_p,
+            sampling_top_k=sampling_top_k,
+            output_kind=output_kind,
+        )
     return [
-        _make_sampling_params(SamplingParams, max_tokens=length, top_k=top_k, output_kind=output_kind)
+        _make_sampling_params(
+            SamplingParams,
+            max_tokens=length,
+            top_k=top_k,
+            temperature=temperature,
+            top_p=top_p,
+            sampling_top_k=sampling_top_k,
+            output_kind=output_kind,
+        )
         for length in lengths
     ]
 
@@ -486,7 +527,14 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     llm = LLM(**llm_kwargs)
     load_seconds = time.perf_counter() - load_t0
 
-    sampling = _sampling_params_for_rows(prompts, SamplingParams, int(args.top_k))
+    sampling = _sampling_params_for_rows(
+        prompts,
+        SamplingParams,
+        int(args.top_k),
+        temperature=args.temperature,
+        top_p=args.top_p,
+        sampling_top_k=args.sampling_top_k,
+    )
     prompt_token_ids = [{"prompt_token_ids": row["input_ids"]} for row in prompts]
 
     # Warmup one prompt before timing.
@@ -494,6 +542,9 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         SamplingParams,
         max_tokens=max(1, min(2, int(prompts[0]["output_len"]))),
         top_k=int(args.top_k),
+        temperature=args.temperature,
+        top_p=args.top_p,
+        sampling_top_k=args.sampling_top_k,
     )
     _ = llm.generate([prompt_token_ids[0]], warm_sampling)
 
@@ -550,6 +601,11 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "speculative_config": speculative_config,
             **prompt_info,
             "top_k": args.top_k,
+            "sampling": {
+                "temperature": float(args.temperature),
+                "top_p": float(args.top_p),
+                "top_k": int(args.sampling_top_k),
+            },
         },
         "load_seconds": load_seconds,
         "performance": performance,
@@ -603,6 +659,9 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
             SamplingParams,
             max_tokens=int(prompt["output_len"]),
             top_k=int(args.top_k),
+            temperature=args.temperature,
+            top_p=args.top_p,
+            sampling_top_k=args.sampling_top_k,
             output_kind=RequestOutputKind.DELTA,
         )
         for prompt in prompts
@@ -677,6 +736,9 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
                     SamplingParams,
                     max_tokens=max(1, min(2, int(prompt["output_len"]))),
                     top_k=int(args.top_k),
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    sampling_top_k=args.sampling_top_k,
                     output_kind=RequestOutputKind.DELTA,
                 ),
             )
@@ -720,6 +782,11 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
             "speculative_config": speculative_config,
             **prompt_info,
             "top_k": args.top_k,
+            "sampling": {
+                "temperature": float(args.temperature),
+                "top_p": float(args.top_p),
+                "top_k": int(args.sampling_top_k),
+            },
         },
         "load_seconds": load_seconds,
         "performance": performance,

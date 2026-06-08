@@ -268,7 +268,10 @@ class Scheduler:
                     self.running.append(seq)
                 continue
             chunk_len = min(remaining_tokens, self.prefill_chunk_budget)
-            if num_batched_tokens + chunk_len > self.max_num_batched_tokens:
+            if (
+                self.max_num_batched_tokens > 0
+                and num_batched_tokens + chunk_len > self.max_num_batched_tokens
+            ):
                 available = self.max_num_batched_tokens - num_batched_tokens
                 if available <= 0:
                     if from_waiting:
@@ -381,7 +384,7 @@ class Scheduler:
                 scheduled_seqs.append(seq)
         
         if not scheduled_seqs:
-            raise RuntimeError("No sequence can be scheduled; KV cache capacity is exhausted")
+            raise RuntimeError(self._capacity_exhausted_message())
         self.running.extendleft(reversed(scheduled_seqs))
         decode_step_count = min(decode_step_counts) if decode_step_counts else 1
         return scheduled_seqs, self.build_scheduled_batch(
@@ -1365,6 +1368,30 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
+    def _capacity_exhausted_message(self) -> str:
+        stats = self.block_manager.stats()
+
+        def seq_snapshot(seq: Sequence) -> dict[str, int]:
+            return {
+                "seq_id": int(seq.seq_id),
+                "tokens": int(seq.num_tokens),
+                "prompt_tokens": int(seq.num_prompt_tokens),
+                "completion_tokens": int(seq.num_completion_tokens),
+                "max_tokens": int(seq.max_tokens),
+                "cached_tokens": int(seq.num_cached_tokens),
+                "blocks": int(len(seq.block_table)),
+                "required_blocks": int((len(seq) + self.block_size - 1) // self.block_size),
+            }
+
+        running = [seq_snapshot(seq) for seq in list(self.running)[:8]]
+        waiting = [seq_snapshot(seq) for seq in list(self.waiting)[:8]]
+        return (
+            "No sequence can be scheduled; KV cache capacity is exhausted "
+            f"stats={stats} max_num_batched_tokens={self.max_num_batched_tokens} "
+            f"max_num_seqs={self.max_num_seqs} max_num_resident_seqs={self.max_num_resident_seqs} "
+            f"max_blocks_per_seq={self.max_blocks_per_seq} running={running} waiting={waiting}"
+        )
+
     def postprocess(
         self, 
         seqs: List[Sequence], 
@@ -1401,7 +1428,6 @@ class Scheduler:
                 device_token = (
                     use_device_carry
                     and _is_device_token(token_id)
-                    and seq.temperature == 0
                     and seq.ignore_eos
                 )
                 if device_token:

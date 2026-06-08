@@ -313,6 +313,17 @@ about `294.63 ms` to `13.74 ms`. Token-event throughput was `794.77 tok/s`,
 about `0.899x` stored vLLM, so the remaining wall-clock gap is now final drain
 plus model-side GPU work, not benchmark-specific recompilation.
 
+Status note, 2026-06-07 sampling: the deferred-token serving path is no longer
+greedy-only. Full-vocab temperature sampling now keeps LM-head token selection
+inside the compiled executor and can use the same device-token carry and
+resident decode metadata machinery as greedy serving. Generic startup warmup
+must cover sampled prefill, generic sampled decode, and resident sampled dense
+decode; both a direct smoke and a guarded two-request random sidecar smoke
+completed with zero measured-phase JIT growth. This is a serving-contract
+improvement, not a random-large speed win yet. Top-p/top-k filtering remains
+outside the fast path until a dedicated FlashInfer/Triton sampler kernel is
+added.
+
 First implementation slice: `full_attention.prefill_impl` now controls reference
 versus packed Triton prefill routing, `server_config.yaml` and the FA/GDN
 benchmark config select `prefill_impl=triton_packed`, and the random sidecar
@@ -3120,6 +3131,105 @@ Current validation:
   JIT growth. Do not add a standalone LM-head reduction kernel; the only
   plausible LM-head direction is a true GEMM epilogue or library-backed
   fused matmul+top-1 path.
+- Entry 276 rejected standalone FlashInfer radix top-k as the LM-head selector
+  on large random. It is correct in focused CUDA tests, but the integrated
+  random-large run regressed to `296.79 output tok/s` versus the current JAX
+  artifact at `756.62 output tok/s` and vLLM greedy at `1081.31 output tok/s`.
+  Keep `lm_head_topk_impl=flashinfer` as an explicit experiment only; optimized
+  configs should stay on `lm_head_topk_impl=jax`. FlashInfer attention remains a
+  separate ABI project because batch decode exposes plan/run workspaces and the
+  current accepted decode path uses a fused Triton append+attention kernel.
+- Entry 278 added a config-file-only `lm_head_greedy_top1_impl` boundary and a
+  fail-fast `cutlass` selector for future fused LM-head work. It does not claim
+  a speedup: vLLM and FlashInfer expose logits-then-sampler paths, not an
+  existing projection-plus-sampler kernel, and cuBLASLt's built-in epilogues do
+  not provide row-wise argmax over GEMM output. If LM-head is revisited, the
+  work item is a real CuTeDSL/CUTLASS JAX custom call for
+  `[B, H] x [H, V] -> token_ids`, not another standalone top-k/argmax selector.
+- Entry 281 finished the LM-head epilogue lane with a JAX-Triton
+  tensor-core-preserving diagnostic. It matched JAX token ids and improved the
+  representative BF16 `B=8,H=1024,V=248064` microbench from `1.213 ms` to
+  `1.174 ms`, but the integrated same-manifest large-random run reached only
+  `753.80 output tok/s`, below the accepted `756-758` JAX anchor. Keep
+  `lm_head_greedy_top1_impl=triton` as a diagnostic backend only; optimized
+  configs stay on `jax`.
+- Entry 281 also added GEMM-kernel shape grouping to
+  `benchmarks/summarize_profile_trace.py`. The current profile shows the
+  random-large GPU bucket is not one missing LM-head selector: `gemm`
+  `~992.61 ms / 24735`, `fusion` `~636.04 ms / 79893`,
+  `_paged_decode_attention` `~197.94 ms / 1488`, and many repeated small-B
+  GEMM grids (`56,1,1` and `65,1,1`) plus `11904` split-K reducers. The next
+  implementation target is code-level coarsening of repeated MLP/GDN
+  GEMM/fusion groups, not XLA split-K/Triton-GEMM flag tuning. The regenerated
+  grid totals rank the current GEMM work as `1940,1,1` LM-head
+  (`250.23 ms / 248`), `56,1,1` packed MLP gate/up (`211.03 ms / 5952`),
+  `65,1,1` packed GDN input projection (`175.71 ms / 4464`), and `8,2,5`
+  projection/down/out kernels (`152.73 ms / 9192`).
+- Entry 282 tried the simplest `65,1,1` follow-up: route GDN's packed
+  `in_proj_qkv_abz` decode projection through the existing row-padded GEMM
+  helper. It was correct but integrated large random reached only
+  `752.99 output tok/s`, below the same-envelope `753.07` repeat and below the
+  accepted `756-758` anchor, so the change was reverted. Do not keep trying to
+  fix fragmentation by padding a single projection; the next attempt must
+  remove a larger launch/materialization group.
+- Entry 283 closed the latest neutral-composition lane. Direct materialization
+  of prefetched token refs reached only `752.55 output tok/s`; composing that
+  with the Triton LM-head diagnostic reached `753.62 output tok/s`; lowering
+  the worker cap to 2 CPU cores reached `751.02 output tok/s`; and wider
+  `1536`/`2048` prefill-token caps hit the 70% RAM guard before timing. Keep
+  the current 4-core, `max_num_batched_tokens=1024` random envelope until
+  memory/compile footprint is reduced. The next speed work should target
+  broader model-side GPU work, not token materialization, worker-core tweaks,
+  or wider prefill warmup buckets.
+
+## Active Backend-Owned Kernel Execution Lane
+
+Current accepted target:
+
+- large random seed `1234`, 8 requests, input `512-1024`, output `128-256`,
+  stored vLLM denominator `1021.59 output tok/s`;
+- accepted JAX anchor
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260608/random_large_flashinfer_lm_triton_bn256_r1.json`,
+  `818.91 output tok/s`, `0.802x` vLLM, `1582` generated tokens, generic
+  warmup, zero measured JIT growth, 70% RAM/four-core guard.
+
+Execution order:
+
+1. Decode outlier and GPU-work attribution on top of the accepted FlashInfer
+   paged-attention path. The current median decode step is `~4.6-4.9 ms`, but
+   B8/B6/B3 transition outliers up to `71.24 ms` still dominate the remaining
+   gap to `0.9x` vLLM. Do not move timing between steps; identify queued GPU
+   work, host sync, or mandatory model work that can actually be removed.
+2. LM-head fused GEMM epilogue follow-up only if it is materially broader than
+   the promoted two-stage Triton top-1 selector. Entry 289 accepted the
+   `BLOCK_N=256` JAX-Triton selector as a small FlashInfer-route win, but the
+   next LM-head attempt must be a true library-backed/CUTLASS-style
+   projection-plus-sampling boundary or a broader decode boundary. Another
+   selector microbench is not enough.
+3. Full MLP backend boundary. Target the whole repeated decode MLP family:
+   gate/up projection, `silu(gate) * up`, down projection, and any cheap local
+   epilogue that can be owned without giving up tensor cores. Do not promote a
+   standalone middle kernel. Entry 286 also rejects a standalone
+   FFN-RMSNorm-plus-packed-gate/up Triton boundary: it removed one
+   materialization but regressed large random to `742.07 output tok/s`.
+4. Native-layout GDN decode. Match FLA/vLLM numerics/layout: BF16 q/k/v,
+   FP32 recurrent state, kernel-native `[B,H,V,K]` state if needed, and one
+   backend-owned boundary for packed projection output, conv update, recurrent
+   update, RMSNorm, and z gate.
+5. FlashInfer or equivalent attention with persistent planning only. The
+   accepted full-attention decode route is now `flashinfer_paged`; further
+   attention work must improve the integrated target over `816.58 tok/s`, not
+   repeat Entry 277 or retest standalone append/decode pieces.
+6. Runtime graph replay only if it is real replay at the runtime/backend level,
+   not JAX `lax.scan` or source unrolling across decode tokens.
+
+Acceptance gates:
+
+- first run a focused CUDA correctness/perf gate for the exact kernel family;
+- then a scaled random sidecar under the RAM/CPU guard;
+- then the large-random sidecar with the stored vLLM denominator;
+- accept only an integrated large-random improvement over `816.58 output
+  tok/s`, or keep the result as diagnostic/rejected evidence.
 
 Model-specific assumptions to track:
 
@@ -3152,6 +3262,69 @@ Model-specific assumptions to track:
 10. For GDN, target V,K serving state; do not preserve K,V as the serving ABI merely because the old JAX path used it.
 11. Keep BF16 GDN prefill activations as a separate opt-in experiment after V,K correctness is established.
 12. Do not use local CUDA probes as the optimization path. They are historical diagnostics only. Use FlashInfer for paged KV/attention and vLLM/FLA-derived kernels for GDN unless those routes are explicitly blocked.
+13. Do not count Entry 280's resident slot-index cache as a large-random win:
+    it improved a focused metadata update but missed the accepted integrated
+    anchor. Further slot-index caching is not the next lever.
+14. LM-head work must preserve tensor-core GEMM efficiency. Standalone
+    selectors are rejected; the viable route is a real fused GEMM+top1 epilogue
+    or a broader decode boundary that removes the full projection/reduction
+    cost without giving up XLA/CUTLASS-quality matmul.
+15. Do not promote Entry 281's Triton LM-head top-1 backend unless a future
+    integrated random-large run beats the accepted JAX anchor. The current
+    route is a focused diagnostic only.
+16. Do not chase installed-XLA GEMM policy flags as the fragmentation route:
+    `force_split_k`, Triton GEMM, and cuBLASLt-disable diagnostics lost or were
+    noisy, while the BF16 3/6-way and CUDA-graph flags were unavailable. Use
+    profile-backed code boundaries that reduce repeated model GEMM/fusion
+    launches.
+17. Do not reapply row-padded GEMM only to GDN's packed decode input
+    projection. Entry 282 showed that this shape change is neutral/slower on
+    the integrated random-large target.
+18. Do not retry Entry 283's token-ref direct materialization, 2-core worker
+    guard, or wider `1536`/`2048` random prefill-token caps as primary
+    hill-climb levers. They either regressed large-random throughput or hit the
+    70% RAM guard before measurement.
+19. Do not promote Entry 284's single-site decode output-projection padding or
+    standalone Triton MLP SiLU/down helper. Output projection padding stayed
+    around `753.6-753.7 output tok/s`, and the MLP helper regressed integrated
+    large random to `723.27 output tok/s` despite a focused microbench tile
+    beating XLA. MLP/GDN work must coarsen a larger model boundary or replace a
+    full repeated kernel family, not add standalone middle kernels.
+20. Do not retry Entry 285's larger decode-boundary probes as primary routes:
+    GDN tail-fused decode regressed target large random to `618.30 output
+    tok/s`, table burst-2 to `326.19`, static-unrolled burst-2 failed the small
+    gate at `266.23`, and resident-dense burst-2 reached only `591.44` with a
+    much larger warmup surface. Future decode-boundary work must use runtime
+    graph replay or a backend-owned token loop, not a full-model JAX
+    `lax.scan`/unroll over decode steps.
+21. Do not retry Entry 286's fused FFN RMSNorm plus packed MLP gate/up
+    projection as a standalone Triton boundary. It passed focused correctness
+    but regressed large random to `742.07 output tok/s`; final drain improved,
+    while token-event throughput fell to `751.69`, which means the replacement
+    custom calls hurt model-side decode work.
+22. Do not retry output-tiled single-kernel full MLP fusion. Entry 287 showed
+    the actual Qwen3.5-0.8B BF16 decode MLP shape regresses from `1.76 ms`
+    JAX/XLA median to `371.37 ms` because each output-column tile recomputes
+    shared gate/up activations. A future MLP route must store/reuse gate/up
+    once, batch/group layers, or use a serving-proven GEMM plan.
+23. Do not retry power-of-two random decode batch buckets as a speed route.
+    The inactive-row warmup support is useful for non-exact bucket policies,
+    but the target large-random run with `1,2,4,8` buckets reached only
+    `784.07 output tok/s` versus the accepted exact-bucket FlashInfer route.
+24. Do not remove the FlashInfer attention output FP32 cast as a speed route.
+    Returning BF16 from the wrapper passed focused FFI tests but regressed the
+    integrated large-random target to `815.22 output tok/s`.
+25. Do not add FlashInfer tensor-core batch-decode attention on A10G/SM86
+    without new evidence. The focused B8 BF16 attention microbench found the
+    current non-tensor-core FlashInfer path faster (`0.0763 ms`) than
+    tensor-core planning (`0.0855 ms`) and fixed/disabled split-KV variants
+    (`0.079-0.081 ms`).
+26. Do not plan the installed FlashInfer CuTe GDN decode kernels as an A10G
+    serving route. Their pool-indexed state ABI is the right shape, but the
+    installed implementation requires SM90+.
+27. Do not retry in-loop trace-token materialization as a final-drain fix.
+    Entry 290 showed it breaks the resident slot-carry route and triggers
+    measured-phase JIT growth (`56 -> 57`) on the target large-random run.
 ```
 
 ## Expected Strategic Outcome

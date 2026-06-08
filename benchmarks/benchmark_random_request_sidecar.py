@@ -109,6 +109,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-output-tokens", type=int, default=1024)
     parser.add_argument("--min-request-count", type=int, default=5)
     parser.add_argument("--max-request-count", type=int, default=15)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--sampling-top-k",
+        type=int,
+        default=-1,
+        help="Sampling top_k for JAX and vLLM; -1 leaves provider defaults.",
+    )
 
     parser.add_argument("--jax-warmup", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -812,6 +820,9 @@ def _build_jax_command(
         "max_blocks_per_seq": args.max_blocks_per_seq,
         "num_speculative_tokens": args.jax_num_speculative_tokens,
         "dataset_name": args.dataset_name or "random",
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "sampling_top_k": args.sampling_top_k,
         "output_json": str(output_json),
     }
     command_args.update(config_engine_overrides or {})
@@ -876,6 +887,9 @@ def _build_vllm_command(args: argparse.Namespace, manifest_jsonl: Path, output_j
         "dataset_name": args.dataset_name or "random",
         "mode": args.vllm_mode,
         "top_k": args.vllm_top_k,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "sampling_top_k": args.sampling_top_k,
         "seed": args.seed,
         "run_label": f"{args.run_label}_vllm",
         "output_json": str(output_json),
@@ -1063,6 +1077,11 @@ def _run() -> None:
                 "full_attention_decode_impl": args.full_attention_decode_impl,
                 "full_attention_prefill_impl": args.full_attention_prefill_impl,
                 "num_speculative_tokens": args.jax_num_speculative_tokens,
+                "sampling": {
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "top_k": args.sampling_top_k,
+                },
                 "config": {
                     "source": jax_config["source"],
                     "engine_overrides": jax_config["engine_overrides"],
@@ -1079,6 +1098,11 @@ def _run() -> None:
                 "gpu_memory_utilization": args.vllm_gpu_memory_utilization,
                 "tensor_parallel_size": args.vllm_tensor_parallel_size,
                 "top_k": args.vllm_top_k,
+                "sampling": {
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "top_k": args.sampling_top_k,
+                },
                 "num_speculative_tokens": args.vllm_num_speculative_tokens,
                 "reference_json": args.vllm_reference_json,
                 "reference_info": vllm_reference_info,

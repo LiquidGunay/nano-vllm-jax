@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -53,6 +54,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-output-len", type=int, default=16)
     parser.add_argument("--random-range-ratio", default='{"input":0.0,"output":0.0}')
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--sampling-top-k",
+        type=int,
+        default=-1,
+        help="JAX SamplingParams top_k. Keep -1 for the compiled temperature-sampling fast path.",
+    )
     parser.add_argument("--num-speculative-tokens", type=int, choices=[0, 1], default=0)
     parser.add_argument("--max-kv-cache-mb", type=int, default=1024)
     parser.add_argument("--num-kvcache-blocks", type=int, default=64)
@@ -71,6 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-blocks-per-seq", type=int, default=16)
     parser.add_argument("--decode-block-table-buckets", default="")
     parser.add_argument("--greedy-token-fastpath", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--sampled-token-fastpath", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--greedy-decode-burst-steps", type=int, default=1)
     parser.add_argument("--device-token-carry", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--static-decode-metadata", action=argparse.BooleanOptionalAction, default=False)
@@ -84,11 +94,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compact-prefill-mlp", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compact-prefill-token-count-mode", default="exact")
     parser.add_argument("--lm-head-decode-act-dtype", default="fp32")
+    parser.add_argument("--lm-head-topk-impl", default="jax")
+    parser.add_argument("--lm-head-greedy-top1-impl", default="jax")
     parser.add_argument("--decode-proj-act-dtype", default="fp32")
     parser.add_argument("--decode-padded-gemm", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--decode-padded-gemm-gate-up", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--decode-rms-padded-gemm", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--decode-padded-gemm-rows", type=int, default=8)
-    parser.add_argument("--decode-padded-gemm-max-out-dim", type=int, default=8192)
+    parser.add_argument("--decode-padded-gemm-max-out-dim", type=int, default=300000)
     parser.add_argument("--full-attention-kv-cache-dtype", default="default")
     parser.add_argument("--full-attention-kv-append-impl", default="reference")
     parser.add_argument("--full-attention-decode-impl", default="reference")
@@ -142,6 +155,24 @@ def _parse_ints(value: str) -> list[int]:
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0") in {"1", "true", "yes", "on", "True"}
+
+
+def _gpu_memory_used_mb() -> int | None:
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception:
+        return None
+    values = [int(line.strip()) for line in output.splitlines() if line.strip()]
+    return max(values) if values else None
 
 
 def _json_safe(value: Any) -> Any:
@@ -333,15 +364,34 @@ def _profile_counters(profile_path: Path) -> dict[str, Any]:
     }
 
 
-def _build_sampling_params(output_lengths: list[int], default_output_len: int):
+def _build_sampling_params(
+    output_lengths: list[int],
+    default_output_len: int,
+    *,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
+):
     from nanovllm_jax.engine.sequence import SamplingParams
 
     if output_lengths:
         return [
-            SamplingParams(temperature=0.0, max_tokens=int(length), ignore_eos=True)
+            SamplingParams(
+                temperature=float(temperature),
+                top_p=float(top_p),
+                top_k=int(top_k),
+                max_tokens=int(length),
+                ignore_eos=True,
+            )
             for length in output_lengths
         ]
-    return SamplingParams(temperature=0.0, max_tokens=int(default_output_len), ignore_eos=True)
+    return SamplingParams(
+        temperature=float(temperature),
+        top_p=float(top_p),
+        top_k=int(top_k),
+        max_tokens=int(default_output_len),
+        ignore_eos=True,
+    )
 
 
 def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
@@ -379,6 +429,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "jax_execution": args.jax_execution,
         "num_speculative_tokens": args.num_speculative_tokens,
         "greedy_token_fastpath": args.greedy_token_fastpath,
+        "sampled_token_fastpath": args.sampled_token_fastpath,
         "greedy_decode_burst_steps": max(1, int(args.greedy_decode_burst_steps or 1)),
         "device_token_carry": args.device_token_carry,
         "static_decode_metadata": args.static_decode_metadata,
@@ -392,9 +443,12 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "compact_prefill_mlp": args.compact_prefill_mlp,
         "compact_prefill_token_count_mode": args.compact_prefill_token_count_mode,
         "lm_head_decode_act_dtype": args.lm_head_decode_act_dtype,
+        "lm_head_topk_impl": args.lm_head_topk_impl,
+        "lm_head_greedy_top1_impl": args.lm_head_greedy_top1_impl,
         "decode_proj_act_dtype": args.decode_proj_act_dtype,
         "decode_padded_gemm": args.decode_padded_gemm,
         "decode_padded_gemm_gate_up": args.decode_padded_gemm_gate_up,
+        "decode_rms_padded_gemm": args.decode_rms_padded_gemm,
         "decode_padded_gemm_rows": args.decode_padded_gemm_rows,
         "decode_padded_gemm_max_out_dim": args.decode_padded_gemm_max_out_dim,
         "full_attention_kv_cache_dtype": args.full_attention_kv_cache_dtype,
@@ -417,10 +471,12 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     if args.linear_chunk_size:
         engine_kwargs["linear_chunk_size"] = args.linear_chunk_size
 
+    gpu_memory_before_engine = _gpu_memory_used_mb()
     engine = LLMEngine(
         args.model,
         **engine_kwargs,
     )
+    gpu_memory_after_engine = _gpu_memory_used_mb()
     kernel_backend = getattr(engine.model_runner.backend, "kernel_backend", None)
     kernel_backend_dict = kernel_backend.as_dict() if kernel_backend is not None else None
     nhd_cache = getattr(engine.model_runner, "full_attention_nhd_cache", None)
@@ -452,7 +508,13 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         else:
             burst_steps = max(1, int(getattr(engine.config, "greedy_decode_burst_steps", 1) or 1))
             warmup_output_len = min(max(2, burst_steps + 1), args.output_len)
-            warmup_params = _build_sampling_params([], warmup_output_len)
+            warmup_params = _build_sampling_params(
+                [],
+                warmup_output_len,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.sampling_top_k,
+            )
             warmup_trace = engine.generate_with_trace(prompts, sampling_params=warmup_params, include_text=False)
             _block_until_ready(warmup_trace)
             warmup_summary.update(
@@ -463,16 +525,24 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                     "request_specific": True,
                 }
             )
+    gpu_memory_after_warmup = _gpu_memory_used_mb()
     jit_cache_entries_before_measurement = len(jit_cache) if jit_cache is not None else None
     jit_cache_keys_before_measurement = _jit_cache_key_snapshot(jit_cache)
 
-    sampling_params = _build_sampling_params(output_lengths, args.output_len)
+    sampling_params = _build_sampling_params(
+        output_lengths,
+        args.output_len,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.sampling_top_k,
+    )
     recorder.start_jax_profile(enabled=args.profile)
     started = time.perf_counter()
     trace = engine.generate_with_trace(prompts, sampling_params=sampling_params, include_text=False)
     _block_until_ready(trace)
     elapsed = time.perf_counter() - started
     recorder.stop_jax_profile()
+    gpu_memory_after_measurement = _gpu_memory_used_mb()
     profile_counters = _profile_counters(recorder.profile_path) if args.profile else None
     jit_cache_entries_after_measurement = len(jit_cache) if jit_cache is not None else None
     jit_cache_keys_after_measurement = _jit_cache_key_snapshot(jit_cache)
@@ -569,14 +639,29 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "prefill_buckets": list(engine.config.prefill_buckets),
             "prefill_token_buckets": list(engine.config.prefill_token_buckets),
             "batch_size_buckets": list(engine.config.batch_size_buckets),
+            "num_kvcache_blocks": int(engine.config.num_kvcache_blocks),
+            "requested_num_kvcache_blocks": int(args.num_kvcache_blocks),
+            "max_kv_cache_bytes": (
+                int(engine.config.max_kv_cache_bytes)
+                if engine.config.max_kv_cache_bytes is not None
+                else None
+            ),
+            "requested_max_kv_cache_mb": float(args.max_kv_cache_mb),
             "max_num_seqs": int(engine.config.max_num_seqs),
             "max_num_resident_seqs": int(engine.config.max_num_resident_seqs),
+            "max_num_batched_tokens": int(engine.config.max_num_batched_tokens),
             "max_blocks_per_seq": int(engine.config.max_blocks_per_seq),
             "decode_block_table_buckets": list(engine.config.decode_block_table_buckets),
             "linear_chunk_size": int(engine.config.linear_chunk_size),
             "num_speculative_tokens": args.num_speculative_tokens,
+            "sampling": {
+                "temperature": float(args.temperature),
+                "top_p": float(args.top_p),
+                "top_k": int(args.sampling_top_k),
+            },
             **prompt_info,
             "greedy_token_fastpath": bool(engine.config.greedy_token_fastpath),
+            "sampled_token_fastpath": bool(engine.config.sampled_token_fastpath),
             "warmup": warmup_summary,
             "jit_cache_audit": {
                 "entries_before_measurement": jit_cache_entries_before_measurement,
@@ -587,6 +672,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             },
             "serving_fastpath_flags": {
                 "greedy_token_fastpath": bool(engine.config.greedy_token_fastpath),
+                "sampled_token_fastpath": bool(engine.config.sampled_token_fastpath),
                 "materialize_tied_lm_head": bool(engine.config.materialize_tied_lm_head),
                 "compact_prefill_in_proj_qkv": bool(engine.config.compact_prefill_in_proj_qkv),
                 "compact_prefill_gdn_z": bool(engine.config.compact_prefill_gdn_z),
@@ -594,9 +680,12 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 "compact_prefill_mlp": bool(engine.config.compact_prefill_mlp),
                 "compact_prefill_token_count_mode": str(engine.config.compact_prefill_token_count_mode),
                 "lm_head_decode_act_dtype": str(engine.config.lm_head_decode_act_dtype),
+                "lm_head_topk_impl": str(engine.config.lm_head_topk_impl),
+                "lm_head_greedy_top1_impl": str(engine.config.lm_head_greedy_top1_impl),
                 "decode_proj_act_dtype": str(engine.config.decode_proj_act_dtype),
                 "decode_padded_gemm": bool(engine.config.decode_padded_gemm),
                 "decode_padded_gemm_gate_up": bool(engine.config.decode_padded_gemm_gate_up),
+                "decode_rms_padded_gemm": bool(engine.config.decode_rms_padded_gemm),
                 "decode_padded_gemm_rows": int(engine.config.decode_padded_gemm_rows),
                 "decode_padded_gemm_max_out_dim": int(engine.config.decode_padded_gemm_max_out_dim),
                 "device_token_carry": bool(engine.config.device_token_carry),
@@ -612,6 +701,12 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             _timing_metrics(trace["events"], elapsed, total_tokens),
             elapsed,
         ),
+        "memory": {
+            "gpu_memory_mb_before_engine": gpu_memory_before_engine,
+            "gpu_memory_mb_after_engine": gpu_memory_after_engine,
+            "gpu_memory_mb_after_warmup": gpu_memory_after_warmup,
+            "gpu_memory_mb_after_measurement": gpu_memory_after_measurement,
+        },
         "rows": rows,
         "events": trace["events"],
         "profile_counters": profile_counters,

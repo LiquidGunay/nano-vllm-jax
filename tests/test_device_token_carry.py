@@ -826,6 +826,31 @@ def test_scheduler_postprocess_can_defer_greedy_device_token(monkeypatch):
     assert seq.completion_token_ids == [202]
 
 
+def test_scheduler_postprocess_can_defer_sampled_device_token_ref(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    scheduler = Scheduler(
+        Qwen3_5Config(
+            max_num_seqs=1,
+            num_kvcache_blocks=4,
+            max_blocks_per_seq=4,
+            device_token_carry=True,
+        )
+    )
+    seq = Sequence(
+        [101],
+        SamplingParams(temperature=0.8, max_tokens=2, ignore_eos=True),
+        seq_id=7,
+    )
+    token_vector = jnp.asarray([202], dtype=jnp.int32)
+
+    finished = scheduler.postprocess([seq], [DeviceTokenRef(tokens=token_vector, row=0)])
+
+    assert finished == [False]
+    assert seq.num_completion_tokens == 1
+    assert seq.has_unmaterialized_device_tokens
+    assert seq.completion_token_ids == [202]
+
+
 def test_iter_generate_overlapped_prefetch_emits_after_next_step(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_OVERLAPPED_STREAMING_TOKEN_PREFETCH", "1")

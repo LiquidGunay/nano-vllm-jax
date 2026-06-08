@@ -224,6 +224,14 @@ class BlockManager:
         required_blocks = (target_tokens + self.block_size - 1) // self.block_size
         return len(self.free_block_ids) >= max(0, required_blocks - len(seq.block_table))
 
+    def stats(self) -> dict[str, int]:
+        """Return allocation counters for scheduler diagnostics."""
+        return {
+            "total_blocks": len(self.blocks),
+            "free_blocks": len(self.free_block_ids),
+            "used_blocks": len(self.used_block_ids),
+        }
+
     def snapshot(self, seqs: List[Sequence] | None = None) -> BlockTables:
         """Expose Python-side prefix-cache state without touching JAX arrays."""
         return BlockTables(
