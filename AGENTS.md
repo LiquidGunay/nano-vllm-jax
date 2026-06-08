@@ -195,6 +195,16 @@
   (`1021.59 output tok/s`), with `1582` generated tokens, generic warmup, and
   zero measured JIT-cache growth. The remaining gap is GPU-side decode work,
   especially B8 decode model work, not another token materialization tweak.
+- Latest broad checkpoint: Entry 291 reran the current checkout on the
+  seed-1234 random-large envelope and got
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/broad_benchmark_20260608/broad_random_large_current_r1.json`,
+  `812.23 output tok/s`, `0.795x` of the same stored vLLM denominator.
+  `decode_heavy_128x128` completed at `179.89 output tok/s`, `0.842x` vLLM and
+  `1.185x` stored JAX baseline. The combined matrix and guarded `hetero8` slice
+  hit the 70% RAM guard during compile/warmup, and `long_prefill_512_2048`
+  currently fails because the promoted config's packed prefill-token buckets
+  stop at `4096` while the workload needs `5120`. Treat this as a broad
+  checkpoint and coverage gap, not as a new accepted speed record.
 - Do not retry direct JAX `.lower().compile()` executable caching as "graph
   replay". The 2026-06-05 guarded smoke stayed CPU-bound in compile/warmup for
   more than six minutes before measurement. Use XLA/runtime graph replay or a

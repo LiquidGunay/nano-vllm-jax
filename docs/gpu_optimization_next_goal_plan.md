@@ -3325,6 +3325,15 @@ Model-specific assumptions to track:
 27. Do not retry in-loop trace-token materialization as a final-drain fix.
     Entry 290 showed it breaks the resident slot-carry route and triggers
     measured-phase JIT growth (`56 -> 57`) on the target large-random run.
+28. Treat Entry 291 as the current broad checkpoint, not a new accepted best:
+    current checkout random-large rerun reached `812.23 output tok/s`,
+    `0.795x` stored vLLM, while the accepted Entry 289 best remains
+    `818.91 output tok/s`, `0.802x`. `decode_heavy_128x128` is healthier at
+    `0.842x` vLLM and `1.185x` stored JAX baseline, but guarded `hetero8`
+    trips the 70% RAM guard and `long_prefill_512_2048` needs a larger
+    prefill-token bucket than the promoted random config exposes. Before the
+    next broad claim, add/fix guarded matrix execution and long-prefill bucket
+    coverage.
 ```
 
 ## Expected Strategic Outcome

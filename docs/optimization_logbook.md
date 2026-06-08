@@ -11564,3 +11564,82 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - do not retry in-loop trace-token materialization unless the model runner's
     device-token carry state is decoupled from sequence materialization and the
     exact resident slot-carry route is proven to remain warmed.
+
+### Entry 291 - Current Broad Benchmark Checkpoint
+
+- date: 2026-06-08
+- purpose:
+  - answer whether the accepted Entry 289 serving path is effectively capped
+    around `0.8x` vLLM, or whether the current checkout has a broader benchmark
+    regression;
+  - take a compact current snapshot without committing full benchmark artifacts.
+- resource policy used:
+  - benchmark artifacts stayed under
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/broad_benchmark_20260608`;
+  - random-large used the sidecar guard with `--max-system-ram-percent 70`,
+    `--worker-cpu-cores 4`, and `--worker-nice 10`;
+  - matrix slices were run one workload at a time under a shell RAM guard that
+    terminated the process group above `70%` system RAM.
+- target random-large snapshot:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/broad_benchmark_20260608/broad_random_large_current_r1.json`;
+  - seed-1234 8-request random-large envelope, `6240` input tokens and `1582`
+    output tokens, same stored vLLM denominator as Entry 289;
+  - current JAX `812.2285487199796 output tok/s`, stored vLLM
+    `1021.5851751977929 output tok/s`, ratio `0.7950668905925744x`;
+  - token-event throughput `824.0007788115695 output tok/s`, measurement
+    seconds `1.9477276469697244`, final drain `27.83 ms`;
+  - TTFT p50 `207.76 ms` versus vLLM `169.25 ms`; ITL p50 `5.67 ms` versus
+    vLLM `5.48 ms`;
+  - GPU memory after measurement `8747 MB`;
+  - exact generated tokens did not match vLLM on the random workload. This is
+    consistent with prior random-workload diagnostics where close early logits
+    can diverge under greedy decode, so use this run as a throughput checkpoint
+    rather than an exact correctness claim.
+- decode-heavy sanity slice:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/broad_benchmark_20260608/gpu_matrix_decode_heavy_current_r1.json`;
+  - report:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/broad_benchmark_20260608/gpu_matrix_decode_heavy_current_r1.md`;
+  - `decode_heavy_128x128`, one repeat, stored references only;
+  - current JAX `179.88507572546163 output tok/s`, stored vLLM
+    `213.54 output tok/s`, ratio `0.842x`;
+  - stored JAX default `151.84 output tok/s`, ratio `1.185x` to the JAX
+    baseline;
+  - GPU memory after measurement `8687 MB`;
+  - exact token comparison failed at generated index `8`, so this is a speed
+    sanity point, not a strict correctness promotion artifact.
+- failed broad slices:
+  - the combined three-workload matrix was stopped manually when system RAM
+    crossed the guard (`72.7%`) while compiling/warming `hetero8`;
+  - guarded `hetero8` single-slice rerun was terminated at `70.2%` system RAM
+    before a report artifact was written;
+  - guarded `long_prefill_512_2048` failed before timing because the current
+    config's prefill-token buckets stop at `4096`, while that workload
+    scheduled `5120` packed prefill tokens:
+    `ValueError: prefill token size 5120 exceeds configured buckets (64, 128,
+    256, 512, 1024, 2048, 4096)`.
+- interpretation:
+  - the current checkout reproduces the accepted large-random band within
+    normal run-to-run noise (`0.795x` now versus Entry 289's `0.802x` best);
+  - `0.8x` is a real current plateau for the A10G random-large path, but not a
+    proven fundamental limit. The remaining gap is unlikely to come from more
+    source-level JAX rewrites, single-selector kernels, or token
+    materialization tweaks;
+  - decode-heavy being `0.842x` while random-large is `0.795x` supports the
+    existing diagnosis that heterogeneous serving/scheduling plus repeated
+    model-side decode work is the harder remaining gap;
+  - long-prefill coverage regressed at the benchmark-contract level because the
+    promoted random config is too narrow for the long-prefill packed token
+    bucket.
+- decision:
+  - keep Entry 289 as the accepted best speed record and use this entry as the
+    current broad checkpoint;
+  - do not commit full JSON/profile artifacts; this logbook entry is the
+    committed summary;
+  - before another broad matrix claim, fix the long-prefill bucket coverage and
+    add a built-in matrix RAM guard instead of relying on manual process-group
+    termination;
+  - the next material speed route must be structural: backend-owned grouped or
+    layer-batched MLP/GDN decode work, a true runtime replay/capture path, or a
+    kernel-native GDN decode boundary on compatible hardware.
