@@ -41,6 +41,11 @@ class ScheduledBatch:
     packed_prefill: bool = False
     token_row_ids: jnp.ndarray | None = None
     mixed_prefill_decode: bool = False
+    speculative_method: str = "none"
+    speculative_num_tokens: int = 0
+    speculative_draft_tokens: jnp.ndarray | None = None
+    speculative_draft_tokens_host: tuple[int, ...] | None = None
+    speculative_admitted_host: tuple[bool, ...] | None = None
 
     @property
     def batch_size(self) -> int:
@@ -55,6 +60,14 @@ class ScheduledBatch:
     @property
     def active_decode_rows(self) -> jnp.ndarray:
         return (self.seq_ids >= 0) & (self.query_lens > 0)
+
+    @property
+    def is_speculative_decode(self) -> bool:
+        return (
+            not self.is_prefill
+            and self.speculative_method != "none"
+            and self.speculative_num_tokens > 0
+        )
 
     @property
     def prefill_final_flags(self) -> list[bool]:

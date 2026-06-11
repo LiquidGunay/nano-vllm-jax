@@ -11751,3 +11751,43 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - keep the matrix runner for per-workload specialized-envelope comparisons,
     but do not interpret its fresh-process compile/RAM behavior as proof that a
     long-lived warmed server would recompile.
+
+### Entry 294 - Config-Owned MTP-1 Speculative Decode Scaffold
+
+- date: 2026-06-11
+- purpose:
+  - move MTP-1 from environment-only diagnostics to an explicit opt-in serving
+    route;
+  - preserve the current non-speculative kernel-backed server path when
+    speculative decoding is disabled;
+  - make the first GPU MTP route correctness-first before claiming speed.
+- implementation:
+  - added typed config fields for `speculative_method`, `draft_sample_method`,
+    `mtp_verifier_impl`, `mtp_batch_accept_policy`, `mtp_seed_after_bonus`,
+    and MTP margin thresholds;
+  - preserved legacy `num_speculative_tokens=1` compatibility by interpreting
+    it as `speculative_method=mtp`;
+  - made model loading and runner startup method-aware, with a fail-fast error
+    when MTP is requested without loaded `mtp.*` weights;
+  - added `ScheduledBatch` speculative metadata so scheduler admission is
+    visible without overloading env vars;
+  - made generic warmup compile the configured MTP verifier buckets;
+  - added `benchmarks/configs/gpu_mtp1_two_decode.json` as a current-stack MTP
+    diagnostic config. It explicitly uses reference full-attention decode
+    because `flashinfer_paged` is currently width-1 only, and it leaves packed
+    GDN decode off because that kernel route is also width-1 only for the
+    verifier shape.
+- validation:
+  - `python -m py_compile nanovllm_jax/config.py nanovllm_jax/server_config.py nanovllm_jax/engine/llm_engine.py nanovllm_jax/engine/scheduled_batch.py nanovllm_jax/engine/scheduler.py nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/model_executor.py benchmarks/benchmark_jax_server_trace.py`;
+  - `pytest -q tests/test_server_config.py`;
+  - `pytest -q tests/test_backend_boundaries.py -k 'scheduler_marks_mtp_decode_batch_metadata or scheduler_omits_speculative_metadata_when_disabled or warmup_compiles or warmup_uses or resident_slot_carry_decode or static_decode_metadata'`;
+  - `pytest -q tests/test_mtp_commit_semantics.py`;
+  - `PYTHONPATH=. pytest -q tests/test_benchmark_jax_server_trace.py tests/test_gpu_matrix_runner.py -k 'config or benchmark or gpu_matrix'`;
+  - `python benchmarks/run_gpu_matrix.py --configs gpu_mtp1_two_decode --dry-run --skip-gpu-preflight`.
+- non-claim:
+  - no MTP speed win is claimed from this entry;
+  - `tests/test_mtp.py` did not collect in the local environment because the
+    installed `transformers` package expects a different `huggingface_hub`
+    API (`is_offline_mode` import missing);
+  - probabilistic MTP draft sampling and a width-2 FlashInfer verifier remain
+    follow-up work.

@@ -1,0 +1,92 @@
+{
+  "name": "gpu_mtp1_two_decode",
+  "description": "Opt-in greedy MTP-1 diagnostic using the current BF16 packed/prefill/GDN policy, with an explicit width-2 target verifier. Full-attention decode uses the reference backend because flashinfer_paged is width-1 only in this repo.",
+  "benchmark_script": "benchmarks/benchmark_jax_server_trace.py",
+  "reference_json": "results/qwen08_jax_server_trace_hetero8_64_512x32_gdn_chunk32_default_repeat.json",
+  "vllm_reference_json": "results/qwen08_vllm_async_delta_baseline_hetero8_64_512x32.json",
+  "allow_live_vllm_if_reference_missing": true,
+  "allow_live_jax_default_if_reference_missing": true,
+  "runtime": {
+    "platform": "cuda",
+    "xla": {
+      "flags": "--xla_gpu_autotune_level=4 --xla_gpu_enable_triton_gemm=false"
+    },
+    "fastpaths": {
+      "greedy_token": true,
+      "materialize_tied_lm_head": true,
+      "compact_prefill_in_proj_qkv": true,
+      "compact_prefill_gdn_z": true,
+      "compact_prefill_full_attn_proj": true,
+      "compact_prefill_mlp": true,
+      "compact_prefill_token_count_mode": "bucket",
+      "device_token_carry": true,
+      "trace_token_prefetch": true,
+      "lm_head_decode_act_dtype": "bf16",
+      "lm_head_topk_impl": "jax",
+      "lm_head_greedy_top1_impl": "triton",
+      "decode_proj_act_dtype": "bf16",
+      "decode_padded_gemm": true,
+      "decode_padded_gemm_gate_up": true,
+      "decode_padded_gemm_rows": 8,
+      "decode_padded_gemm_max_out_dim": 300000
+    }
+  },
+  "kernels": {
+    "backend": "pure_jax",
+    "allow_local_cuda_probes": false,
+    "full_attention": {
+      "kv_cache_dtype": "bf16",
+      "prefill_impl": "triton_packed",
+      "decode_impl": "reference"
+    },
+    "gdn": {
+      "disable_fallbacks": false,
+      "prefill_post_conv_impl": "triton_fla_padded",
+      "prefill_block_dot": true,
+      "packed_decode": {
+        "impl": "off",
+        "qkv_dtype": "bf16"
+      }
+    }
+  },
+  "args": {
+    "model": "Qwen/Qwen3.5-0.8B",
+    "backend": "gpu",
+    "dtype": "bfloat16",
+    "weight_dtype": "bfloat16",
+    "jax_execution": "jit",
+    "input_lens": "64,128,192,256,320,384,448,512",
+    "output_len": 32,
+    "prompt_suite": "mixed",
+    "speculative_method": "mtp",
+    "draft_sample_method": "greedy",
+    "mtp_verifier_impl": "two_decode",
+    "mtp_batch_accept_policy": "rowwise",
+    "mtp_seed_after_bonus": false,
+    "num_speculative_tokens": 1,
+    "max_kv_cache_mb": 3072,
+    "num_kvcache_blocks": 256,
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 4096,
+    "prefill_buckets": "64,128,256,384,512",
+    "prefill_token_buckets": "64,128,256,512,1024,2048,4096",
+    "prefill_layout": "packed",
+    "batch_size_buckets": "1,2,3,4,5,6,7,8",
+    "max_blocks_per_seq": 40,
+    "greedy_token_fastpath": true,
+    "device_token_carry": true,
+    "static_decode_metadata": false,
+    "resident_decode_metadata": false,
+    "trace_token_prefetch": true,
+    "static_decode_seq_lens_carry": false,
+    "top_k": 5,
+    "warmup": true,
+    "warmup_mode": "generic",
+    "fail_on_jit_cache_growth": true,
+    "profile": false
+  },
+  "diagnostics": {
+    "speed_claim_allowed": false,
+    "expected_limit": "MTP two_decode is correctness-first until a width-2 FlashInfer/full-attention verifier exists."
+  }
+}

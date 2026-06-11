@@ -103,8 +103,13 @@ class Scheduler:
                     else 64,
                 )
             )
-        self.decode_lookahead_tokens = max(1, 1 + int(getattr(config, "num_speculative_tokens", 0) or 0))
-        self.num_speculative_tokens = max(0, int(getattr(config, "num_speculative_tokens", 0) or 0))
+        self.speculative_method = str(getattr(config, "speculative_method", "none") or "none").lower()
+        self.num_speculative_tokens = (
+            max(0, int(getattr(config, "num_speculative_tokens", 0) or 0))
+            if self.speculative_method == "mtp"
+            else 0
+        )
+        self.decode_lookahead_tokens = max(1, 1 + self.num_speculative_tokens)
         self.greedy_decode_burst_steps = max(
             1,
             _config_or_env_int(
@@ -131,7 +136,8 @@ class Scheduler:
             or "2"
         )
         self.mtp_scheduler_gate_enabled = (
-            self.num_speculative_tokens > 0
+            self.speculative_method == "mtp"
+            and self.num_speculative_tokens > 0
             and (self.mtp_min_accept_rate > 0 or self.mtp_min_speedup > 0)
         )
         self.mtp_dtype = str(config.get_dtype())
@@ -610,6 +616,17 @@ class Scheduler:
         if len(seqs) > batch_size_bucket:
             raise ValueError(f"scheduled batch has {len(seqs)} seqs but bucket has {batch_size_bucket}")
         seq_ids_host = tuple([seq.seq_id for seq in seqs] + [-1] * (batch_size_bucket - len(seqs)))
+        speculative_admitted_host = tuple(
+            (
+                not is_prefill
+                and self.speculative_method == "mtp"
+                and self.num_speculative_tokens > 0
+                and row < len(seqs)
+                and bool(getattr(seqs[row], "mtp_admitted", False))
+            )
+            for row in range(batch_size_bucket)
+        )
+        speculative_draft_tokens_host = tuple(-1 for _ in range(batch_size_bucket))
 
         if is_prefill and self.prefill_layout == "packed":
             return self._build_packed_prefill_batch(
@@ -712,6 +729,25 @@ class Scheduler:
             block_tables_host=block_tables_host,
             decode_step_count_host=1 if is_prefill else max(1, int(decode_step_count)),
             uses_static_decode_metadata=uses_static_decode_metadata,
+            speculative_method=(
+                self.speculative_method
+                if not is_prefill and any(speculative_admitted_host)
+                else "none"
+            ),
+            speculative_num_tokens=(
+                self.num_speculative_tokens
+                if not is_prefill and any(speculative_admitted_host)
+                else 0
+            ),
+            speculative_draft_tokens=jnp.array(speculative_draft_tokens_host, dtype=jnp.int32)
+            if not is_prefill and self.speculative_method == "mtp"
+            else None,
+            speculative_draft_tokens_host=speculative_draft_tokens_host
+            if not is_prefill and self.speculative_method == "mtp"
+            else None,
+            speculative_admitted_host=speculative_admitted_host
+            if not is_prefill and self.speculative_method == "mtp"
+            else None,
         )
 
     def build_mixed_prefill_decode_batch(

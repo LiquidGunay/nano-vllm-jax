@@ -62,6 +62,13 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="JAX SamplingParams top_k. Keep -1 for the compiled temperature-sampling fast path.",
     )
+    parser.add_argument("--speculative-method", choices=["none", "mtp"], default="none")
+    parser.add_argument("--draft-sample-method", choices=["greedy", "probabilistic"], default="greedy")
+    parser.add_argument("--mtp-verifier-impl", choices=["two_decode", "commit_select"], default="two_decode")
+    parser.add_argument("--mtp-batch-accept-policy", choices=["rowwise", "all_or_none"], default="rowwise")
+    parser.add_argument("--mtp-seed-after-bonus", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--mtp-bonus-margin", type=float, default=0.0)
+    parser.add_argument("--mtp-draft-margin", type=float, default=0.0)
     parser.add_argument("--num-speculative-tokens", type=int, choices=[0, 1], default=0)
     parser.add_argument("--max-kv-cache-mb", type=int, default=1024)
     parser.add_argument("--num-kvcache-blocks", type=int, default=64)
@@ -427,6 +434,13 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "max_blocks_per_seq": args.max_blocks_per_seq,
         "decode_block_table_buckets": tuple(_parse_ints(args.decode_block_table_buckets)),
         "jax_execution": args.jax_execution,
+        "speculative_method": args.speculative_method,
+        "draft_sample_method": args.draft_sample_method,
+        "mtp_verifier_impl": args.mtp_verifier_impl,
+        "mtp_batch_accept_policy": args.mtp_batch_accept_policy,
+        "mtp_seed_after_bonus": args.mtp_seed_after_bonus,
+        "mtp_bonus_margin": args.mtp_bonus_margin,
+        "mtp_draft_margin": args.mtp_draft_margin,
         "num_speculative_tokens": args.num_speculative_tokens,
         "greedy_token_fastpath": args.greedy_token_fastpath,
         "sampled_token_fastpath": args.sampled_token_fastpath,
@@ -653,7 +667,14 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "max_blocks_per_seq": int(engine.config.max_blocks_per_seq),
             "decode_block_table_buckets": list(engine.config.decode_block_table_buckets),
             "linear_chunk_size": int(engine.config.linear_chunk_size),
-            "num_speculative_tokens": args.num_speculative_tokens,
+            "speculative_method": str(engine.config.speculative_method),
+            "draft_sample_method": str(engine.config.draft_sample_method),
+            "mtp_verifier_impl": str(engine.config.mtp_verifier_impl),
+            "mtp_batch_accept_policy": str(engine.config.mtp_batch_accept_policy),
+            "mtp_seed_after_bonus": bool(engine.config.mtp_seed_after_bonus),
+            "mtp_bonus_margin": float(engine.config.mtp_bonus_margin),
+            "mtp_draft_margin": float(engine.config.mtp_draft_margin),
+            "num_speculative_tokens": int(engine.config.num_speculative_tokens),
             "sampling": {
                 "temperature": float(args.temperature),
                 "top_p": float(args.top_p),
@@ -746,6 +767,7 @@ def main() -> None:
             summary={
                 "performance": summary["performance"],
                 "correctness": correctness,
+                "speculative_method": summary["config"]["speculative_method"],
                 "num_speculative_tokens": args.num_speculative_tokens,
             },
             learnings=["JAX server-path timing now records per-token step timestamps."],

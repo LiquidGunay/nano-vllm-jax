@@ -4,11 +4,30 @@ import os
 
 import pytest
 
+from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.server_config import (
     engine_overrides_from_config,
     load_server_config,
     runtime_env_from_config,
 )
+
+
+def test_speculative_config_legacy_num_tokens_selects_mtp():
+    config = Qwen3_5Config(num_speculative_tokens=1)
+
+    assert config.speculative_method == "mtp"
+    assert config.num_speculative_tokens == 1
+    assert config.draft_sample_method == "greedy"
+    assert config.mtp_verifier_impl == "two_decode"
+
+
+def test_speculative_config_rejects_unimplemented_probabilistic_mtp():
+    with pytest.raises(ValueError, match="probabilistic"):
+        Qwen3_5Config(
+            speculative_method="mtp",
+            num_speculative_tokens=1,
+            draft_sample_method="probabilistic",
+        )
 
 
 def test_runtime_and_kernel_sections_translate_to_env():
@@ -171,6 +190,38 @@ runtime:
     assert loaded.engine["lm_head_greedy_top1_impl"] == "cutlass"
     assert loaded.engine["decode_rms_padded_gemm"] is True
     assert loaded.engine["decode_padded_gemm_rows"] == 8
+
+
+def test_engine_config_supports_speculative_fields(tmp_path, monkeypatch):
+    for key in (
+        "NANO_VLLM_JAX_SPECULATIVE_METHOD",
+        "NANO_VLLM_JAX_DRAFT_SAMPLE_METHOD",
+        "NANO_VLLM_JAX_MTP_VERIFIER_IMPL",
+        "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+        "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    config = tmp_path / "server_config.yaml"
+    config.write_text(
+        """
+engine:
+  speculative_method: mtp
+  num_speculative_tokens: 1
+  draft_sample_method: greedy
+  mtp_verifier_impl: two_decode
+  mtp_batch_accept_policy: rowwise
+  mtp_seed_after_bonus: true
+""".strip()
+    )
+
+    loaded = load_server_config(config)
+
+    assert loaded.engine["speculative_method"] == "mtp"
+    assert loaded.engine["num_speculative_tokens"] == 1
+    assert loaded.engine["draft_sample_method"] == "greedy"
+    assert loaded.engine["mtp_verifier_impl"] == "two_decode"
+    assert loaded.engine["mtp_batch_accept_policy"] == "rowwise"
+    assert loaded.engine["mtp_seed_after_bonus"] is True
 
 
 def test_engine_config_supports_resident_sequence_capacity(tmp_path, monkeypatch):

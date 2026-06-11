@@ -127,10 +127,14 @@ class LLMEngine:
         # Initialize model parameters - load from HF (no silent fallback)
         print(f"Loading pretrained weights from {model_path}...")
         load_config = replace(self.config, dtype=self.weight_dtype)
+        load_mtp = (
+            self.config.speculative_method == "mtp"
+            and self.config.num_speculative_tokens > 0
+        )
         self.params = load_weights_from_hf_streaming(
             model_path,
             load_config,
-            load_mtp=self.config.num_speculative_tokens > 0,
+            load_mtp=load_mtp,
         )
         print("✓ Using pretrained weights")
         

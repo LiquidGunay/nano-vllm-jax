@@ -59,6 +59,13 @@ class Qwen3_5Config:
     # MTP config
     mtp_num_hidden_layers: int = 1
     mtp_use_dedicated_embeddings: bool = False
+    speculative_method: str = "none"
+    draft_sample_method: str = "greedy"
+    mtp_verifier_impl: str = "two_decode"
+    mtp_batch_accept_policy: str = "rowwise"
+    mtp_seed_after_bonus: bool = False
+    mtp_bonus_margin: float = 0.0
+    mtp_draft_margin: float = 0.0
     num_speculative_tokens: int = 0
     
     # KV cache config (for vLLM paging)
@@ -164,6 +171,35 @@ class Qwen3_5Config:
             "greedy_decode_burst_steps",
             max(1, int(self.greedy_decode_burst_steps or 1)),
         )
+        num_speculative_tokens = max(0, int(self.num_speculative_tokens or 0))
+        if num_speculative_tokens > 1:
+            raise ValueError("MTP speculative decoding currently supports num_speculative_tokens <= 1")
+        speculative_method = str(self.speculative_method or "none").strip().lower()
+        if speculative_method == "none" and num_speculative_tokens > 0:
+            # Legacy configs selected MTP by setting only num_speculative_tokens.
+            speculative_method = "mtp"
+        if speculative_method not in {"none", "mtp"}:
+            raise ValueError("speculative_method must be 'none' or 'mtp'")
+        draft_sample_method = str(self.draft_sample_method or "greedy").strip().lower()
+        if draft_sample_method not in {"greedy", "probabilistic"}:
+            raise ValueError("draft_sample_method must be 'greedy' or 'probabilistic'")
+        if speculative_method == "mtp" and num_speculative_tokens != 1:
+            raise ValueError("speculative_method='mtp' requires num_speculative_tokens=1")
+        if speculative_method == "mtp" and draft_sample_method != "greedy":
+            raise ValueError("MTP probabilistic draft sampling is not implemented yet")
+        mtp_verifier_impl = str(self.mtp_verifier_impl or "two_decode").strip().lower()
+        if mtp_verifier_impl not in {"two_decode", "commit_select"}:
+            raise ValueError("mtp_verifier_impl must be 'two_decode' or 'commit_select'")
+        mtp_batch_accept_policy = str(self.mtp_batch_accept_policy or "rowwise").strip().lower()
+        if mtp_batch_accept_policy not in {"rowwise", "all_or_none"}:
+            raise ValueError("mtp_batch_accept_policy must be 'rowwise' or 'all_or_none'")
+        object.__setattr__(self, "num_speculative_tokens", num_speculative_tokens)
+        object.__setattr__(self, "speculative_method", speculative_method)
+        object.__setattr__(self, "draft_sample_method", draft_sample_method)
+        object.__setattr__(self, "mtp_verifier_impl", mtp_verifier_impl)
+        object.__setattr__(self, "mtp_batch_accept_policy", mtp_batch_accept_policy)
+        object.__setattr__(self, "mtp_bonus_margin", max(0.0, float(self.mtp_bonus_margin or 0.0)))
+        object.__setattr__(self, "mtp_draft_margin", max(0.0, float(self.mtp_draft_margin or 0.0)))
         object.__setattr__(
             self,
             "compact_prefill_token_count_mode",
@@ -299,6 +335,13 @@ class Qwen3_5Config:
             self.dtype,
             self.mtp_num_hidden_layers,
             self.mtp_use_dedicated_embeddings,
+            self.speculative_method,
+            self.draft_sample_method,
+            self.mtp_verifier_impl,
+            self.mtp_batch_accept_policy,
+            self.mtp_seed_after_bonus,
+            self.mtp_bonus_margin,
+            self.mtp_draft_margin,
             self.num_speculative_tokens,
             self.block_size,
             self.max_kv_cache_bytes,
@@ -452,6 +495,13 @@ class Qwen3_5Config:
             "tie_word_embeddings": self.tie_word_embeddings,
             "mtp_num_hidden_layers": self.mtp_num_hidden_layers,
             "mtp_use_dedicated_embeddings": self.mtp_use_dedicated_embeddings,
+            "speculative_method": self.speculative_method,
+            "draft_sample_method": self.draft_sample_method,
+            "mtp_verifier_impl": self.mtp_verifier_impl,
+            "mtp_batch_accept_policy": self.mtp_batch_accept_policy,
+            "mtp_seed_after_bonus": self.mtp_seed_after_bonus,
+            "mtp_bonus_margin": self.mtp_bonus_margin,
+            "mtp_draft_margin": self.mtp_draft_margin,
             "num_speculative_tokens": self.num_speculative_tokens,
             "max_kv_cache_bytes": self.max_kv_cache_bytes,
             "max_num_seqs": self.max_num_seqs,

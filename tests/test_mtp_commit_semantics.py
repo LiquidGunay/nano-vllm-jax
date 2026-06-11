@@ -594,6 +594,44 @@ def test_k1_forced_reject_probe_row_is_logical_one_token(monkeypatch):
     assert runner.stored[-1][0].seq_lens.tolist() == committed_seq_lens
 
 
+def test_k1_config_selected_two_decode_runs_without_legacy_env(monkeypatch):
+    for key in (
+        "NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED",
+        "NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1",
+        "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+        "NANO_VLLM_JAX_MTP_COMMIT_SELECT",
+        "NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1",
+        "NANO_VLLM_JAX_MTP_ENABLE_ROWWISE_REPAIR",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    seq_lens = [5, 6]
+    executor = _FakeExecutor(
+        accepted=[True, False],
+        target=[10, 101],
+        bonus=[20, 201],
+        next_draft=[30, 301],
+        state_marker=[901, 910],
+        committed_seq_lens=[6, 6],
+        kv_slots=[
+            [1000, 1001],
+            [1010, 2011],
+        ],
+    )
+    runner = _FakeRunner(executor, {0: 10, 1: 11}, block_size=16)
+    runner.mtp_verifier_impl = "two_decode"
+    runner.mtp_batch_accept_policy = "rowwise"
+    runner.mtp_seed_after_bonus = False
+    seqs = [_seq(i, seq_lens[i]) for i in range(2)]
+
+    outputs = ModelRunner._run_mtp1_batched(runner, seqs, _batch(seq_lens), [0, 1])
+
+    assert outputs == {0: [10, 20], 1: 101}
+    assert runner.executor.calls[-1]["draft_token"] == [10, 11]
+    assert runner.stats["drafts_accepted"] == 1
+    assert runner.stats["drafts_rejected"] == 1
+    assert runner.stats["bonus_tokens"] == 1
+
+
 def test_k1_commit_consecutive_reject(monkeypatch):
     runner, first_outputs = _run_case(monkeypatch, accepted=[False], target=[111], next_draft=[211], block_size=16)
     assert first_outputs == {0: 111}
@@ -836,6 +874,8 @@ def test_k1_safe_and_fast_two_decode_verifier_parity_rowwise(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
     monkeypatch.delenv("NANO_VLLM_JAX_MTP_BONUS_MARGIN", raising=False)
     monkeypatch.delenv("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", raising=False)
 
     config = _tiny_mtp_verifier_config()
     params = init_params(jax.random.PRNGKey(0), config)

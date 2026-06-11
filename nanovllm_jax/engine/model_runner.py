@@ -10,7 +10,12 @@ from typing import List, Tuple, Dict, Optional, Any
 from functools import partial
 from dataclasses import replace
 
-from nanovllm_jax.backends import select_backend
+from nanovllm_jax.backends import (
+    gdn_disable_fallbacks_enabled,
+    gdn_packed_decode_enabled,
+    gdn_packed_decode_impl,
+    select_backend,
+)
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.model import ModelParams, full_attention_block, gated_deltanet_block, transformer_block, forward as model_forward
 from nanovllm_jax.engine.sequence import DeviceTokenRef, Sequence
@@ -1075,9 +1080,53 @@ class CanonicalModelRunner:
         self._resident_rng_counters = jnp.zeros((max_seqs,), dtype=jnp.int32)
         self._resident_rng_counter_reset_slots: set[int] = set()
         self._sample_fn = jax.jit(self._sample_logits)
-        self.mtp_enabled = hasattr(params, "mtp_params") and params.mtp_params is not None
-        self.num_speculative_tokens = int(getattr(config, "num_speculative_tokens", 0) or 0)
+        self.speculative_method = str(getattr(config, "speculative_method", "none") or "none").lower()
+        requested_mtp = (
+            self.speculative_method == "mtp"
+            and int(getattr(config, "num_speculative_tokens", 0) or 0) > 0
+        )
+        self.mtp_enabled = requested_mtp and hasattr(params, "mtp_params") and params.mtp_params is not None
+        if requested_mtp and not self.mtp_enabled:
+            raise ValueError("speculative_method='mtp' requires loaded mtp.* weights")
+        self.num_speculative_tokens = (
+            int(getattr(config, "num_speculative_tokens", 0) or 0)
+            if requested_mtp
+            else 0
+        )
         self.mtp1_enabled = self.mtp_enabled and self.num_speculative_tokens > 0
+        self.draft_sample_method = str(getattr(config, "draft_sample_method", "greedy") or "greedy").lower()
+        self.mtp_verifier_impl = str(getattr(config, "mtp_verifier_impl", "two_decode") or "two_decode").lower()
+        self.mtp_batch_accept_policy = str(
+            getattr(config, "mtp_batch_accept_policy", "rowwise") or "rowwise"
+        ).lower()
+        self.mtp_seed_after_bonus = bool(getattr(config, "mtp_seed_after_bonus", False))
+        self.mtp_bonus_margin = float(getattr(config, "mtp_bonus_margin", 0.0) or 0.0)
+        self.mtp_draft_margin = float(getattr(config, "mtp_draft_margin", 0.0) or 0.0)
+        if self.mtp1_enabled and self.draft_sample_method != "greedy":
+            raise ValueError("MTP probabilistic draft sampling is not implemented yet")
+        if (
+            self.mtp1_enabled
+            and self.mtp_verifier_impl == "two_decode"
+            and str(getattr(config, "full_attention_decode_impl", "reference")).lower()
+            == "flashinfer_paged"
+        ):
+            raise ValueError(
+                "MTP two_decode verifier needs a width-2 full-attention decode backend; "
+                "flashinfer_paged currently supports the width-1 non-speculative path. "
+                "Use mtp_verifier_impl='commit_select' or a width-2-capable full_attention_decode_impl."
+            )
+        if (
+            self.mtp1_enabled
+            and self.mtp_verifier_impl == "two_decode"
+            and gdn_packed_decode_enabled(config)
+            and gdn_disable_fallbacks_enabled(config)
+        ):
+            raise ValueError(
+                "MTP two_decode verifier needs width-2 GDN decode. The configured "
+                f"GDN packed decode implementation {gdn_packed_decode_impl(config)!r} "
+                "is width-1 only with fallbacks disabled. Disable gdn_packed_decode_impl "
+                "for MTP two_decode, allow fallback, or use mtp_verifier_impl='commit_select'."
+            )
         compile_mtp_draft_default = os.environ.get("NANO_VLLM_JAX_MTP_COMPILE_DRAFT", "1") in {
             "1",
             "true",
@@ -1458,7 +1507,8 @@ class CanonicalModelRunner:
                 )
 
                 def _record_decode_warmup(output, route: str, decode_steps: int = 1) -> None:
-                    _block_until_ready(output.activations)
+                    activations = getattr(output, "activations", None)
+                    _block_until_ready(activations if activations is not None else output)
                     self.cache_storage = output.cache_storage
                     self._sample_fn(
                         jnp.zeros((batch_size, self.config.vocab_size), dtype=jnp.float32),
@@ -1676,6 +1726,34 @@ class CanonicalModelRunner:
                             last_logits_only=True,
                         )
                         _record_decode_warmup(output, "forward_step_jit:decode")
+                if seed_mtp1 and self.num_speculative_tokens == 1:
+                    mtp_hybrid_state = init_hybrid_state(
+                        self.config,
+                        batch_size=batch_size,
+                        dtype=self.config.get_dtype(),
+                    )
+                    verifier_drafts = jnp.zeros((int(batch_size),), dtype=jnp.int32)
+                    next_positions = jnp.full((int(batch_size),), 2, dtype=jnp.int32)
+                    if str(getattr(self, "mtp_verifier_impl", "two_decode")) == "commit_select":
+                        output = self.executor.mtp1_commit_select_greedy_step_jit(
+                            batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state=mtp_hybrid_state,
+                            draft_token=verifier_drafts,
+                            next_mtp_position=next_positions,
+                            mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                        )
+                        _record_decode_warmup(output, "mtp1_commit_select_greedy_step_jit:decode")
+                    else:
+                        output = self.executor.mtp1_two_decode_greedy_step_jit(
+                            batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state=mtp_hybrid_state,
+                            draft_token=verifier_drafts,
+                            next_mtp_position=next_positions,
+                            mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                        )
+                        _record_decode_warmup(output, "mtp1_two_decode_greedy_step_jit:decode")
                 if use_sampled_token_fastpath and not seed_mtp1:
                     temperatures = jnp.ones((int(batch_size),), dtype=jnp.float32)
                     sampled_hybrid_state = init_hybrid_state(
@@ -4193,7 +4271,13 @@ class CanonicalModelRunner:
         token_input = jnp.array(token_values, dtype=jnp.int32)[:, None]
         position_input = jnp.array(position_values, dtype=jnp.int32)[:, None]
         draft_len = max(1, int(getattr(self, "num_speculative_tokens", 1) or 1))
-        draft_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_DRAFT_MARGIN", "0") or "0")
+        draft_margin_threshold = float(
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_DRAFT_MARGIN",
+                getattr(self, "mtp_draft_margin", 0.0),
+            )
+            or "0"
+        )
         draft_margin_values = None
         if getattr(self, "mtp_debug", False):
             draft_logits = self._mtp1_logits(
@@ -4277,7 +4361,13 @@ class CanonicalModelRunner:
         hidden_input = hidden[None, None, :]
         token_input = jnp.array([[confirmed_token_id]], dtype=jnp.int32)
         position_input = jnp.array([[position + int(getattr(self, "mtp_position_offset", 0))]], dtype=jnp.int32)
-        draft_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_DRAFT_MARGIN", "0") or "0")
+        draft_margin_threshold = float(
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_DRAFT_MARGIN",
+                getattr(self, "mtp_draft_margin", 0.0),
+            )
+            or "0"
+        )
         draft_margin = None
         if getattr(self, "mtp_debug", False):
             draft_logits = self._mtp1_logits(
@@ -4614,8 +4704,12 @@ class CanonicalModelRunner:
                 + int(getattr(self, "mtp_position_offset", 0))
             )
         next_mtp_positions = jnp.array(next_mtp_positions_for_batch, dtype=jnp.int32)
+        verifier_impl = str(getattr(self, "mtp_verifier_impl", "two_decode") or "two_decode")
         force_commit_select = (
-            os.environ.get("NANO_VLLM_JAX_MTP_COMMIT_SELECT", "0")
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_COMMIT_SELECT",
+                "1" if verifier_impl == "commit_select" else "0",
+            )
             in {"1", "true", "yes", "on", "True"}
         )
         disable_one_pass_k1 = (
@@ -4627,15 +4721,24 @@ class CanonicalModelRunner:
             in {"1", "true", "yes", "on", "True"}
         )
         allow_unsafe_one_pass_k1 = (
-            os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0")
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1",
+                "1" if verifier_impl == "two_decode" else "0",
+            )
             in {"1", "true", "yes", "on", "True"}
         )
         allow_mixed_fused_k1 = (
-            os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "0")
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED",
+                "1" if verifier_impl == "two_decode" else "0",
+            )
             in {"1", "true", "yes", "on", "True"}
         )
         seed_after_bonus_enabled = (
-            os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0")
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self, "mtp_seed_after_bonus", False) else "0",
+            )
             in {"1", "true", "yes", "on", "True"}
         )
         allow_seeded_one_pass_k1 = (
@@ -4654,7 +4757,10 @@ class CanonicalModelRunner:
             not in {"1", "true", "yes", "on", "True"}
             and hasattr(self.executor, "mtp1_two_decode_greedy_fast_step_jit")
         )
-        batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
+        batch_accept_policy = os.environ.get(
+            "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+            str(getattr(self, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+        )
         enable_rowwise_repair = (
             os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_ROWWISE_REPAIR", "1")
             in {"1", "true", "yes", "on", "True"}
@@ -4908,7 +5014,10 @@ class CanonicalModelRunner:
             outputs: dict[int, List[int] | int] = {}
             repair_rows: List[int] = []
             stats = self._speculative_stats()
-            seed_after_bonus = os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0") in {
+            seed_after_bonus = os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self, "mtp_seed_after_bonus", False) else "0",
+            ) in {
                 "1",
                 "true",
                 "yes",
@@ -5281,7 +5390,10 @@ class CanonicalModelRunner:
         t_profile = _mark("accepted_result_transfer", t_profile)
         outputs: dict[int, List[int] | int] = {}
         stats = self._speculative_stats()
-        seed_after_bonus = os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0") in {
+        seed_after_bonus = os.environ.get(
+            "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+            "1" if getattr(self, "mtp_seed_after_bonus", False) else "0",
+        ) in {
             "1",
             "true",
             "yes",
@@ -5486,7 +5598,10 @@ class CanonicalModelRunner:
             batch = self._build_scheduled_batch(seqs, is_prefill=is_prefill)
 
         seed_mtp1 = bool(self.mtp1_enabled)
-        force_commit_select = os.environ.get("NANO_VLLM_JAX_MTP_COMMIT_SELECT", "0") in {
+        force_commit_select = os.environ.get(
+            "NANO_VLLM_JAX_MTP_COMMIT_SELECT",
+            "1" if getattr(self, "mtp_verifier_impl", "two_decode") == "commit_select" else "0",
+        ) in {
             "1",
             "true",
             "yes",
@@ -5500,7 +5615,10 @@ class CanonicalModelRunner:
             "on",
             "True",
         }
-        allow_unsafe_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0") in {
+        allow_unsafe_one_pass_k1 = os.environ.get(
+            "NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1",
+            "1" if getattr(self, "mtp_verifier_impl", "two_decode") == "two_decode" else "0",
+        ) in {
             "1",
             "true",
             "yes",
@@ -5605,14 +5723,21 @@ class CanonicalModelRunner:
                         reason = "other"
                     not_fused_reasons[reason] = not_fused_reasons.get(reason, 0) + 1
 
-            allow_mixed_fused = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "0") in {
+            verifier_impl = str(getattr(self, "mtp_verifier_impl", "two_decode") or "two_decode")
+            allow_mixed_fused = os.environ.get(
+                "NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED",
+                "1" if verifier_impl == "two_decode" else "0",
+            ) in {
                 "1",
                 "true",
                 "yes",
                 "on",
                 "True",
             }
-            batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
+            batch_accept_policy = os.environ.get(
+                "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+                str(getattr(self, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+            )
             force_reuse_fallback = os.environ.get("NANO_VLLM_JAX_MTP_FORCE_REUSE_FALLBACK", "0") in {
                 "1",
                 "true",
@@ -5627,7 +5752,10 @@ class CanonicalModelRunner:
                 "on",
                 "True",
             }
-            seed_after_bonus_enabled = os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0") in {
+            seed_after_bonus_enabled = os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self, "mtp_seed_after_bonus", False) else "0",
+            ) in {
                 "1",
                 "true",
                 "yes",
@@ -5641,7 +5769,10 @@ class CanonicalModelRunner:
                 "on",
                 "True",
             }
-            allow_unsafe_one_pass_k1 = os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", "0") in {
+            allow_unsafe_one_pass_k1 = os.environ.get(
+                "NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1",
+                "1" if verifier_impl == "two_decode" else "0",
+            ) in {
                 "1",
                 "true",
                 "yes",

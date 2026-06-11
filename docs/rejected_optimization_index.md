@@ -140,7 +140,10 @@ but lost integrated correctness or performance.
 
 ## MTP Status
 
-Default MTP1 serving is rejected for speed work. Entry 049 kept exact output
-only because all verified speculative drafts were rejected (`0/92` accepted).
-MTP remains diagnostics-only until draft acceptance is meaningfully nonzero and
-commit-select/verifier shapes are warmed before timing.
+The old default MTP1 serving speed claim remains rejected. Entry 049 kept exact
+output only because all verified speculative drafts were rejected (`0/92`
+accepted). As of Entry 294, MTP-1 is an explicit opt-in diagnostic/implementation
+route with config-owned verifier selection and generic warmup coverage. Do not
+report it as a serving win until draft acceptance is meaningful and the
+correctness-gated MTP run beats the current non-speculative kernel-backed path
+on the same benchmark lane.

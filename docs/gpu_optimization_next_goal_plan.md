@@ -85,6 +85,13 @@ optimization work starts.
     scalar, independently testable, and every later FLA stage consumes its
     cumulative gate output. Porting later stages first makes failures harder to
     localize.
+18. As of 2026-06-11, MTP-1 speculative decoding is the next explicit
+    implementation branch. It must be opt-in, preserve the current
+    non-speculative kernel-backed server path when disabled, and report speed
+    only against the same random-large/JAX/vLLM baselines. The first accepted
+    route is greedy K=1 with config-owned verifier selection and generic warmup
+    coverage; probabilistic sampling and a width-2 FlashInfer verifier remain
+    follow-up work.
 
 ## Active Random Request Contract - 2026-06-04
 
@@ -1020,9 +1027,12 @@ Current tracked records:
   decode steps, about `17.74 s` total prefill-step time, and about `6.30 s`
   total decode-step time, so the sidecar gap is heavily
   TTFT/static-concurrency driven.
-- Active target: fastest accepted kernel-backed non-speculative serving at
-  `>=0.9x` vLLM on the same benchmark discipline, with MTP remaining
-  diagnostic-only.
+- Historical target before the MTP branch: fastest accepted kernel-backed
+  non-speculative serving at `>=0.9x` vLLM on the same benchmark discipline.
+  Decision 18 supersedes this for the current implementation branch: MTP is now
+  an opt-in implementation target, but remains diagnostic-only for speed claims
+  until it beats the current non-speculative path and vLLM/JAX references on the
+  same lane.
 
 If paged-layout kernels remain hard to integrate cleanly, insert a smaller
 kernel-integration probe before more complicated paging work. GEMM-shaped or
@@ -3252,7 +3262,9 @@ Model-specific assumptions to track:
    consistent with known close-logit/tie-sensitive behavior rather than
    capacity/state bugs.
 2. Do not compare against stale baselines; compare against Entry 045 or the latest accepted baseline.
-3. Do not optimize MTP for speed yet.
+3. MTP may be implemented and optimized only as an opt-in route; do not promote
+   it as a speed win until it beats the current non-speculative path and
+   vLLM/JAX references on the same lane.
 4. Do not implement more source-level JAX rewrites unless HLO/profile evidence says they target a real bottleneck.
 5. Do not accept microbenchmark-only wins.
 6. Do not add per-layer layout conversions to use an external kernel.

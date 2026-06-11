@@ -3220,14 +3220,25 @@ class ModelExecutor:
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
-            float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0")),
-            os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
+            float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", getattr(self.config, "mtp_bonus_margin", 0.0))),
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+                str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+            ),
             os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "1"),
-            os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0"),
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
+            ),
         )
         if key not in self._jit_cache:
-            bonus_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0"))
-            batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
+            bonus_margin_threshold = float(
+                os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", getattr(self.config, "mtp_bonus_margin", 0.0))
+            )
+            batch_accept_policy = os.environ.get(
+                "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+                str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+            )
             one_pass_decode_mode = os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "1") in {
                 "1",
                 "true",
@@ -3235,7 +3246,10 @@ class ModelExecutor:
                 "on",
                 "True",
             }
-            compute_next_draft = os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0") in {
+            compute_next_draft = os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
+            ) in {
                 "1",
                 "true",
                 "yes",
@@ -4111,14 +4125,28 @@ class ModelExecutor:
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
-            float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0")),
-            os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
-            os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0"),
+            float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", getattr(self.config, "mtp_bonus_margin", 0.0))),
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+                str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+            ),
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
+            ),
         )
         if key not in self._jit_cache:
-            bonus_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0"))
-            batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
-            compute_next_draft = os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0") in {
+            bonus_margin_threshold = float(
+                os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", getattr(self.config, "mtp_bonus_margin", 0.0))
+            )
+            batch_accept_policy = os.environ.get(
+                "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+                str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+            )
+            compute_next_draft = os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
+            ) in {
                 "1",
                 "true",
                 "yes",
@@ -4357,14 +4385,28 @@ class ModelExecutor:
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
-            float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0")),
-            os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
-            os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0"),
+            float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", getattr(self.config, "mtp_bonus_margin", 0.0))),
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+                str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+            ),
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
+            ),
         )
         if key not in self._jit_cache:
-            bonus_margin_threshold = float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", "0"))
-            batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
-            compute_next_draft = os.environ.get("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "0") in {
+            bonus_margin_threshold = float(
+                os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", getattr(self.config, "mtp_bonus_margin", 0.0))
+            )
+            batch_accept_policy = os.environ.get(
+                "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+                str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+            )
+            compute_next_draft = os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
+            ) in {
                 "1",
                 "true",
                 "yes",
@@ -4690,10 +4732,16 @@ class ModelExecutor:
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
-            os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none"),
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+                str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+            ),
         )
         if key not in self._jit_cache:
-            batch_accept_policy = os.environ.get("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "all_or_none")
+            batch_accept_policy = os.environ.get(
+                "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+                str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+            )
 
             def _expand_row_mask(mask: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
                 return mask.reshape((mask.shape[0],) + (1,) * (target.ndim - 1))

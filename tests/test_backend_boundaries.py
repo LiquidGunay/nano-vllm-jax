@@ -218,6 +218,80 @@ def test_full_attention_kv_cache_dtype_default_config_uses_spec_dtype(monkeypatc
     assert cache.v_cache.dtype == jnp.float32
 
 
+def test_scheduler_marks_mtp_decode_batch_metadata():
+    config = Qwen3_5Config(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        block_size=4,
+        num_kvcache_blocks=8,
+        max_num_seqs=2,
+        batch_size_buckets=(2,),
+        max_blocks_per_seq=2,
+        num_speculative_tokens=1,
+        prefill_layout="dense",
+    )
+    scheduler = Scheduler(config)
+    seq = Sequence(
+        token_ids=[3, 4, 5],
+        sampling_params=SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True),
+        seq_id=7,
+    )
+    seq.num_prompt_tokens = 1
+    seq.num_cached_tokens = 1
+    seq.block_table = [0, 1]
+    seq.mtp_admitted = True
+
+    batch = scheduler.build_scheduled_batch([seq], is_prefill=False)
+
+    assert batch.speculative_method == "mtp"
+    assert batch.speculative_num_tokens == 1
+    assert batch.speculative_admitted_host == (True, False)
+    assert batch.speculative_draft_tokens_host == (-1, -1)
+    assert tuple(batch.speculative_draft_tokens.shape) == (2,)
+    assert batch.is_speculative_decode
+
+
+def test_scheduler_omits_speculative_metadata_when_disabled():
+    config = Qwen3_5Config(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        block_size=4,
+        num_kvcache_blocks=8,
+        max_num_seqs=2,
+        batch_size_buckets=(2,),
+        max_blocks_per_seq=2,
+        prefill_layout="dense",
+    )
+    scheduler = Scheduler(config)
+    seq = Sequence(
+        token_ids=[3, 4, 5],
+        sampling_params=SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True),
+        seq_id=7,
+    )
+    seq.num_prompt_tokens = 1
+    seq.num_cached_tokens = 1
+    seq.block_table = [0, 1]
+    seq.mtp_admitted = True
+
+    batch = scheduler.build_scheduled_batch([seq], is_prefill=False)
+
+    assert batch.speculative_method == "none"
+    assert batch.speculative_num_tokens == 0
+    assert batch.speculative_admitted_host is None
+    assert batch.speculative_draft_tokens is None
+    assert not batch.is_speculative_decode
+
+
 def test_pure_jax_metadata_uses_non_identity_block_tables():
     backend = PureJAXBackend()
     block_tables = jnp.array([[5, 2, 8], [7, 4, 6]], dtype=jnp.int32)

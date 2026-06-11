@@ -6,6 +6,38 @@ Do not describe the current MTP path as production-ready. Current GPU server-sha
 
 ## Current GPU caveat
 
+As of 2026-06-11, MTP-1 is an explicit opt-in serving mode rather than an
+environment-only diagnostic. The server config fields are:
+
+- `speculative_method`: `none` or `mtp`;
+- `num_speculative_tokens`: currently `0` or `1`;
+- `draft_sample_method`: currently only `greedy` is implemented for MTP;
+- `mtp_verifier_impl`: `two_decode` for the width-2 target verifier, or
+  `commit_select` for the older exact sequential reference;
+- `mtp_batch_accept_policy`: `rowwise` or `all_or_none`;
+- `mtp_seed_after_bonus`: default `false`.
+
+Legacy configs that set only `num_speculative_tokens=1` are interpreted as
+`speculative_method=mtp` for compatibility. Invalid or unimplemented MTP modes
+fail at startup instead of silently taking a partial speculative path.
+
+The first GPU MTP-1 route is correctness-first:
+
+- the target model remains canonical;
+- the scheduler marks admitted speculative rows in `ScheduledBatch`;
+- generic warmup compiles the configured MTP verifier buckets;
+- `flashinfer_paged` full-attention decode is rejected for `two_decode` because
+  the current FlashInfer route is width-1 only;
+- packed GDN decode kernels are also width-1 only for this verifier shape, so
+  the MTP two-decode diagnostic leaves packed GDN decode off;
+- `benchmarks/configs/gpu_mtp1_two_decode.json` uses the reference
+  full-attention decode backend for the width-2 verifier until a real width-2
+  FlashInfer or equivalent verifier exists.
+
+Do not use the new MTP config as a speed-claim artifact yet. It is the first
+clean GPU implementation target for measuring acceptance, verifier cost, and
+whether a width-2 verifier can beat the current non-speculative kernel path.
+
 The current GPU correctness contract is `dtype=float32` with `weight_dtype=bfloat16` for Qwen3.5 real weights. Under that contract:
 
 - the long-decode top-5 guardrail matches HF for 500/500 decode steps,
@@ -16,8 +48,10 @@ The current GPU correctness contract is `dtype=float32` with `weight_dtype=bfloa
 Current default posture:
 
 - regular serving uses `num_speculative_tokens=0` unless a caller opts into MTP,
-- unsafe one-pass K=1 verifier paths are opt-in through `NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1=1`,
-- the exact commit-select path is the correctness reference for focused MTP1 tests,
+- the width-2 K=1 verifier is selected through config rather than
+  `NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1=1`,
+- the exact commit-select path remains the correctness reference for focused
+  MTP1 tests and diagnostics,
 - forced MTP benchmarks are diagnostics, not serving guidance, until they pass generated-token parity and measured decode speedup.
 
 ## Historical TPU validated state
