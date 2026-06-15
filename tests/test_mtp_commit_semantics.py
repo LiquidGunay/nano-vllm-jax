@@ -2133,3 +2133,87 @@ def test_k1_safe_and_fast_two_decode_verifier_parity_rowwise(monkeypatch):
         pytest.xfail(_format_mtp_fast_safe_mismatch(safe_fields, fast_fields))
 
     assert fast_fields == safe_fields
+
+
+def test_k1_safe_and_table_two_decode_verifier_parity_rowwise(monkeypatch):
+    import jax
+    import numpy as np
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_BONUS_MARGIN", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", raising=False)
+
+    config = _tiny_mtp_verifier_config()
+    params = init_params(jax.random.PRNGKey(0), config)
+    params.mtp_params = init_mtp_params(jax.random.PRNGKey(1), config)
+    executor = ModelExecutor(config, params, backend="pure_jax")
+
+    batch = ScheduledBatch(
+        tokens=jnp.array([[3], [4]], dtype=jnp.int32),
+        positions=jnp.array([[0], [0]], dtype=jnp.int32),
+        seq_ids=jnp.array([0, 1], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 2], dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=2,
+        block_tables=jnp.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=jnp.int32),
+        seq_lens=jnp.array([1, 1], dtype=jnp.int32),
+    )
+
+    kv_spec = KVCacheSpec(
+        num_layers=config.num_hidden_layers,
+        num_blocks=config.num_kvcache_blocks,
+        block_size=config.block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        dtype=config.get_dtype(),
+        max_kv_cache_bytes=config.max_kv_cache_bytes,
+    )
+    base_cache = executor.backend.allocate_kv_cache(kv_spec, max_seqs=2, max_blocks_per_seq=4)
+    base_hybrid = init_hybrid_state(config, batch_size=2, dtype=config.get_dtype())
+
+    probe = executor.mtp1_two_decode_greedy_step_jit(
+        batch,
+        cache_storage=_clone_cache_storage(base_cache),
+        hybrid_state=_clone_hybrid_state(base_hybrid),
+        draft_token=jnp.array([-1, -1], dtype=jnp.int32),
+        next_mtp_position=jnp.array([2, 2], dtype=jnp.int32),
+        mtp_hidden_final_normed=True,
+    )
+    target_tokens = jnp.array(probe.target_token.tolist(), dtype=jnp.int32)
+    draft_tokens = target_tokens.at[1].set((target_tokens[1] + 1) % config.vocab_size)
+
+    safe = executor.mtp1_two_decode_greedy_step_jit(
+        batch,
+        cache_storage=_clone_cache_storage(base_cache),
+        hybrid_state=_clone_hybrid_state(base_hybrid),
+        draft_token=draft_tokens,
+        next_mtp_position=jnp.array([2, 2], dtype=jnp.int32),
+        mtp_hidden_final_normed=True,
+    )
+    table = executor.mtp1_two_decode_greedy_table_step_jit(
+        batch,
+        cache_storage=_clone_cache_storage(base_cache),
+        hybrid_state_table=_clone_hybrid_state(base_hybrid),
+        hybrid_slot_ids=jnp.array([0, 1], dtype=jnp.int32),
+        draft_token=draft_tokens,
+        next_mtp_position=jnp.array([2, 2], dtype=jnp.int32),
+        mtp_hidden_final_normed=True,
+    )
+
+    assert table.hybrid_state_is_table is True
+    assert _output_fields(table) == _output_fields(safe)
+    np.testing.assert_allclose(
+        np.asarray(table.hybrid_state.conv_state[:2]),
+        np.asarray(safe.hybrid_state.conv_state),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(table.hybrid_state.recurrent_state[:2]),
+        np.asarray(safe.hybrid_state.recurrent_state),
+        rtol=1e-5,
+        atol=1e-5,
+    )

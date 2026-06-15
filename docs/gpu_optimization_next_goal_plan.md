@@ -122,6 +122,39 @@ optimization work starts.
     reference/packed projection and raw-tail GDN; `2.20 output tok/s` for
     conv-tail GDN). The next speed lever is a coarser width-2 target-model
     verifier boundary, not another per-token GDN kernel swap.
+22. The active MTP route is now the exact resident-table K=1 two-decode
+    verifier. It gathers active hybrid state rows from the resident table,
+    verifies `[current, draft]`, selects the after-current or after-draft
+    hybrid state per row, scatters the selected state back to the resident
+    table inside the compiled boundary, and returns compact emitted token
+    summaries. On the two-row smoke lane it is exact and JIT-stable with
+    `12/13` accepted drafts, improving the compact one-pass verifier from
+    `22.52 output tok/s` to `28.23 output tok/s`, close to the `k_decode`
+    route's `28.97 output tok/s`. This is still well below the no-MTP control
+    at `47.25 output tok/s`, so the current blocker is no longer only the
+    prefix-state verifier selection. The next work must profile and remove the
+    remaining host/token-carry/scheduler overhead around verified MTP groups:
+    postprocess materialization placement, device-token prefetch, block commit
+    bookkeeping, MTP admission/update cost, and any first-use/final-drain
+    synchronizations. Do not resume isolated GDN decode-kernel swaps for this
+    goal unless the integrated verified MTP path shows the verifier kernel
+    itself has returned as the dominant bucket.
+23. A 2026-06-15 prefill-seeded resident-table diagnostic did not solve the
+    verifier bottleneck. It removed the explicit fallback seed step
+    (`fallback_seeded_main_steps=0`) but only reached `29.37 output tok/s`
+    versus `31.45 output tok/s` for the non-prefill-seeded burst2 table route
+    and `47.25 output tok/s` for no-MTP. Profiling showed the seed work moved
+    into prefill/TTFT (`~628 ms`) rather than making the verified decode path a
+    win. Two decode-side seed-plus-table-burst diagnostics were also rejected:
+    seed plus two verifier groups reached `27.70 output tok/s`, and seed plus
+    one verifier group reached `29.11 output tok/s`, both below the old
+    non-prefill-seeded table burst route. A broad attempt to warm every decode
+    route at the maximum configured prefill length crashed inside a Triton
+    custom call with `CUDA_ERROR_ILLEGAL_ADDRESS`, so do not make max-length
+    decode warmup a default for the current kernel mix. The accepted path stays
+    the old exact resident-table burst verifier while the next work isolates
+    the long first seed execution and steady-state target-verifier cost without
+    changing default routing to the rejected seed-boundary variants.
 
 ## Active Random Request Contract - 2026-06-04
 

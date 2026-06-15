@@ -175,6 +175,45 @@ Do not seed a follow-up K=1 draft after a rejected row unless the rejected-row n
 
 The current MTP research target is a coarse safe verifier whose width-2 target-model forward is materially cheaper than two width-1 forwards. The after-current-token prefix state is now exposed by `return_first_prefix_hybrid` in focused coverage, but the corrected one-pass GPU smoke is still slower than both `k_decode` and no-MTP.
 
+## GPU 2026-06-15 resident-table K=1 verifier
+
+The current active K=1 verifier is an exact resident-table two-decode boundary.
+Instead of returning a compact per-row hybrid state and asking Python to store
+it, the compiled verifier:
+
+- gathers the active rows from the resident hybrid/GDN state table;
+- runs the target model on `[current_token, draft_token]`;
+- compares the verified target token with the draft token on device;
+- selects the after-current state for rejected rows and after-draft state for
+  accepted rows;
+- scatters the selected state back into the resident table inside the JIT;
+- emits a fixed two-token row summary plus accepted counts for the scheduler.
+
+This route keeps target-model verification exact and removes the old Python
+hybrid-state writeback boundary. On the two-request smoke manifest with
+`final_normed` MTP hidden state and Triton MTP top-1, it is exact,
+JIT-cache-stable, and accepts `12/13` drafts. Throughput improved from
+`22.52 output tok/s` for the compact one-pass verifier to `28.23 output tok/s`,
+roughly matching `k_decode` at `28.97 output tok/s`.
+
+That is not a serving win yet: the no-MTP control on the same smoke is
+`47.25 output tok/s`. The next blocker is therefore the surrounding serving
+loop, not another narrow GDN kernel swap. The current profiling target is to
+remove or move host-facing work around verified MTP groups: token prefetch and
+materialization, `Sequence`/block-manager commit bookkeeping, admission updates,
+and first-use/final-drain synchronizations. Any future speed claim must stay on
+the exact verified route and keep zero measured JIT-cache growth.
+
+Prefill seeding is not the current speed route. The `entry325` diagnostic moved
+the seed cost into prefill (`~628 ms` TTFT) and reached only
+`29.37 output tok/s`, below the non-prefill-seeded exact table burst2 run at
+`31.45 output tok/s`. Decode-side seed-plus-table-burst was tested next and is
+also rejected as a default: seed plus two verifier groups reached
+`27.70 output tok/s`, and seed plus one verifier group reached
+`29.11 output tok/s`. The active route remains the non-prefill-seeded exact
+resident-table burst verifier while the next pass isolates the first seed
+execution and steady-state verifier model cost.
+
 Break-even direction:
 
 - With the historical safe path, increasing from 0.8B to 4B did not materially lower the threshold. The 4B accepted-step per-token latency was approximately baseline latency, while rejected rows remained about 2x baseline latency.

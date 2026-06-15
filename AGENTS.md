@@ -434,3 +434,16 @@
   intentionally rejects the packed-prefill MTP verifier route until a
   kernel-backed prefix-state boundary exists; do not re-enable this fallback
   for benchmark runs.
+- Entry 329 restored the best exact MTP route after rejecting decode-side
+  seed-plus-table-burst experiments. The accepted exact route is still the
+  resident-table K=1 two-decode verifier with burst2 steady groups:
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_verifier_20260615/entry329_mtp_table_burst2_restored_profile_b2_active2.json`
+  reached `31.22 output tok/s`, `12/13` accepted, JIT `20 -> 20`, matching
+  Entry 324. Do not retry prefill seeding (`29.37 output tok/s`), seed plus
+  two verifier groups (`27.70`), or seed plus one verifier group (`29.11`) as
+  default routes. Also do not make max-prefill-length decode warmup a default:
+  warming the current MTP table-burst verifier at long `seq_lens` crashed in a
+  Triton custom call with `CUDA_ERROR_ILLEGAL_ADDRESS`. The remaining exact-MTP
+  blockers are the cold first fused seed execution (~493 ms), a measured
+  scheduler gap before the first steady burst in short smokes, and the
+  target-model verifier cost itself.

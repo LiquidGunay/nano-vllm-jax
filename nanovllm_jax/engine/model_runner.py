@@ -29,6 +29,30 @@ from nanovllm_jax.mtp.speculative import generate_draft_tokens, verify_draft_tok
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
 
 
+def _block_until_ready_tree(value: object) -> None:
+    ready = getattr(value, "block_until_ready", None)
+    if callable(ready):
+        ready()
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _block_until_ready_tree(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _block_until_ready_tree(item)
+        return
+    dataclass_fields = getattr(value, "__dataclass_fields__", None)
+    if dataclass_fields is not None:
+        for name in dataclass_fields:
+            _block_until_ready_tree(getattr(value, name))
+        return
+    for leaf in jax.tree_util.tree_leaves(value):
+        leaf_ready = getattr(leaf, "block_until_ready", None)
+        if callable(leaf_ready):
+            leaf_ready()
+
+
 def _config_or_env_flag(config: Qwen3_5Config | None, attr: str, env_name: str, *, default: bool = False) -> bool:
     if config is not None and hasattr(config, attr):
         return bool(getattr(config, attr))
@@ -1138,6 +1162,7 @@ class CanonicalModelRunner:
         self._device_token_carry_by_seq_id: dict[int, DeviceTokenRef] = {}
         self._device_seq_lens_carry_seq_ids: tuple[int, ...] | None = None
         self._device_seq_lens_carry: jnp.ndarray | None = None
+        self._resident_last_tokens_stale_seq_ids: set[int] = set()
         self._hybrid_slot_ids_device_cache: dict[tuple[int, ...], jnp.ndarray] = {}
         self._prefill_final_flags_device_cache: dict[tuple[bool, ...], jnp.ndarray] = {}
         self.reset_speculative_stats()
@@ -1227,10 +1252,7 @@ class CanonicalModelRunner:
     ):
         """Compile configured static shapes through the canonical executor path."""
         def _block_until_ready(value: object) -> None:
-            for leaf in jax.tree_util.tree_leaves(value):
-                ready = getattr(leaf, "block_until_ready", None)
-                if callable(ready):
-                    ready()
+            _block_until_ready_tree(value)
 
         def _cache_entries() -> int | None:
             cache = getattr(getattr(self, "executor", None), "_jit_cache", None)
@@ -2194,15 +2216,61 @@ class CanonicalModelRunner:
                         _record_decode_warmup(output, "mtp_k_decode_greedy_step_jit:decode")
                         warmed_mtp_k_decode = True
                     elif draft_len == 1:
-                        output = self.executor.mtp1_two_decode_greedy_step_jit(
-                            batch,
-                            cache_storage=self.cache_storage,
-                            hybrid_state=mtp_hybrid_state,
-                            draft_token=verifier_drafts,
-                            next_mtp_position=next_positions,
-                            mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
-                        )
-                        _record_decode_warmup(output, "mtp1_two_decode_greedy_step_jit:decode")
+                        warmed_exact_table = False
+                        if (
+                            mtp_verifier_impl == "two_decode"
+                            and getattr(self, "_hybrid_state_table", None) is not None
+                            and self._hybrid_state_table.conv_state is not None
+                            and self._hybrid_state_table.recurrent_state is not None
+                            and hasattr(self.executor, "mtp1_two_decode_greedy_table_step_jit")
+                        ):
+                            table_hybrid_slot_ids = self._batch_hybrid_slot_ids(batch)
+                            if (
+                                mtp_burst_groups > 1
+                                and hasattr(self.executor, "mtp1_two_decode_greedy_table_burst_step_jit")
+                            ):
+                                burst_output = self.executor.mtp1_two_decode_greedy_table_burst_step_jit(
+                                    batch,
+                                    cache_storage=self.cache_storage,
+                                    hybrid_state_table=self._hybrid_state_table,
+                                    hybrid_slot_ids=table_hybrid_slot_ids,
+                                    draft_token=verifier_drafts,
+                                    next_mtp_position=next_positions,
+                                    mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                                    burst_groups=mtp_burst_groups,
+                                )
+                                _record_decode_warmup(
+                                    burst_output,
+                                    "mtp1_two_decode_greedy_table_burst_step_jit:decode",
+                                )
+                                self._hybrid_state_table = burst_output.hybrid_state
+                                self._mark_hybrid_slots_written(list(batch.hybrid_slot_ids_host or ()))
+                            output = self.executor.mtp1_two_decode_greedy_table_step_jit(
+                                batch,
+                                cache_storage=self.cache_storage,
+                                hybrid_state_table=self._hybrid_state_table,
+                                hybrid_slot_ids=table_hybrid_slot_ids,
+                                draft_token=verifier_drafts,
+                                next_mtp_position=next_positions,
+                                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                            )
+                            _record_decode_warmup(
+                                output,
+                                "mtp1_two_decode_greedy_table_step_jit:decode",
+                            )
+                            self._hybrid_state_table = output.hybrid_state
+                            self._mark_hybrid_slots_written(list(batch.hybrid_slot_ids_host or ()))
+                            warmed_exact_table = True
+                        if not warmed_exact_table:
+                            output = self.executor.mtp1_two_decode_greedy_step_jit(
+                                batch,
+                                cache_storage=self.cache_storage,
+                                hybrid_state=mtp_hybrid_state,
+                                draft_token=verifier_drafts,
+                                next_mtp_position=next_positions,
+                                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                            )
+                            _record_decode_warmup(output, "mtp1_two_decode_greedy_step_jit:decode")
                         if (
                             os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_FAST_ALL_ACCEPT", "0")
                             in {"1", "true", "yes", "on", "True"}
@@ -2549,6 +2617,8 @@ class CanonicalModelRunner:
                         self._resident_rng_counter_reset_slots = reset_slots
                     reset_slots.add(int(slot))
             self._mtp1_drafts.pop(seq_id, None)
+            if hasattr(self, "_resident_last_tokens_stale_seq_ids"):
+                self._resident_last_tokens_stale_seq_ids.discard(int(seq_id))
         carry_by_seq_id = getattr(self, "_device_token_carry_by_seq_id", {})
         if carry_by_seq_id and any(seq_id in carry_by_seq_id for seq_id in seq_ids):
             finished_seq_ids = {int(seq_id) for seq_id in seq_ids}
@@ -2591,6 +2661,8 @@ class CanonicalModelRunner:
             self._resident_rng_counters = jnp.zeros_like(self._resident_rng_counters)
         if hasattr(self, "_resident_rng_counter_reset_slots"):
             self._resident_rng_counter_reset_slots.clear()
+        if hasattr(self, "_resident_last_tokens_stale_seq_ids"):
+            self._resident_last_tokens_stale_seq_ids.clear()
         if hasattr(self, "_resident_block_tables_host") and hasattr(self, "_max_hybrid_slots"):
             self._resident_block_tables_host = [
                 tuple(0 for _ in range(self.max_blocks_per_seq))
@@ -2787,8 +2859,11 @@ class CanonicalModelRunner:
         if not carry_by_seq_id:
             return False
         hybrid_slots = getattr(self, "_hybrid_slots", {})
+        stale_seq_ids = getattr(self, "_resident_last_tokens_stale_seq_ids", set())
         for row in active_rows:
             seq_id = int(batch.seq_ids_host[row])
+            if seq_id in stale_seq_ids:
+                return False
             if seq_id < 0 or seq_id not in carry_by_seq_id or seq_id not in hybrid_slots:
                 return False
         return True
@@ -2922,6 +2997,12 @@ class CanonicalModelRunner:
                 active_row_to_token_row=active_row_to_token_row,
                 full_batch_tokens=full_batch_tokens,
             )
+            if hasattr(self, "_resident_last_tokens_stale_seq_ids"):
+                for seq_id in new_carry_by_seq_id:
+                    self._resident_last_tokens_stale_seq_ids.discard(int(seq_id))
+        elif hasattr(self, "_resident_last_tokens_stale_seq_ids"):
+            for seq_id in new_carry_by_seq_id:
+                self._resident_last_tokens_stale_seq_ids.add(int(seq_id))
         self._device_token_carry_seq_ids = (
             tuple(int(seq_id) for seq_id in batch.seq_ids_host)
             if full_batch_tokens
@@ -5614,6 +5695,201 @@ class CanonicalModelRunner:
             stats["bonus_tokens"] += 1
         return outputs
 
+    def _run_mtp1_seed_then_table_burst(
+        self,
+        seqs: List[Sequence],
+        batch: ScheduledBatch,
+        admitted_rows: List[int],
+    ) -> dict[int, List[int] | int] | None:
+        """Run the initial MTP seed and exact K=1 verifier groups in one JIT."""
+        if (
+            batch.is_prefill
+            or not admitted_rows
+            or self.num_speculative_tokens != 1
+            or str(getattr(self, "mtp_verifier_impl", "two_decode") or "two_decode") != "two_decode"
+            or not hasattr(self.executor, "mtp1_seed_then_table_burst_step_jit")
+            or getattr(self, "_hybrid_state_table", None) is None
+            or self._hybrid_state_table.conv_state is None
+            or self._hybrid_state_table.recurrent_state is None
+        ):
+            return None
+
+        query_lens_host = batch.query_lens_host
+        seed_burst_groups = 1
+        max_emit_tokens = 1 + 2 * seed_burst_groups
+        relax_bonus_boundary = os.environ.get(
+            "NANO_VLLM_JAX_MTP_RELAX_BONUS_BOUNDARY",
+            "0",
+        ) in {"1", "true", "yes", "on", "True"}
+        active_rows: List[int] = []
+        for row in admitted_rows:
+            if row < 0 or row >= len(seqs):
+                continue
+            seq = seqs[row]
+            query_len = (
+                int(query_lens_host[row])
+                if query_lens_host is not None and row < len(query_lens_host)
+                else int(batch.query_lens[row])
+            )
+            required_blocks = (seq.num_tokens + max_emit_tokens - 1 + self.block_size - 1) // self.block_size
+            unsafe_bonus_boundary = (
+                not relax_bonus_boundary
+                and (seq.num_tokens + max_emit_tokens) % self.block_size == 0
+            )
+            if (
+                seq.seq_id not in self._mtp1_drafts
+                and seq.temperature == 0
+                and self._seq_mtp_admitted(seq)
+                and query_len == 1
+                and seq.num_completion_tokens + max_emit_tokens <= seq.max_tokens
+                and len(seq.block_table) >= required_blocks
+                and not unsafe_bonus_boundary
+            ):
+                active_rows.append(row)
+        if not active_rows:
+            return None
+
+        profile_mtp = os.environ.get("NANO_VLLM_JAX_PROFILE_MTP_RUN", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }
+        t_profile = time.perf_counter()
+
+        def _mark(label: str) -> None:
+            nonlocal t_profile
+            if not profile_mtp:
+                return
+            now = time.perf_counter()
+            print(f"[MTP_RUN] seed_table_burst_{label}={(now - t_profile) * 1000:.3f}ms", flush=True)
+            t_profile = now
+
+        batch = self._materialize_static_decode_metadata_batch(batch)
+        _mark("materialize_static_decode_metadata")
+        if active_rows != list(range(int(batch.tokens.shape[0]))):
+            decode_batch = self._masked_decode_batch(batch, active_rows)
+            verifier_index_for_local = list(range(len(active_rows)))
+            _mark("masked_batch")
+        else:
+            decode_batch = batch
+            verifier_index_for_local = list(active_rows)
+        decode_batch = self._maybe_apply_device_token_carry(decode_batch)
+        _mark("apply_device_token_carry")
+        hybrid_slot_ids = self._batch_hybrid_slot_ids(decode_batch)
+        if profile_mtp:
+            _block_until_ready_tree(hybrid_slot_ids)
+        _mark("batch_hybrid_slot_ids")
+        output = self.executor.mtp1_seed_then_table_burst_step_jit(
+            decode_batch,
+            cache_storage=self.cache_storage,
+            hybrid_state_table=self._hybrid_state_table,
+            hybrid_slot_ids=hybrid_slot_ids,
+            mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+            burst_groups=seed_burst_groups,
+        )
+        if profile_mtp:
+            _block_until_ready_tree(output)
+        _mark("executor")
+
+        self.cache_storage = output.cache_storage
+        committed_batch = self._with_committed_seq_lens(
+            decode_batch,
+            output.committed_seq_lens,
+        )
+        self._hybrid_state_table = output.hybrid_state
+        self._mark_hybrid_slots_written(list(decode_batch.hybrid_slot_ids_host or ()))
+        _mark("install_hybrid_table")
+        self._record_kv_snapshot(committed_batch, output.hybrid_state)
+        _mark("record_kv_snapshot")
+
+        verifier_batch_size = int(decode_batch.tokens.shape[0])
+        emitted_width = 1 + 2 * seed_burst_groups
+        emitted_tokens = output.emitted_tokens.astype(jnp.int32).reshape(
+            (verifier_batch_size, emitted_width)
+        )
+        next_draft_tokens = output.next_draft_token.astype(jnp.int32)
+        emitted_counts_host, accepted_counts_host = jax.device_get(
+            (
+                output.emitted_counts.reshape((verifier_batch_size, seed_burst_groups)),
+                output.accepted_counts.reshape((verifier_batch_size, seed_burst_groups)),
+            )
+        )
+        _mark("host_burst_count_transfer")
+
+        outputs: dict[int, List[int] | int] = {}
+        stats = self._speculative_stats()
+        accepted_matrix: list[list[bool]] = []
+        max_seeded_chain = int(os.environ.get("NANO_VLLM_JAX_MTP_MAX_SEEDED_CHAIN", "0") or "0")
+        for local_row, row in enumerate(active_rows):
+            seq = seqs[row]
+            verifier_idx = verifier_index_for_local[local_row]
+            self._mtp1_drafts.pop(seq.seq_id, None)
+            row_outputs: list[object] = [
+                DeviceTokenRef(tokens=emitted_tokens, row=verifier_idx * emitted_width)
+            ]
+            emitted_total = 1
+            accepted_total = 0
+            rejected_total = 0
+            bonus_total = 0
+            for group_idx in range(seed_burst_groups):
+                emitted_count = max(
+                    0,
+                    min(2, int(emitted_counts_host[verifier_idx, group_idx])),
+                )
+                accepted_count = max(
+                    0,
+                    min(1, int(accepted_counts_host[verifier_idx, group_idx])),
+                )
+                group_offset = 1 + group_idx * 2
+                row_outputs.extend(
+                    DeviceTokenRef(
+                        tokens=emitted_tokens,
+                        row=verifier_idx * emitted_width + group_offset + offset,
+                    )
+                    for offset in range(emitted_count)
+                )
+                emitted_total += emitted_count
+                accepted_total += accepted_count
+                if accepted_count:
+                    bonus_total += 1
+                else:
+                    rejected_total += 1
+                accepted_matrix.append([bool(accepted_count)])
+            outputs[row] = row_outputs
+            stats["drafts_proposed"] += seed_burst_groups
+            stats["drafts_accepted"] += accepted_total
+            stats["drafts_rejected"] += rejected_total
+            stats["bonus_tokens"] += bonus_total
+            if (
+                self.mtp1_enabled
+                and seq.temperature == 0
+                and seq.num_completion_tokens + emitted_total < seq.max_tokens
+                and not getattr(self, "_mtp_adaptive_gated", lambda: False)()
+                and (
+                    max_seeded_chain <= 0
+                    or self._mtp1_seeded_chain.get(seq.seq_id, 0) < max_seeded_chain
+                )
+            ):
+                self._mtp1_drafts[seq.seq_id] = DeviceTokenRef(
+                    tokens=next_draft_tokens,
+                    row=verifier_idx,
+                )
+                self._mtp1_seeded_chain[seq.seq_id] = (
+                    self._mtp1_seeded_chain.get(seq.seq_id, 0) + seed_burst_groups
+                )
+                stats["drafts_proposed"] += 1
+            else:
+                self._mtp1_seeded_chain.pop(seq.seq_id, None)
+
+        self._record_draft_position_acceptance(accepted_matrix)
+        if not ModelRunner._device_token_carry_enabled(self):
+            outputs = ModelRunner._materialize_device_token_outputs(outputs)
+        self._record_mtp_output_token_carry(committed_batch, seqs, outputs)
+        _mark("commit")
+        return outputs
+
     def _run_main_and_seed_mtp_chain_fused(
         self,
         seqs: List[Sequence],
@@ -5630,13 +5906,18 @@ class CanonicalModelRunner:
         draft_len = max(1, int(getattr(self, "num_speculative_tokens", 1) or 1))
         if draft_len < 1:
             return None
+        query_lens_host = batch.query_lens_host
         active_rows = [
             row
             for row in admitted_rows
             if row < len(seqs)
             and seqs[row].temperature == 0
             and self._seq_mtp_admitted(seqs[row])
-            and int(batch.query_lens[row]) == 1
+            and (
+                int(query_lens_host[row])
+                if query_lens_host is not None and row < len(query_lens_host)
+                else int(batch.query_lens[row])
+            ) == 1
             and seqs[row].num_completion_tokens + 1 < seqs[row].max_tokens
         ]
         if not active_rows:
@@ -5676,10 +5957,7 @@ class CanonicalModelRunner:
             draft_len=draft_len,
         )
         if profile_mtp:
-            for leaf in jax.tree_util.tree_leaves(output):
-                ready = getattr(leaf, "block_until_ready", None)
-                if ready is not None:
-                    ready()
+            _block_until_ready_tree(output)
         _mark("executor")
         self.cache_storage = output.cache_storage
         self._store_batch_hybrid_state(batch, output.hybrid_state)
@@ -5687,22 +5965,33 @@ class CanonicalModelRunner:
         self._record_kv_snapshot(batch, output.hybrid_state)
         _mark("record_kv_snapshot")
 
-        token_rows = output.activations.astype(jnp.int32)
+        token_rows = output.activations
         width = int(token_rows.shape[1])
-        target_tokens = token_rows[:, :1]
+        target_tokens = output.resident_last_tokens
+        if target_tokens is None:
+            target_tokens = token_rows[:, :1]
         chain_debug_payload = getattr(output, "debug_payload", None)
         chain_debug_host = None
         token_rows_host = None
         if chain_debug_payload is not None:
             chain_debug_host = jax.device_get(chain_debug_payload)
             token_rows_host = jax.device_get(token_rows)
-        self._record_device_token_carry(
-            batch,
-            target_tokens,
-            active_rows=active_rows,
-            prefill_final_flags=[True for _ in range(len(seqs))],
-            seqs=seqs,
+        carry_by_seq_id: dict[int, DeviceTokenRef] = dict(
+            getattr(self, "_device_token_carry_by_seq_id", {})
         )
+        stale_seq_ids = getattr(self, "_resident_last_tokens_stale_seq_ids", None)
+        for row in active_rows:
+            seq_id = int(batch.seq_ids_host[row]) if batch.seq_ids_host is not None else -1
+            if seq_id < 0:
+                continue
+            carry_by_seq_id[seq_id] = DeviceTokenRef(tokens=target_tokens, row=row)
+            if stale_seq_ids is not None:
+                stale_seq_ids.add(seq_id)
+        self._device_token_carry_seq_ids = None
+        self._device_token_carry_tokens = None
+        self._device_token_carry_by_seq_id = carry_by_seq_id
+        self._device_seq_lens_carry_seq_ids = None
+        self._device_seq_lens_carry = None
         _mark("record_device_token_carry")
 
         outputs: List[int | List[int]] = [[] for _ in range(len(seqs))]
@@ -6152,10 +6441,7 @@ class CanonicalModelRunner:
         def _ready(value):
             if not profile_mtp:
                 return
-            for leaf in jax.tree_util.tree_leaves(value):
-                ready = getattr(leaf, "block_until_ready", None)
-                if ready is not None:
-                    ready()
+            _block_until_ready_tree(value)
 
         def _mark(label: str, start: float) -> float:
             if profile_mtp:
@@ -6434,8 +6720,21 @@ class CanonicalModelRunner:
             force_generic_k_verifier
             or verifier_impl in {"k_decode", "generic_k", "expanded"}
         )
+        use_one_pass_table_k1 = (
+            draft_len == 1
+            and verifier_impl == "two_decode"
+            and not use_generic_k_verifier
+            and not force_commit_select
+            and not disable_one_pass_k1
+            and enable_one_pass_k1
+            and getattr(self, "_hybrid_state_table", None) is not None
+            and self._hybrid_state_table.conv_state is not None
+            and self._hybrid_state_table.recurrent_state is not None
+            and hasattr(self.executor, "mtp1_two_decode_greedy_table_step_jit")
+        )
         use_one_pass_k1 = (
             draft_len == 1
+            and not use_one_pass_table_k1
             and not enable_fast_all_accept
             and not use_generic_k_verifier
             and not force_commit_select
@@ -6483,6 +6782,22 @@ class CanonicalModelRunner:
             (seq.num_tokens + burst_emit_tokens) % self.block_size == 0
             for seq in mtp_seqs
         )
+        table_burst_groups = 1
+        if (
+            use_one_pass_table_k1
+            and mtp_burst_groups > 1
+            and hasattr(self.executor, "mtp1_two_decode_greedy_table_burst_step_jit")
+            and all(
+                seq.num_completion_tokens + burst_emit_tokens <= seq.max_tokens
+                for seq in mtp_seqs
+            )
+            and all(
+                len(seq.block_table) >= required_blocks
+                for seq, required_blocks in zip(mtp_seqs, burst_required_blocks)
+            )
+            and not burst_final_bonus_boundary
+        ):
+            table_burst_groups = mtp_burst_groups
         use_k_burst = (
             mtp_burst_groups > 1
             and (draft_len > 1 or use_generic_k_verifier)
@@ -6502,6 +6817,7 @@ class CanonicalModelRunner:
         use_fast_all_accept = (
             draft_len == 1
             and not use_one_pass_k1
+            and not use_one_pass_table_k1
             and not use_commit_select
             and enable_fast_all_accept
         )
@@ -6527,7 +6843,7 @@ class CanonicalModelRunner:
         t_profile = _mark("verifier_route_setup", t_profile)
         hybrid_state = None
         hybrid_slot_ids = None
-        if use_fast_table_verifier or use_burst_table_verifier:
+        if use_one_pass_table_k1 or use_fast_table_verifier or use_burst_table_verifier:
             hybrid_slot_ids = self._batch_hybrid_slot_ids(decode_batch)
             _ready(hybrid_slot_ids)
             t_profile = _mark("batch_hybrid_slot_ids", t_profile)
@@ -6568,7 +6884,9 @@ class CanonicalModelRunner:
             and hasattr(self.executor, "mtp1_layerwise_drift_debug_jit")
         )
         if profile_mtp:
-            if use_one_pass_k1:
+            if use_one_pass_table_k1:
+                verifier_mode = "mtp1_one_pass_prefix_table"
+            elif use_one_pass_k1:
                 verifier_mode = "mtp1_one_pass_prefix"
             elif use_commit_select:
                 verifier_mode = "mtp1_commit_select"
@@ -6589,6 +6907,7 @@ class CanonicalModelRunner:
             print(
                 "[MTP_RUN] verifier "
                 f"mode={verifier_mode} draft_len={draft_len} "
+                f"burst_groups={table_burst_groups if use_one_pass_table_k1 else mtp_burst_groups} "
                 f"rows={rows} physical_batch={physical_batch_size} "
                 f"verifier_batch={verifier_physical_batch_size} "
                 f"partial_physical={partial_physical_batch} "
@@ -6598,7 +6917,33 @@ class CanonicalModelRunner:
         parity_output = None
         layer_parity_output = None
         layerwise_drift_output = None
-        if use_one_pass_k1:
+        if use_one_pass_table_k1:
+            if table_burst_groups > 1:
+                output = self.executor.mtp1_two_decode_greedy_table_burst_step_jit(
+                    decode_batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state_table=self._hybrid_state_table,
+                    hybrid_slot_ids=hybrid_slot_ids,
+                    draft_token=_verifier_draft_tokens_device(),
+                    next_mtp_position=_next_mtp_positions_device(),
+                    mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                    burst_groups=table_burst_groups,
+                )
+                route_label = "executor_mtp1_one_pass_prefix_table_burst"
+            else:
+                output = self.executor.mtp1_two_decode_greedy_table_step_jit(
+                    decode_batch,
+                    cache_storage=self.cache_storage,
+                    hybrid_state_table=self._hybrid_state_table,
+                    hybrid_slot_ids=hybrid_slot_ids,
+                    draft_token=_verifier_draft_tokens_device(),
+                    next_mtp_position=_next_mtp_positions_device(),
+                    mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                )
+                route_label = "executor_mtp1_one_pass_prefix_table"
+            _ready(output)
+            t_profile = _mark(route_label, t_profile)
+        elif use_one_pass_k1:
             if layerwise_drift_debug_one_pass:
                 layerwise_drift_output = self.executor.mtp1_layerwise_drift_debug_jit(
                     decode_batch,
@@ -6965,8 +7310,13 @@ class CanonicalModelRunner:
                 decode_batch,
                 output.committed_seq_lens,
             )
-            self._store_batch_hybrid_state(committed_batch, output.hybrid_state)
-            t_profile = _mark("store_resident_burst_hybrid_state", t_profile)
+            if getattr(output, "hybrid_state_is_table", False):
+                self._hybrid_state_table = output.hybrid_state
+                self._mark_hybrid_slots_written(list(decode_batch.hybrid_slot_ids_host or ()))
+                t_profile = _mark("install_resident_burst_hybrid_table", t_profile)
+            else:
+                self._store_batch_hybrid_state(committed_batch, output.hybrid_state)
+                t_profile = _mark("store_resident_burst_hybrid_state", t_profile)
             self._record_kv_snapshot(committed_batch, output.hybrid_state)
             t_profile = _mark("record_resident_burst_kv_snapshot", t_profile)
 
@@ -7998,11 +8348,17 @@ class CanonicalModelRunner:
                 "True",
             }
             not_fused_reasons: Dict[str, int] = {}
+            query_lens_host = batch.query_lens_host
             relax_bonus_boundary = os.environ.get(
                 "NANO_VLLM_JAX_MTP_RELAX_BONUS_BOUNDARY",
                 "0",
             ) in {"1", "true", "yes", "on", "True"}
             for row, seq in enumerate(seqs):
+                query_len = (
+                    int(query_lens_host[row])
+                    if query_lens_host is not None and row < len(query_lens_host)
+                    else int(batch.query_lens[row])
+                )
                 draft_value = self._mtp1_drafts.get(seq.seq_id)
                 draft_len = len(draft_value) if isinstance(draft_value, list) else (1 if draft_value is not None else 0)
                 draft_len = min(draft_len, max(1, int(getattr(self, "num_speculative_tokens", 1) or 1)))
@@ -8022,7 +8378,7 @@ class CanonicalModelRunner:
                     and self._seq_mtp_admitted(seq)
                     and seq.temperature == 0
                     and seq.num_completion_tokens + draft_len + 1 <= seq.max_tokens
-                    and int(batch.query_lens[row]) == 1
+                    and query_len == 1
                     and len(seq.block_table) >= required_blocks
                     and not unsafe_bonus_boundary
                 )
@@ -8034,7 +8390,7 @@ class CanonicalModelRunner:
                     and self._seq_mtp_admitted(seq)
                     and seq.temperature == 0
                     and seq.num_completion_tokens + 1 <= seq.max_tokens
-                    and int(batch.query_lens[row]) == 1
+                    and query_len == 1
                     and len(seq.block_table) >= required_blocks
                     and not unsafe_bonus_boundary
                 ):
@@ -8050,7 +8406,7 @@ class CanonicalModelRunner:
                         reason = "temperature"
                     elif seq.num_completion_tokens + draft_len + 1 > seq.max_tokens:
                         reason = "max_tokens"
-                    elif int(batch.query_lens[row]) != 1:
+                    elif query_len != 1:
                         reason = "query_len"
                     elif len(seq.block_table) < required_blocks:
                         reason = "blocks"
@@ -8116,12 +8472,24 @@ class CanonicalModelRunner:
                 "on",
                 "True",
             }
-            one_pass_available_for_partial = (
-                hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
+            exact_table_one_pass_available = (
+                verifier_impl == "two_decode"
+                and hasattr(self.executor, "mtp1_two_decode_greedy_table_step_jit")
+                and getattr(self, "_hybrid_state_table", None) is not None
+                and self._hybrid_state_table.conv_state is not None
+                and self._hybrid_state_table.recurrent_state is not None
                 and os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1", "0")
                 not in {"1", "true", "yes", "on", "True"}
-                and allow_unsafe_one_pass_k1
-                and (not seed_after_bonus_enabled or allow_seeded_one_pass_k1)
+            )
+            one_pass_available_for_partial = (
+                exact_table_one_pass_available
+                or (
+                    hasattr(self.executor, "mtp1_two_decode_greedy_step_jit")
+                    and os.environ.get("NANO_VLLM_JAX_MTP_DISABLE_ONE_PASS_K1", "0")
+                    not in {"1", "true", "yes", "on", "True"}
+                    and allow_unsafe_one_pass_k1
+                    and (not seed_after_bonus_enabled or allow_seeded_one_pass_k1)
+                )
             )
             homogeneous_full_batch = (
                 len(seqs) == batch.tokens.shape[0]
@@ -8232,21 +8600,22 @@ class CanonicalModelRunner:
                             if row in admitted_mtp_rows
                         ]
                         if self.mtp1_enabled and seed_mtp1 and seedable_rows:
-                            stats["fallback_seeded_main_steps"] += 1
-                            seeded_outputs = self._run_main_and_seed_mtp_chain_fused(
-                                seqs,
-                                batch,
-                                seedable_rows,
-                            )
-                            if seeded_outputs is not None:
-                                next_unresolved: List[int] = []
-                                for row in unresolved_rows:
-                                    value = seeded_outputs[row] if row < len(seeded_outputs) else []
-                                    if value == []:
-                                        next_unresolved.append(row)
-                                    else:
-                                        outputs[row] = value
-                                unresolved_rows = next_unresolved
+                            if unresolved_rows:
+                                stats["fallback_seeded_main_steps"] += 1
+                                seeded_outputs = self._run_main_and_seed_mtp_chain_fused(
+                                    seqs,
+                                    batch,
+                                    unresolved_rows,
+                                )
+                                if seeded_outputs is not None:
+                                    next_unresolved = []
+                                    for row in unresolved_rows:
+                                        value = seeded_outputs[row] if row < len(seeded_outputs) else []
+                                        if value == []:
+                                            next_unresolved.append(row)
+                                        else:
+                                            outputs[row] = value
+                                    unresolved_rows = next_unresolved
                         if unresolved_rows:
                             stats["fallback_gated_no_spec_steps"] += 1
                             fallback_batch = self._masked_decode_batch(batch, unresolved_rows)
