@@ -37,9 +37,19 @@ This roadmap is grouped by work type. It is not a production-readiness claim.
   revisiting per-group host count parsing.
 - Improve bucket-specific admission decisions.
 - Investigate K=1 overhead in rejected and fallback steps.
-- Implement a safe fast K=1 verifier that can commit rejected rows from after-current-token state without full repair decode.
-- Keep `mtp_verifier_impl=k_decode` as the verified K=1 optimization route; K=1 burst verification is available for host-sync amortization, but it still needs a cheaper exact prefix-state path before it can beat the no-MTP baseline.
-- Do not promote `return_first_prefix_hybrid` as that cheaper path until it matches full prefix-hybrid selection layer-by-layer; the 2026-06-15 smoke reduced acceptance from 11/13 to 6/13.
+- Implement a coarse safe K=1 verifier whose width-2 target-model forward is
+  materially cheaper than two separate width-1 target forwards. The
+  after-current-token prefix state is fixed in focused coverage and the
+  corrected one-pass smoke is exact with `12/13` accepted drafts, but the
+  verifier graph is still slower than `k_decode` and no-MTP.
+- Keep `mtp_verifier_impl=k_decode` as the conservative verified K=1 route.
+  The corrected one-pass route is now a diagnostic speed target, not a
+  promoted serving path, until it beats both `k_decode` and no-MTP under the
+  same generic warmup and correctness envelope.
+- Do not retry per-token/per-layer GDN kernel swaps as the main MTP speed
+  lever: on the same smoke, reference/packed-projection and raw-tail Triton GDN
+  one-pass were neutral (`22.52-22.60 output tok/s`), while conv-tail Triton
+  GDN was much slower (`2.20 output tok/s`).
 - Keep packed-prefill K verifier work diagnostic-only until its verifier logits
   and accept/reject decisions match the decode verifier. The 2026-06-15 B=2
   non-boundary FlashInfer smoke validated the packed shape and fixed packed
@@ -52,6 +62,14 @@ This roadmap is grouped by work type. It is not a production-readiness claim.
 - Use the vLLM/MaxText references for the next boundary design: vLLM flattens
   speculative metadata and pads uniform speculative decode graph keys, while
   MaxText donates persistent decode state into a compiled `generate` step.
+- Make the next MTP verifier route a hybrid of those references: scheduler
+  builds vLLM-style flattened verifier metadata, the compiled JAX step consumes
+  resident decode/GDN state with MaxText-style donation, and the step returns
+  compact per-row commit metadata rather than logits or prefix-state tensors.
+- Treat verifier speed as the MTP release gate. MTP should stay disabled or
+  scheduler-gated unless verified rows amortize target verification, draft
+  generation, and commit bookkeeping enough to beat the accepted no-MTP
+  random-large path on the same warmup and correctness envelope.
 - Treat K=2 as optimization research only until it beats K=1/baseline in valid benchmarks.
 - Avoid accelerator-kernel claims unless a dedicated backend exists; current GPU path is JAX/XLA on CUDA.
 

@@ -10,12 +10,7 @@ from typing import List, Tuple, Dict, Optional, Any
 from functools import partial
 from dataclasses import replace
 
-from nanovllm_jax.backends import (
-    gdn_disable_fallbacks_enabled,
-    gdn_packed_decode_enabled,
-    gdn_packed_decode_impl,
-    select_backend,
-)
+from nanovllm_jax.backends import select_backend
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.model import ModelParams, full_attention_block, gated_deltanet_block, transformer_block, forward as model_forward
 from nanovllm_jax.engine.sequence import DeviceTokenRef, Sequence
@@ -1114,35 +1109,11 @@ class CanonicalModelRunner:
         self.mtp_max_active_rows = max(0, int(getattr(config, "mtp_max_active_rows", 0) or 0))
         if self.mtp1_enabled and self.draft_sample_method != "greedy":
             raise ValueError("MTP probabilistic draft sampling is not implemented yet")
-        mtp_one_pass_decode_mode = os.environ.get(
-            "NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE",
-            "1",
-        ) in {"1", "true", "yes", "on", "True"}
-        if (
-            self.mtp1_enabled
-            and self.mtp_verifier_impl == "two_decode"
-            and mtp_one_pass_decode_mode
-            and str(getattr(config, "full_attention_decode_impl", "reference")).lower()
-            == "flashinfer_paged"
-        ):
-            raise ValueError(
-                "MTP two_decode verifier needs a width-2 full-attention decode backend; "
-                "flashinfer_paged currently supports the width-1 non-speculative path. "
-                "Use mtp_verifier_impl='commit_select' or a width-2-capable full_attention_decode_impl."
-            )
-        if (
-            self.mtp1_enabled
-            and self.mtp_verifier_impl == "two_decode"
-            and mtp_one_pass_decode_mode
-            and gdn_packed_decode_enabled(config)
-            and gdn_disable_fallbacks_enabled(config)
-        ):
-            raise ValueError(
-                "MTP two_decode verifier needs width-2 GDN decode. The configured "
-                f"GDN packed decode implementation {gdn_packed_decode_impl(config)!r} "
-                "is width-1 only with fallbacks disabled. Disable gdn_packed_decode_impl "
-                "for MTP two_decode, allow fallback, or use mtp_verifier_impl='commit_select'."
-            )
+        # FlashInfer paged decode handles verifier width > 1 through the
+        # append/decode loop in the backend. Width>1 GDN verification uses a
+        # static token loop inside the compiled model path, so strict fallback
+        # checks live at the kernel callsite where the exact packed
+        # implementation and projection availability are known.
         compile_mtp_draft_default = os.environ.get("NANO_VLLM_JAX_MTP_COMPILE_DRAFT", "1") in {
             "1",
             "true",
@@ -6971,12 +6942,23 @@ class CanonicalModelRunner:
             t_profile = _mark("assume_all_accept_k_commit", t_profile)
             return outputs
 
-        if use_k_burst:
+        use_resident_verifier_commit = (
+            use_k_burst
+            or (
+                getattr(output, "emitted_counts", None) is not None
+                and (draft_len == 1 or use_generic_k_verifier)
+            )
+        )
+        if use_resident_verifier_commit:
             if getattr(output, "emitted_counts", None) is None:
                 raise RuntimeError(
-                    "MTP K-burst verifier must return emitted_counts; "
-                    "rowwise host repair is disabled for the resident burst path"
+                    "MTP resident verifier commit requires emitted_counts; "
+                    "rowwise host repair is disabled for this path"
                 )
+            resident_burst_groups = int(
+                getattr(output, "burst_groups", None)
+                or (mtp_burst_groups if use_k_burst else 1)
+            )
 
             self.cache_storage = output.cache_storage
             committed_batch = self._with_committed_seq_lens(
@@ -6988,7 +6970,7 @@ class CanonicalModelRunner:
             self._record_kv_snapshot(committed_batch, output.hybrid_state)
             t_profile = _mark("record_resident_burst_kv_snapshot", t_profile)
 
-            emitted_width = mtp_burst_groups * (draft_len + 1)
+            emitted_width = resident_burst_groups * (draft_len + 1)
             emitted_tokens = output.emitted_tokens.astype(jnp.int32).reshape(
                 (verifier_physical_batch_size, emitted_width)
             )
@@ -7001,21 +6983,30 @@ class CanonicalModelRunner:
                 and getattr(output, "accepted_bitmask", None) is not None
             )
             if compact_burst_output:
-                (
-                    emitted_totals_host,
-                    accepted_totals_host,
-                    rejected_totals_host,
-                    bonus_totals_host,
-                    accepted_bitmask_host,
-                ) = jax.device_get(
+                compact_summary = getattr(output, "compact_summary", None)
+                if compact_summary is not None:
+                    compact_summary_host = jax.device_get(compact_summary)
+                    emitted_totals_host = compact_summary_host[:, 0]
+                    accepted_totals_host = compact_summary_host[:, 1]
+                    rejected_totals_host = compact_summary_host[:, 2]
+                    bonus_totals_host = compact_summary_host[:, 3]
+                    accepted_bitmask_host = compact_summary_host[:, 4]
+                else:
                     (
-                        output.emitted_totals,
-                        output.accepted_totals,
-                        output.rejected_totals,
-                        output.bonus_totals,
-                        output.accepted_bitmask,
+                        emitted_totals_host,
+                        accepted_totals_host,
+                        rejected_totals_host,
+                        bonus_totals_host,
+                        accepted_bitmask_host,
+                    ) = jax.device_get(
+                        (
+                            output.emitted_totals,
+                            output.accepted_totals,
+                            output.rejected_totals,
+                            output.bonus_totals,
+                            output.accepted_bitmask,
+                        )
                     )
-                )
                 t_profile = _mark("host_burst_summary_transfer", t_profile)
                 accepted_matrix = []
                 for local_row, _row in enumerate(rows):
@@ -7023,15 +7014,15 @@ class CanonicalModelRunner:
                     bitmask = int(accepted_bitmask_host[verifier_idx])
                     accepted_matrix.extend(
                         [bool(bitmask & (1 << group_idx))]
-                        for group_idx in range(mtp_burst_groups)
+                        for group_idx in range(resident_burst_groups)
                     )
             else:
                 emitted_counts_host = jax.device_get(output.emitted_counts).reshape(
-                    (verifier_physical_batch_size, mtp_burst_groups)
+                    (verifier_physical_batch_size, resident_burst_groups)
                 )
                 if getattr(output, "accepted_counts", None) is not None:
                     accepted_counts_host = jax.device_get(output.accepted_counts).reshape(
-                        (verifier_physical_batch_size, mtp_burst_groups)
+                        (verifier_physical_batch_size, resident_burst_groups)
                     )
                 else:
                     accepted_counts_host = emitted_counts_host - 1
@@ -7039,7 +7030,7 @@ class CanonicalModelRunner:
                 accepted_matrix = [
                     [pos < int(accepted_counts_host[verifier_index_for_local[local_row], group_idx]) for pos in range(draft_len)]
                     for local_row, _row in enumerate(rows)
-                    for group_idx in range(mtp_burst_groups)
+                    for group_idx in range(resident_burst_groups)
                 ]
             self._record_draft_position_acceptance(accepted_matrix)
             if getattr(output, "debug_payload", None) is not None:
@@ -7057,7 +7048,7 @@ class CanonicalModelRunner:
                     seq_id = int(seqs[row].seq_id)
                     seed_debug = seed_debug_by_seq.get(seq_id, {})
                     seed_chain_top = seed_debug.get("mtp_chain_top", [])
-                    for group_idx in range(mtp_burst_groups):
+                    for group_idx in range(resident_burst_groups):
                         for draft_pos in range(draft_len):
                             mtp_top_ids = [
                                 int(value)
@@ -7107,7 +7098,7 @@ class CanonicalModelRunner:
                                     "target_token": target_token_dbg,
                                     "accepted": bool(
                                         accepted_matrix[
-                                            local_row * mtp_burst_groups + group_idx
+                                            local_row * resident_burst_groups + group_idx
                                         ][draft_pos]
                                     ),
                                     "target_in_mtp_top5": target_token_dbg in mtp_top_ids,
@@ -7148,21 +7139,21 @@ class CanonicalModelRunner:
                     accepted_total = max(
                         0,
                         min(
-                            mtp_burst_groups * draft_len,
+                            resident_burst_groups * draft_len,
                             int(accepted_totals_host[verifier_idx]),
                         ),
                     )
                     rejected_total = max(
                         0,
                         min(
-                            mtp_burst_groups,
+                            resident_burst_groups,
                             int(rejected_totals_host[verifier_idx]),
                         ),
                     )
                     bonus_total = max(
                         0,
                         min(
-                            mtp_burst_groups,
+                            resident_burst_groups,
                             int(bonus_totals_host[verifier_idx]),
                         ),
                     )
@@ -7178,7 +7169,7 @@ class CanonicalModelRunner:
                     accepted_total = 0
                     rejected_total = 0
                     bonus_total = 0
-                    for group_idx in range(mtp_burst_groups):
+                    for group_idx in range(resident_burst_groups):
                         emitted_count = int(emitted_counts_host[verifier_idx, group_idx])
                         accepted_count = int(accepted_counts_host[verifier_idx, group_idx])
                         emitted_count = max(0, min(draft_len + 1, emitted_count))
@@ -7198,7 +7189,7 @@ class CanonicalModelRunner:
                         else:
                             bonus_total += 1
                 outputs[row] = row_outputs
-                stats["drafts_proposed"] += max(0, (mtp_burst_groups - 1) * draft_len)
+                stats["drafts_proposed"] += max(0, (resident_burst_groups - 1) * draft_len)
                 stats["drafts_accepted"] += accepted_total
                 stats["drafts_rejected"] += rejected_total
                 stats["bonus_tokens"] += bonus_total
@@ -7221,7 +7212,7 @@ class CanonicalModelRunner:
                     ]
                     self._mtp1_drafts[seq.seq_id] = next_chain if len(next_chain) > 1 else next_chain[0]
                     self._mtp1_seeded_chain[seq.seq_id] = (
-                        self._mtp1_seeded_chain.get(seq.seq_id, 0) + mtp_burst_groups * draft_len
+                        self._mtp1_seeded_chain.get(seq.seq_id, 0) + resident_burst_groups * draft_len
                     )
                     stats["drafts_proposed"] += len(next_chain)
                 else:

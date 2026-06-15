@@ -115,10 +115,13 @@ optimization work starts.
     no-MTP path (`~28.6-30.4` versus `47.25 output tok/s`). K=1
     `mtp_burst_groups=2` is implemented and correctness-clean on the same
     smoke, but only reached `29.83 output tok/s`; it reduces return-to-Python
-    frequency but does not remove enough target-model verifier work. Do not
-    promote `return_first_prefix_hybrid` for K=1 verification: it reduced
-    acceptance to `6/13` on the same smoke, so full prefix-hybrid selection is
-    required until a layerwise proof/fix exists.
+    frequency but does not remove enough target-model verifier work. A later
+    2026-06-15 fix restored the cached GDN `return_first_prefix_state` return
+    path, so one-pass two-decode is now exact on the smoke with `12/13`
+    accepted drafts. It is still slower (`22.52-22.60 output tok/s` for
+    reference/packed projection and raw-tail GDN; `2.20 output tok/s` for
+    conv-tail GDN). The next speed lever is a coarser width-2 target-model
+    verifier boundary, not another per-token GDN kernel swap.
 
 ## Active Random Request Contract - 2026-06-04
 

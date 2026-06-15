@@ -468,8 +468,8 @@ def _use_gdn_decode_packed_in_proj(
 ) -> bool:
     return (
         not is_prefill
-        and seq_len == 1
         and _GDN_DECODE_IN_PROJ_PACKED_KEY in params
+        and (seq_len == 1 or gdn_packed_decode_enabled(config))
         and (batch > 1 or gdn_packed_decode_tail_fused_enabled(config))
     )
 
@@ -1546,6 +1546,7 @@ def gated_deltanet_block(
 
         packed_decode_max_batch = gdn_packed_decode_max_batch(config)
         packed_decode_requested = gdn_packed_decode_enabled(config)
+        conv_packed_decode_requested = gdn_packed_decode_conv_enabled(config)
         use_packed_decode = (
             packed_decode_requested
             and (packed_decode_max_batch is None or batch <= packed_decode_max_batch)
@@ -1566,6 +1567,10 @@ def gated_deltanet_block(
         use_packed_multitoken_decode = (
             packed_decode_requested
             and allow_explicit_multitoken_decode
+            and (
+                not conv_packed_decode_requested
+                or packed_decode_projection is not None
+            )
         )
         if (
             packed_decode_requested
@@ -1586,6 +1591,12 @@ def gated_deltanet_block(
                 reasons.append("return_first_prefix_state needs prefix-state output")
             if initial_recurrent is None:
                 reasons.append("initial recurrent state is missing")
+            if (
+                seq_len > 1
+                and conv_packed_decode_requested
+                and packed_decode_projection is None
+            ):
+                reasons.append("conv packed width>1 decode needs packed projection")
             if not reasons:
                 reasons.append("the packed decode predicate was false")
             raise RuntimeError(
@@ -1594,6 +1605,11 @@ def gated_deltanet_block(
                 + "; ".join(reasons)
             )
         use_conv_packed_decode = use_packed_decode and gdn_packed_decode_conv_enabled(config)
+        use_conv_packed_multitoken_decode = (
+            use_packed_multitoken_decode
+            and conv_packed_decode_requested
+            and packed_decode_projection is not None
+        )
         tail_fused_requested = (
             use_packed_decode or use_packed_multitoken_decode
         ) and gdn_packed_decode_tail_fused_enabled(config)
@@ -1675,6 +1691,50 @@ def gated_deltanet_block(
                 )
             prefix_layer_conv_state = None
             prefix_recurrent_state_single = None
+        elif use_conv_packed_multitoken_decode:
+            conv_state = layer_conv_state
+            recurrent_state = initial_recurrent.astype(jnp.float32)
+            output_parts = []
+            conv_state_parts = []
+            recurrent_state_parts = []
+            for token_idx in range(seq_len):
+                out_t, conv_state, recurrent_state = (
+                    backend.gated_delta_conv_packed_projection_decode(
+                        packed_decode_projection[:, token_idx, :],
+                        params["A"].astype(jnp.float32),
+                        params["dt_bias"].astype(jnp.float32),
+                        conv_state,
+                        conv_weight,
+                        conv_bias,
+                        recurrent_state,
+                        qkv_dim=conv_dim,
+                        use_qk_l2norm_in_kernel=True,
+                        norm_weight=params["norm_weight"].astype(jnp.float32)
+                        if tail_fused_requested
+                        else None,
+                        rms_norm_eps=float(config.rms_norm_eps),
+                    )
+                )
+                output_parts.append(out_t)
+                if return_prefix_state or (return_first_prefix_state and token_idx == 0):
+                    conv_state_parts.append(conv_state)
+                    recurrent_state_parts.append(recurrent_state)
+            new_layer_conv_state = conv_state
+            new_recurrent_state_single = recurrent_state
+            if tail_fused_requested:
+                core_attn_out = jnp.concatenate(output_parts, axis=1)
+                tail_fused_gdn_decode = True
+            else:
+                core_attn_out = jnp.concatenate(output_parts, axis=2)
+            if return_prefix_state:
+                prefix_layer_conv_state = jnp.stack(conv_state_parts, axis=1)
+                prefix_recurrent_state_single = jnp.stack(recurrent_state_parts, axis=1)
+            elif return_first_prefix_state:
+                prefix_layer_conv_state = conv_state_parts[0]
+                prefix_recurrent_state_single = recurrent_state_parts[0]
+            else:
+                prefix_layer_conv_state = None
+                prefix_recurrent_state_single = None
         else:
             if a is None or b is None:
                 a = packed_decode_projection[:, :, qkv_end:a_end].reshape(batch, seq_len, config.linear_num_value_heads)
@@ -1724,7 +1784,11 @@ def gated_deltanet_block(
                 prefix_layer_conv_state = None
             conv_out = conv_out_steps.transpose(1, 0, 2, 3).reshape(batch, seq_len, conv_dim)
 
-        if use_packed_multitoken_decode and not use_conv_packed_decode:
+        if (
+            use_packed_multitoken_decode
+            and not use_conv_packed_decode
+            and not use_conv_packed_multitoken_decode
+        ):
             recurrent_state = initial_recurrent.astype(jnp.float32)
             output_parts = []
             recurrent_state_parts = []
@@ -1785,7 +1849,7 @@ def gated_deltanet_block(
                     use_qk_l2norm_in_kernel=True,
                 )
             prefix_recurrent_state_single = None
-        elif not use_conv_packed_decode:
+        elif not use_conv_packed_decode and not use_conv_packed_multitoken_decode:
             # 2. Split q, k, v
             query = conv_out[:, :, :key_dim].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
             key = conv_out[:, :, key_dim:key_dim*2].reshape(batch, seq_len, config.linear_num_key_heads, config.linear_key_head_dim)
@@ -2471,12 +2535,12 @@ def gated_deltanet_block(
     )
     
     if use_cached:
-        if return_prefix_state:
+        if return_prefix_state or return_first_prefix_state:
             return attn_out, hybrid_state, prefix_layer_state
         return attn_out, hybrid_state
     elif hybrid_state is not None:
         # Prefill mode with cache - return state for decode
-        if return_prefix_state and prefix_layer_state is not None:
+        if (return_prefix_state or return_first_prefix_state) and prefix_layer_state is not None:
             return attn_out, hybrid_state, prefix_layer_state
         return attn_out, hybrid_state
     else:

@@ -118,6 +118,7 @@ class MTP1GreedyOutput:
     rejected_totals: object | None = None
     bonus_totals: object | None = None
     accepted_bitmask: object | None = None
+    compact_summary: object | None = None
     burst_groups: int | None = None
     debug_payload: object | None = None
 
@@ -4564,10 +4565,15 @@ class ModelExecutor:
 
                 if compute_next_draft:
                     next_draft_token = jax.lax.cond(
-                        jnp.any(accepted),
+                        jnp.any(row_valid),
                         run_next_mtp,
                         skip_next_mtp,
                         operand=None,
+                    )
+                    next_draft_token = jnp.where(
+                        row_valid,
+                        next_draft_token,
+                        jnp.full_like(next_draft_token, -1),
                     )
                 else:
                     next_draft_token = skip_next_mtp(None)
@@ -4623,6 +4629,34 @@ class ModelExecutor:
                 selected_k_cache = updated_kv_state.k_cache
                 selected_v_cache = updated_kv_state.v_cache
                 committed_seq_lens = seq_lens + accepted.astype(jnp.int32)
+                emitted_tokens = jnp.stack(
+                    [
+                        jnp.where(row_valid, target_token, jnp.zeros_like(target_token)),
+                        jnp.where(accepted, bonus_token, jnp.zeros_like(bonus_token)),
+                    ],
+                    axis=1,
+                ).astype(jnp.int32)
+                emitted_counts = jnp.where(
+                    row_valid,
+                    jnp.asarray(1, dtype=jnp.int32) + accepted.astype(jnp.int32),
+                    jnp.zeros_like(accepted.astype(jnp.int32)),
+                )[:, None]
+                accepted_counts = accepted.astype(jnp.int32)[:, None]
+                emitted_totals = emitted_counts[:, 0].astype(jnp.int32)
+                accepted_totals = accepted.astype(jnp.int32)
+                rejected_totals = (row_valid & ~accepted).astype(jnp.int32)
+                bonus_totals = accepted.astype(jnp.int32)
+                accepted_bitmask = accepted.astype(jnp.int32)
+                compact_summary = jnp.stack(
+                    [
+                        emitted_totals,
+                        accepted_totals,
+                        rejected_totals,
+                        bonus_totals,
+                        accepted_bitmask,
+                    ],
+                    axis=1,
+                ).astype(jnp.int32)
                 return (
                     target_token,
                     bonus_token,
@@ -4633,6 +4667,15 @@ class ModelExecutor:
                     selected_conv,
                     selected_recurrent,
                     committed_seq_lens,
+                    emitted_tokens,
+                    emitted_counts,
+                    accepted_counts,
+                    emitted_totals,
+                    accepted_totals,
+                    rejected_totals,
+                    bonus_totals,
+                    accepted_bitmask,
+                    compact_summary,
                 )
 
             self._jit_cache[key] = jax.jit(compiled, donate_argnums=(8, 9))
@@ -4647,6 +4690,15 @@ class ModelExecutor:
             conv_state,
             recurrent_state,
             committed_seq_lens,
+            emitted_tokens,
+            emitted_counts,
+            accepted_counts,
+            emitted_totals,
+            accepted_totals,
+            rejected_totals,
+            bonus_totals,
+            accepted_bitmask,
+            compact_summary,
         ) = self._profile_jit_call(
             key,
             self._jit_cache[key],
@@ -4676,6 +4728,16 @@ class ModelExecutor:
             cache_storage=KVCacheStorage(k_cache, v_cache),
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
             committed_seq_lens=committed_seq_lens,
+            emitted_tokens=emitted_tokens,
+            emitted_counts=emitted_counts,
+            accepted_counts=accepted_counts,
+            emitted_totals=emitted_totals,
+            accepted_totals=accepted_totals,
+            rejected_totals=rejected_totals,
+            bonus_totals=bonus_totals,
+            accepted_bitmask=accepted_bitmask,
+            compact_summary=compact_summary,
+            burst_groups=1,
         )
 
     def mtp1_layer_parity_debug_jit(
@@ -7130,15 +7192,59 @@ class ModelExecutor:
                     if prefix_hybrid_state.recurrent_state is not None
                     else updated_hybrid_state.recurrent_state
                 )
-                host_payload = jnp.concatenate(
-                    [
-                        target_tokens.astype(jnp.int32),
-                        bonus_token.astype(jnp.int32)[:, None],
-                        next_draft_tokens.astype(jnp.int32),
-                        accepted.astype(jnp.int32),
-                    ],
+                emit_columns = jnp.arange(draft_len + 1, dtype=jnp.int32)[None, :]
+                draft_columns = jnp.broadcast_to(
+                    jnp.clip(emit_columns, 0, draft_len - 1),
+                    (draft_tokens_arg.shape[0], draft_len + 1),
+                )
+                draft_values = jnp.take_along_axis(
+                    draft_tokens_arg,
+                    draft_columns,
                     axis=1,
                 )
+                emitted_counts = jnp.where(
+                    row_active,
+                    prefix_len + jnp.asarray(1, dtype=jnp.int32),
+                    jnp.zeros_like(prefix_len),
+                )[:, None]
+                group_emitted = jnp.where(
+                    emit_columns < prefix_len[:, None],
+                    draft_values,
+                    jnp.where(
+                        emit_columns == prefix_len[:, None],
+                        selected_next_token[:, None],
+                        jnp.zeros_like(draft_values),
+                    ),
+                ).astype(jnp.int32)
+                emitted_tokens = group_emitted[:, None, :]
+                accepted_counts = prefix_len[:, None].astype(jnp.int32)
+                emitted_totals = None
+                accepted_totals = None
+                rejected_totals = None
+                bonus_totals = None
+                accepted_bitmask = None
+                compact_summary = None
+                if draft_len == 1:
+                    emitted_tokens = group_emitted
+                    emitted_totals = emitted_counts[:, 0].astype(jnp.int32)
+                    accepted_totals = prefix_len.astype(jnp.int32)
+                    rejected_totals = (
+                        row_active & (prefix_len < draft_len)
+                    ).astype(jnp.int32)
+                    bonus_totals = (
+                        row_active & (prefix_len == draft_len)
+                    ).astype(jnp.int32)
+                    accepted_bitmask = (prefix_len > 0).astype(jnp.int32)
+                    compact_summary = jnp.stack(
+                        [
+                            emitted_totals,
+                            accepted_totals,
+                            rejected_totals,
+                            bonus_totals,
+                            accepted_bitmask,
+                        ],
+                        axis=1,
+                    ).astype(jnp.int32)
                 return (
                     target_tokens,
                     bonus_token,
@@ -7149,7 +7255,15 @@ class ModelExecutor:
                     selected_conv,
                     selected_recurrent,
                     seq_lens + prefix_len,
-                    host_payload,
+                    emitted_tokens,
+                    emitted_counts,
+                    accepted_counts,
+                    emitted_totals,
+                    accepted_totals,
+                    rejected_totals,
+                    bonus_totals,
+                    accepted_bitmask,
+                    compact_summary,
                 )
 
             self._jit_cache[key] = jax.jit(compiled, donate_argnums=(8, 9))
@@ -7164,7 +7278,15 @@ class ModelExecutor:
             conv_state,
             recurrent_state,
             committed_seq_lens,
-            host_payload,
+            emitted_tokens,
+            emitted_counts,
+            accepted_counts,
+            emitted_totals,
+            accepted_totals,
+            rejected_totals,
+            bonus_totals,
+            accepted_bitmask,
+            compact_summary,
         ) = self._profile_jit_call(
             key,
             self._jit_cache[key],
@@ -7193,7 +7315,17 @@ class ModelExecutor:
             cache_storage=KVCacheStorage(k_cache, v_cache),
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
             committed_seq_lens=committed_seq_lens,
-            host_payload=host_payload,
+            host_payload=None,
+            emitted_tokens=emitted_tokens,
+            emitted_counts=emitted_counts,
+            accepted_counts=accepted_counts,
+            emitted_totals=emitted_totals,
+            accepted_totals=accepted_totals,
+            rejected_totals=rejected_totals,
+            bonus_totals=bonus_totals,
+            accepted_bitmask=accepted_bitmask,
+            compact_summary=compact_summary,
+            burst_groups=1,
         )
 
     def mtp_k_burst_greedy_step_jit(
@@ -7573,6 +7705,7 @@ class ModelExecutor:
                 rejected_totals = None
                 bonus_totals = None
                 accepted_bitmask = None
+                compact_summary = None
                 if draft_len == 1:
                     group_width = draft_len + 1
                     compact_width = burst_groups * group_width
@@ -7615,6 +7748,16 @@ class ModelExecutor:
                         (accepted_counts > 0).astype(jnp.int32) * bit_values[None, :],
                         axis=1,
                     )
+                    compact_summary = jnp.stack(
+                        [
+                            emitted_totals,
+                            accepted_totals,
+                            rejected_totals,
+                            bonus_totals,
+                            accepted_bitmask,
+                        ],
+                        axis=1,
+                    ).astype(jnp.int32)
                 if logit_debug_enabled:
                     debug_payload = (
                         jnp.stack(debug_draft_top_ids_groups, axis=1),
@@ -7644,6 +7787,7 @@ class ModelExecutor:
                     rejected_totals,
                     bonus_totals,
                     accepted_bitmask,
+                    compact_summary,
                     debug_payload,
                 )
 
@@ -7667,6 +7811,7 @@ class ModelExecutor:
             rejected_totals,
             bonus_totals,
             accepted_bitmask,
+            compact_summary,
             debug_payload,
         ) = self._profile_jit_call(
             key,
@@ -7704,6 +7849,7 @@ class ModelExecutor:
             rejected_totals=rejected_totals,
             bonus_totals=bonus_totals,
             accepted_bitmask=accepted_bitmask,
+            compact_summary=compact_summary,
             burst_groups=burst_groups,
             debug_payload=debug_payload,
         )

@@ -173,7 +173,7 @@ needs a high acceptance rate to break even.
 
 Do not seed a follow-up K=1 draft after a rejected row unless the rejected-row next-draft state invariant is proven. The historical safe policy commits the target token and leaves no draft behind for rejected K=1 rows.
 
-The next MTP research target is a safe fast verifier that preserves the cheap accepted path while exposing an after-current-token state for rejected rows. Without that prefix state, fast rejected rows must either be repaired or left uncommitted, which removes the expected K=1 speedup.
+The current MTP research target is a coarse safe verifier whose width-2 target-model forward is materially cheaper than two width-1 forwards. The after-current-token prefix state is now exposed by `return_first_prefix_hybrid` in focused coverage, but the corrected one-pass GPU smoke is still slower than both `k_decode` and no-MTP.
 
 Break-even direction:
 

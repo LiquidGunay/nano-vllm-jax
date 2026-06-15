@@ -121,11 +121,16 @@
   amortization win, not a final speed path. A K=1 logit-debug burst run showed
   seed-time MTP top-1 matching verifier top-1 for `5/6` first-group drafts and
   target-in-MTP-top5 for `5/6`; the remaining rejection was a real logit
-  disagreement, not a draft bookkeeping bug. Do not use
-  `return_first_prefix_hybrid` as a shortcut for the K=1 verifier state
-  selection: the first-prefix specialization dropped acceptance to `6/13`
-  (`46.2%`) on the same smoke, so full prefix-hybrid selection remains required
-  until the first-prefix state is proven equivalent layer by layer.
+  disagreement, not a draft bookkeeping bug. A 2026-06-15 follow-up fixed the
+  cached GDN `return_first_prefix_state` return path: first-prefix state now
+  matches full-prefix token-0 gather in focused coverage, and the one-pass
+  two-decode smoke is correctness-clean with `12/13` accepted drafts (`92.3%`).
+  It is still not a speed path: reference/packed-projection one-pass reached
+  only `22.52 output tok/s`, raw-tail Triton GDN reached `22.60 output tok/s`,
+  and conv-tail Triton GDN collapsed to `2.20 output tok/s`, all below
+  `k_decode` (`28.97`) and no-MTP (`47.25`). Do not spend more iterations on
+  per-token/per-layer GDN kernel swaps for MTP; the remaining verifier blocker
+  is the coarse width-2 target-model boundary.
   Later on 2026-06-15, the verified K=1 burst boundary was widened: the
   executor now compacts emitted burst tokens on device and returns per-row
   emitted/accepted/rejected/bonus totals plus an acceptance bitmask, so Python

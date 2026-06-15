@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import pytest
 
 from nanovllm_jax.config import Qwen3_5Config
-from nanovllm_jax.model import init_params
+from nanovllm_jax.model import forward_step, init_params
 from nanovllm_jax.mtp.mtp_layer import init_mtp_params
 from nanovllm_jax.engine.model_executor import ModelExecutor
 from nanovllm_jax.engine.model_executor import ExecutorOutput
@@ -18,7 +18,7 @@ from nanovllm_jax.engine.model_executor import MTP1GreedyOutput
 from nanovllm_jax.engine.model_runner import ModelRunner
 from nanovllm_jax.engine.scheduled_batch import ScheduledBatch
 from nanovllm_jax.engine.sequence import SamplingParams, Sequence
-from nanovllm_jax.kv_cache import HybridLayerState, KVCacheSpec, KVCacheStorage, init_hybrid_state
+from nanovllm_jax.kv_cache import HybridLayerState, KVCacheSpec, KVCacheState, KVCacheStorage, init_hybrid_state
 
 
 def _batch(seq_lens):
@@ -153,9 +153,80 @@ class _FakeExecutor:
             (-1, 1, 1, 1)
         )
         width = int(draft_tokens.shape[1])
+        target_rows = [
+            self._row_values(self.target, row, width)
+            for row in output_rows
+        ]
+        accepted_rows = [
+            [bool(value) for value in self._row_values(self.accepted, row, width)]
+            for row in output_rows
+        ]
+        emitted_rows = []
+        emitted_count_rows = []
+        accepted_count_rows = []
+        draft_token_rows = draft_tokens.tolist()
+        for row_idx, (row, target_values, accepted_values) in enumerate(
+            zip(
+                output_rows,
+                target_rows,
+                accepted_rows,
+            )
+        ):
+            accepted_count = 0
+            for value in accepted_values:
+                if not value:
+                    break
+                accepted_count += 1
+            draft_values = self._row_values(draft_token_rows, row_idx, width)
+            row_emitted = []
+            for pos in range(width + 1):
+                if pos < accepted_count:
+                    row_emitted.append(draft_values[pos])
+                elif pos == accepted_count:
+                    if accepted_count == width:
+                        row_emitted.append(int(self.bonus[row]))
+                    else:
+                        row_emitted.append(target_values[pos])
+                else:
+                    row_emitted.append(0)
+            emitted_rows.append(row_emitted)
+            emitted_count_rows.append(accepted_count + 1)
+            accepted_count_rows.append(accepted_count)
+        emitted_tokens = jnp.array(emitted_rows, dtype=jnp.int32).reshape(
+            (len(output_rows), 1, width + 1)
+        )
+        emitted_counts = jnp.array(emitted_count_rows, dtype=jnp.int32).reshape(
+            (len(output_rows), 1)
+        )
+        accepted_counts = jnp.array(accepted_count_rows, dtype=jnp.int32).reshape(
+            (len(output_rows), 1)
+        )
+        emitted_totals = None
+        accepted_totals = None
+        rejected_totals = None
+        bonus_totals = None
+        accepted_bitmask = None
+        compact_summary = None
+        if width == 1:
+            emitted_tokens = emitted_tokens.reshape((len(output_rows), width + 1))
+            emitted_totals = emitted_counts[:, 0].astype(jnp.int32)
+            accepted_totals = accepted_counts[:, 0].astype(jnp.int32)
+            rejected_totals = (accepted_counts[:, 0] < width).astype(jnp.int32)
+            bonus_totals = (accepted_counts[:, 0] == width).astype(jnp.int32)
+            accepted_bitmask = (accepted_counts[:, 0] > 0).astype(jnp.int32)
+            compact_summary = jnp.stack(
+                [
+                    emitted_totals,
+                    accepted_totals,
+                    rejected_totals,
+                    bonus_totals,
+                    accepted_bitmask,
+                ],
+                axis=1,
+            ).astype(jnp.int32)
         return MTP1GreedyOutput(
             target_token=jnp.array(
-                [self._row_values(self.target, row, width) for row in output_rows],
+                target_rows,
                 dtype=jnp.int32,
             ),
             bonus_token=jnp.array([self.bonus[row] for row in output_rows], dtype=jnp.int32),
@@ -164,7 +235,7 @@ class _FakeExecutor:
                 dtype=jnp.int32,
             ),
             accepted=jnp.array(
-                [self._row_values(self.accepted, row, width) for row in output_rows],
+                accepted_rows,
                 dtype=jnp.bool_,
             ),
             cache_storage=KVCacheStorage(
@@ -176,6 +247,16 @@ class _FakeExecutor:
                 [self.committed_seq_lens[row] for row in output_rows],
                 dtype=jnp.int32,
             ),
+            emitted_tokens=emitted_tokens,
+            emitted_counts=emitted_counts,
+            accepted_counts=accepted_counts,
+            emitted_totals=emitted_totals,
+            accepted_totals=accepted_totals,
+            rejected_totals=rejected_totals,
+            bonus_totals=bonus_totals,
+            accepted_bitmask=accepted_bitmask,
+            compact_summary=compact_summary,
+            burst_groups=1,
         )
 
     def mtp_k_decode_greedy_step_jit(
@@ -343,6 +424,7 @@ class _FakeExecutor:
         rejected_totals = None
         bonus_totals = None
         accepted_bitmask = None
+        compact_summary = None
         if width == 1:
             compact_rows = []
             for row_idx in range(len(output_rows)):
@@ -379,6 +461,16 @@ class _FakeExecutor:
                 (accepted_counts > 0).astype(jnp.int32) * bit_values[None, :],
                 axis=1,
             )
+            compact_summary = jnp.stack(
+                [
+                    emitted_totals,
+                    accepted_totals,
+                    rejected_totals,
+                    bonus_totals,
+                    accepted_bitmask,
+                ],
+                axis=1,
+            ).astype(jnp.int32)
         marker = jnp.array([self.state_marker[row] for row in output_rows], dtype=jnp.float32).reshape(
             (-1, 1, 1, 1)
         )
@@ -413,6 +505,7 @@ class _FakeExecutor:
             rejected_totals=rejected_totals,
             bonus_totals=bonus_totals,
             accepted_bitmask=accepted_bitmask,
+            compact_summary=compact_summary,
             burst_groups=int(burst_groups),
         )
 
@@ -1872,6 +1965,92 @@ def test_generic_k_verifier_supports_strict_multitoken_gdn_prefix_state():
     assert output.committed_seq_lens.shape == (2,)
     assert output.hybrid_state.conv_state.shape == base_hybrid.conv_state.shape
     assert output.hybrid_state.recurrent_state.shape == base_hybrid.recurrent_state.shape
+
+
+def test_first_prefix_hybrid_matches_full_prefix_gather():
+    import jax
+
+    config = _tiny_mtp_verifier_config()
+    config.gdn_packed_decode_impl = "reference"
+    params = init_params(jax.random.PRNGKey(0), config)
+    executor = ModelExecutor(config, params, backend="pure_jax")
+    batch = ScheduledBatch(
+        tokens=jnp.array([[3, 5], [4, 6]], dtype=jnp.int32),
+        positions=jnp.array([[0, 1], [0, 1]], dtype=jnp.int32),
+        seq_ids=jnp.array([0, 1], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 2, 4], dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=4,
+        block_tables=jnp.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=jnp.int32),
+        seq_lens=jnp.array([2, 2], dtype=jnp.int32),
+    )
+    kv_spec = KVCacheSpec(
+        num_layers=config.num_hidden_layers,
+        num_blocks=config.num_kvcache_blocks,
+        block_size=config.block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        dtype=config.get_dtype(),
+        max_kv_cache_bytes=config.max_kv_cache_bytes,
+    )
+    base_cache = executor.backend.allocate_kv_cache(kv_spec, max_seqs=2, max_blocks_per_seq=4)
+    base_hybrid = init_hybrid_state(config, batch_size=2, dtype=config.get_dtype())
+    metadata = executor.backend.build_attention_metadata(
+        positions=batch.positions,
+        block_tables=batch.block_tables,
+        seq_lens=batch.seq_lens,
+        block_size=config.block_size,
+        is_prefill=False,
+        query_start_loc=batch.query_start_loc,
+        num_prefill_tokens=0,
+        num_decode_tokens=batch.num_decode_tokens,
+    )
+    kv_state = KVCacheState(
+        k_cache=base_cache.k_cache,
+        v_cache=base_cache.v_cache,
+        block_table=batch.block_tables,
+        kv_lens=batch.seq_lens,
+        slot_mapping=metadata.slot_mapping,
+    )
+
+    _, _, _, full_prefix = forward_step(
+        batch.tokens,
+        params,
+        config,
+        positions=batch.positions,
+        kv_cache_state=kv_state,
+        attention_metadata=metadata,
+        hybrid_state=_clone_hybrid_state(base_hybrid),
+        is_prefill=False,
+        return_hidden=True,
+        return_prefix_hybrid=True,
+        backend=executor.backend,
+    )
+    _, _, _, first_prefix = forward_step(
+        batch.tokens,
+        params,
+        config,
+        positions=batch.positions,
+        kv_cache_state=kv_state,
+        attention_metadata=metadata,
+        hybrid_state=_clone_hybrid_state(base_hybrid),
+        is_prefill=False,
+        return_hidden=True,
+        return_first_prefix_hybrid=True,
+        backend=executor.backend,
+    )
+
+    assert first_prefix.conv_state.shape == base_hybrid.conv_state.shape
+    assert first_prefix.recurrent_state.shape == base_hybrid.recurrent_state.shape
+    assert jnp.max(
+        jnp.abs(full_prefix.conv_state[:, 0] - first_prefix.conv_state)
+    ) == pytest.approx(0.0)
+    assert jnp.max(
+        jnp.abs(
+            full_prefix.recurrent_state[:, 0] - first_prefix.recurrent_state
+        )
+    ) == pytest.approx(0.0)
 
 
 def test_k1_safe_and_fast_two_decode_verifier_parity_rowwise(monkeypatch):
