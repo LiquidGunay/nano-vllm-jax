@@ -30,6 +30,19 @@ def test_speculative_config_rejects_unimplemented_probabilistic_mtp():
         )
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["mtp_unverified_draft_append", "mtp_unverified_fused_append"],
+)
+def test_speculative_config_rejects_unverified_mtp_append(field):
+    with pytest.raises(ValueError, match="Unverified MTP draft append"):
+        Qwen3_5Config(
+            speculative_method="mtp",
+            num_speculative_tokens=1,
+            **{field: True},
+        )
+
+
 def test_runtime_and_kernel_sections_translate_to_env():
     env = runtime_env_from_config(
         {
@@ -60,6 +73,11 @@ def test_runtime_and_kernel_sections_translate_to_env():
                 "xla": {
                     "preallocate": False,
                     "gpu_allocator": "cuda_malloc_async",
+                    "command_buffer": {
+                        "enable_during_profiling": True,
+                        "unroll_loops": True,
+                        "graph_min_size": 1,
+                    },
                 },
             },
             "kernels": {
@@ -89,6 +107,12 @@ def test_runtime_and_kernel_sections_translate_to_env():
 
     assert env["JAX_PLATFORMS"] == "cuda"
     assert env["TOKENIZERS_PARALLELISM"] == "0"
+    assert env["XLA_FLAGS"] == (
+        "--xla_gpu_autotune_level=4 "
+        "--xla_enable_command_buffers_during_profiling=true "
+        "--xla_gpu_command_buffer_unroll_loops=true "
+        "--xla_gpu_graph_min_graph_size=1"
+    )
     assert env["NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH"] == "1"
     assert env["NANO_VLLM_JAX_COMPACT_PREFILL_TOKEN_COUNT_MODE"] == "bucket"
     assert env["NANO_VLLM_JAX_DEVICE_TOKEN_CARRY"] == "1"

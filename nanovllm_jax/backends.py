@@ -255,6 +255,21 @@ def _gdn_packed_decode_impl(config=None) -> str:
     }:
         return "triton_fla_raw_gates"
     if normalized in {
+        "triton_fla_raw_gates_tail",
+        "triton_raw_gates_tail",
+        "fla_triton_raw_gates_tail",
+        "triton_fla_raw_tail",
+        "triton_fla_tail_fused",
+    }:
+        return "triton_fla_raw_gates_tail"
+    if normalized in {
+        "triton_fla_raw_gates_split_tail",
+        "triton_raw_gates_split_tail",
+        "fla_triton_raw_gates_split_tail",
+        "triton_fla_split_tail",
+    }:
+        return "triton_fla_raw_gates_split_tail"
+    if normalized in {
         "triton_fla_conv_raw_gates",
         "triton_conv_raw_gates",
         "fla_triton_conv_raw_gates",
@@ -274,7 +289,10 @@ def _gdn_packed_decode_impl(config=None) -> str:
     raise ValueError(
         f"Unknown {_GDN_PACKED_DECODE_IMPL_ENV}={value!r}; "
         "expected off, reference, triton_fla, triton_fla_raw_gates, "
-        "triton_fla_conv_raw_gates, triton_fla_conv_raw_gates_tail, or cuda_fp32"
+        "triton_fla_raw_gates_tail, "
+        "triton_fla_raw_gates_split_tail, "
+        "triton_fla_conv_raw_gates, "
+        "triton_fla_conv_raw_gates_tail, or cuda_fp32"
     )
 
 
@@ -296,7 +314,11 @@ def gdn_packed_decode_conv_enabled(config=None) -> bool:
 
 
 def gdn_packed_decode_tail_fused_enabled(config=None) -> bool:
-    return _gdn_packed_decode_impl(config) == "triton_fla_conv_raw_gates_tail"
+    return _gdn_packed_decode_impl(config) in {
+        "triton_fla_raw_gates_tail",
+        "triton_fla_raw_gates_split_tail",
+        "triton_fla_conv_raw_gates_tail",
+    }
 
 
 def gdn_packed_decode_max_batch(config=None) -> int | None:
@@ -795,6 +817,25 @@ class InferenceBackend(Protocol):
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         ...
 
+    def gated_delta_conv_packed_projection_decode_state_pool(
+        self,
+        packed_proj: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        conv_state_pool: jnp.ndarray,
+        conv_weight: jnp.ndarray,
+        conv_bias: jnp.ndarray | None,
+        recurrent_state_pool: jnp.ndarray,
+        *,
+        qkv_dim: int,
+        linear_layer_idx: int,
+        use_qk_l2norm_in_kernel: bool,
+        norm_weight: jnp.ndarray,
+        valid_rows: jnp.ndarray | None = None,
+        rms_norm_eps: float = 1.0e-6,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        ...
+
 
 class PureJAXBackend:
     """Reference backend implemented with ordinary JAX operations."""
@@ -1133,7 +1174,7 @@ class PureJAXBackend:
                 scale=scale,
                 num_key_value_groups=num_key_value_groups,
             )
-        if decode_impl == "flashinfer_paged":
+        if decode_impl == "flashinfer_paged" and query.shape[1] == 1:
             if query.shape[1] != 1:
                 raise ValueError(
                     "full_attention.decode_impl=flashinfer_paged supports only "
@@ -1203,7 +1244,63 @@ class PureJAXBackend:
         is_prefill: bool,
     ) -> tuple[KVCacheStorage, jnp.ndarray]:
         decode_impl = _full_attention_decode_impl(self.config)
-        if not is_prefill and decode_impl == "flashinfer_paged":
+        if not is_prefill and decode_impl == "flashinfer_paged" and query.shape[1] > 1:
+            if metadata.positions is None:
+                raise ValueError("metadata.positions is required for FlashInfer decode attention")
+            if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
+                raise ValueError(
+                    "full_attention.decode_impl=flashinfer_paged requires cache shape "
+                    "[num_layers, num_pages, page_size, num_kv_heads, head_dim]"
+                )
+            if cache.k_cache.dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
+                raise ValueError(
+                    "full_attention.decode_impl=flashinfer_paged requires BF16/FP16 "
+                    "NHD KV cache; set full_attention_kv_cache_dtype to bf16 or fp16"
+                )
+            from nanovllm_jax.kernels.flashinfer_ffi import (
+                paged_decode_attention_with_kv_append_gqa_nhd,
+            )
+            from nanovllm_jax.kernels.paged_attention import (
+                dense_block_tables_to_kv_indptr,
+                kv_last_page_len_from_seq_lens,
+            )
+
+            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
+                metadata.block_tables,
+            )
+            width = int(query.shape[1])
+            k_cache = cache.k_cache
+            v_cache = cache.v_cache
+            outputs = []
+            for token_idx in range(width):
+                seq_lens_step = metadata.seq_lens - jnp.asarray(
+                    width - 1 - token_idx,
+                    dtype=metadata.seq_lens.dtype,
+                )
+                out, k_cache, v_cache = paged_decode_attention_with_kv_append_gqa_nhd(
+                    query[:, token_idx].astype(cache.k_cache.dtype),
+                    k[:, token_idx].astype(cache.k_cache.dtype),
+                    v[:, token_idx].astype(cache.v_cache.dtype),
+                    k_cache,
+                    v_cache,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_len_from_seq_lens(seq_lens_step, block_size),
+                    metadata.positions[:, token_idx].astype(jnp.int32),
+                    layer_id=layer_id,
+                    scale=scale,
+                )
+                outputs.append(
+                    out.reshape(query.shape[0], 1, query.shape[2] * query.shape[3])
+                )
+            return KVCacheStorage(k_cache, v_cache), jnp.concatenate(outputs, axis=1)
+        if (
+            not is_prefill
+            and decode_impl == "flashinfer_paged"
+            and query.shape[1] == 1
+            and k.shape[1] == 1
+            and v.shape[1] == 1
+        ):
             if metadata.positions is None:
                 raise ValueError("metadata.positions is required for FlashInfer decode attention")
             if query.shape[1] != 1 or k.shape[1] != 1 or v.shape[1] != 1:
@@ -2273,6 +2370,10 @@ class PureJAXBackend:
         dt_bias: jnp.ndarray,
         initial_state: jnp.ndarray,
         use_qk_l2norm_in_kernel: bool,
+        *,
+        z: jnp.ndarray | None = None,
+        norm_weight: jnp.ndarray | None = None,
+        rms_norm_eps: float = 1.0e-6,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         impl = _gdn_packed_decode_impl(self.config)
         packed_qkv_dtype = _gdn_packed_decode_qkv_activation_jnp_dtype(self.config)
@@ -2280,6 +2381,36 @@ class PureJAXBackend:
             raise RuntimeError(
                 f"{_GDN_PACKED_DECODE_IMPL_ENV} is off; use gated_delta_decode"
             )
+        tail_fused = impl in {
+            "triton_fla_raw_gates_tail",
+            "triton_fla_raw_gates_split_tail",
+        }
+        if tail_fused and (z is None or norm_weight is None):
+            raise ValueError(
+                "tail-fused raw-gate packed GDN decode requires z and norm_weight"
+            )
+
+        def tail_from_core(core_out: jnp.ndarray) -> jnp.ndarray:
+            assert z is not None
+            assert norm_weight is not None
+            batch = core_out.shape[0]
+            value_heads = initial_state.shape[1]
+            value_dim = initial_state.shape[2]
+            tail = core_out.transpose(0, 2, 1, 3).reshape(
+                batch,
+                value_heads,
+                value_dim,
+            )
+            tail = tail.astype(jnp.float32)
+            variance = jnp.mean(jnp.square(tail), axis=-1, keepdims=True)
+            tail = tail * jax.lax.rsqrt(variance + float(rms_norm_eps))
+            tail = tail * norm_weight.astype(jnp.float32)
+            tail = tail * jax.nn.silu(
+                z.astype(jnp.bfloat16)
+                .astype(jnp.float32)
+                .reshape(batch, value_heads, value_dim)
+            )
+            return tail.reshape(batch, 1, value_heads * value_dim)
 
         if impl == "reference":
             from nanovllm_jax.kernels.gdn_fla import (
@@ -2364,7 +2495,12 @@ class PureJAXBackend:
                 initial_state,
             )
 
-        if impl in {"triton_fla", "triton_fla_raw_gates"}:
+        if impl in {
+            "triton_fla",
+            "triton_fla_raw_gates",
+            "triton_fla_raw_gates_tail",
+            "triton_fla_raw_gates_split_tail",
+        }:
             pre_normalize_qk = _gdn_packed_decode_pre_normalize_qk(self.config)
             if pre_normalize_qk and use_qk_l2norm_in_kernel:
                 # q/k are already normalized before entering the kernel. Leave the
@@ -2400,7 +2536,16 @@ class PureJAXBackend:
             )
 
             try:
-                if impl == "triton_fla_raw_gates":
+                if impl == "triton_fla_raw_gates_tail":
+                    from nanovllm_jax.kernels.gdn_fla_triton import (
+                        gdn_packed_decode_step_bf16_raw_gates_tail,
+                    )
+                elif impl == "triton_fla_raw_gates_split_tail":
+                    from nanovllm_jax.kernels.gdn_fla_triton import (
+                        gdn_decode_tail_rms_silu_bf16,
+                        gdn_packed_decode_step_bf16_raw_gates,
+                    )
+                elif impl == "triton_fla_raw_gates":
                     from nanovllm_jax.kernels.gdn_fla_triton import (
                         gdn_packed_decode_step_bf16_raw_gates,
                     )
@@ -2413,7 +2558,7 @@ class PureJAXBackend:
                     "Triton FLA packed decode kernel is unavailable",
                     self.config,
                 )
-                return gdn_packed_decode_reference_from_decay(
+                core_out, new_state = gdn_packed_decode_reference_from_decay(
                     mixed_qkv,
                     a,
                     b,
@@ -2422,6 +2567,47 @@ class PureJAXBackend:
                     initial_state,
                     qkv_dtype=jnp.bfloat16,
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
+                if tail_fused:
+                    return tail_from_core(core_out), new_state
+                return core_out, new_state
+
+            if impl == "triton_fla_raw_gates_tail":
+                assert z is not None
+                assert norm_weight is not None
+                return gdn_packed_decode_step_bf16_raw_gates_tail(
+                    mixed_qkv,
+                    a,
+                    b,
+                    decay,
+                    dt_bias,
+                    initial_state,
+                    z.astype(jnp.bfloat16),
+                    norm_weight.astype(jnp.float32),
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    rms_norm_eps=float(rms_norm_eps),
+                )
+
+            if impl == "triton_fla_raw_gates_split_tail":
+                assert z is not None
+                assert norm_weight is not None
+                core_out, new_state = gdn_packed_decode_step_bf16_raw_gates(
+                    mixed_qkv,
+                    a,
+                    b,
+                    decay,
+                    dt_bias,
+                    initial_state,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
+                return (
+                    gdn_decode_tail_rms_silu_bf16(
+                        core_out,
+                        z.astype(jnp.bfloat16),
+                        norm_weight.astype(jnp.float32),
+                        rms_norm_eps=float(rms_norm_eps),
+                    ),
+                    new_state,
                 )
 
             if impl == "triton_fla_raw_gates":
@@ -2667,6 +2853,67 @@ class PureJAXBackend:
                 self.config,
             )
             return reference()
+
+    def gated_delta_conv_packed_projection_decode_state_pool(
+        self,
+        packed_proj: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        conv_state_pool: jnp.ndarray,
+        conv_weight: jnp.ndarray,
+        conv_bias: jnp.ndarray | None,
+        recurrent_state_pool: jnp.ndarray,
+        *,
+        qkv_dim: int,
+        linear_layer_idx: int,
+        use_qk_l2norm_in_kernel: bool,
+        norm_weight: jnp.ndarray,
+        valid_rows: jnp.ndarray | None = None,
+        rms_norm_eps: float = 1.0e-6,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        impl = _gdn_packed_decode_impl(self.config)
+        if impl != "triton_fla_conv_raw_gates_tail":
+            raise RuntimeError(
+                "state-pool packed-projection GDN decode is only enabled by "
+                f"{_GDN_PACKED_DECODE_IMPL_ENV}=triton_fla_conv_raw_gates_tail"
+            )
+        if not use_qk_l2norm_in_kernel:
+            raise ValueError("state-pool conv packed GDN decode requires q/k l2norm")
+        if conv_bias is None:
+            conv_bias = jnp.zeros((conv_weight.shape[0],), dtype=conv_weight.dtype)
+
+        try:
+            from nanovllm_jax.kernels.gdn_fla_triton import (
+                gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail_state_pool,
+            )
+        except (ImportError, ModuleNotFoundError, AttributeError):
+            _raise_if_gdn_fallback_disabled(
+                "Triton FLA state-pool packed-projection conv+decode kernel is unavailable",
+                self.config,
+            )
+            raise
+
+        try:
+            return gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail_state_pool(
+                packed_proj.astype(jnp.bfloat16),
+                decay.astype(jnp.float32),
+                dt_bias.astype(jnp.float32),
+                conv_state_pool.astype(jnp.float32),
+                conv_weight.astype(jnp.float32),
+                conv_bias.astype(jnp.float32),
+                recurrent_state_pool.astype(jnp.float32),
+                norm_weight.astype(jnp.float32),
+                valid_rows,
+                qkv_dim=int(qkv_dim),
+                linear_layer_idx=int(linear_layer_idx),
+                rms_norm_eps=float(rms_norm_eps),
+            )
+        except Exception:
+            _raise_if_gdn_fallback_disabled(
+                "Triton FLA state-pool packed-projection conv+decode kernel cannot handle this shape",
+                self.config,
+            )
+            raise
 
 
 class KernelBackendPlaceholder(PureJAXBackend):

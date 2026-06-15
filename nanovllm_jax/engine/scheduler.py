@@ -104,10 +104,31 @@ class Scheduler:
                 )
             )
         self.speculative_method = str(getattr(config, "speculative_method", "none") or "none").lower()
+        raw_num_speculative_tokens = max(0, int(getattr(config, "num_speculative_tokens", 0) or 0))
+        if self.speculative_method == "none" and raw_num_speculative_tokens > 0:
+            self.speculative_method = "mtp"
         self.num_speculative_tokens = (
-            max(0, int(getattr(config, "num_speculative_tokens", 0) or 0))
+            raw_num_speculative_tokens
             if self.speculative_method == "mtp"
             else 0
+        )
+        self.mtp_burst_groups = max(
+            1,
+            _config_or_env_int(
+                config,
+                "mtp_burst_groups",
+                "NANO_VLLM_JAX_MTP_BURST_GROUPS",
+                default=1,
+            ),
+        )
+        self.mtp_max_active_rows = max(
+            0,
+            _config_or_env_int(
+                config,
+                "mtp_max_active_rows",
+                "NANO_VLLM_JAX_MTP_MAX_ACTIVE_ROWS",
+                default=0,
+            ),
         )
         self.decode_lookahead_tokens = max(1, 1 + self.num_speculative_tokens)
         self.greedy_decode_burst_steps = max(
@@ -131,9 +152,9 @@ class Scheduler:
         self.mtp_probe_steps = int(
             os.environ.get(
                 "NANO_VLLM_JAX_MTP_PROBE_STEPS",
-                os.environ.get("NANO_VLLM_JAX_MTP_LATENCY_MIN_STEPS", "2"),
+                "1",
             )
-            or "2"
+            or "1"
         )
         self.mtp_scheduler_gate_enabled = (
             self.speculative_method == "mtp"
@@ -154,7 +175,7 @@ class Scheduler:
         self.mtp_admission_enabled = True
         self.mtp_admission_reason = "enabled"
         self.mtp_latency_alpha = float(os.environ.get("NANO_VLLM_JAX_MTP_LATENCY_ALPHA", "0.2") or "0.2")
-        self.mtp_latency_min_steps = int(os.environ.get("NANO_VLLM_JAX_MTP_LATENCY_MIN_STEPS", "2") or "2")
+        self.mtp_latency_min_steps = int(os.environ.get("NANO_VLLM_JAX_MTP_LATENCY_MIN_STEPS", "1") or "1")
         self.mtp_baseline_ms_per_token: float | None = None
         self.mtp_spec_ms_per_token: float | None = None
         self.mtp_baseline_latency_steps = 0
@@ -293,7 +314,7 @@ class Scheduler:
                 prospective_query_bucket = self._select_prefill_query_bucket(
                     max(prefill_chunk_lens + [chunk_len])
                 )
-                prospective_batch_bucket = self._select_batch_size_bucket(num_seqs + 1)
+                prospective_batch_bucket = self._select_mtp_static_batch_size_bucket(num_seqs + 1)
                 prospective_padded_tokens = prospective_query_bucket * prospective_batch_bucket
                 if (
                     scheduled_seqs
@@ -317,7 +338,7 @@ class Scheduler:
             seq.status = SequenceStatus.RUNNING
             mtp_admitted = self.should_admit_mtp(
                 seq,
-                batch_size_bucket=self._select_batch_size_bucket(num_seqs + 1),
+                batch_size_bucket=self._select_mtp_static_batch_size_bucket(num_seqs + 1),
                 active_decode_rows=0,
             )
             seq.mtp_admitted = mtp_admitted
@@ -344,9 +365,18 @@ class Scheduler:
             )
         
         # Phase 2: Decode - schedule running sequences
-        decode_step_counts: List[int] = []
         running_candidates = 0
         running_budget = len(self.running)
+        ready_decode_rows = sum(
+            1
+            for seq in self.running
+            if seq.num_cached_tokens >= seq.num_prompt_tokens
+        )
+        mtp_active_rows_cap_blocks_decode = (
+            self.num_speculative_tokens > 0
+            and self.mtp_max_active_rows > 0
+            and min(ready_decode_rows, self.max_num_seqs) > self.mtp_max_active_rows
+        )
         while self.running and num_seqs < self.max_num_seqs and running_candidates < running_budget:
             running_candidates += 1
             seq = self.running.popleft()
@@ -355,21 +385,32 @@ class Scheduler:
                 continue
             
             # Ensure we can append
-            mtp_admitted = self.should_admit_mtp(
-                seq,
-                for_decode=True,
-                batch_size_bucket=self._select_batch_size_bucket(num_seqs + 1),
-                active_decode_rows=num_seqs + 1,
-            )
+            if mtp_active_rows_cap_blocks_decode:
+                mtp_admitted = False
+                self.mtp_admission_reason = "active_rows_cap"
+            else:
+                mtp_admitted = self.should_admit_mtp(
+                    seq,
+                    for_decode=True,
+                    batch_size_bucket=self._select_mtp_static_batch_size_bucket(num_seqs + 1),
+                    active_decode_rows=num_seqs + 1,
+                )
             seq.mtp_admitted = mtp_admitted
             seq.mtp_admission_reason = self.mtp_admission_reason if mtp_admitted else "scheduler_gate"
             remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
+            mtp_burst_groups = 1
+            if mtp_admitted and self.num_speculative_tokens > 0:
+                mtp_burst_groups = self.mtp_burst_groups
             lookahead_tokens = min(
-                1 + (self.num_speculative_tokens if mtp_admitted else 0),
+                (
+                    mtp_burst_groups * (1 + self.num_speculative_tokens)
+                    if mtp_admitted
+                    else 1
+                ),
                 remaining_tokens,
             )
             if (
-                self.num_speculative_tokens == 0
+                not mtp_admitted
                 and self.greedy_decode_burst_steps > 1
                 and seq.temperature == 0
                 and seq.ignore_eos
@@ -387,18 +428,59 @@ class Scheduler:
                 # Can append - schedule for decode
                 num_seqs += 1
                 self.block_manager.may_append_slots(seq, lookahead_tokens)
-                decode_step_counts.append(int(lookahead_tokens))
                 scheduled_seqs.append(seq)
         
         if not scheduled_seqs:
             raise RuntimeError(self._capacity_exhausted_message())
+        if (
+            self.num_speculative_tokens > 0
+            and self.mtp_max_active_rows > 0
+            and len(scheduled_seqs) > self.mtp_max_active_rows
+        ):
+            for seq in scheduled_seqs:
+                seq.mtp_admitted = False
+                seq.mtp_admission_reason = "active_rows_cap"
+        elif self.num_speculative_tokens > 0:
+            final_active_rows = len(scheduled_seqs)
+            final_batch_size_bucket = self._select_mtp_static_batch_size_bucket(final_active_rows)
+            for seq in scheduled_seqs:
+                if not bool(getattr(seq, "mtp_admitted", False)):
+                    continue
+                final_admitted = self.should_admit_mtp(
+                    seq,
+                    for_decode=True,
+                    batch_size_bucket=final_batch_size_bucket,
+                    active_decode_rows=final_active_rows,
+                )
+                seq.mtp_admitted = final_admitted
+                seq.mtp_admission_reason = self.mtp_admission_reason if final_admitted else "scheduler_gate"
         self.running.extendleft(reversed(scheduled_seqs))
-        decode_step_count = min(decode_step_counts) if decode_step_counts else 1
+        decode_step_count = self._decode_step_count_for_scheduled_batch(scheduled_seqs)
         return scheduled_seqs, self.build_scheduled_batch(
             scheduled_seqs,
             is_prefill=False,
             decode_step_count=decode_step_count,
         )
+
+    def _decode_step_count_for_scheduled_batch(self, seqs: List[Sequence]) -> int:
+        step_counts: List[int] = []
+        for seq in seqs:
+            remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
+            if bool(getattr(seq, "mtp_admitted", False)) and self.num_speculative_tokens > 0:
+                step_count = min(
+                    self.mtp_burst_groups * (1 + self.num_speculative_tokens),
+                    remaining_tokens,
+                )
+            elif (
+                self.greedy_decode_burst_steps > 1
+                and seq.temperature == 0
+                and seq.ignore_eos
+            ):
+                step_count = min(self.greedy_decode_burst_steps, remaining_tokens)
+            else:
+                step_count = 1
+            step_counts.append(int(step_count))
+        return min(step_counts) if step_counts else 1
 
     def _max_prefill_token_budget(self) -> int:
         """Largest prefill token count that the configured buckets cover."""
@@ -410,8 +492,18 @@ class Scheduler:
         )
         if self.prefill_token_buckets:
             max_token_budget = min(max_token_budget, max(self.prefill_token_buckets))
-        elif self.prefill_buckets:
+        elif self.prefill_layout == "packed" and self.prefill_buckets:
             max_token_budget = min(max_token_budget, max(self.prefill_buckets))
+        elif self.prefill_buckets:
+            max_dense_batch = (
+                max(self.batch_size_buckets)
+                if self.batch_size_buckets
+                else self.max_num_seqs
+            )
+            max_token_budget = min(
+                max_token_budget,
+                max(self.prefill_buckets) * max(1, int(max_dense_batch)),
+            )
         return int(max_token_budget)
 
     def _schedule_mixed_prefill_decode(self) -> Tuple[List[Sequence], ScheduledBatch] | None:
@@ -610,7 +702,17 @@ class Scheduler:
             prefill_is_final.append(final_chunk)
 
         if batch_size_bucket is None and self.batch_size_buckets:
-            batch_size_bucket = self._select_bucket(len(seqs), self.batch_size_buckets, "batch")
+            if is_prefill and self.prefill_layout == "packed":
+                batch_size_bucket = self._select_mtp_static_batch_size_bucket(len(seqs))
+            elif (
+                not is_prefill
+                and self.speculative_method == "mtp"
+                and self.num_speculative_tokens > 0
+                and any(bool(getattr(seq, "mtp_admitted", False)) for seq in seqs)
+            ):
+                batch_size_bucket = self._select_mtp_static_batch_size_bucket(len(seqs))
+            else:
+                batch_size_bucket = self._select_bucket(len(seqs), self.batch_size_buckets, "batch")
         if batch_size_bucket is None:
             batch_size_bucket = len(seqs)
         if len(seqs) > batch_size_bucket:
@@ -908,7 +1010,10 @@ class Scheduler:
             or not self.static_decode_metadata
             or self.jax_execution not in {"decode-jit", "jit"}
             or not self.device_token_carry
-            or self.num_speculative_tokens != 0
+            or (
+                self.num_speculative_tokens != 0
+                and any(bool(getattr(seq, "mtp_admitted", False)) for seq in seqs)
+            )
             or query_len_bucket != 1
             or not seqs
         ):
@@ -1023,6 +1128,25 @@ class Scheduler:
         if self.batch_size_buckets:
             return self._select_bucket(size, self.batch_size_buckets, "batch")
         return size
+
+    def _select_mtp_static_batch_size_bucket(self, size: int) -> int:
+        """Return a reusable physical row bucket for active MTP serving.
+
+        ``mtp_max_active_rows`` is the scheduler's cap for rows that may enter
+        speculative decode.  When it is configured, prefill metadata can use
+        that same row bucket for all smaller MTP-serving batches so generic
+        warmup/runtime do not compile separate packed-prefill executables for
+        row counts 1, 2, ..., cap.
+        """
+
+        if (
+            self.speculative_method == "mtp"
+            and self.num_speculative_tokens > 0
+            and self.mtp_max_active_rows > 0
+            and size <= self.mtp_max_active_rows
+        ):
+            return self._select_batch_size_bucket(self.mtp_max_active_rows)
+        return self._select_batch_size_bucket(size)
 
     def _select_prefill_query_bucket(self, size: int) -> int:
         if self.prefill_buckets:
@@ -1192,6 +1316,12 @@ class Scheduler:
         ):
             self.mtp_admission_reason = "bonus_boundary"
             return False
+        if for_decode and self.mtp_max_active_rows > 0:
+            if active_decode_rows is None:
+                active_decode_rows = batch_size_bucket if batch_size_bucket is not None else 1
+            if int(active_decode_rows) > self.mtp_max_active_rows:
+                self.mtp_admission_reason = "active_rows_cap"
+                return False
         if not self.mtp_scheduler_gate_enabled:
             self.mtp_admission_reason = "enabled"
             return True
@@ -1320,18 +1450,26 @@ class Scheduler:
         if probing:
             stats["admission_enabled"] = True
             stats["admission_reason"] = "probing_mtp"
+        elif (
+            not latency_ready
+            and self.mtp_min_speedup > 0
+            and stats["spec_ms_per_token"] is not None
+        ):
+            # Once the speculative probe has run, collect baseline latency right
+            # away. Waiting for the acceptance confidence window first can keep
+            # small tail buckets on an obviously expensive verifier for many
+            # steps without ever measuring the ordinary decode alternative.
+            stats["admission_enabled"] = False
+            stats["admission_reason"] = "waiting_baseline_probe"
+        elif not latency_ok:
+            stats["admission_enabled"] = False
+            stats["admission_reason"] = "low_throughput"
         elif not acceptance_ready:
             stats["admission_enabled"] = True
             stats["admission_reason"] = "warming_acceptance"
         elif not acceptance_ok:
             stats["admission_enabled"] = False
             stats["admission_reason"] = "low_acceptance"
-        elif not latency_ok:
-            stats["admission_enabled"] = False
-            stats["admission_reason"] = "low_throughput"
-        elif not latency_ready and self.mtp_min_speedup > 0:
-            stats["admission_enabled"] = True
-            stats["admission_reason"] = "waiting_baseline_probe"
         else:
             stats["admission_enabled"] = True
             stats["admission_reason"] = "enabled"

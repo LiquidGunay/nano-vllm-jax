@@ -177,6 +177,73 @@ def init_mtp_layer(key: jax.Array, config: Qwen3_5Config) -> Dict[str, jnp.ndarr
     }
 
 
+def _mtp_forward_hidden(
+    hidden_state: jnp.ndarray,
+    next_token_ids: jnp.ndarray,
+    embed_tokens: jnp.ndarray,
+    params: MTPParams,
+    config: Qwen3_5Config,
+    positions: Optional[jnp.ndarray] = None,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Run the MTP transformer block and return normed/output hidden states."""
+    batch, seq_len, _ = hidden_state.shape
+
+    # Compute positions if not provided: [0, 1, ..., seq_len-1] for each batch item
+    if positions is None:
+        positions = jnp.broadcast_to(jnp.arange(seq_len)[None, :], (batch, seq_len))
+
+    # Lookup embeddings for confirmed tokens (like mlx-lm does)
+    next_token_embed = embed_tokens[next_token_ids]
+
+    # Apply pre-norms
+    hidden_norm = rms_norm(hidden_state, params.pre_fc_norm_hidden, config.rms_norm_eps)
+    embed_norm = rms_norm(next_token_embed, params.pre_fc_norm_embedding, config.rms_norm_eps)
+
+    # Fuse inputs: [embed, hidden] -> [batch, seq_len, hidden_size*2]
+    # Note: Order matters! mlx-lm and HF use [embedding, hidden], not [hidden, embedding]
+    fused = jnp.concatenate([embed_norm, hidden_norm], axis=-1)
+
+    # Input projection: [batch, seq_len, hidden_size*2] @ [hidden_size*2, hidden_size] -> [batch, seq_len, hidden_size]
+    x = jnp.dot(fused, params.eh_proj)
+
+    # Run MTP layers
+    for i, layer_params in enumerate(params.layers):
+        x = mtp_layer_forward(x, layer_params, config, positions)
+
+    # Apply final norm after MTP layers (ALWAYS, as in mlx-lm)
+    x_normed = rms_norm(x, params.final_norm, config.rms_norm_eps)
+    return x_normed, x
+
+
+def _mtp_greedy_top1_token_ids(
+    x_normed: jnp.ndarray,
+    output_weight: jnp.ndarray,
+    config: Qwen3_5Config,
+) -> jnp.ndarray:
+    impl = str(getattr(config, "mtp_lm_head_greedy_top1_impl", "jax") or "jax").strip().lower()
+    if impl in {"triton", "triton_tensorcore", "triton_top1"}:
+        from nanovllm_jax.kernels.lm_head_triton import lm_head_greedy_top1_triton
+
+        return lm_head_greedy_top1_triton(x_normed, output_weight).astype(jnp.int32)
+    if impl in {"cutlass", "cutlass_top1", "cutlass_fused_gemm", "fused_gemm"}:
+        raise NotImplementedError(
+            "lm_head_greedy_top1_impl='cutlass' is not implemented for MTP draft seeding"
+        )
+    if impl not in {"jax", "", "none"}:
+        raise ValueError(f"unsupported MTP greedy top1 implementation: {impl!r}")
+    logits = jnp.dot(x_normed, output_weight)
+    return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+
+def _mtp_decode_activation_dtype(config: Qwen3_5Config) -> jnp.dtype:
+    value = str(getattr(config, "lm_head_decode_act_dtype", "fp32") or "fp32").strip().lower()
+    if value in {"", "0", "false", "no", "off", "none", "fp32", "float32"}:
+        return jnp.float32
+    if value in {"bf16", "bfloat16"}:
+        return jnp.bfloat16
+    raise ValueError(f"unsupported MTP decode activation dtype: {value!r}")
+
+
 def mtp_forward(
     hidden_state: jnp.ndarray,
     next_token_ids: jnp.ndarray,
@@ -186,7 +253,7 @@ def mtp_forward(
     positions: Optional[jnp.ndarray] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """MTP forward pass to generate draft logits.
-    
+
     Args:
         hidden_state: Pre-norm hidden state from main model [batch, seq_len, hidden_size]
         next_token_ids: Token IDs of confirmed token t+1 [batch, seq_len]
@@ -194,46 +261,51 @@ def mtp_forward(
         params: MTP parameters
         config: Main model config
         positions: Position IDs [batch, seq_len] (optional, will compute if not provided)
-        
+
     Returns:
         Tuple of:
         - Draft logits [batch, seq_len, vocab_size]
         - Output hidden state [batch, seq_len, hidden_size] (for chaining MTP predictions)
     """
-    batch, seq_len, _ = hidden_state.shape
-    
-    # Compute positions if not provided: [0, 1, ..., seq_len-1] for each batch item
-    if positions is None:
-        positions = jnp.broadcast_to(jnp.arange(seq_len)[None, :], (batch, seq_len))
-    
-    # Lookup embeddings for confirmed tokens (like mlx-lm does)
-    next_token_embed = embed_tokens[next_token_ids]
-    
-    # Apply pre-norms
-    hidden_norm = rms_norm(hidden_state, params.pre_fc_norm_hidden, config.rms_norm_eps)
-    embed_norm = rms_norm(next_token_embed, params.pre_fc_norm_embedding, config.rms_norm_eps)
-    
-    # Fuse inputs: [embed, hidden] -> [batch, seq_len, hidden_size*2]
-    # Note: Order matters! mlx-lm and HF use [embedding, hidden], not [hidden, embedding]
-    fused = jnp.concatenate([embed_norm, hidden_norm], axis=-1)
-    
-    # Input projection: [batch, seq_len, hidden_size*2] @ [hidden_size*2, hidden_size] -> [batch, seq_len, hidden_size]
-    x = jnp.dot(fused, params.eh_proj)
-    
-    # Run MTP layers
-    for i, layer_params in enumerate(params.layers):
-        x = mtp_layer_forward(x, layer_params, config, positions)
-    
-    # Apply final norm after MTP layers (ALWAYS, as in mlx-lm)
-    x_normed = rms_norm(x, params.final_norm, config.rms_norm_eps)
-    
+    x_normed, _ = _mtp_forward_hidden(
+        hidden_state=hidden_state,
+        next_token_ids=next_token_ids,
+        embed_tokens=embed_tokens,
+        params=params,
+        config=config,
+        positions=positions,
+    )
+
     # Output projection to vocab. MTP checkpoints may omit lm_head when
     # embeddings are shared with the main model, so fallback to tied
     # embedding weights in that case.
     output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
     logits = jnp.dot(x_normed, output_weight)
-    
-    return logits, x
+
+    return logits, x_normed
+
+
+def mtp_forward_token_ids(
+    hidden_state: jnp.ndarray,
+    next_token_ids: jnp.ndarray,
+    embed_tokens: jnp.ndarray,
+    params: MTPParams,
+    config: Qwen3_5Config,
+    positions: Optional[jnp.ndarray] = None,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """MTP forward pass for greedy draft token ids without materializing logits."""
+    x_normed, _ = _mtp_forward_hidden(
+        hidden_state=hidden_state,
+        next_token_ids=next_token_ids,
+        embed_tokens=embed_tokens,
+        params=params,
+        config=config,
+        positions=positions,
+    )
+    output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
+    x_normed = x_normed.astype(_mtp_decode_activation_dtype(config))
+    token_ids = _mtp_greedy_top1_token_ids(x_normed, output_weight, config)
+    return token_ids, x_normed
 
 
 def mtp_layer_forward(

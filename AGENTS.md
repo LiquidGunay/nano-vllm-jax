@@ -64,6 +64,52 @@
 - Stay on the random decode graph as the main hill-climb target. Do not switch to
   shape-specific microbench tuning unless it is needed to debug a random-graph
   regression.
+- MTP speed work must be an overlay on the current accepted best serving config
+  only. Do not change random-large batch buckets, cache/block geometry,
+  FlashInfer full-attention policy, Triton greedy LM-head policy, or
+  resident/static decode metadata when testing MTP unless the same change has
+  already been promoted by a non-MTP best-path run.
+  Corrected K=3 unverified MTP stack test reached only `683.53 output tok/s`,
+  below the accepted non-MTP best (`818.91 output tok/s`), so do not promote
+  the old collapsed-bucket route. The K=8 unverified diagnostic:
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_stack_20260614/random_large_best_overlay_mtp_k8_unverified_repeat_r2.json`
+  reached `1018.75 output tok/s` with no measured JIT growth, about `1.244x`
+  the accepted non-MTP best and `0.997x` the stored vLLM denominator, but this
+  is rejected as a valid MTP speedup. It emitted MTP draft tokens without
+  target-model verification (`drafts_accepted=0`, `drafts_rejected=0`,
+  `bonus_tokens=1397`) and matched only short prefixes against the exact
+  best-path output (`0/8` full matches, average prefix `2.375` tokens).
+  Unverified MTP append is no longer a valid config surface; stale configs must
+  fail rather than run. All MTP benchmarks must use target-model verification
+  and report accepted/rejected drafts.
+  Keep `NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1=0` and
+  `NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED=0` for correctness and speed runs
+  unless the run is explicitly labeled as an unsafe diagnostic.
+  Verified MTP should not pre-seed drafts during prefill by default
+  (`mtp_prefill_seed=false`); on the 2026-06-14 short verified diagnostic this
+  reduced TTFT from `335.3 ms` to about `74 ms`. When MTP is scheduler-gated
+  off, the decode batch must still use the static/resident metadata hot path;
+  otherwise "MTP enabled but gated" remains slower than the accepted no-MTP
+  path and benchmark results become misleading. Current exact verified MTP is
+  still not a speed path: the same short diagnostic improved from `26.13` to
+  `57.87 output tok/s` after the guardrail fixes, but the no-MTP control is
+  `84.01 output tok/s`.
+  Follow-up exact K>1 GPU diagnostics on 2026-06-14 also failed to produce a
+  speed path. The warmup reset fix made K=2 packed-prefill verification
+  correctness-clean on the short two-request probe
+  (`short8_verified_k2_prefill_generic_after_reset_r4.json` matched the
+  no-MTP rows exactly), but throughput was only `15.81 output tok/s` with
+  `25%` acceptance. Generic K=2 decode verification with a packed in-JIT host
+  payload stayed correctness-clean but reached only `16.75 output tok/s` on
+  the same mixed short probe. A high-acceptance B=1 stream
+  (`single64_mtp_k2_generic_decode_24_r1.json`) accepted `87.5%` of drafts
+  and still reached only `34.69 output tok/s` versus the no-MTP control's
+  `63.99 output tok/s`. K=4 was worse on the 40-token B=1 control:
+  exact K=4 reached `37.50 output tok/s` versus `109.85 output tok/s`
+  no-MTP, and the assume-accepted upper bound reached only `52.53 output
+  tok/s`. Do not retry K=2/K=4 generic decode or packed-prefill verification
+  as a speed route unless the verifier boundary avoids per-step host decisions
+  and the MTP-head/main-width verifier work is materially reduced.
 - Keep these work items in order: accepted FA/FLA policy validation, broader
   resident/scheduler decode metadata reduction, coarse GDN decode/prefill
   kernels, and model-family-general batched GEMM/fusion improvements.
@@ -170,10 +216,32 @@
   current non-tensor-core path (`0.0855 ms` versus `0.0763 ms`; fixed/disabled
   split-KV variants `0.079-0.081 ms`), so do not add a tensor-core attention
   JAX FFI unless new hardware/profile evidence changes that.
-- Borrowed FlashInfer GDN decode status: the installed `flashinfer.gdn_decode`
-  CuTe kernels expose the desired pool-indexed state boundary, but they require
-  SM90+ while the current GPU is A10G/SM86. They are therefore a blocked
-  borrowed-kernel route on this machine, not an integrated serving path.
+- Borrowed GDN decode status, corrected 2026-06-12: FlashInfer GDN prefill is
+  still SM90/SM100-gated on this A10G/SM86 host, but FlashInfer GDN decode and
+  vLLM FLA packed recurrent decode both run as raw kernels on A10G. Focused
+  Qwen3.5-0.8B shape microbench (`H=HV=16,K=V=128`, FP32 state) recorded
+  `results/gdn_decode_kernel_microbench_a10g_qwen08_b1_b2_b4_b8.json`: at B8,
+  JAX reference `0.858 ms` p50, local JAX-Triton raw-gate `0.256 ms`, vLLM FLA
+  `0.084 ms`, FlashInfer pretranspose `0.086 ms`; output differs from JAX only
+  at BF16-output scale (`max_abs <= 5.5e-5`) and FP32 state matches closely
+  enough (`max_abs <= 4.5e-8`) for serving diagnostics. The follow-up state-pool
+  conv+projection+tail GDN boundary is correct and removes the caller-side
+  layer scatter for that route, but it did not produce a stable random-large
+  speed win (`776.98` then `749.59 output tok/s` versus `818.17` reference).
+  Treat it as graph-replay scaffolding, not a promoted serving path, unless a
+  fresh profile shows GDN decode becoming dominant again.
+  Do not call Torch/FlashInfer from the JAX serving loop;
+  that would introduce a framework/host boundary. The viable borrowed-kernel
+  path is a JAX FFI/custom call or a port of the vLLM/FlashInfer kernel behind
+  the resident state ABI.
+- Do not promote the existing non-conv `triton_fla_raw_gates` route solely from
+  the raw microbench. The integrated random-large follow-up
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260612/random_large_gdn_raw_decode_microbench_followup_r1.json`
+  used the accepted FlashInfer full-attention baseline plus only
+  `gdn_packed_decode_impl=triton_fla_raw_gates`; it hit the 70% RAM guard during
+  generic warmup/compile after `473 s`, before measurement. Treat the existing
+  JAX-Triton raw-gate route as a useful parity/per-kernel probe, not an accepted
+  serving route.
 - Current accepted FA/FLA kernel policy: GDN keeps strict
   `triton_fla_padded` prefill plus explicit packed-projection `reference`
   decode, while full-attention uses `triton_packed` prefill and
@@ -230,6 +298,28 @@
   replay". The 2026-06-05 guarded smoke stayed CPU-bound in compile/warmup for
   more than six minutes before measurement. Use XLA/runtime graph replay or a
   backend-owned decode boundary if replay is revisited.
+- XLA command-buffer graph-replay knobs are now config-owned through
+  `runtime.xla.command_buffer`. The accepted startup flags in this jaxlib are
+  `--xla_enable_command_buffers_during_profiling=true`,
+  `--xla_gpu_command_buffer_unroll_loops=true`, and
+  `--xla_gpu_graph_min_graph_size=<int>`; direct
+  `--xla_gpu_enable_cuda_graphs=true` and tested
+  `--xla_gpu_enable_command_buffer=...` values are unavailable/invalid. Do not
+  promote these knobs blindly: on 2026-06-12, forcing graph min size to `1`
+  regressed large random to `777.67 output tok/s` and `239.62 s` warmup, while
+  unroll-only tied throughput (`818.58` vs `818.17 output tok/s`) but still
+  inflated warmup to `234.69 s`. The current JAX/XLA path already has
+  command-buffer regions; further replay work needs a backend-owned decode loop
+  or materially broader compiled boundary, not flag-only tuning.
+- NVIDIA JAX-Toolbox flag A/B, 2026-06-12: do not promote the tested flags on
+  this A10G/SM86 `jax==0.10.0` stack. `JAX_OPTIMIZATION_LEVEL=O1` tied the
+  optimized path (`818.27` vs `818.17 output tok/s`) and regressed the plain
+  JAX baseline (`180.85` vs `227.72`). `--xla_gpu_enable_command_buffer=FUSION,CUSTOM_CALL`
+  regressed optimized random-large to `691.55 output tok/s` and `233.48 s`
+  warmup. `--xla_gpu_cudnn_gemm_fusion_level=1` tied throughput (`818.49`) but
+  also inflated warmup (`235.44 s`). The optimized path is already about
+  `3.59x` the plain JAX baseline on random-large; the remaining gap is
+  structural GPU/kernel/scheduler work, not these XLA flag knobs.
 - Do not retry Entry 272 rejected branches as primary routes: resident
   prefix-slot compaction, decode block-table buckets `32,64,128`, scalar
   block-entry scatter, in-JIT resident metadata delta application, and
@@ -247,3 +337,45 @@
 - Do not remove the FlashInfer attention output FP32 cast as a speed route.
   Returning BF16 from the wrapper passed focused FFI tests but regressed the
   integrated large-random target to `815.22 output tok/s`.
+- Entry 296 tightened request-specific benchmark warmup so it replays the full
+  per-request output lengths. The earlier short request warmup compiled only
+  the first couple decode steps and missed later active-batch shrink shapes.
+  With the patched diagnostic path, the raw-GDN decode config completed the
+  reduced 4-request random slice with JIT cache `6 -> 6`, peak child RSS
+  `3.48 GB`, and peak system RAM `57.2%`. Reduced generic warmup for the same
+  slice also completed with JIT cache `22 -> 22`, but took `177 s` and peaked
+  at `4.61 GB` child RSS. This confirms the failed random-large raw-GDN run was
+  compile/warmup surface pressure, not KV cache memory for a few requests.
+  Repeating the request-specific slice with BF16 activations did not materially
+  reduce memory (`8675 MB` GPU after warmup versus `8673 MB` for FP32
+  activations), so the dominant retained footprint is runtime/executable
+  workspace, not live activation dtype.
+- Entry 297 restored the actual random-large benchmark envelope and added
+  route-aware generic warmup for greedy runs. Do not compare random-large runs
+  with `num_kvcache_blocks=320` against the stored `0.80x` result: the stored
+  fast run used `2048` KV blocks, and 320 blocks cannot keep all 8 random-large
+  prompts resident. With 320 blocks the current scheduler decodes at max B6 and
+  drops to about `0.57x` vLLM. With 2048 blocks and route-aware warmup, current
+  reference GDN reaches
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260612/random_large_gdn_reference_2048blocks_routeaware_warmup_r2.json`,
+  `818.47 output tok/s`, `0.801x` vLLM, JIT cache `24 -> 24`, warmup `61.6 s`,
+  peak child RSS `4.56 GB`, peak system RAM `62.1%`. The old full warmup
+  compiled sampled routes unnecessarily for greedy and used `56` JIT entries,
+  `138.8 s`, and `6.07 GB` child RSS. Raw GDN decode remains rejected for
+  serving: the matching route-aware 2048-block run reached only `778.41 output
+  tok/s`, `0.762x` vLLM.
+- Entry 298 tested broader GDN decode kernel boundaries on the actual
+  FlashInfer random-large path using the project venv
+  (`.venv/bin/python`; the conda Python lacks `flashinfer`/`jax_tvm_ffi`).
+  The route-aware greedy multisuite run reproduced the accepted reference at
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260612/random_large_gdn_reference_flashinfer_routeaware_venv_r1.json`,
+  `818.33 output tok/s`, JIT `24 -> 24`, warmup `60.59 s`. GDN kernel
+  substitutions lost: raw recurrent
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260612/random_large_gdn_raw_decode_flashinfer_routeaware_venv_r1.json`
+  hit `779.37 output tok/s` (`0.952x` reference), raw recurrent plus separate
+  Triton tail epilogue
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260612/random_large_gdn_raw_split_tail_decode_flashinfer_routeaware_venv_r1.json`
+  hit `759.25 output tok/s` (`0.928x`), and monolithic conv/recurrent/tail
+  variants were already slower. Do not retry isolated GDN decode replacement as
+  the 0.9x lever on A10G; the next speed route needs a broader serving boundary
+  than per-layer GDN decode or a different bottleneck.

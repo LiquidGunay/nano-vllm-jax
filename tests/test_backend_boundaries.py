@@ -20,7 +20,7 @@ from nanovllm_jax.engine.llm_engine import LLMEngine
 from nanovllm_jax.engine.model_executor import ModelExecutor
 from nanovllm_jax.engine.model_runner import ModelRunner
 from nanovllm_jax.engine.scheduler import Scheduler
-from nanovllm_jax.engine.sequence import SamplingParams, Sequence, SequenceStatus
+from nanovllm_jax.engine.sequence import DeviceTokenRef, SamplingParams, Sequence, SequenceStatus
 from nanovllm_jax.engine.scheduled_batch import ScheduledBatch
 from nanovllm_jax.kv_cache import (
     HybridLayerState,
@@ -940,6 +940,7 @@ def test_mtp_admission_gate_tracks_logical_decode_rows(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE", "0")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_ACCEPT_SAMPLES", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_SPEEDUP", "1.0")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_PROBE_STEPS", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_LATENCY_MIN_STEPS", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_LATENCY_ALPHA", "1.0")
     config = _tiny_full_attention_config()
@@ -999,6 +1000,198 @@ def test_mtp_admission_gate_tracks_logical_decode_rows(monkeypatch):
     assert buckets[2]["admission_reason"] == "low_throughput"
     assert buckets[2]["measured_speedup"] == pytest.approx(1 / 3)
     assert buckets[4]["admission_reason"] == "probing_mtp"
+
+
+def test_mtp_admission_gate_collects_baseline_before_speed_decision(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE", "0")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_ACCEPT_SAMPLES", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_SPEEDUP", "1.0")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_PROBE_STEPS", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_LATENCY_MIN_STEPS", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_LATENCY_ALPHA", "1.0")
+    config = _tiny_full_attention_config()
+    config.num_speculative_tokens = 1
+    scheduler = Scheduler(config)
+    batch = ScheduledBatch(
+        tokens=jnp.zeros((2, 1), dtype=jnp.int32),
+        positions=jnp.zeros((2, 1), dtype=jnp.int32),
+        seq_ids=jnp.array([0, 1], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 2], dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=2,
+        block_tables=jnp.zeros((2, 2), dtype=jnp.int32),
+        seq_lens=jnp.array([3, 3], dtype=jnp.int32),
+    )
+    seq = Sequence([1, 2, 3], SamplingParams(temperature=0.0, max_tokens=4), seq_id=99)
+
+    scheduler.update_mtp_admission(
+        {"drafts_accepted": 2, "drafts_rejected": 0},
+        is_decode=True,
+        elapsed_seconds=0.02,
+        emitted_tokens=2,
+        batch=batch,
+    )
+
+    assert not scheduler.should_admit_mtp(
+        seq,
+        for_decode=True,
+        batch_size_bucket=2,
+        active_decode_rows=2,
+    )
+    assert scheduler.mtp_admission_reason == "waiting_baseline_probe"
+
+    scheduler.update_mtp_admission(
+        {"drafts_accepted": 2, "drafts_rejected": 0},
+        is_decode=True,
+        elapsed_seconds=0.04,
+        emitted_tokens=2,
+        batch=batch,
+    )
+
+    assert scheduler.should_admit_mtp(
+        seq,
+        for_decode=True,
+        batch_size_bucket=2,
+        active_decode_rows=2,
+    )
+    assert scheduler.mtp_admission_reason == "enabled"
+
+
+def test_mtp_admission_gate_low_throughput_preempts_acceptance_warmup(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE", "0")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_ACCEPT_SAMPLES", "8")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_SPEEDUP", "1.0")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_PROBE_STEPS", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_LATENCY_MIN_STEPS", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_LATENCY_ALPHA", "1.0")
+    config = _tiny_full_attention_config()
+    config.num_speculative_tokens = 1
+    scheduler = Scheduler(config)
+    batch = ScheduledBatch(
+        tokens=jnp.zeros((2, 1), dtype=jnp.int32),
+        positions=jnp.zeros((2, 1), dtype=jnp.int32),
+        seq_ids=jnp.array([0, 1], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 2], dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=2,
+        block_tables=jnp.zeros((2, 2), dtype=jnp.int32),
+        seq_lens=jnp.array([3, 3], dtype=jnp.int32),
+    )
+    seq = Sequence([1, 2, 3], SamplingParams(temperature=0.0, max_tokens=4), seq_id=99)
+
+    scheduler.update_mtp_admission(
+        {"drafts_accepted": 2, "drafts_rejected": 0},
+        is_decode=True,
+        elapsed_seconds=0.04,
+        emitted_tokens=2,
+        batch=batch,
+    )
+    scheduler.update_mtp_admission(
+        {"drafts_accepted": 2, "drafts_rejected": 0},
+        is_decode=True,
+        elapsed_seconds=0.01,
+        emitted_tokens=2,
+        batch=batch,
+    )
+
+    assert not scheduler.should_admit_mtp(
+        seq,
+        for_decode=True,
+        batch_size_bucket=2,
+        active_decode_rows=2,
+    )
+    assert scheduler.mtp_admission_reason == "low_throughput"
+
+
+def test_scheduler_finalizes_mtp_admission_on_full_decode_bucket(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE", "0")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_ACCEPT_SAMPLES", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_MIN_SPEEDUP", "1.0")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_PROBE_STEPS", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_LATENCY_MIN_STEPS", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_LATENCY_ALPHA", "1.0")
+    config = _tiny_full_attention_config()
+    config.block_size = 8
+    config.num_kvcache_blocks = 8
+    config.max_num_seqs = 2
+    config.batch_size_buckets = (2,)
+    config.num_speculative_tokens = 1
+    scheduler = Scheduler(config)
+    batch_active_2 = ScheduledBatch(
+        tokens=jnp.zeros((2, 1), dtype=jnp.int32),
+        positions=jnp.zeros((2, 1), dtype=jnp.int32),
+        seq_ids=jnp.array([0, 1], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 2], dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=2,
+        block_tables=jnp.zeros((2, 2), dtype=jnp.int32),
+        seq_lens=jnp.array([3, 3], dtype=jnp.int32),
+    )
+    scheduler.update_mtp_admission(
+        {},
+        is_decode=True,
+        elapsed_seconds=0.01,
+        emitted_tokens=2,
+        batch=batch_active_2,
+    )
+    scheduler.update_mtp_admission(
+        {"drafts_accepted": 2, "drafts_rejected": 0},
+        is_decode=True,
+        elapsed_seconds=0.04,
+        emitted_tokens=2,
+        batch=batch_active_2,
+    )
+
+    seqs = [
+        Sequence([1, 2, 3], SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True), seq_id=10),
+        Sequence([4, 5, 6], SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True), seq_id=11),
+    ]
+    for seq in seqs:
+        scheduler.block_manager.allocate(seq, use_prefix_cache=False)
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        seq.status = SequenceStatus.RUNNING
+        scheduler.running.append(seq)
+
+    scheduled_seqs, scheduled_batch = scheduler.schedule()
+
+    assert len(scheduled_seqs) == 2
+    assert tuple(seq.mtp_admitted for seq in scheduled_seqs) == (False, False)
+    assert scheduled_batch.speculative_method == "none"
+    assert scheduled_batch.decode_step_count_host == 1
+
+
+def test_mtp_gated_decode_can_use_static_metadata_hot_path():
+    config = _tiny_full_attention_config()
+    config.block_size = 8
+    config.max_num_seqs = 2
+    config.batch_size_buckets = (2,)
+    config.max_blocks_per_seq = 2
+    config.num_speculative_tokens = 1
+    config.jax_execution = "jit"
+    config.device_token_carry = True
+    config.static_decode_metadata = True
+    config.resident_decode_metadata = True
+    scheduler = Scheduler(config)
+    seqs = [
+        Sequence([1, 2, 0], SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True), seq_id=20),
+        Sequence([4, 5, 0], SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True), seq_id=21),
+    ]
+    carried_tokens = jnp.array([3, 6], dtype=jnp.int32)
+    for row, seq in enumerate(seqs):
+        seq.status = SequenceStatus.RUNNING
+        seq.block_table = [row]
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        seq.last_token = 0
+        seq.last_token_device = DeviceTokenRef(carried_tokens, row)
+        seq.mtp_admitted = False
+
+    batch = scheduler.build_scheduled_batch(seqs, is_prefill=False)
+
+    assert batch.speculative_method == "none"
+    assert batch.uses_static_decode_metadata
 
 
 def test_scheduler_rejects_requests_exceeding_static_capacity():
@@ -1158,6 +1351,37 @@ def test_scheduler_builds_packed_prefill_token_bucket():
     assert int(batch.num_prefill_tokens) == 7
     np.testing.assert_array_equal(np.array(batch.query_start_loc), np.array([0, 5, 7, 7, 7]))
     np.testing.assert_array_equal(np.array(batch.token_row_ids), np.array([[0, 0, 0, 0, 0, 1, 1, 0]]))
+
+
+def test_scheduler_pads_mtp_packed_prefill_metadata_to_static_cap():
+    config = _tiny_full_attention_config()
+    config.prefill_layout = "packed"
+    config.max_num_seqs = 4
+    config.num_kvcache_blocks = 20
+    config.max_blocks_per_seq = 8
+    config.max_num_batched_tokens = 8
+    config.prefill_token_buckets = (8,)
+    config.batch_size_buckets = (1, 2, 3, 4)
+    config.speculative_method = "mtp"
+    config.num_speculative_tokens = 1
+    config.mtp_max_active_rows = 4
+    scheduler = Scheduler(config)
+
+    seq_a = Sequence([1, 2, 3], SamplingParams(temperature=0.0, max_tokens=1), seq_id=10)
+    seq_b = Sequence([6, 7], SamplingParams(temperature=0.0, max_tokens=1), seq_id=11)
+    scheduler.add(seq_a)
+    scheduler.add(seq_b)
+
+    seqs, batch = scheduler.schedule()
+
+    assert [seq.seq_id for seq in seqs] == [10, 11]
+    assert batch.packed_prefill
+    assert batch.tokens.shape == (1, 8)
+    assert batch.block_tables.shape == (4, 8)
+    assert batch.seq_ids_host == (10, 11, -1, -1)
+    assert batch.query_lens_host == (3, 2, 0, 0)
+    assert int(batch.num_prefill_tokens) == 5
+    np.testing.assert_array_equal(np.array(batch.query_start_loc), np.array([0, 3, 5, 5, 5]))
 
 
 def test_scheduler_chunks_packed_prefill_by_token_bucket_budget():
@@ -2555,6 +2779,7 @@ def test_model_runner_uses_bucketed_batched_jit_path():
     config.prefill_buckets = (4,)
     config.batch_size_buckets = (2,)
     config.max_blocks_per_seq = 2
+    config.max_num_batched_tokens = 8
     config.jax_execution = "jit"
     params = init_params(jax.random.PRNGKey(7), config)
     scheduler = Scheduler(config)

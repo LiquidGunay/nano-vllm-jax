@@ -69,7 +69,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mtp-seed-after-bonus", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--mtp-bonus-margin", type=float, default=0.0)
     parser.add_argument("--mtp-draft-margin", type=float, default=0.0)
-    parser.add_argument("--num-speculative-tokens", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--mtp-hidden-source", choices=["pre_norm", "final_normed"], default="pre_norm")
+    parser.add_argument("--mtp-token-source", choices=["generated", "current"], default="generated")
+    parser.add_argument("--mtp-position-offset", type=int, default=0)
+    parser.add_argument("--mtp-lm-head-greedy-top1-impl", default="jax")
+    parser.add_argument("--num-speculative-tokens", type=int, choices=list(range(0, 9)), default=0)
+    parser.add_argument("--mtp-burst-groups", type=int, default=1)
+    parser.add_argument("--mtp-max-active-rows", type=int, default=0)
+    parser.add_argument("--mtp-prefill-seed", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--max-kv-cache-mb", type=int, default=1024)
     parser.add_argument("--num-kvcache-blocks", type=int, default=64)
     parser.add_argument("--max-num-seqs", type=int, default=4)
@@ -441,7 +448,14 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "mtp_seed_after_bonus": args.mtp_seed_after_bonus,
         "mtp_bonus_margin": args.mtp_bonus_margin,
         "mtp_draft_margin": args.mtp_draft_margin,
+        "mtp_hidden_source": args.mtp_hidden_source,
+        "mtp_token_source": args.mtp_token_source,
+        "mtp_position_offset": args.mtp_position_offset,
+        "mtp_lm_head_greedy_top1_impl": args.mtp_lm_head_greedy_top1_impl,
         "num_speculative_tokens": args.num_speculative_tokens,
+        "mtp_burst_groups": args.mtp_burst_groups,
+        "mtp_max_active_rows": args.mtp_max_active_rows,
+        "mtp_prefill_seed": args.mtp_prefill_seed,
         "greedy_token_fastpath": args.greedy_token_fastpath,
         "sampled_token_fastpath": args.sampled_token_fastpath,
         "greedy_decode_burst_steps": max(1, int(args.greedy_decode_burst_steps or 1)),
@@ -507,6 +521,11 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     if args.warmup:
         warmup_started = time.perf_counter()
         if args.warmup_mode == "generic":
+            include_sampled_routes = not (
+                float(args.temperature) == 0.0
+                and float(args.top_p) == 1.0
+                and int(args.sampling_top_k) == -1
+            )
             warmup_summary = engine.warmup_compilation(
                 max_prefill_len=max(
                     tuple(getattr(engine.config, "prefill_token_buckets", ()) or ())
@@ -518,13 +537,12 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                     tuple(getattr(engine.config, "batch_size_buckets", ()) or ())
                     or (int(args.max_num_seqs),)
                 ),
+                include_sampled_routes=include_sampled_routes,
             )
         else:
-            burst_steps = max(1, int(getattr(engine.config, "greedy_decode_burst_steps", 1) or 1))
-            warmup_output_len = min(max(2, burst_steps + 1), args.output_len)
             warmup_params = _build_sampling_params(
-                [],
-                warmup_output_len,
+                output_lengths,
+                args.output_len,
                 temperature=args.temperature,
                 top_p=args.top_p,
                 top_k=args.sampling_top_k,
@@ -537,6 +555,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                     "seconds": time.perf_counter() - warmup_started,
                     "jit_cache_entries_after": len(jit_cache) if jit_cache is not None else None,
                     "request_specific": True,
+                    "request_output_lengths": output_lengths,
                 }
             )
     gpu_memory_after_warmup = _gpu_memory_used_mb()
@@ -672,9 +691,17 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "mtp_verifier_impl": str(engine.config.mtp_verifier_impl),
             "mtp_batch_accept_policy": str(engine.config.mtp_batch_accept_policy),
             "mtp_seed_after_bonus": bool(engine.config.mtp_seed_after_bonus),
+            "mtp_prefill_seed": bool(engine.config.mtp_prefill_seed),
             "mtp_bonus_margin": float(engine.config.mtp_bonus_margin),
             "mtp_draft_margin": float(engine.config.mtp_draft_margin),
+            "mtp_hidden_source": str(engine.config.mtp_hidden_source),
+            "mtp_token_source": str(engine.config.mtp_token_source),
+            "mtp_position_offset": int(engine.config.mtp_position_offset),
+            "mtp_lm_head_greedy_top1_impl": str(engine.config.mtp_lm_head_greedy_top1_impl),
             "num_speculative_tokens": int(engine.config.num_speculative_tokens),
+            "mtp_burst_groups": int(engine.config.mtp_burst_groups),
+            "mtp_max_active_rows": int(engine.config.mtp_max_active_rows),
+            "mtp_prefill_seed": bool(engine.config.mtp_prefill_seed),
             "sampling": {
                 "temperature": float(args.temperature),
                 "top_p": float(args.top_p),
@@ -767,7 +794,12 @@ def main() -> None:
             summary={
                 "performance": summary["performance"],
                 "correctness": correctness,
-                "speculative_method": summary["config"]["speculative_method"],
+                "speculative_method": (
+                    (summary.get("run_config") or summary.get("config") or {}).get(
+                        "speculative_method",
+                        args.speculative_method,
+                    )
+                ),
                 "num_speculative_tokens": args.num_speculative_tokens,
             },
             learnings=["JAX server-path timing now records per-token step timestamps."],

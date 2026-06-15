@@ -4,6 +4,31 @@ MTP is experimental in this repository. This page records the current GPU servin
 
 Do not describe the current MTP path as production-ready. Current GPU server-shape artifacts show exact commit-select MTP1 matching JAX/HF generated tokens across the suite, but still slower than the regular JAX paged baseline. Treat the TPU results below as historical for current GPU work.
 
+## No-Host-Sync MTP Target
+
+The active implementation target is a resident speculative decode boundary, not
+more Python-side repair of verifier outputs. The hot path should launch a fixed
+compiled step that:
+
+- verifies the current draft chain;
+- computes the accepted prefix length on device;
+- selects the committed KV/hybrid/GDN state at that prefix;
+- emits `draft_prefix + target_or_bonus` into a fixed device token matrix;
+- regenerates the next MTP draft chain from the committed token;
+- advances resident sequence lengths and paging metadata using masks.
+
+The host must not read `accepted`, split rows into accepted/rejected groups, or
+run a repair decode before the next speculative group can execute. The current
+Python engine may still drain the final emitted token matrix after a burst so it
+can update `Sequence` objects and stream results; that drain is not allowed to
+control intra-burst commit. A future resident output ring should remove even
+that post-burst length drain from the decode scheduling loop.
+
+The first concrete boundary is K-burst greedy MTP: each compiled burst handles
+mixed accepted/rejected rows by selecting prefix state per row and continuing
+from the selected committed token. This replaces the old K-burst behavior where
+any rejected row returned to Python for repair.
+
 ## Current GPU caveat
 
 As of 2026-06-11, MTP-1 is an explicit opt-in serving mode rather than an
@@ -16,6 +41,9 @@ environment-only diagnostic. The server config fields are:
   `commit_select` for the older exact sequential reference;
 - `mtp_batch_accept_policy`: `rowwise` or `all_or_none`;
 - `mtp_seed_after_bonus`: default `false`.
+- `mtp_prefill_seed`: default `false`. Prefill draft seeding is now opt-in
+  because the current verified GPU path paid a large TTFT cost without beating
+  the no-MTP decode baseline.
 
 Legacy configs that set only `num_speculative_tokens=1` are interpreted as
 `speculative_method=mtp` for compatibility. Invalid or unimplemented MTP modes
@@ -48,10 +76,14 @@ The current GPU correctness contract is `dtype=float32` with `weight_dtype=bfloa
 Current default posture:
 
 - regular serving uses `num_speculative_tokens=0` unless a caller opts into MTP,
+- unverified draft append is not a valid serving or benchmark mode; configs
+  that request it fail at startup,
 - the width-2 K=1 verifier is selected through config rather than
   `NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1=1`,
 - the exact commit-select path remains the correctness reference for focused
   MTP1 tests and diagnostics,
+- scheduler-gated MTP decode falls back to the ordinary static/resident
+  metadata hot path when no rows are admitted,
 - forced MTP benchmarks are diagnostics, not serving guidance, until they pass generated-token parity and measured decode speedup.
 
 ## Historical TPU validated state
@@ -165,6 +197,76 @@ K=2 should stay disabled for serving until it has:
 - per-bucket latency evidence showing a real throughput benefit,
 - clear state-commit handling for partial acceptance,
 - benchmark coverage comparable to K=1.
+
+## GPU 2026-06-14 K>1 status
+
+Exact K>1 verification is correctness-clean on the focused GPU probes but is
+not a speed path.
+
+- Warmup state reset fixed the short K=2 packed-prefill first-token drift:
+  `short8_verified_k2_prefill_generic_after_reset_r4.json` matched the no-MTP
+  short8 rows exactly.
+- The same K=2 packed-prefill run was only `15.81 output tok/s` at `25%`
+  acceptance; the no-MTP short8 control was `74.69 output tok/s`.
+- Generic K=2 decode verification with in-JIT result packing stayed
+  correctness-clean but reached only `16.75 output tok/s` on the mixed short
+  probe.
+- On a high-acceptance B=1 repeated-token stream, exact K=2 accepted `87.5%`
+  of drafts and still reached only `34.69 output tok/s` versus `63.99 output
+  tok/s` no-MTP.
+- Exact K=4 on the same B=1 stream reached `37.50 output tok/s` versus
+  `109.85 output tok/s` no-MTP. Even the assume-accepted upper bound, valid
+  only as a diagnostic on the zero-rejection stream, reached only `52.53
+  output tok/s`.
+
+Current diagnosis: the verifier boundary is dominated by width-K target-model
+work, MTP-head chaining, hybrid state gather/store, and first seed/probe cost.
+Avoiding the small host acceptance transfer is not enough. Do not promote or
+retry K=2/K=4 generic decode/packed-prefill verification as serving speed
+routes without a new device-side fixed-output/repair boundary and evidence that
+the verifier plus MTP-head work is cheaper than ordinary decode.
+
+## GPU 2026-06-14 random-large K=1/K=2 status
+
+The random-large benchmark currently blocks before a useful verified MTP
+speedup comparison:
+
+- no-MTP under the accepted random-large envelope reaches `817.85 output
+  tok/s`, `0.801x` of the stored vLLM denominator, with no JIT-cache growth;
+- best-path verified K=1 with materialized tied LM head trips the RAM guard
+  before measurement, at `80.1-82.2%` system RAM and `7.47-7.86 GB` child RSS;
+- disabling materialized tied LM head makes K=1 memory-safe but leaves it in
+  CPU-side warmup/compile for about ten minutes with `0%` GPU utilization;
+- diagnostic K=2 without materialized tied LM head timed out after `300 s`
+  before measurement, with output ending after weight load.
+
+This means random-large MTP is currently blocked by startup/compile and host
+memory surface before acceptance-rate economics can help. Treat K=1/K=2 random
+serving as non-promoted until the MTP verifier compilation boundary and
+materialized LM-head duplication are reduced.
+
+## GPU 2026-06-15 no-host-sync K-burst status
+
+The first no-host-sync K-burst commit boundary is implemented, but it is not a
+serving speed path yet.
+
+- The compiled burst now computes accepted prefix length, selects prefix
+  KV/hybrid/GDN state, emits fixed token/count tensors, regenerates drafts, and
+  advances committed sequence lengths without Python row repair between burst
+  groups.
+- Focused tests pass, including mixed-reject K=2 semantics without repair.
+- A guarded two-row random smoke with exact K=2, burst groups `2`, and
+  `final_normed` hidden was cache-stable but slow:
+  `23.11 output tok/s` versus `96.15` no-MTP (`0.240x`), with only `2/42`
+  accepted drafts.
+- Repeating the same smoke with `pre_norm` hidden kept acceptance at `2/42` and
+  was slower (`19.62 output tok/s`).
+
+Current diagnosis: intra-burst host-sync removal worked, but random-request
+MTP is dominated by low draft acceptance plus width-K target verification and
+MTP-head chaining. Keep MTP off the best random/hetero serving path until a
+better draft contract/model or confidence gate makes the verifier cheaper than
+ordinary decode for the active bucket.
 
 ## Unsafe fused paths
 

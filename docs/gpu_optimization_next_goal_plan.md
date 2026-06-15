@@ -92,6 +92,21 @@ optimization work starts.
     route is greedy K=1 with config-owned verifier selection and generic warmup
     coverage; probabilistic sampling and a width-2 FlashInfer verifier remain
     follow-up work.
+19. As of 2026-06-13, Entry 303 proves an exact MTP speedup on the controlled
+    B=1 greedy repeat-yes lane only: exact K=2 burst3 with prefill seed reaches
+    `186.67 tok/s` versus `168.67 tok/s` no-MTP on the 256-token run
+    (`1.107x`) with correctness OK and no measured JIT-cache growth. This does
+    not promote MTP as a default random-serving route. Short 64-token output
+    still loses, and the `204.09 tok/s` all-accept result is an unsafe upper
+    bound because it skips acceptance transfer.
+20. The active MTP follow-up is to broaden Entry 303 from B=1 to realistic
+    hetero/random decode buckets without benchmark-specific shape assumptions.
+    The first implementation target is an exact multi-row K-burst verifier:
+    fixed physical buckets, paged KV attention, generic warmup, commit all
+    rows that accept every burst group, and repair only rejected rows from the
+    already-computed target-token output. Any speed claim must compare against
+    the same no-MTP config on `hetero8` and `random_large`; unsafe all-accept
+    shortcuts remain upper bounds only.
 
 ## Active Random Request Contract - 2026-06-04
 
@@ -188,6 +203,59 @@ Next implementation order:
      and zero measured-phase JIT cache growth;
    - reprofile only after a structural change and compare against the fresh
      random anchor, the Entry 240 anchor, and the live vLLM reference.
+
+## Active GDN Decode Boundary Goal - 2026-06-12
+
+The current GDN decode pass must target the widest useful boundary around the
+microbench-fast recurrent decode kernel. Do not repeat the already-rejected
+isolated `triton_fla_raw_gates`, split-tail, or non-conv wrapper routes as
+serving candidates. The candidate boundary is:
+
+```text
+packed GDN decode projection [qkv, a, b, z]
+  -> causal-conv state update
+  -> SiLU(q/k/v), Q/K normalization, gate/beta prep
+  -> recurrent GDN state read/update
+  -> per-head RMSNorm + silu(z) tail
+  -> existing output projection
+```
+
+This is the maximum non-GEMM boundary that can be represented by a single
+JAX-Triton custom call today. The remaining expansion directions are:
+
+- remove redundant work inside that kernel while preserving the boundary;
+- update recurrent/conv state closer to the resident table if the table scatter
+  is a measured bottleneck;
+- keep output projection in XLA/cuBLAS unless profiling proves that the GDN
+  tail-to-output projection handoff is the dominant exposed cost.
+
+Success criteria:
+
+- strict GDN fallbacks disabled for the candidate route;
+- focused GDN tests pass against the accepted reference route;
+- `random_large` uses the standard route-aware warmup, has zero measured-phase
+  JIT growth, and improves over the current FlashInfer/reference-GDN anchor
+  (`818.33 output tok/s`, 2026-06-12 `.venv` run);
+- if the route cannot win, record the measured reason and the next boundary
+  needed before moving to graph replay.
+
+Status note, 2026-06-12: implemented the widest current non-GEMM GDN decode
+boundary with a state-pool JAX-Triton custom call. The conv+projection+tail
+kernel now accepts the full `[batch, linear_layer, ...]` conv/recurrent state
+tables, writes only the selected layer, preserves inactive rows, and aliases
+the state-table outputs back to the inputs so the model does not need a
+caller-side layer scatter for this route. Focused CUDA tests pass, including a
+state-pool test that verifies one-layer update and invalid-row preservation.
+Random-large results did not produce a stable end-to-end win over the accepted
+reference-GDN route: reference rerun `818.17 output tok/s`, previous conv-tail
+max-boundary `775.01`, state-pool conv-tail repeats `776.98` and `749.59`.
+Profiles show total GPU time essentially tied with the reference route
+(`577.75 ms` state-pool versus `577.60 ms` reference); the custom GDN decode
+kernel itself is only about `13.20 ms`, while GEMM, generic fusion, scatter,
+attention/prefill, and LM-head buckets dominate. Treat this as evidence that
+GDN-only boundary expansion has hit diminishing returns; the next structural
+route is graph replay / backend-owned decode-step capture or a broader boundary
+that includes surrounding model work without duplicating GEMM.
 
 Status note, 2026-06-05: resident decode metadata v1 is correct and
 cache-stable on a tiny random A/B, but it is slower than the current
@@ -3361,6 +3429,143 @@ Model-specific assumptions to track:
     random-large envelope covers hetero8 compilation-wise. Do not treat its
     `478.64 output tok/s` hetero8 number as a specialized hetero speed claim;
     it is a shared-envelope validation with smaller prefill-token caps.
+31. Entry 300 added typed XLA command-buffer replay controls under
+    `runtime.xla.command_buffer` and tested them on the accepted large-random
+    path. The current JAX/XLA route already emits command-buffer regions.
+    Forcing graph capture with `--xla_gpu_graph_min_graph_size=1` regressed to
+    `777.67 output tok/s` and `239.62 s` warmup; safer unroll-only replay tied
+    measured throughput (`818.58` vs `818.17 output tok/s`) but still expanded
+    generic warmup to `234.69 s`. Do not promote flag-only graph replay as a
+    speed path. The next replay attempt must be a backend-owned decode loop or
+    broader compiled boundary that reduces PJRT dispatch/GPU fragmentation
+    without source-level full-model burst regressions.
+32. Entry 301 tested the relevant NVIDIA JAX-Toolbox knobs that parse on the
+    installed `jax==0.10.0` stack. `JAX_OPTIMIZATION_LEVEL=O1` tied the
+    optimized path (`818.27` vs `818.17 output tok/s`) and regressed the plain
+    JAX baseline (`180.85` vs `227.72`). Restricting command buffers to
+    `FUSION,CUSTOM_CALL` regressed optimized random-large to `691.55` and
+    `233.48 s` warmup. `--xla_gpu_cudnn_gemm_fusion_level=1` tied throughput
+    but expanded warmup to `235.44 s`. Keep these as diagnostics only; do not
+    add them to the accepted serving config.
+33. Entry 303 changes the MTP status from diagnostic-only to narrow controlled
+    speedup only. Keep the exact B=1 K=2/K>1 burst route available for
+    high-acceptance long-output experiments, but do not retry burst4+ unrolling
+    or prefill-seed device refs without new evidence. Do not use the
+    all-accept shortcut as a correctness claim; it is an upper bound for the
+    remaining acceptance-transfer cost.
+34. For the next MTP pass, do not add a benchmark-specific route. Reuse the
+    generic server warmup envelope and support the active physical decode
+    buckets used by `hetero8` and `random_large`. The route may adapt at runtime
+    to acceptance, but it must not specialize to a particular seed, request
+    ordering, prompt length set, or Qwen3.5-0.8B-only hidden dimension.
+35. Entry 304 rejects the current K=1 B>1 MTP routes as speed paths. B=1-capped
+    K=2 burst cannot help `hetero8` or current random-large because there is no
+    useful B=1 verification window; K=1 reuse and K=1 commit-select both
+    regress hetero8 to roughly `58-78 output tok/s` versus `313.70 output
+    tok/s` no-MTP. Do not retry rejected-row K=1 seeding from the current
+    commit-select `next_draft_token`; diagnostics showed token drift/zero
+    tokens. The next MTP attempt must be a lower-overhead K>1 verifier that
+    keeps active rows in warmed physical buckets, or a correct verifier-side
+    rejected-row seed from target hidden that does not require an extra
+    full-logits/host path.
+36. Entry 304 follow-up originally tested an approximate/unverified MTP append
+    route, but that route is now rejected as invalid. The resident-table K=3
+    chain emitted one target token plus three MTP-1 chained drafts from one
+    full-model decode without target verification. The apparent `439.83 output
+    tok/s` on `hetero8` and `604.93 output tok/s` on `random_large` are
+    throughput-counter diagnostics only, not speculative decoding wins. The
+    selectable K=3/K=8 unverified configs were deleted, and
+    `Qwen3_5Config` now rejects unverified MTP append flags. All future MTP
+    testing must use target-model verification and report accept/reject counts.
+    Do not retry K=1/K=2/K=3 unverified routes.
+37. From 2026-06-14 onward, MTP speed work must be an overlay on the current
+    accepted best serving config only. Do not change random-large batch buckets,
+    cache/block geometry, FlashInfer full-attention policy, Triton greedy
+    LM-head policy, or resident/static decode metadata when testing MTP unless
+    the same change is first promoted as a non-MTP best-path improvement. The
+    corrected stack test,
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_stack_20260614/random_large_best_overlay_mtp_k3_unverified_r1.json`,
+    keeps the accepted random-large geometry and kernel policy, then adds only
+    the K=3 unverified MTP fields. Result: `683.53 output tok/s`, `1.130x` the
+    earlier collapsed-bucket K=3 MTP run but only `0.835x` the accepted
+    non-MTP best (`818.91 output tok/s`) and `0.669x` stored vLLM. Treat this
+    unverified K=3 chain as a useful diagnostic but not a promoted speed path
+    until it beats the same best-path no-MTP control.
+38. The wide unverified MTP chain is not a valid speculative speedup even
+    though it can make the benchmark counter faster. K sweep on `random_large`
+    with no measured-phase JIT growth produced: K=1 `354.84`, K=2 `589.47`,
+    K=3 `683.53`, K=4 `754.92`, K=5 `850.80`, K=6 `855.32`, K=7 `950.47`,
+    K=8 `1001.51 output tok/s`. K=8 repeated at `1018.75 output tok/s` in
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_stack_20260614/random_large_best_overlay_mtp_k8_unverified_repeat_r2.json`,
+    about `1.244x` the accepted non-MTP best and `0.997x` the stored vLLM
+    denominator, but the speculative counters show no verification happened:
+    `drafts_accepted=0`, `drafts_rejected=0`, and `bonus_tokens=1397`. Full
+    generated-token matches versus the exact best-path output were `0/8`, with
+    average prefix match `2.375` tokens. The K=8 unverified config was deleted;
+    do not report it as MTP speedup or as a speed/quality route. The exact K=8
+    verifier path did not reach measurement in a useful warmup window and
+    should not be retried until verification is made cheaper or staged.
+39. Verified MTP audit, 2026-06-14:
+    - unverified append flags now fail config construction, so all MTP tests
+      must verify drafts with the target model;
+    - exact K=1 commit-select on the short two-request diagnostic is slow
+      because prefill draft seeding and the first verified seed/probe step are
+      far more expensive than baseline decode;
+    - fixes applied: default `mtp_prefill_seed=false`, default
+      `NANO_VLLM_JAX_MTP_PROBE_STEPS=1`, final-batch MTP admission is
+      rechecked before building decode metadata, and fully gated MTP decode can
+      use the same static/resident metadata hot path as no-MTP;
+    - measured artifacts:
+      `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_verified_20260614/short_verified_k1_commit_select_finalbucket_r1.json`
+      was `26.13 output tok/s`, TTFT p50 `335.33 ms`;
+      `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_verified_20260614/short_verified_k1_commit_select_newdefaults_r1.json`
+      is `57.87 output tok/s`, TTFT p50 `74.40 ms`, ITL p50 `19.42 ms`;
+      no-MTP control
+      `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_verified_20260614/short_nomtp_same_surface_r1.json`
+      remains faster at `84.01 output tok/s`.
+    - decision: exact verified MTP remains diagnostic-only. It should not be
+      promoted until the seed/probe and verifier boundary become cheaper than
+      the accepted no-MTP serving path on the same benchmark surface.
+40. Exact K>1 MTP verifier audit, 2026-06-14:
+    - warmup state reset plus packed-prefix GDN state made K=2 packed-prefill
+      verification correctness-clean on the short two-request probe:
+      `short8_verified_k2_prefill_generic_after_reset_r4.json` matched the
+      no-MTP rows exactly;
+    - K=2/K=4 did not produce a speed path:
+      `short8_verified_k2_prefill_generic_after_reset_r4.json` was
+      `15.81 output tok/s` versus `74.69` no-MTP, K=2 generic decode with
+      in-JIT payload was `16.75`, high-acceptance B=1 K=2 was `34.69` versus
+      `63.99` no-MTP, and exact B=1 K=4 was `37.50` versus `109.85` no-MTP;
+    - even the B=1 K=4 assume-accepted upper bound reached only `52.53 output
+      tok/s`, so removing the host acceptance transfer alone is insufficient;
+    - next MTP work, if resumed, must be a new device-side fixed-output/repair
+      verifier boundary that avoids per-step host decisions and reduces
+      verifier/MTP-head work below ordinary decode. Do not retry generic K=2,
+      generic K=4, or packed-prefill K verification as a default speed route.
+41. No-host-sync MTP boundary, 2026-06-15:
+    - the active MTP implementation target is a resident K-burst greedy
+      verifier, not another Python repair path;
+    - within one compiled burst, each group must compute accepted prefix length,
+      select the corresponding KV/hybrid/GDN state, emit a fixed-width token row
+      plus an emitted-count row, regenerate the next draft chain from the
+      committed token, and advance committed sequence lengths before the next
+      group starts;
+    - the host must not read acceptance or split accepted/rejected rows before
+      the next speculative group executes. The current engine may drain
+      `emitted_tokens` and `emitted_counts` after the burst to update Python
+      `Sequence` objects; a future resident output ring should remove even that
+      post-burst drain from the scheduling loop;
+    - success requires zero rowwise repair calls inside K-burst, zero JIT growth
+      after warmup, correctness under the existing approximate random benchmark
+      rules, and throughput above the current no-MTP random-large best before
+      MTP can be called a serving win.
+    - status: implemented the intra-burst device-side prefix commit and removed
+      rowwise repair from the K-burst path. Focused tests pass and the forced
+      two-row GPU smoke has zero measured JIT growth, but exact K=2 burst is
+      still only `0.240x` the matching no-MTP control on that random smoke
+      because acceptance is `2/42`. Do not promote MTP for random/hetero until
+      the draft contract/model or confidence gate produces a high-acceptance
+      bucket where verifier cost is cheaper than ordinary decode.
 ```
 
 ## Expected Strategic Outcome
@@ -3374,7 +3579,8 @@ Clean baseline
 -> FlashInfer paged KV/attention where dtype/layout gates allow
 -> vLLM/FLA-shaped GDN decode recurrence
 -> vLLM/FLA-shaped segmented GDN prefill
--> only then revisit MTP or finer fusions
+-> opt-in MTP burst only where acceptance and output length justify it
+-> only then consider broader MTP or finer fusions
 ```
 
 The core bet is: keep the JAX model and correctness harness, but align the GDN

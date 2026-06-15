@@ -50,6 +50,10 @@ def _trace_token_prefetch_enabled(config: Qwen3_5Config | None = None) -> bool:
     )
 
 
+def _engine_step_profile_enabled() -> bool:
+    return os.environ.get("NANO_VLLM_JAX_PROFILE_ENGINE_STEP", "0") in _TRUE_ENV_VALUES
+
+
 @dataclass(frozen=True)
 class _DeferredTokenStreamRecord:
     slots: tuple
@@ -151,6 +155,7 @@ class LLMEngine:
         *,
         max_prefill_len: int | None = None,
         max_batch: int | None = None,
+        include_sampled_routes: bool = True,
     ) -> dict[str, object]:
         """Compile configured serving buckets without using live request data."""
         if max_prefill_len is None:
@@ -174,6 +179,7 @@ class LLMEngine:
         runner_summary = runner.warmup_compilation(
             max_prefill_len=int(max_prefill_len),
             max_batch=int(max_batch),
+            include_sampled_routes=bool(include_sampled_routes),
         )
         elapsed = perf_counter() - started
         cache_entries_after = len(cache) if cache is not None else None
@@ -188,6 +194,7 @@ class LLMEngine:
             "prefill_layout": str(getattr(self.config, "prefill_layout", "packed")),
             "batch_size_buckets": list(getattr(self.config, "batch_size_buckets", ()) or ()),
             "decode_block_table_buckets": list(getattr(self.config, "decode_block_table_buckets", ()) or ()),
+            "include_sampled_routes": bool(include_sampled_routes),
             "jit_cache_entries_before": cache_entries_before,
             "jit_cache_entries_after": cache_entries_after,
             "jit_cache_entries_added": (
@@ -274,12 +281,15 @@ class LLMEngine:
             - outputs: List of (seq_id, completion_tokens) for finished sequences
             - num_tokens: Number of tokens processed (positive for prefill, negative for decode)
         """
+        profile_step = _engine_step_profile_enabled()
         step_t = perf_counter()
         # Schedule sequences
         seqs, scheduled_batch = self.scheduler.schedule()
+        schedule_t = perf_counter()
 
         # Run model
         token_ids = self.model_runner.run(seqs, batch=scheduled_batch)
+        runner_t = perf_counter()
         emitted_tokens = 0
         mixed_prefill_decode = bool(getattr(scheduled_batch, "mixed_prefill_decode", False))
         if (not scheduled_batch.is_prefill) or mixed_prefill_decode:
@@ -294,9 +304,11 @@ class LLMEngine:
             else:
                 prefill_chunk_lengths = [int(x) for x in scheduled_batch.query_lens.tolist()[:len(seqs)]]
         finished_flags = self.scheduler.postprocess(seqs, token_ids, prefill_chunk_lengths=prefill_chunk_lengths)
+        postprocess_t = perf_counter()
         finished_seq_ids = [seq.seq_id for seq, is_finished in zip(seqs, finished_flags) if is_finished]
         if finished_seq_ids:
             self.model_runner.release(finished_seq_ids)
+        release_t = perf_counter()
         step_elapsed = perf_counter() - step_t
         self.scheduler.update_mtp_admission(
             self.model_runner.get_speculative_stats(),
@@ -305,6 +317,7 @@ class LLMEngine:
             emitted_tokens=emitted_tokens,
             batch=scheduled_batch,
         )
+        admission_t = perf_counter()
         
         # Collect outputs
         if materialize_finished_outputs:
@@ -315,12 +328,29 @@ class LLMEngine:
             ]
         else:
             outputs = [(seq.seq_id, []) for seq in seqs if seq.is_finished]
+        outputs_t = perf_counter()
         
         # Track throughput
         if scheduled_batch.is_prefill and not mixed_prefill_decode:
             num_tokens = scheduled_batch.num_prefill_tokens
         else:
             num_tokens = -getattr(self.scheduler, "last_num_generated_tokens", scheduled_batch.num_decode_tokens)
+
+        if profile_step:
+            is_decode = (not scheduled_batch.is_prefill) or mixed_prefill_decode
+            print(
+                "[ENGINE_STEP] "
+                f"decode={int(is_decode)} emitted={int(emitted_tokens)} "
+                f"num_tokens={int(abs(num_tokens))} seqs={len(seqs)} "
+                f"schedule_ms={(schedule_t - step_t) * 1000:.3f} "
+                f"runner_ms={(runner_t - schedule_t) * 1000:.3f} "
+                f"post_ms={(postprocess_t - runner_t) * 1000:.3f} "
+                f"release_ms={(release_t - postprocess_t) * 1000:.3f} "
+                f"admit_ms={(admission_t - release_t) * 1000:.3f} "
+                f"outputs_ms={(outputs_t - admission_t) * 1000:.3f} "
+                f"total_ms={(outputs_t - step_t) * 1000:.3f}",
+                flush=True,
+            )
 
         return outputs, num_tokens
 

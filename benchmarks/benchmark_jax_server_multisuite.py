@@ -103,6 +103,15 @@ def _jit_cache_snapshot(cache: Any) -> set[str] | None:
     return {repr(key) for key in cache.keys()}
 
 
+def _reset_mtp_measurement_counters(engine: Any) -> None:
+    model_runner = getattr(engine, "model_runner", None)
+    if model_runner is not None and hasattr(model_runner, "reset_speculative_stats"):
+        model_runner.reset_speculative_stats()
+    scheduler = getattr(engine, "scheduler", None)
+    if scheduler is not None and hasattr(scheduler, "reset_mtp_admission"):
+        scheduler.reset_mtp_admission()
+
+
 def _workload_names(value: str) -> list[str]:
     names = [part.strip() for part in value.split(",") if part.strip()]
     missing = [name for name in names if name not in WORKLOADS and name not in PSEUDO_WORKLOADS]
@@ -236,7 +245,25 @@ def _engine_kwargs(args: argparse.Namespace, config: dict[str, Any]) -> dict[str
         "max_blocks_per_seq": int(config_args["max_blocks_per_seq"]),
         "decode_block_table_buckets": _parse_ints(config_args.get("decode_block_table_buckets", "")),
         "jax_execution": config_args["jax_execution"],
+        "speculative_method": str(config_args.get("speculative_method", "none")),
+        "draft_sample_method": str(config_args.get("draft_sample_method", "greedy")),
+        "mtp_verifier_impl": str(config_args.get("mtp_verifier_impl", "two_decode")),
+        "mtp_batch_accept_policy": str(config_args.get("mtp_batch_accept_policy", "rowwise")),
+        "mtp_seed_after_bonus": bool(config_args.get("mtp_seed_after_bonus", False)),
+        "mtp_bonus_margin": float(config_args.get("mtp_bonus_margin", 0.0)),
+        "mtp_draft_margin": float(config_args.get("mtp_draft_margin", 0.0)),
+        "mtp_hidden_source": str(config_args.get("mtp_hidden_source", "pre_norm")),
+        "mtp_token_source": str(config_args.get("mtp_token_source", "generated")),
+        "mtp_position_offset": int(config_args.get("mtp_position_offset", 0)),
+        "mtp_lm_head_greedy_top1_impl": str(
+            config_args.get("mtp_lm_head_greedy_top1_impl", "jax")
+        ),
         "num_speculative_tokens": int(config_args.get("num_speculative_tokens", 0)),
+        "mtp_burst_groups": int(config_args.get("mtp_burst_groups", 1)),
+        "mtp_max_active_rows": int(config_args.get("mtp_max_active_rows", 0)),
+        "mtp_prefill_seed": bool(config_args.get("mtp_prefill_seed", True)),
+        "mtp_unverified_draft_append": bool(config_args.get("mtp_unverified_draft_append", False)),
+        "mtp_unverified_fused_append": bool(config_args.get("mtp_unverified_fused_append", False)),
         "greedy_token_fastpath": bool(config_args.get("greedy_token_fastpath", True)),
         "sampled_token_fastpath": bool(config_args.get("sampled_token_fastpath", True)),
         "greedy_decode_burst_steps": max(1, int(config_args.get("greedy_decode_burst_steps", 1) or 1)),
@@ -329,9 +356,15 @@ def main() -> None:
 
     warmup_summary: dict[str, Any] = {"enabled": bool(args.warmup)}
     if args.warmup:
+        include_sampled_routes = not (
+            float(args.temperature) == 0.0
+            and float(args.top_p) == 1.0
+            and int(args.sampling_top_k) == -1
+        )
         warmup_summary = engine.warmup_compilation(
             max_prefill_len=max(tuple(getattr(engine.config, "prefill_token_buckets", ()) or (1024,))),
             max_batch=max(tuple(getattr(engine.config, "batch_size_buckets", ()) or (8,))),
+            include_sampled_routes=include_sampled_routes,
         )
     gpu_after_warmup = trace_mod._gpu_memory_used_mb()
 
@@ -355,6 +388,7 @@ def main() -> None:
             top_k=args.sampling_top_k,
         )
 
+        _reset_mtp_measurement_counters(engine)
         before_count = len(jit_cache) if jit_cache is not None else None
         before_keys = _jit_cache_snapshot(jit_cache)
         recorder.start_jax_profile(enabled=args.profile)
@@ -398,6 +432,22 @@ def main() -> None:
                 "prefill_token_buckets": list(engine_kwargs["prefill_token_buckets"]),
                 "batch_size_buckets": list(engine_kwargs["batch_size_buckets"]),
                 "max_blocks_per_seq": engine_kwargs["max_blocks_per_seq"],
+                "speculative_method": str(engine.config.speculative_method),
+                "draft_sample_method": str(engine.config.draft_sample_method),
+                "num_speculative_tokens": int(engine.config.num_speculative_tokens),
+                "mtp_verifier_impl": str(engine.config.mtp_verifier_impl),
+                "mtp_batch_accept_policy": str(engine.config.mtp_batch_accept_policy),
+                "mtp_seed_after_bonus": bool(engine.config.mtp_seed_after_bonus),
+                "mtp_burst_groups": int(engine.config.mtp_burst_groups),
+                "mtp_max_active_rows": int(engine.config.mtp_max_active_rows),
+                "mtp_prefill_seed": bool(engine.config.mtp_prefill_seed),
+                "mtp_unverified_draft_append": bool(engine.config.mtp_unverified_draft_append),
+                "mtp_unverified_fused_append": bool(engine.config.mtp_unverified_fused_append),
+                "mtp_hidden_source": str(engine.config.mtp_hidden_source),
+                "mtp_token_source": str(engine.config.mtp_token_source),
+                "mtp_position_offset": int(engine.config.mtp_position_offset),
+                "mtp_lm_head_greedy_top1_impl": str(engine.config.mtp_lm_head_greedy_top1_impl),
+                "greedy_decode_burst_steps": int(engine.config.greedy_decode_burst_steps),
                 "warmup": warmup_summary,
                 "jit_cache_audit": {
                     "entries_before_measurement": before_count,
@@ -417,6 +467,8 @@ def main() -> None:
             },
             "rows": rows,
             "events": trace["events"],
+            "speculative": engine.model_runner.get_speculative_stats(),
+            "mtp_admission": engine.get_mtp_admission_report(),
             "correctness": compare_reference(
                 {"rows": rows},
                 _reference_for(config, workload_name, args.reference_dir),

@@ -785,7 +785,6 @@ def lm_head_token_ids_and_topk(
         (not is_prefill)
         and top_k == 0
         and hidden.ndim == 3
-        and int(hidden.shape[1]) == 1
         and _lm_head_greedy_top1_impl(config) != "jax"
     ):
         hidden_norm, output_weight = _lm_head_normed_hidden_and_weight(
@@ -795,8 +794,10 @@ def lm_head_token_ids_and_topk(
             hidden_is_normed=hidden_is_normed,
             is_prefill=False,
         )
-        token_ids = _lm_head_greedy_top1_token_ids(hidden_norm, output_weight, config)
-        return token_ids, None, None
+        batch, width, hidden_dim = hidden_norm.shape
+        flat_hidden = hidden_norm.reshape(batch * width, 1, hidden_dim)
+        token_ids = _lm_head_greedy_top1_token_ids(flat_hidden, output_weight, config)
+        return token_ids.reshape(batch, width), None, None
 
     logits = _lm_head_logits(
         hidden,
@@ -1514,6 +1515,9 @@ def gated_deltanet_block(
             force_width1=force_width1_dot,
         ).reshape(batch, seq_len, config.linear_num_value_heads)
     tail_fused_gdn_decode = False
+    state_pool_gdn_decode = False
+    new_conv_state_pool = None
+    new_recurrent_state_pool = None
 
     if use_cached:
         # === DECODE MODE ===
@@ -1550,9 +1554,23 @@ def gated_deltanet_block(
             and not return_first_prefix_state
             and initial_recurrent is not None
         )
+        # Width>1 decode is used by speculative verification: the current token
+        # and one or more draft tokens are replayed through the target model in a
+        # single JIT boundary. The packed GDN kernel is width-1 only, but the
+        # explicit unrolled decode path below preserves decode semantics and
+        # avoids forcing speculative decode through a prefill-shaped verifier.
+        allow_explicit_multitoken_decode = (
+            seq_len > 1
+            and initial_recurrent is not None
+        )
+        use_packed_multitoken_decode = (
+            packed_decode_requested
+            and allow_explicit_multitoken_decode
+        )
         if (
             packed_decode_requested
             and not use_packed_decode
+            and not use_packed_multitoken_decode
             and gdn_disable_fallbacks_enabled(config)
         ):
             reasons = []
@@ -1576,7 +1594,9 @@ def gated_deltanet_block(
                 + "; ".join(reasons)
             )
         use_conv_packed_decode = use_packed_decode and gdn_packed_decode_conv_enabled(config)
-        tail_fused_requested = use_packed_decode and gdn_packed_decode_tail_fused_enabled(config)
+        tail_fused_requested = (
+            use_packed_decode or use_packed_multitoken_decode
+        ) and gdn_packed_decode_tail_fused_enabled(config)
         if (
             tail_fused_requested
             and packed_decode_projection is None
@@ -1587,7 +1607,41 @@ def gated_deltanet_block(
                 "projection route; strict GDN fallback mode is enabled."
             )
         if use_conv_packed_decode:
-            if packed_decode_projection is not None:
+            use_state_pool_decode = (
+                packed_decode_projection is not None
+                and tail_fused_requested
+                and not hybrid_state_is_layer
+                and hybrid_state.conv_state is not None
+                and hybrid_state.recurrent_state is not None
+            )
+            if use_state_pool_decode:
+                tail_fused_gdn_decode = True
+                state_pool_gdn_decode = True
+                valid_rows = None
+                if valid_token_mask is not None:
+                    if row_valid is None:
+                        row_valid = (valid_token_mask.astype(jnp.int32).sum(axis=1) > 0)
+                    valid_rows = row_valid
+                core_attn_out, new_conv_state_pool, new_recurrent_state_pool = (
+                    backend.gated_delta_conv_packed_projection_decode_state_pool(
+                        packed_decode_projection[:, 0, :],
+                        params["A"].astype(jnp.float32),
+                        params["dt_bias"].astype(jnp.float32),
+                        hybrid_state.conv_state.astype(jnp.float32),
+                        conv_weight,
+                        conv_bias,
+                        hybrid_state.recurrent_state.astype(jnp.float32),
+                        qkv_dim=conv_dim,
+                        linear_layer_idx=linear_layer_idx,
+                        use_qk_l2norm_in_kernel=True,
+                        norm_weight=params["norm_weight"].astype(jnp.float32),
+                        valid_rows=valid_rows,
+                        rms_norm_eps=float(config.rms_norm_eps),
+                    )
+                )
+                new_layer_conv_state = layer_conv_state
+                new_recurrent_state_single = initial_recurrent
+            elif packed_decode_projection is not None:
                 tail_fused_gdn_decode = gdn_packed_decode_tail_fused_enabled(config)
                 core_attn_out, new_layer_conv_state, new_recurrent_state_single = (
                     backend.gated_delta_conv_packed_projection_decode(
@@ -1670,16 +1724,66 @@ def gated_deltanet_block(
                 prefix_layer_conv_state = None
             conv_out = conv_out_steps.transpose(1, 0, 2, 3).reshape(batch, seq_len, conv_dim)
 
-        if use_packed_decode and not use_conv_packed_decode:
-            core_attn_out, new_recurrent_state_single = backend.gated_delta_packed_decode(
-                conv_out_t[:, :, 0].astype(jnp.float32),
-                a[:, 0, :].astype(jnp.float32),
-                b[:, 0, :].astype(jnp.float32),
-                params["A"].astype(jnp.float32),
-                params["dt_bias"].astype(jnp.float32),
-                initial_recurrent.astype(jnp.float32),
-                use_qk_l2norm_in_kernel=True,
-            )
+        if use_packed_multitoken_decode and not use_conv_packed_decode:
+            recurrent_state = initial_recurrent.astype(jnp.float32)
+            output_parts = []
+            recurrent_state_parts = []
+            for token_idx in range(seq_len):
+                token_z = z[:, token_idx, :] if tail_fused_requested else None
+                out_t, recurrent_state = backend.gated_delta_packed_decode(
+                    conv_out[:, token_idx, :].astype(jnp.float32),
+                    a[:, token_idx, :].astype(jnp.float32),
+                    b[:, token_idx, :].astype(jnp.float32),
+                    params["A"].astype(jnp.float32),
+                    params["dt_bias"].astype(jnp.float32),
+                    recurrent_state,
+                    use_qk_l2norm_in_kernel=True,
+                    z=token_z,
+                    norm_weight=params["norm_weight"].astype(jnp.float32)
+                    if tail_fused_requested
+                    else None,
+                    rms_norm_eps=float(config.rms_norm_eps),
+                )
+                output_parts.append(out_t)
+                if return_prefix_state or (return_first_prefix_state and token_idx == 0):
+                    recurrent_state_parts.append(recurrent_state)
+            new_recurrent_state_single = recurrent_state
+            if tail_fused_requested:
+                core_attn_out = jnp.concatenate(output_parts, axis=1)
+                tail_fused_gdn_decode = True
+            else:
+                core_attn_out = jnp.concatenate(output_parts, axis=2)
+            if return_prefix_state:
+                prefix_recurrent_state_single = jnp.stack(recurrent_state_parts, axis=1)
+            elif return_first_prefix_state:
+                prefix_recurrent_state_single = recurrent_state_parts[0]
+            else:
+                prefix_recurrent_state_single = None
+        elif use_packed_decode and not use_conv_packed_decode:
+            if tail_fused_requested:
+                core_attn_out, new_recurrent_state_single = backend.gated_delta_packed_decode(
+                    conv_out_t[:, :, 0].astype(jnp.float32),
+                    a[:, 0, :].astype(jnp.float32),
+                    b[:, 0, :].astype(jnp.float32),
+                    params["A"].astype(jnp.float32),
+                    params["dt_bias"].astype(jnp.float32),
+                    initial_recurrent.astype(jnp.float32),
+                    use_qk_l2norm_in_kernel=True,
+                    z=z[:, 0, :],
+                    norm_weight=params["norm_weight"].astype(jnp.float32),
+                    rms_norm_eps=float(config.rms_norm_eps),
+                )
+                tail_fused_gdn_decode = True
+            else:
+                core_attn_out, new_recurrent_state_single = backend.gated_delta_packed_decode(
+                    conv_out_t[:, :, 0].astype(jnp.float32),
+                    a[:, 0, :].astype(jnp.float32),
+                    b[:, 0, :].astype(jnp.float32),
+                    params["A"].astype(jnp.float32),
+                    params["dt_bias"].astype(jnp.float32),
+                    initial_recurrent.astype(jnp.float32),
+                    use_qk_l2norm_in_kernel=True,
+                )
             prefix_recurrent_state_single = None
         elif not use_conv_packed_decode:
             # 2. Split q, k, v
@@ -1748,7 +1852,7 @@ def gated_deltanet_block(
                 )
                 prefix_recurrent_state_single = None
         # new_recurrent_state_single has shape [batch, num_heads, v_dim, k_dim]
-        if valid_token_mask is not None:
+        if valid_token_mask is not None and not state_pool_gdn_decode:
             if row_valid is None:
                 row_valid = (valid_token_mask.astype(jnp.int32).sum(axis=1) > 0)
             conv_keep = row_valid[:, None, None]
@@ -1778,7 +1882,10 @@ def gated_deltanet_block(
                 )
 
         # Update cache with new recurrent state and conv state for this layer
-        if hybrid_state.recurrent_state is not None:
+        if state_pool_gdn_decode:
+            new_recurrent_state = new_recurrent_state_pool
+            new_conv_state = new_conv_state_pool
+        elif hybrid_state.recurrent_state is not None:
             if hybrid_state_is_layer:
                 new_recurrent_state = new_recurrent_state_single
                 new_conv_state = new_layer_conv_state
@@ -1811,8 +1918,6 @@ def gated_deltanet_block(
         # === PREFILL MODE (Metal-compatible implementation) ===
         mixed_qkv_t = mixed_qkv.transpose(0, 2, 1)  # [B, D, T]
         if packed_token_row_ids is not None:
-            if return_prefix_state or return_first_prefix_state:
-                raise ValueError("packed prefill does not support prefix hybrid-state returns")
             if packed_query_start_loc is None:
                 raise ValueError("packed_query_start_loc is required for packed GDN prefill")
             if batch != 1:
@@ -1822,6 +1927,33 @@ def gated_deltanet_block(
             token_rows = packed_token_row_ids.reshape(-1).astype(jnp.int32)
             valid_tokens = jnp.arange(seq_len, dtype=jnp.int32) < packed_query_start_loc[-1].astype(jnp.int32)
             safe_rows = jnp.clip(token_rows, 0, row_count - 1)
+            max_row_tokens = (
+                max(tuple(getattr(config, "prefill_buckets", ()) or ()))
+                if tuple(getattr(config, "prefill_buckets", ()) or ())
+                else seq_len
+            )
+            row_query_len = (
+                max(1, seq_len // row_count)
+                if return_prefix_state or return_first_prefix_state
+                else (
+                    seq_len
+                    if max_row_tokens is None
+                    else min(seq_len, int(max_row_tokens))
+                )
+            )
+            row_query_len = max(1, row_query_len)
+            row_offsets = jnp.arange(row_query_len, dtype=jnp.int32)
+            row_starts = packed_query_start_loc[:-1].astype(jnp.int32)
+            row_lens = (
+                packed_query_start_loc[1:] - packed_query_start_loc[:-1]
+            ).astype(jnp.int32)
+            token_indices_by_row = row_starts[:, None] + row_offsets[None, :]
+            valid_queries_by_row = row_offsets[None, :] < row_lens[:, None]
+            safe_token_indices_by_row = jnp.clip(
+                token_indices_by_row,
+                0,
+                seq_len - 1,
+            )
             conv_weight = params["conv1d_weight"].reshape(conv_dim, config.linear_conv_kernel_size)
             conv_bias = params.get("conv1d_bias")
             if use_cached_prefill:
@@ -1836,11 +1968,6 @@ def gated_deltanet_block(
                     dtype=mixed_qkv_t.dtype,
                 )
 
-            max_row_tokens = (
-                max(tuple(getattr(config, "prefill_buckets", ()) or ()))
-                if tuple(getattr(config, "prefill_buckets", ()) or ())
-                else seq_len
-            )
             conv_out, final_conv_state = _packed_causal_conv1d_prefill(
                 mixed_qkv,
                 initial_conv_state,
@@ -1872,6 +1999,8 @@ def gated_deltanet_block(
             use_packed_post_conv_prefill = (
                 gdn_prefill_post_conv_enabled(config)
                 and not use_recurrent_prefill
+                and not return_prefix_state
+                and not return_first_prefix_state
             )
             if use_packed_post_conv_prefill:
                 core_attn_out, final_state = backend.gated_delta_packed_prefill_post_conv(
@@ -1939,9 +2068,9 @@ def gated_deltanet_block(
                     next_row_state = jnp.where(valid, next_row_state, previous_row_state)
                     state = state.at[row].set(next_row_state)
                     out_t = jnp.where(valid, out_t, jnp.zeros_like(out_t))
-                    return state, out_t
+                    return state, (out_t, next_row_state)
 
-                final_state, recurrent_out_tokens = lax.scan(
+                final_state, (recurrent_out_tokens, recurrent_state_tokens) = lax.scan(
                     recurrent_scan,
                     initial_recurrent.astype(jnp.float32),
                     (
@@ -1955,6 +2084,76 @@ def gated_deltanet_block(
                     ),
                 )
                 core_attn_out = recurrent_out_tokens[None, :, :, :].astype(dtype)
+                if return_prefix_state or return_first_prefix_state:
+                    prefix_recurrent_rows = recurrent_state_tokens[safe_token_indices_by_row]
+                    prefix_recurrent_rows = jnp.where(
+                        valid_queries_by_row[
+                            :,
+                            :,
+                            None,
+                            None,
+                            None,
+                        ],
+                        prefix_recurrent_rows,
+                        initial_recurrent[:, None, :, :, :],
+                    )
+                    prefix_recurrent_state_single = (
+                        prefix_recurrent_rows
+                        if return_prefix_state
+                        else prefix_recurrent_rows[:, 0]
+                    )
+                    mixed_rows = mixed_qkv[0][safe_token_indices_by_row]
+                    mixed_rows = jnp.where(
+                        valid_queries_by_row[:, :, None],
+                        mixed_rows,
+                        0.0,
+                    )
+                    conv_input_by_row = jnp.concatenate(
+                        [
+                            initial_conv_state.astype(mixed_qkv.dtype),
+                            mixed_rows.transpose(0, 2, 1),
+                        ],
+                        axis=-1,
+                    )
+                    kernel_size = config.linear_conv_kernel_size
+                    gather_starts = row_offsets + 1
+                    gather_idx = gather_starts[:, None] + jnp.arange(
+                        kernel_size,
+                        dtype=jnp.int32,
+                    )[None, :]
+                    gather_idx = jnp.broadcast_to(
+                        gather_idx[None, :, None, :],
+                        (
+                            row_count,
+                            row_query_len,
+                            conv_dim,
+                            kernel_size,
+                        ),
+                    )
+                    conv_input_expanded = jnp.broadcast_to(
+                        conv_input_by_row[:, None, :, :],
+                        (
+                            row_count,
+                            row_query_len,
+                            conv_dim,
+                            conv_input_by_row.shape[-1],
+                        ),
+                    )
+                    prefix_conv_rows = jnp.take_along_axis(
+                        conv_input_expanded,
+                        gather_idx,
+                        axis=3,
+                    )
+                    prefix_conv_rows = jnp.where(
+                        valid_queries_by_row[:, :, None, None],
+                        prefix_conv_rows,
+                        initial_conv_state[:, None, :, :],
+                    )
+                    prefix_layer_conv_state = (
+                        prefix_conv_rows.astype(dtype)
+                        if return_prefix_state
+                        else prefix_conv_rows[:, 0].astype(dtype)
+                    )
 
             if (
                 hybrid_state is not None
@@ -1974,6 +2173,11 @@ def gated_deltanet_block(
                     conv_state=new_conv_state,
                     recurrent_state=new_recurrent_state,
                 )
+                if return_prefix_state or return_first_prefix_state:
+                    prefix_layer_state = HybridLayerState(
+                        conv_state=prefix_layer_conv_state,
+                        recurrent_state=prefix_recurrent_state_single,
+                    )
 
             core_attn_out = core_attn_out.reshape(
                 batch * seq_len,
@@ -1994,6 +2198,8 @@ def gated_deltanet_block(
                 force_width1=False,
             )
             if hybrid_state is not None:
+                if return_prefix_state or return_first_prefix_state:
+                    return attn_out, hybrid_state, prefix_layer_state
                 return attn_out, hybrid_state
             return attn_out
         elif use_cached_prefill:
@@ -2827,20 +3033,53 @@ def forward_step(
     mask = causal_mask(seq_len, seq_len)
     prefix_hybrid_state = None
     if return_prefix_hybrid and hybrid_state is not None:
-        prefix_hybrid_state = HybridLayerState(
-            conv_state=jnp.broadcast_to(
-                hybrid_state.conv_state[:, None, ...],
-                (batch, seq_len) + hybrid_state.conv_state.shape[1:],
-            )
-            if hybrid_state.conv_state is not None
-            else None,
-            recurrent_state=jnp.broadcast_to(
-                hybrid_state.recurrent_state[:, None, ...],
-                (batch, seq_len) + hybrid_state.recurrent_state.shape[1:],
-            )
-            if hybrid_state.recurrent_state is not None
-            else None,
+        packed_token_rows = (
+            attention_metadata.token_row_ids
+            if attention_metadata is not None
+            and attention_metadata.token_row_ids is not None
+            else None
         )
+        if packed_token_rows is not None:
+            row_count = (
+                int(hybrid_state.conv_state.shape[0])
+                if hybrid_state.conv_state is not None
+                else int(hybrid_state.recurrent_state.shape[0])
+            )
+            row_query_len = int(
+                attention_metadata.max_query_len
+                if attention_metadata.max_query_len is not None
+                else seq_len
+            )
+            prefix_hybrid_state = HybridLayerState(
+                conv_state=jnp.broadcast_to(
+                    hybrid_state.conv_state[:, None, ...],
+                    (row_count, row_query_len) + hybrid_state.conv_state.shape[1:],
+                )
+                if hybrid_state.conv_state is not None
+                else None,
+                recurrent_state=jnp.broadcast_to(
+                    hybrid_state.recurrent_state[:, None, ...],
+                    (row_count, row_query_len)
+                    + hybrid_state.recurrent_state.shape[1:],
+                )
+                if hybrid_state.recurrent_state is not None
+                else None,
+            )
+        else:
+            prefix_hybrid_state = HybridLayerState(
+                conv_state=jnp.broadcast_to(
+                    hybrid_state.conv_state[:, None, ...],
+                    (batch, seq_len) + hybrid_state.conv_state.shape[1:],
+                )
+                if hybrid_state.conv_state is not None
+                else None,
+                recurrent_state=jnp.broadcast_to(
+                    hybrid_state.recurrent_state[:, None, ...],
+                    (batch, seq_len) + hybrid_state.recurrent_state.shape[1:],
+                )
+                if hybrid_state.recurrent_state is not None
+                else None,
+            )
     if return_first_prefix_hybrid and hybrid_state is not None:
         prefix_hybrid_state = HybridLayerState(
             conv_state=hybrid_state.conv_state,

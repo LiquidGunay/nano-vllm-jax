@@ -18,11 +18,12 @@ from nanovllm_jax.kv_cache import AttentionMetadata, HybridLayerState, KVCacheSt
 from nanovllm_jax.layers import rms_norm
 from nanovllm_jax.model import (
     ModelParams,
+    _lm_head_greedy_top1_token_ids,
     forward_step as model_forward_step,
     lm_head_sample_token_ids,
     lm_head_token_ids_and_topk,
 )
-from nanovllm_jax.mtp.mtp_layer import mtp_forward
+from nanovllm_jax.mtp.mtp_layer import mtp_forward, mtp_forward_token_ids
 
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
@@ -107,6 +108,11 @@ class MTP1GreedyOutput:
     cache_storage: KVCacheStorage
     hybrid_state: HybridLayerState
     committed_seq_lens: object | None = None
+    host_payload: object | None = None
+    emitted_tokens: object | None = None
+    emitted_counts: object | None = None
+    accepted_counts: object | None = None
+    burst_groups: int | None = None
 
 
 @dataclass
@@ -448,10 +454,13 @@ class ModelExecutor:
             gather_positions = self._logit_positions(batch)
             gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
             gathered_hidden = hidden[0, gather_idx, :][:, None, :]
-            normed = rms_norm(gathered_hidden, self.params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
-            output_weight = self.params.lm_head if self.params.lm_head is not None else self.params.embed_tokens.T
-            logits = jnp.dot(normed, output_weight)
-            activations = (gathered_hidden, logits) if return_hidden_with_logits else logits
+            if return_hidden_with_logits or not return_hidden:
+                normed = rms_norm(gathered_hidden, self.params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                output_weight = self.params.lm_head if self.params.lm_head is not None else self.params.embed_tokens.T
+                logits = jnp.dot(normed, output_weight)
+                activations = (gathered_hidden, logits) if return_hidden_with_logits else logits
+            else:
+                activations = gathered_hidden
 
         updated_storage = cache_storage
         if updated_kv_state is not None:
@@ -590,10 +599,13 @@ class ModelExecutor:
                     gather_positions = self._logit_positions(step_batch)
                     gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
                     gathered_hidden = hidden[0, gather_idx, :][:, None, :]
-                    normed = rms_norm(gathered_hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
-                    output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
-                    logits = jnp.dot(normed, output_weight)
-                    activations = (gathered_hidden, logits) if return_hidden_with_logits else logits
+                    if return_hidden_with_logits or not return_hidden:
+                        normed = rms_norm(gathered_hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                        output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
+                        logits = jnp.dot(normed, output_weight)
+                        activations = (gathered_hidden, logits) if return_hidden_with_logits else logits
+                    else:
+                        activations = gathered_hidden
                 return (
                     activations,
                     updated_kv_state.k_cache,
@@ -816,6 +828,8 @@ class ModelExecutor:
         cache_storage: KVCacheStorage,
         hybrid_state_table: HybridLayerState,
         hybrid_slot_ids: jnp.ndarray,
+        return_last_hidden: bool = False,
+        return_mtp_draft: bool = False,
     ) -> ExecutorOutput:
         """Prefill greedy-token path that owns hybrid table gather/scatter in JIT."""
         if not batch.is_prefill:
@@ -832,6 +846,8 @@ class ModelExecutor:
             tuple(batch.block_tables.shape),
             tuple(batch.token_row_ids.shape) if batch.token_row_ids is not None else None,
             bool(batch.packed_prefill),
+            bool(return_last_hidden),
+            bool(return_mtp_draft),
             tuple(hybrid_state_table.conv_state.shape),
             tuple(hybrid_state_table.recurrent_state.shape),
             _static_prefill_token_count_for_batch(
@@ -975,8 +991,42 @@ class ModelExecutor:
                     updated_recurrent,
                     mode="drop",
                 )
+                emitted_token_ids = token_ids[:, 0].astype(jnp.int32)
+                if return_mtp_draft:
+                    mtp_hidden = (
+                        rms_norm(last_hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                        if str(getattr(self.config, "mtp_hidden_source", "pre_norm") or "pre_norm").lower()
+                        == "final_normed"
+                        else last_hidden
+                    )
+                    mtp_positions = (gather_positions + 1).astype(jnp.int32)
+                    draft_len = max(1, int(getattr(self.config, "num_speculative_tokens", 1) or 1))
+                    current_hidden = mtp_hidden
+                    current_token = emitted_token_ids[:, None]
+                    current_position = mtp_positions[:, None]
+                    mtp_drafts = []
+                    for _ in range(draft_len):
+                        current_token, current_hidden = mtp_forward_token_ids(
+                            hidden_state=current_hidden,
+                            next_token_ids=current_token,
+                            embed_tokens=params.embed_tokens,
+                            params=params.mtp_params,
+                            config=self.config,
+                            positions=current_position,
+                        )
+                        mtp_drafts.append(current_token[:, 0].astype(jnp.int32))
+                        current_position = current_position + 1
+                    mtp_draft_tokens = jnp.stack(mtp_drafts, axis=1)
+                    activations = (
+                        emitted_token_ids,
+                        mtp_draft_tokens[:, 0] if draft_len == 1 else mtp_draft_tokens,
+                    )
+                elif return_last_hidden:
+                    activations = (emitted_token_ids, last_hidden[:, 0, :])
+                else:
+                    activations = emitted_token_ids
                 return (
-                    token_ids[:, 0].astype(jnp.int32),
+                    activations,
                     updated_kv_state.k_cache,
                     updated_kv_state.v_cache,
                     updated_conv_table,
@@ -988,7 +1038,7 @@ class ModelExecutor:
                 donate_argnums=(7, 8, 9, 10),
             )
 
-        token_ids, k_cache, v_cache, conv_state, recurrent_state = self._profile_jit_call(
+        activations, k_cache, v_cache, conv_state, recurrent_state = self._profile_jit_call(
             key,
             self._jit_cache[key],
             (
@@ -1008,7 +1058,759 @@ class ModelExecutor:
             "forward_prefill_token_ids_table_jit:prefill",
         )
         return ExecutorOutput(
-            activations=token_ids,
+            activations=activations,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            attention_metadata=None,
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+        )
+
+    def forward_step_token_ids_mtp_draft_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state: HybridLayerState,
+        mtp_hidden_final_normed: bool,
+    ) -> ExecutorOutput:
+        """Decode one target token and one unverified MTP draft in one JIT."""
+        if batch.is_prefill:
+            raise ValueError("forward_step_token_ids_mtp_draft_jit is decode-only")
+        if hybrid_state.conv_state is None or hybrid_state.recurrent_state is None:
+            raise ValueError("forward_step_token_ids_mtp_draft_jit requires initialized hybrid_state")
+        self._log_step(
+            "forward_step_token_ids_mtp_draft_jit",
+            batch,
+            return_hidden=True,
+            last_logits_only=False,
+        )
+        self._validate_batch_contract(batch)
+
+        key = (
+            "token-ids-mtp-draft",
+            tuple(batch.tokens.shape),
+            tuple(batch.positions.shape),
+            tuple(batch.block_tables.shape),
+            tuple(hybrid_state.conv_state.shape),
+            tuple(hybrid_state.recurrent_state.shape),
+            bool(mtp_hidden_final_normed),
+        )
+        if key not in self._jit_cache:
+
+            def compiled(
+                params_leaves,
+                tokens,
+                positions,
+                seq_ids,
+                query_start_loc,
+                block_tables,
+                seq_lens,
+                k_cache,
+                v_cache,
+                conv_state,
+                recurrent_state,
+            ):
+                del positions
+                params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
+                query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
+                step_batch = ScheduledBatch(
+                    tokens=tokens,
+                    positions=step_positions,
+                    seq_ids=seq_ids,
+                    query_start_loc=query_start_loc,
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=query_start_loc[-1].astype(jnp.int32),
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                )
+                attention_metadata = self.backend.build_attention_metadata(
+                    positions=step_batch.positions,
+                    block_tables=step_batch.block_tables,
+                    seq_lens=step_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=False,
+                    query_start_loc=step_batch.query_start_loc,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=step_batch.num_decode_tokens,
+                )
+                kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=step_batch.block_tables,
+                    kv_lens=step_batch.seq_lens,
+                    slot_mapping=attention_metadata.slot_mapping,
+                )
+                hidden, updated_kv_state, updated_hybrid_state = model_forward_step(
+                    step_batch.tokens,
+                    params,
+                    self.config,
+                    positions=step_batch.positions,
+                    kv_cache_state=kv_state,
+                    attention_metadata=attention_metadata,
+                    hybrid_state=HybridLayerState(conv_state, recurrent_state),
+                    is_prefill=False,
+                    return_hidden=True,
+                    return_hidden_with_logits=False,
+                    last_logits_only=False,
+                    backend=self.backend,
+                )
+                target_token_ids, _, _ = lm_head_token_ids_and_topk(
+                    hidden[:, :1, :],
+                    params,
+                    self.config,
+                    hidden_is_normed=False,
+                    is_prefill=False,
+                    top_k=0,
+                )
+                target_token_ids = target_token_ids[:, 0].astype(jnp.int32)
+                mtp_hidden = (
+                    rms_norm(hidden[:, :1, :], params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                    if mtp_hidden_final_normed
+                    else hidden[:, :1, :]
+                )
+                mtp_positions = (
+                    seq_lens.astype(jnp.int32)
+                    + jnp.asarray(int(getattr(self.config, "mtp_position_offset", 0)), dtype=jnp.int32)
+                )[:, None]
+                mtp_token_ids, _ = mtp_forward_token_ids(
+                    hidden_state=mtp_hidden,
+                    next_token_ids=target_token_ids[:, None],
+                    embed_tokens=params.embed_tokens,
+                    params=params.mtp_params,
+                    config=self.config,
+                    positions=mtp_positions,
+                )
+                draft_token_ids = mtp_token_ids[:, 0].astype(jnp.int32)
+                active = (query_lens > 0) & (seq_ids >= 0)
+                token_rows = jnp.stack([target_token_ids, draft_token_ids], axis=1)
+                token_rows = jnp.where(active[:, None], token_rows, jnp.zeros_like(token_rows))
+                return (
+                    token_rows,
+                    updated_kv_state.k_cache,
+                    updated_kv_state.v_cache,
+                    updated_hybrid_state.conv_state,
+                    updated_hybrid_state.recurrent_state,
+                )
+
+            self._jit_cache[key] = jax.jit(compiled, donate_argnums=(7, 8))
+
+        token_rows, k_cache, v_cache, conv_state, recurrent_state = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self._params_leaves,
+                batch.tokens,
+                batch.positions,
+                batch.seq_ids,
+                batch.query_start_loc,
+                batch.block_tables,
+                batch.seq_lens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state.conv_state,
+                hybrid_state.recurrent_state,
+            ),
+            "forward_step_token_ids_mtp_draft_jit:decode",
+        )
+        return ExecutorOutput(
+            activations=token_rows,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            attention_metadata=None,
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+        )
+
+    def forward_step_token_ids_mtp_draft_table_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state_table: HybridLayerState,
+        hybrid_slot_ids: jnp.ndarray,
+        resident_last_tokens: jnp.ndarray,
+        mtp_hidden_final_normed: bool,
+    ) -> ExecutorOutput:
+        """Decode one target token and one unverified MTP draft with table-owned hybrid state."""
+        if batch.is_prefill:
+            raise ValueError("forward_step_token_ids_mtp_draft_table_jit is decode-only")
+        if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
+            raise ValueError(
+                "forward_step_token_ids_mtp_draft_table_jit requires initialized hybrid state tables"
+            )
+        self._log_step(
+            "forward_step_token_ids_mtp_draft_table_jit",
+            batch,
+            return_hidden=True,
+            last_logits_only=False,
+        )
+        self._validate_batch_contract(batch)
+
+        key = (
+            "token-ids-mtp-draft-table",
+            tuple(batch.tokens.shape),
+            tuple(batch.positions.shape),
+            tuple(batch.block_tables.shape),
+            tuple(hybrid_state_table.conv_state.shape),
+            tuple(hybrid_state_table.recurrent_state.shape),
+            tuple(resident_last_tokens.shape),
+            bool(mtp_hidden_final_normed),
+        )
+        if key not in self._jit_cache:
+
+            def compiled(
+                params_leaves,
+                tokens,
+                positions,
+                query_start_loc,
+                block_tables,
+                seq_lens,
+                k_cache,
+                v_cache,
+                conv_state_table,
+                recurrent_state_table,
+                slot_ids,
+                last_tokens_table,
+            ):
+                del positions
+                params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
+                query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                row_valid = (slot_ids >= 0) & (query_lens > 0)
+                safe_slot_ids = jnp.maximum(slot_ids, 0)
+
+                conv_state = conv_state_table[safe_slot_ids]
+                recurrent_state = recurrent_state_table[safe_slot_ids]
+                conv_state = jnp.where(
+                    row_valid.reshape((row_valid.shape[0],) + (1,) * (conv_state.ndim - 1)),
+                    conv_state,
+                    jnp.zeros_like(conv_state),
+                )
+                recurrent_state = jnp.where(
+                    row_valid.reshape((row_valid.shape[0],) + (1,) * (recurrent_state.ndim - 1)),
+                    recurrent_state,
+                    jnp.zeros_like(recurrent_state),
+                )
+
+                step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
+                num_query_tokens = query_start_loc[-1].astype(jnp.int32)
+                step_batch = ScheduledBatch(
+                    tokens=tokens,
+                    positions=step_positions,
+                    seq_ids=jnp.where(
+                        row_valid,
+                        safe_slot_ids.astype(jnp.int32),
+                        jnp.full_like(safe_slot_ids, -1),
+                    ),
+                    query_start_loc=query_start_loc,
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=num_query_tokens,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                )
+                attention_metadata = self.backend.build_attention_metadata(
+                    positions=step_batch.positions,
+                    block_tables=step_batch.block_tables,
+                    seq_lens=step_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=False,
+                    query_start_loc=step_batch.query_start_loc,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=step_batch.num_decode_tokens,
+                )
+                kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=step_batch.block_tables,
+                    kv_lens=step_batch.seq_lens,
+                    slot_mapping=attention_metadata.slot_mapping,
+                )
+                hidden, updated_kv_state, updated_hybrid_state = model_forward_step(
+                    step_batch.tokens,
+                    params,
+                    self.config,
+                    positions=step_batch.positions,
+                    kv_cache_state=kv_state,
+                    attention_metadata=attention_metadata,
+                    hybrid_state=HybridLayerState(conv_state, recurrent_state),
+                    is_prefill=False,
+                    return_hidden=True,
+                    return_hidden_with_logits=False,
+                    last_logits_only=False,
+                    backend=self.backend,
+                    hybrid_state_layerwise=True,
+                )
+                target_token_ids, _, _ = lm_head_token_ids_and_topk(
+                    hidden[:, :1, :],
+                    params,
+                    self.config,
+                    hidden_is_normed=False,
+                    is_prefill=False,
+                    top_k=0,
+                )
+                target_token_ids = target_token_ids[:, 0].astype(jnp.int32)
+                mtp_hidden = (
+                    rms_norm(hidden[:, :1, :], params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                    if mtp_hidden_final_normed
+                    else hidden[:, :1, :]
+                )
+                mtp_positions = (
+                    seq_lens.astype(jnp.int32)
+                    + jnp.asarray(int(getattr(self.config, "mtp_position_offset", 0)), dtype=jnp.int32)
+                )[:, None]
+                mtp_token_ids, _ = mtp_forward_token_ids(
+                    hidden_state=mtp_hidden,
+                    next_token_ids=target_token_ids[:, None],
+                    embed_tokens=params.embed_tokens,
+                    params=params.mtp_params,
+                    config=self.config,
+                    positions=mtp_positions,
+                )
+                draft_token_ids = mtp_token_ids[:, 0].astype(jnp.int32)
+                active = (query_lens > 0) & (slot_ids >= 0)
+                token_rows = jnp.stack([target_token_ids, draft_token_ids], axis=1)
+                token_rows = jnp.where(active[:, None], token_rows, jnp.zeros_like(token_rows))
+
+                scatter_slot_ids = jnp.where(
+                    row_valid,
+                    slot_ids,
+                    jnp.full_like(slot_ids, conv_state_table.shape[0]),
+                )
+                updated_conv = updated_hybrid_state.conv_state.astype(conv_state_table.dtype)
+                updated_recurrent = updated_hybrid_state.recurrent_state.astype(
+                    recurrent_state_table.dtype
+                )
+                updated_conv_table = conv_state_table.at[scatter_slot_ids].set(
+                    updated_conv,
+                    mode="drop",
+                )
+                updated_recurrent_table = recurrent_state_table.at[scatter_slot_ids].set(
+                    updated_recurrent,
+                    mode="drop",
+                )
+                updated_last_tokens = last_tokens_table.at[scatter_slot_ids].set(
+                    draft_token_ids,
+                    mode="drop",
+                )
+                return (
+                    token_rows,
+                    updated_kv_state.k_cache,
+                    updated_kv_state.v_cache,
+                    updated_conv_table,
+                    updated_recurrent_table,
+                    updated_last_tokens,
+                )
+
+            self._jit_cache[key] = jax.jit(
+                compiled,
+                donate_argnums=(6, 7, 8, 9, 11),
+            )
+
+        token_rows, k_cache, v_cache, conv_state, recurrent_state, last_tokens_table = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self._params_leaves,
+                batch.tokens,
+                batch.positions,
+                batch.query_start_loc,
+                batch.block_tables,
+                batch.seq_lens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state_table.conv_state,
+                hybrid_state_table.recurrent_state,
+                hybrid_slot_ids,
+                resident_last_tokens,
+            ),
+            "forward_step_token_ids_mtp_draft_table_jit:decode",
+        )
+        return ExecutorOutput(
+            activations=token_rows,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            attention_metadata=None,
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+            resident_last_tokens=last_tokens_table,
+        )
+
+    def forward_step_token_ids_mtp_draft_resident_table_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state_table: HybridLayerState,
+        hybrid_slot_ids: jnp.ndarray,
+        resident_last_tokens: jnp.ndarray,
+        mtp_hidden_final_normed: bool,
+    ) -> ExecutorOutput:
+        """MTP draft decode that gathers input tokens from resident slot state."""
+        if batch.is_prefill:
+            raise ValueError("forward_step_token_ids_mtp_draft_resident_table_jit is decode-only")
+        if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
+            raise ValueError(
+                "forward_step_token_ids_mtp_draft_resident_table_jit requires initialized hybrid state tables"
+            )
+        self._log_step(
+            "forward_step_token_ids_mtp_draft_resident_table_jit",
+            batch,
+            return_hidden=True,
+            last_logits_only=False,
+        )
+        self._validate_batch_contract(batch)
+
+        key = (
+            "token-ids-mtp-draft-resident-table",
+            tuple(batch.tokens.shape),
+            tuple(batch.block_tables.shape),
+            tuple(hybrid_state_table.conv_state.shape),
+            tuple(hybrid_state_table.recurrent_state.shape),
+            tuple(resident_last_tokens.shape),
+            max(1, int(getattr(self.config, "num_speculative_tokens", 1) or 1)),
+            bool(mtp_hidden_final_normed),
+        )
+        if key not in self._jit_cache:
+            draft_len = max(1, int(getattr(self.config, "num_speculative_tokens", 1) or 1))
+
+            def compiled(
+                params_leaves,
+                query_start_loc,
+                block_tables,
+                seq_lens,
+                k_cache,
+                v_cache,
+                conv_state_table,
+                recurrent_state_table,
+                slot_ids,
+                last_tokens_table,
+            ):
+                params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
+                query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                row_valid = (slot_ids >= 0) & (query_lens > 0)
+                safe_slot_ids = jnp.maximum(slot_ids, 0)
+
+                tokens = last_tokens_table[safe_slot_ids].astype(jnp.int32)[:, None]
+                tokens = jnp.where(row_valid[:, None], tokens, jnp.zeros_like(tokens))
+                conv_state = conv_state_table[safe_slot_ids]
+                recurrent_state = recurrent_state_table[safe_slot_ids]
+                conv_state = jnp.where(
+                    row_valid.reshape((row_valid.shape[0],) + (1,) * (conv_state.ndim - 1)),
+                    conv_state,
+                    jnp.zeros_like(conv_state),
+                )
+                recurrent_state = jnp.where(
+                    row_valid.reshape((row_valid.shape[0],) + (1,) * (recurrent_state.ndim - 1)),
+                    recurrent_state,
+                    jnp.zeros_like(recurrent_state),
+                )
+
+                step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
+                num_query_tokens = query_start_loc[-1].astype(jnp.int32)
+                step_batch = ScheduledBatch(
+                    tokens=tokens,
+                    positions=step_positions,
+                    seq_ids=jnp.where(
+                        row_valid,
+                        safe_slot_ids.astype(jnp.int32),
+                        jnp.full_like(safe_slot_ids, -1),
+                    ),
+                    query_start_loc=query_start_loc,
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=num_query_tokens,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                )
+                attention_metadata = self.backend.build_attention_metadata(
+                    positions=step_batch.positions,
+                    block_tables=step_batch.block_tables,
+                    seq_lens=step_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=False,
+                    query_start_loc=step_batch.query_start_loc,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=step_batch.num_decode_tokens,
+                )
+                kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=step_batch.block_tables,
+                    kv_lens=step_batch.seq_lens,
+                    slot_mapping=attention_metadata.slot_mapping,
+                )
+                hidden, updated_kv_state, updated_hybrid_state = model_forward_step(
+                    step_batch.tokens,
+                    params,
+                    self.config,
+                    positions=step_batch.positions,
+                    kv_cache_state=kv_state,
+                    attention_metadata=attention_metadata,
+                    hybrid_state=HybridLayerState(conv_state, recurrent_state),
+                    is_prefill=False,
+                    return_hidden=True,
+                    return_hidden_with_logits=False,
+                    last_logits_only=False,
+                    backend=self.backend,
+                    hybrid_state_layerwise=True,
+                )
+                target_token_ids, _, _ = lm_head_token_ids_and_topk(
+                    hidden[:, :1, :],
+                    params,
+                    self.config,
+                    hidden_is_normed=False,
+                    is_prefill=False,
+                    top_k=0,
+                )
+                target_token_ids = target_token_ids[:, 0].astype(jnp.int32)
+                mtp_hidden = (
+                    rms_norm(hidden[:, :1, :], params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                    if mtp_hidden_final_normed
+                    else hidden[:, :1, :]
+                )
+                mtp_positions = (
+                    seq_lens.astype(jnp.int32)
+                    + jnp.asarray(int(getattr(self.config, "mtp_position_offset", 0)), dtype=jnp.int32)
+                )[:, None]
+                current_hidden = mtp_hidden
+                current_token_ids = target_token_ids[:, None]
+                draft_columns = []
+                for _ in range(draft_len):
+                    current_token_ids, current_hidden = mtp_forward_token_ids(
+                        hidden_state=current_hidden,
+                        next_token_ids=current_token_ids,
+                        embed_tokens=params.embed_tokens,
+                        params=params.mtp_params,
+                        config=self.config,
+                        positions=mtp_positions,
+                    )
+                    draft_columns.append(current_token_ids[:, 0].astype(jnp.int32))
+                    mtp_positions = mtp_positions + jnp.asarray(1, dtype=jnp.int32)
+                draft_token_ids = draft_columns[-1]
+                token_rows = jnp.stack([target_token_ids, *draft_columns], axis=1)
+                token_rows = jnp.where(row_valid[:, None], token_rows, jnp.zeros_like(token_rows))
+
+                scatter_slot_ids = jnp.where(
+                    row_valid,
+                    slot_ids,
+                    jnp.full_like(slot_ids, conv_state_table.shape[0]),
+                )
+                updated_conv = updated_hybrid_state.conv_state.astype(conv_state_table.dtype)
+                updated_recurrent = updated_hybrid_state.recurrent_state.astype(
+                    recurrent_state_table.dtype
+                )
+                updated_conv_table = conv_state_table.at[scatter_slot_ids].set(
+                    updated_conv,
+                    mode="drop",
+                )
+                updated_recurrent_table = recurrent_state_table.at[scatter_slot_ids].set(
+                    updated_recurrent,
+                    mode="drop",
+                )
+                updated_last_tokens = last_tokens_table.at[scatter_slot_ids].set(
+                    draft_token_ids,
+                    mode="drop",
+                )
+                return (
+                    token_rows,
+                    updated_kv_state.k_cache,
+                    updated_kv_state.v_cache,
+                    updated_conv_table,
+                    updated_recurrent_table,
+                    updated_last_tokens,
+                )
+
+            self._jit_cache[key] = jax.jit(
+                compiled,
+                donate_argnums=(4, 5, 6, 7, 9),
+            )
+
+        token_rows, k_cache, v_cache, conv_state, recurrent_state, last_tokens_table = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self._params_leaves,
+                batch.query_start_loc,
+                batch.block_tables,
+                batch.seq_lens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state_table.conv_state,
+                hybrid_state_table.recurrent_state,
+                hybrid_slot_ids,
+                resident_last_tokens,
+            ),
+            "forward_step_token_ids_mtp_draft_resident_table_jit:decode",
+        )
+        return ExecutorOutput(
+            activations=token_rows,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            attention_metadata=None,
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+            resident_last_tokens=last_tokens_table,
+        )
+
+    def forward_step_token_ids_mtp_draft_chain_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state: HybridLayerState,
+        mtp_hidden_final_normed: bool,
+        draft_len: int,
+    ) -> ExecutorOutput:
+        """Decode one target token and seed a greedy MTP draft chain in one JIT."""
+        if batch.is_prefill:
+            raise ValueError("forward_step_token_ids_mtp_draft_chain_jit is decode-only")
+        if hybrid_state.conv_state is None or hybrid_state.recurrent_state is None:
+            raise ValueError("forward_step_token_ids_mtp_draft_chain_jit requires initialized hybrid_state")
+        draft_len = int(draft_len)
+        if draft_len < 1:
+            raise ValueError("draft_len must be >= 1")
+        self._log_step(
+            "forward_step_token_ids_mtp_draft_chain_jit",
+            batch,
+            return_hidden=True,
+            last_logits_only=False,
+        )
+        self._validate_batch_contract(batch)
+
+        key = (
+            "token-ids-mtp-draft-chain",
+            draft_len,
+            tuple(batch.tokens.shape),
+            tuple(batch.positions.shape),
+            tuple(batch.block_tables.shape),
+            tuple(hybrid_state.conv_state.shape),
+            tuple(hybrid_state.recurrent_state.shape),
+            bool(mtp_hidden_final_normed),
+        )
+        if key not in self._jit_cache:
+
+            def compiled(
+                params_leaves,
+                tokens,
+                positions,
+                seq_ids,
+                query_start_loc,
+                block_tables,
+                seq_lens,
+                k_cache,
+                v_cache,
+                conv_state,
+                recurrent_state,
+            ):
+                del positions
+                params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
+                query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
+                step_batch = ScheduledBatch(
+                    tokens=tokens,
+                    positions=step_positions,
+                    seq_ids=seq_ids,
+                    query_start_loc=query_start_loc,
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=query_start_loc[-1].astype(jnp.int32),
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                )
+                attention_metadata = self.backend.build_attention_metadata(
+                    positions=step_batch.positions,
+                    block_tables=step_batch.block_tables,
+                    seq_lens=step_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=False,
+                    query_start_loc=step_batch.query_start_loc,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=step_batch.num_decode_tokens,
+                )
+                kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=step_batch.block_tables,
+                    kv_lens=step_batch.seq_lens,
+                    slot_mapping=attention_metadata.slot_mapping,
+                )
+                hidden, updated_kv_state, updated_hybrid_state = model_forward_step(
+                    step_batch.tokens,
+                    params,
+                    self.config,
+                    positions=step_batch.positions,
+                    kv_cache_state=kv_state,
+                    attention_metadata=attention_metadata,
+                    hybrid_state=HybridLayerState(conv_state, recurrent_state),
+                    is_prefill=False,
+                    return_hidden=True,
+                    return_hidden_with_logits=False,
+                    last_logits_only=False,
+                    backend=self.backend,
+                )
+                target_token_ids, _, _ = lm_head_token_ids_and_topk(
+                    hidden[:, :1, :],
+                    params,
+                    self.config,
+                    hidden_is_normed=False,
+                    is_prefill=False,
+                    top_k=0,
+                )
+                target_token_ids = target_token_ids[:, 0].astype(jnp.int32)
+                current_hidden = (
+                    rms_norm(hidden[:, :1, :], params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                    if mtp_hidden_final_normed
+                    else hidden[:, :1, :]
+                )
+                current_token = target_token_ids[:, None]
+                current_position = (
+                    seq_lens.astype(jnp.int32)
+                    + jnp.asarray(int(getattr(self.config, "mtp_position_offset", 0)), dtype=jnp.int32)
+                )[:, None]
+                draft_tokens = []
+                for _ in range(draft_len):
+                    mtp_token_ids, current_hidden = mtp_forward_token_ids(
+                        hidden_state=current_hidden,
+                        next_token_ids=current_token,
+                        embed_tokens=params.embed_tokens,
+                        params=params.mtp_params,
+                        config=self.config,
+                        positions=current_position,
+                    )
+                    current_token = mtp_token_ids[:, 0].astype(jnp.int32)[:, None]
+                    draft_tokens.append(current_token[:, 0])
+                    current_position = current_position + 1
+                token_rows = jnp.concatenate(
+                    [target_token_ids[:, None], jnp.stack(draft_tokens, axis=1)],
+                    axis=1,
+                ).astype(jnp.int32)
+                active = (query_lens > 0) & (seq_ids >= 0)
+                token_rows = jnp.where(active[:, None], token_rows, jnp.zeros_like(token_rows))
+                return (
+                    token_rows,
+                    updated_kv_state.k_cache,
+                    updated_kv_state.v_cache,
+                    updated_hybrid_state.conv_state,
+                    updated_hybrid_state.recurrent_state,
+                )
+
+            self._jit_cache[key] = jax.jit(compiled, donate_argnums=(7, 8))
+
+        token_rows, k_cache, v_cache, conv_state, recurrent_state = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self._params_leaves,
+                batch.tokens,
+                batch.positions,
+                batch.seq_ids,
+                batch.query_start_loc,
+                batch.block_tables,
+                batch.seq_lens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state.conv_state,
+                hybrid_state.recurrent_state,
+            ),
+            "forward_step_token_ids_mtp_draft_chain_jit:decode",
+        )
+        return ExecutorOutput(
+            activations=token_rows,
             cache_storage=KVCacheStorage(k_cache, v_cache),
             attention_metadata=None,
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
@@ -3018,6 +3820,309 @@ class ModelExecutor:
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
         )
 
+    def mtp1_greedy_burst_table_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state_table: HybridLayerState,
+        hybrid_slot_ids: jnp.ndarray,
+        draft_token: jnp.ndarray,
+        mtp_hidden_final_normed: bool,
+    ) -> MTP1GreedyOutput:
+        """K=1 verifier that reuses the optimized greedy burst table graph.
+
+        For greedy decoding, an accepted draft is exactly the target model's
+        first emitted token. Running the normal two-step greedy burst therefore
+        gives the same accepted-path state and bonus token without feeding the
+        dynamic draft token into the second target-model step. Rejected outputs
+        are only safe to discard; callers must not commit this path unless all
+        active rows accept.
+        """
+        if batch.is_prefill:
+            raise ValueError("mtp1_greedy_burst_table_jit is decode-only")
+        if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
+            raise ValueError("mtp1_greedy_burst_table_jit requires initialized hybrid state tables")
+        self._log_step("mtp1_greedy_burst_table_jit", batch, return_hidden=True, last_logits_only=False)
+        self._validate_batch_contract(batch)
+
+        key = (
+            "mtp1-greedy-burst-table",
+            tuple(batch.tokens.shape),
+            tuple(batch.positions.shape),
+            tuple(batch.block_tables.shape),
+            tuple(hybrid_state_table.conv_state.shape),
+            tuple(hybrid_state_table.recurrent_state.shape),
+            bool(mtp_hidden_final_normed),
+            os.environ.get("NANO_VLLM_JAX_MTP_BURST_ASSUME_ALL_ACCEPT", "0"),
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
+            ),
+        )
+        if key not in self._jit_cache:
+            assume_all_accept = os.environ.get(
+                "NANO_VLLM_JAX_MTP_BURST_ASSUME_ALL_ACCEPT", "0"
+            ) in {"1", "true", "yes", "on", "True"}
+            compute_next_draft = os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
+            ) in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+
+            def compiled(
+                params_leaves,
+                tokens,
+                positions,
+                query_start_loc,
+                block_tables,
+                seq_lens,
+                k_cache,
+                v_cache,
+                conv_state_table,
+                recurrent_state_table,
+                slot_ids,
+                draft_token_arg,
+            ):
+                params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
+                query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                row_valid = (slot_ids >= 0) & (query_lens > 0) & (draft_token_arg >= 0)
+                safe_slot_ids = jnp.maximum(slot_ids, 0)
+                conv_state = conv_state_table[safe_slot_ids]
+                recurrent_state = recurrent_state_table[safe_slot_ids]
+                conv_state = jnp.where(
+                    row_valid.reshape((row_valid.shape[0],) + (1,) * (conv_state.ndim - 1)),
+                    conv_state,
+                    jnp.zeros_like(conv_state),
+                )
+                recurrent_state = jnp.where(
+                    row_valid.reshape((row_valid.shape[0],) + (1,) * (recurrent_state.ndim - 1)),
+                    recurrent_state,
+                    jnp.zeros_like(recurrent_state),
+                )
+
+                active = row_valid
+                num_query_tokens = query_start_loc[-1].astype(jnp.int32)
+                initial_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
+
+                def build_step_outputs(include_hidden: bool):
+                    def step(carry, _):
+                        (
+                            step_tokens,
+                            step_positions,
+                            step_seq_lens,
+                            step_k_cache,
+                            step_v_cache,
+                            step_conv_state,
+                            step_recurrent_state,
+                        ) = carry
+                        step_batch = ScheduledBatch(
+                            tokens=step_tokens,
+                            positions=step_positions,
+                            seq_ids=jnp.where(
+                                active,
+                                safe_slot_ids.astype(jnp.int32),
+                                jnp.full_like(safe_slot_ids, -1),
+                            ),
+                            query_start_loc=query_start_loc,
+                            is_prefill=False,
+                            num_prefill_tokens=0,
+                            num_decode_tokens=num_query_tokens,
+                            block_tables=block_tables,
+                            seq_lens=step_seq_lens,
+                        )
+                        attention_metadata = self.backend.build_attention_metadata(
+                            positions=step_batch.positions,
+                            block_tables=step_batch.block_tables,
+                            seq_lens=step_batch.seq_lens,
+                            block_size=self.config.block_size,
+                            is_prefill=False,
+                            query_start_loc=step_batch.query_start_loc,
+                            num_prefill_tokens=0,
+                            num_decode_tokens=step_batch.num_decode_tokens,
+                        )
+                        kv_state = KVCacheState(
+                            k_cache=step_k_cache,
+                            v_cache=step_v_cache,
+                            block_table=step_batch.block_tables,
+                            kv_lens=step_batch.seq_lens,
+                            slot_mapping=attention_metadata.slot_mapping,
+                        )
+                        hidden, updated_kv_state, updated_hybrid_state = model_forward_step(
+                            step_batch.tokens,
+                            params,
+                            self.config,
+                            positions=step_batch.positions,
+                            kv_cache_state=kv_state,
+                            attention_metadata=attention_metadata,
+                            hybrid_state=HybridLayerState(step_conv_state, step_recurrent_state),
+                            is_prefill=False,
+                            return_hidden=True,
+                            return_hidden_with_logits=False,
+                            last_logits_only=False,
+                            backend=self.backend,
+                            hybrid_state_layerwise=True,
+                        )
+                        token_ids, _, _ = lm_head_token_ids_and_topk(
+                            hidden[:, :1, :],
+                            params,
+                            self.config,
+                            hidden_is_normed=False,
+                            is_prefill=False,
+                            top_k=0,
+                        )
+                        token_ids = token_ids[:, 0].astype(jnp.int32)
+                        next_tokens = token_ids[:, None]
+                        next_positions = step_positions + active[:, None].astype(step_positions.dtype)
+                        next_seq_lens = jnp.where(active, step_seq_lens + 1, step_seq_lens)
+                        next_carry = (
+                            next_tokens,
+                            next_positions,
+                            next_seq_lens,
+                            updated_kv_state.k_cache.astype(step_k_cache.dtype),
+                            updated_kv_state.v_cache.astype(step_v_cache.dtype),
+                            updated_hybrid_state.conv_state.astype(step_conv_state.dtype),
+                            updated_hybrid_state.recurrent_state.astype(step_recurrent_state.dtype),
+                        )
+                        if include_hidden:
+                            return next_carry, (token_ids, hidden)
+                        return next_carry, token_ids
+
+                    initial = (
+                        tokens,
+                        initial_positions,
+                        seq_lens,
+                        k_cache,
+                        v_cache,
+                        conv_state,
+                        recurrent_state,
+                    )
+                    return jax.lax.scan(
+                        step,
+                        initial,
+                        jnp.arange(2, dtype=jnp.int32),
+                    )
+
+                if compute_next_draft:
+                    final, scan_outputs = build_step_outputs(include_hidden=True)
+                    token_ids_by_step, hidden_by_step = scan_outputs
+                else:
+                    final, token_ids_by_step = build_step_outputs(include_hidden=False)
+                    hidden_by_step = None
+                (
+                    _tokens,
+                    _positions,
+                    _seq_lens,
+                    final_k_cache,
+                    final_v_cache,
+                    final_conv_state,
+                    final_recurrent_state,
+                ) = final
+                target_token = token_ids_by_step[0].astype(jnp.int32)
+                bonus_token = token_ids_by_step[1].astype(jnp.int32)
+                accepted = (target_token == draft_token_arg) & row_valid
+                if compute_next_draft:
+                    hidden1 = hidden_by_step[1]
+                    mtp_hidden = (
+                        rms_norm(hidden1, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                        if mtp_hidden_final_normed
+                        else hidden1
+                    )
+                    mtp_positions = initial_positions[:, 0] + jnp.asarray(2, dtype=positions.dtype)
+                    mtp_token_ids, _ = mtp_forward_token_ids(
+                        hidden_state=mtp_hidden,
+                        next_token_ids=bonus_token[:, None],
+                        embed_tokens=params.embed_tokens,
+                        params=params.mtp_params,
+                        config=self.config,
+                        positions=mtp_positions[:, None],
+                    )
+                    next_draft_token = mtp_token_ids[:, 0].astype(jnp.int32)
+                else:
+                    next_draft_token = jnp.full_like(target_token, -1)
+                scatter_slot_ids = jnp.where(
+                    row_valid,
+                    slot_ids,
+                    jnp.full_like(slot_ids, conv_state_table.shape[0]),
+                )
+                updated_conv_table = conv_state_table.at[scatter_slot_ids].set(
+                    final_conv_state,
+                    mode="drop",
+                )
+                updated_recurrent_table = recurrent_state_table.at[scatter_slot_ids].set(
+                    final_recurrent_state,
+                    mode="drop",
+                )
+                return (
+                    target_token,
+                    bonus_token,
+                    next_draft_token,
+                    accepted,
+                    jnp.stack(
+                        [
+                            target_token,
+                            bonus_token,
+                            next_draft_token,
+                            accepted.astype(jnp.int32),
+                        ],
+                        axis=1,
+                    ),
+                    final_k_cache,
+                    final_v_cache,
+                    updated_conv_table,
+                    updated_recurrent_table,
+                    seq_lens + row_valid.astype(jnp.int32),
+                )
+
+            donate_argnums = (6, 7, 8, 9) if assume_all_accept else ()
+            self._jit_cache[key] = jax.jit(compiled, donate_argnums=donate_argnums)
+
+        (
+            target_token,
+            bonus_token,
+            next_draft_token,
+            accepted,
+            host_payload,
+            k_cache,
+            v_cache,
+            conv_state,
+            recurrent_state,
+            committed_seq_lens,
+        ) = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self._params_leaves,
+                batch.tokens,
+                batch.positions,
+                batch.query_start_loc,
+                batch.block_tables,
+                batch.seq_lens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state_table.conv_state,
+                hybrid_state_table.recurrent_state,
+                hybrid_slot_ids,
+                jnp.asarray(draft_token, dtype=jnp.int32),
+            ),
+            "mtp1_greedy_burst_table_jit",
+        )
+        return MTP1GreedyOutput(
+            target_token=target_token,
+            bonus_token=bonus_token,
+            next_draft_token=next_draft_token,
+            accepted=accepted,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+            committed_seq_lens=committed_seq_lens,
+            host_payload=host_payload,
+        )
+
     def mtp1_greedy_step_jit(
         self,
         batch: ScheduledBatch,
@@ -3121,7 +4226,7 @@ class ModelExecutor:
                     jnp.asarray(next_mtp_position_arg, dtype=jnp.int32),
                     (batch.tokens.shape[0],),
                 )
-                mtp_logits, _ = mtp_forward(
+                mtp_token_ids, _ = mtp_forward_token_ids(
                     hidden_state=mtp_hidden,
                     next_token_ids=bonus_token[:, None],
                     embed_tokens=params.embed_tokens,
@@ -3129,7 +4234,7 @@ class ModelExecutor:
                     config=self.config,
                     positions=next_mtp_positions[:, None],
                 )
-                next_draft_token = jnp.argmax(mtp_logits[:, 0], axis=-1).astype(jnp.int32)
+                next_draft_token = mtp_token_ids[:, 0].astype(jnp.int32)
                 return (
                     target_token,
                     bonus_token,
@@ -3226,6 +4331,8 @@ class ModelExecutor:
                 str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
             ),
             os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "1"),
+            os.environ.get("NANO_VLLM_JAX_MTP_ASSUME_ALL_ACCEPT", "0"),
+            os.environ.get("NANO_VLLM_JAX_MTP_BURST_ASSUME_ALL_ACCEPT", "0"),
             os.environ.get(
                 "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
                 "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
@@ -3240,6 +4347,19 @@ class ModelExecutor:
                 str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
             )
             one_pass_decode_mode = os.environ.get("NANO_VLLM_JAX_MTP_ONE_PASS_DECODE_MODE", "1") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+            assume_all_accept = os.environ.get("NANO_VLLM_JAX_MTP_ASSUME_ALL_ACCEPT", "0") in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            } or os.environ.get("NANO_VLLM_JAX_MTP_BURST_ASSUME_ALL_ACCEPT", "0") in {
                 "1",
                 "true",
                 "yes",
@@ -3285,6 +4405,11 @@ class ModelExecutor:
                         jnp.cumsum(verify_query_lens),
                     ]
                 )
+                packed_prefill_token_row_ids = (
+                    jnp.zeros_like(verify_positions, dtype=jnp.int32)
+                    if (not one_pass_decode_mode and tokens.shape[0] == 1)
+                    else None
+                )
                 verify_batch = ScheduledBatch(
                     tokens=verify_tokens,
                     positions=verify_positions,
@@ -3295,6 +4420,8 @@ class ModelExecutor:
                     num_decode_tokens=jnp.sum(verify_query_lens) if one_pass_decode_mode else 0,
                     block_tables=block_tables,
                     seq_lens=seq_lens + row_has_draft.astype(jnp.int32),
+                    packed_prefill=packed_prefill_token_row_ids is not None,
+                    token_row_ids=packed_prefill_token_row_ids,
                 )
                 verify_metadata = self.backend.build_attention_metadata(
                     positions=verify_batch.positions,
@@ -3305,6 +4432,12 @@ class ModelExecutor:
                     query_start_loc=verify_batch.query_start_loc,
                     num_prefill_tokens=verify_batch.num_prefill_tokens,
                     num_decode_tokens=verify_batch.num_decode_tokens,
+                    token_row_ids=(
+                        verify_batch.token_row_ids
+                        if verify_batch.packed_prefill
+                        else None
+                    ),
+                    max_query_len=2 if verify_batch.packed_prefill else None,
                 )
                 verify_kv_state = KVCacheState(
                     k_cache=k_cache,
@@ -3313,7 +4446,7 @@ class ModelExecutor:
                     kv_lens=verify_batch.seq_lens,
                     slot_mapping=verify_metadata.slot_mapping,
                 )
-                hidden, updated_kv_state, updated_hybrid_state, first_prefix_hybrid_state = model_forward_step(
+                forward_result = model_forward_step(
                     verify_batch.tokens,
                     params,
                     self.config,
@@ -3323,9 +4456,19 @@ class ModelExecutor:
                     hybrid_state=HybridLayerState(conv_state, recurrent_state),
                     is_prefill=not one_pass_decode_mode,
                     return_hidden=True,
-                    return_first_prefix_hybrid=True,
+                    return_first_prefix_hybrid=not assume_all_accept,
                     backend=self.backend,
                 )
+                if assume_all_accept:
+                    hidden, updated_kv_state, updated_hybrid_state = forward_result
+                    first_prefix_hybrid_state = updated_hybrid_state
+                else:
+                    (
+                        hidden,
+                        updated_kv_state,
+                        updated_hybrid_state,
+                        first_prefix_hybrid_state,
+                    ) = forward_result
 
                 hidden_norm = rms_norm(hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                 token_ids, bonus_topk_values, _ = lm_head_token_ids_and_topk(
@@ -3369,7 +4512,7 @@ class ModelExecutor:
                     pos_next_after_reject,
                 )
                 def run_next_mtp(_):
-                    next_mtp_logits, _ = mtp_forward(
+                    next_mtp_token_ids, _ = mtp_forward_token_ids(
                         hidden_state=selected_mtp_hidden,
                         next_token_ids=selected_mtp_token[:, None],
                         embed_tokens=params.embed_tokens,
@@ -3377,7 +4520,7 @@ class ModelExecutor:
                         config=self.config,
                         positions=selected_mtp_position[:, None],
                     )
-                    return jnp.argmax(next_mtp_logits[:, 0], axis=-1).astype(jnp.int32)
+                    return next_mtp_token_ids[:, 0].astype(jnp.int32)
 
                 def skip_next_mtp(_):
                     return jnp.full_like(target_token, -1)
@@ -3392,14 +4535,17 @@ class ModelExecutor:
                 else:
                     next_draft_token = skip_next_mtp(None)
 
-                hybrid_after_current = HybridLayerState(
-                    conv_state=first_prefix_hybrid_state.conv_state
-                    if first_prefix_hybrid_state.conv_state is not None
-                    else None,
-                    recurrent_state=first_prefix_hybrid_state.recurrent_state
-                    if first_prefix_hybrid_state.recurrent_state is not None
-                    else None,
-                )
+                if assume_all_accept:
+                    hybrid_after_current = updated_hybrid_state
+                else:
+                    hybrid_after_current = HybridLayerState(
+                        conv_state=first_prefix_hybrid_state.conv_state
+                        if first_prefix_hybrid_state.conv_state is not None
+                        else None,
+                        recurrent_state=first_prefix_hybrid_state.recurrent_state
+                        if first_prefix_hybrid_state.recurrent_state is not None
+                        else None,
+                    )
                 hybrid_after_draft = HybridLayerState(
                     conv_state=updated_hybrid_state.conv_state,
                     recurrent_state=updated_hybrid_state.recurrent_state,
@@ -4210,7 +5356,7 @@ class ModelExecutor:
                     kv_lens=verify_batch.seq_lens,
                     slot_mapping=verify_metadata.slot_mapping,
                 )
-                (hidden, verify_logits), updated_kv_state, updated_hybrid_state = model_forward_step(
+                hidden, updated_kv_state, updated_hybrid_state = model_forward_step(
                     verify_batch.tokens,
                     params,
                     self.config,
@@ -4220,19 +5366,25 @@ class ModelExecutor:
                     hybrid_state=HybridLayerState(conv_state, recurrent_state),
                     is_prefill=False,
                     return_hidden=True,
-                    return_hidden_with_logits=True,
                     backend=self.backend,
                 )
 
                 hidden_norm = rms_norm(hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
-                token_ids = jnp.argmax(verify_logits[:, :2], axis=-1).astype(jnp.int32)
+                token_ids, bonus_topk_values, _ = lm_head_token_ids_and_topk(
+                    hidden_norm,
+                    params,
+                    self.config,
+                    hidden_is_normed=True,
+                    is_prefill=False,
+                    top_k=2 if bonus_margin_threshold > 0 else 0,
+                )
                 target_token = token_ids[:, 0]
                 bonus_token = token_ids[:, 1]
                 accepted = (target_token == draft_token_arg) & row_has_draft
                 if batch_accept_policy == "all_or_none":
                     accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
                 if bonus_margin_threshold > 0:
-                    bonus_top2, _ = jax.lax.top_k(verify_logits[:, 1].astype(jnp.float32), 2)
+                    bonus_top2 = bonus_topk_values[:, 1]
                     bonus_margin = bonus_top2[:, 0] - bonus_top2[:, 1]
                     accepted = accepted & (bonus_margin >= bonus_margin_threshold)
                     if batch_accept_policy == "all_or_none":
@@ -4253,7 +5405,7 @@ class ModelExecutor:
                     pos_next_after_reject,
                 )
                 def run_next_mtp(_):
-                    mtp_logits, _ = mtp_forward(
+                    mtp_token_ids, _ = mtp_forward_token_ids(
                         hidden_state=selected_mtp_hidden,
                         next_token_ids=selected_mtp_token[:, None],
                         embed_tokens=params.embed_tokens,
@@ -4261,7 +5413,7 @@ class ModelExecutor:
                         config=self.config,
                         positions=selected_mtp_position[:, None],
                     )
-                    return jnp.argmax(mtp_logits[:, 0], axis=-1).astype(jnp.int32)
+                    return mtp_token_ids[:, 0].astype(jnp.int32)
 
                 def skip_next_mtp(_):
                     return jnp.full_like(target_token, -1)
@@ -4339,6 +5491,555 @@ class ModelExecutor:
                 jnp.asarray(next_mtp_position, dtype=jnp.int32),
             ),
             "mtp1_two_decode_greedy_fast_step_jit",
+        )
+        return MTP1GreedyOutput(
+            target_token=target_token,
+            bonus_token=bonus_token,
+            next_draft_token=next_draft_token,
+            accepted=accepted,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+            committed_seq_lens=committed_seq_lens,
+        )
+
+    def mtp1_two_decode_greedy_fast_table_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state_table: HybridLayerState,
+        hybrid_slot_ids: jnp.ndarray,
+        draft_token: jnp.ndarray,
+        next_mtp_position: jnp.ndarray,
+        mtp_hidden_final_normed: bool,
+    ) -> MTP1GreedyOutput:
+        """Fast K=1 greedy verifier that gathers hybrid state inside JIT.
+
+        This keeps the hot speculative path aligned with the normal table-based
+        decode route. The runner may commit this output only when every row
+        accepts; otherwise the tentative cache and compact hybrid state are
+        discarded.
+        """
+        del next_mtp_position
+        if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
+            raise ValueError("mtp1_two_decode_greedy_fast_table_jit requires initialized hybrid_state_table")
+        if batch.is_prefill or batch.tokens.shape[1] != 1:
+            raise ValueError("mtp1_two_decode_greedy_fast_table_jit expects a decode batch")
+        self._log_step("mtp1_two_decode_greedy_fast_table_jit", batch, return_hidden=True, last_logits_only=False)
+        self._validate_batch_contract(batch)
+
+        key = (
+            "mtp1-two-token-fast-table-greedy",
+            tuple(batch.tokens.shape),
+            tuple(batch.positions.shape),
+            tuple(batch.block_tables.shape),
+            tuple(hybrid_state_table.conv_state.shape),
+            tuple(hybrid_state_table.recurrent_state.shape),
+            bool(mtp_hidden_final_normed),
+            float(os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", getattr(self.config, "mtp_bonus_margin", 0.0))),
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+                str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+            ),
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
+            ),
+        )
+        if key not in self._jit_cache:
+            bonus_margin_threshold = float(
+                os.environ.get("NANO_VLLM_JAX_MTP_BONUS_MARGIN", getattr(self.config, "mtp_bonus_margin", 0.0))
+            )
+            batch_accept_policy = os.environ.get(
+                "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+                str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+            )
+            compute_next_draft = os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
+            ) in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+
+            def compiled(
+                params,
+                tokens,
+                positions,
+                seq_ids,
+                query_start_loc,
+                num_decode_tokens,
+                block_tables,
+                seq_lens,
+                k_cache,
+                v_cache,
+                conv_state_table,
+                recurrent_state_table,
+                slot_ids,
+                draft_token_arg,
+            ):
+                row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                row_valid = (row_query_lens > 0) & (seq_ids >= 0) & (slot_ids >= 0)
+                safe_slot_ids = jnp.maximum(slot_ids, 0)
+                conv_state = conv_state_table[safe_slot_ids]
+                recurrent_state = recurrent_state_table[safe_slot_ids]
+                conv_state = jnp.where(
+                    row_valid.reshape((row_valid.shape[0],) + (1,) * (conv_state.ndim - 1)),
+                    conv_state,
+                    jnp.zeros_like(conv_state),
+                )
+                recurrent_state = jnp.where(
+                    row_valid.reshape((row_valid.shape[0],) + (1,) * (recurrent_state.ndim - 1)),
+                    recurrent_state,
+                    jnp.zeros_like(recurrent_state),
+                )
+
+                verify_tokens = jnp.concatenate([tokens, draft_token_arg[:, None]], axis=1)
+                verify_positions = jnp.concatenate([positions, positions + 1], axis=1)
+                row_has_draft = row_valid & (draft_token_arg >= 0)
+                verify_query_lens = row_query_lens + row_has_draft.astype(jnp.int32)
+                verify_query_start_loc = jnp.concatenate(
+                    [
+                        jnp.zeros((1,), dtype=jnp.int32),
+                        jnp.cumsum(verify_query_lens),
+                    ]
+                )
+                verify_batch = ScheduledBatch(
+                    tokens=verify_tokens,
+                    positions=verify_positions,
+                    seq_ids=seq_ids,
+                    query_start_loc=verify_query_start_loc,
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=jnp.sum(verify_query_lens),
+                    block_tables=block_tables,
+                    seq_lens=seq_lens + row_has_draft.astype(jnp.int32),
+                )
+                verify_metadata = self.backend.build_attention_metadata(
+                    positions=verify_batch.positions,
+                    block_tables=verify_batch.block_tables,
+                    seq_lens=verify_batch.seq_lens,
+                    block_size=self.config.block_size,
+                    is_prefill=False,
+                    query_start_loc=verify_batch.query_start_loc,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=verify_batch.num_decode_tokens,
+                )
+                verify_kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=verify_batch.block_tables,
+                    kv_lens=verify_batch.seq_lens,
+                    slot_mapping=verify_metadata.slot_mapping,
+                )
+                hidden, updated_kv_state, updated_hybrid_state = model_forward_step(
+                    verify_batch.tokens,
+                    params,
+                    self.config,
+                    positions=verify_batch.positions,
+                    kv_cache_state=verify_kv_state,
+                    attention_metadata=verify_metadata,
+                    hybrid_state=HybridLayerState(conv_state, recurrent_state),
+                    is_prefill=False,
+                    return_hidden=True,
+                    backend=self.backend,
+                    hybrid_state_layerwise=True,
+                )
+
+                hidden_norm = rms_norm(hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                token_ids, bonus_topk_values, _ = lm_head_token_ids_and_topk(
+                    hidden_norm,
+                    params,
+                    self.config,
+                    hidden_is_normed=True,
+                    is_prefill=False,
+                    top_k=2 if bonus_margin_threshold > 0 else 0,
+                )
+                target_token = token_ids[:, 0]
+                bonus_token = token_ids[:, 1]
+                accepted = (target_token == draft_token_arg) & row_has_draft
+                if batch_accept_policy == "all_or_none":
+                    accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
+                if bonus_margin_threshold > 0:
+                    bonus_top2 = bonus_topk_values[:, 1]
+                    bonus_margin = bonus_top2[:, 0] - bonus_top2[:, 1]
+                    accepted = accepted & (bonus_margin >= bonus_margin_threshold)
+                    if batch_accept_policy == "all_or_none":
+                        accepted = accepted & jnp.all(jnp.where(row_valid, accepted, True))
+
+                pos_current = verify_positions[:, 0]
+                pos_next_after_reject = pos_current + jnp.asarray(1, dtype=pos_current.dtype)
+                pos_next_after_accept = pos_current + jnp.asarray(2, dtype=pos_current.dtype)
+                hidden_for_mtp = hidden_norm if mtp_hidden_final_normed else hidden
+                selected_mtp_hidden = jnp.where(
+                    accepted[:, None, None],
+                    hidden_for_mtp[:, 1:2, :],
+                    hidden_for_mtp[:, 0:1, :],
+                )
+                selected_mtp_token = jnp.where(accepted, bonus_token, target_token)
+                selected_mtp_position = jnp.where(
+                    accepted,
+                    pos_next_after_accept,
+                    pos_next_after_reject,
+                )
+
+                def run_next_mtp(_):
+                    mtp_token_ids, _ = mtp_forward_token_ids(
+                        hidden_state=selected_mtp_hidden,
+                        next_token_ids=selected_mtp_token[:, None],
+                        embed_tokens=params.embed_tokens,
+                        params=params.mtp_params,
+                        config=self.config,
+                        positions=selected_mtp_position[:, None],
+                    )
+                    return mtp_token_ids[:, 0].astype(jnp.int32)
+
+                def skip_next_mtp(_):
+                    return jnp.full_like(target_token, -1)
+
+                next_draft_token = jax.lax.cond(
+                    compute_next_draft & jnp.any(accepted),
+                    run_next_mtp,
+                    skip_next_mtp,
+                    operand=None,
+                )
+                output_accepted = jnp.where(row_valid, accepted, True)
+                return (
+                    target_token,
+                    bonus_token,
+                    next_draft_token,
+                    output_accepted,
+                    updated_kv_state.k_cache,
+                    updated_kv_state.v_cache,
+                    updated_hybrid_state.conv_state,
+                    updated_hybrid_state.recurrent_state,
+                    seq_lens + accepted.astype(jnp.int32),
+                )
+
+            self._jit_cache[key] = jax.jit(compiled)
+
+        (
+            target_token,
+            bonus_token,
+            next_draft_token,
+            accepted,
+            k_cache,
+            v_cache,
+            conv_state,
+            recurrent_state,
+            committed_seq_lens,
+        ) = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self.params,
+                batch.tokens,
+                batch.positions,
+                batch.seq_ids,
+                batch.query_start_loc,
+                jnp.asarray(batch.num_decode_tokens, dtype=jnp.int32),
+                batch.block_tables,
+                batch.seq_lens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state_table.conv_state,
+                hybrid_state_table.recurrent_state,
+                hybrid_slot_ids,
+                jnp.asarray(draft_token, dtype=jnp.int32),
+            ),
+            "mtp1_two_decode_greedy_fast_table_jit",
+        )
+        return MTP1GreedyOutput(
+            target_token=target_token,
+            bonus_token=bonus_token,
+            next_draft_token=next_draft_token,
+            accepted=accepted,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+            committed_seq_lens=committed_seq_lens,
+        )
+
+    def mtp1_burst_verify_table_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state_table: HybridLayerState,
+        hybrid_slot_ids: jnp.ndarray,
+        draft_token: jnp.ndarray,
+        next_mtp_position: jnp.ndarray,
+        mtp_hidden_final_normed: bool,
+    ) -> MTP1GreedyOutput:
+        """K=1 verifier shaped like the greedy burst table path.
+
+        The graph always runs two width-1 target-model decode steps:
+        current-token verification, then draft-token bonus generation.  On
+        rejection the second step's KV slot is left dirty but uncommitted and
+        will be overwritten by the next real decode; recurrent state is
+        selected back to the first-step prefix.
+        """
+        if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
+            raise ValueError("mtp1_burst_verify_table_jit requires initialized hybrid_state_table")
+        if batch.is_prefill or batch.tokens.shape[1] != 1:
+            raise ValueError("mtp1_burst_verify_table_jit expects a decode batch")
+        self._log_step("mtp1_burst_verify_table_jit", batch, return_hidden=True, last_logits_only=False)
+        self._validate_batch_contract(batch)
+
+        key = (
+            "mtp1-burst-verify-table",
+            tuple(batch.tokens.shape),
+            tuple(batch.positions.shape),
+            tuple(batch.block_tables.shape),
+            tuple(hybrid_state_table.conv_state.shape),
+            tuple(hybrid_state_table.recurrent_state.shape),
+            bool(mtp_hidden_final_normed),
+            os.environ.get("NANO_VLLM_JAX_MTP_BURST_ASSUME_ALL_ACCEPT", "0"),
+            os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
+            ),
+        )
+        if key not in self._jit_cache:
+            assume_all_accept = os.environ.get(
+                "NANO_VLLM_JAX_MTP_BURST_ASSUME_ALL_ACCEPT", "0"
+            ) in {"1", "true", "yes", "on", "True"}
+            compute_next_draft = os.environ.get(
+                "NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS",
+                "1" if getattr(self.config, "mtp_seed_after_bonus", False) else "0",
+            ) in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "True",
+            }
+
+            def compiled(
+                params_leaves,
+                tokens,
+                positions,
+                query_start_loc,
+                block_tables,
+                seq_lens,
+                k_cache,
+                v_cache,
+                conv_state_table,
+                recurrent_state_table,
+                slot_ids,
+                draft_token_arg,
+            ):
+                params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
+                query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
+                row_valid = (slot_ids >= 0) & (query_lens > 0) & (draft_token_arg >= 0)
+                safe_slot_ids = jnp.maximum(slot_ids, 0)
+                conv_state = conv_state_table[safe_slot_ids]
+                recurrent_state = recurrent_state_table[safe_slot_ids]
+                conv_state = jnp.where(
+                    row_valid.reshape((row_valid.shape[0],) + (1,) * (conv_state.ndim - 1)),
+                    conv_state,
+                    jnp.zeros_like(conv_state),
+                )
+                recurrent_state = jnp.where(
+                    row_valid.reshape((row_valid.shape[0],) + (1,) * (recurrent_state.ndim - 1)),
+                    recurrent_state,
+                    jnp.zeros_like(recurrent_state),
+                )
+                seq_ids = jnp.where(
+                    row_valid,
+                    safe_slot_ids.astype(jnp.int32),
+                    jnp.full_like(safe_slot_ids, -1),
+                )
+                num_query_tokens = query_start_loc[-1].astype(jnp.int32)
+
+                def build_step_outputs(include_hidden: bool):
+                    def step(carry, step_i):
+                        (
+                            step_tokens,
+                            step_positions,
+                            step_seq_lens,
+                            step_k_cache,
+                            step_v_cache,
+                            step_conv_state,
+                            step_recurrent_state,
+                        ) = carry
+                        step_batch = ScheduledBatch(
+                            tokens=step_tokens,
+                            positions=step_positions,
+                            seq_ids=seq_ids,
+                            query_start_loc=query_start_loc,
+                            is_prefill=False,
+                            num_prefill_tokens=0,
+                            num_decode_tokens=num_query_tokens,
+                            block_tables=block_tables,
+                            seq_lens=step_seq_lens,
+                        )
+                        metadata = self.backend.build_attention_metadata(
+                            positions=step_batch.positions,
+                            block_tables=step_batch.block_tables,
+                            seq_lens=step_batch.seq_lens,
+                            block_size=self.config.block_size,
+                            is_prefill=False,
+                            query_start_loc=step_batch.query_start_loc,
+                            num_prefill_tokens=0,
+                            num_decode_tokens=step_batch.num_decode_tokens,
+                        )
+                        kv_state = KVCacheState(
+                            k_cache=step_k_cache,
+                            v_cache=step_v_cache,
+                            block_table=step_batch.block_tables,
+                            kv_lens=step_batch.seq_lens,
+                            slot_mapping=metadata.slot_mapping,
+                        )
+                        hidden, updated_kv_state, updated_hybrid_state = model_forward_step(
+                            step_batch.tokens,
+                            params,
+                            self.config,
+                            positions=step_batch.positions,
+                            kv_cache_state=kv_state,
+                            attention_metadata=metadata,
+                            hybrid_state=HybridLayerState(step_conv_state, step_recurrent_state),
+                            is_prefill=False,
+                            return_hidden=True,
+                            return_hidden_with_logits=False,
+                            last_logits_only=False,
+                            backend=self.backend,
+                            hybrid_state_layerwise=True,
+                        )
+                        token_ids, _, _ = lm_head_token_ids_and_topk(
+                            hidden[:, :1, :],
+                            params,
+                            self.config,
+                            hidden_is_normed=False,
+                            is_prefill=False,
+                            top_k=0,
+                        )
+                        token_ids = token_ids[:, 0].astype(jnp.int32)
+                        draft_tokens = jnp.where(
+                            row_valid[:, None],
+                            draft_token_arg[:, None],
+                            jnp.zeros_like(tokens),
+                        )
+                        next_tokens = jnp.where(step_i == 0, draft_tokens, token_ids[:, None])
+                        next_positions = step_positions + row_valid[:, None].astype(step_positions.dtype)
+                        next_seq_lens = jnp.where(row_valid, step_seq_lens + 1, step_seq_lens)
+                        next_carry = (
+                            next_tokens,
+                            next_positions,
+                            next_seq_lens,
+                            updated_kv_state.k_cache.astype(step_k_cache.dtype),
+                            updated_kv_state.v_cache.astype(step_v_cache.dtype),
+                            updated_hybrid_state.conv_state.astype(step_conv_state.dtype),
+                            updated_hybrid_state.recurrent_state.astype(step_recurrent_state.dtype),
+                        )
+                        if include_hidden:
+                            return next_carry, (token_ids, hidden)
+                        return next_carry, token_ids
+
+                    initial = (
+                        tokens,
+                        positions,
+                        seq_lens,
+                        k_cache,
+                        v_cache,
+                        conv_state,
+                        recurrent_state,
+                    )
+                    return jax.lax.scan(
+                        step,
+                        initial,
+                        jnp.arange(2, dtype=jnp.int32),
+                    )
+
+                if compute_next_draft:
+                    final, scan_outputs = build_step_outputs(include_hidden=True)
+                    token_ids_by_step, hidden_by_step = scan_outputs
+                else:
+                    final, token_ids_by_step = build_step_outputs(include_hidden=False)
+                    hidden_by_step = None
+
+                (
+                    _tokens,
+                    _positions,
+                    _seq_lens,
+                    final_k_cache,
+                    final_v_cache,
+                    final_conv_state,
+                    final_recurrent_state,
+                ) = final
+                target_token = token_ids_by_step[0].astype(jnp.int32)
+                bonus_token = token_ids_by_step[1].astype(jnp.int32)
+                accepted = (target_token == draft_token_arg) & row_valid
+                committed_seq_lens = seq_lens + accepted.astype(jnp.int32)
+
+                if compute_next_draft:
+                    hidden1 = hidden_by_step[1]
+                    mtp_hidden = (
+                        rms_norm(hidden1, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                        if mtp_hidden_final_normed
+                        else hidden1
+                    )
+                    mtp_positions = positions[:, 0] + jnp.asarray(2, dtype=positions.dtype)
+                    mtp_token_ids, _ = mtp_forward_token_ids(
+                        hidden_state=mtp_hidden,
+                        next_token_ids=bonus_token[:, None],
+                        embed_tokens=params.embed_tokens,
+                        params=params.mtp_params,
+                        config=self.config,
+                        positions=mtp_positions[:, None],
+                    )
+                    next_draft_token = jnp.where(
+                        accepted,
+                        mtp_token_ids[:, 0].astype(jnp.int32),
+                        jnp.full_like(target_token, -1),
+                    )
+                else:
+                    next_draft_token = jnp.full_like(target_token, -1)
+                return (
+                    target_token,
+                    bonus_token,
+                    next_draft_token,
+                    accepted,
+                    final_k_cache,
+                    final_v_cache,
+                    final_conv_state.astype(conv_state.dtype),
+                    final_recurrent_state.astype(recurrent_state.dtype),
+                    committed_seq_lens,
+                )
+
+            donate_argnums = (6, 7) if assume_all_accept else ()
+            self._jit_cache[key] = jax.jit(compiled, donate_argnums=donate_argnums)
+
+        (
+            target_token,
+            bonus_token,
+            next_draft_token,
+            accepted,
+            k_cache,
+            v_cache,
+            conv_state,
+            recurrent_state,
+            committed_seq_lens,
+        ) = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self._params_leaves,
+                batch.tokens,
+                batch.positions,
+                batch.query_start_loc,
+                batch.block_tables,
+                batch.seq_lens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state_table.conv_state,
+                hybrid_state_table.recurrent_state,
+                hybrid_slot_ids,
+                jnp.asarray(draft_token, dtype=jnp.int32),
+            ),
+            "mtp1_burst_verify_table_jit",
         )
         return MTP1GreedyOutput(
             target_token=target_token,
@@ -4612,7 +6313,7 @@ class ModelExecutor:
                     next_mtp_position_arg - 1,
                 )
                 if compute_next_draft:
-                    next_draft_logits, _ = mtp_forward(
+                    next_draft_token_ids, _ = mtp_forward_token_ids(
                         hidden_state=selected_hidden,
                         next_token_ids=selected_next_token[:, None],
                         embed_tokens=params.embed_tokens,
@@ -4620,7 +6321,7 @@ class ModelExecutor:
                         config=self.config,
                         positions=selected_mtp_position[:, None],
                     )
-                    next_draft_token = jnp.argmax(next_draft_logits[:, 0], axis=-1).astype(jnp.int32)
+                    next_draft_token = next_draft_token_ids[:, 0].astype(jnp.int32)
                 else:
                     next_draft_token = jnp.full_like(target_token, -1)
 
@@ -4723,7 +6424,7 @@ class ModelExecutor:
             raise ValueError("mtp2_commit_select_greedy_step_jit expects a decode batch")
         if draft_tokens.ndim != 2 or draft_tokens.shape[0] != batch.tokens.shape[0] or draft_tokens.shape[1] != 2:
             raise ValueError("draft_tokens must have shape [batch, 2]")
-        self._log_step("mtp2_commit_select_greedy_step_jit", batch, return_hidden=True, last_logits_only=True)
+        self._log_step("mtp2_commit_select_greedy_step_jit", batch, return_hidden=True, last_logits_only=False)
         self._validate_batch_contract(batch)
 
         key = (
@@ -4795,7 +6496,7 @@ class ModelExecutor:
                     kv_lens=first_batch.seq_lens,
                     slot_mapping=first_metadata.slot_mapping,
                 )
-                (hidden0, logits0), kv_after_current, hybrid_after_current = model_forward_step(
+                hidden0, kv_after_current, hybrid_after_current = model_forward_step(
                     first_batch.tokens,
                     params,
                     self.config,
@@ -4805,11 +6506,19 @@ class ModelExecutor:
                     hybrid_state=HybridLayerState(conv_state, recurrent_state),
                     is_prefill=False,
                     return_hidden=True,
-                    return_hidden_with_logits=True,
-                    last_logits_only=True,
+                    return_hidden_with_logits=False,
+                    last_logits_only=False,
                     backend=self.backend,
                 )
-                target0 = jnp.argmax(logits0[:, 0], axis=-1).astype(jnp.int32)
+                target0_ids, _, _ = lm_head_token_ids_and_topk(
+                    hidden0[:, :1, :],
+                    params,
+                    self.config,
+                    hidden_is_normed=False,
+                    is_prefill=False,
+                    top_k=0,
+                )
+                target0 = target0_ids[:, 0].astype(jnp.int32)
                 row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
                 row_active = (row_query_lens > 0) & (seq_ids >= 0)
                 accepted0 = (target0 == draft_tokens_arg[:, 0]) & row_active
@@ -4857,7 +6566,7 @@ class ModelExecutor:
                         kv_lens=second_batch.seq_lens,
                         slot_mapping=second_metadata.slot_mapping,
                     )
-                    (next_hidden, next_logits), next_kv, next_hybrid = model_forward_step(
+                    next_hidden, next_kv, next_hybrid = model_forward_step(
                         second_batch.tokens,
                         params,
                         self.config,
@@ -4867,13 +6576,21 @@ class ModelExecutor:
                         hybrid_state=hybrid_after_current,
                         is_prefill=False,
                         return_hidden=True,
-                        return_hidden_with_logits=True,
-                        last_logits_only=True,
+                        return_hidden_with_logits=False,
+                        last_logits_only=False,
                         backend=self.backend,
+                    )
+                    next_target_ids, _, _ = lm_head_token_ids_and_topk(
+                        next_hidden[:, :1, :],
+                        params,
+                        self.config,
+                        hidden_is_normed=False,
+                        is_prefill=False,
+                        top_k=0,
                     )
                     return (
                         next_hidden,
-                        next_logits,
+                        next_target_ids[:, 0].astype(jnp.int32),
                         next_kv.k_cache,
                         next_kv.v_cache,
                         next_hybrid.conv_state,
@@ -4884,7 +6601,7 @@ class ModelExecutor:
                 def skip_second_decode(_):
                     return (
                         jnp.zeros_like(hidden0),
-                        jnp.zeros_like(logits0),
+                        jnp.zeros_like(target0),
                         kv_after_current.k_cache,
                         kv_after_current.v_cache,
                         hybrid_after_current.conv_state,
@@ -4894,7 +6611,7 @@ class ModelExecutor:
 
                 (
                     hidden1,
-                    logits1,
+                    target1,
                     token1_k_cache,
                     token1_v_cache,
                     token1_conv_state,
@@ -4911,7 +6628,6 @@ class ModelExecutor:
                     conv_state=token1_conv_state,
                     recurrent_state=token1_recurrent_state,
                 )
-                target1 = jnp.argmax(logits1[:, 0], axis=-1).astype(jnp.int32)
                 accepted1 = accepted0 & (target1 == draft_tokens_arg[:, 1])
                 if batch_accept_policy == "all_or_none":
                     accepted1 = accepted1 & jnp.all(jnp.where(row_active, accepted1, True))
@@ -4957,7 +6673,7 @@ class ModelExecutor:
                         kv_lens=third_batch.seq_lens,
                         slot_mapping=third_metadata.slot_mapping,
                     )
-                    (next_hidden, next_logits), next_kv, next_hybrid = model_forward_step(
+                    next_hidden, next_kv, next_hybrid = model_forward_step(
                         third_batch.tokens,
                         params,
                         self.config,
@@ -4967,13 +6683,21 @@ class ModelExecutor:
                         hybrid_state=hybrid_after_token1,
                         is_prefill=False,
                         return_hidden=True,
-                        return_hidden_with_logits=True,
-                        last_logits_only=True,
+                        return_hidden_with_logits=False,
+                        last_logits_only=False,
                         backend=self.backend,
+                    )
+                    next_target_ids, _, _ = lm_head_token_ids_and_topk(
+                        next_hidden[:, :1, :],
+                        params,
+                        self.config,
+                        hidden_is_normed=False,
+                        is_prefill=False,
+                        top_k=0,
                     )
                     return (
                         next_hidden,
-                        next_logits,
+                        next_target_ids[:, 0].astype(jnp.int32),
                         next_kv.k_cache,
                         next_kv.v_cache,
                         next_hybrid.conv_state,
@@ -4984,7 +6708,7 @@ class ModelExecutor:
                 def skip_third_decode(_):
                     return (
                         jnp.zeros_like(hidden0),
-                        jnp.zeros_like(logits0),
+                        jnp.zeros_like(target0),
                         kv_after_token1.k_cache,
                         kv_after_token1.v_cache,
                         hybrid_after_token1.conv_state,
@@ -4994,7 +6718,7 @@ class ModelExecutor:
 
                 (
                     hidden2,
-                    logits2,
+                    target2,
                     token2_k_cache,
                     token2_v_cache,
                     token2_conv_state,
@@ -5011,7 +6735,6 @@ class ModelExecutor:
                     conv_state=token2_conv_state,
                     recurrent_state=token2_recurrent_state,
                 )
-                target2 = jnp.argmax(logits2[:, 0], axis=-1).astype(jnp.int32)
 
                 prefix_len = accepted0.astype(jnp.int32) + accepted1.astype(jnp.int32)
                 hidden0_norm = rms_norm(hidden0, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
@@ -5031,7 +6754,7 @@ class ModelExecutor:
                 current_position = selected_mtp_position[:, None]
                 next_drafts = []
                 for _ in range(2):
-                    mtp_logits, current_hidden = mtp_forward(
+                    mtp_token_ids, current_hidden = mtp_forward_token_ids(
                         hidden_state=current_hidden,
                         next_token_ids=current_token,
                         embed_tokens=params.embed_tokens,
@@ -5039,7 +6762,7 @@ class ModelExecutor:
                         config=self.config,
                         positions=current_position,
                     )
-                    current_token = jnp.argmax(mtp_logits[:, 0], axis=-1).astype(jnp.int32)[:, None]
+                    current_token = mtp_token_ids[:, 0].astype(jnp.int32)[:, None]
                     next_drafts.append(current_token[:, 0])
                     current_position = current_position + 1
                 next_draft_tokens = jnp.stack(next_drafts, axis=1)
@@ -5060,6 +6783,15 @@ class ModelExecutor:
                 selected_k_cache = kv_after_token2.k_cache
                 selected_v_cache = kv_after_token2.v_cache
 
+                host_payload = jnp.concatenate(
+                    [
+                        jnp.stack([target0, target1], axis=1).astype(jnp.int32),
+                        target2.astype(jnp.int32)[:, None],
+                        next_draft_tokens.astype(jnp.int32),
+                        jnp.stack([accepted0, accepted1], axis=1).astype(jnp.int32),
+                    ],
+                    axis=1,
+                )
                 return (
                     jnp.stack([target0, target1], axis=1),
                     target2,
@@ -5070,6 +6802,7 @@ class ModelExecutor:
                     selected_conv,
                     selected_recurrent,
                     seq_lens + prefix_len,
+                    host_payload,
                 )
 
             self._jit_cache[key] = jax.jit(compiled, donate_argnums=(8, 9))
@@ -5084,6 +6817,7 @@ class ModelExecutor:
             conv_state,
             recurrent_state,
             committed_seq_lens,
+            host_payload,
         ) = self._profile_jit_call(
             key,
             self._jit_cache[key],
@@ -5113,6 +6847,7 @@ class ModelExecutor:
             cache_storage=KVCacheStorage(k_cache, v_cache),
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
             committed_seq_lens=committed_seq_lens,
+            host_payload=host_payload,
         )
 
     def mtp_k_decode_greedy_step_jit(
@@ -5129,9 +6864,9 @@ class ModelExecutor:
 
         The target model decodes ``[last_token, draft_1, ..., draft_k]`` once.
         Logits from positions ``0..k-1`` verify the draft prefix. Logits from
-        position ``k`` produce the target bonus token. On all-row acceptance,
-        the runner commits the cache/hybrid state after ``draft_k`` and stores
-        a fresh MTP draft chain seeded from ``hidden(draft_k), bonus``.
+        position ``k`` produce the target bonus token. The compiled body
+        selects the committed hybrid state at each row's accepted-prefix length,
+        so mixed accept/reject batches do not need a serial K=1 repair pass.
         """
         if hybrid_state.conv_state is None or hybrid_state.recurrent_state is None:
             raise ValueError("mtp_k_decode_greedy_step_jit requires initialized hybrid_state")
@@ -5144,16 +6879,46 @@ class ModelExecutor:
             raise ValueError("draft_tokens must contain at least one draft token")
         self._log_step("mtp_k_decode_greedy_step_jit", batch, return_hidden=True, last_logits_only=False)
         self._validate_batch_contract(batch)
+        verify_mode = os.environ.get(
+            "NANO_VLLM_JAX_MTP_K_VERIFY_MODE",
+            "decode",
+        ).strip().lower()
+        if verify_mode in {"packed_prefill", "prefill_packed"}:
+            verify_mode = "prefill"
+        if verify_mode not in {"decode", "prefill"}:
+            raise ValueError(
+                "NANO_VLLM_JAX_MTP_K_VERIFY_MODE must be 'decode' or 'prefill'"
+            )
+        batch_accept_policy = os.environ.get(
+            "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
+            str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
+        )
+        carry_bonus_as_draft = os.environ.get(
+            "NANO_VLLM_JAX_MTP_CARRY_BONUS_AS_DRAFT",
+            "0",
+        ) in {"1", "true", "yes", "on", "True"}
 
         key = (
-            "mtp-k-decode-greedy",
+            "mtp-k-decode-greedy-prefix-select",
+            verify_mode,
             draft_len,
             tuple(batch.tokens.shape),
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
+            bool(carry_bonus_as_draft),
+            batch_accept_policy,
         )
         if key not in self._jit_cache:
+
+            def _gather_prefix(value: jnp.ndarray, prefix_len: jnp.ndarray) -> jnp.ndarray:
+                gather_idx = prefix_len.astype(jnp.int32)
+                gather_idx = gather_idx.reshape((gather_idx.shape[0],) + (1,) * (value.ndim - 1))
+                gather_idx = jnp.broadcast_to(
+                    gather_idx,
+                    (value.shape[0], 1) + value.shape[2:],
+                )
+                return jnp.take_along_axis(value, gather_idx, axis=1)[:, 0, ...]
 
             def compiled(
                 params,
@@ -5170,29 +6935,54 @@ class ModelExecutor:
                 draft_tokens_arg,
                 next_mtp_position_arg,
             ):
-                verify_tokens = jnp.concatenate([tokens, draft_tokens_arg], axis=1)
-                verify_positions = positions + jnp.arange(draft_len + 1, dtype=jnp.int32)[None, :]
-                verify_query_start_loc = jnp.arange(tokens.shape[0] + 1, dtype=jnp.int32) * (draft_len + 1)
+                row_count = int(tokens.shape[0])
+                verify_tokens_rows = jnp.concatenate([tokens, draft_tokens_arg], axis=1)
+                verify_positions_rows = (
+                    positions
+                    + jnp.arange(draft_len + 1, dtype=jnp.int32)[None, :]
+                )
+                verify_query_start_loc = (
+                    jnp.arange(row_count + 1, dtype=jnp.int32) * (draft_len + 1)
+                )
+                verify_as_prefill = verify_mode == "prefill"
+                if verify_as_prefill:
+                    verify_tokens = verify_tokens_rows.reshape(1, row_count * (draft_len + 1))
+                    verify_positions = verify_positions_rows.reshape(
+                        1,
+                        row_count * (draft_len + 1),
+                    )
+                    token_row_ids = jnp.broadcast_to(
+                        jnp.arange(row_count, dtype=jnp.int32)[:, None],
+                        (row_count, draft_len + 1),
+                    ).reshape(1, row_count * (draft_len + 1))
+                else:
+                    verify_tokens = verify_tokens_rows
+                    verify_positions = verify_positions_rows
+                    token_row_ids = None
                 verify_batch = ScheduledBatch(
                     tokens=verify_tokens,
                     positions=verify_positions,
                     seq_ids=seq_ids,
                     query_start_loc=verify_query_start_loc,
-                    is_prefill=False,
-                    num_prefill_tokens=0,
-                    num_decode_tokens=num_decode_tokens * (draft_len + 1),
+                    is_prefill=verify_as_prefill,
+                    num_prefill_tokens=num_decode_tokens * (draft_len + 1) if verify_as_prefill else 0,
+                    num_decode_tokens=0 if verify_as_prefill else num_decode_tokens * (draft_len + 1),
                     block_tables=block_tables,
                     seq_lens=seq_lens + draft_len,
+                    packed_prefill=verify_as_prefill,
+                    token_row_ids=token_row_ids,
                 )
                 verify_metadata = self.backend.build_attention_metadata(
                     positions=verify_batch.positions,
                     block_tables=verify_batch.block_tables,
                     seq_lens=verify_batch.seq_lens,
                     block_size=self.config.block_size,
-                    is_prefill=False,
+                    is_prefill=verify_as_prefill,
                     query_start_loc=verify_batch.query_start_loc,
-                    num_prefill_tokens=0,
+                    num_prefill_tokens=verify_batch.num_prefill_tokens,
                     num_decode_tokens=verify_batch.num_decode_tokens,
+                    token_row_ids=token_row_ids,
+                    max_query_len=draft_len + 1 if verify_as_prefill else None,
                 )
                 verify_kv_state = KVCacheState(
                     k_cache=k_cache,
@@ -5201,7 +6991,7 @@ class ModelExecutor:
                     kv_lens=verify_batch.seq_lens,
                     slot_mapping=verify_metadata.slot_mapping,
                 )
-                (hidden, verify_logits), updated_kv_state, updated_hybrid_state = model_forward_step(
+                hidden, updated_kv_state, updated_hybrid_state, prefix_hybrid_state = model_forward_step(
                     verify_batch.tokens,
                     params,
                     self.config,
@@ -5209,29 +6999,74 @@ class ModelExecutor:
                     kv_cache_state=verify_kv_state,
                     attention_metadata=verify_metadata,
                     hybrid_state=HybridLayerState(conv_state, recurrent_state),
-                    is_prefill=False,
+                    is_prefill=verify_as_prefill,
                     return_hidden=True,
-                    return_hidden_with_logits=True,
+                    return_hidden_with_logits=False,
+                    return_prefix_hybrid=True,
                     backend=self.backend,
                 )
+                if verify_as_prefill:
+                    hidden = hidden.reshape(row_count, draft_len + 1, hidden.shape[-1])
+                    prefix_hybrid_state = HybridLayerState(
+                        conv_state=prefix_hybrid_state.conv_state.reshape(
+                            (row_count, draft_len + 1)
+                            + prefix_hybrid_state.conv_state.shape[2:]
+                        )
+                        if prefix_hybrid_state.conv_state is not None
+                        else None,
+                        recurrent_state=prefix_hybrid_state.recurrent_state.reshape(
+                            (row_count, draft_len + 1)
+                            + prefix_hybrid_state.recurrent_state.shape[2:]
+                        )
+                        if prefix_hybrid_state.recurrent_state is not None
+                        else None,
+                    )
 
                 hidden_norm = rms_norm(hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
-                token_ids = jnp.argmax(verify_logits, axis=-1).astype(jnp.int32)
+                output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
+                hidden_norm_for_top1 = hidden_norm.astype(output_weight.dtype)
+                token_ids = _lm_head_greedy_top1_token_ids(
+                    hidden_norm_for_top1.reshape(hidden_norm.shape[0] * hidden_norm.shape[1], 1, hidden_norm.shape[-1]),
+                    output_weight,
+                    self.config,
+                ).reshape(hidden_norm.shape[0], hidden_norm.shape[1]).astype(jnp.int32)
                 target_tokens = token_ids[:, :draft_len]
                 bonus_token = token_ids[:, draft_len]
-                accepted = target_tokens == draft_tokens_arg
+                row_query_lens = jnp.diff(verify_query_start_loc).astype(jnp.int32)
+                row_active = (row_query_lens > 0) & (seq_ids >= 0)
+                raw_accepted = (target_tokens == draft_tokens_arg) & row_active[:, None]
+                if batch_accept_policy == "all_or_none":
+                    active_or_accepted = jnp.where(row_active[:, None], raw_accepted, True)
+                    accepted_by_position = jnp.all(active_or_accepted, axis=0)
+                    global_prefix = jnp.cumprod(
+                        accepted_by_position.astype(jnp.int32),
+                        axis=0,
+                    ).astype(jnp.bool_)
+                    accepted = raw_accepted & global_prefix[None, :]
+                else:
+                    accepted = jnp.cumprod(
+                        raw_accepted.astype(jnp.int32),
+                        axis=1,
+                    ).astype(jnp.bool_)
+                prefix_len = jnp.sum(accepted.astype(jnp.int32), axis=1)
 
-                mtp_hidden = (
-                    hidden_norm[:, draft_len : draft_len + 1, :]
-                    if mtp_hidden_final_normed
-                    else hidden[:, draft_len : draft_len + 1, :]
-                )
-                current_hidden = mtp_hidden
-                current_token = bonus_token[:, None]
-                current_position = next_mtp_position_arg[:, None]
-                next_drafts = []
-                for _ in range(draft_len):
-                    mtp_logits, current_hidden = mtp_forward(
+                selected_hidden_for_mtp = _gather_prefix(
+                    hidden_norm if mtp_hidden_final_normed else hidden,
+                    prefix_len,
+                )[:, None, :]
+                selected_next_token = jnp.take_along_axis(
+                    token_ids,
+                    prefix_len[:, None],
+                    axis=1,
+                )[:, 0].astype(jnp.int32)
+                selected_mtp_position = next_mtp_position_arg - (draft_len - prefix_len)
+                current_hidden = selected_hidden_for_mtp
+                current_token = selected_next_token[:, None]
+                current_position = selected_mtp_position[:, None]
+                next_drafts = [selected_next_token] if carry_bonus_as_draft else []
+                mtp_drafts_to_generate = draft_len - 1 if carry_bonus_as_draft else draft_len
+                for _ in range(mtp_drafts_to_generate):
+                    mtp_token_ids, current_hidden = mtp_forward_token_ids(
                         hidden_state=current_hidden,
                         next_token_ids=current_token,
                         embed_tokens=params.embed_tokens,
@@ -5239,10 +7074,29 @@ class ModelExecutor:
                         config=self.config,
                         positions=current_position,
                     )
-                    current_token = jnp.argmax(mtp_logits[:, 0], axis=-1).astype(jnp.int32)[:, None]
+                    current_token = mtp_token_ids[:, 0].astype(jnp.int32)[:, None]
                     next_drafts.append(current_token[:, 0])
                     current_position = current_position + 1
                 next_draft_tokens = jnp.stack(next_drafts, axis=1)
+                selected_conv = (
+                    _gather_prefix(prefix_hybrid_state.conv_state, prefix_len)
+                    if prefix_hybrid_state.conv_state is not None
+                    else updated_hybrid_state.conv_state
+                )
+                selected_recurrent = (
+                    _gather_prefix(prefix_hybrid_state.recurrent_state, prefix_len)
+                    if prefix_hybrid_state.recurrent_state is not None
+                    else updated_hybrid_state.recurrent_state
+                )
+                host_payload = jnp.concatenate(
+                    [
+                        target_tokens.astype(jnp.int32),
+                        bonus_token.astype(jnp.int32)[:, None],
+                        next_draft_tokens.astype(jnp.int32),
+                        accepted.astype(jnp.int32),
+                    ],
+                    axis=1,
+                )
                 return (
                     target_tokens,
                     bonus_token,
@@ -5250,12 +7104,13 @@ class ModelExecutor:
                     accepted,
                     updated_kv_state.k_cache,
                     updated_kv_state.v_cache,
-                    updated_hybrid_state.conv_state,
-                    updated_hybrid_state.recurrent_state,
-                    seq_lens + draft_len,
+                    selected_conv,
+                    selected_recurrent,
+                    seq_lens + prefix_len,
+                    host_payload,
                 )
 
-            self._jit_cache[key] = jax.jit(compiled)
+            self._jit_cache[key] = jax.jit(compiled, donate_argnums=(8, 9))
 
         (
             target_tokens,
@@ -5267,6 +7122,7 @@ class ModelExecutor:
             conv_state,
             recurrent_state,
             committed_seq_lens,
+            host_payload,
         ) = self._profile_jit_call(
             key,
             self._jit_cache[key],
@@ -5295,6 +7151,370 @@ class ModelExecutor:
             cache_storage=KVCacheStorage(k_cache, v_cache),
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
             committed_seq_lens=committed_seq_lens,
+            host_payload=host_payload,
+        )
+
+    def mtp_k_burst_greedy_step_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state: HybridLayerState,
+        draft_tokens: jnp.ndarray,
+        next_mtp_position: jnp.ndarray,
+        mtp_hidden_final_normed: bool,
+        burst_groups: int,
+    ) -> MTP1GreedyOutput:
+        """Run several greedy MTP verifier groups before returning to Python.
+
+        Each group commits the accepted prefix entirely inside the compiled
+        boundary, then continues the next group from that committed token/state.
+        The runner drains the fixed emitted-token/count tensors after the burst;
+        it does not repair rejected rows between groups.
+        """
+        if hybrid_state.conv_state is None or hybrid_state.recurrent_state is None:
+            raise ValueError("mtp_k_burst_greedy_step_jit requires initialized hybrid_state")
+        if batch.is_prefill or batch.tokens.shape[1] != 1:
+            raise ValueError("mtp_k_burst_greedy_step_jit expects a decode batch")
+        if draft_tokens.ndim != 2 or draft_tokens.shape[0] != batch.tokens.shape[0]:
+            raise ValueError("draft_tokens must have shape [batch, draft_len]")
+        draft_len = int(draft_tokens.shape[1])
+        if draft_len < 1:
+            raise ValueError("draft_tokens must contain at least one draft token")
+        burst_groups = int(burst_groups)
+        if burst_groups <= 1:
+            return self.mtp_k_decode_greedy_step_jit(
+                batch,
+                cache_storage=cache_storage,
+                hybrid_state=hybrid_state,
+                draft_tokens=draft_tokens,
+                next_mtp_position=next_mtp_position,
+                mtp_hidden_final_normed=mtp_hidden_final_normed,
+            )
+        self._log_step("mtp_k_burst_greedy_step_jit", batch, return_hidden=True, last_logits_only=False)
+        self._validate_batch_contract(batch)
+        verify_mode = os.environ.get(
+            "NANO_VLLM_JAX_MTP_K_VERIFY_MODE",
+            "decode",
+        ).strip().lower()
+        if verify_mode in {"packed_prefill", "prefill_packed"}:
+            verify_mode = "prefill"
+        if verify_mode not in {"decode", "prefill"}:
+            raise ValueError(
+                "NANO_VLLM_JAX_MTP_K_VERIFY_MODE must be 'decode' or 'prefill'"
+            )
+        if verify_mode == "prefill" and int(batch.tokens.shape[0]) != 1:
+            raise ValueError("MTP K burst prefill verifier currently supports only batch=1")
+
+        key = (
+            "mtp-k-burst-greedy-compact-lm-head",
+            verify_mode,
+            draft_len,
+            burst_groups,
+            tuple(batch.tokens.shape),
+            tuple(batch.positions.shape),
+            tuple(batch.block_tables.shape),
+            bool(mtp_hidden_final_normed),
+        )
+        if key not in self._jit_cache:
+
+            def compiled(
+                params,
+                tokens,
+                positions,
+                seq_ids,
+                num_decode_tokens,
+                block_tables,
+                seq_lens,
+                k_cache,
+                v_cache,
+                conv_state,
+                recurrent_state,
+                draft_tokens_arg,
+                next_mtp_position_arg,
+            ):
+                current_tokens = tokens
+                current_positions = positions
+                current_seq_lens = seq_lens
+                current_drafts = draft_tokens_arg
+                current_next_mtp_position = next_mtp_position_arg
+                current_k_cache = k_cache
+                current_v_cache = v_cache
+                current_conv_state = conv_state
+                current_recurrent_state = recurrent_state
+
+                emitted_groups = []
+                emitted_count_groups = []
+                target_groups = []
+                bonus_groups = []
+                accepted_groups = []
+                accepted_count_groups = []
+
+                def _gather_prefix(value: jnp.ndarray, prefix_len: jnp.ndarray) -> jnp.ndarray:
+                    gather_idx = prefix_len.astype(jnp.int32)
+                    gather_idx = gather_idx.reshape((gather_idx.shape[0],) + (1,) * (value.ndim - 1))
+                    gather_idx = jnp.broadcast_to(
+                        gather_idx,
+                        (value.shape[0], 1) + value.shape[2:],
+                    )
+                    return jnp.take_along_axis(value, gather_idx, axis=1)[:, 0, ...]
+
+                for _ in range(burst_groups):
+                    verify_tokens = jnp.concatenate([current_tokens, current_drafts], axis=1)
+                    verify_positions = (
+                        current_positions
+                        + jnp.arange(draft_len + 1, dtype=jnp.int32)[None, :]
+                    )
+                    verify_query_start_loc = (
+                        jnp.arange(tokens.shape[0] + 1, dtype=jnp.int32) * (draft_len + 1)
+                    )
+                    verify_as_prefill = verify_mode == "prefill"
+                    token_row_ids = (
+                        jnp.zeros_like(verify_tokens, dtype=jnp.int32)
+                        if verify_as_prefill
+                        else None
+                    )
+                    verify_batch = ScheduledBatch(
+                        tokens=verify_tokens,
+                        positions=verify_positions,
+                        seq_ids=seq_ids,
+                        query_start_loc=verify_query_start_loc,
+                        is_prefill=verify_as_prefill,
+                        num_prefill_tokens=num_decode_tokens * (draft_len + 1) if verify_as_prefill else 0,
+                        num_decode_tokens=0 if verify_as_prefill else num_decode_tokens * (draft_len + 1),
+                        block_tables=block_tables,
+                        seq_lens=current_seq_lens + draft_len,
+                        packed_prefill=verify_as_prefill,
+                        token_row_ids=token_row_ids,
+                    )
+                    verify_metadata = self.backend.build_attention_metadata(
+                        positions=verify_batch.positions,
+                        block_tables=verify_batch.block_tables,
+                        seq_lens=verify_batch.seq_lens,
+                        block_size=self.config.block_size,
+                        is_prefill=verify_as_prefill,
+                        query_start_loc=verify_batch.query_start_loc,
+                        num_prefill_tokens=verify_batch.num_prefill_tokens,
+                        num_decode_tokens=verify_batch.num_decode_tokens,
+                        token_row_ids=token_row_ids,
+                        max_query_len=draft_len + 1 if verify_as_prefill else None,
+                    )
+                    verify_kv_state = KVCacheState(
+                        k_cache=current_k_cache,
+                        v_cache=current_v_cache,
+                        block_table=verify_batch.block_tables,
+                        kv_lens=verify_batch.seq_lens,
+                        slot_mapping=verify_metadata.slot_mapping,
+                    )
+                    hidden, updated_kv_state, updated_hybrid_state, prefix_hybrid_state = model_forward_step(
+                        verify_batch.tokens,
+                        params,
+                        self.config,
+                        positions=verify_batch.positions,
+                        kv_cache_state=verify_kv_state,
+                        attention_metadata=verify_metadata,
+                        hybrid_state=HybridLayerState(current_conv_state, current_recurrent_state),
+                        is_prefill=verify_as_prefill,
+                        return_hidden=True,
+                        return_hidden_with_logits=False,
+                        return_prefix_hybrid=True,
+                        backend=self.backend,
+                    )
+                    if verify_as_prefill:
+                        hidden = hidden.reshape(tokens.shape[0], draft_len + 1, hidden.shape[-1])
+                        prefix_hybrid_state = HybridLayerState(
+                            conv_state=prefix_hybrid_state.conv_state.reshape(
+                                (tokens.shape[0], draft_len + 1)
+                                + prefix_hybrid_state.conv_state.shape[2:]
+                            )
+                            if prefix_hybrid_state.conv_state is not None
+                            else None,
+                            recurrent_state=prefix_hybrid_state.recurrent_state.reshape(
+                                (tokens.shape[0], draft_len + 1)
+                                + prefix_hybrid_state.recurrent_state.shape[2:]
+                            )
+                            if prefix_hybrid_state.recurrent_state is not None
+                            else None,
+                        )
+
+                    hidden_norm = rms_norm(hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                    output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
+                    hidden_norm_for_top1 = hidden_norm.astype(output_weight.dtype)
+                    token_ids = _lm_head_greedy_top1_token_ids(
+                        hidden_norm_for_top1.reshape(
+                            hidden_norm.shape[0] * hidden_norm.shape[1],
+                            1,
+                            hidden_norm.shape[-1],
+                        ),
+                        output_weight,
+                        self.config,
+                    ).reshape(hidden_norm.shape[0], hidden_norm.shape[1]).astype(jnp.int32)
+                    target_tokens = token_ids[:, :draft_len]
+                    bonus_token = token_ids[:, draft_len]
+                    row_query_lens = jnp.diff(verify_query_start_loc).astype(jnp.int32)
+                    row_active = (row_query_lens > 0) & (seq_ids >= 0)
+                    raw_accepted = (target_tokens == current_drafts) & row_active[:, None]
+                    accepted = jnp.cumprod(
+                        raw_accepted.astype(jnp.int32),
+                        axis=1,
+                    ).astype(jnp.bool_)
+                    prefix_len = jnp.sum(accepted.astype(jnp.int32), axis=1)
+                    emitted_count = jnp.where(
+                        row_active,
+                        prefix_len + jnp.asarray(1, dtype=jnp.int32),
+                        jnp.zeros_like(prefix_len),
+                    )
+                    selected_next_token = jnp.take_along_axis(
+                        token_ids,
+                        prefix_len[:, None],
+                        axis=1,
+                    )[:, 0].astype(jnp.int32)
+                    selected_next_token = jnp.where(
+                        row_active,
+                        selected_next_token,
+                        jnp.zeros_like(selected_next_token),
+                    )
+
+                    mtp_hidden = (
+                        _gather_prefix(hidden_norm, prefix_len)[:, None, :]
+                        if mtp_hidden_final_normed
+                        else _gather_prefix(hidden, prefix_len)[:, None, :]
+                    )
+                    mtp_drafts = []
+                    mtp_hidden_current = mtp_hidden
+                    mtp_token_current = selected_next_token[:, None]
+                    mtp_position_current = (
+                        current_next_mtp_position - (draft_len - prefix_len)
+                    )[:, None]
+                    for _draft_idx in range(draft_len):
+                        mtp_token_ids, mtp_hidden_current = mtp_forward_token_ids(
+                            hidden_state=mtp_hidden_current,
+                            next_token_ids=mtp_token_current,
+                            embed_tokens=params.embed_tokens,
+                            params=params.mtp_params,
+                            config=self.config,
+                            positions=mtp_position_current,
+                        )
+                        mtp_token_current = mtp_token_ids[:, 0].astype(jnp.int32)[:, None]
+                        mtp_drafts.append(mtp_token_current[:, 0])
+                        mtp_position_current = mtp_position_current + 1
+                    next_draft_tokens = jnp.stack(mtp_drafts, axis=1)
+
+                    emit_columns = jnp.arange(draft_len + 1, dtype=jnp.int32)[None, :]
+                    draft_columns = jnp.broadcast_to(
+                        jnp.clip(emit_columns, 0, draft_len - 1),
+                        (current_drafts.shape[0], draft_len + 1),
+                    )
+                    draft_values = jnp.take_along_axis(
+                        current_drafts,
+                        draft_columns,
+                        axis=1,
+                    )
+                    group_emitted = jnp.where(
+                        emit_columns < prefix_len[:, None],
+                        draft_values,
+                        jnp.where(
+                            emit_columns == prefix_len[:, None],
+                            selected_next_token[:, None],
+                            jnp.zeros_like(draft_values),
+                        ),
+                    ).astype(jnp.int32)
+                    selected_conv = (
+                        _gather_prefix(prefix_hybrid_state.conv_state, prefix_len)
+                        if prefix_hybrid_state.conv_state is not None
+                        else updated_hybrid_state.conv_state
+                    )
+                    selected_recurrent = (
+                        _gather_prefix(prefix_hybrid_state.recurrent_state, prefix_len)
+                        if prefix_hybrid_state.recurrent_state is not None
+                        else updated_hybrid_state.recurrent_state
+                    )
+
+                    emitted_groups.append(group_emitted)
+                    emitted_count_groups.append(emitted_count)
+                    target_groups.append(target_tokens)
+                    bonus_groups.append(bonus_token)
+                    accepted_groups.append(accepted)
+                    accepted_count_groups.append(prefix_len)
+
+                    current_tokens = selected_next_token[:, None]
+                    current_positions = current_positions + emitted_count[:, None]
+                    current_seq_lens = current_seq_lens + emitted_count
+                    current_drafts = next_draft_tokens
+                    current_next_mtp_position = current_next_mtp_position + emitted_count
+                    current_k_cache = updated_kv_state.k_cache
+                    current_v_cache = updated_kv_state.v_cache
+                    current_conv_state = selected_conv
+                    current_recurrent_state = selected_recurrent
+
+                emitted_tokens = jnp.stack(emitted_groups, axis=1)
+                emitted_counts = jnp.stack(emitted_count_groups, axis=1)
+                target_tokens = jnp.stack(target_groups, axis=1)
+                bonus_tokens = jnp.stack(bonus_groups, axis=1)
+                accepted = jnp.stack(accepted_groups, axis=1)
+                accepted_counts = jnp.stack(accepted_count_groups, axis=1)
+                return (
+                    emitted_tokens,
+                    emitted_counts,
+                    target_tokens,
+                    bonus_tokens,
+                    current_drafts,
+                    accepted,
+                    accepted_counts,
+                    current_k_cache,
+                    current_v_cache,
+                    current_conv_state,
+                    current_recurrent_state,
+                    current_seq_lens,
+                )
+
+            self._jit_cache[key] = jax.jit(compiled)
+
+        (
+            emitted_tokens,
+            emitted_counts,
+            target_tokens,
+            bonus_tokens,
+            next_draft_tokens,
+            accepted,
+            accepted_counts,
+            k_cache,
+            v_cache,
+            conv_state,
+            recurrent_state,
+            committed_seq_lens,
+        ) = self._profile_jit_call(
+            key,
+            self._jit_cache[key],
+            (
+                self.params,
+                batch.tokens,
+                batch.positions,
+                batch.seq_ids,
+                jnp.asarray(batch.num_decode_tokens, dtype=jnp.int32),
+                batch.block_tables,
+                batch.seq_lens,
+                cache_storage.k_cache,
+                cache_storage.v_cache,
+                hybrid_state.conv_state,
+                hybrid_state.recurrent_state,
+                jnp.asarray(draft_tokens, dtype=jnp.int32),
+                jnp.asarray(next_mtp_position, dtype=jnp.int32),
+            ),
+            "mtp_k_burst_greedy_step_jit",
+        )
+        return MTP1GreedyOutput(
+            target_token=target_tokens,
+            bonus_token=bonus_tokens,
+            next_draft_token=next_draft_tokens,
+            accepted=accepted,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+            committed_seq_lens=committed_seq_lens,
+            emitted_tokens=emitted_tokens,
+            emitted_counts=emitted_counts,
+            accepted_counts=accepted_counts,
+            burst_groups=burst_groups,
         )
 
     @staticmethod

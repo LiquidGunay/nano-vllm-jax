@@ -153,7 +153,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--full-attention-kv-append-impl", default="reference")
     parser.add_argument("--full-attention-decode-impl", default="reference")
     parser.add_argument("--full-attention-prefill-impl", default="reference")
-    parser.add_argument("--jax-num-speculative-tokens", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--jax-speculative-method", choices=["none", "mtp"], default="none")
+    parser.add_argument("--jax-draft-sample-method", choices=["greedy", "probabilistic"], default="greedy")
+    parser.add_argument("--jax-mtp-verifier-impl", choices=["two_decode", "commit_select"], default="commit_select")
+    parser.add_argument("--jax-mtp-batch-accept-policy", choices=["rowwise", "all_or_none"], default="rowwise")
+    parser.add_argument("--jax-mtp-seed-after-bonus", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--jax-mtp-bonus-margin", type=float, default=0.0)
+    parser.add_argument("--jax-mtp-draft-margin", type=float, default=0.0)
+    parser.add_argument("--jax-mtp-hidden-source", choices=["pre_norm", "final_normed"], default="final_normed")
+    parser.add_argument("--jax-mtp-token-source", choices=["generated", "current"], default="generated")
+    parser.add_argument("--jax-mtp-position-offset", type=int, default=0)
+    parser.add_argument("--jax-mtp-lm-head-greedy-top1-impl", default="triton")
+    parser.add_argument("--jax-num-speculative-tokens", type=int, choices=list(range(0, 9)), default=0)
+    parser.add_argument("--jax-mtp-burst-groups", type=int, default=1)
+    parser.add_argument("--jax-mtp-max-active-rows", type=int, default=0)
+    parser.add_argument("--jax-mtp-prefill-seed", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--vllm-max-model-len", type=int, default=8192)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.72)
@@ -818,7 +832,21 @@ def _build_jax_command(
         "prefill_layout": args.prefill_layout,
         "batch_size_buckets": args.batch_size_buckets,
         "max_blocks_per_seq": args.max_blocks_per_seq,
+        "speculative_method": args.jax_speculative_method,
+        "draft_sample_method": args.jax_draft_sample_method,
+        "mtp_verifier_impl": args.jax_mtp_verifier_impl,
+        "mtp_batch_accept_policy": args.jax_mtp_batch_accept_policy,
+        "mtp_seed_after_bonus": args.jax_mtp_seed_after_bonus,
+        "mtp_bonus_margin": args.jax_mtp_bonus_margin,
+        "mtp_draft_margin": args.jax_mtp_draft_margin,
+        "mtp_hidden_source": args.jax_mtp_hidden_source,
+        "mtp_token_source": args.jax_mtp_token_source,
+        "mtp_position_offset": args.jax_mtp_position_offset,
+        "mtp_lm_head_greedy_top1_impl": args.jax_mtp_lm_head_greedy_top1_impl,
         "num_speculative_tokens": args.jax_num_speculative_tokens,
+        "mtp_burst_groups": args.jax_mtp_burst_groups,
+        "mtp_max_active_rows": args.jax_mtp_max_active_rows,
+        "mtp_prefill_seed": args.jax_mtp_prefill_seed,
         "dataset_name": args.dataset_name or "random",
         "temperature": args.temperature,
         "top_p": args.top_p,
@@ -1076,7 +1104,21 @@ def _run() -> None:
                 "full_attention_kv_append_impl": args.full_attention_kv_append_impl,
                 "full_attention_decode_impl": args.full_attention_decode_impl,
                 "full_attention_prefill_impl": args.full_attention_prefill_impl,
+                "speculative_method": args.jax_speculative_method,
+                "draft_sample_method": args.jax_draft_sample_method,
+                "mtp_verifier_impl": args.jax_mtp_verifier_impl,
+                "mtp_batch_accept_policy": args.jax_mtp_batch_accept_policy,
+                "mtp_seed_after_bonus": args.jax_mtp_seed_after_bonus,
+                "mtp_bonus_margin": args.jax_mtp_bonus_margin,
+                "mtp_draft_margin": args.jax_mtp_draft_margin,
+                "mtp_hidden_source": args.jax_mtp_hidden_source,
+                "mtp_token_source": args.jax_mtp_token_source,
+                "mtp_position_offset": args.jax_mtp_position_offset,
+                "mtp_lm_head_greedy_top1_impl": args.jax_mtp_lm_head_greedy_top1_impl,
                 "num_speculative_tokens": args.jax_num_speculative_tokens,
+                "mtp_burst_groups": args.jax_mtp_burst_groups,
+                "mtp_max_active_rows": args.jax_mtp_max_active_rows,
+                "mtp_prefill_seed": args.jax_mtp_prefill_seed,
                 "sampling": {
                     "temperature": args.temperature,
                     "top_p": args.top_p,

@@ -66,7 +66,16 @@ class Qwen3_5Config:
     mtp_seed_after_bonus: bool = False
     mtp_bonus_margin: float = 0.0
     mtp_draft_margin: float = 0.0
+    mtp_hidden_source: str = "pre_norm"
+    mtp_token_source: str = "generated"
+    mtp_position_offset: int = 0
+    mtp_lm_head_greedy_top1_impl: str = "jax"
     num_speculative_tokens: int = 0
+    mtp_burst_groups: int = 1
+    mtp_max_active_rows: int = 0
+    mtp_prefill_seed: bool = False
+    mtp_unverified_draft_append: bool = False
+    mtp_unverified_fused_append: bool = False
     
     # KV cache config (for vLLM paging)
     block_size: int = 16
@@ -172,8 +181,8 @@ class Qwen3_5Config:
             max(1, int(self.greedy_decode_burst_steps or 1)),
         )
         num_speculative_tokens = max(0, int(self.num_speculative_tokens or 0))
-        if num_speculative_tokens > 1:
-            raise ValueError("MTP speculative decoding currently supports num_speculative_tokens <= 1")
+        if num_speculative_tokens > 8:
+            raise ValueError("MTP speculative decoding currently supports num_speculative_tokens <= 8")
         speculative_method = str(self.speculative_method or "none").strip().lower()
         if speculative_method == "none" and num_speculative_tokens > 0:
             # Legacy configs selected MTP by setting only num_speculative_tokens.
@@ -183,8 +192,8 @@ class Qwen3_5Config:
         draft_sample_method = str(self.draft_sample_method or "greedy").strip().lower()
         if draft_sample_method not in {"greedy", "probabilistic"}:
             raise ValueError("draft_sample_method must be 'greedy' or 'probabilistic'")
-        if speculative_method == "mtp" and num_speculative_tokens != 1:
-            raise ValueError("speculative_method='mtp' requires num_speculative_tokens=1")
+        if speculative_method == "mtp" and num_speculative_tokens < 1:
+            raise ValueError("speculative_method='mtp' requires num_speculative_tokens >= 1")
         if speculative_method == "mtp" and draft_sample_method != "greedy":
             raise ValueError("MTP probabilistic draft sampling is not implemented yet")
         mtp_verifier_impl = str(self.mtp_verifier_impl or "two_decode").strip().lower()
@@ -200,6 +209,46 @@ class Qwen3_5Config:
         object.__setattr__(self, "mtp_batch_accept_policy", mtp_batch_accept_policy)
         object.__setattr__(self, "mtp_bonus_margin", max(0.0, float(self.mtp_bonus_margin or 0.0)))
         object.__setattr__(self, "mtp_draft_margin", max(0.0, float(self.mtp_draft_margin or 0.0)))
+        mtp_hidden_source = str(self.mtp_hidden_source or "pre_norm").strip().lower()
+        if mtp_hidden_source not in {"pre_norm", "final_normed"}:
+            raise ValueError("mtp_hidden_source must be 'pre_norm' or 'final_normed'")
+        mtp_token_source = str(self.mtp_token_source or "generated").strip().lower()
+        if mtp_token_source not in {"generated", "current"}:
+            raise ValueError("mtp_token_source must be 'generated' or 'current'")
+        mtp_lm_head_greedy_top1_impl = str(
+            self.mtp_lm_head_greedy_top1_impl or "jax"
+        ).strip().lower()
+        if mtp_lm_head_greedy_top1_impl not in {
+            "jax",
+            "triton",
+            "triton_tensorcore",
+            "triton_top1",
+            "cutlass",
+            "cutlass_top1",
+            "cutlass_fused_gemm",
+            "fused_gemm",
+        }:
+            raise ValueError(
+                "mtp_lm_head_greedy_top1_impl must be jax, triton, or cutlass"
+            )
+        object.__setattr__(self, "mtp_hidden_source", mtp_hidden_source)
+        object.__setattr__(self, "mtp_token_source", mtp_token_source)
+        object.__setattr__(self, "mtp_position_offset", int(self.mtp_position_offset or 0))
+        object.__setattr__(
+            self,
+            "mtp_lm_head_greedy_top1_impl",
+            mtp_lm_head_greedy_top1_impl,
+        )
+        object.__setattr__(self, "mtp_burst_groups", max(1, int(self.mtp_burst_groups or 1)))
+        object.__setattr__(self, "mtp_max_active_rows", max(0, int(self.mtp_max_active_rows or 0)))
+        object.__setattr__(self, "mtp_prefill_seed", bool(self.mtp_prefill_seed))
+        if bool(self.mtp_unverified_draft_append) or bool(self.mtp_unverified_fused_append):
+            raise ValueError(
+                "Unverified MTP draft append is not supported. "
+                "All MTP benchmark and serving paths must verify drafts with the target model."
+            )
+        object.__setattr__(self, "mtp_unverified_draft_append", bool(self.mtp_unverified_draft_append))
+        object.__setattr__(self, "mtp_unverified_fused_append", bool(self.mtp_unverified_fused_append))
         object.__setattr__(
             self,
             "compact_prefill_token_count_mode",
@@ -342,7 +391,16 @@ class Qwen3_5Config:
             self.mtp_seed_after_bonus,
             self.mtp_bonus_margin,
             self.mtp_draft_margin,
+            self.mtp_hidden_source,
+            self.mtp_token_source,
+            self.mtp_position_offset,
+            self.mtp_lm_head_greedy_top1_impl,
             self.num_speculative_tokens,
+            self.mtp_burst_groups,
+            self.mtp_max_active_rows,
+            self.mtp_prefill_seed,
+            self.mtp_unverified_draft_append,
+            self.mtp_unverified_fused_append,
             self.block_size,
             self.max_kv_cache_bytes,
             self.prefill_token_buckets,
@@ -502,7 +560,16 @@ class Qwen3_5Config:
             "mtp_seed_after_bonus": self.mtp_seed_after_bonus,
             "mtp_bonus_margin": self.mtp_bonus_margin,
             "mtp_draft_margin": self.mtp_draft_margin,
+            "mtp_hidden_source": self.mtp_hidden_source,
+            "mtp_token_source": self.mtp_token_source,
+            "mtp_position_offset": self.mtp_position_offset,
+            "mtp_lm_head_greedy_top1_impl": self.mtp_lm_head_greedy_top1_impl,
             "num_speculative_tokens": self.num_speculative_tokens,
+            "mtp_burst_groups": self.mtp_burst_groups,
+            "mtp_max_active_rows": self.mtp_max_active_rows,
+            "mtp_prefill_seed": self.mtp_prefill_seed,
+            "mtp_unverified_draft_append": self.mtp_unverified_draft_append,
+            "mtp_unverified_fused_append": self.mtp_unverified_fused_append,
             "max_kv_cache_bytes": self.max_kv_cache_bytes,
             "max_num_seqs": self.max_num_seqs,
             "max_num_resident_seqs": self.max_num_resident_seqs,

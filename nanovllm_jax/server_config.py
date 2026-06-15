@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shlex
 from typing import Any
 
 import yaml
@@ -90,7 +91,16 @@ _ENGINE_ENV_MAP: dict[str, tuple[str, type]] = {
     "mtp_seed_after_bonus": ("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", bool),
     "mtp_bonus_margin": ("NANO_VLLM_JAX_MTP_BONUS_MARGIN", float),
     "mtp_draft_margin": ("NANO_VLLM_JAX_MTP_DRAFT_MARGIN", float),
+    "mtp_hidden_source": ("NANO_VLLM_JAX_MTP_HIDDEN_SOURCE", str),
+    "mtp_token_source": ("NANO_VLLM_JAX_MTP_TOKEN_SOURCE", str),
+    "mtp_position_offset": ("NANO_VLLM_JAX_MTP_POSITION_OFFSET", int),
+    "mtp_lm_head_greedy_top1_impl": ("NANO_VLLM_JAX_MTP_LM_HEAD_GREEDY_TOP1_IMPL", str),
     "num_speculative_tokens": ("NANO_VLLM_JAX_NUM_SPECULATIVE_TOKENS", int),
+    "mtp_burst_groups": ("NANO_VLLM_JAX_MTP_BURST_GROUPS", int),
+    "mtp_max_active_rows": ("NANO_VLLM_JAX_MTP_MAX_ACTIVE_ROWS", int),
+    "mtp_prefill_seed": ("NANO_VLLM_JAX_MTP_PREFILL_SEED", bool),
+    "mtp_unverified_draft_append": ("NANO_VLLM_JAX_MTP_UNVERIFIED_DRAFT_APPEND", bool),
+    "mtp_unverified_fused_append": ("NANO_VLLM_JAX_MTP_UNVERIFIED_FUSED_APPEND", bool),
     "greedy_token_fastpath": ("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH", bool),
     "sampled_token_fastpath": ("NANO_VLLM_JAX_SAMPLED_TOKEN_FASTPATH", bool),
     "device_token_carry": ("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", bool),
@@ -177,6 +187,48 @@ def _env_bool(value: Any) -> str:
 def _put_env(env: dict[str, str], key: str, value: Any) -> None:
     if value is not None:
         env[key] = _env_bool(value) if isinstance(value, bool) else str(value)
+
+
+def _format_xla_bool(value: Any) -> str:
+    return "true" if _config_bool(value) else "false"
+
+
+def _upsert_xla_flag(parts: list[str], name: str, value: Any) -> None:
+    """Append an XLA flag, replacing an earlier setting for the same flag."""
+
+    prefix = f"{name}="
+    parts[:] = [part for part in parts if part != name and not part.startswith(prefix)]
+    if value is None:
+        return
+    if isinstance(value, bool):
+        formatted = _format_xla_bool(value)
+    else:
+        formatted = str(value)
+    parts.append(f"{name}={formatted}")
+
+
+def _xla_flags_from_config(xla_section: dict) -> str | None:
+    """Build XLA_FLAGS from raw flags plus typed XLA runtime knobs."""
+
+    raw_flags = str(xla_section.get("flags") or "").strip()
+    parts = shlex.split(raw_flags) if raw_flags else []
+    command_buffer = xla_section.get("command_buffer", {}) or {}
+    if not command_buffer:
+        return raw_flags or None
+
+    if not parts:
+        autotune_level = xla_section.get("autotune_level", 4)
+        _upsert_xla_flag(parts, "--xla_gpu_autotune_level", autotune_level)
+
+    mapping = {
+        "enable_during_profiling": "--xla_enable_command_buffers_during_profiling",
+        "unroll_loops": "--xla_gpu_command_buffer_unroll_loops",
+        "graph_min_size": "--xla_gpu_graph_min_graph_size",
+    }
+    for key, flag_name in mapping.items():
+        if key in command_buffer:
+            _upsert_xla_flag(parts, flag_name, command_buffer[key])
+    return " ".join(parts) if parts else None
 
 
 def _coerce(value: str, target_type: type) -> Any:
@@ -316,7 +368,7 @@ def _runtime_section_to_env(runtime_section: dict) -> dict[str, str]:
     _put_env(env, "XLA_PYTHON_CLIENT_PREALLOCATE", xla.get("preallocate"))
     _put_env(env, "TF_GPU_ALLOCATOR", xla.get("gpu_allocator"))
     _put_env(env, "NANO_VLLM_JAX_XLA_GPU_AUTOTUNE_LEVEL", xla.get("autotune_level"))
-    _put_env(env, "XLA_FLAGS", xla.get("flags"))
+    _put_env(env, "XLA_FLAGS", _xla_flags_from_config(xla))
 
     fastpaths = runtime_section.get("fastpaths", {}) or {}
     fastpath_map = {
@@ -586,7 +638,16 @@ def load_server_config(path: str | Path | None = None) -> ServerConfig:
         "mtp_seed_after_bonus": False,
         "mtp_bonus_margin": 0.0,
         "mtp_draft_margin": 0.0,
+        "mtp_hidden_source": "pre_norm",
+        "mtp_token_source": "generated",
+        "mtp_position_offset": 0,
+        "mtp_lm_head_greedy_top1_impl": "jax",
+        "mtp_prefill_seed": False,
+        "mtp_unverified_draft_append": False,
+        "mtp_unverified_fused_append": False,
         "num_speculative_tokens": 0,
+        "mtp_burst_groups": 1,
+        "mtp_max_active_rows": 0,
         "greedy_token_fastpath": True,
         "sampled_token_fastpath": True,
         "device_token_carry": False,
