@@ -197,8 +197,10 @@ class Qwen3_5Config:
         if speculative_method == "mtp" and draft_sample_method != "greedy":
             raise ValueError("MTP probabilistic draft sampling is not implemented yet")
         mtp_verifier_impl = str(self.mtp_verifier_impl or "two_decode").strip().lower()
-        if mtp_verifier_impl not in {"two_decode", "commit_select"}:
-            raise ValueError("mtp_verifier_impl must be 'two_decode' or 'commit_select'")
+        if mtp_verifier_impl in {"generic_k", "expanded"}:
+            mtp_verifier_impl = "k_decode"
+        if mtp_verifier_impl not in {"two_decode", "commit_select", "k_decode"}:
+            raise ValueError("mtp_verifier_impl must be 'two_decode', 'commit_select', or 'k_decode'")
         mtp_batch_accept_policy = str(self.mtp_batch_accept_policy or "rowwise").strip().lower()
         if mtp_batch_accept_policy not in {"rowwise", "all_or_none"}:
             raise ValueError("mtp_batch_accept_policy must be 'rowwise' or 'all_or_none'")

@@ -35,6 +35,8 @@ This roadmap is grouped by work type. It is not a production-readiness claim.
 - Improve bucket-specific admission decisions.
 - Investigate K=1 overhead in rejected and fallback steps.
 - Implement a safe fast K=1 verifier that can commit rejected rows from after-current-token state without full repair decode.
+- Keep `mtp_verifier_impl=k_decode` as the verified K=1 optimization route; K=1 burst verification is available for host-sync amortization, but it still needs a cheaper exact prefix-state path before it can beat the no-MTP baseline.
+- Do not promote `return_first_prefix_hybrid` as that cheaper path until it matches full prefix-hybrid selection layer-by-layer; the 2026-06-15 smoke reduced acceptance from 11/13 to 6/13.
 - Treat K=2 as optimization research only until it beats K=1/baseline in valid benchmarks.
 - Avoid accelerator-kernel claims unless a dedicated backend exists; current GPU path is JAX/XLA on CUDA.
 

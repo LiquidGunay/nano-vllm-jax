@@ -2098,7 +2098,22 @@ class CanonicalModelRunner:
                             k2_fallback_output,
                             "mtp2_commit_select_greedy_step_jit:decode-k-fallback",
                         )
-                    if draft_len == 1 and str(getattr(self, "mtp_verifier_impl", "two_decode")) == "commit_select":
+                    mtp_verifier_impl = str(
+                        getattr(self, "mtp_verifier_impl", "two_decode") or "two_decode"
+                    ).lower()
+                    use_generic_k_warmup = (
+                        mtp_verifier_impl in {"k_decode", "generic_k", "expanded"}
+                        or os.environ.get(
+                            "NANO_VLLM_JAX_MTP_FORCE_GENERIC_K",
+                            "0",
+                        )
+                        in {"1", "true", "yes", "on", "True"}
+                    )
+                    if (
+                        draft_len == 1
+                        and mtp_verifier_impl == "commit_select"
+                        and not use_generic_k_warmup
+                    ):
                         output = self.executor.mtp1_commit_select_greedy_step_jit(
                             batch,
                             cache_storage=self.cache_storage,
@@ -2172,6 +2187,41 @@ class CanonicalModelRunner:
                                     greedy_burst_output,
                                     "mtp1_greedy_burst_table_jit:decode",
                                 )
+                    elif (
+                        draft_len == 1
+                        and use_generic_k_warmup
+                        and (
+                            hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
+                            or (
+                                mtp_burst_groups > 1
+                                and hasattr(self.executor, "mtp_k_burst_greedy_step_jit")
+                            )
+                        )
+                    ):
+                        if mtp_burst_groups > 1 and hasattr(self.executor, "mtp_k_burst_greedy_step_jit"):
+                            burst_output = self.executor.mtp_k_burst_greedy_step_jit(
+                                batch,
+                                cache_storage=self.cache_storage,
+                                hybrid_state=mtp_hybrid_state,
+                                draft_tokens=jnp.zeros((int(batch_size), 1), dtype=jnp.int32),
+                                next_mtp_position=next_positions,
+                                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                                burst_groups=mtp_burst_groups,
+                            )
+                            _record_decode_warmup(
+                                burst_output,
+                                "mtp_k_burst_greedy_step_jit:decode",
+                            )
+                        output = self.executor.mtp_k_decode_greedy_step_jit(
+                            batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state=mtp_hybrid_state,
+                            draft_tokens=jnp.zeros((int(batch_size), 1), dtype=jnp.int32),
+                            next_mtp_position=next_positions,
+                            mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                        )
+                        _record_decode_warmup(output, "mtp_k_decode_greedy_step_jit:decode")
+                        warmed_mtp_k_decode = True
                     elif draft_len == 1:
                         output = self.executor.mtp1_two_decode_greedy_step_jit(
                             batch,
@@ -2239,8 +2289,7 @@ class CanonicalModelRunner:
                     elif (
                         draft_len == 2
                         and mtp_burst_groups <= 1
-                        and os.environ.get("NANO_VLLM_JAX_MTP_FORCE_GENERIC_K", "0")
-                        not in {"1", "true", "yes", "on", "True"}
+                        and not use_generic_k_warmup
                         and hasattr(self.executor, "mtp2_commit_select_greedy_step_jit")
                     ):
                         output = self.executor.mtp2_commit_select_greedy_step_jit(
@@ -3132,6 +3181,44 @@ class CanonicalModelRunner:
             seqs=seqs,
             update_resident_tokens=update_resident_tokens,
         )
+
+    def _device_token_carry_enabled(self) -> bool:
+        return bool(
+            getattr(
+                self,
+                "device_token_carry",
+                _config_or_env_flag(
+                    getattr(self, "config", None),
+                    "device_token_carry",
+                    "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+                ),
+            )
+        )
+
+    @staticmethod
+    def _materialize_device_token_outputs(
+        outputs: dict[int, List[object] | object],
+    ) -> dict[int, List[int] | int]:
+        """Resolve deferred token refs for non-device-carry execution paths."""
+        resolved_arrays: dict[int, np.ndarray] = {}
+
+        def resolve_token(token: object) -> int:
+            if isinstance(token, DeviceTokenRef):
+                key = id(token.tokens)
+                if key not in resolved_arrays:
+                    resolved_arrays[key] = np.asarray(jax.device_get(token.tokens)).reshape(-1)
+                return int(resolved_arrays[key][int(token.row)])
+            if hasattr(token, "dtype") and hasattr(token, "shape"):
+                return int(np.asarray(jax.device_get(token)).reshape(-1)[0])
+            return int(token)  # type: ignore[arg-type]
+
+        materialized: dict[int, List[int] | int] = {}
+        for row, value in outputs.items():
+            if isinstance(value, list):
+                materialized[int(row)] = [resolve_token(token) for token in value]
+            else:
+                materialized[int(row)] = resolve_token(value)
+        return materialized
 
     def _build_scheduled_batch(self, seqs: List[Sequence], is_prefill: bool) -> ScheduledBatch:
         query_tokens: List[List[int]] = []
@@ -4394,6 +4481,60 @@ class CanonicalModelRunner:
             )
         return forward(hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
 
+    def _mtp1_draft_chain_with_topk(
+        self,
+        hidden_state: jnp.ndarray,
+        token_ids: jnp.ndarray,
+        positions: jnp.ndarray,
+        draft_len: int,
+        *,
+        top_k: int = 5,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        def forward(hidden_arg, token_arg, position_arg, embed_tokens_arg, mtp_params_tree):
+            mtp_params = self._mtp1_params_from_tree(mtp_params_tree)
+            current_hidden = hidden_arg
+            current_token = token_arg
+            current_position = position_arg
+            drafts = []
+            top_ids = []
+            top_values = []
+            for _idx in range(draft_len):
+                logits, current_hidden = mtp_forward(
+                    hidden_state=current_hidden,
+                    next_token_ids=current_token,
+                    embed_tokens=embed_tokens_arg,
+                    params=mtp_params,
+                    config=self.config,
+                    positions=current_position,
+                )
+                values, ids = jax.lax.top_k(logits[:, 0].astype(jnp.float32), top_k)
+                current_token = jnp.argmax(logits[:, 0], axis=-1).astype(jnp.int32)[:, None]
+                drafts.append(current_token[:, 0])
+                top_ids.append(ids.astype(jnp.int32))
+                top_values.append(values.astype(jnp.float32))
+                current_position = current_position + 1
+            return (
+                jnp.stack(drafts, axis=1),
+                jnp.stack(top_ids, axis=1),
+                jnp.stack(top_values, axis=1),
+            )
+
+        mtp_params_tree = self._mtp1_params_tree()
+        if getattr(self, "execution", "eager") in {"decode-jit", "jit"}:
+            if not hasattr(self, "_mtp1_chain_topk_jit"):
+                self._mtp1_chain_topk_jit = {}
+            key = (int(draft_len), int(top_k))
+            if key not in self._mtp1_chain_topk_jit:
+                self._mtp1_chain_topk_jit[key] = jax.jit(forward)
+            return self._mtp1_chain_topk_jit[key](
+                hidden_state,
+                token_ids,
+                positions,
+                self.params.embed_tokens,
+                mtp_params_tree,
+            )
+        return forward(hidden_state, token_ids, positions, self.params.embed_tokens, mtp_params_tree)
+
     def _greedy_tokens_from_hidden(self, hidden: jnp.ndarray) -> jnp.ndarray:
         from nanovllm_jax.layers import rms_norm
 
@@ -5578,6 +5719,12 @@ class CanonicalModelRunner:
         token_rows = output.activations.astype(jnp.int32)
         width = int(token_rows.shape[1])
         target_tokens = token_rows[:, :1]
+        chain_debug_payload = getattr(output, "debug_payload", None)
+        chain_debug_host = None
+        token_rows_host = None
+        if chain_debug_payload is not None:
+            chain_debug_host = jax.device_get(chain_debug_payload)
+            token_rows_host = jax.device_get(token_rows)
         self._record_device_token_carry(
             batch,
             target_tokens,
@@ -5600,6 +5747,33 @@ class CanonicalModelRunner:
                 self._mtp1_drafts[seq.seq_id] = chain_refs if len(chain_refs) > 1 else chain_refs[0]
                 self._mtp1_seeded_chain[seq.seq_id] = 0
                 stats["drafts_proposed"] += len(chain_refs)
+                if chain_debug_host is not None and token_rows_host is not None:
+                    draft_top_ids, draft_top_values = chain_debug_host
+                    draft_debug, _ = self._mtp1_debug_state()
+                    draft_debug[seq.seq_id] = {
+                        "confirmed_token_id": int(token_rows_host[row, 0]),
+                        "draft_chain": [
+                            int(token_rows_host[row, offset])
+                            for offset in range(1, width)
+                        ],
+                        "position": int(seqs[row].num_tokens),
+                        "position_offset": int(getattr(self, "mtp_position_offset", 0)),
+                        "token_source": str(getattr(self, "mtp_token_source", "generated")),
+                        "hidden_source": str(getattr(self, "mtp_hidden_source", "final_normed")),
+                        "mtp_chain_top": [
+                            {
+                                "ids": [
+                                    int(value)
+                                    for value in draft_top_ids[row, pos].tolist()
+                                ],
+                                "values": [
+                                    float(value)
+                                    for value in draft_top_values[row, pos].tolist()
+                                ],
+                            }
+                            for pos in range(len(chain_refs))
+                        ],
+                    }
             else:
                 self._mtp1_drafts.pop(seq.seq_id, None)
                 self._mtp1_seeded_chain.pop(seq.seq_id, None)
@@ -5665,7 +5839,22 @@ class CanonicalModelRunner:
             or "0"
         )
         draft_margin_values = None
-        if getattr(self, "mtp_debug", False):
+        chain_logit_debug = os.environ.get(
+            "NANO_VLLM_JAX_MTP_CHAIN_LOGIT_DEBUG",
+            "0",
+        ) in {"1", "true", "yes", "on", "True"}
+        draft_top_ids = None
+        draft_top_values = None
+        if chain_logit_debug:
+            draft_logits = None
+            draft_chains, draft_top_ids, draft_top_values = self._mtp1_draft_chain_with_topk(
+                hidden_state=hidden_input,
+                token_ids=token_input,
+                positions=position_input,
+                draft_len=draft_len,
+                top_k=5,
+            )
+        elif getattr(self, "mtp_debug", False):
             draft_logits = self._mtp1_logits(
                 hidden_state=hidden_input,
                 token_ids=token_input,
@@ -5696,6 +5885,7 @@ class CanonicalModelRunner:
 
         keep_drafts_on_device = (
             not getattr(self, "mtp_debug", False)
+            and not chain_logit_debug
             and draft_margin_threshold <= 0
         )
         draft_chain_list = (
@@ -5722,7 +5912,32 @@ class CanonicalModelRunner:
                 draft_chain = draft_chain_list[local_row]
             self._mtp1_drafts[seq.seq_id] = draft_chain if len(draft_chain) > 1 else draft_chain[0]
             self._mtp1_seeded_chain[seq.seq_id] = 0
-            if getattr(self, "mtp_debug", False):
+            if chain_logit_debug:
+                assert draft_top_ids is not None
+                assert draft_top_values is not None
+                draft_debug, _ = self._mtp1_debug_state()
+                draft_debug[seq.seq_id] = {
+                    "confirmed_token_id": int(token_values[local_row]),
+                    "draft_chain": [int(token) for token in draft_chain],
+                    "position": int(position_values[local_row] - int(getattr(self, "mtp_position_offset", 0))),
+                    "position_offset": int(getattr(self, "mtp_position_offset", 0)),
+                    "token_source": str(getattr(self, "mtp_token_source", "generated")),
+                    "hidden_source": str(getattr(self, "mtp_hidden_source", "final_normed")),
+                    "mtp_chain_top": [
+                        {
+                            "ids": [
+                                int(value)
+                                for value in draft_top_ids[local_row, draft_pos].tolist()
+                            ],
+                            "values": [
+                                float(value)
+                                for value in draft_top_values[local_row, draft_pos].tolist()
+                            ],
+                        }
+                        for draft_pos in range(draft_len)
+                    ],
+                }
+            elif getattr(self, "mtp_debug", False):
                 draft_token = draft_chain[0]
                 draft_vector = draft_logits[local_row, 0]
                 draft_debug, _ = self._mtp1_debug_state()
@@ -6244,10 +6459,14 @@ class CanonicalModelRunner:
             "NANO_VLLM_JAX_MTP_FORCE_GENERIC_K",
             "0",
         ) in {"1", "true", "yes", "on", "True"}
+        use_generic_k_verifier = (
+            force_generic_k_verifier
+            or verifier_impl in {"k_decode", "generic_k", "expanded"}
+        )
         use_one_pass_k1 = (
             draft_len == 1
             and not enable_fast_all_accept
-            and not force_generic_k_verifier
+            and not use_generic_k_verifier
             and not force_commit_select
             and not disable_one_pass_k1
             and not block_seeded_one_pass_k1
@@ -6259,7 +6478,7 @@ class CanonicalModelRunner:
             draft_len == 1
             and not use_one_pass_k1
             and not enable_fast_all_accept
-            and not force_generic_k_verifier
+            and not use_generic_k_verifier
             and hasattr(self.executor, "mtp1_commit_select_greedy_step_jit")
         )
         verifier_full_physical_batch = (
@@ -6280,7 +6499,7 @@ class CanonicalModelRunner:
         use_mtp2_commit_select = (
             draft_len == 2
             and mtp_burst_groups <= 1
-            and not force_generic_k_verifier
+            and not use_generic_k_verifier
             and verifier_full_physical_batch
             and hasattr(self.executor, "mtp2_commit_select_greedy_step_jit")
         )
@@ -6295,7 +6514,7 @@ class CanonicalModelRunner:
         )
         use_k_burst = (
             mtp_burst_groups > 1
-            and draft_len > 1
+            and (draft_len > 1 or use_generic_k_verifier)
             and not use_mtp2_commit_select
             and verifier_full_physical_batch
             and all(
@@ -6390,7 +6609,7 @@ class CanonicalModelRunner:
                 verifier_mode = "mtp2_commit_select"
             elif use_k_burst:
                 verifier_mode = "mtp_k_burst"
-            elif draft_len == 1 and not force_generic_k_verifier:
+            elif draft_len == 1 and not use_generic_k_verifier:
                 verifier_mode = "fallback_k1_no_verifier"
             elif partial_physical_batch and not use_compact_verifier:
                 verifier_mode = "fallback_k_gt1_partial_physical"
@@ -6525,7 +6744,7 @@ class CanonicalModelRunner:
             )
             _ready(output)
             t_profile = _mark("executor_mtp1_two_decode", t_profile)
-        elif draft_len == 1 and not force_generic_k_verifier:
+        elif draft_len == 1 and not use_generic_k_verifier:
             return None
         elif use_mtp2_commit_select:
             output = self.executor.mtp2_commit_select_greedy_step_jit(
@@ -6792,6 +7011,91 @@ class CanonicalModelRunner:
                 for group_idx in range(mtp_burst_groups)
             ]
             self._record_draft_position_acceptance(accepted_matrix)
+            if getattr(output, "debug_payload", None) is not None:
+                (
+                    draft_top_ids_dbg,
+                    draft_top_values_dbg,
+                    verifier_top_ids_dbg,
+                    verifier_top_values_dbg,
+                    draft_tokens_dbg,
+                    target_tokens_dbg,
+                ) = jax.device_get(output.debug_payload)
+                seed_debug_by_seq, debug_events = self._mtp1_debug_state()
+                for local_row, row in enumerate(rows):
+                    verifier_idx = verifier_index_for_local[local_row]
+                    seq_id = int(seqs[row].seq_id)
+                    seed_debug = seed_debug_by_seq.get(seq_id, {})
+                    seed_chain_top = seed_debug.get("mtp_chain_top", [])
+                    for group_idx in range(mtp_burst_groups):
+                        for draft_pos in range(draft_len):
+                            mtp_top_ids = [
+                                int(value)
+                                for value in draft_top_ids_dbg[
+                                    verifier_idx, group_idx, draft_pos
+                                ].tolist()
+                            ]
+                            verifier_top_ids = [
+                                int(value)
+                                for value in verifier_top_ids_dbg[
+                                    verifier_idx, group_idx, draft_pos
+                                ].tolist()
+                            ]
+                            target_token_dbg = int(
+                                target_tokens_dbg[verifier_idx, group_idx, draft_pos]
+                            )
+                            draft_token_dbg = int(
+                                draft_tokens_dbg[verifier_idx, group_idx, draft_pos]
+                            )
+                            mtp_top_source = "verifier_current_hidden_recompute"
+                            mtp_top_values = [
+                                float(value)
+                                for value in draft_top_values_dbg[
+                                    verifier_idx, group_idx, draft_pos
+                                ].tolist()
+                            ]
+                            if group_idx == 0 and draft_pos < len(seed_chain_top):
+                                seed_top = seed_chain_top[draft_pos]
+                                mtp_top_ids = [int(value) for value in seed_top.get("ids", [])]
+                                mtp_top_values = [
+                                    float(value)
+                                    for value in seed_top.get("values", [])
+                                ]
+                                seed_chain = seed_debug.get("draft_chain", [])
+                                if draft_pos < len(seed_chain):
+                                    draft_token_dbg = int(seed_chain[draft_pos])
+                                mtp_top_source = "seed_time"
+                            debug_events.append(
+                                {
+                                    "kind": "mtp_k_logit_debug",
+                                    "seq_id": seq_id,
+                                    "row": int(row),
+                                    "verifier_row": int(verifier_idx),
+                                    "burst_group": int(group_idx),
+                                    "draft_position": int(draft_pos),
+                                    "draft_token": draft_token_dbg,
+                                    "target_token": target_token_dbg,
+                                    "accepted": bool(
+                                        accepted_matrix[
+                                            local_row * mtp_burst_groups + group_idx
+                                        ][draft_pos]
+                                    ),
+                                    "target_in_mtp_top5": target_token_dbg in mtp_top_ids,
+                                    "mtp_top_source": mtp_top_source,
+                                    "mtp_top": {
+                                        "ids": mtp_top_ids,
+                                        "values": mtp_top_values,
+                                    },
+                                    "verifier_top": {
+                                        "ids": verifier_top_ids,
+                                        "values": [
+                                            float(value)
+                                            for value in verifier_top_values_dbg[
+                                                verifier_idx, group_idx, draft_pos
+                                            ].tolist()
+                                        ],
+                                    },
+                                }
+                            )
 
             outputs: dict[int, List[int] | int] = {}
             stats = self._speculative_stats()
@@ -6854,6 +7158,8 @@ class CanonicalModelRunner:
                     stats["drafts_proposed"] += len(next_chain)
                 else:
                     self._mtp1_seeded_chain.pop(seq.seq_id, None)
+            if not ModelRunner._device_token_carry_enabled(self):
+                outputs = ModelRunner._materialize_device_token_outputs(outputs)
             self._record_mtp_output_token_carry(committed_batch, seqs, outputs)
             t_profile = _mark("resident_burst_commit", t_profile)
             return outputs
@@ -7017,7 +7323,7 @@ class CanonicalModelRunner:
             not accepted_all
             and not (use_one_pass_k1 or use_commit_select)
             and draft_len == 1
-            and not force_generic_k_verifier
+            and not use_generic_k_verifier
         ):
             # Correctness first: the verifier may have physically written KV /
             # hybrid state for rejected draft slots. Do not install those side
@@ -7342,7 +7648,7 @@ class CanonicalModelRunner:
                     "NANO_VLLM_JAX_MTP_SEED_REJECTED_K1",
                     "0",
                 ) in {"1", "true", "yes", "on", "True"}
-                seed_rejected_k1 = seed_rejected_k1 or bool(force_generic_k_verifier)
+                seed_rejected_k1 = seed_rejected_k1 or bool(use_generic_k_verifier)
                 can_seed_next_chain = seed_after_bonus and (accepted or seed_rejected_k1)
             else:
                 can_seed_next_chain = prefix_len < draft_len or seed_after_bonus

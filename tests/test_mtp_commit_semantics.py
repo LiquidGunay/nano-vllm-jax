@@ -1031,11 +1031,10 @@ def test_generic_k1_rejected_prefix_seeds_next_draft(monkeypatch):
         block_size=16,
         num_speculative_tokens=1,
     )
-    runner.mtp_verifier_impl = "commit_select"
+    runner.mtp_verifier_impl = "k_decode"
     runner.mtp_seed_after_bonus = True
     seqs = [_seq(0, seq_lens[0])]
 
-    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FORCE_GENERIC_K", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_SEED_AFTER_BONUS", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
 
@@ -1056,6 +1055,52 @@ def test_generic_k1_rejected_prefix_seeds_next_draft(monkeypatch):
     }
     assert runner._mtp1_drafts == {0: 301}
     assert runner.stored[-1][0].seq_lens.tolist() == [5]
+
+
+def test_k1_k_decode_verifier_uses_expanded_boundary_without_env(monkeypatch):
+    seq_lens = [5, 6]
+    executor = _FakeExecutor(
+        accepted=[[True], [False]],
+        target=[[10], [101]],
+        bonus=[20, 201],
+        next_draft=[[30], [301]],
+        state_marker=[901, 910],
+        committed_seq_lens=[6, 6],
+        kv_slots=[
+            [1000, 1001],
+            [1010, 2011],
+        ],
+    )
+    runner = _FakeRunner(
+        executor,
+        {0: 10, 1: 11},
+        block_size=16,
+        num_speculative_tokens=1,
+    )
+    runner.mtp_verifier_impl = "k_decode"
+    seqs = [_seq(i, seq_lens[i]) for i in range(2)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_FORCE_GENERIC_K", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_COMMIT_SELECT", raising=False)
+
+    outputs = ModelRunner._run_mtp1_batched(
+        runner,
+        seqs,
+        _batch(seq_lens),
+        [0, 1],
+    )
+
+    assert outputs == {0: [10, 20], 1: 101}
+    assert runner.executor.calls[-1]["method"] == "mtp_k_decode"
+    assert runner.executor.calls[-1]["draft_tokens"] == [[10], [11]]
+    assert runner.stats == {
+        "drafts_proposed": 0,
+        "drafts_accepted": 1,
+        "drafts_rejected": 1,
+        "bonus_tokens": 1,
+    }
 
 
 def test_fused_chain_seed_supports_partial_padded_rows():
@@ -1264,6 +1309,52 @@ def test_k2_burst_exact_commits_multirow_all_accept(monkeypatch):
     assert _resolve_output_tokens(runner._mtp1_drafts[1]) == [32, 33]
     assert runner._mtp1_seeded_chain == {0: 4, 1: 4}
     assert runner.stored[-1][0].seq_lens.tolist() == [10, 11]
+
+
+def test_k1_k_decode_burst_commits_multiple_verified_groups(monkeypatch):
+    seq_lens = [5, 6]
+    executor = _FakeExecutor(
+        accepted=[True, True],
+        target=[10, 12],
+        bonus=[20, 22],
+        next_draft=[30, 32],
+        state_marker=[908, 918],
+        committed_seq_lens=[11, 12],
+        kv_slots=[[1000, 1001], [1010, 1011]],
+    )
+    runner = _FakeRunner(
+        executor,
+        {0: 10, 1: 12},
+        block_size=16,
+        num_speculative_tokens=1,
+    )
+    runner.mtp_verifier_impl = "k_decode"
+    seqs = [_seq(i, seq_lens[i], max_tokens=64) for i in range(2)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "3")
+
+    outputs = ModelRunner._run_mtp1_batched(
+        runner,
+        seqs,
+        _batch(seq_lens),
+        [0, 1],
+    )
+
+    assert runner.executor.calls[-1]["method"] == "mtp_k_burst"
+    assert runner.executor.calls[-1]["burst_groups"] == 3
+    assert _resolve_output_tokens(outputs[0]) == [10, 20, 10, 21, 10, 22]
+    assert _resolve_output_tokens(outputs[1]) == [12, 22, 12, 23, 12, 24]
+    assert runner.stats == {
+        "drafts_proposed": 6,
+        "drafts_accepted": 6,
+        "drafts_rejected": 0,
+        "bonus_tokens": 6,
+    }
+    assert _resolve_output_tokens(runner._mtp1_drafts[0]) == [30]
+    assert _resolve_output_tokens(runner._mtp1_drafts[1]) == [32]
+    assert runner._mtp1_seeded_chain == {0: 3, 1: 3}
+    assert runner.stored[-1][0].seq_lens.tolist() == [11, 12]
 
 
 def test_k2_burst_mixed_reject_commits_without_repair(monkeypatch):

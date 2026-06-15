@@ -107,6 +107,18 @@ optimization work starts.
     already-computed target-token output. Any speed claim must compare against
     the same no-MTP config on `hetero8` and `random_large`; unsafe all-accept
     shortcuts remain upper bounds only.
+21. As of 2026-06-15, verified K=1 uses explicit
+    `mtp_verifier_impl=k_decode` rather than the old
+    `NANO_VLLM_JAX_MTP_FORCE_GENERIC_K=1` diagnostic. On the two-request smoke
+    manifest it preserves the good MTP-head/verifier behavior (`11/13`
+    accepted, `84.6%`, zero measured JIT growth) but is still slower than the
+    no-MTP path (`~28.6-30.4` versus `47.25 output tok/s`). K=1
+    `mtp_burst_groups=2` is implemented and correctness-clean on the same
+    smoke, but only reached `29.83 output tok/s`; it reduces return-to-Python
+    frequency but does not remove enough target-model verifier work. Do not
+    promote `return_first_prefix_hybrid` for K=1 verification: it reduced
+    acceptance to `6/13` on the same smoke, so full prefix-hybrid selection is
+    required until a layerwise proof/fix exists.
 
 ## Active Random Request Contract - 2026-06-04
 

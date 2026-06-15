@@ -224,7 +224,7 @@ def _mtp_greedy_top1_token_ids(
     if impl in {"triton", "triton_tensorcore", "triton_top1"}:
         from nanovllm_jax.kernels.lm_head_triton import lm_head_greedy_top1_triton
 
-        return lm_head_greedy_top1_triton(x_normed, output_weight).astype(jnp.int32)
+        return lm_head_greedy_top1_triton(x_normed.astype(output_weight.dtype), output_weight).astype(jnp.int32)
     if impl in {"cutlass", "cutlass_top1", "cutlass_fused_gemm", "fused_gemm"}:
         raise NotImplementedError(
             "lm_head_greedy_top1_impl='cutlass' is not implemented for MTP draft seeding"
@@ -267,7 +267,7 @@ def mtp_forward(
         - Draft logits [batch, seq_len, vocab_size]
         - Output hidden state [batch, seq_len, hidden_size] (for chaining MTP predictions)
     """
-    x_normed, _ = _mtp_forward_hidden(
+    x_normed, x = _mtp_forward_hidden(
         hidden_state=hidden_state,
         next_token_ids=next_token_ids,
         embed_tokens=embed_tokens,
@@ -282,7 +282,7 @@ def mtp_forward(
     output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
     logits = jnp.dot(x_normed, output_weight)
 
-    return logits, x_normed
+    return logits, x
 
 
 def mtp_forward_token_ids(
@@ -294,7 +294,7 @@ def mtp_forward_token_ids(
     positions: Optional[jnp.ndarray] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """MTP forward pass for greedy draft token ids without materializing logits."""
-    x_normed, _ = _mtp_forward_hidden(
+    x_normed, x = _mtp_forward_hidden(
         hidden_state=hidden_state,
         next_token_ids=next_token_ids,
         embed_tokens=embed_tokens,
@@ -305,7 +305,7 @@ def mtp_forward_token_ids(
     output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
     x_normed = x_normed.astype(_mtp_decode_activation_dtype(config))
     token_ids = _mtp_greedy_top1_token_ids(x_normed, output_weight, config)
-    return token_ids, x_normed
+    return token_ids, x
 
 
 def mtp_layer_forward(

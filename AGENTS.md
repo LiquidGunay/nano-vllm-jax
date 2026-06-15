@@ -110,6 +110,22 @@
   tok/s`. Do not retry K=2/K=4 generic decode or packed-prefill verification
   as a speed route unless the verifier boundary avoids per-step host decisions
   and the MTP-head/main-width verifier work is materially reduced.
+  On 2026-06-15, the verified K=1 path was promoted from the
+  `NANO_VLLM_JAX_MTP_FORCE_GENERIC_K=1` diagnostic to explicit
+  `mtp_verifier_impl=k_decode`. On the two-request smoke manifest it matched
+  the diagnostic acceptance (`11/13`, `84.6%`) with zero measured JIT growth,
+  reaching about `28.55-30.41 output tok/s` depending on run variance, still
+  below the no-MTP control (`47.25 output tok/s`). K=1 burst verification now
+  supports `mtp_burst_groups>1`; burst-2 reached `29.83 output tok/s` with the
+  same acceptance and zero JIT growth, so it is only a small host-sync
+  amortization win, not a final speed path. A K=1 logit-debug burst run showed
+  seed-time MTP top-1 matching verifier top-1 for `5/6` first-group drafts and
+  target-in-MTP-top5 for `5/6`; the remaining rejection was a real logit
+  disagreement, not a draft bookkeeping bug. Do not use
+  `return_first_prefix_hybrid` as a shortcut for the K=1 verifier state
+  selection: the first-prefix specialization dropped acceptance to `6/13`
+  (`46.2%`) on the same smoke, so full prefix-hybrid selection remains required
+  until the first-prefix state is proven equivalent layer by layer.
 - Keep these work items in order: accepted FA/FLA policy validation, broader
   resident/scheduler decode metadata reduction, coarse GDN decode/prefill
   kernels, and model-family-general batched GEMM/fusion improvements.

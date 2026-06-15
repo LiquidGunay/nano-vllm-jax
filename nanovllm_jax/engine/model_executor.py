@@ -97,6 +97,7 @@ class ExecutorOutput:
     resident_seq_lens: Optional[jnp.ndarray] = None
     resident_last_tokens: Optional[jnp.ndarray] = None
     resident_rng_counters: Optional[jnp.ndarray] = None
+    debug_payload: object | None = None
 
 
 @dataclass
@@ -113,6 +114,7 @@ class MTP1GreedyOutput:
     emitted_counts: object | None = None
     accepted_counts: object | None = None
     burst_groups: int | None = None
+    debug_payload: object | None = None
 
 
 @dataclass
@@ -1671,6 +1673,10 @@ class ModelExecutor:
             last_logits_only=False,
         )
         self._validate_batch_contract(batch)
+        chain_logit_debug = os.environ.get(
+            "NANO_VLLM_JAX_MTP_CHAIN_LOGIT_DEBUG",
+            "0",
+        ) in {"1", "true", "yes", "on", "True"}
 
         key = (
             "token-ids-mtp-draft-chain",
@@ -1681,6 +1687,7 @@ class ModelExecutor:
             tuple(hybrid_state.conv_state.shape),
             tuple(hybrid_state.recurrent_state.shape),
             bool(mtp_hidden_final_normed),
+            bool(chain_logit_debug),
         )
         if key not in self._jit_cache:
 
@@ -1763,15 +1770,31 @@ class ModelExecutor:
                     + jnp.asarray(int(getattr(self.config, "mtp_position_offset", 0)), dtype=jnp.int32)
                 )[:, None]
                 draft_tokens = []
+                draft_top_ids = []
+                draft_top_values = []
                 for _ in range(draft_len):
-                    mtp_token_ids, current_hidden = mtp_forward_token_ids(
-                        hidden_state=current_hidden,
-                        next_token_ids=current_token,
-                        embed_tokens=params.embed_tokens,
-                        params=params.mtp_params,
-                        config=self.config,
-                        positions=current_position,
-                    )
+                    if chain_logit_debug:
+                        draft_logits, current_hidden = mtp_forward(
+                            hidden_state=current_hidden,
+                            next_token_ids=current_token,
+                            embed_tokens=params.embed_tokens,
+                            params=params.mtp_params,
+                            config=self.config,
+                            positions=current_position,
+                        )
+                        values, ids = jax.lax.top_k(draft_logits[:, 0].astype(jnp.float32), 5)
+                        mtp_token_ids = jnp.argmax(draft_logits[:, 0], axis=-1).astype(jnp.int32)[:, None]
+                        draft_top_ids.append(ids.astype(jnp.int32))
+                        draft_top_values.append(values.astype(jnp.float32))
+                    else:
+                        mtp_token_ids, current_hidden = mtp_forward_token_ids(
+                            hidden_state=current_hidden,
+                            next_token_ids=current_token,
+                            embed_tokens=params.embed_tokens,
+                            params=params.mtp_params,
+                            config=self.config,
+                            positions=current_position,
+                        )
                     current_token = mtp_token_ids[:, 0].astype(jnp.int32)[:, None]
                     draft_tokens.append(current_token[:, 0])
                     current_position = current_position + 1
@@ -1781,17 +1804,25 @@ class ModelExecutor:
                 ).astype(jnp.int32)
                 active = (query_lens > 0) & (seq_ids >= 0)
                 token_rows = jnp.where(active[:, None], token_rows, jnp.zeros_like(token_rows))
+                if chain_logit_debug:
+                    debug_payload = (
+                        jnp.stack(draft_top_ids, axis=1),
+                        jnp.stack(draft_top_values, axis=1),
+                    )
+                else:
+                    debug_payload = None
                 return (
                     token_rows,
                     updated_kv_state.k_cache,
                     updated_kv_state.v_cache,
                     updated_hybrid_state.conv_state,
                     updated_hybrid_state.recurrent_state,
+                    debug_payload,
                 )
 
             self._jit_cache[key] = jax.jit(compiled, donate_argnums=(7, 8))
 
-        token_rows, k_cache, v_cache, conv_state, recurrent_state = self._profile_jit_call(
+        token_rows, k_cache, v_cache, conv_state, recurrent_state, debug_payload = self._profile_jit_call(
             key,
             self._jit_cache[key],
             (
@@ -1814,6 +1845,7 @@ class ModelExecutor:
             cache_storage=KVCacheStorage(k_cache, v_cache),
             attention_metadata=None,
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
+            debug_payload=debug_payload,
         )
 
     def forward_step_sampled_token_ids_jit(
@@ -7205,6 +7237,10 @@ class ModelExecutor:
             )
         if verify_mode == "prefill" and int(batch.tokens.shape[0]) != 1:
             raise ValueError("MTP K burst prefill verifier currently supports only batch=1")
+        logit_debug_enabled = os.environ.get(
+            "NANO_VLLM_JAX_MTP_K_LOGIT_DEBUG",
+            "0",
+        ) in {"1", "true", "yes", "on", "True"}
 
         key = (
             "mtp-k-burst-greedy-compact-lm-head",
@@ -7215,6 +7251,7 @@ class ModelExecutor:
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
+            bool(logit_debug_enabled),
         )
         if key not in self._jit_cache:
 
@@ -7249,6 +7286,11 @@ class ModelExecutor:
                 bonus_groups = []
                 accepted_groups = []
                 accepted_count_groups = []
+                debug_draft_top_ids_groups = []
+                debug_draft_top_values_groups = []
+                debug_verifier_top_ids_groups = []
+                debug_verifier_top_values_groups = []
+                debug_draft_token_groups = []
 
                 def _gather_prefix(value: jnp.ndarray, prefix_len: jnp.ndarray) -> jnp.ndarray:
                     gather_idx = prefix_len.astype(jnp.int32)
@@ -7351,6 +7393,54 @@ class ModelExecutor:
                     ).reshape(hidden_norm.shape[0], hidden_norm.shape[1]).astype(jnp.int32)
                     target_tokens = token_ids[:, :draft_len]
                     bonus_token = token_ids[:, draft_len]
+                    if logit_debug_enabled:
+                        verifier_logits = jnp.dot(
+                            hidden_norm[:, :draft_len, :],
+                            output_weight,
+                        ).astype(jnp.float32)
+                        verifier_top_values, verifier_top_ids = jax.lax.top_k(verifier_logits, 5)
+                        debug_hidden_current = (
+                            hidden_norm[:, 0:1, :]
+                            if mtp_hidden_final_normed
+                            else hidden[:, 0:1, :]
+                        )
+                        debug_token_current = current_tokens
+                        debug_position_current = current_positions
+                        draft_top_ids = []
+                        draft_top_values = []
+                        draft_debug_tokens = []
+                        for _debug_idx in range(draft_len):
+                            draft_logits, debug_hidden_current = mtp_forward(
+                                hidden_state=debug_hidden_current,
+                                next_token_ids=debug_token_current,
+                                embed_tokens=params.embed_tokens,
+                                params=params.mtp_params,
+                                config=self.config,
+                                positions=debug_position_current,
+                            )
+                            top_values, top_ids = jax.lax.top_k(
+                                draft_logits[:, 0].astype(jnp.float32),
+                                5,
+                            )
+                            debug_token_current = jnp.argmax(
+                                draft_logits[:, 0],
+                                axis=-1,
+                            ).astype(jnp.int32)[:, None]
+                            draft_top_ids.append(top_ids.astype(jnp.int32))
+                            draft_top_values.append(top_values.astype(jnp.float32))
+                            draft_debug_tokens.append(debug_token_current[:, 0])
+                            debug_position_current = debug_position_current + 1
+                        debug_draft_top_ids_groups.append(
+                            jnp.stack(draft_top_ids, axis=1)
+                        )
+                        debug_draft_top_values_groups.append(
+                            jnp.stack(draft_top_values, axis=1)
+                        )
+                        debug_verifier_top_ids_groups.append(verifier_top_ids.astype(jnp.int32))
+                        debug_verifier_top_values_groups.append(verifier_top_values.astype(jnp.float32))
+                        debug_draft_token_groups.append(
+                            jnp.stack(draft_debug_tokens, axis=1)
+                        )
                     row_query_lens = jnp.diff(verify_query_start_loc).astype(jnp.int32)
                     row_active = (row_query_lens > 0) & (seq_ids >= 0)
                     raw_accepted = (target_tokens == current_drafts) & row_active[:, None]
@@ -7453,6 +7543,17 @@ class ModelExecutor:
                 bonus_tokens = jnp.stack(bonus_groups, axis=1)
                 accepted = jnp.stack(accepted_groups, axis=1)
                 accepted_counts = jnp.stack(accepted_count_groups, axis=1)
+                if logit_debug_enabled:
+                    debug_payload = (
+                        jnp.stack(debug_draft_top_ids_groups, axis=1),
+                        jnp.stack(debug_draft_top_values_groups, axis=1),
+                        jnp.stack(debug_verifier_top_ids_groups, axis=1),
+                        jnp.stack(debug_verifier_top_values_groups, axis=1),
+                        jnp.stack(debug_draft_token_groups, axis=1),
+                        target_tokens,
+                    )
+                else:
+                    debug_payload = None
                 return (
                     emitted_tokens,
                     emitted_counts,
@@ -7466,6 +7567,7 @@ class ModelExecutor:
                     current_conv_state,
                     current_recurrent_state,
                     current_seq_lens,
+                    debug_payload,
                 )
 
             self._jit_cache[key] = jax.jit(compiled)
@@ -7483,6 +7585,7 @@ class ModelExecutor:
             conv_state,
             recurrent_state,
             committed_seq_lens,
+            debug_payload,
         ) = self._profile_jit_call(
             key,
             self._jit_cache[key],
@@ -7515,6 +7618,7 @@ class ModelExecutor:
             emitted_counts=emitted_counts,
             accepted_counts=accepted_counts,
             burst_groups=burst_groups,
+            debug_payload=debug_payload,
         )
 
     @staticmethod
