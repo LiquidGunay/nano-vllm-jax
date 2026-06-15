@@ -421,10 +421,11 @@
   variants were already slower. Do not retry isolated GDN decode replacement as
   the 0.9x lever on A10G; the next speed route needs a broader serving boundary
   than per-layer GDN decode or a different bottleneck.
-- Entry 299 tightened strict GDN fallback behavior for packed prefill. With
+- Entry 299 tightened strict GDN fallback behavior for prefill. With
   `gdn_disable_fallbacks=True`/`NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS=1`, packed
-  GDN prefill now errors before convolution if `return_prefix_state`,
-  `return_first_prefix_state`, recurrent prefill, or disabled post-conv kernels
-  would force the slow JAX recurrent scan. This intentionally rejects the
-  packed-prefill MTP verifier route until a kernel-backed prefix-state boundary
-  exists; do not re-enable this fallback for benchmark runs.
+  and non-packed GDN prefill now error before the slow recurrent/chunked branch
+  if `return_prefix_state`, `return_first_prefix_state`, recurrent prefill, or
+  disabled post-conv kernels would prevent the post-conv kernel path. This
+  intentionally rejects the packed-prefill MTP verifier route until a
+  kernel-backed prefix-state boundary exists; do not re-enable this fallback
+  for benchmark runs.

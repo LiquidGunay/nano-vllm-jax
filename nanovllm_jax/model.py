@@ -2279,6 +2279,23 @@ def gated_deltanet_block(
             and not return_prefix_state
             and not return_first_prefix_state
         )
+        if gdn_disable_fallbacks_enabled(config) and not use_post_conv_prefill:
+            reasons = []
+            if not gdn_prefill_post_conv_enabled(config):
+                reasons.append("post-conv prefill kernel is disabled")
+            if use_recurrent_prefill:
+                reasons.append("recurrent prefill is requested")
+            if return_prefix_state:
+                reasons.append("return_prefix_state needs state-sequence output")
+            if return_first_prefix_state:
+                reasons.append("return_first_prefix_state needs prefix-state output")
+            if not reasons:
+                reasons.append("the post-conv prefill predicate was false")
+            raise RuntimeError(
+                "GDN prefill post-conv fallback is disabled, but the requested "
+                "prefill route would use the slow JAX recurrent/chunked path: "
+                + "; ".join(reasons)
+            )
         if use_post_conv_prefill:
             core_attn_out, final_state = backend.gated_delta_prefill_post_conv(
                 conv_out,
