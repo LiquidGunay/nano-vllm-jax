@@ -1274,6 +1274,47 @@ def test_model_post_conv_prefill_strict_rejects_missing_triton_module(monkeypatc
         )
 
 
+def test_model_packed_prefill_strict_rejects_prefix_state_fallback(monkeypatch):
+    for env_name in (
+        "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS",
+        "NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    config = _small_gdn_config()
+    config.gdn_disable_fallbacks = True
+    config.gdn_prefill_post_conv_impl = "triton_fla_padded"
+    config.linear_recurrent_prefill_threshold = 0
+    config.prefill_buckets = (8,)
+    params = init_transformer_block(jax.random.PRNGKey(3), config, layer_idx=0)
+    seq_len = 8
+    x = jnp.linspace(
+        -0.2,
+        0.3,
+        seq_len * config.hidden_size,
+        dtype=jnp.float32,
+    ).reshape(1, seq_len, config.hidden_size)
+    positions = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+    packed_token_row_ids = jnp.array(
+        [[0, 0, 0, 1, 1, 1, 1, 1]],
+        dtype=jnp.int32,
+    )
+    packed_query_start_loc = jnp.array([0, 3, 8], dtype=jnp.int32)
+
+    with pytest.raises(RuntimeError, match="return_first_prefix_state"):
+        gated_deltanet_block(
+            x,
+            params,
+            positions,
+            config,
+            layer_idx=0,
+            is_prefill=True,
+            return_first_prefix_state=True,
+            packed_token_row_ids=packed_token_row_ids,
+            packed_query_start_loc=packed_query_start_loc,
+        )
+
+
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 def test_cuda_post_conv_prep_matches_jax_prep_with_mask():
     batch = 2

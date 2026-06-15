@@ -45,6 +45,10 @@ This roadmap is grouped by work type. It is not a production-readiness claim.
   non-boundary FlashInfer smoke validated the packed shape and fixed packed
   `kv_lens` visibility, but packed-prefill still diverged from no-MTP at one
   generated token while decode verification remained exact.
+- Strict GDN fallback mode must error on packed-prefill prefix-state verifier
+  routes until there is a kernel-backed prefix-state boundary. Do not let
+  `return_prefix_hybrid` or `return_first_prefix_hybrid` silently select the
+  slow JAX recurrent scan in packed GDN prefill.
 - Use the vLLM/MaxText references for the next boundary design: vLLM flattens
   speculative metadata and pads uniform speculative decode graph keys, while
   MaxText donates persistent decode state into a compiled `generate` step.

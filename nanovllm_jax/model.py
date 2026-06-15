@@ -1954,6 +1954,33 @@ def gated_deltanet_block(
                 0,
                 seq_len - 1,
             )
+            use_packed_post_conv_prefill = (
+                gdn_prefill_post_conv_enabled(config)
+                and not use_recurrent_prefill
+                and not return_prefix_state
+                and not return_first_prefix_state
+            )
+            if (
+                gdn_disable_fallbacks_enabled(config)
+                and not use_packed_post_conv_prefill
+            ):
+                reasons = []
+                if not gdn_prefill_post_conv_enabled(config):
+                    reasons.append("packed post-conv prefill kernel is disabled")
+                if use_recurrent_prefill:
+                    reasons.append("recurrent prefill is requested")
+                if return_prefix_state:
+                    reasons.append("return_prefix_state needs state-sequence output")
+                if return_first_prefix_state:
+                    reasons.append("return_first_prefix_state needs prefix-state output")
+                if not reasons:
+                    reasons.append("the packed post-conv prefill predicate was false")
+                raise RuntimeError(
+                    "GDN packed prefill post-conv fallback is disabled, but the "
+                    "requested packed prefill route would use the slow JAX "
+                    "recurrent scan: "
+                    + "; ".join(reasons)
+                )
             conv_weight = params["conv1d_weight"].reshape(conv_dim, config.linear_conv_kernel_size)
             conv_bias = params.get("conv1d_bias")
             if use_cached_prefill:
@@ -1994,13 +2021,6 @@ def gated_deltanet_block(
                     ),
                     dtype=jnp.float32,
                 )
-            )
-
-            use_packed_post_conv_prefill = (
-                gdn_prefill_post_conv_enabled(config)
-                and not use_recurrent_prefill
-                and not return_prefix_state
-                and not return_first_prefix_state
             )
             if use_packed_post_conv_prefill:
                 core_attn_out, final_state = backend.gated_delta_packed_prefill_post_conv(
