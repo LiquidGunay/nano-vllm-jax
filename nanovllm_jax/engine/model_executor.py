@@ -6996,6 +6996,11 @@ class ModelExecutor:
                     verify_tokens = verify_tokens_rows
                     verify_positions = verify_positions_rows
                     token_row_ids = None
+                # Packed prefill writes all verifier tokens before attention, so
+                # kv_lens must include the current token and every draft token.
+                verify_seq_lens = seq_lens + (
+                    draft_len + 1 if verify_as_prefill else draft_len
+                )
                 verify_batch = ScheduledBatch(
                     tokens=verify_tokens,
                     positions=verify_positions,
@@ -7005,7 +7010,7 @@ class ModelExecutor:
                     num_prefill_tokens=num_decode_tokens * (draft_len + 1) if verify_as_prefill else 0,
                     num_decode_tokens=0 if verify_as_prefill else num_decode_tokens * (draft_len + 1),
                     block_tables=block_tables,
-                    seq_lens=seq_lens + draft_len,
+                    seq_lens=verify_seq_lens,
                     packed_prefill=verify_as_prefill,
                     token_row_ids=token_row_ids,
                 )
@@ -7240,8 +7245,6 @@ class ModelExecutor:
             raise ValueError(
                 "NANO_VLLM_JAX_MTP_K_VERIFY_MODE must be 'decode' or 'prefill'"
             )
-        if verify_mode == "prefill" and int(batch.tokens.shape[0]) != 1:
-            raise ValueError("MTP K burst prefill verifier currently supports only batch=1")
         logit_debug_enabled = os.environ.get(
             "NANO_VLLM_JAX_MTP_K_LOGIT_DEBUG",
             "0",
@@ -7307,8 +7310,8 @@ class ModelExecutor:
                     return jnp.take_along_axis(value, gather_idx, axis=1)[:, 0, ...]
 
                 for _ in range(burst_groups):
-                    verify_tokens = jnp.concatenate([current_tokens, current_drafts], axis=1)
-                    verify_positions = (
+                    verify_tokens_rows = jnp.concatenate([current_tokens, current_drafts], axis=1)
+                    verify_positions_rows = (
                         current_positions
                         + jnp.arange(draft_len + 1, dtype=jnp.int32)[None, :]
                     )
@@ -7316,10 +7319,27 @@ class ModelExecutor:
                         jnp.arange(tokens.shape[0] + 1, dtype=jnp.int32) * (draft_len + 1)
                     )
                     verify_as_prefill = verify_mode == "prefill"
-                    token_row_ids = (
-                        jnp.zeros_like(verify_tokens, dtype=jnp.int32)
-                        if verify_as_prefill
-                        else None
+                    if verify_as_prefill:
+                        verify_tokens = verify_tokens_rows.reshape(
+                            1,
+                            tokens.shape[0] * (draft_len + 1),
+                        )
+                        verify_positions = verify_positions_rows.reshape(
+                            1,
+                            tokens.shape[0] * (draft_len + 1),
+                        )
+                        token_row_ids = jnp.broadcast_to(
+                            jnp.arange(tokens.shape[0], dtype=jnp.int32)[:, None],
+                            (tokens.shape[0], draft_len + 1),
+                        ).reshape(1, tokens.shape[0] * (draft_len + 1))
+                    else:
+                        verify_tokens = verify_tokens_rows
+                        verify_positions = verify_positions_rows
+                        token_row_ids = None
+                    # Packed prefill writes all verifier tokens before attention,
+                    # so kv_lens must include the current token and every draft token.
+                    verify_seq_lens = current_seq_lens + (
+                        draft_len + 1 if verify_as_prefill else draft_len
                     )
                     verify_batch = ScheduledBatch(
                         tokens=verify_tokens,
@@ -7330,7 +7350,7 @@ class ModelExecutor:
                         num_prefill_tokens=num_decode_tokens * (draft_len + 1) if verify_as_prefill else 0,
                         num_decode_tokens=0 if verify_as_prefill else num_decode_tokens * (draft_len + 1),
                         block_tables=block_tables,
-                        seq_lens=current_seq_lens + draft_len,
+                        seq_lens=verify_seq_lens,
                         packed_prefill=verify_as_prefill,
                         token_row_ids=token_row_ids,
                     )

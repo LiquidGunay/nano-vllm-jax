@@ -81,6 +81,23 @@ def _configure_flashinfer_cache() -> None:
         )
     Path(os.environ["FLASHINFER_WORKSPACE_BASE"]).mkdir(parents=True, exist_ok=True)
     Path(os.environ["FLASHINFER_CUBIN_DIR"]).mkdir(parents=True, exist_ok=True)
+    _configure_flashinfer_cuda_arch()
+
+
+def _configure_flashinfer_cuda_arch() -> None:
+    if os.environ.get("FLASHINFER_CUDA_ARCH_LIST"):
+        return
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+        pynvml.nvmlShutdown()
+    except Exception:
+        return
+    if major > 0:
+        os.environ.setdefault("FLASHINFER_CUDA_ARCH_LIST", f"{major}.{minor}")
 
 
 def _require_flashinfer_modules() -> None:

@@ -40,6 +40,14 @@ This roadmap is grouped by work type. It is not a production-readiness claim.
 - Implement a safe fast K=1 verifier that can commit rejected rows from after-current-token state without full repair decode.
 - Keep `mtp_verifier_impl=k_decode` as the verified K=1 optimization route; K=1 burst verification is available for host-sync amortization, but it still needs a cheaper exact prefix-state path before it can beat the no-MTP baseline.
 - Do not promote `return_first_prefix_hybrid` as that cheaper path until it matches full prefix-hybrid selection layer-by-layer; the 2026-06-15 smoke reduced acceptance from 11/13 to 6/13.
+- Keep packed-prefill K verifier work diagnostic-only until its verifier logits
+  and accept/reject decisions match the decode verifier. The 2026-06-15 B=2
+  non-boundary FlashInfer smoke validated the packed shape and fixed packed
+  `kv_lens` visibility, but packed-prefill still diverged from no-MTP at one
+  generated token while decode verification remained exact.
+- Use the vLLM/MaxText references for the next boundary design: vLLM flattens
+  speculative metadata and pads uniform speculative decode graph keys, while
+  MaxText donates persistent decode state into a compiled `generate` step.
 - Treat K=2 as optimization research only until it beats K=1/baseline in valid benchmarks.
 - Avoid accelerator-kernel claims unless a dedicated backend exists; current GPU path is JAX/XLA on CUDA.
 

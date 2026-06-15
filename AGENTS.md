@@ -136,6 +136,22 @@
   `7/16` position accepts), but remained slow (`19.29 output tok/s`) because
   verifier work and low acceptance still dominate. This validates the widened
   boundary, not a promoted speed path.
+  The same day, FlashInfer was made usable in this environment by installing a
+  CUDA Torch build and restoring JAX-compatible `triton>=3.6` plus
+  `nvidia-cudnn-cu12>=9.8`; keep this package constraint in mind because
+  PyTorch 2.5.1's metadata pins older Triton/cuDNN that break JAX. Runtime
+  setup now derives `FLASHINFER_CUDA_ARCH_LIST` from NVML when Torch cannot
+  discover CUDA. vLLM's relevant pattern is uniform speculative decode metadata
+  plus persistent CUDA-graph buffers; MaxText's relevant pattern is a donated
+  JIT `generate` transition over persistent decode state. A B=2 packed-prefill
+  verifier was added as a diagnostic route and its packed `kv_lens` was fixed
+  to include current plus all draft tokens, but it is not correctness-clean yet:
+  on the non-boundary two-request FlashInfer smoke it reached `26.87 output
+  tok/s` with zero measured JIT growth, close to the decode verifier's `26.78`,
+  but diverged from no-MTP at row `len_129` token index 9. The decode verifier
+  stayed exact against no-MTP on that same non-boundary smoke while no-MTP
+  reached `77.34 output tok/s`. Do not promote packed-prefill verification
+  until verifier logits/acceptance match decode verifier under the same inputs.
 - Keep these work items in order: accepted FA/FLA policy validation, broader
   resident/scheduler decode metadata reduction, coarse GDN decode/prefill
   kernels, and model-family-general batched GEMM/fusion improvements.

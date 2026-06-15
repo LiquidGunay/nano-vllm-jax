@@ -40,7 +40,30 @@ def configure_flashinfer_cache() -> str:
     os.environ.setdefault("FLASHINFER_CUBIN_DIR", str(cubin_dir))
     Path(os.environ["FLASHINFER_WORKSPACE_BASE"]).mkdir(parents=True, exist_ok=True)
     Path(os.environ["FLASHINFER_CUBIN_DIR"]).mkdir(parents=True, exist_ok=True)
+    configure_flashinfer_cuda_arch()
     return os.environ["FLASHINFER_WORKSPACE_BASE"]
+
+
+def configure_flashinfer_cuda_arch() -> str | None:
+    """Set FlashInfer's CUDA arch when Torch cannot discover the GPU."""
+
+    configured = os.environ.get("FLASHINFER_CUDA_ARCH_LIST")
+    if configured:
+        return configured
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+        pynvml.nvmlShutdown()
+    except Exception:
+        return None
+    if major <= 0:
+        return None
+    arch = f"{major}.{minor}"
+    os.environ.setdefault("FLASHINFER_CUDA_ARCH_LIST", arch)
+    return arch
 
 
 def configure_xla_flags(default_gpu_autotune_level: int = 4) -> str:
