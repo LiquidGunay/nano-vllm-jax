@@ -126,6 +126,16 @@
   selection: the first-prefix specialization dropped acceptance to `6/13`
   (`46.2%`) on the same smoke, so full prefix-hybrid selection remains required
   until the first-prefix state is proven equivalent layer by layer.
+  Later on 2026-06-15, the verified K=1 burst boundary was widened: the
+  executor now compacts emitted burst tokens on device and returns per-row
+  emitted/accepted/rejected/bonus totals plus an acceptance bitmask, so Python
+  no longer walks the `[batch, burst_groups]` count matrix to commit K=1 burst
+  outputs. Unit coverage includes mixed accept/reject K=1 burst ordering. A
+  forced two-request GPU smoke with reference attention had zero measured JIT
+  growth, no backend fallbacks, and sane counters (`7/19` accepted drafts,
+  `7/16` position accepts), but remained slow (`19.29 output tok/s`) because
+  verifier work and low acceptance still dominate. This validates the widened
+  boundary, not a promoted speed path.
 - Keep these work items in order: accepted FA/FLA policy validation, broader
   resident/scheduler decode metadata reduction, coarse GDN decode/prefill
   kernels, and model-family-general batched GEMM/fusion improvements.

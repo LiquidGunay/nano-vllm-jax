@@ -113,6 +113,11 @@ class MTP1GreedyOutput:
     emitted_tokens: object | None = None
     emitted_counts: object | None = None
     accepted_counts: object | None = None
+    emitted_totals: object | None = None
+    accepted_totals: object | None = None
+    rejected_totals: object | None = None
+    bonus_totals: object | None = None
+    accepted_bitmask: object | None = None
     burst_groups: int | None = None
     debug_payload: object | None = None
 
@@ -7543,6 +7548,53 @@ class ModelExecutor:
                 bonus_tokens = jnp.stack(bonus_groups, axis=1)
                 accepted = jnp.stack(accepted_groups, axis=1)
                 accepted_counts = jnp.stack(accepted_count_groups, axis=1)
+                emitted_totals = None
+                accepted_totals = None
+                rejected_totals = None
+                bonus_totals = None
+                accepted_bitmask = None
+                if draft_len == 1:
+                    group_width = draft_len + 1
+                    compact_width = burst_groups * group_width
+                    starts = jnp.cumsum(emitted_counts, axis=1) - emitted_counts
+                    offsets = jnp.arange(group_width, dtype=jnp.int32)
+                    valid_offsets = offsets[None, None, :] < emitted_counts[:, :, None]
+                    dest = starts[:, :, None] + offsets[None, None, :]
+                    dest = jnp.where(valid_offsets, dest, compact_width)
+                    batch_idx = jnp.broadcast_to(
+                        jnp.arange(tokens.shape[0], dtype=jnp.int32)[:, None, None],
+                        (tokens.shape[0], burst_groups, group_width),
+                    )
+                    compact_tokens = jnp.zeros(
+                        (tokens.shape[0], compact_width),
+                        dtype=jnp.int32,
+                    )
+                    compact_tokens = compact_tokens.at[
+                        batch_idx.reshape(-1),
+                        dest.reshape(-1),
+                    ].set(
+                        emitted_tokens.reshape(-1),
+                        mode="drop",
+                    )
+                    emitted_tokens = compact_tokens
+                    emitted_totals = jnp.sum(emitted_counts, axis=1).astype(jnp.int32)
+                    accepted_totals = jnp.sum(accepted_counts, axis=1).astype(jnp.int32)
+                    rejected_totals = jnp.sum(
+                        (accepted_counts < draft_len).astype(jnp.int32),
+                        axis=1,
+                    )
+                    bonus_totals = jnp.sum(
+                        (accepted_counts == draft_len).astype(jnp.int32),
+                        axis=1,
+                    )
+                    bit_values = jnp.left_shift(
+                        jnp.ones((burst_groups,), dtype=jnp.int32),
+                        jnp.arange(burst_groups, dtype=jnp.int32),
+                    )
+                    accepted_bitmask = jnp.sum(
+                        (accepted_counts > 0).astype(jnp.int32) * bit_values[None, :],
+                        axis=1,
+                    )
                 if logit_debug_enabled:
                     debug_payload = (
                         jnp.stack(debug_draft_top_ids_groups, axis=1),
@@ -7567,6 +7619,11 @@ class ModelExecutor:
                     current_conv_state,
                     current_recurrent_state,
                     current_seq_lens,
+                    emitted_totals,
+                    accepted_totals,
+                    rejected_totals,
+                    bonus_totals,
+                    accepted_bitmask,
                     debug_payload,
                 )
 
@@ -7585,6 +7642,11 @@ class ModelExecutor:
             conv_state,
             recurrent_state,
             committed_seq_lens,
+            emitted_totals,
+            accepted_totals,
+            rejected_totals,
+            bonus_totals,
+            accepted_bitmask,
             debug_payload,
         ) = self._profile_jit_call(
             key,
@@ -7617,6 +7679,11 @@ class ModelExecutor:
             emitted_tokens=emitted_tokens,
             emitted_counts=emitted_counts,
             accepted_counts=accepted_counts,
+            emitted_totals=emitted_totals,
+            accepted_totals=accepted_totals,
+            rejected_totals=rejected_totals,
+            bonus_totals=bonus_totals,
+            accepted_bitmask=accepted_bitmask,
             burst_groups=burst_groups,
             debug_payload=debug_payload,
         )

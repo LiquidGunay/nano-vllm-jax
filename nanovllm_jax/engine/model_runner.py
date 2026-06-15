@@ -6994,22 +6994,53 @@ class CanonicalModelRunner:
             )
             next_draft_tokens = output.next_draft_token.astype(jnp.int32)
 
-            emitted_counts_host = jax.device_get(output.emitted_counts).reshape(
-                (verifier_physical_batch_size, mtp_burst_groups)
+            compact_burst_output = (
+                draft_len == 1
+                and getattr(output, "emitted_totals", None) is not None
+                and getattr(output, "accepted_totals", None) is not None
+                and getattr(output, "accepted_bitmask", None) is not None
             )
-            if getattr(output, "accepted_counts", None) is not None:
-                accepted_counts_host = jax.device_get(output.accepted_counts).reshape(
+            if compact_burst_output:
+                (
+                    emitted_totals_host,
+                    accepted_totals_host,
+                    rejected_totals_host,
+                    bonus_totals_host,
+                    accepted_bitmask_host,
+                ) = jax.device_get(
+                    (
+                        output.emitted_totals,
+                        output.accepted_totals,
+                        output.rejected_totals,
+                        output.bonus_totals,
+                        output.accepted_bitmask,
+                    )
+                )
+                t_profile = _mark("host_burst_summary_transfer", t_profile)
+                accepted_matrix = []
+                for local_row, _row in enumerate(rows):
+                    verifier_idx = verifier_index_for_local[local_row]
+                    bitmask = int(accepted_bitmask_host[verifier_idx])
+                    accepted_matrix.extend(
+                        [bool(bitmask & (1 << group_idx))]
+                        for group_idx in range(mtp_burst_groups)
+                    )
+            else:
+                emitted_counts_host = jax.device_get(output.emitted_counts).reshape(
                     (verifier_physical_batch_size, mtp_burst_groups)
                 )
-            else:
-                accepted_counts_host = emitted_counts_host - 1
-            t_profile = _mark("host_burst_output_count_transfer", t_profile)
-
-            accepted_matrix = [
-                [pos < int(accepted_counts_host[verifier_index_for_local[local_row], group_idx]) for pos in range(draft_len)]
-                for local_row, _row in enumerate(rows)
-                for group_idx in range(mtp_burst_groups)
-            ]
+                if getattr(output, "accepted_counts", None) is not None:
+                    accepted_counts_host = jax.device_get(output.accepted_counts).reshape(
+                        (verifier_physical_batch_size, mtp_burst_groups)
+                    )
+                else:
+                    accepted_counts_host = emitted_counts_host - 1
+                t_profile = _mark("host_burst_output_count_transfer", t_profile)
+                accepted_matrix = [
+                    [pos < int(accepted_counts_host[verifier_index_for_local[local_row], group_idx]) for pos in range(draft_len)]
+                    for local_row, _row in enumerate(rows)
+                    for group_idx in range(mtp_burst_groups)
+                ]
             self._record_draft_position_acceptance(accepted_matrix)
             if getattr(output, "debug_payload", None) is not None:
                 (
@@ -7106,29 +7137,66 @@ class CanonicalModelRunner:
                 verifier_idx = verifier_index_for_local[local_row]
                 self._mtp1_drafts.pop(seq.seq_id, None)
                 row_outputs: list[object] = []
-                emitted_total = 0
-                accepted_total = 0
-                rejected_total = 0
-                bonus_total = 0
-                for group_idx in range(mtp_burst_groups):
-                    emitted_count = int(emitted_counts_host[verifier_idx, group_idx])
-                    accepted_count = int(accepted_counts_host[verifier_idx, group_idx])
-                    emitted_count = max(0, min(draft_len + 1, emitted_count))
-                    accepted_count = max(0, min(draft_len, accepted_count))
-                    group_offset = group_idx * (draft_len + 1)
+                if compact_burst_output:
+                    emitted_total = max(
+                        0,
+                        min(
+                            emitted_width,
+                            int(emitted_totals_host[verifier_idx]),
+                        ),
+                    )
+                    accepted_total = max(
+                        0,
+                        min(
+                            mtp_burst_groups * draft_len,
+                            int(accepted_totals_host[verifier_idx]),
+                        ),
+                    )
+                    rejected_total = max(
+                        0,
+                        min(
+                            mtp_burst_groups,
+                            int(rejected_totals_host[verifier_idx]),
+                        ),
+                    )
+                    bonus_total = max(
+                        0,
+                        min(
+                            mtp_burst_groups,
+                            int(bonus_totals_host[verifier_idx]),
+                        ),
+                    )
                     row_outputs.extend(
                         DeviceTokenRef(
                             tokens=emitted_tokens,
-                            row=verifier_idx * emitted_width + group_offset + offset,
+                            row=verifier_idx * emitted_width + offset,
                         )
-                        for offset in range(emitted_count)
+                        for offset in range(emitted_total)
                     )
-                    emitted_total += emitted_count
-                    accepted_total += accepted_count
-                    if accepted_count < draft_len:
-                        rejected_total += 1
-                    else:
-                        bonus_total += 1
+                else:
+                    emitted_total = 0
+                    accepted_total = 0
+                    rejected_total = 0
+                    bonus_total = 0
+                    for group_idx in range(mtp_burst_groups):
+                        emitted_count = int(emitted_counts_host[verifier_idx, group_idx])
+                        accepted_count = int(accepted_counts_host[verifier_idx, group_idx])
+                        emitted_count = max(0, min(draft_len + 1, emitted_count))
+                        accepted_count = max(0, min(draft_len, accepted_count))
+                        group_offset = group_idx * (draft_len + 1)
+                        row_outputs.extend(
+                            DeviceTokenRef(
+                                tokens=emitted_tokens,
+                                row=verifier_idx * emitted_width + group_offset + offset,
+                            )
+                            for offset in range(emitted_count)
+                        )
+                        emitted_total += emitted_count
+                        accepted_total += accepted_count
+                        if accepted_count < draft_len:
+                            rejected_total += 1
+                        else:
+                            bonus_total += 1
                 outputs[row] = row_outputs
                 stats["drafts_proposed"] += max(0, (mtp_burst_groups - 1) * draft_len)
                 stats["drafts_accepted"] += accepted_total

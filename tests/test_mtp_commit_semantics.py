@@ -329,6 +329,56 @@ class _FakeExecutor:
                 accepted_rows.append(accepted_values)
                 accepted_count_rows.append(accepted_count)
                 bonus_rows.append(int(self.bonus[row]) + group_idx)
+        emitted_tokens = jnp.array(emitted_rows, dtype=jnp.int32).reshape(
+            (len(output_rows), int(burst_groups), width + 1)
+        )
+        emitted_counts = jnp.array(emitted_count_rows, dtype=jnp.int32).reshape(
+            (len(output_rows), int(burst_groups))
+        )
+        accepted_counts = jnp.array(accepted_count_rows, dtype=jnp.int32).reshape(
+            (len(output_rows), int(burst_groups))
+        )
+        emitted_totals = None
+        accepted_totals = None
+        rejected_totals = None
+        bonus_totals = None
+        accepted_bitmask = None
+        if width == 1:
+            compact_rows = []
+            for row_idx in range(len(output_rows)):
+                compact_row = []
+                for group_idx in range(int(burst_groups)):
+                    emitted_count = int(emitted_counts[row_idx, group_idx])
+                    compact_row.extend(
+                        int(value)
+                        for value in emitted_tokens[
+                            row_idx, group_idx, :emitted_count
+                        ].tolist()
+                    )
+                compact_row.extend(
+                    [0]
+                    * (int(burst_groups) * (width + 1) - len(compact_row))
+                )
+                compact_rows.append(compact_row)
+            emitted_tokens = jnp.array(compact_rows, dtype=jnp.int32)
+            emitted_totals = jnp.sum(emitted_counts, axis=1).astype(jnp.int32)
+            accepted_totals = jnp.sum(accepted_counts, axis=1).astype(jnp.int32)
+            rejected_totals = jnp.sum(
+                (accepted_counts < width).astype(jnp.int32),
+                axis=1,
+            )
+            bonus_totals = jnp.sum(
+                (accepted_counts == width).astype(jnp.int32),
+                axis=1,
+            )
+            bit_values = jnp.left_shift(
+                jnp.ones((int(burst_groups),), dtype=jnp.int32),
+                jnp.arange(int(burst_groups), dtype=jnp.int32),
+            )
+            accepted_bitmask = jnp.sum(
+                (accepted_counts > 0).astype(jnp.int32) * bit_values[None, :],
+                axis=1,
+            )
         marker = jnp.array([self.state_marker[row] for row in output_rows], dtype=jnp.float32).reshape(
             (-1, 1, 1, 1)
         )
@@ -355,15 +405,14 @@ class _FakeExecutor:
                 [self.committed_seq_lens[row] for row in output_rows],
                 dtype=jnp.int32,
             ),
-            emitted_tokens=jnp.array(emitted_rows, dtype=jnp.int32).reshape(
-                (len(output_rows), int(burst_groups), width + 1)
-            ),
-            emitted_counts=jnp.array(emitted_count_rows, dtype=jnp.int32).reshape(
-                (len(output_rows), int(burst_groups))
-            ),
-            accepted_counts=jnp.array(accepted_count_rows, dtype=jnp.int32).reshape(
-                (len(output_rows), int(burst_groups))
-            ),
+            emitted_tokens=emitted_tokens,
+            emitted_counts=emitted_counts,
+            accepted_counts=accepted_counts,
+            emitted_totals=emitted_totals,
+            accepted_totals=accepted_totals,
+            rejected_totals=rejected_totals,
+            bonus_totals=bonus_totals,
+            accepted_bitmask=accepted_bitmask,
             burst_groups=int(burst_groups),
         )
 
@@ -1355,6 +1404,59 @@ def test_k1_k_decode_burst_commits_multiple_verified_groups(monkeypatch):
     assert _resolve_output_tokens(runner._mtp1_drafts[1]) == [32]
     assert runner._mtp1_seeded_chain == {0: 3, 1: 3}
     assert runner.stored[-1][0].seq_lens.tolist() == [11, 12]
+
+
+def test_k1_k_decode_burst_compact_output_tracks_rejections(monkeypatch):
+    seq_lens = [5, 6]
+    executor = _FakeExecutor(
+        accepted=[False, True],
+        target=[101, 12],
+        bonus=[201, 22],
+        next_draft=[301, 32],
+        state_marker=[908, 918],
+        committed_seq_lens=[8, 12],
+        kv_slots=[[1000, 1001], [1010, 1011]],
+    )
+    runner = _FakeRunner(
+        executor,
+        {0: 10, 1: 12},
+        block_size=16,
+        num_speculative_tokens=1,
+    )
+    runner.mtp_verifier_impl = "k_decode"
+    seqs = [_seq(i, seq_lens[i], max_tokens=64) for i in range(2)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "3")
+
+    outputs = ModelRunner._run_mtp1_batched(
+        runner,
+        seqs,
+        _batch(seq_lens),
+        [0, 1],
+    )
+
+    assert runner.executor.calls[-1]["method"] == "mtp_k_burst"
+    assert _resolve_output_tokens(outputs[0]) == [101, 101, 101]
+    assert _resolve_output_tokens(outputs[1]) == [12, 22, 12, 23, 12, 24]
+    assert runner.draft_position_acceptance[-1] == [
+        [False],
+        [False],
+        [False],
+        [True],
+        [True],
+        [True],
+    ]
+    assert runner.stats == {
+        "drafts_proposed": 6,
+        "drafts_accepted": 3,
+        "drafts_rejected": 3,
+        "bonus_tokens": 3,
+    }
+    assert _resolve_output_tokens(runner._mtp1_drafts[0]) == [301]
+    assert _resolve_output_tokens(runner._mtp1_drafts[1]) == [32]
+    assert runner._mtp1_seeded_chain == {0: 3, 1: 3}
+    assert runner.stored[-1][0].seq_lens.tolist() == [8, 12]
 
 
 def test_k2_burst_mixed_reject_commits_without_repair(monkeypatch):

@@ -32,6 +32,9 @@ This roadmap is grouped by work type. It is not a production-readiness claim.
 ## Optimization
 
 - Reduce host synchronization in token materialization and MTP accounting.
+- K=1 burst MTP accounting now uses compact device-side emitted-token output
+  and per-row summary metadata; continue reducing verifier work rather than
+  revisiting per-group host count parsing.
 - Improve bucket-specific admission decisions.
 - Investigate K=1 overhead in rejected and fallback steps.
 - Implement a safe fast K=1 verifier that can commit rejected rows from after-current-token state without full repair decode.
