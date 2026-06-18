@@ -324,8 +324,8 @@ shape/range pressure than `hetero8` and feeds the exact same prompts to both
   --max-request-count 15 \
   --seed 1234 \
   --max-num-seqs 8 \
-  --max-num-batched-tokens 2048 \
-  --prefill-buckets 128,256,512,1024,2048 \
+  --max-num-batched-tokens 1024 \
+  --prefill-buckets 128,256,512,1024 \
   --batch-size-buckets 1,2,4,8 \
   --max-blocks-per-seq 320 \
   --decode-block-table-buckets 128,256,320 \

@@ -56,6 +56,16 @@
 - Keep benchmark artifacts under `/mountpoint/.exp/diagnostics` or another
   mountpoint path, but commit only summaries, configs, docs, and tests. Do not
   stage `results/*` or full profile/artifact dumps.
+- As of the 2026-06-18 full-random sweep, the accepted random sidecar prefill
+  envelope is `max_num_batched_tokens=1024` with prefill/token buckets
+  `128,256,512,1024`. Do not restore the 2048/4096 prefill envelope as a
+  default unless a new generic server-style run beats the 1024 envelope without
+  extra measured-phase compilation.
+- XLA low-memory allocator/platform flags are diagnostic only: they can reduce
+  GPU memory to about `5 GiB`, but they regressed random/hetero throughput in
+  the accepted benchmark lane. XLA Triton GEMM and B16-capacity diagnostics
+  showed runtime potential but remain compile-heavy and are not promoted
+  defaults.
 - Do not pass an existing diagnostic `*.prompts.jsonl` file back into the
   random sidecar unless it has first been copied to a throwaway path. The
   sidecar may regenerate/rewrite prompt manifests, so exact-envelope A/B runs

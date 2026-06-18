@@ -13090,8 +13090,8 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     `XLA_PYTHON_CLIENT_ALLOCATOR` and `XLA_PYTHON_CLIENT_MEM_FRACTION`, so
     low-memory XLA/JAX configs no longer silently drop those flags;
   - corrected random sidecar defaults to the accepted full-random envelope:
-    `max_num_batched_tokens=2048`, prefill/token buckets
-    `128,256,512,1024,2048`, batch buckets `1,2,4,8`,
+    `max_num_batched_tokens=1024`, prefill/token buckets
+    `128,256,512,1024`, batch buckets `1,2,4,8`,
     `max_blocks_per_seq=320`, decode block-table buckets `128,256,320`,
     `num_kvcache_blocks=2048`, and KV cap `8192 MiB`.
 - validation:
@@ -13166,3 +13166,113 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - the remaining `random_large` gap is still dominated by mixed-serving decode
     execution and underfilled tail batches, not by the benchmark event list
     alone.
+
+#### Entry 312 audit - Full-Random Scheduler/Profile Sweep
+
+- date: 2026-06-18
+- trigger:
+  - user asked to profile the current best path, use server-style generic
+    warmup/compile/benchmarking, try XLA RAM flags, and keep optimizing toward
+    `0.8x` vLLM on full random or `hetero8` without benchmark-specific hacks.
+- accepted code/config changes:
+  - random sidecar default prefill envelope is now `max_num_batched_tokens=1024`
+    with prefill/token buckets `128,256,512,1024`. This is a generic serving
+    envelope change, not a seed-specific warmup;
+  - `--jax-prefix-cache/--no-jax-prefix-cache` is part of the random sidecar
+    command surface and is recorded in the run config;
+  - docs and tests were updated to reflect the 1024 default envelope.
+- validation:
+  - `.venv/bin/python -m py_compile benchmarks/benchmark_random_request_sidecar.py benchmarks/benchmark_jax_server_trace.py benchmarks/benchmark_jax_server_multisuite.py nanovllm_jax/engine/llm_engine.py nanovllm_jax/engine/model_runner.py`;
+  - `PYTHONPATH=. .venv/bin/python -m pytest -q tests/test_benchmark_random_request_sidecar.py`:
+    `12 passed`;
+  - `PYTHONPATH=. .venv/bin/python -m pytest -q tests/test_device_token_carry.py`:
+    `33 passed`;
+  - combined focused rerun:
+    `PYTHONPATH=. .venv/bin/python -m pytest -q tests/test_benchmark_random_request_sidecar.py tests/test_device_token_carry.py`:
+    `45 passed`.
+- control measurements:
+  - shared-envelope no-prefix control:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/shared_current_control_r1.json`;
+    warmup `59.94 s`, JIT `24`;
+    `random_large` `814.11 output tok/s` (`0.797x` stored vLLM), event rate
+    `874.98 output tok/s`; `hetero8` `486.36 output tok/s` total and
+    `691.17 output tok/s` event rate. The event-rate ratio for `hetero8` is
+    `0.800x`, but the total throughput ratio is only `0.563x` because the
+    final drain is a large fraction of the short `256`-output-token workload.
+  - full random no-prefix hot path:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/full_random_current_hot_nocap_r1.json`;
+    JAX `810.16 output tok/s`, vLLM `1541.89 output tok/s`, ratio `0.525x`,
+    zero measured JIT-cache growth, peak system RAM `75.1%`, RSS `5.69 GiB`.
+- profile:
+  - step profile:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/full_random_current_hot_stepprofile_r1_jax.json`;
+  - full random ran `19` prefill steps for `30506` prompt tokens. Prefill
+    runner time summed to `1553.7 ms`, total prefill step time `1945.4 ms`,
+    and scheduling around prefill `391.2 ms`;
+  - decode ran `1809` steps for `11587` emitted tokens. Decode runner time
+    summed to `10905.6 ms`, total decode step time `11405.0 ms`, and decode
+    scheduling summed to only `463.6 ms`;
+  - B8 decode is the dominant steady bucket (`1006` steps, `6.20 ms` mean
+    runner time). Python scheduler work is not the dominant remaining cost;
+    the bottleneck is compiled GPU/PJRT decode execution plus admission/tail
+    effects.
+- rejected or diagnostic-only variants:
+  - XLA low-memory allocator/platform flags reduced GPU memory after
+    measurement to about `5.0 GiB`, but regressed shared-envelope throughput to
+    `451.60 output tok/s` on `random_large` and `326.28 output tok/s` on
+    `hetero8`. Keep these flags for compile containment diagnostics, not the
+    serving hot path;
+  - adaptive summary token prefetch regressed `hetero8` (`486.36 -> 479.32`
+    output tok/s total, event rate `691.17 -> 641.38`) and was reverted;
+  - full-random B16 capacity without other changes regressed to `778.63 output
+    tok/s` (`0.505x`) and increased JIT surface from `38` to `49` keys;
+  - prefill chunk `4096` regressed to `754.31 output tok/s` and used about
+    `16.9 GiB` GPU memory. Prefill chunk `512` reached only `807.47 output
+    tok/s`;
+  - `decode_padded_gemm_rows=16` on the B16/Triton diagnostic was neutral
+    (`908.04` versus `907.92 output tok/s`).
+- accepted benchmark default:
+  - prefill chunk `1024` is the best generic full-random default among
+    `512/1024/2048/4096` in this pass:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/full_random_current_hot_prefill1024_r1.json`;
+    `828.63 output tok/s`, ratio `0.537x`, event rate `864.43 output tok/s`,
+    peak system RAM `71.8%`, RSS `5.27 GiB`, JIT `34`.
+- no-regression checks:
+  - a four-workload multisuite attempt correctly failed before measurement
+    because the `random_large` serving envelope has `max_blocks_per_seq=128`
+    (`2048` tokens) while `long_prefill_512_2048` needs `2064` total tokens.
+    Do not treat that as a speed result;
+  - the same warmed server-style multisuite over the workloads that fit that
+    envelope completed:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/multisuite_no_regression_3workloads_r1.json`;
+    `random_large` `814.66 output tok/s`, `hetero8` `491.35 output tok/s`,
+    and `short_32_128` `501.88 output tok/s`, with generic warmup adding `24`
+    JIT entries before measurement;
+  - a plain trace long-prefill run without the config-expanded optimized flags
+    reached only `11.02 output tok/s`; discard it as an invalid no-regression
+    signal;
+  - the configured one-repeat matrix long-prefill check used the optimized
+    config path and reached `138.56 output tok/s` (`1.19x` stored vLLM), but it
+    is not correctness-clean versus the old stored JAX reference (`3/4` rows
+    diverged). Keep this as a performance/correctness caveat, not an accepted
+    speed claim, until a refreshed long-prefill correctness gate is run.
+- speed diagnostics not promoted:
+  - enabling XLA Triton GEMM with the accepted 1024 envelope reached
+    `876.47 output tok/s` (`0.568x`) but increased elapsed compile/startup time
+    to about `381 s`;
+  - combining B16 capacity with the 1024 envelope and XLA Triton GEMM reached
+    `907.92 output tok/s` (`0.589x`), with much better TTFT p95 but worse ITL
+    and a still-heavy startup/compile surface (`484 s`, JIT `44`). This is the
+    best diagnostic from the pass, but not a production default and still far
+    below `0.8x`.
+- interpretation:
+  - `hetero8` did not improve much in total throughput because it is short and
+    final materialization/drain dominates the denominator; its token-phase rate
+    is already at the `0.8x` line in the control run;
+  - full random remains the harder and more representative target. The current
+    accepted default improves full random from `810.16` to `828.63 output tok/s`
+    but still only reaches `0.537x` vLLM;
+  - the next real lever is an efficient B>8 / arbitrary-batch decode execution
+    route or backend-owned broader decode boundary. Capacity alone, allocator
+    flags, prefetch tweaks, and one-off padding changes do not remove enough
+    compiled decode work.

@@ -349,10 +349,16 @@ class LLMEngine:
                 emitted_tokens += len(token_id) if isinstance(token_id, list) else 1
 
         if scheduled_batch.is_prefill:
+            prefix_states_by_seq = None
+            if (
+                getattr(self.scheduler, "enable_prefix_cache_execution", False)
+                and getattr(self.scheduler, "prefix_cache_requires_hybrid_state", False)
+            ):
+                prefix_states_by_seq = self.model_runner.hybrid_states_for_sequences(seqs)
             self.scheduler.record_computed_prefix_states(
                 seqs,
                 prefill_chunk_lengths or [],
-                self.model_runner.hybrid_states_for_sequences(seqs),
+                prefix_states_by_seq,
             )
         finished_flags = self.scheduler.postprocess(seqs, token_ids, prefill_chunk_lengths=prefill_chunk_lengths)
         postprocess_t = perf_counter()
@@ -949,7 +955,9 @@ class LLMEngine:
         emitted_finish = set()
         stream_start = perf_counter()
         events = []
-        prefetch_trace_tokens = trace_events and _trace_token_prefetch_enabled(getattr(self, "config", None))
+        config = getattr(self, "config", None)
+        trace_token_prefetch_enabled = _trace_token_prefetch_enabled(config)
+        prefetch_trace_tokens = trace_events and trace_token_prefetch_enabled
         snapshotted_completion_lengths = {seq.seq_id: 0 for seq in seqs}
         pending_prefetch_slots: tuple[DeviceTokenSlot, ...] = ()
 

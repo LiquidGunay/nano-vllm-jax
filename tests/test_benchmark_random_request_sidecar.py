@@ -23,12 +23,13 @@ def test_parse_args_defaults_set_random_ranges():
     assert args.jax_profile is False
     assert args.jax_warmup_mode == "generic"
     assert args.jax_fail_on_jit_cache_growth is False
+    assert args.jax_prefix_cache is True
     assert args.jax_config == ""
     assert args.jax_max_kv_cache_mb == 8192
     assert args.jax_num_kvcache_blocks == 2048
-    assert args.max_num_batched_tokens == 2048
+    assert args.max_num_batched_tokens == 1024
     assert args.max_num_resident_seqs == 0
-    assert args.prefill_buckets == "128,256,512,1024,2048"
+    assert args.prefill_buckets == "128,256,512,1024"
     assert args.batch_size_buckets == "1,2,4,8"
     assert args.max_blocks_per_seq == 320
     assert args.decode_block_table_buckets == "128,256,320"

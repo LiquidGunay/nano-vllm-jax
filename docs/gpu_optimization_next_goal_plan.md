@@ -187,43 +187,35 @@ with generic startup warmup and no measured-phase JIT growth. This lane is more
 representative than the old fixed `hetero8` shape because request count, prompt
 lengths, and output lengths vary within a declared range.
 
-Current best:
+Current accepted full-random default:
 
 - artifact:
-  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_noprofile_after_driver_fix_20260604.json`;
-- workload: `15` requests, `30506` input tokens, `11602` output tokens,
-  prompt lengths `1077..4022`, output lengths `425..1007`;
-- generic warmup compiled all batch buckets `1,2,4,8`, prefill token buckets
-  `128,256,512,1024,2048`, and decode block-table buckets `128,256,320`;
-- generated lengths complete and measured-phase JIT growth was zero
-  (`32 -> 32`);
-- throughput `437.63 output tok/s`, fresh same-manifest vLLM reference
-  `1541.89 output tok/s`, ratio `0.284x`;
-- the `0.9x` target requires about `1387.70 output tok/s`, so the remaining
-  speedup needed is about `3.17x`.
-- the previous accepted run
-  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260604/random_b8_320width_static_cache_split_decode_block_buckets_128_256_320_r1_20260604.json`
-  remains equivalent evidence at `436.24 output tok/s`.
-- Entry 244 tested mixed packed backfill and greedy decode burst diagnostics.
-  Mixed backfill is rejected for automatic scheduling (`165.24` then
-  `113.64 output tok/s`) because it delays live decode rows behind prompt
-  chunks. Greedy burst has dtype-stable scans and honest generic warmup now,
-  but burst4/burst8 resident runs only reached `282.37`/`284.73 output tok/s`
-  and remain below the B8 no-burst anchor.
-- 2026-06-18 host-scheduler pass: summary trace mode now avoids per-token event
-  objects and skips per-step token prefetch unless detailed `--trace-events` are
-  requested. Shared-envelope `random_large` improved from `582.31` to
-  `651.71 output tok/s`; `hetero8` moved from `419.06` to `424.09 output tok/s`.
-  This is a real host-communication win, but it does not close the structural
-  mixed-serving decode/tail-batch gap. `hetero8` token-phase throughput improved
-  more (`423.64 -> 458.87 output tok/s`), but final materialization drain rose
-  on the short 256-token workload and absorbed most of the end-to-end gain. Full
-  random remeasurement with low-memory XLA flags now completes. The comparable
-  BF16 run reached `361.19 output tok/s` (`0.234x` stored vLLM) with zero
-  measured JIT growth, peak system RAM `73.9%`, and GPU memory after warmup
-  `4917 MiB`; this is slower than the prior BF16 full-random anchor
-  (`437.63 output tok/s`). RAM flags are therefore a compile-memory diagnostic
-  tool rather than the default speed path.
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/full_random_current_hot_prefill1024_r1.json`;
+- workload: seed `1234`, `15` requests, `30506` input tokens, `11602` output
+  tokens, prompt lengths `1077..4022`, output lengths `425..1007`;
+- generic warmup compiles serving-envelope buckets only: batch buckets
+  `1,2,4,8`, prefill token buckets `128,256,512,1024`, decode block-table
+  buckets `128,256,320`, and no measured-phase JIT cache growth;
+- throughput `828.63 output tok/s`, fresh same-manifest vLLM reference
+  `1541.89 output tok/s`, ratio `0.537x`;
+- the current `0.8x` target requires about `1233.51 output tok/s`, so the
+  remaining speedup needed is about `1.49x`.
+- 2026-06-18 control details:
+  - `hetero8` token-phase/event throughput is already at the current target in
+    the shared-envelope control (`691.17 output tok/s`, `0.800x` stored vLLM),
+    but the total headline is only `486.36 output tok/s` (`0.563x`) because
+    final materialization/drain is large for a `256`-output-token workload;
+  - full random with the previous 2048 prefill cap reached `810.16 output
+    tok/s`; changing the generic prefill envelope to 1024 reached `828.63`;
+  - XLA low-memory allocator flags reduce GPU memory to about `5 GiB` but
+    regress throughput, so they are diagnostic-only;
+  - XLA Triton GEMM and B16 capacity diagnostics reached up to `907.92 output
+    tok/s`, but startup/compile cost was very high and this still only reached
+    `0.589x`; do not promote it as the default.
+- Historical rejected routes are kept in the logbook. In particular, mixed
+  packed backfill, greedy decode bursts, standalone FA decode, standalone
+  GDN/LM-head kernels, adaptive summary prefetch, B16 capacity alone, 512/4096
+  prefill caps, and pad16 are not current speed routes.
 
 Rules for this lane:
 

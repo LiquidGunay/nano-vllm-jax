@@ -141,8 +141,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="Resident JAX request capacity; 0 keeps it equal to --max-num-seqs.",
     )
-    parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
-    parser.add_argument("--prefill-buckets", default="128,256,512,1024,2048")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
+    parser.add_argument("--jax-prefix-cache", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--prefill-buckets", default="128,256,512,1024")
     parser.add_argument("--prefill-token-buckets", default="")
     parser.add_argument("--prefill-layout", choices=["packed", "dense"], default="packed")
     parser.add_argument("--batch-size-buckets", default="1,2,4,8")
@@ -827,6 +828,7 @@ def _build_jax_command(
         "max_num_seqs": args.max_num_seqs,
         "max_num_resident_seqs": args.max_num_resident_seqs,
         "max_num_batched_tokens": args.max_num_batched_tokens,
+        "prefix_cache": args.jax_prefix_cache,
         "prefill_buckets": args.prefill_buckets,
         "prefill_token_buckets": args.prefill_token_buckets or args.prefill_buckets,
         "prefill_layout": args.prefill_layout,
@@ -1087,6 +1089,7 @@ def _run() -> None:
                 "max_num_seqs": args.max_num_seqs,
                 "max_num_resident_seqs": args.max_num_resident_seqs,
                 "max_num_batched_tokens": args.max_num_batched_tokens,
+                "prefix_cache": args.jax_prefix_cache,
                 "warmup": args.jax_warmup,
                 "warmup_mode": args.jax_warmup_mode,
                 "fail_on_jit_cache_growth": args.jax_fail_on_jit_cache_growth,

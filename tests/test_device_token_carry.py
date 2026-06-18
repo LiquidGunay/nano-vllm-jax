@@ -5,7 +5,10 @@ import numpy as np
 import pytest
 
 from nanovllm_jax.config import Qwen3_5Config
-from nanovllm_jax.engine.llm_engine import LLMEngine, _trace_token_prefetch_enabled
+from nanovllm_jax.engine.llm_engine import (
+    LLMEngine,
+    _trace_token_prefetch_enabled,
+)
 from nanovllm_jax.engine.model_runner import ModelRunner
 from nanovllm_jax.engine.scheduled_batch import ScheduledBatch
 from nanovllm_jax.engine.scheduler import Scheduler
@@ -266,6 +269,57 @@ def test_model_runner_device_token_carry_updates_resident_last_tokens(monkeypatc
         np.asarray(runner._resident_last_tokens),
         np.asarray([0, 80, 70, 0], dtype=np.int32),
     )
+
+
+def test_model_runner_device_token_carry_clears_resident_stale_when_tokens_already_current(
+    monkeypatch,
+):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    runner = ModelRunner.__new__(ModelRunner)
+    runner._device_token_carry_seq_ids = None
+    runner._device_token_carry_tokens = None
+    runner._device_token_carry_by_seq_id = {}
+    runner._resident_last_tokens_stale_seq_ids = {7, 8, 99}
+    seq_a = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
+    seq_b = Sequence([2], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=8)
+    batch = _decode_batch((7, 8), [0, 0], seq_lens=[4, 5])
+
+    runner._record_device_token_carry(
+        batch,
+        jnp.asarray([70, 80], dtype=jnp.int32),
+        active_rows=[0, 1],
+        prefill_final_flags=[True, True],
+        seqs=[seq_a, seq_b],
+        update_resident_tokens=False,
+        resident_tokens_already_current=True,
+    )
+
+    assert runner._resident_last_tokens_stale_seq_ids == {99}
+    assert set(runner._device_token_carry_by_seq_id) == {7, 8}
+
+
+def test_model_runner_device_token_carry_marks_resident_stale_when_not_updated(
+    monkeypatch,
+):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    runner = ModelRunner.__new__(ModelRunner)
+    runner._device_token_carry_seq_ids = None
+    runner._device_token_carry_tokens = None
+    runner._device_token_carry_by_seq_id = {}
+    runner._resident_last_tokens_stale_seq_ids = {99}
+    seq = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
+    batch = _decode_batch((7,), [0], seq_lens=[4])
+
+    runner._record_device_token_carry(
+        batch,
+        jnp.asarray([70], dtype=jnp.int32),
+        active_rows=[0],
+        prefill_final_flags=[True],
+        seqs=[seq],
+        update_resident_tokens=False,
+    )
+
+    assert runner._resident_last_tokens_stale_seq_ids == {7, 99}
 
 
 def test_model_runner_device_token_carry_follows_seq_ids_after_row_order_change(monkeypatch):

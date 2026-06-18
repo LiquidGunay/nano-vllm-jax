@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--sampling-top-k", type=int, default=-1)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fail-on-jit-cache-growth", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
@@ -236,6 +237,7 @@ def _engine_kwargs(args: argparse.Namespace, config: dict[str, Any]) -> dict[str
             "top_p": args.top_p,
             "sampling_top_k": args.sampling_top_k,
             "top_k": args.top_k,
+            "prefix_cache": args.prefix_cache,
         }
     )
     return {
@@ -247,6 +249,7 @@ def _engine_kwargs(args: argparse.Namespace, config: dict[str, Any]) -> dict[str
         "max_num_seqs": int(config_args["max_num_seqs"]),
         "max_num_resident_seqs": int(config_args["max_num_resident_seqs"]),
         "max_num_batched_tokens": int(config_args["max_num_batched_tokens"]),
+        "prefix_cache": bool(config_args.get("prefix_cache", True)),
         "prefill_buckets": _parse_ints(config_args["prefill_buckets"]),
         "prefill_token_buckets": _parse_ints(config_args["prefill_token_buckets"]),
         "prefill_layout": str(config_args["prefill_layout"]),
@@ -442,6 +445,7 @@ def main() -> None:
                 "max_num_seqs": engine_kwargs["max_num_seqs"],
                 "max_num_resident_seqs": engine_kwargs["max_num_resident_seqs"],
                 "max_num_batched_tokens": engine_kwargs["max_num_batched_tokens"],
+                "prefix_cache": bool(engine_kwargs["prefix_cache"]),
                 "prefill_buckets": list(engine_kwargs["prefill_buckets"]),
                 "prefill_token_buckets": list(engine_kwargs["prefill_token_buckets"]),
                 "batch_size_buckets": list(engine_kwargs["batch_size_buckets"]),

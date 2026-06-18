@@ -1753,7 +1753,30 @@ class CanonicalModelRunner:
                     self._hybrid_state_table = output.hybrid_state
                     _record_decode_warmup(output, route)
                     if (
-                        self.resident_decode_metadata
+                        use_slot_carry_table_decode
+                        and not self.resident_decode_metadata
+                        and hasattr(self.executor, "forward_step_token_ids_table_jit")
+                    ):
+                        # The first decode after prefill can arrive before every
+                        # row has a resident last-token slot, so the serving hot
+                        # path falls back to the plain table boundary once and
+                        # then returns to slot-carry table decode. Warm both
+                        # generic routes so measured serving never compiles this
+                        # real fallback from live request data.
+                        table_output = self.executor.forward_step_token_ids_table_jit(
+                            batch,
+                            cache_storage=self.cache_storage,
+                            hybrid_state_table=self._hybrid_state_table,
+                            hybrid_slot_ids=hybrid_slot_ids,
+                        )
+                        self._hybrid_state_table = table_output.hybrid_state
+                        _record_decode_warmup(
+                            table_output,
+                            "forward_step_token_ids_table_jit:decode-fallback",
+                    )
+                    if (
+                        seed_mtp1
+                        and self.resident_decode_metadata
                         and hasattr(self.executor, "forward_step_token_ids_resident_jit")
                     ):
                         # MTP can still fall back to the older resident
@@ -2950,6 +2973,7 @@ class CanonicalModelRunner:
         prefill_final_flags: list[bool],
         seqs: List[Sequence],
         update_resident_tokens: bool = True,
+        resident_tokens_already_current: bool = False,
     ) -> None:
         if (
             not bool(
@@ -3007,6 +3031,12 @@ class CanonicalModelRunner:
             if hasattr(self, "_resident_last_tokens_stale_seq_ids"):
                 for seq_id in new_carry_by_seq_id:
                     self._resident_last_tokens_stale_seq_ids.discard(int(seq_id))
+        elif resident_tokens_already_current and hasattr(
+            self,
+            "_resident_last_tokens_stale_seq_ids",
+        ):
+            for seq_id in new_carry_by_seq_id:
+                self._resident_last_tokens_stale_seq_ids.discard(int(seq_id))
         elif hasattr(self, "_resident_last_tokens_stale_seq_ids"):
             for seq_id in new_carry_by_seq_id:
                 self._resident_last_tokens_stale_seq_ids.add(int(seq_id))
@@ -5094,18 +5124,20 @@ class CanonicalModelRunner:
         )
         if (use_greedy_token_fastpath or use_sampled_token_fastpath) and decode_burst_steps <= 1:
             carry_tokens = token_ids_all if token_ids_all is not None else output.activations
+            resident_tokens_already_current = (
+                resident_slot_token_decode
+                or resident_slot_token_metadata_decode
+                or sampled_resident_dense_slot_token_metadata_decode
+                or prefill_resident_tokens_seeded
+            )
             self._record_device_token_carry(
                 batch,
                 carry_tokens,
                 active_rows=active_rows,
                 prefill_final_flags=prefill_final_flags,
                 seqs=seqs,
-                update_resident_tokens=not (
-                    resident_slot_token_decode
-                    or resident_slot_token_metadata_decode
-                    or sampled_resident_dense_slot_token_metadata_decode
-                    or prefill_resident_tokens_seeded
-                ),
+                update_resident_tokens=not resident_tokens_already_current,
+                resident_tokens_already_current=resident_tokens_already_current,
             )
         elif use_greedy_token_fastpath and decode_burst_steps > 1 and carry_device_tokens:
                 self._record_device_token_carry(

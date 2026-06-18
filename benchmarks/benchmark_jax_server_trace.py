@@ -87,6 +87,7 @@ def parse_args() -> argparse.Namespace:
         help="Resident request capacity; 0 keeps it equal to --max-num-seqs.",
     )
     parser.add_argument("--max-num-batched-tokens", type=int, default=512)
+    parser.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prefill-buckets", default="16,32,64,128")
     parser.add_argument("--prefill-token-buckets", default="")
     parser.add_argument("--prefill-layout", choices=["packed", "dense"], default="packed")
@@ -471,6 +472,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             args.max_num_resident_seqs if args.max_num_resident_seqs > 0 else None
         ),
         "max_num_batched_tokens": args.max_num_batched_tokens,
+        "prefix_cache": args.prefix_cache,
         "prefill_buckets": tuple(_parse_ints(args.prefill_buckets)),
         "prefill_token_buckets": (
             tuple(_parse_ints(args.prefill_token_buckets))
@@ -734,6 +736,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "max_num_seqs": int(engine.config.max_num_seqs),
             "max_num_resident_seqs": int(engine.config.max_num_resident_seqs),
             "max_num_batched_tokens": int(engine.config.max_num_batched_tokens),
+            "prefix_cache": bool(engine.config.prefix_cache),
             "max_blocks_per_seq": int(engine.config.max_blocks_per_seq),
             "decode_block_table_buckets": list(engine.config.decode_block_table_buckets),
             "linear_chunk_size": int(engine.config.linear_chunk_size),
