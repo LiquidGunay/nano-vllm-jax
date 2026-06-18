@@ -215,10 +215,14 @@ Current best:
   requested. Shared-envelope `random_large` improved from `582.31` to
   `651.71 output tok/s`; `hetero8` moved from `419.06` to `424.09 output tok/s`.
   This is a real host-communication win, but it does not close the structural
-  mixed-serving decode/tail-batch gap. Full random remeasurement was blocked by
-  compile RAM on the shared host during reduced-envelope attempts; the sidecar
-  defaults now dry-run to the accepted KV/block envelope, but a final corrected
-  full-stress measurement is still pending.
+  mixed-serving decode/tail-batch gap. `hetero8` token-phase throughput improved
+  more (`423.64 -> 458.87 output tok/s`), but final materialization drain rose
+  on the short 256-token workload and absorbed most of the end-to-end gain. Full
+  random remeasurement with low-memory XLA flags now completes: the best
+  diagnostic run reached `591.86 output tok/s` (`0.384x` stored vLLM) with zero
+  measured JIT growth; the complete allocator/memory-fraction flag run reduced
+  peak memory further but fell to `355.73 output tok/s`, so RAM flags are a
+  compile-memory tool rather than the default speed path.
 
 Rules for this lane:
 

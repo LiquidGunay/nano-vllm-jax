@@ -13086,6 +13086,9 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - detailed per-token events remain available with `--trace-events`;
   - summary trace mode no longer calls per-step `trace_token_prefetch`, because
     token IDs are only needed once at final correctness materialization;
+  - `runtime.xla.allocator` and `runtime.xla.memory_fraction` now map to
+    `XLA_PYTHON_CLIENT_ALLOCATOR` and `XLA_PYTHON_CLIENT_MEM_FRACTION`, so
+    low-memory XLA/JAX configs no longer silently drop those flags;
   - corrected random sidecar defaults to the accepted full-random envelope:
     `max_num_batched_tokens=2048`, prefill/token buckets
     `128,256,512,1024,2048`, batch buckets `1,2,4,8`,
@@ -13095,6 +13098,9 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - `.venv/bin/python -m py_compile nanovllm_jax/engine/llm_engine.py benchmarks/benchmark_jax_server_trace.py benchmarks/benchmark_jax_server_multisuite.py benchmarks/benchmark_random_request_sidecar.py`;
   - `PYTHONPATH=. .venv/bin/pytest -q tests/test_benchmark_jax_server_trace.py tests/test_benchmark_jax_server_multisuite.py tests/test_benchmark_random_request_sidecar.py`:
     `18 passed`.
+  - after the XLA env mapping change:
+    `PYTHONPATH=. .venv/bin/pytest -q tests/test_server_config.py tests/test_benchmark_random_request_sidecar.py`:
+    `35 passed`.
 - benchmark evidence:
   - shared-envelope summary before disabling summary prefetch:
     `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/summary_trace_random_large_hetero8_r1.json`;
@@ -13108,6 +13114,14 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/summary_no_prefetch_random_large_r2.json`;
     `650.33 output tok/s`, token-event rate `688.98 output tok/s`, zero
     measured JIT growth.
+- hetero8 interpretation:
+  - `hetero8` end-to-end throughput moved only `419.06 -> 424.09 output tok/s`,
+    but token-phase throughput moved `423.64 -> 458.87 output tok/s` and ITL
+    p50 improved `6.87 -> 4.96 ms`;
+  - because `hetero8` has only `256` output tokens, the final materialization
+    drain increase (`6.6 -> 45.7 ms`) absorbs much of the token-phase gain. The
+    no-prefetch route is still better end-to-end, but the headline improvement
+    is small for this short-output workload.
 - full random stress status:
   - the old sidecar defaults either hit the RAM guard while compiling extra
     shapes (`1..8` batch buckets and a `4096` prefill bucket) or rejected the
@@ -13116,15 +13130,30 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - a reduced bucket retry with `max_blocks_per_seq=320` still exceeded the
     80% system RAM guard during compile on this shared host before measurement
     completed;
-  - after that, the sidecar defaults were corrected to the accepted KV/block
-    envelope and verified with a dry run, but the final corrected full-stress
-    command has not yet completed a measured run. Treat full-stress
-    remeasurement as pending until either the host has more free RAM or warmup
-    is split into lower-memory phases.
+  - low-memory XLA/JAX diagnostic config:
+    `XLA_FLAGS=--xla_gpu_autotune_level=0 --xla_gpu_force_compilation_parallelism=1 --xla_gpu_enable_triton_gemm=false`,
+    `XLA_PYTHON_CLIENT_PREALLOCATE=0`,
+    `XLA_PYTHON_CLIENT_ALLOCATOR=platform`,
+    `XLA_PYTHON_CLIENT_MEM_FRACTION=0.5`, and
+    `TF_GPU_ALLOCATOR=cuda_malloc_async`;
+  - partial low-memory flag run before the config parser forwarded allocator
+    and memory fraction:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/full_random_summary_no_prefetch_xla_memflags_r1.json`;
+    `591.86 output tok/s`, `0.384x` stored vLLM, warmup `457.54 s`, zero
+    measured JIT growth, peak system RAM `78.5%`;
+  - complete low-memory flag run after forwarding all RAM flags:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/full_random_summary_no_prefetch_xla_memflags_r2_fullenv.json`;
+    `355.73 output tok/s`, `0.231x` stored vLLM, warmup `127.03 s`, zero
+    measured JIT growth, peak system RAM `72.6%`, GPU memory after warmup
+    `4929 MiB`.
 - interpretation:
   - per-token trace event serialization was not the whole gap, but per-step
     token prefetch in summary mode was a real host-communication cost. Removing
     it is a small, general win and does not change model compute or scheduling;
+  - the XLA RAM flags are useful for getting memory-heavy compile surfaces
+    through the guard and reducing GPU/system memory, but `autotune_level=0`
+    hurts inference quality enough that this should stay diagnostic, not the
+    default serving path;
   - the remaining `random_large` gap is still dominated by mixed-serving decode
     execution and underfilled tail batches, not by the benchmark event list
     alone.

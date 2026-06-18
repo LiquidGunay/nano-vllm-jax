@@ -112,6 +112,8 @@ def test_runtime_and_kernel_sections_translate_to_env():
                 },
                 "xla": {
                     "preallocate": False,
+                    "allocator": "platform",
+                    "memory_fraction": 0.5,
                     "gpu_allocator": "cuda_malloc_async",
                     "command_buffer": {
                         "enable_during_profiling": True,
@@ -153,6 +155,10 @@ def test_runtime_and_kernel_sections_translate_to_env():
         "--xla_gpu_command_buffer_unroll_loops=true "
         "--xla_gpu_graph_min_graph_size=1"
     )
+    assert env["XLA_PYTHON_CLIENT_PREALLOCATE"] == "0"
+    assert env["XLA_PYTHON_CLIENT_ALLOCATOR"] == "platform"
+    assert env["XLA_PYTHON_CLIENT_MEM_FRACTION"] == "0.5"
+    assert env["TF_GPU_ALLOCATOR"] == "cuda_malloc_async"
     assert env["NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH"] == "1"
     assert env["NANO_VLLM_JAX_COMPACT_PREFILL_TOKEN_COUNT_MODE"] == "bucket"
     assert env["NANO_VLLM_JAX_DEVICE_TOKEN_CARRY"] == "1"

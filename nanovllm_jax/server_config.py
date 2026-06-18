@@ -377,6 +377,8 @@ def _runtime_section_to_env(runtime_section: dict) -> dict[str, str]:
 
     xla = runtime_section.get("xla", {}) or {}
     _put_env(env, "XLA_PYTHON_CLIENT_PREALLOCATE", xla.get("preallocate"))
+    _put_env(env, "XLA_PYTHON_CLIENT_ALLOCATOR", xla.get("allocator"))
+    _put_env(env, "XLA_PYTHON_CLIENT_MEM_FRACTION", xla.get("memory_fraction"))
     _put_env(env, "TF_GPU_ALLOCATOR", xla.get("gpu_allocator"))
     _put_env(env, "NANO_VLLM_JAX_XLA_GPU_AUTOTUNE_LEVEL", xla.get("autotune_level"))
     _put_env(env, "XLA_FLAGS", _xla_flags_from_config(xla))
