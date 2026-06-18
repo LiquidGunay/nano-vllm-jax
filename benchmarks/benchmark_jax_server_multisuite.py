@@ -65,6 +65,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fail-on-jit-cache-growth", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--trace-events",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Store detailed per-token events. The default summary mode keeps "
+            "TTFT/ITL metrics without per-token Python event overhead."
+        ),
+    )
     parser.add_argument("--profile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--output-json", default="results/jax_server_multisuite.json")
     parser.add_argument("--run-label", default="jax_server_multisuite")
@@ -393,7 +402,12 @@ def main() -> None:
         before_keys = _jit_cache_snapshot(jit_cache)
         recorder.start_jax_profile(enabled=args.profile)
         started = time.perf_counter()
-        trace = engine.generate_with_trace(prompts, sampling_params=sampling_params, include_text=False)
+        trace = engine.generate_with_trace(
+            prompts,
+            sampling_params=sampling_params,
+            include_text=False,
+            trace_events=bool(args.trace_events),
+        )
         trace_mod._block_until_ready(trace)
         elapsed = time.perf_counter() - started
         recorder.stop_jax_profile()
@@ -411,7 +425,7 @@ def main() -> None:
         total_tokens = sum(row["generated_tokens"] for row in rows)
         performance = trace_mod._performance_with_token_scopes(
             rows,
-            trace_mod._timing_metrics(trace["events"], elapsed, total_tokens),
+            trace_mod._timing_metrics_from_trace(trace, elapsed, total_tokens),
             elapsed,
         )
         summary = {
@@ -449,6 +463,7 @@ def main() -> None:
                 "mtp_lm_head_greedy_top1_impl": str(engine.config.mtp_lm_head_greedy_top1_impl),
                 "greedy_decode_burst_steps": int(engine.config.greedy_decode_burst_steps),
                 "warmup": warmup_summary,
+                "trace_mode": "events" if args.trace_events else "summary",
                 "jit_cache_audit": {
                     "entries_before_measurement": before_count,
                     "entries_after_measurement": after_count,
@@ -466,7 +481,8 @@ def main() -> None:
                 "gpu_memory_mb_after_measurement": trace_mod._gpu_memory_used_mb(),
             },
             "rows": rows,
-            "events": trace["events"],
+            "events": trace["events"] if args.trace_events else [],
+            "timing_summary": trace.get("timing_summary"),
             "speculative": engine.model_runner.get_speculative_stats(),
             "mtp_admission": engine.get_mtp_admission_report(),
             "correctness": compare_reference(

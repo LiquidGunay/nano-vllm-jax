@@ -326,8 +326,9 @@ shape/range pressure than `hetero8` and feeds the exact same prompts to both
   --max-num-seqs 8 \
   --max-num-batched-tokens 2048 \
   --prefill-buckets 128,256,512,1024,2048 \
-  --batch-size-buckets 1,2,3,4,5,6,7,8 \
-  --max-blocks-per-seq 512 \
+  --batch-size-buckets 1,2,4,8 \
+  --max-blocks-per-seq 320 \
+  --decode-block-table-buckets 128,256,320 \
   --jax-num-kvcache-blocks 2048 \
   --jax-max-kv-cache-mb 8192 \
   --output-json /mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_request_sidecar.json \
@@ -352,7 +353,7 @@ For the `512-4096` input and `256-1024` output range, JAX must be launched with
 per-sequence capacity above the largest prompt+output request in the manifest.
 For seed `1234`, one request needs `5029` total tokens, so
 `--max-blocks-per-seq 256` is insufficient; use at least
-`--max-blocks-per-seq 512` and size `--jax-num-kvcache-blocks` for the active
+`--max-blocks-per-seq 320` and size `--jax-num-kvcache-blocks` for the active
 concurrency.
 
 Current working seed-`1234` A10G baseline:

@@ -210,6 +210,14 @@ Current best:
   chunks. Greedy burst has dtype-stable scans and honest generic warmup now,
   but burst4/burst8 resident runs only reached `282.37`/`284.73 output tok/s`
   and remain below the B8 no-burst anchor.
+- 2026-06-18 host-scheduler pass: summary trace mode now avoids per-token event
+  objects and skips per-step token prefetch unless detailed `--trace-events` are
+  requested. Shared-envelope `random_large` improved from `582.31` to
+  `651.71 output tok/s`; `hetero8` moved from `419.06` to `424.09 output tok/s`.
+  This is a real host-communication win, but it does not close the structural
+  mixed-serving decode/tail-batch gap. Full random remeasurement was blocked by
+  compile RAM on the shared host even after restoring the accepted
+  `1,2,4,8`/`128,256,320` envelope.
 
 Rules for this lane:
 

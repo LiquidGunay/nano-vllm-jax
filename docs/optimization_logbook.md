@@ -13071,3 +13071,56 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     confidence/admission policy that avoids proposing drafts in low-acceptance
     random buckets. Keep no-MTP as the best serving path for random/hetero
     until that changes.
+
+### Entry 311 - Host-Scheduler Trace Overhead Pass
+
+- date: 2026-06-18
+- trigger:
+  - speculative decoding is paused; user asked for easy host-sync or scheduler
+    overhead reductions on `hetero8`, `random_large`, and full random stress
+    because pure prefill/decode are much closer to target than mixed serving.
+- changes:
+  - added summary mode to `LLMEngine.generate_with_trace`. Benchmark runs now
+    keep aggregate TTFT/ITL and final token IDs without allocating/backfilling
+    one Python event dict per generated token;
+  - detailed per-token events remain available with `--trace-events`;
+  - summary trace mode no longer calls per-step `trace_token_prefetch`, because
+    token IDs are only needed once at final correctness materialization;
+  - corrected random sidecar defaults to the accepted full-random envelope:
+    `max_num_batched_tokens=2048`, prefill/token buckets
+    `128,256,512,1024,2048`, batch buckets `1,2,4,8`,
+    `max_blocks_per_seq=320`, decode block-table buckets `128,256,320`,
+    `num_kvcache_blocks=2048`, and KV cap `8192 MiB`.
+- validation:
+  - `.venv/bin/python -m py_compile nanovllm_jax/engine/llm_engine.py benchmarks/benchmark_jax_server_trace.py benchmarks/benchmark_jax_server_multisuite.py benchmarks/benchmark_random_request_sidecar.py`;
+  - `PYTHONPATH=. .venv/bin/pytest -q tests/test_benchmark_jax_server_trace.py tests/test_benchmark_jax_server_multisuite.py tests/test_benchmark_random_request_sidecar.py`:
+    `18 passed`.
+- benchmark evidence:
+  - shared-envelope summary before disabling summary prefetch:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/summary_trace_random_large_hetero8_r1.json`;
+    `random_large` `582.31 output tok/s`, `hetero8` `419.06 output tok/s`,
+    zero measured JIT growth;
+  - shared-envelope summary after disabling summary prefetch:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/summary_no_prefetch_random_large_hetero8_r3.json`;
+    `random_large` `651.71 output tok/s`, `hetero8` `424.09 output tok/s`,
+    zero measured JIT growth;
+  - single `random_large` after the change:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/summary_no_prefetch_random_large_r2.json`;
+    `650.33 output tok/s`, token-event rate `688.98 output tok/s`, zero
+    measured JIT growth.
+- full random stress status:
+  - the old sidecar defaults either hit the RAM guard while compiling extra
+    shapes (`1..8` batch buckets and a `4096` prefill bucket) or rejected the
+    seed-`1234` manifest because `max_blocks_per_seq=256` cannot admit the
+    `5029`-token request;
+  - after matching the active envelope, the run still exceeded the 80% system
+    RAM guard during compile on this shared host before measurement completed.
+    Treat full-stress remeasurement as blocked by compile memory until either
+    the host has more free RAM or warmup is split into lower-memory phases.
+- interpretation:
+  - per-token trace event serialization was not the whole gap, but per-step
+    token prefetch in summary mode was a real host-communication cost. Removing
+    it is a small, general win and does not change model compute or scheduling;
+  - the remaining `random_large` gap is still dominated by mixed-serving decode
+    execution and underfilled tail batches, not by the benchmark event list
+    alone.

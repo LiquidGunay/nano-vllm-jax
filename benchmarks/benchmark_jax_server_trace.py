@@ -148,6 +148,15 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Fail if new executor JIT keys are created during the measured generation phase.",
     )
+    parser.add_argument(
+        "--trace-events",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Store detailed per-token events. The default summary mode keeps "
+            "TTFT/ITL metrics without per-token Python event overhead."
+        ),
+    )
     parser.add_argument("--reference-json", default="")
     parser.add_argument("--output-json", default="results/qwen08_jax_server_trace.json")
     parser.add_argument(
@@ -275,6 +284,38 @@ def _timing_metrics(events: list[dict[str, Any]], elapsed: float, total_tokens: 
         "itl_ms_p50": _percentile(itls, 50),
         "itl_ms_p95": _percentile(itls, 95),
         "itl_source": "jax_server_step_trace",
+    }
+
+
+def _timing_metrics_from_trace(trace: dict[str, Any], elapsed: float, total_tokens: int) -> dict[str, Any]:
+    summary = trace.get("timing_summary")
+    if not summary:
+        return _timing_metrics(trace.get("events") or [], elapsed, total_tokens)
+
+    last_token_elapsed = summary.get("last_token_elapsed_seconds")
+    post_last_token_drain_seconds = (
+        max(0.0, elapsed - float(last_token_elapsed))
+        if last_token_elapsed is not None
+        else None
+    )
+    return {
+        "seconds": elapsed,
+        "last_token_elapsed_seconds": last_token_elapsed,
+        "post_last_token_drain_seconds": post_last_token_drain_seconds,
+        "generated_tokens": total_tokens,
+        "tokens_per_second": total_tokens / max(elapsed, 1e-9),
+        "token_event_tokens_per_second": (
+            total_tokens / max(float(last_token_elapsed), 1e-9)
+            if last_token_elapsed is not None
+            else None
+        ),
+        "ttft_ms_mean": summary.get("ttft_ms_mean"),
+        "ttft_ms_p50": summary.get("ttft_ms_p50"),
+        "ttft_ms_p95": summary.get("ttft_ms_p95"),
+        "itl_ms_mean": summary.get("itl_ms_mean"),
+        "itl_ms_p50": summary.get("itl_ms_p50"),
+        "itl_ms_p95": summary.get("itl_ms_p95"),
+        "itl_source": summary.get("source") or "jax_server_step_summary",
     }
 
 
@@ -547,7 +588,12 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 top_p=args.top_p,
                 top_k=args.sampling_top_k,
             )
-            warmup_trace = engine.generate_with_trace(prompts, sampling_params=warmup_params, include_text=False)
+            warmup_trace = engine.generate_with_trace(
+                prompts,
+                sampling_params=warmup_params,
+                include_text=False,
+                trace_events=bool(args.trace_events),
+            )
             _block_until_ready(warmup_trace)
             warmup_summary.update(
                 {
@@ -571,7 +617,12 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     )
     recorder.start_jax_profile(enabled=args.profile)
     started = time.perf_counter()
-    trace = engine.generate_with_trace(prompts, sampling_params=sampling_params, include_text=False)
+    trace = engine.generate_with_trace(
+        prompts,
+        sampling_params=sampling_params,
+        include_text=False,
+        trace_events=bool(args.trace_events),
+    )
     _block_until_ready(trace)
     elapsed = time.perf_counter() - started
     recorder.stop_jax_profile()
@@ -743,10 +794,11 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 "greedy_decode_burst_steps": int(engine.config.greedy_decode_burst_steps),
                 "trace_token_prefetch": bool(engine.config.trace_token_prefetch),
             },
+            "trace_mode": "events" if args.trace_events else "summary",
         },
         "performance": _performance_with_token_scopes(
             rows,
-            _timing_metrics(trace["events"], elapsed, total_tokens),
+            _timing_metrics_from_trace(trace, elapsed, total_tokens),
             elapsed,
         ),
         "memory": {
@@ -756,7 +808,8 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "gpu_memory_mb_after_measurement": gpu_memory_after_measurement,
         },
         "rows": rows,
-        "events": trace["events"],
+        "events": trace["events"] if args.trace_events else [],
+        "timing_summary": trace.get("timing_summary"),
         "profile_counters": profile_counters,
         "speculative": engine.model_runner.get_speculative_stats(),
         "mtp_admission": engine.get_mtp_admission_report(),

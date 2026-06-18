@@ -50,6 +50,38 @@ def _trace_token_prefetch_enabled(config: Qwen3_5Config | None = None) -> bool:
     )
 
 
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    index = (len(sorted_values) - 1) * percentile / 100.0
+    lower = int(index)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    fraction = index - lower
+    return float(sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction)
+
+
+def _deferred_trace_timing_summary(
+    *,
+    ttfts_ms: list[float],
+    itls_ms: list[float],
+    last_token_elapsed_seconds: float | None,
+    generated_tokens: int,
+    source: str,
+) -> dict:
+    return {
+        "source": source,
+        "generated_tokens": int(generated_tokens),
+        "last_token_elapsed_seconds": last_token_elapsed_seconds,
+        "ttft_ms_mean": float(sum(ttfts_ms) / len(ttfts_ms)) if ttfts_ms else None,
+        "ttft_ms_p50": _percentile(ttfts_ms, 50),
+        "ttft_ms_p95": _percentile(ttfts_ms, 95),
+        "itl_ms_mean": float(sum(itls_ms) / len(itls_ms)) if itls_ms else None,
+        "itl_ms_p50": _percentile(itls_ms, 50),
+        "itl_ms_p95": _percentile(itls_ms, 95),
+    }
+
+
 def _engine_step_profile_enabled() -> bool:
     return os.environ.get("NANO_VLLM_JAX_PROFILE_ENGINE_STEP", "0") in _TRUE_ENV_VALUES
 
@@ -810,6 +842,7 @@ class LLMEngine:
         sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
         *,
         include_text: bool = True,
+        trace_events: bool = True,
     ) -> dict:
         """Generate requests and return server-side per-token timing events."""
         device_token_carry = _config_or_env_flag(
@@ -822,6 +855,7 @@ class LLMEngine:
                 prompts,
                 sampling_params=sampling_params,
                 include_text=include_text,
+                trace_events=trace_events,
             )
         events = []
         results = []
@@ -860,6 +894,7 @@ class LLMEngine:
         sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
         *,
         include_text: bool = True,
+        trace_events: bool = True,
     ) -> dict:
         """Trace greedy device-token-carry runs without per-step token readback."""
         if sampling_params is None:
@@ -907,10 +942,14 @@ class LLMEngine:
         seqs = [self.add_request(prompt, sp) for prompt, sp in zip(request_inputs, sampling_params)]
         seq_to_request = {seq.seq_id: index for index, seq in enumerate(seqs)}
         seen_completion_lengths = {seq.seq_id: 0 for seq in seqs}
+        last_token_elapsed_by_seq: dict[int, float] = {}
+        ttfts_ms: list[float] = []
+        itls_ms: list[float] = []
+        last_token_elapsed_seconds: float | None = None
         emitted_finish = set()
         stream_start = perf_counter()
         events = []
-        prefetch_trace_tokens = _trace_token_prefetch_enabled(getattr(self, "config", None))
+        prefetch_trace_tokens = trace_events and _trace_token_prefetch_enabled(getattr(self, "config", None))
         snapshotted_completion_lengths = {seq.seq_id: 0 for seq in seqs}
         pending_prefetch_slots: tuple[DeviceTokenSlot, ...] = ()
 
@@ -937,23 +976,36 @@ class LLMEngine:
                 previous_length = seen_completion_lengths[seq.seq_id]
                 current_length = seq.num_completion_tokens
                 if current_length > previous_length:
+                    token_elapsed = step_end - stream_start
                     for completion_index in range(previous_length, current_length):
-                        token_event = {
-                            "event": "token",
-                            "seq_id": seq.seq_id,
-                            "request_index": request_index,
-                            "completion_index": completion_index,
-                            "token_id": None,
-                            "elapsed_seconds": step_end - stream_start,
-                            "step_seconds": step_end - step_start,
-                            "step_start_seconds": step_start - stream_start,
-                            "step_end_seconds": step_end - stream_start,
-                            "scheduler_step_tokens": int(abs(num_tokens)),
-                            "scheduler_step_is_decode": bool(num_tokens < 0),
-                        }
-                        events.append(token_event)
+                        previous_token_elapsed = last_token_elapsed_by_seq.get(seq.seq_id)
+                        if previous_token_elapsed is None:
+                            ttfts_ms.append(1000.0 * token_elapsed)
+                        else:
+                            itls_ms.append(1000.0 * (token_elapsed - previous_token_elapsed))
+                        last_token_elapsed_by_seq[seq.seq_id] = token_elapsed
+                        last_token_elapsed_seconds = (
+                            token_elapsed
+                            if last_token_elapsed_seconds is None
+                            else max(last_token_elapsed_seconds, token_elapsed)
+                        )
+                        if trace_events:
+                            token_event = {
+                                "event": "token",
+                                "seq_id": seq.seq_id,
+                                "request_index": request_index,
+                                "completion_index": completion_index,
+                                "token_id": None,
+                                "elapsed_seconds": token_elapsed,
+                                "step_seconds": step_end - step_start,
+                                "step_start_seconds": step_start - stream_start,
+                                "step_end_seconds": step_end - stream_start,
+                                "scheduler_step_tokens": int(abs(num_tokens)),
+                                "scheduler_step_is_decode": bool(num_tokens < 0),
+                            }
+                            events.append(token_event)
                     seen_completion_lengths[seq.seq_id] = current_length
-                if seq.is_finished and seq.seq_id not in emitted_finish:
+                if trace_events and seq.is_finished and seq.seq_id not in emitted_finish:
                     emitted_finish.add(seq.seq_id)
                     events.append(
                         {
@@ -982,26 +1034,38 @@ class LLMEngine:
             int(result["request_index"]): list(result["token_ids"])
             for result in results
         }
-        for event in events:
-            if event.get("event") != "token":
-                continue
-            request_tokens = tokens_by_request.get(int(event["request_index"]), [])
-            completion_index = int(event["completion_index"])
-            if completion_index < len(request_tokens):
-                token_id = int(request_tokens[completion_index])
-                event["token_id"] = token_id
-                if include_text:
-                    event["text"] = self._detokenize([token_id])
-        events.append(
-            {
-                "event": "done",
-                "elapsed_seconds": perf_counter() - stream_start,
-                "results": results,
-            }
-        )
+        if trace_events:
+            for event in events:
+                if event.get("event") != "token":
+                    continue
+                request_tokens = tokens_by_request.get(int(event["request_index"]), [])
+                completion_index = int(event["completion_index"])
+                if completion_index < len(request_tokens):
+                    token_id = int(request_tokens[completion_index])
+                    event["token_id"] = token_id
+                    if include_text:
+                        event["text"] = self._detokenize([token_id])
+            events.append(
+                {
+                    "event": "done",
+                    "elapsed_seconds": perf_counter() - stream_start,
+                    "results": results,
+                }
+            )
         return {
             "results": results,
             "events": events,
+            "timing_summary": _deferred_trace_timing_summary(
+                ttfts_ms=ttfts_ms,
+                itls_ms=itls_ms,
+                last_token_elapsed_seconds=last_token_elapsed_seconds,
+                generated_tokens=sum(len(result["token_ids"]) for result in results),
+                source=(
+                    "jax_server_step_trace"
+                    if trace_events
+                    else "jax_server_step_summary"
+                ),
+            ),
         }
 
     def _tokenize(self, text: str) -> List[int]:

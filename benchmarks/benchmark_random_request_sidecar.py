@@ -132,8 +132,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--jax-profile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--jax-trace-profile-dir", default="")
-    parser.add_argument("--jax-max-kv-cache-mb", type=int, default=3072)
-    parser.add_argument("--jax-num-kvcache-blocks", type=int, default=320)
+    parser.add_argument("--jax-max-kv-cache-mb", type=int, default=8192)
+    parser.add_argument("--jax-num-kvcache-blocks", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument(
         "--max-num-resident-seqs",
@@ -141,13 +141,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="Resident JAX request capacity; 0 keeps it equal to --max-num-seqs.",
     )
-    parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
-    parser.add_argument("--prefill-buckets", default="128,256,512,1024,2048,4096")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
+    parser.add_argument("--prefill-buckets", default="128,256,512,1024,2048")
     parser.add_argument("--prefill-token-buckets", default="")
     parser.add_argument("--prefill-layout", choices=["packed", "dense"], default="packed")
-    parser.add_argument("--batch-size-buckets", default="1,2,3,4,5,6,7,8")
-    parser.add_argument("--max-blocks-per-seq", type=int, default=256)
-    parser.add_argument("--decode-block-table-buckets", default="")
+    parser.add_argument("--batch-size-buckets", default="1,2,4,8")
+    parser.add_argument("--max-blocks-per-seq", type=int, default=320)
+    parser.add_argument("--decode-block-table-buckets", default="128,256,320")
     parser.add_argument("--resident-decode-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--full-attention-kv-cache-dtype", default="default")
     parser.add_argument("--full-attention-kv-append-impl", default="reference")

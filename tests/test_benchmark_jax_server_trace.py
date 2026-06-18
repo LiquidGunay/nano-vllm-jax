@@ -3,6 +3,7 @@ import pytest
 from benchmarks.benchmark_jax_server_trace import (
     _performance_with_token_scopes,
     _timing_metrics,
+    _timing_metrics_from_trace,
 )
 
 
@@ -20,6 +21,31 @@ def test_timing_metrics_reports_final_materialization_gap():
     assert metrics["post_last_token_drain_seconds"] == pytest.approx(0.05)
     assert metrics["tokens_per_second"] == 12.0
     assert metrics["token_event_tokens_per_second"] == 15.0
+
+
+def test_timing_metrics_from_trace_uses_summary_without_events():
+    trace = {
+        "events": [],
+        "timing_summary": {
+            "source": "jax_server_step_summary",
+            "last_token_elapsed_seconds": 0.20,
+            "ttft_ms_mean": 100.0,
+            "ttft_ms_p50": 100.0,
+            "ttft_ms_p95": 145.0,
+            "itl_ms_mean": 50.0,
+            "itl_ms_p50": 50.0,
+            "itl_ms_p95": 75.0,
+        },
+    }
+
+    metrics = _timing_metrics_from_trace(trace, elapsed=0.25, total_tokens=3)
+
+    assert metrics["seconds"] == 0.25
+    assert metrics["last_token_elapsed_seconds"] == 0.20
+    assert metrics["post_last_token_drain_seconds"] == pytest.approx(0.05)
+    assert metrics["tokens_per_second"] == 12.0
+    assert metrics["token_event_tokens_per_second"] == 15.0
+    assert metrics["itl_source"] == "jax_server_step_summary"
 
 
 def test_performance_with_token_scopes_keeps_end_to_end_and_token_event_rates():
