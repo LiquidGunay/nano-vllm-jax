@@ -13137,23 +13137,32 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     `XLA_PYTHON_CLIENT_MEM_FRACTION=0.5`, and
     `TF_GPU_ALLOCATOR=cuda_malloc_async`;
   - partial low-memory flag run before the config parser forwarded allocator
-    and memory fraction:
+    and memory fraction, using sidecar default FP32 activations:
     `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/full_random_summary_no_prefetch_xla_memflags_r1.json`;
     `591.86 output tok/s`, `0.384x` stored vLLM, warmup `457.54 s`, zero
     measured JIT growth, peak system RAM `78.5%`;
-  - complete low-memory flag run after forwarding all RAM flags:
+  - complete low-memory flag run after forwarding all RAM flags, still with
+    sidecar default FP32 activations:
     `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/full_random_summary_no_prefetch_xla_memflags_r2_fullenv.json`;
     `355.73 output tok/s`, `0.231x` stored vLLM, warmup `127.03 s`, zero
     measured JIT growth, peak system RAM `72.6%`, GPU memory after warmup
     `4929 MiB`.
+  - apples-to-apples BF16 activation/weight run with the complete low-memory
+    flag set:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/full_random_bf16_summary_no_prefetch_xla_memflags_r1.json`;
+    `361.19 output tok/s`, `0.234x` stored vLLM, warmup `430.81 s`, zero
+    measured JIT growth, peak system RAM `73.9%`, GPU memory after warmup
+    `4917 MiB`.
 - interpretation:
   - per-token trace event serialization was not the whole gap, but per-step
     token prefetch in summary mode was a real host-communication cost. Removing
     it is a small, general win and does not change model compute or scheduling;
   - the XLA RAM flags are useful for getting memory-heavy compile surfaces
     through the guard and reducing GPU/system memory, but `autotune_level=0`
-    hurts inference quality enough that this should stay diagnostic, not the
-    default serving path;
+    and the platform allocator hurt inference quality enough that this should
+    stay diagnostic, not the default serving path. The BF16 low-memory result
+    is slower than the prior BF16 full-random anchor (`361.19` vs `437.63
+    output tok/s`);
   - the remaining `random_large` gap is still dominated by mixed-serving decode
     execution and underfilled tail batches, not by the benchmark event list
     alone.

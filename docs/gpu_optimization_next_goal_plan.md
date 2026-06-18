@@ -218,11 +218,12 @@ Current best:
   mixed-serving decode/tail-batch gap. `hetero8` token-phase throughput improved
   more (`423.64 -> 458.87 output tok/s`), but final materialization drain rose
   on the short 256-token workload and absorbed most of the end-to-end gain. Full
-  random remeasurement with low-memory XLA flags now completes: the best
-  diagnostic run reached `591.86 output tok/s` (`0.384x` stored vLLM) with zero
-  measured JIT growth; the complete allocator/memory-fraction flag run reduced
-  peak memory further but fell to `355.73 output tok/s`, so RAM flags are a
-  compile-memory tool rather than the default speed path.
+  random remeasurement with low-memory XLA flags now completes. The comparable
+  BF16 run reached `361.19 output tok/s` (`0.234x` stored vLLM) with zero
+  measured JIT growth, peak system RAM `73.9%`, and GPU memory after warmup
+  `4917 MiB`; this is slower than the prior BF16 full-random anchor
+  (`437.63 output tok/s`). RAM flags are therefore a compile-memory diagnostic
+  tool rather than the default speed path.
 
 Rules for this lane:
 
