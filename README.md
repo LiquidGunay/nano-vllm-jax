@@ -86,6 +86,28 @@ The local chat UI uses the EOS-compatible mode by default.
 - Experimental MTP-1 speculative decoding kept separate in [configs/server/mtp_experimental.yaml](configs/server/mtp_experimental.yaml). It keeps target-model verification enabled and unverified draft append disabled.
 - Benchmark and profiling harnesses for JAX server traces, vLLM comparison, random workloads, and optimization log summaries.
 
+## Benchmark Snapshot
+
+These are the best recorded local A10G numbers currently worth showcasing. They
+are benchmark artifacts, not startup smoke tests. vLLM ratios use the matching
+stored or live vLLM reference recorded with each artifact.
+
+| workload | status | JAX | vLLM reference | ratio | evidence |
+| --- | --- | ---: | ---: | ---: | --- |
+| Long prefill `512..2048 -> 16`, 4 requests | exact token parity, no-profile sanity | `106.08 tok/s` | stored reference | `0.912x` | [docs/gpu_optimization_next_goal_plan.md](docs/gpu_optimization_next_goal_plan.md) |
+| Decode-heavy `128 -> 128`, 1 request | exact token parity, no-profile sanity | `197.60 tok/s` | fresh vLLM | `0.902x` | [docs/gpu_optimization_next_goal_plan.md](docs/gpu_optimization_next_goal_plan.md) |
+| Heterogeneous `64..512 -> 32`, 8 requests | exact token parity, zero measured-phase JIT growth | `514.16 tok/s` | `864.18 tok/s` | `0.595x` | [docs/gpu_optimization_next_goal_plan.md](docs/gpu_optimization_next_goal_plan.md) |
+| Random medium, 4 requests, `1787` input / `290` output tokens | zero measured-phase JIT growth | `359.34 output tok/s` | stored `471.06 output tok/s` | `0.763x` | [docs/gpu_optimization_next_goal_plan.md](docs/gpu_optimization_next_goal_plan.md) |
+| Random large, 8 requests, `6240` input / `1582` output tokens | best accepted large-random JAX route, zero measured-phase JIT growth | `757.24 output tok/s` | stored reference | `0.857x` | [docs/gpu_optimization_next_goal_plan.md](docs/gpu_optimization_next_goal_plan.md) |
+| Full random stress, 15 requests, `30506` input / `11602` output tokens | current broad stress target, not close to vLLM yet | `437.63 output tok/s` | `1541.89 output tok/s` | `0.284x` | [docs/gpu_optimization_next_goal_plan.md](docs/gpu_optimization_next_goal_plan.md) |
+
+The long-prefill and decode-heavy rows clear the `0.9x` vLLM target in the
+recorded no-profile sanity runs. Random serving is still the hard gap: the
+8-request large-random lane has a strong local best, while the 15-request full
+stress run remains far behind vLLM. MTP speculative decoding is excluded from
+these speed claims because verified MTP has not beaten the same non-MTP
+baseline.
+
 ## Current Artifact Configuration
 
 The promoted path is [configs/server/gpu_optimal.yaml](configs/server/gpu_optimal.yaml):
