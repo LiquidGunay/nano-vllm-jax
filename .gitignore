@@ -69,6 +69,14 @@ results/gpu_matrix_*/
 results/gpu_matrix_runs/
 results/debug_*.json
 results/debug_*.md
+results/entry*.json
+results/entry*.md
+results/entry*.jsonl
+results/entry*.prompts.jsonl
+results/mtp*.json
+results/mtp*.md
+results/mtp*.jsonl
+results/*_random_large.prompts.jsonl
 results/gdn_decode_*_microbench_*.json
 results/gdn_decode_*_microbench_*.md
 results/gdn_strict_*_202606*.json
@@ -81,6 +89,14 @@ results/quick_vllm_*.json
 results/quick_vllm_*.md
 results/vllm_fla_correctness_boundary*.json
 results/vllm_fla_correctness_boundary*.md
+benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata_command_buffer*.json
+benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata_cudnn_gemm*.json
+benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata_*raw*.json
+benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata_*fa_triton*.json
+benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata_graph_replay.json
+benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata_mtp_burst*.json
+benchmarks/configs/gpu_paged_gdn_fla_decode_static_metadata_xla_o*.json
+benchmarks/microbench_gdn_decode_kernels.py
 
 # OS
 .DS_Store

@@ -93,6 +93,7 @@ class Qwen3_5Config:
     batch_size_buckets: tuple = field(default_factory=tuple)
     max_blocks_per_seq: Optional[int] = None
     decode_block_table_buckets: tuple = field(default_factory=tuple)
+    prefix_cache: bool = True
     jax_execution: str = "eager"
     greedy_token_fastpath: bool = True
     sampled_token_fastpath: bool = True
@@ -408,6 +409,7 @@ class Qwen3_5Config:
             self.prefill_token_buckets,
             self.prefill_layout,
             self.decode_block_table_buckets,
+            self.prefix_cache,
             self.greedy_token_fastpath,
             self.sampled_token_fastpath,
             self.device_token_carry,

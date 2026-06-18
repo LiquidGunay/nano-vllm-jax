@@ -61,7 +61,9 @@ class Scheduler:
         self.max_num_batched_tokens = getattr(config, 'max_num_batched_tokens', 2048)
         self.eos = getattr(config, 'eos', None)
         self.block_size = config.block_size
-        self.enable_prefix_cache_execution = not getattr(config, "linear_attn_layers", ())
+        self.enable_prefix_cache_execution = bool(getattr(config, "prefix_cache", True))
+        self.prefix_cache_requires_hybrid_state = bool(getattr(config, "linear_attn_layers", ()))
+        self.prefix_cache_hybrid_states: dict[int, object] = {}
         self.prefill_buckets = tuple(getattr(config, "prefill_buckets", ()))
         self.prefill_token_buckets = tuple(getattr(config, "prefill_token_buckets", ()))
         self.prefill_layout = str(getattr(config, "prefill_layout", "packed") or "packed").lower()
@@ -194,6 +196,69 @@ class Scheduler:
         self.waiting: Deque[Sequence] = deque()
         self.running: Deque[Sequence] = deque()
 
+    def _prefix_cacheable_hashes(self) -> set[int] | None:
+        if not self.enable_prefix_cache_execution:
+            return None
+        if not self.prefix_cache_requires_hybrid_state:
+            return None
+        return set(self.prefix_cache_hybrid_states)
+
+    def _can_allocate_waiting(self, seq: Sequence) -> bool:
+        return self.block_manager.can_allocate(
+            seq,
+            use_prefix_cache=self.enable_prefix_cache_execution,
+            cacheable_hashes=self._prefix_cacheable_hashes(),
+        )
+
+    def _allocate_waiting(self, seq: Sequence) -> None:
+        self.block_manager.allocate(
+            seq,
+            use_prefix_cache=self.enable_prefix_cache_execution,
+            cacheable_hashes=self._prefix_cacheable_hashes(),
+        )
+
+    def record_computed_prefix_states(
+        self,
+        seqs: List[Sequence],
+        prefill_chunk_lengths: List[int],
+        prefix_states_by_seq: dict[int, object] | None = None,
+    ) -> None:
+        """Publish prefix-cache entries after prefill materializes them.
+
+        For hybrid/GDN models, a prefix is reusable only when the matching
+        hybrid state for that exact full-block prefix is also available.
+        """
+        if not self.enable_prefix_cache_execution:
+            return
+        if len(prefill_chunk_lengths) != len(seqs):
+            return
+        for seq, chunk_len in zip(seqs, prefill_chunk_lengths):
+            chunk_len = int(chunk_len)
+            if chunk_len <= 0:
+                continue
+            computed_tokens = min(seq.num_prompt_tokens, seq.num_cached_tokens + chunk_len)
+            if computed_tokens <= 0:
+                continue
+            if self.prefix_cache_requires_hybrid_state:
+                block_hash = self.block_manager.record_computed_prefix(
+                    seq,
+                    computed_tokens,
+                    publish=False,
+                )
+                if block_hash is None:
+                    continue
+                state = (prefix_states_by_seq or {}).get(int(seq.seq_id))
+                if state is None:
+                    continue
+                self.prefix_cache_hybrid_states[int(block_hash)] = state
+                self.block_manager.publish_computed_prefix(seq, computed_tokens)
+            else:
+                self.block_manager.record_computed_prefix(
+                    seq,
+                    computed_tokens,
+                    publish=True,
+                )
+
     def set_mtp_backend(self, backend: object) -> None:
         """Set backend identity used in scheduler-side MTP bucket keys."""
         self.mtp_backend = type(backend).__name__ if not isinstance(backend, str) else backend
@@ -269,12 +334,10 @@ class Scheduler:
                 and len(self.running) + len(scheduled_running) < self.max_num_resident_seqs
             ):
                 candidate = self.waiting[0]
-                if self.block_manager.can_allocate(
-                    candidate,
-                    use_prefix_cache=self.enable_prefix_cache_execution,
-                ):
+                if self._can_allocate_waiting(candidate):
                     seq = self.waiting.popleft()
                     from_waiting = True
+                    self._allocate_waiting(seq)
                 else:
                     waiting_blocked_by_kv = True
 
@@ -292,8 +355,8 @@ class Scheduler:
 
             remaining_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
             if remaining_tokens <= 0:
-                if not from_waiting:
-                    self.running.append(seq)
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
                 continue
             chunk_len = min(remaining_tokens, self.prefill_chunk_budget)
             if (
@@ -303,7 +366,8 @@ class Scheduler:
                 available = prefill_token_budget - num_batched_tokens
                 if available <= 0:
                     if from_waiting:
-                        self.waiting.appendleft(seq)
+                        seq.status = SequenceStatus.RUNNING
+                        self.running.append(seq)
                     else:
                         scheduled_running.append(seq)
                     break
@@ -322,19 +386,12 @@ class Scheduler:
                     and prospective_padded_tokens > self.max_num_batched_tokens
                 ):
                     if from_waiting:
-                        self.waiting.appendleft(seq)
+                        seq.status = SequenceStatus.RUNNING
+                        self.running.append(seq)
                     else:
                         self.running.appendleft(seq)
                     break
 
-            # Allocate and schedule
-            if from_waiting:
-                self.block_manager.allocate(
-                    seq,
-                    use_prefix_cache=self.enable_prefix_cache_execution,
-                )
-                if not self.enable_prefix_cache_execution:
-                    seq.num_cached_tokens = 0
             seq.status = SequenceStatus.RUNNING
             mtp_admitted = self.should_admit_mtp(
                 seq,
@@ -571,24 +628,26 @@ class Scheduler:
             and len(self.running) + len(waiting_to_allocate) < self.max_num_resident_seqs
         ):
             candidate = self.waiting[0]
-            if not self.block_manager.can_allocate(
-                candidate,
-                use_prefix_cache=self.enable_prefix_cache_execution,
-            ):
-                break
-            remaining_tokens = candidate.num_prompt_tokens - candidate.num_cached_tokens
-            chunk_len = min(remaining_tokens, mixed_chunk_budget, remaining_token_budget)
-            if chunk_len <= 0:
+            if not self._can_allocate_waiting(candidate):
                 break
             seq = self.waiting.popleft()
+            self._allocate_waiting(seq)
+            remaining_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
+            if remaining_tokens <= 0:
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
+                continue
+            chunk_len = min(remaining_tokens, mixed_chunk_budget, remaining_token_budget)
+            if chunk_len <= 0:
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
+                break
             prefill_seqs.append(seq)
             prefill_chunk_lens.append(chunk_len)
             waiting_to_allocate.append(seq)
             remaining_token_budget -= chunk_len
 
         if not prefill_seqs:
-            for seq in reversed(waiting_to_allocate):
-                self.waiting.appendleft(seq)
             return None
 
         for seq in decode_seqs:
@@ -597,12 +656,6 @@ class Scheduler:
             self.block_manager.may_append_slots(seq, 1)
 
         for seq in waiting_to_allocate:
-            self.block_manager.allocate(
-                seq,
-                use_prefix_cache=self.enable_prefix_cache_execution,
-            )
-            if not self.enable_prefix_cache_execution:
-                seq.num_cached_tokens = 0
             seq.status = SequenceStatus.RUNNING
             seq.mtp_admitted = False
             seq.mtp_admission_reason = "mixed_prefill_decode"

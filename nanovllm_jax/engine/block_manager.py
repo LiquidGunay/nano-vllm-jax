@@ -59,10 +59,21 @@ class BlockManager:
         """Allocate a free block."""
         block = self.blocks[block_id]
         assert block.ref_count == 0
+        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
+            del self.hash_to_block_id[block.hash]
         block.reset()
         self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
         return self.blocks[block_id]
+
+    def _reuse_cached_block(self, block_id: int) -> Block:
+        """Mark a cached free block used without clearing its KV metadata."""
+        block = self.blocks[block_id]
+        assert block.ref_count == 0
+        block.ref_count = 1
+        self.free_block_ids.remove(block_id)
+        self.used_block_ids.add(block_id)
+        return block
 
     def _deallocate_block(self, block_id: int) -> Block:
         """Free a block."""
@@ -78,32 +89,76 @@ class BlockManager:
         end = (block_idx + 1) * self.block_size
         return seq.token_ids[start:end]
 
-    def _record_completed_block_hash(self, seq: Sequence, block_idx: int) -> None:
+    def _record_completed_block_hash(self, seq: Sequence, block_idx: int, *, publish: bool | None = None) -> int | None:
         if block_idx < 0 or block_idx >= len(seq.block_table):
-            return
+            return None
         if seq.block_has_unmaterialized_device_tokens(block_idx):
-            return
+            return None
         token_ids = self._block_tokens(seq, block_idx)
         if len(token_ids) != self.block_size:
-            return
+            return None
         block = self.blocks[seq.block_table[block_idx]]
+        should_publish = seq.prefix_cache_enabled if publish is None else bool(publish)
         if block.hash != -1:
-            return
+            if should_publish:
+                self.hash_to_block_id[block.hash] = block.block_id
+            return block.hash
         prefix = self.blocks[seq.block_table[block_idx - 1]].hash if block_idx > 0 else -1
         h = self.compute_hash(token_ids, prefix)
         block.update(h, token_ids)
-        self.hash_to_block_id[h] = block.block_id
+        if should_publish:
+            self.hash_to_block_id[h] = block.block_id
+        return h
+
+    def _cached_block_id(self, h: int, token_ids: List[int]) -> int:
+        block_id = self.hash_to_block_id.get(h, -1)
+        if block_id == -1:
+            return -1
+        block = self.blocks[block_id]
+        if block.hash != h or block.token_ids != token_ids:
+            return -1
+        return block_id
+
+    def cached_prefix_info(
+        self,
+        seq: Sequence,
+        *,
+        cacheable_hashes: Set[int] | None = None,
+    ) -> tuple[int, int | None]:
+        """Return the longest contiguous reusable full-block prefix.
+
+        When ``cacheable_hashes`` is provided, intermediate KV blocks may be
+        reused only up to the longest prefix whose final chained hash is in the
+        set. Hybrid models use this to require a matching cached recurrent/GDN
+        state for the exact skipped prefix.
+        """
+        h = -1
+        best_blocks = 0
+        best_hash: int | None = None
+        for block_idx in range(self._num_blocks(seq)):
+            token_ids = self._block_tokens(seq, block_idx)
+            if len(token_ids) != self.block_size:
+                break
+            h = self.compute_hash(token_ids, h)
+            if self._cached_block_id(h, token_ids) == -1:
+                break
+            if cacheable_hashes is None or h in cacheable_hashes:
+                best_blocks = block_idx + 1
+                best_hash = h
+        return best_blocks * self.block_size, best_hash
 
     def can_allocate(
         self,
         seq: Sequence,
         *,
         use_prefix_cache: bool = True,
+        cacheable_hashes: Set[int] | None = None,
     ) -> bool:
         """Check if we can allocate blocks for sequence."""
         return len(self.free_block_ids) >= self._num_required_blocks(
             seq,
             use_prefix_cache=use_prefix_cache,
+            cacheable_hashes=cacheable_hashes,
         )
 
     def _num_required_blocks(
@@ -111,6 +166,7 @@ class BlockManager:
         seq: Sequence,
         *,
         use_prefix_cache: bool = True,
+        cacheable_hashes: Set[int] | None = None,
     ) -> int:
         """Count physical free blocks needed for allocation.
 
@@ -119,21 +175,20 @@ class BlockManager:
         """
         if not use_prefix_cache:
             return self._num_blocks(seq)
-
+        cached_tokens, _ = self.cached_prefix_info(seq, cacheable_hashes=cacheable_hashes)
+        cached_blocks = cached_tokens // self.block_size
         h = -1
         required = 0
-        prompt_blocks = self._num_blocks(seq)
-        for i in range(prompt_blocks):
-            token_ids = self._block_tokens(seq, i)
-            if len(token_ids) != self.block_size:
-                required += 1
+        for block_idx in range(self._num_blocks(seq)):
+            token_ids = self._block_tokens(seq, block_idx)
+            block_id = -1
+            if len(token_ids) == self.block_size:
+                h = self.compute_hash(token_ids, h)
+                if block_idx < cached_blocks:
+                    block_id = self._cached_block_id(h, token_ids)
+            if block_idx < cached_blocks and block_id in self.used_block_ids:
                 continue
-
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id.get(h, -1)
-            cache_hit = block_id != -1 and self.blocks[block_id].token_ids == token_ids
-            if not cache_hit or block_id not in self.used_block_ids:
-                required += 1
+            required += 1
         return required
 
     def allocate(
@@ -141,6 +196,7 @@ class BlockManager:
         seq: Sequence,
         *,
         use_prefix_cache: bool = True,
+        cacheable_hashes: Set[int] | None = None,
     ):
         """Allocate blocks for a sequence.
         
@@ -151,30 +207,30 @@ class BlockManager:
         """
         assert not seq.block_table
         seq.block_size = self.block_size
+        seq.num_cached_tokens = 0
+        seq.cached_prefix_hash = None
+        seq.cached_prefix_hybrid_seeded = False
+        seq.prefix_cache_enabled = bool(use_prefix_cache)
+        cached_tokens, cached_hash = (
+            self.cached_prefix_info(seq, cacheable_hashes=cacheable_hashes)
+            if use_prefix_cache
+            else (0, None)
+        )
+        cached_blocks = cached_tokens // self.block_size
         h = -1
-        cache_miss = False
         
         for i in range(self._num_blocks(seq)):
             token_ids = self._block_tokens(seq, i)
-            
-            # Compute hash only for full blocks
+            block_id = -1
+
             if len(token_ids) == self.block_size:
                 h = self.compute_hash(token_ids, h)
+                if i < cached_blocks:
+                    block_id = self._cached_block_id(h, token_ids)
+                    if block_id == -1:
+                        raise AssertionError("cached prefix disappeared during allocation")
 
-                if not use_prefix_cache:
-                    cache_miss = True
-                else:
-                    block_id = self.hash_to_block_id.get(h, -1)
-
-                    # Check if we have a cache hit
-                    if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                        cache_miss = True
-                    else:
-                        cache_miss = False
-            else:
-                cache_miss = True
-            
-            if cache_miss:
+            if block_id == -1:
                 # Allocate new block
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
@@ -186,17 +242,16 @@ class BlockManager:
                     block = self.blocks[block_id]
                     block.ref_count += 1
                 else:
-                    # Block is free - allocate it
-                    block = self._allocate_block(block_id)
+                    block = self._reuse_cached_block(block_id)
             
-            # Only full blocks are content-addressed. Partial tail blocks are
-            # request-local and must not overwrite the prefix-cache hash map.
+            # Only full blocks are content-addressed. Newly allocated blocks are
+            # not published to the prefix-cache map until execution has actually
+            # materialized their KV rows.
             if len(token_ids) == self.block_size and h != -1:
                 block.update(h, token_ids)
-                if use_prefix_cache:
-                    self.hash_to_block_id[h] = block_id
 
             seq.block_table.append(block_id)
+        seq.cached_prefix_hash = cached_hash if seq.num_cached_tokens > 0 else None
 
     def deallocate(self, seq: Sequence):
         """Free blocks for a sequence."""
@@ -207,6 +262,9 @@ class BlockManager:
                 self._deallocate_block(block_id)
         
         seq.num_cached_tokens = 0
+        seq.cached_prefix_hash = None
+        seq.cached_prefix_hybrid_seeded = False
+        seq.prefix_cache_enabled = False
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
@@ -293,3 +351,24 @@ class BlockManager:
             return
         block_idx = len(seq) // self.block_size - 1
         self._record_completed_block_hash(seq, block_idx)
+
+    def record_computed_prefix(self, seq: Sequence, upto_tokens: int, *, publish: bool) -> int | None:
+        """Record completed full prompt blocks through ``upto_tokens``.
+
+        Returns the chained hash for ``upto_tokens`` when it is exactly on a
+        full-block boundary, otherwise ``None``.
+        """
+        upto_tokens = max(0, min(int(upto_tokens), int(seq.num_prompt_tokens)))
+        full_blocks = upto_tokens // self.block_size
+        final_hash: int | None = None
+        for block_idx in range(full_blocks):
+            block_hash = self._record_completed_block_hash(seq, block_idx, publish=publish)
+            if block_idx == full_blocks - 1:
+                final_hash = block_hash
+        if upto_tokens > 0 and upto_tokens % self.block_size == 0:
+            return final_hash
+        return None
+
+    def publish_computed_prefix(self, seq: Sequence, upto_tokens: int) -> int | None:
+        """Publish an already-recorded full-block prefix to the cache map."""
+        return self.record_computed_prefix(seq, upto_tokens, publish=True)

@@ -156,6 +156,9 @@ class LLMEngine:
         max_prefill_len: int | None = None,
         max_batch: int | None = None,
         include_sampled_routes: bool = True,
+        prefill_token_buckets: tuple[int, ...] | None = None,
+        batch_size_buckets: tuple[int, ...] | None = None,
+        decode_block_table_buckets: tuple[int, ...] | None = None,
     ) -> dict[str, object]:
         """Compile configured serving buckets without using live request data."""
         if max_prefill_len is None:
@@ -180,6 +183,9 @@ class LLMEngine:
             max_prefill_len=int(max_prefill_len),
             max_batch=int(max_batch),
             include_sampled_routes=bool(include_sampled_routes),
+            prefill_token_buckets=prefill_token_buckets,
+            batch_size_buckets=batch_size_buckets,
+            decode_block_table_buckets=decode_block_table_buckets,
         )
         elapsed = perf_counter() - started
         cache_entries_after = len(cache) if cache is not None else None
@@ -194,6 +200,9 @@ class LLMEngine:
             "prefill_layout": str(getattr(self.config, "prefill_layout", "packed")),
             "batch_size_buckets": list(getattr(self.config, "batch_size_buckets", ()) or ()),
             "decode_block_table_buckets": list(getattr(self.config, "decode_block_table_buckets", ()) or ()),
+            "startup_warmup_prefill_token_buckets": list(prefill_token_buckets or ()),
+            "startup_warmup_batch_size_buckets": list(batch_size_buckets or ()),
+            "startup_warmup_decode_block_table_buckets": list(decode_block_table_buckets or ()),
             "include_sampled_routes": bool(include_sampled_routes),
             "jit_cache_entries_before": cache_entries_before,
             "jit_cache_entries_after": cache_entries_after,
@@ -286,6 +295,17 @@ class LLMEngine:
         # Schedule sequences
         seqs, scheduled_batch = self.scheduler.schedule()
         schedule_t = perf_counter()
+        prefill_chunk_lengths: list[int] | None = None
+        if scheduled_batch.is_prefill:
+            if scheduled_batch.query_lens_host is not None:
+                prefill_chunk_lengths = [int(x) for x in scheduled_batch.query_lens_host[:len(seqs)]]
+            else:
+                prefill_chunk_lengths = [int(x) for x in scheduled_batch.query_lens.tolist()[:len(seqs)]]
+
+        self.model_runner.install_cached_prefix_hybrid_states(
+            seqs,
+            getattr(self.scheduler, "prefix_cache_hybrid_states", None),
+        )
 
         # Run model
         token_ids = self.model_runner.run(seqs, batch=scheduled_batch)
@@ -296,13 +316,12 @@ class LLMEngine:
             for token_id in token_ids:
                 emitted_tokens += len(token_id) if isinstance(token_id, list) else 1
 
-        # Post-process
-        prefill_chunk_lengths: list[int] | None = None
         if scheduled_batch.is_prefill:
-            if scheduled_batch.query_lens_host is not None:
-                prefill_chunk_lengths = [int(x) for x in scheduled_batch.query_lens_host[:len(seqs)]]
-            else:
-                prefill_chunk_lengths = [int(x) for x in scheduled_batch.query_lens.tolist()[:len(seqs)]]
+            self.scheduler.record_computed_prefix_states(
+                seqs,
+                prefill_chunk_lengths or [],
+                self.model_runner.hybrid_states_for_sequences(seqs),
+            )
         finished_flags = self.scheduler.postprocess(seqs, token_ids, prefill_chunk_lengths=prefill_chunk_lengths)
         postprocess_t = perf_counter()
         finished_seq_ids = [seq.seq_id for seq, is_finished in zip(seqs, finished_flags) if is_finished]
@@ -798,7 +817,7 @@ class LLMEngine:
             "device_token_carry",
             "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
         )
-        if device_token_carry:
+        if device_token_carry and self._trace_can_defer_device_tokens(prompts, sampling_params):
             return self._generate_with_trace_deferred_tokens(
                 prompts,
                 sampling_params=sampling_params,
@@ -818,6 +837,22 @@ class LLMEngine:
             "results": results,
             "events": events,
         }
+
+    def _trace_can_defer_device_tokens(
+        self,
+        prompts: List[Union[str, List[int]]],
+        sampling_params: Union[SamplingParams, List[SamplingParams], None],
+    ) -> bool:
+        """The deferred trace path avoids token readback and cannot stop on EOS."""
+        if sampling_params is None:
+            return False
+        if isinstance(sampling_params, list):
+            if len(sampling_params) != len(prompts):
+                return False
+            params = sampling_params
+        else:
+            params = [sampling_params] * len(prompts)
+        return all(bool(sp.ignore_eos) for sp in params)
 
     def _generate_with_trace_deferred_tokens(
         self,

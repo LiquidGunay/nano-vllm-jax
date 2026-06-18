@@ -6,6 +6,7 @@ Start here for current documentation. Archived notes may be useful for history, 
 
 - [Architecture](architecture.md): engine loop, scheduler/runner/executor/backend boundaries, state ownership.
 - [GPU correctness guardrails](gpu_correctness_guardrails.md): current GPU correctness contract, runtime cache roots, and guard commands.
+- [Serving paths](serving_paths.md): promoted server config, small smoke config, and separated experimental paths.
 - [GDN FLA kernel flow](gdn_fla_kernel_flow.md): block-dot GDN/FLA prefill route, model-specific assumptions, and benchmark interpretation.
 - [KV cache](kv_cache.md): block tables, slot mapping, masks, block-boundary behavior.
 - [MTP](mtp.md): historical TPU K=1 terminology and invariants, with current GPU caveats.

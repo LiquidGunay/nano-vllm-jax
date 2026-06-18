@@ -65,6 +65,9 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
+        self.cached_prefix_hash: int | None = None
+        self.cached_prefix_hybrid_seeded = False
+        self.prefix_cache_enabled = False
         self.block_table: List[int] = []
         # Scheduler-owned speculative decoding admission. The model runner
         # treats this as a per-step permission bit and must fall back to

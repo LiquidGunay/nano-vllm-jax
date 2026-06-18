@@ -8,6 +8,11 @@
 
 ## GPU And Benchmark Commands
 
+- Use `configs/server/gpu_optimal.yaml` as the promoted non-MTP server path.
+  The root `server_config.yaml` intentionally mirrors it. Keep optional MTP,
+  local CUDA probes, raw GDN experiments, and route-specific warmups in
+  separate diagnostic configs/docs rather than adding them to the default
+  server path.
 - Run benchmark, profiling, vLLM, JAX GPU, CUDA, NVIDIA, and model-serving
   commands with GPU visibility verified up front. In sessions that support
   elevated access, use it for GPU work; in unrestricted sessions where approvals

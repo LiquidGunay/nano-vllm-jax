@@ -1,8 +1,7 @@
-# Default nano-vllm-jax server configuration.
+# Promoted non-MTP CUDA serving path.
 #
-# This file intentionally mirrors configs/server/gpu_optimal.yaml: it is the
-# promoted non-MTP GPU serving path, not a tiny smoke-test shape. For a smaller
-# pure-JAX smoke config or MTP diagnostics, use configs/server/*.yaml.
+# This is the path new GPU users should start with. It keeps local CUDA probes
+# disabled, uses the accepted config-owned fast paths, and leaves MTP off.
 
 server:
   host: "127.0.0.1"

@@ -1249,6 +1249,9 @@ class CanonicalModelRunner:
         max_batch: int = 1,
         *,
         include_sampled_routes: bool = True,
+        prefill_token_buckets: tuple[int, ...] | None = None,
+        batch_size_buckets: tuple[int, ...] | None = None,
+        decode_block_table_buckets: tuple[int, ...] | None = None,
     ):
         """Compile configured static shapes through the canonical executor path."""
         def _block_until_ready(value: object) -> None:
@@ -1282,13 +1285,17 @@ class CanonicalModelRunner:
             summary["jit_cache_entries_after"] = _cache_entries()
             return summary
 
-        prefill_buckets = (
+        prefill_buckets = tuple(int(bucket) for bucket in (prefill_token_buckets or ())) or (
             tuple(getattr(self.config, "prefill_token_buckets", ()))
             or tuple(getattr(self.config, "prefill_buckets", ()))
             or (max_prefill_len,)
         )
-        batch_buckets = tuple(getattr(self.config, "batch_size_buckets", ())) or (max_batch,)
-        decode_block_table_buckets = (
+        batch_buckets = tuple(int(bucket) for bucket in (batch_size_buckets or ())) or (
+            tuple(getattr(self.config, "batch_size_buckets", ())) or (max_batch,)
+        )
+        decode_block_table_buckets = tuple(
+            int(bucket) for bucket in (decode_block_table_buckets or ())
+        ) or (
             tuple(getattr(self.config, "decode_block_table_buckets", ()) or ())
             or (int(self.max_blocks_per_seq),)
         )
@@ -3493,6 +3500,44 @@ class CanonicalModelRunner:
             if self._hybrid_state_table.recurrent_state is not None and state.recurrent_state is not None
             else self._hybrid_state_table.recurrent_state,
         )
+
+    def hybrid_state_for_sequence(self, seq_id: int) -> HybridLayerState | None:
+        if seq_id < 0 or getattr(self, "_hybrid_state_table", None) is None:
+            return None
+        if self._hybrid_state_table.conv_state is None and self._hybrid_state_table.recurrent_state is None:
+            return None
+        if seq_id not in self._hybrid_slots:
+            return None
+        return self._get_hybrid_state(seq_id)
+
+    def hybrid_states_for_sequences(self, seqs: List[Sequence]) -> dict[int, HybridLayerState]:
+        states: dict[int, HybridLayerState] = {}
+        for seq in seqs:
+            state = self.hybrid_state_for_sequence(int(seq.seq_id))
+            if state is not None:
+                states[int(seq.seq_id)] = state
+        return states
+
+    def install_cached_prefix_hybrid_states(
+        self,
+        seqs: List[Sequence],
+        prefix_states: dict[int, HybridLayerState] | None,
+    ) -> None:
+        if not prefix_states:
+            return
+        for seq in seqs:
+            prefix_hash = getattr(seq, "cached_prefix_hash", None)
+            if prefix_hash is None or int(getattr(seq, "num_cached_tokens", 0)) <= 0:
+                continue
+            if getattr(seq, "cached_prefix_hybrid_seeded", False):
+                continue
+            state = prefix_states.get(int(prefix_hash))
+            if state is None:
+                raise RuntimeError(
+                    f"missing hybrid prefix state for cached prefix hash {int(prefix_hash)}"
+                )
+            self._set_hybrid_state(int(seq.seq_id), state)
+            seq.cached_prefix_hybrid_seeded = True
 
     def _slice_batch(self, batch: ScheduledBatch, idx: int) -> ScheduledBatch:
         query_len = int(batch.query_lens[idx])

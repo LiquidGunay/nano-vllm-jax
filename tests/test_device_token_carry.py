@@ -1089,3 +1089,26 @@ def test_generate_with_trace_prefetches_when_trace_prefetch_enabled(monkeypatch)
         "materialize-202",
         "materialize-203",
     ]
+
+
+def test_generate_with_trace_keeps_eos_compatible_path_when_ignore_eos_false(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    calls = []
+
+    def iter_generate(prompts, sampling_params=None, *, include_text=True):
+        calls.append((prompts, sampling_params, include_text))
+        yield {"event": "token", "token_id": 123}
+        yield {"event": "done", "results": [{"text": "ok", "token_ids": [123]}]}
+
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.iter_generate = iter_generate
+
+    trace = engine.generate_with_trace(
+        [[101]],
+        SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=False),
+        include_text=False,
+    )
+
+    assert calls
+    assert trace["events"][0]["event"] == "token"
+    assert trace["results"] == [{"text": "ok", "token_ids": [123]}]

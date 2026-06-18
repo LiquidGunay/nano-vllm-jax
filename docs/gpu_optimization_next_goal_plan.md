@@ -156,6 +156,30 @@ optimization work starts.
     the long first seed execution and steady-state target-verifier cost without
     changing default routing to the rejected seed-boundary variants.
 
+## Parked MTP Verifier Plan - 2026-06-18
+
+Cleanup is the active priority before more speculative decoding work. When MTP
+work resumes, continue from this checklist rather than re-opening rejected
+routes:
+
+1. Keep the current exact path as the control: resident-table K=1, burst-2,
+   target-model verification, no unverified append, and no promoted prefill
+   seed route.
+2. Isolate the long seed cost with a direct microbenchmark for
+   `forward_step_token_ids_mtp_draft_chain_jit` across small batch and sequence
+   length buckets, toggling attention, GDN, MTP-head, and top-1 implementations.
+3. Fix warmup only if the microbenchmark proves a real first-use tax. Do not
+   add broad max-length decode warmup; build any route-aware warmup from real
+   prefill-created cache/state so it cannot hit the previous Triton
+   `CUDA_ERROR_ILLEGAL_ADDRESS` path.
+4. Move seed execution to a resident-table boundary only after the seed cost is
+   understood, and keep target-token carry canonical.
+5. Profile and remove the scheduler gap observed after the first seed group
+   before optimizing steady verifier math.
+6. Optimize steady verifier cost last. Success requires exact verification,
+   zero measured-phase JIT growth, and a speed win over the same no-MTP serving
+   config on the same benchmark envelope.
+
 ## Active Random Request Contract - 2026-06-04
 
 The active broad serving target is now the seed-`1234` random request sidecar,

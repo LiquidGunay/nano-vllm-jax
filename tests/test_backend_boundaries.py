@@ -4181,6 +4181,7 @@ def test_prefix_cache_shares_blocks_and_refcounts():
     seq_b = Sequence([1, 2, 7], SamplingParams(temperature=0.0), seq_id=2)
 
     block_manager.allocate(seq_a)
+    block_manager.record_computed_prefix(seq_a, 2, publish=True)
     block_manager.allocate(seq_b)
 
     shared_block = seq_a.block_table[0]
@@ -4196,12 +4197,72 @@ def test_prefix_cache_allocation_allows_used_full_block_hit_without_free_blocks(
     seq_b = Sequence([1, 2], SamplingParams(temperature=0.0), seq_id=2)
 
     block_manager.allocate(seq_a)
+    block_manager.record_computed_prefix(seq_a, 2, publish=True)
 
     assert len(block_manager.free_block_ids) == 0
     assert block_manager.can_allocate(seq_b)
     block_manager.allocate(seq_b)
     assert seq_a.block_table == seq_b.block_table == [0]
     assert block_manager.blocks[0].ref_count == 2
+
+
+def test_prefix_cache_does_not_share_uncomputed_allocation():
+    block_manager = BlockManager(num_blocks=2, block_size=2)
+    seq_a = Sequence([1, 2], SamplingParams(temperature=0.0), seq_id=1)
+    seq_b = Sequence([1, 2], SamplingParams(temperature=0.0), seq_id=2)
+
+    block_manager.allocate(seq_a)
+
+    assert block_manager.can_allocate(seq_b)
+    block_manager.allocate(seq_b)
+    assert seq_a.block_table != seq_b.block_table
+    assert seq_b.num_cached_tokens == 0
+
+
+def test_prefix_cache_hybrid_allowlist_requires_final_prefix_hash():
+    block_manager = BlockManager(num_blocks=6, block_size=2)
+    seq_a = Sequence([1, 2, 3, 4], SamplingParams(temperature=0.0), seq_id=1)
+    seq_b = Sequence([1, 2, 3, 4, 5], SamplingParams(temperature=0.0), seq_id=2)
+
+    block_manager.allocate(seq_a)
+    final_hash = block_manager.record_computed_prefix(seq_a, 4, publish=True)
+    assert final_hash is not None
+
+    assert block_manager.cached_prefix_info(seq_b, cacheable_hashes=set()) == (0, None)
+    cached_tokens, cached_hash = block_manager.cached_prefix_info(
+        seq_b,
+        cacheable_hashes={final_hash},
+    )
+    assert cached_tokens == 4
+    assert cached_hash == final_hash
+
+    block_manager.allocate(seq_b, cacheable_hashes={final_hash})
+    assert seq_b.block_table[:2] == seq_a.block_table
+    assert seq_b.num_cached_tokens == 4
+    assert seq_b.cached_prefix_hash == final_hash
+
+
+def test_scheduler_hybrid_prefix_cache_records_state_before_reuse():
+    config = _tiny_linear_attention_config()
+    config.prefix_cache = True
+    config.num_kvcache_blocks = 6
+    scheduler = Scheduler(config)
+    seq_a = Sequence([1, 2, 3, 4], SamplingParams(temperature=0.0), seq_id=10)
+    seq_b = Sequence([1, 2, 3, 4, 5], SamplingParams(temperature=0.0), seq_id=11)
+
+    scheduler._allocate_waiting(seq_a)
+    scheduler.record_computed_prefix_states(
+        [seq_a],
+        [4],
+        {seq_a.seq_id: object()},
+    )
+
+    assert scheduler.prefix_cache_hybrid_states
+    assert scheduler._can_allocate_waiting(seq_b)
+    scheduler._allocate_waiting(seq_b)
+    assert seq_b.num_cached_tokens == 4
+    assert seq_b.block_table[:2] == seq_a.block_table
+    assert seq_b.cached_prefix_hash in scheduler.prefix_cache_hybrid_states
 
 
 def test_no_prefix_cache_allocation_keeps_repeated_prompts_on_unique_blocks():
@@ -4280,6 +4341,52 @@ def test_server_generate_accepts_batched_prompts(monkeypatch):
     assert payload["usage"]["prompt_tokens"] == 3
     assert payload["usage"]["completion_tokens"] == 4
     assert payload["stats"]["jit_cache_entries"] == 1
+
+
+def test_server_generate_accepts_chat_messages(monkeypatch):
+    import server
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+            assert tokenize is True
+            assert add_generation_prompt is True
+            assert messages == [
+                {"role": "system", "content": "Be terse."},
+                {"role": "user", "content": "Hello"},
+            ]
+            return {"input_ids": [101, 102, 103]}
+
+    class FakeEngine:
+        config = type("Config", (), {"jax_execution": "jit", "prefill_buckets": (), "batch_size_buckets": ()})()
+        tokenizer = FakeTokenizer()
+        model_runner = type("Runner", (), {"executor": type("Executor", (), {"_jit_cache": {}})()})()
+
+        def _tokenize(self, text):
+            raise AssertionError("chat messages should be tokenized through the chat template")
+
+        def generate(self, inputs, sampling_params, use_tqdm):
+            assert inputs == [[101, 102, 103]]
+            assert sampling_params.max_tokens == 1
+            assert sampling_params.ignore_eos is False
+            return [{"text": "Hi", "token_ids": [104]}]
+
+    monkeypatch.setattr(server, "engine", FakeEngine())
+
+    response = server.app.test_client().post(
+        "/v1/generate",
+        json={
+            "messages": [
+                {"role": "system", "content": "Be terse."},
+                {"role": "user", "content": "Hello"},
+            ],
+            "max_tokens": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["text"] == "Hi"
+    assert payload["usage"]["prompt_tokens"] == 3
 
 
 def test_server_generate_keeps_single_input_ids_response_shape(monkeypatch):

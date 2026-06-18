@@ -1,15 +1,55 @@
 """Tests for typed runtime/kernel configuration loading."""
 
 import os
+from pathlib import Path
 
 import pytest
+import yaml
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.server_config import (
+    _ENGINE_ENV_MAP,
+    _SERVER_ENV_MAP,
     engine_overrides_from_config,
     load_server_config,
     runtime_env_from_config,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _clear_config_env(monkeypatch):
+    for env_name, _ in (*_SERVER_ENV_MAP.values(), *_ENGINE_ENV_MAP.values()):
+        monkeypatch.delenv(env_name, raising=False)
+    for key in (
+        "JAX_PLATFORMS",
+        "TOKENIZERS_PARALLELISM",
+        "XLA_PYTHON_CLIENT_PREALLOCATE",
+        "TF_GPU_ALLOCATOR",
+        "XLA_FLAGS",
+        "NANO_VLLM_JAX_KERNEL_BACKEND",
+        "NANO_VLLM_JAX_ALLOW_LOCAL_CUDA_PROBES",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+def _assert_engine_config_constructible(engine: dict):
+    kwargs = dict(engine)
+    kwargs["max_kv_cache_bytes"] = int(kwargs.pop("max_kv_cache_mb") * 1024 * 1024)
+    for key in (
+        "model",
+        "backend",
+        "max_prefill",
+        "skip_compile",
+        "startup_warmup_prefill_token_buckets",
+        "startup_warmup_batch_size_buckets",
+        "startup_warmup_decode_block_table_buckets",
+        "startup_warmup_include_sampled_routes",
+    ):
+        kwargs.pop(key, None)
+    config_fields = set(Qwen3_5Config.__dataclass_fields__)
+    Qwen3_5Config(**{key: value for key, value in kwargs.items() if key in config_fields})
 
 
 def test_speculative_config_legacy_num_tokens_selects_mtp():
@@ -250,12 +290,16 @@ engine:
 
 def test_engine_config_supports_resident_sequence_capacity(tmp_path, monkeypatch):
     monkeypatch.delenv("NANO_VLLM_JAX_MAX_NUM_RESIDENT_SEQS", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_MAX_BLOCKS_PER_SEQ", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_PREFIX_CACHE", raising=False)
     config = tmp_path / "server_config.yaml"
     config.write_text(
         """
 engine:
   max_num_seqs: 8
   max_num_resident_seqs: 16
+  max_blocks_per_seq: 96
+  prefix_cache: true
 """.strip()
     )
 
@@ -263,11 +307,55 @@ engine:
 
     assert loaded.engine["max_num_seqs"] == 8
     assert loaded.engine["max_num_resident_seqs"] == 16
+    assert loaded.engine["max_blocks_per_seq"] == 96
+    assert loaded.engine["prefix_cache"] is True
 
     monkeypatch.setenv("NANO_VLLM_JAX_MAX_NUM_RESIDENT_SEQS", "12")
+    monkeypatch.setenv("NANO_VLLM_JAX_MAX_BLOCKS_PER_SEQ", "80")
+    monkeypatch.setenv("NANO_VLLM_JAX_PREFIX_CACHE", "0")
     loaded = load_server_config(config)
 
     assert loaded.engine["max_num_resident_seqs"] == 12
+    assert loaded.engine["max_blocks_per_seq"] == 80
+    assert loaded.engine["prefix_cache"] is False
+
+
+def test_engine_config_supports_startup_warmup_profile(tmp_path, monkeypatch):
+    for key in (
+        "NANO_VLLM_JAX_STARTUP_WARMUP_PREFILL_TOKEN_BUCKETS",
+        "NANO_VLLM_JAX_STARTUP_WARMUP_BATCH_SIZE_BUCKETS",
+        "NANO_VLLM_JAX_STARTUP_WARMUP_DECODE_BLOCK_TABLE_BUCKETS",
+        "NANO_VLLM_JAX_STARTUP_WARMUP_INCLUDE_SAMPLED_ROUTES",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    config = tmp_path / "server_config.yaml"
+    config.write_text(
+        """
+engine:
+  startup_warmup_prefill_token_buckets: "64,128"
+  startup_warmup_batch_size_buckets: "1,4"
+  startup_warmup_decode_block_table_buckets: "128"
+  startup_warmup_include_sampled_routes: false
+""".strip()
+    )
+
+    loaded = load_server_config(config)
+
+    assert loaded.engine["startup_warmup_prefill_token_buckets"] == "64,128"
+    assert loaded.engine["startup_warmup_batch_size_buckets"] == "1,4"
+    assert loaded.engine["startup_warmup_decode_block_table_buckets"] == "128"
+    assert loaded.engine["startup_warmup_include_sampled_routes"] is False
+
+    monkeypatch.setenv("NANO_VLLM_JAX_STARTUP_WARMUP_PREFILL_TOKEN_BUCKETS", "256")
+    monkeypatch.setenv("NANO_VLLM_JAX_STARTUP_WARMUP_BATCH_SIZE_BUCKETS", "8")
+    monkeypatch.setenv("NANO_VLLM_JAX_STARTUP_WARMUP_DECODE_BLOCK_TABLE_BUCKETS", "320")
+    monkeypatch.setenv("NANO_VLLM_JAX_STARTUP_WARMUP_INCLUDE_SAMPLED_ROUTES", "1")
+    loaded = load_server_config(config)
+
+    assert loaded.engine["startup_warmup_prefill_token_buckets"] == "256"
+    assert loaded.engine["startup_warmup_batch_size_buckets"] == "8"
+    assert loaded.engine["startup_warmup_decode_block_table_buckets"] == "320"
+    assert loaded.engine["startup_warmup_include_sampled_routes"] is True
 
 
 def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy():
@@ -429,3 +517,62 @@ kernels:
     assert loaded.env["NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL"] == "triton_fla"
     assert os.environ["JAX_PLATFORMS"] == "cuda"
     assert os.environ["NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL"] == "triton_fla"
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "server_config.yaml",
+        "configs/server/gpu_optimal.yaml",
+        "configs/server/gpu_minimal_pure_jax.yaml",
+        "configs/server/mtp_experimental.yaml",
+    ],
+)
+def test_promoted_server_configs_load_and_project(relative_path, monkeypatch):
+    _clear_config_env(monkeypatch)
+
+    loaded = load_server_config(REPO_ROOT / relative_path)
+
+    assert loaded.engine["model"] == "Qwen/Qwen3.5-0.8B"
+    assert loaded.engine["backend"] == "gpu"
+    assert loaded.engine["max_blocks_per_seq"] is not None
+    assert loaded.engine["prefix_cache"] is True
+    assert loaded.env["JAX_PLATFORMS"] == "cuda"
+    assert loaded.env.get("NANO_VLLM_JAX_ALLOW_LOCAL_CUDA_PROBES", "0") == "0"
+    _assert_engine_config_constructible(loaded.engine)
+
+
+def test_root_server_config_mirrors_gpu_optimal():
+    root = yaml.safe_load((REPO_ROOT / "server_config.yaml").read_text()) or {}
+    optimal = yaml.safe_load((REPO_ROOT / "configs/server/gpu_optimal.yaml").read_text()) or {}
+
+    assert root == optimal
+
+
+def test_gpu_optimal_config_is_non_mtp_promoted_path(monkeypatch):
+    _clear_config_env(monkeypatch)
+
+    loaded = load_server_config(REPO_ROOT / "configs/server/gpu_optimal.yaml")
+
+    assert loaded.engine["speculative_method"] == "none"
+    assert loaded.engine["num_speculative_tokens"] == 0
+    assert loaded.engine["full_attention_decode_impl"] == "flashinfer_paged"
+    assert loaded.engine["full_attention_prefill_impl"] == "triton_packed"
+    assert loaded.engine["gdn_prefill_post_conv_impl"] == "triton_fla_padded"
+    assert loaded.engine["gdn_packed_decode_impl"] == "reference"
+    assert loaded.engine["lm_head_greedy_top1_impl"] == "triton"
+    assert loaded.engine["resident_decode_metadata"] is True
+
+
+def test_mtp_experimental_config_is_exact_and_separate(monkeypatch):
+    _clear_config_env(monkeypatch)
+
+    loaded = load_server_config(REPO_ROOT / "configs/server/mtp_experimental.yaml")
+
+    assert loaded.engine["speculative_method"] == "mtp"
+    assert loaded.engine["num_speculative_tokens"] == 1
+    assert loaded.engine["draft_sample_method"] == "greedy"
+    assert loaded.engine["mtp_verifier_impl"] == "two_decode"
+    assert loaded.engine["mtp_prefill_seed"] is False
+    assert loaded.engine["mtp_unverified_draft_append"] is False
+    assert loaded.engine["mtp_unverified_fused_append"] is False
