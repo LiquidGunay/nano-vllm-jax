@@ -216,8 +216,9 @@ Current best:
   `651.71 output tok/s`; `hetero8` moved from `419.06` to `424.09 output tok/s`.
   This is a real host-communication win, but it does not close the structural
   mixed-serving decode/tail-batch gap. Full random remeasurement was blocked by
-  compile RAM on the shared host even after restoring the accepted
-  `1,2,4,8`/`128,256,320` envelope.
+  compile RAM on the shared host during reduced-envelope attempts; the sidecar
+  defaults now dry-run to the accepted KV/block envelope, but a final corrected
+  full-stress measurement is still pending.
 
 Rules for this lane:
 

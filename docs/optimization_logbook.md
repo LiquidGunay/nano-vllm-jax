@@ -13113,10 +13113,14 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     shapes (`1..8` batch buckets and a `4096` prefill bucket) or rejected the
     seed-`1234` manifest because `max_blocks_per_seq=256` cannot admit the
     `5029`-token request;
-  - after matching the active envelope, the run still exceeded the 80% system
-    RAM guard during compile on this shared host before measurement completed.
-    Treat full-stress remeasurement as blocked by compile memory until either
-    the host has more free RAM or warmup is split into lower-memory phases.
+  - a reduced bucket retry with `max_blocks_per_seq=320` still exceeded the
+    80% system RAM guard during compile on this shared host before measurement
+    completed;
+  - after that, the sidecar defaults were corrected to the accepted KV/block
+    envelope and verified with a dry run, but the final corrected full-stress
+    command has not yet completed a measured run. Treat full-stress
+    remeasurement as pending until either the host has more free RAM or warmup
+    is split into lower-memory phases.
 - interpretation:
   - per-token trace event serialization was not the whole gap, but per-step
     token prefetch in summary mode was a real host-communication cost. Removing
