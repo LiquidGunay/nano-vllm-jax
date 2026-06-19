@@ -3674,6 +3674,19 @@ Model-specific assumptions to track:
       because acceptance is `2/42`. Do not promote MTP for random/hetero until
       the draft contract/model or confidence gate produces a high-acceptance
       bucket where verifier cost is cheaper than ordinary decode.
+42. Final materialization audit, 2026-06-19:
+    - the fixed-B8 random lane's remaining final bucket is the last-finishing
+      row's deferred token-id readback plus queued GPU completion at the first
+      blocking host read, not Python result construction;
+    - O(n) stale-slot filtering is safe and promoted, but resident output-table
+      scatter, final stacked vector transfer, longest-row live prefetch, and
+      background `device_get` resolver all regressed total throughput while
+      only moving the sync point;
+    - next work should not be another Python prefetch/materialization tweak.
+      It should either make throughput summaries avoid full token-id readback
+      when correctness tokens are not requested, or introduce a broader
+      device-owned output/result boundary that does not add hot per-step scatter
+      work to decode.
 ```
 
 ## Expected Strategic Outcome

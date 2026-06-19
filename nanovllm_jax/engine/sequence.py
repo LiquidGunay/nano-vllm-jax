@@ -225,9 +225,18 @@ class Sequence:
         vector_entries: List[tuple[int, int, int]] = []
         vector_arrays = []
         vector_slots: dict[int, int] = {}
+        current_slot_keys_by_seq: dict[int, set[tuple[int, int]]] = {}
         for slot in slots:
             seq = slot.seq
-            if not any(index == slot.index and token is slot.token for index, token in seq._device_token_slots):
+            seq_key = id(seq)
+            current_slot_keys = current_slot_keys_by_seq.get(seq_key)
+            if current_slot_keys is None:
+                current_slot_keys = {
+                    (int(index), id(token))
+                    for index, token in seq._device_token_slots
+                }
+                current_slot_keys_by_seq[seq_key] = current_slot_keys
+            if (int(slot.index), id(slot.token)) not in current_slot_keys:
                 continue
             entries.append(slot)
             entry_index = len(entries) - 1

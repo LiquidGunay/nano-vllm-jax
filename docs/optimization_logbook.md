@@ -13391,3 +13391,71 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     because final drain is a large fraction of a short 256-token run. The next
     hetero-specific improvement needs a device-owned output table or a broader
     decode/output boundary, not more Python-loop prefetch calls.
+
+#### Entry 315 audit - Final Materialization Boundary Check
+
+- date: 2026-06-19
+- trigger:
+  - user asked to keep optimizing final materialization until it became
+    negligible on the fixed-B8 random lane.
+- promoted code path:
+  - `Sequence.materialize_device_token_slots` now filters stale snapshot slots
+    in O(n) by precomputing current `(index, token-id)` sets per sequence. This
+    keeps stale pending snapshots cheap after another materializer has already
+    cleared slots;
+  - summary trace output now reports finalization timing fields:
+    `final_post_loop_seconds`, `final_pending_materialize_seconds`,
+    `final_device_token_materialize_seconds`, `final_result_build_seconds`, and
+    before/after device-token slot counts.
+- validation:
+  - `PYTHONPATH=. .venv/bin/python -m pytest -q tests/test_device_token_carry.py tests/test_backend_boundaries.py::test_executor_table_hybrid_decode_matches_sliced_decode`:
+    `35 passed`;
+  - `.venv/bin/python -m py_compile nanovllm_jax/engine/llm_engine.py nanovllm_jax/engine/sequence.py`.
+- fixed-B8 random current safe path with timing:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/materialization_20260619/full_random_b8_linear_slot_timing_sidecar_r1.json`;
+  - JAX `794.86 output tok/s`, ratio `0.794x` stored vLLM, token-event rate
+    `816.14 output tok/s`, final drain `0.201 s`, zero measured JIT growth;
+  - final timing: `final_pending_materialize_seconds=0.1867`,
+    `final_post_loop_seconds=0.1871`, `final_device_token_slots_before=1007`.
+- post-experiment safe repeat after reverting regressive variants:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/materialization_20260619/full_random_b8_final_materialization_safe_r1.json`;
+  - JAX `791.27 output tok/s`, ratio `0.790x` stored vLLM, token-event rate
+    `811.54 output tok/s`, final drain `0.193 s`, zero measured JIT growth,
+    peak system RAM `53.2%`;
+  - final timing: `final_pending_materialize_seconds=0.1779`,
+    `final_post_loop_seconds=0.1783`, `final_device_token_slots_before=1007`;
+  - treat this as a repeat of the safe path, not a new best. The canonical
+    current-code comparison point remains
+    `full_random_b8_linear_slot_timing_sidecar_r1.json`.
+- rejected variants:
+  - resident output-token table: changed the dense decode boundary to scatter
+    token ids into a `[max_seqs, max_blocks_per_seq * block_size]` table every
+    step. Reordering finalization made scalar pending materialization
+    negligible (`0.0005 s`) but total throughput collapsed to
+    `416.72 output tok/s`; the hot scatter increased GPU memory and TTFT;
+  - final stacked vector transfer: grouped same-shaped per-step token vectors
+    into stacked JAX arrays at finalization. This made the final wait worse:
+    `362.20 output tok/s`, `0.514 s` drain, `0.496 s`
+    `final_pending_materialize_seconds`;
+  - longest-row live `copy_to_host_async`: after fixing the skipped-slot bug,
+    it submitted all `1006` decode `DeviceTokenRef`s for the final row, reduced
+    final pending materialization to `0.1286 s`, but regressed throughput to
+    `778.27 output tok/s`;
+  - background `device_get` resolver: resolving the longest row on two worker
+    threads made the measured final pending block small
+    (`0.0061 s`, one fallback slot) but introduced a mandatory
+    `0.1465 s` background flush and regressed throughput to
+    `768.00 output tok/s`.
+- interpretation:
+  - the remaining final bucket is not just Python list processing. It is the
+    necessary readback of the last-finishing row's deferred token ids, plus
+    queued GPU completion observed at the first blocking host read;
+  - making the final block itself negligible is possible, but every attempted
+    implementation merely moved the wait earlier or added hot decode work,
+    reducing total throughput. Do not promote these variants;
+  - the next real fix needs a broader device-owned output/results boundary:
+    either avoid materializing full token ids for throughput-only summaries, or
+    produce and consume output tokens through a resident result buffer without a
+    per-step scatter that competes with decode.

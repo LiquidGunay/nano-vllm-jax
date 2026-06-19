@@ -68,8 +68,9 @@ def _deferred_trace_timing_summary(
     last_token_elapsed_seconds: float | None,
     generated_tokens: int,
     source: str,
+    extra: dict | None = None,
 ) -> dict:
-    return {
+    summary = {
         "source": source,
         "generated_tokens": int(generated_tokens),
         "last_token_elapsed_seconds": last_token_elapsed_seconds,
@@ -80,6 +81,9 @@ def _deferred_trace_timing_summary(
         "itl_ms_p50": _percentile(itls_ms, 50),
         "itl_ms_p95": _percentile(itls_ms, 95),
     }
+    if extra:
+        summary.update(extra)
+    return summary
 
 
 def _engine_step_profile_enabled() -> bool:
@@ -1045,9 +1049,21 @@ class LLMEngine:
 
         if prefetch_trace_tokens and pending_prefetch_slots:
             Sequence.prefetch_device_token_slots(pending_prefetch_slots)
+        final_post_loop_start = perf_counter()
+        final_pending_materialize_seconds = 0.0
+        final_device_token_materialize_seconds = 0.0
+        final_result_build_seconds = 0.0
+        final_slots_before = sum(len(seq._device_token_slots) for seq in seqs)
         if prefetch_finished_tokens and pending_finished_slots:
+            final_pending_start = perf_counter()
             Sequence.materialize_device_token_slots(pending_finished_slots)
+            final_pending_materialize_seconds = perf_counter() - final_pending_start
+        final_slots_after_pending = sum(len(seq._device_token_slots) for seq in seqs)
+        final_device_materialize_start = perf_counter()
         Sequence.materialize_device_tokens_for_sequences(seqs)
+        final_device_token_materialize_seconds = perf_counter() - final_device_materialize_start
+        final_slots_after_device_materialize = sum(len(seq._device_token_slots) for seq in seqs)
+        final_result_build_start = perf_counter()
         results = []
         for index, seq in enumerate(seqs):
             token_ids = [int(token) for token in seq.completion_token_ids]
@@ -1058,6 +1074,8 @@ class LLMEngine:
                     "token_ids": token_ids,
                 }
             )
+        final_result_build_seconds = perf_counter() - final_result_build_start
+        final_post_loop_seconds = perf_counter() - final_post_loop_start
         tokens_by_request = {
             int(result["request_index"]): list(result["token_ids"])
             for result in results
@@ -1093,6 +1111,15 @@ class LLMEngine:
                     if trace_events
                     else "jax_server_step_summary"
                 ),
+                extra={
+                    "final_post_loop_seconds": final_post_loop_seconds,
+                    "final_pending_materialize_seconds": final_pending_materialize_seconds,
+                    "final_device_token_materialize_seconds": final_device_token_materialize_seconds,
+                    "final_result_build_seconds": final_result_build_seconds,
+                    "final_device_token_slots_before": final_slots_before,
+                    "final_device_token_slots_after_pending": final_slots_after_pending,
+                    "final_device_token_slots_after_device_materialize": final_slots_after_device_materialize,
+                },
             ),
         }
 

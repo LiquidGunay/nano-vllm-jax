@@ -72,6 +72,16 @@
   broader device-owned output boundary. The 2026-06-19 short-output prefetch
   experiment regressed `hetero8` from `581.38` to `482.70 output tok/s` while
   barely reducing final drain.
+- Do not retry final-token materialization fixes that only move the sync point:
+  on 2026-06-19, a resident output-token table made scalar finalization cheap
+  but added a hot decode scatter and collapsed fixed-B8 random throughput to
+  about `416 output tok/s`; stacked final vector transfers regressed to about
+  `362 output tok/s`; corrected longest-row `copy_to_host_async` submitted all
+  `1006` decode token refs but regressed to `778 output tok/s`; a two-worker
+  background `device_get` resolver made the final pending block `~6 ms` but
+  added a `~146 ms` mandatory flush and regressed to `768 output tok/s`.
+  Keep the safe direct-vector materializer until a broader device-owned output
+  boundary eliminates result readback without stealing from the decode loop.
 - XLA low-memory allocator/platform flags are diagnostic only: they can reduce
   GPU memory to about `5 GiB`, but they regressed random/hetero throughput in
   the accepted benchmark lane. XLA Triton GEMM and B16-capacity diagnostics
