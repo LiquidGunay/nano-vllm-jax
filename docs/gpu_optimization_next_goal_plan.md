@@ -3687,6 +3687,31 @@ Model-specific assumptions to track:
       when correctness tokens are not requested, or introduce a broader
       device-owned output/result boundary that does not add hot per-step scatter
       work to decode.
+43. Donated resident output-ring audit, 2026-06-19:
+    - implemented a donated decode output ring written by the dense resident
+      decode boundary and a slot-pinning finalizer that materializes only
+      recorded resident decode positions before falling back to scalar/vector
+      token refs;
+    - correctness/deferred-token unit coverage passes, and the bucket can be
+      reduced sharply, but integrated fixed-B8 random throughput regresses:
+      all-batch 2D ring
+      `/mountpoint/.exp/diagnostics/nano-vllm-jax/output_ring_20260619/full_random_b8_donated_output_ring_r1.json`
+      reached `765.39 tok/s` (`0.765x` stored vLLM) with final post-loop
+      `23.98 ms`, resident output `9.21 ms`, pending fallback `14.34 ms`,
+      down from safe `791.27 tok/s` despite reducing the old `178.30 ms`
+      final post-loop;
+    - flat ring scatter made lowering/runtime worse:
+      `/mountpoint/.exp/diagnostics/nano-vllm-jax/output_ring_20260619/full_random_b8_donated_output_ring_flat_scatter_r1.json`
+      reached `755.02 tok/s`;
+    - low-overlap variants also lost: B1-only ring reached `768.69 tok/s`
+      with final post-loop `74.97 ms`; capacity-scaled low-overlap tail
+      (`active_rows <= max(1, max_resident_slots // 4)`) reached
+      `771.69 tok/s` with final post-loop `78.06 ms`;
+    - conclusion: final materialization can be made small, but decode-side
+      output-ring scatter costs more than the saved final drain on this lane.
+      Do not promote resident output-ring capture as the default best path
+      unless a future design removes the hot per-step scatter cost. The main
+      remaining speed work should return to steady decode/model-side bubbles.
 ```
 
 ## Expected Strategic Outcome
