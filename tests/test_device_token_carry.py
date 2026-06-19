@@ -1145,6 +1145,79 @@ def test_generate_with_trace_prefetches_when_trace_prefetch_enabled(monkeypatch)
     ]
 
 
+def test_generate_with_trace_summary_prefetches_finished_rows(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "1")
+    events: list[str] = []
+    step_index = {"value": 0}
+    seqs: dict[int, Sequence] = {}
+
+    def add_request(prompt, sampling_params):
+        seq_id = len(seqs)
+        seq = Sequence(prompt, sampling_params, seq_id=seq_id)
+        seq.status = SequenceStatus.RUNNING
+        seqs[seq_id] = seq
+        return seq
+
+    def is_finished():
+        return bool(seqs) and all(seq.is_finished for seq in seqs.values())
+
+    def step():
+        step = step_index["value"]
+        events.append(f"step-{step}")
+        if step == 0:
+            seqs[0].append_token_device(_AsyncScalar(200, events))
+            seqs[1].append_token_device(_AsyncScalar(300, events))
+        elif step == 1:
+            seqs[0].append_token_device(_AsyncScalar(201, events))
+            seqs[0].status = SequenceStatus.FINISHED
+            seqs[1].append_token_device(_AsyncScalar(301, events))
+        elif step == 2:
+            seqs[1].append_token_device(_AsyncScalar(302, events))
+            seqs[1].status = SequenceStatus.FINISHED
+        else:
+            raise AssertionError("unexpected step")
+        step_index["value"] += 1
+        return [], -1
+
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.add_request = add_request
+    engine.is_finished = is_finished
+    engine.step = step
+    engine._detokenize = lambda token_ids: ""
+
+    trace = engine.generate_with_trace(
+        [[101], [102]],
+        [
+            SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True),
+            SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True),
+        ],
+        include_text=False,
+        trace_events=False,
+    )
+
+    assert trace["events"] == []
+    assert [result["token_ids"] for result in trace["results"]] == [
+        [200, 201],
+        [300, 301, 302],
+    ]
+    assert events == [
+        "step-0",
+        "step-1",
+        "prefetch-200",
+        "prefetch-201",
+        "step-2",
+        "materialize-200",
+        "materialize-201",
+        "prefetch-300",
+        "prefetch-301",
+        "prefetch-302",
+        "materialize-300",
+        "materialize-301",
+        "materialize-302",
+    ]
+
+
 def test_generate_with_trace_keeps_eos_compatible_path_when_ignore_eos_false(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     calls = []

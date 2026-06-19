@@ -958,13 +958,19 @@ class LLMEngine:
         config = getattr(self, "config", None)
         trace_token_prefetch_enabled = _trace_token_prefetch_enabled(config)
         prefetch_trace_tokens = trace_events and trace_token_prefetch_enabled
+        prefetch_finished_tokens = (not trace_events) and trace_token_prefetch_enabled
         snapshotted_completion_lengths = {seq.seq_id: 0 for seq in seqs}
         pending_prefetch_slots: tuple[DeviceTokenSlot, ...] = ()
+        pending_finished_slots: tuple[DeviceTokenSlot, ...] = ()
+        prefetched_finished_seq_ids: set[int] = set()
 
         while not self.is_finished():
             step_start = perf_counter()
             _, num_tokens = self._step_without_finished_output_materialization()
             step_end = perf_counter()
+            if prefetch_finished_tokens and pending_finished_slots:
+                Sequence.materialize_device_token_slots(pending_finished_slots)
+                pending_finished_slots = ()
             if prefetch_trace_tokens:
                 if pending_prefetch_slots:
                     Sequence.prefetch_device_token_slots(pending_prefetch_slots)
@@ -1024,9 +1030,23 @@ class LLMEngine:
                             "completion_tokens": seq.num_completion_tokens,
                         }
                     )
+            if prefetch_finished_tokens:
+                newly_finished = [
+                    seq
+                    for seq in seqs
+                    if seq.is_finished and int(seq.seq_id) not in prefetched_finished_seq_ids
+                ]
+                if newly_finished:
+                    slots = Sequence.snapshot_device_token_slots_for_sequences(newly_finished)
+                    prefetched_finished_seq_ids.update(int(seq.seq_id) for seq in newly_finished)
+                    if slots:
+                        pending_finished_slots = slots
+                        Sequence.prefetch_device_token_slots(slots)
 
         if prefetch_trace_tokens and pending_prefetch_slots:
             Sequence.prefetch_device_token_slots(pending_prefetch_slots)
+        if prefetch_finished_tokens and pending_finished_slots:
+            Sequence.materialize_device_token_slots(pending_finished_slots)
         Sequence.materialize_device_tokens_for_sequences(seqs)
         results = []
         for index, seq in enumerate(seqs):

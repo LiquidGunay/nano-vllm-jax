@@ -259,11 +259,7 @@ class Sequence:
                 jnp.asarray(tokens, dtype=jnp.int32).reshape(-1)
                 for tokens in vector_arrays
             ]
-            vector_shapes = {tuple(array.shape) for array in vector_arrays}
-            if len(vector_shapes) == 1:
-                host_vectors = jax.device_get(jnp.stack(vector_arrays, axis=0))
-            else:
-                host_vectors = jax.device_get(vector_arrays)
+            host_vectors = jax.device_get(vector_arrays)
             for entry_index, vector_slot, row in vector_entries:
                 values_by_entry[entry_index] = int(host_vectors[vector_slot][row])
 

@@ -63,10 +63,15 @@
   extra measured-phase compilation.
 - As of the 2026-06-19 reset, the default random sidecar request count is fixed
   at `8` requests. Treat the old 15-request stress as a future B16/B32 scaling
-  lane, not the active B8 target. The fixed-8 lane is close to target:
-  `770.12 output tok/s` (`0.769x` vLLM) total and `807.16 output tok/s`
-  (`0.806x` vLLM) token-event throughput, with the remaining miss mostly final
-  device-token materialization/drain.
+  lane, not the active B8 target. The current fixed-8 best is close to target:
+  `788.34 output tok/s` (`0.788x` vLLM) total and `809.28 output tok/s`
+  (`0.808x` vLLM) token-event throughput after finished-row summary prefetch
+  plus direct vector-token host fetch. Remaining miss is about `1.6%`, mostly
+  residual final token materialization/drain and TTFT.
+- Do not retry summary-mode per-step token prefetch as a hetero8 fix without a
+  broader device-owned output boundary. The 2026-06-19 short-output prefetch
+  experiment regressed `hetero8` from `581.38` to `482.70 output tok/s` while
+  barely reducing final drain.
 - XLA low-memory allocator/platform flags are diagnostic only: they can reduce
   GPU memory to about `5 GiB`, but they regressed random/hetero throughput in
   the accepted benchmark lane. XLA Triton GEMM and B16-capacity diagnostics

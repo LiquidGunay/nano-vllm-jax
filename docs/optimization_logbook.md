@@ -13323,3 +13323,71 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     deferred token materialization in summary mode, while keeping exact output
     lengths and the same generic startup warmup. Removing the `0.35-0.36 s`
     drain alone should move the sidecar result above `0.8x` vLLM.
+
+#### Entry 314 audit - Summary Materialization Drain Pass
+
+- date: 2026-06-19
+- trigger:
+  - user asked to drop the B16 lane, optimize output materialization, and make
+    sure `hetero8` remains healthy under the B8/random-large serving envelope.
+- promoted code path:
+  - summary-mode `generate_with_trace(..., trace_events=False)` now prefetches
+    device token slots for rows as soon as they finish, then materializes those
+    rows after one more model step when overlap is available;
+  - final `DeviceTokenRef` materialization now fetches existing decoded token
+    vectors directly with `jax.device_get(vector_arrays)` instead of first
+    creating a stacked JAX array solely for host transfer;
+  - detailed trace mode is unchanged.
+- validation:
+  - `PYTHONPATH=. .venv/bin/python -m pytest -q tests/test_device_token_carry.py`:
+    `34 passed`;
+  - `.venv/bin/python -m py_compile nanovllm_jax/engine/llm_engine.py tests/test_device_token_carry.py`;
+  - `.venv/bin/python -m py_compile nanovllm_jax/engine/sequence.py`.
+- fixed-B8 random benchmark:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/materialization_20260619/full_random_b8_direct_vector_get_r1.json`;
+  - workload and vLLM denominator are unchanged from Entry 313: seed `1234`,
+    exactly `8` requests, `6126` output tokens, same-manifest vLLM
+    `1000.98 output tok/s`;
+  - current JAX: `788.34 output tok/s`, ratio `0.788x`, token-event rate
+    `809.28 output tok/s`, TTFT p50 `904.79 ms`, ITL p50 `5.29 ms`, final
+    drain `0.201 s`;
+  - improvement over Entry 313 baseline: `770.12 -> 788.34 output tok/s` and
+    final drain `0.365 -> 0.201 s`. The remaining gap to `0.8x` vLLM is about
+    `12.4 output tok/s`.
+- hetero8 server-envelope check:
+  - artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/materialization_20260619/hetero8_direct_vector_get_r1.json`;
+  - run used the `random_large` serving envelope, generic warmup, no trace
+    events, no measured-phase JIT growth failure, and the sidecar RAM/CPU guard
+    wrapper;
+  - current JAX: `581.30 output tok/s`, token-event rate `865.48 output tok/s`,
+    `0.440 s` total, final drain `0.145 s`, peak system RAM `46.3%`, process
+    RSS `4.81 GB`;
+  - compared with the 2026-06-18 no-regression artifact, total throughput is up
+    from `491.35 output tok/s` and token-event rate is up from `693.05 output
+    tok/s`;
+  - strict generated-token comparison against the old stored single-length
+    reference remains `ok=false` with `1/8` exact row matches, the same exact
+    match count as the June 18 no-regression artifact. Treat this as the
+    existing hetero-vs-stored-reference caveat, not a new materialization
+    regression.
+- rejected materialization variants:
+  - periodic live-row prefetch on the fixed-B8 random lane was neutral/slightly
+    negative: `787.19 output tok/s` versus `788.09` for finished-row-only, with
+    final drain essentially unchanged at `0.201 s`;
+  - short-completion summary live prefetch regressed `hetero8` badly:
+    `581.38 -> 482.70 output tok/s`, event rate `872.76 -> 662.21`, and final
+    drain barely changed (`0.147 -> 0.144 s`). Do not retry per-step summary
+    host-copy prefetch as a hetero fix without a broader device-owned output
+    buffer boundary.
+- interpretation:
+  - materialization overlap was a real B8 win and nearly closes the current
+    `0.8x` target, but per-step host prefetch is not the answer for short
+    hetero workloads;
+  - `hetero8` is "working" under the shared server envelope in the sense that
+    throughput recovered versus the recent regression and resource use is
+    stable, but its headline total still lags the stored vLLM hetero reference
+    because final drain is a large fraction of a short 256-token run. The next
+    hetero-specific improvement needs a device-owned output table or a broader
+    decode/output boundary, not more Python-loop prefetch calls.

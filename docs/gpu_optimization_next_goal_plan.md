@@ -190,24 +190,28 @@ lengths, and output lengths vary within a declared range.
 Current accepted random sidecar default:
 
 - artifact:
-  `/mountpoint/.exp/diagnostics/nano-vllm-jax/b8_full_random_20260619/full_random_b8_sidecar_r1.json`;
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/materialization_20260619/full_random_b8_direct_vector_get_r1.json`;
 - workload: seed `1234`, exactly `8` requests, `16806` input tokens, `6126`
   output tokens, prompt lengths `1116..4022`, output lengths `425..1007`;
 - generic warmup compiles serving-envelope buckets only: batch buckets
   `1,2,4,8`, prefill token buckets `128,256,512,1024`, decode block-table
   buckets `128,256,320`, and no measured-phase JIT cache growth;
-- throughput `770.12 output tok/s`, fresh same-manifest vLLM reference
-  `1000.98 output tok/s`, ratio `0.769x`;
+- throughput `788.34 output tok/s`, fresh same-manifest vLLM reference
+  `1000.98 output tok/s`, ratio `0.788x`;
 - the current `0.8x` target requires about `800.78 output tok/s`, so the
-  remaining speedup needed is about `4%`;
-- token-event throughput is `807.16 output tok/s` (`0.806x` vLLM), so the
-  steady token phase already clears the target. The total-throughput miss is
-  primarily final device-token materialization/drain (`0.365 s`) and TTFT.
+  remaining speedup needed is about `1.6%`;
+- token-event throughput is `809.28 output tok/s` (`0.808x` vLLM), so the
+  steady token phase clears the target. The total-throughput miss is now
+  primarily the remaining final device-token materialization/drain (`0.201 s`)
+  plus TTFT.
 - 2026-06-18/19 control details:
   - `hetero8` token-phase/event throughput is already at the current target in
-    the shared-envelope control (`691.17 output tok/s`, `0.800x` stored vLLM),
-    but the total headline is only `486.36 output tok/s` (`0.563x`) because
-    final materialization/drain is large for a `256`-output-token workload;
+    the latest shared-envelope check (`865.48 output tok/s`, about `1.00x` the
+    stored vLLM hetero denominator), but the total headline is only
+    `581.30 output tok/s` (`0.673x`) because final materialization/drain is
+    large for a `256`-output-token workload. The strict old-reference token
+    comparison is still `1/8` exact row matches, matching the existing caveat
+    from prior hetero artifacts rather than a new regression;
   - the old 15-request full-random stress remains useful as a future B16/B32
     scaling target, but it is no longer the active B8-capped sidecar default;
   - XLA low-memory allocator flags reduce GPU memory to about `5 GiB` but
@@ -216,6 +220,14 @@ Current accepted random sidecar default:
     tok/s` on the old 15-request stress, but startup/compile cost was very
     high and this still only reached `0.589x`; do not promote it as the B8
     default.
+- 2026-06-19 materialization status:
+  - accepted: finished-row summary prefetch plus direct vector-token host fetch
+    reduces fixed-B8 final drain from `0.365 s` to `0.201 s`;
+  - rejected: periodic/live per-step summary prefetch. On fixed-B8 random it
+    was neutral/slightly negative, and on `hetero8` it regressed total
+    throughput from `581.38` to `482.70 output tok/s` while barely changing
+    final drain. Do not retry that route without a device-owned output buffer
+    boundary.
 - Historical rejected routes are kept in the logbook. In particular, mixed
   packed backfill, greedy decode bursts, standalone FA decode, standalone
   GDN/LM-head kernels, adaptive summary prefetch, B16 capacity alone, 512/4096
