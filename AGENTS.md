@@ -61,6 +61,12 @@
   `128,256,512,1024`. Do not restore the 2048/4096 prefill envelope as a
   default unless a new generic server-style run beats the 1024 envelope without
   extra measured-phase compilation.
+- As of the 2026-06-19 reset, the default random sidecar request count is fixed
+  at `8` requests. Treat the old 15-request stress as a future B16/B32 scaling
+  lane, not the active B8 target. The fixed-8 lane is close to target:
+  `770.12 output tok/s` (`0.769x` vLLM) total and `807.16 output tok/s`
+  (`0.806x` vLLM) token-event throughput, with the remaining miss mostly final
+  device-token materialization/drain.
 - XLA low-memory allocator/platform flags are diagnostic only: they can reduce
   GPU memory to about `5 GiB`, but they regressed random/hetero throughput in
   the accepted benchmark lane. XLA Triton GEMM and B16-capacity diagnostics

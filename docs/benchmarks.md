@@ -320,8 +320,8 @@ shape/range pressure than `hetero8` and feeds the exact same prompts to both
   --max-input-tokens 4096 \
   --min-output-tokens 256 \
   --max-output-tokens 1024 \
-  --min-request-count 5 \
-  --max-request-count 15 \
+  --min-request-count 8 \
+  --max-request-count 8 \
   --seed 1234 \
   --max-num-seqs 8 \
   --max-num-batched-tokens 1024 \
@@ -337,7 +337,7 @@ shape/range pressure than `hetero8` and feeds the exact same prompts to both
 
 Differences versus the current `hetero8` anchor:
 
-- Fixed counts are replaced with random request counts (`--min-request-count`/`--max-request-count`) and random input/output lengths.
+- Fixed prompt shapes are replaced with a fixed 8-request random suite and random input/output lengths.
 - Outputs include token-bucket stress (`256-1024`) and input stress (`512-4096`) that are larger than `hetero8`.
 - The sidecar saves the manifest and SHA (`prompt_manifest_jsonl` + `prompt_manifest_sha256`) so the generated suite can be rerun exactly.
 - Artifacts include per-run throughput, `ttft_ms_p50`, `itl_ms_p50`, request throughput, and cross-run generated-token comparison rows (`jax_vs_vllm`).
@@ -356,20 +356,24 @@ For seed `1234`, one request needs `5029` total tokens, so
 `--max-blocks-per-seq 320` and size `--jax-num-kvcache-blocks` for the active
 concurrency.
 
-Current working seed-`1234` A10G baseline:
+Current working seed-`1234` A10G fixed-8 baseline:
 
 - artifact:
-  `/mountpoint/.exp/diagnostics/nano-vllm-jax/random_request_sidecar/qwen08_random_request_sidecar_seed1234_20260603_r19_full_bf16_2048cap_2048blocks_fixed.json`;
-- JAX BF16, `max_num_batched_tokens=2048`, `num_kvcache_blocks=2048`,
-  `max_blocks_per_seq=512`: `204.61 output tok/s`, `742.62 total tok/s`,
-  TTFT p50 `1361.02 ms`, ITL p50 `17.03 ms`;
-- live vLLM BF16 on the same manifest: `1531.33 output tok/s`,
-  `5557.75 total tok/s`, TTFT p50 `587.22 ms`, ITL p50 `6.95 ms`;
-- ratio: `0.134x` vLLM for both output and total token throughput;
-- generated lengths match, but generated tokens are not an exact parity pass:
-  4 of 15 rows diverge, first at request `12`, generated index `32`
-  (`1599` versus `9032`). Treat this as a working stress benchmark and speed
-  baseline, not as correctness proof.
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/b8_full_random_20260619/full_random_b8_sidecar_r1.json`;
+- workload: seed `1234`, exactly `8` requests, input range `512-4096`, output
+  range `256-1024`, `16806` input tokens, and `6126` output tokens;
+- JAX BF16 optimized server path, generic warmup, no measured-phase JIT growth:
+  `770.12 output tok/s`, token-event rate `807.16 output tok/s`, TTFT p50
+  `905.49 ms`, ITL p50 `6.47 ms`, peak system RAM `73.5%`;
+- live vLLM BF16 on the same manifest: `1000.98 output tok/s`, TTFT p50
+  `354.00 ms`, ITL p50 `5.79 ms`;
+- ratio: `0.769x` vLLM for output throughput. The token-event rate is
+  `0.806x` vLLM, so the remaining miss is mostly final device-token
+  materialization/drain plus TTFT, not steady B8 decode alone;
+- generated lengths match. Generated-token parity is approximate for this
+  random lane: 3 of 8 rows match exactly, while divergent rows start at early
+  indices consistent with the known close-logit sensitivity of the random
+  benchmark.
 
 ## HF long-prefill reference generation
 

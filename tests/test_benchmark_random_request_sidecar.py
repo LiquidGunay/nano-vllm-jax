@@ -17,8 +17,8 @@ def test_parse_args_defaults_set_random_ranges():
     assert args.max_input_tokens == 4096
     assert args.min_output_tokens == 256
     assert args.max_output_tokens == 1024
-    assert args.min_request_count == 5
-    assert args.max_request_count == 15
+    assert args.min_request_count == 8
+    assert args.max_request_count == 8
     assert args.seed == 1234
     assert args.jax_profile is False
     assert args.jax_warmup_mode == "generic"

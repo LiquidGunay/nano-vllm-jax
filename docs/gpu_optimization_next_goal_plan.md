@@ -187,35 +187,53 @@ with generic startup warmup and no measured-phase JIT growth. This lane is more
 representative than the old fixed `hetero8` shape because request count, prompt
 lengths, and output lengths vary within a declared range.
 
-Current accepted full-random default:
+Current accepted random sidecar default:
 
 - artifact:
-  `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_scheduler_20260618/full_random_current_hot_prefill1024_r1.json`;
-- workload: seed `1234`, `15` requests, `30506` input tokens, `11602` output
-  tokens, prompt lengths `1077..4022`, output lengths `425..1007`;
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/b8_full_random_20260619/full_random_b8_sidecar_r1.json`;
+- workload: seed `1234`, exactly `8` requests, `16806` input tokens, `6126`
+  output tokens, prompt lengths `1116..4022`, output lengths `425..1007`;
 - generic warmup compiles serving-envelope buckets only: batch buckets
   `1,2,4,8`, prefill token buckets `128,256,512,1024`, decode block-table
   buckets `128,256,320`, and no measured-phase JIT cache growth;
-- throughput `828.63 output tok/s`, fresh same-manifest vLLM reference
-  `1541.89 output tok/s`, ratio `0.537x`;
-- the current `0.8x` target requires about `1233.51 output tok/s`, so the
-  remaining speedup needed is about `1.49x`.
-- 2026-06-18 control details:
+- throughput `770.12 output tok/s`, fresh same-manifest vLLM reference
+  `1000.98 output tok/s`, ratio `0.769x`;
+- the current `0.8x` target requires about `800.78 output tok/s`, so the
+  remaining speedup needed is about `4%`;
+- token-event throughput is `807.16 output tok/s` (`0.806x` vLLM), so the
+  steady token phase already clears the target. The total-throughput miss is
+  primarily final device-token materialization/drain (`0.365 s`) and TTFT.
+- 2026-06-18/19 control details:
   - `hetero8` token-phase/event throughput is already at the current target in
     the shared-envelope control (`691.17 output tok/s`, `0.800x` stored vLLM),
     but the total headline is only `486.36 output tok/s` (`0.563x`) because
     final materialization/drain is large for a `256`-output-token workload;
-  - full random with the previous 2048 prefill cap reached `810.16 output
-    tok/s`; changing the generic prefill envelope to 1024 reached `828.63`;
+  - the old 15-request full-random stress remains useful as a future B16/B32
+    scaling target, but it is no longer the active B8-capped sidecar default;
   - XLA low-memory allocator flags reduce GPU memory to about `5 GiB` but
     regress throughput, so they are diagnostic-only;
   - XLA Triton GEMM and B16 capacity diagnostics reached up to `907.92 output
-    tok/s`, but startup/compile cost was very high and this still only reached
-    `0.589x`; do not promote it as the default.
+    tok/s` on the old 15-request stress, but startup/compile cost was very
+    high and this still only reached `0.589x`; do not promote it as the B8
+    default.
 - Historical rejected routes are kept in the logbook. In particular, mixed
   packed backfill, greedy decode bursts, standalone FA decode, standalone
   GDN/LM-head kernels, adaptive summary prefetch, B16 capacity alone, 512/4096
   prefill caps, and pad16 are not current speed routes.
+
+Immediate final speedup pass for the fixed-8 lane:
+
+1. Remove or overlap final device-token materialization in summary mode. The
+   current fixed-8 JAX run spends `0.355-0.365 s` after the last token; removing
+   only this drain is enough to move total throughput from `0.769x` to about
+   `0.806x` vLLM.
+2. Keep the RAM guard enabled for all validation. Full XLA profiling on this
+   lane hit the guard at `82.4%` system RAM; engine-step-only profiling
+   completed at `52.4%`.
+3. If drain removal is not enough or regresses short workloads, reduce TTFT by
+   revisiting prompt admission/chunked prefill scheduling on this fixed-8
+   manifest. Do not reopen B16 or model-kernel work until the B8-capped lane
+   clears `0.8x`.
 
 Rules for this lane:
 

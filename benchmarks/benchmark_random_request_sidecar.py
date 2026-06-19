@@ -107,8 +107,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-input-tokens", type=int, default=4096)
     parser.add_argument("--min-output-tokens", type=int, default=256)
     parser.add_argument("--max-output-tokens", type=int, default=1024)
-    parser.add_argument("--min-request-count", type=int, default=5)
-    parser.add_argument("--max-request-count", type=int, default=15)
+    parser.add_argument("--min-request-count", type=int, default=8)
+    parser.add_argument("--max-request-count", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument(

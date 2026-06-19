@@ -13276,3 +13276,50 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     route or backend-owned broader decode boundary. Capacity alone, allocator
     flags, prefetch tweaks, and one-off padding changes do not remove enough
     compiled decode work.
+
+#### Entry 313 audit - Fixed-8 Random Sidecar Reset
+
+- date: 2026-06-19
+- trigger:
+  - user asked to cap the random sidecar to B=8, benchmark that serving contract,
+    and use it to plan the final speedup pass instead of continuing to chase
+    B16/full-random scaling.
+- code/docs changes:
+  - random sidecar defaults now use exactly `8` requests:
+    `--min-request-count=8` and `--max-request-count=8`;
+  - docs and unit expectations were updated to make the B8 cap explicit.
+- validation:
+  - `PYTHONPATH=. .venv/bin/python -m pytest -q tests/test_benchmark_random_request_sidecar.py`:
+    `12 passed`;
+  - `.venv/bin/python -m py_compile benchmarks/benchmark_random_request_sidecar.py`.
+- benchmark:
+  - sidecar artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/b8_full_random_20260619/full_random_b8_sidecar_r1.json`;
+  - workload: seed `1234`, exactly `8` requests, `16806` input tokens, `6126`
+    output tokens, prompt lengths `1116..4022`, output lengths `425..1007`;
+  - JAX optimized server path: `770.12 output tok/s`, token-event rate
+    `807.16 output tok/s`, TTFT p50 `905.49 ms`, ITL p50 `6.47 ms`, final
+    drain `0.365 s`, peak system RAM `73.5%`, zero measured JIT growth;
+  - live vLLM same manifest: `1000.98 output tok/s`, TTFT p50 `354.00 ms`,
+    ITL p50 `5.79 ms`;
+  - total-throughput ratio: `0.769x`; token-event ratio: `0.806x`.
+- guarded profiling:
+  - full XLA profile under the sidecar guard was correctly killed at
+    `82.4%` system RAM, proving the RAM prevention mechanism is active. Do not
+    retry full XLA trace capture on this host without tighter workload scaling;
+  - engine-step-only guarded repeat completed:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/b8_full_random_20260619/full_random_b8_stepprofile_guarded_r1.json`;
+    JAX `795.62 output tok/s`, token-event `834.07 output tok/s`, final drain
+    `0.355 s`, peak system RAM `52.4%`, zero measured JIT growth;
+  - the output tail only captures the final B1 drain/tail decode steps, where
+    schedule p50 is about `0.059 ms` and runner p50 about `4.70 ms`; scheduler
+    is not the final blocker.
+- interpretation:
+  - the B8-capped random lane is close to the `0.8x` target. The steady token
+    phase already clears the target in both fixed-8 runs; total throughput is
+    pulled below target by final device-token materialization/drain and TTFT;
+  - for the next pass, do not return to B16 or broad model-kernel work first.
+    The highest-probability final speedup is to eliminate or overlap final
+    deferred token materialization in summary mode, while keeping exact output
+    lengths and the same generic startup warmup. Removing the `0.35-0.36 s`
+    drain alone should move the sidecar result above `0.8x` vLLM.
