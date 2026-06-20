@@ -5975,15 +5975,38 @@ class ModelExecutor:
                 verifier_emitted_tokens = jnp.transpose(emitted_tokens_by_group, (1, 0, 2)).reshape(
                     (tokens.shape[0], static_burst_groups * 2)
                 )
-                emitted_tokens = jnp.concatenate(
-                    [
-                        jnp.where(row_valid, seed_target_token, jnp.zeros_like(seed_target_token))[:, None],
-                        verifier_emitted_tokens,
-                    ],
-                    axis=1,
-                ).astype(jnp.int32)
                 emitted_counts = jnp.transpose(emitted_counts_by_group, (1, 0)).astype(jnp.int32)
                 accepted_counts = jnp.transpose(accepted_counts_by_group, (1, 0)).astype(jnp.int32)
+                group_width = 2
+                compact_width = 1 + static_burst_groups * group_width
+                starts = (
+                    jnp.asarray(1, dtype=jnp.int32)
+                    + jnp.cumsum(emitted_counts, axis=1)
+                    - emitted_counts
+                )
+                offsets = jnp.arange(group_width, dtype=jnp.int32)
+                valid_offsets = offsets[None, None, :] < emitted_counts[:, :, None]
+                dest = starts[:, :, None] + offsets[None, None, :]
+                dest = jnp.where(valid_offsets, dest, compact_width)
+                batch_idx = jnp.broadcast_to(
+                    jnp.arange(tokens.shape[0], dtype=jnp.int32)[:, None, None],
+                    (tokens.shape[0], static_burst_groups, group_width),
+                )
+                compact_tokens = jnp.zeros(
+                    (tokens.shape[0], compact_width),
+                    dtype=jnp.int32,
+                )
+                compact_tokens = compact_tokens.at[
+                    batch_idx.reshape(-1),
+                    dest.reshape(-1),
+                ].set(
+                    verifier_emitted_tokens.reshape(-1),
+                    mode="drop",
+                )
+                compact_tokens = compact_tokens.at[:, 0].set(
+                    jnp.where(row_valid, seed_target_token, jnp.zeros_like(seed_target_token))
+                )
+                emitted_tokens = compact_tokens
                 accepted_bitmask = jnp.sum(
                     accepted_counts.astype(jnp.int32)
                     * (

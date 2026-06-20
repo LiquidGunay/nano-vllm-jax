@@ -54,9 +54,12 @@ def _block_until_ready_tree(value: object) -> None:
 
 
 def _config_or_env_flag(config: Qwen3_5Config | None, attr: str, env_name: str, *, default: bool = False) -> bool:
+    env_value = os.environ.get(env_name)
+    if env_value is not None:
+        return env_value in _TRUE_ENV_VALUES
     if config is not None and hasattr(config, attr):
         return bool(getattr(config, attr))
-    return os.environ.get(env_name, "1" if default else "0") in _TRUE_ENV_VALUES
+    return bool(default)
 
 
 def _config_or_env_int(config: Qwen3_5Config | None, attr: str, env_name: str, *, default: int = 0) -> int:
@@ -5792,7 +5795,19 @@ class CanonicalModelRunner:
             return None
 
         query_lens_host = batch.query_lens_host
-        seed_burst_groups = 1
+        configured_burst_groups = max(
+            1,
+            int(
+                os.environ.get(
+                    "NANO_VLLM_JAX_MTP_BURST_GROUPS",
+                    str(getattr(self, "mtp_burst_groups", 1)),
+                )
+                or "1"
+            ),
+        )
+        if configured_burst_groups <= 1:
+            return None
+        seed_burst_groups = max(1, configured_burst_groups - 1)
         max_emit_tokens = 1 + 2 * seed_burst_groups
         relax_bonus_boundary = os.environ.get(
             "NANO_VLLM_JAX_MTP_RELAX_BONUS_BOUNDARY",
@@ -5816,6 +5831,7 @@ class CanonicalModelRunner:
             if (
                 seq.seq_id not in self._mtp1_drafts
                 and seq.temperature == 0
+                and seq.ignore_eos
                 and self._seq_mtp_admitted(seq)
                 and query_len == 1
                 and seq.num_completion_tokens + max_emit_tokens <= seq.max_tokens
@@ -5887,13 +5903,31 @@ class CanonicalModelRunner:
             (verifier_batch_size, emitted_width)
         )
         next_draft_tokens = output.next_draft_token.astype(jnp.int32)
-        emitted_counts_host, accepted_counts_host = jax.device_get(
-            (
-                output.emitted_counts.reshape((verifier_batch_size, seed_burst_groups)),
-                output.accepted_counts.reshape((verifier_batch_size, seed_burst_groups)),
+        compact_summary = getattr(output, "compact_summary", None)
+        if compact_summary is not None:
+            compact_summary_host = jax.device_get(compact_summary)
+            emitted_totals_host = compact_summary_host[:, 0]
+            accepted_totals_host = compact_summary_host[:, 1]
+            rejected_totals_host = compact_summary_host[:, 2]
+            bonus_totals_host = compact_summary_host[:, 3]
+            accepted_bitmask_host = compact_summary_host[:, 4]
+        else:
+            emitted_counts_host, accepted_counts_host = jax.device_get(
+                (
+                    output.emitted_counts.reshape((verifier_batch_size, seed_burst_groups)),
+                    output.accepted_counts.reshape((verifier_batch_size, seed_burst_groups)),
+                )
             )
-        )
-        _mark("host_burst_count_transfer")
+            emitted_totals_host = 1 + np.sum(emitted_counts_host, axis=1)
+            accepted_totals_host = np.sum(accepted_counts_host, axis=1)
+            rejected_totals_host = np.sum((accepted_counts_host < 1).astype(np.int32), axis=1)
+            bonus_totals_host = accepted_totals_host
+            bit_values = np.left_shift(
+                np.ones((seed_burst_groups,), dtype=np.int32),
+                np.arange(seed_burst_groups, dtype=np.int32),
+            )
+            accepted_bitmask_host = np.sum((accepted_counts_host > 0).astype(np.int32) * bit_values[None, :], axis=1)
+        _mark("host_burst_summary_transfer")
 
         outputs: dict[int, List[int] | int] = {}
         stats = self._speculative_stats()
@@ -5903,37 +5937,31 @@ class CanonicalModelRunner:
             seq = seqs[row]
             verifier_idx = verifier_index_for_local[local_row]
             self._mtp1_drafts.pop(seq.seq_id, None)
+            emitted_total = max(
+                0,
+                min(emitted_width, int(emitted_totals_host[verifier_idx])),
+            )
+            accepted_total = max(
+                0,
+                min(seed_burst_groups, int(accepted_totals_host[verifier_idx])),
+            )
+            rejected_total = max(
+                0,
+                min(seed_burst_groups, int(rejected_totals_host[verifier_idx])),
+            )
+            bonus_total = max(
+                0,
+                min(seed_burst_groups, int(bonus_totals_host[verifier_idx])),
+            )
             row_outputs: list[object] = [
-                DeviceTokenRef(tokens=emitted_tokens, row=verifier_idx * emitted_width)
+                DeviceTokenRef(tokens=emitted_tokens, row=verifier_idx * emitted_width + offset)
+                for offset in range(emitted_total)
             ]
-            emitted_total = 1
-            accepted_total = 0
-            rejected_total = 0
-            bonus_total = 0
-            for group_idx in range(seed_burst_groups):
-                emitted_count = max(
-                    0,
-                    min(2, int(emitted_counts_host[verifier_idx, group_idx])),
-                )
-                accepted_count = max(
-                    0,
-                    min(1, int(accepted_counts_host[verifier_idx, group_idx])),
-                )
-                group_offset = 1 + group_idx * 2
-                row_outputs.extend(
-                    DeviceTokenRef(
-                        tokens=emitted_tokens,
-                        row=verifier_idx * emitted_width + group_offset + offset,
-                    )
-                    for offset in range(emitted_count)
-                )
-                emitted_total += emitted_count
-                accepted_total += accepted_count
-                if accepted_count:
-                    bonus_total += 1
-                else:
-                    rejected_total += 1
-                accepted_matrix.append([bool(accepted_count)])
+            bitmask = int(accepted_bitmask_host[verifier_idx])
+            accepted_matrix.extend(
+                [bool(bitmask & (1 << group_idx))]
+                for group_idx in range(seed_burst_groups)
+            )
             outputs[row] = row_outputs
             stats["drafts_proposed"] += seed_burst_groups
             stats["drafts_accepted"] += accepted_total
@@ -8677,6 +8705,17 @@ class CanonicalModelRunner:
                             if row in admitted_mtp_rows
                         ]
                         if self.mtp1_enabled and seed_mtp1 and seedable_rows:
+                            seed_then_outputs = self._run_mtp1_seed_then_table_burst(
+                                seqs,
+                                batch,
+                                seedable_rows,
+                            )
+                            if seed_then_outputs is not None:
+                                for row, value in seed_then_outputs.items():
+                                    outputs[row] = value
+                                unresolved_rows = [
+                                    row for row in unresolved_rows if outputs[row] is None
+                                ]
                             if unresolved_rows:
                                 stats["fallback_seeded_main_steps"] += 1
                                 seeded_outputs = self._run_main_and_seed_mtp_chain_fused(
@@ -8743,6 +8782,56 @@ class CanonicalModelRunner:
             )
             stats = self._speculative_stats()
             if main_seed_mtp1:
+                seed_then_outputs = self._run_mtp1_seed_then_table_burst(
+                    seqs,
+                    batch,
+                    admitted_mtp_rows,
+                )
+                if seed_then_outputs is not None:
+                    outputs: List[int | List[int] | None] = [None] * len(seqs)
+                    for row, value in seed_then_outputs.items():
+                        outputs[row] = value
+                    unresolved_rows = [
+                        row for row in range(len(seqs)) if outputs[row] is None
+                    ]
+                    if unresolved_rows:
+                        stats["fallback_partial_rows"] += len(unresolved_rows)
+                        stats["fallback_seeded_main_steps"] += 1
+                        seeded_outputs = self._run_main_and_seed_mtp_chain_fused(
+                            seqs,
+                            batch,
+                            unresolved_rows,
+                        )
+                        if seeded_outputs is not None:
+                            for row in unresolved_rows:
+                                outputs[row] = (
+                                    seeded_outputs[row]
+                                    if row < len(seeded_outputs)
+                                    else []
+                                )
+                            unresolved_rows = [
+                                row for row in unresolved_rows if outputs[row] == []
+                            ]
+                    if unresolved_rows:
+                        stats["fallback_gated_no_spec_steps"] += 1
+                        fallback_batch = self._masked_decode_batch(batch, unresolved_rows)
+                        fallback_outputs = self._run_main_and_sample(
+                            seqs,
+                            fallback_batch,
+                            seed_mtp1=False,
+                        )
+                        for row in unresolved_rows:
+                            outputs[row] = fallback_outputs[row]
+                    self._record_mtp_output_token_carry(
+                        batch,
+                        seqs,
+                        {
+                            row: value
+                            for row, value in enumerate(outputs)
+                            if value is not None
+                        },
+                    )
+                    return [outputs[row] for row in range(len(seqs))]  # type: ignore[list-item]
                 stats["fallback_seeded_main_steps"] += 1
                 fused_seed_outputs = self._run_main_and_seed_mtp_chain_fused(
                     seqs,

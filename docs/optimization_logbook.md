@@ -13515,3 +13515,51 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     bulk final token readback on long-output summary runs; remaining work should
     focus on TTFT and decode GPU work/launch structure, while keeping the
     thresholded sink for long summaries and avoiding it for short outputs.
+
+#### Entry 317 - Resident Seed-Then-Table MTP Burst Boundary
+
+- date: 2026-06-20
+- trigger:
+  - user asked to implement MTP so drafting and verification stay on device,
+    with no host sync controlling verification.
+- implementation:
+  - added a K=1 resident seed-then-table burst route that runs the initial MTP
+    seed, verifier table-burst groups, accept/reject selection, KV/hybrid
+    commit, emitted-token compaction, and next-draft generation inside one JIT
+    boundary;
+  - compacted emitted tokens on device so host code consumes
+    `emitted_total` directly instead of parsing sparse target/bonus slots;
+  - routed missing-draft rows through the new boundary before the older
+    seed-only path;
+  - changed the MTP experimental config to seed after bonus so the verifier can
+    keep drafting without a host-managed seed transition;
+  - fixed scheduler/model-runner fast-path flag helpers so explicit
+    `NANO_VLLM_JAX_*` env values override dataclass defaults, matching the repo
+    config comments. This fixed a mismatch where the runner returned
+    `DeviceTokenRef`s but scheduler postprocess still tried `int(token_ref)`;
+  - made MTP decode admission reject non-`ignore_eos` requests when device
+    token carry is active. EOS-checking requests need a separate on-device EOS
+    completion boundary before they can safely use resident token refs.
+- validation:
+  - `.venv/bin/python -m pytest tests/test_mtp_commit_semantics.py -q`:
+    `33 passed, 1 xfailed`;
+  - `.venv/bin/python -m pytest tests/test_device_token_carry.py -q`:
+    `36 passed`;
+  - `.venv/bin/python -m pytest tests/test_server_config.py -q`:
+    `23 passed`;
+  - B=1 GPU smoke artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_on_device_20260620/single_synthetic_seed_table_burst_smoke_r3.json`.
+- smoke result:
+  - exact token match: true;
+  - MTP path exercised: `drafts_proposed=3`, `drafts_accepted=2`,
+    `drafts_rejected=0`, `bonus_tokens=2`, `accepted_decode_steps=1`;
+  - reported host/device postprocess buckets: `0.0 ms`;
+  - decode speedup versus same-run no-MTP control: `0.684x`;
+  - acceptance for the required metrics row: `0.667`.
+- interpretation:
+  - this is the first correctness-clean device-resident drafting/verification
+    boundary for the current GPU MTP path;
+  - it is not a serving speed claim. The verifier remains slower than the
+    no-MTP control in the smoke, and the first full hetero8 server-style
+    attempt timed out compiling before this env/config fix. Continue from this
+    boundary and attack verifier GPU work/compile surface next.

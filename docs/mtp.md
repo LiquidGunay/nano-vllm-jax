@@ -29,6 +29,17 @@ mixed accepted/rejected rows by selecting prefix state per row and continuing
 from the selected committed token. This replaces the old K-burst behavior where
 any rejected row returned to Python for repair.
 
+2026-06-20 update: the current implementation checkpoint is a resident
+seed-then-table burst for K=1. The compiled step seeds the first draft when no
+draft is already stored, verifies fixed table-burst groups, computes
+accept/reject on device, commits KV plus hybrid state, compacts emitted tokens
+into a fixed device matrix, and seeds the next draft before returning to
+Python. The host drains one compact per-row summary and deferred token refs
+after the burst; those reads no longer decide verification before the next
+group can be formed. A B=1 synthetic GPU smoke was exact and exercised this
+path, but it remained slower than the no-MTP control, so this is an
+architecture/correctness checkpoint rather than a speed claim.
+
 ## Current GPU caveat
 
 As of 2026-06-11, MTP-1 is an explicit opt-in serving mode rather than an

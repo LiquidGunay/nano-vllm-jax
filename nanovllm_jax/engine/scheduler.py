@@ -23,9 +23,12 @@ _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
 
 
 def _config_or_env_flag(config: Qwen3_5Config | None, attr: str, env_name: str, *, default: bool = False) -> bool:
+    env_value = os.environ.get(env_name)
+    if env_value is not None:
+        return env_value in _TRUE_ENV_VALUES
     if config is not None and hasattr(config, attr):
         return bool(getattr(config, attr))
-    return os.environ.get(env_name, "1" if default else "0") in _TRUE_ENV_VALUES
+    return bool(default)
 
 
 def _config_or_env_int(config: Qwen3_5Config | None, attr: str, env_name: str, *, default: int = 0) -> int:
@@ -1344,6 +1347,9 @@ class Scheduler:
             return False
         if seq.temperature != 0:
             self.mtp_admission_reason = "temperature"
+            return False
+        if for_decode and self.device_token_carry and not seq.ignore_eos:
+            self.mtp_admission_reason = "eos_host_check"
             return False
         remaining = seq.max_tokens - seq.num_completion_tokens
         if remaining <= 1:

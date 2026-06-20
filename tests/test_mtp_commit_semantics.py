@@ -509,6 +509,138 @@ class _FakeExecutor:
             burst_groups=int(burst_groups),
         )
 
+    def mtp1_seed_then_table_burst_step_jit(
+        self,
+        batch,
+        *,
+        cache_storage,
+        hybrid_state_table,
+        hybrid_slot_ids,
+        mtp_hidden_final_normed,
+        burst_groups,
+    ):
+        self.calls.append(
+            {
+                "method": "mtp1_seed_then_table_burst",
+                "batch_size": int(batch.tokens.shape[0]),
+                "seq_ids": [int(x) for x in batch.seq_ids.tolist()],
+                "hybrid_slot_ids": [int(x) for x in hybrid_slot_ids.tolist()],
+                "burst_groups": int(burst_groups),
+            }
+        )
+        output_rows = [int(seq_id) for seq_id in batch.seq_ids.tolist()]
+        emitted_rows = []
+        emitted_count_rows = []
+        accepted_count_rows = []
+        accepted_bitmask_rows = []
+        emitted_total_rows = []
+        accepted_total_rows = []
+        rejected_total_rows = []
+        bonus_total_rows = []
+        for row in output_rows:
+            if row < 0:
+                emitted_rows.append([0 for _ in range(1 + 2 * int(burst_groups))])
+                emitted_count_rows.append([0 for _ in range(int(burst_groups))])
+                accepted_count_rows.append([0 for _ in range(int(burst_groups))])
+                accepted_bitmask_rows.append(0)
+                emitted_total_rows.append(0)
+                accepted_total_rows.append(0)
+                rejected_total_rows.append(0)
+                bonus_total_rows.append(0)
+                continue
+            accepted_values = [
+                bool(value)
+                for value in self._row_values(self.accepted, row, int(burst_groups))[: int(burst_groups)]
+            ]
+            target_values = self._row_values(self.target, row, int(burst_groups) + 1)
+            if len(target_values) < int(burst_groups) + 1:
+                target_values = target_values + [target_values[-1] for _ in range(int(burst_groups) + 1 - len(target_values))]
+            bonus_values = self._row_values(self.bonus, row, int(burst_groups))
+            if len(bonus_values) < int(burst_groups):
+                bonus_values = bonus_values + [bonus_values[-1] for _ in range(int(burst_groups) - len(bonus_values))]
+            compact_row = [int(target_values[0])]
+            emitted_counts = []
+            accepted_counts = []
+            accepted_bitmask = 0
+            accepted_total = 0
+            rejected_total = 0
+            bonus_total = 0
+            for group_idx, accepted in enumerate(accepted_values):
+                compact_row.append(int(target_values[group_idx + 1]))
+                if accepted:
+                    compact_row.append(int(bonus_values[group_idx]))
+                    emitted_counts.append(2)
+                    accepted_counts.append(1)
+                    accepted_bitmask |= 1 << group_idx
+                    accepted_total += 1
+                    bonus_total += 1
+                else:
+                    emitted_counts.append(1)
+                    accepted_counts.append(0)
+                    rejected_total += 1
+            compact_row.extend([0] * (1 + 2 * int(burst_groups) - len(compact_row)))
+            emitted_rows.append(compact_row)
+            emitted_count_rows.append(emitted_counts)
+            accepted_count_rows.append(accepted_counts)
+            accepted_bitmask_rows.append(accepted_bitmask)
+            emitted_total_rows.append(1 + sum(emitted_counts))
+            accepted_total_rows.append(accepted_total)
+            rejected_total_rows.append(rejected_total)
+            bonus_total_rows.append(bonus_total)
+
+        marker = jnp.array(
+            [0 if row < 0 else self.state_marker[row] for row in output_rows],
+            dtype=jnp.float32,
+        ).reshape((-1, 1, 1, 1))
+        compact_summary = jnp.stack(
+            [
+                jnp.array(emitted_total_rows, dtype=jnp.int32),
+                jnp.array(accepted_total_rows, dtype=jnp.int32),
+                jnp.array(rejected_total_rows, dtype=jnp.int32),
+                jnp.array(bonus_total_rows, dtype=jnp.int32),
+                jnp.array(accepted_bitmask_rows, dtype=jnp.int32),
+            ],
+            axis=1,
+        )
+        return MTP1GreedyOutput(
+            target_token=jnp.array(
+                [0 if row < 0 else self._row_values(self.target, row, 1)[0] for row in output_rows],
+                dtype=jnp.int32,
+            ),
+            bonus_token=jnp.array(
+                [0 if row < 0 else self._row_values(self.bonus, row, 1)[0] for row in output_rows],
+                dtype=jnp.int32,
+            ),
+            next_draft_token=jnp.array(
+                [0 if row < 0 else self._row_values(self.next_draft, row, 1)[0] for row in output_rows],
+                dtype=jnp.int32,
+            ),
+            accepted=jnp.array(
+                [bool(mask & 1) for mask in accepted_bitmask_rows],
+                dtype=jnp.bool_,
+            ),
+            cache_storage=KVCacheStorage(
+                k_cache=jnp.array(self.kv_slots, dtype=jnp.float32),
+                v_cache=jnp.array(self.kv_slots, dtype=jnp.float32) + 100,
+            ),
+            hybrid_state=HybridLayerState(conv_state=marker, recurrent_state=marker + 1000),
+            committed_seq_lens=jnp.array(
+                [0 if row < 0 else self.committed_seq_lens[row] for row in output_rows],
+                dtype=jnp.int32,
+            ),
+            emitted_tokens=jnp.array(emitted_rows, dtype=jnp.int32),
+            emitted_counts=jnp.array(emitted_count_rows, dtype=jnp.int32),
+            accepted_counts=jnp.array(accepted_count_rows, dtype=jnp.int32),
+            emitted_totals=compact_summary[:, 0],
+            accepted_totals=compact_summary[:, 1],
+            rejected_totals=compact_summary[:, 2],
+            bonus_totals=compact_summary[:, 3],
+            accepted_bitmask=compact_summary[:, 4],
+            compact_summary=compact_summary,
+            burst_groups=int(burst_groups),
+            hybrid_state_is_table=True,
+        )
+
 
 class _FakeRunner:
     def __init__(
@@ -549,6 +681,7 @@ class _FakeRunner:
         self.snapshots = []
         self.draft_position_acceptance = []
         self._hybrid_state_table = None
+        self.written_slots = []
 
     def _maybe_apply_device_token_carry(self, batch):
         return batch
@@ -652,6 +785,14 @@ class _FakeRunner:
         zeros = jnp.zeros((n, 1, 1, 1), dtype=jnp.float32)
         return HybridLayerState(conv_state=zeros, recurrent_state=zeros)
 
+    def _batch_hybrid_slot_ids(self, batch):
+        n = int(batch.tokens.shape[0])
+        batch.hybrid_slot_ids_host = tuple(range(n))
+        return jnp.arange(n, dtype=jnp.int32)
+
+    def _mark_hybrid_slots_written(self, slots):
+        self.written_slots.extend(int(slot) for slot in slots)
+
     def _store_batch_hybrid_state(self, batch, state):
         self.stored.append((batch, state))
         self._hybrid_state_table = state
@@ -703,6 +844,14 @@ class _FakeRunner:
             batch,
             rows,
             forced_reject_rows=forced_reject_rows,
+        )
+
+    def _run_mtp1_seed_then_table_burst(self, seqs, batch, admitted_rows):
+        return ModelRunner._run_mtp1_seed_then_table_burst(
+            self,
+            seqs,
+            batch,
+            admitted_rows,
         )
 
     def _run_main_and_seed_mtp_chain_fused(self, seqs, batch, admitted_rows):
@@ -802,6 +951,86 @@ def _resolve_output_tokens(value):
     if hasattr(value, "tokens") and hasattr(value, "row"):
         return [int(jnp.asarray(value.tokens, dtype=jnp.int32).reshape(-1)[int(value.row)])]
     return [int(value)]
+
+
+def test_seed_then_table_burst_compacts_outputs_and_seeds_next_draft(monkeypatch):
+    seq_lens = [5]
+    executor = _FakeExecutor(
+        accepted=[[True, False]],
+        target=[[100, 101, 102]],
+        bonus=[[201, 202]],
+        next_draft=[301],
+        state_marker=[930],
+        committed_seq_lens=[7],
+        kv_slots=[[1000, 1001, 1002]],
+    )
+    runner = _FakeRunner(executor, {}, block_size=16)
+    runner.mtp_burst_groups = 3
+    runner.config.mtp_burst_groups = 3
+    runner._hybrid_state_table = HybridLayerState(
+        conv_state=jnp.zeros((1, 1, 1, 1), dtype=jnp.float32),
+        recurrent_state=jnp.zeros((1, 1, 1, 1), dtype=jnp.float32),
+    )
+    seqs = [_seq(0, seq_lens[0], max_tokens=64, ignore_eos=True)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "3")
+
+    outputs = ModelRunner._run_mtp1_seed_then_table_burst(
+        runner,
+        seqs,
+        _batch(seq_lens),
+        [0],
+    )
+
+    assert executor.calls[-1]["method"] == "mtp1_seed_then_table_burst"
+    assert executor.calls[-1]["burst_groups"] == 2
+    assert _resolve_output_tokens(outputs[0]) == [100, 101, 201, 102]
+    assert _resolve_output_tokens(runner._mtp1_drafts[0]) == [301]
+    assert runner.stats == {
+        "drafts_proposed": 3,
+        "drafts_accepted": 1,
+        "drafts_rejected": 1,
+        "bonus_tokens": 1,
+    }
+    assert runner.draft_position_acceptance[-1] == [[True], [False]]
+    assert runner.written_slots == [0]
+
+
+def test_run_uses_seed_then_table_burst_for_missing_draft_rows(monkeypatch):
+    seq_lens = [5]
+    executor = _FakeExecutor(
+        accepted=[[True, True]],
+        target=[[100, 101, 102]],
+        bonus=[[201, 202]],
+        next_draft=[301],
+        state_marker=[930],
+        committed_seq_lens=[8],
+        kv_slots=[[1000, 1001, 1002]],
+    )
+    runner = _FakeRunner(executor, {}, block_size=16)
+    runner.mtp_burst_groups = 3
+    runner.config.mtp_burst_groups = 3
+    runner._hybrid_state_table = HybridLayerState(
+        conv_state=jnp.zeros((1, 1, 1, 1), dtype=jnp.float32),
+        recurrent_state=jnp.zeros((1, 1, 1, 1), dtype=jnp.float32),
+    )
+    seqs = [_seq(0, seq_lens[0], max_tokens=64, ignore_eos=True)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "3")
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_COMMIT_SELECT", raising=False)
+
+    outputs = ModelRunner.run(
+        runner,
+        seqs,
+        batch=_batch(seq_lens),
+    )
+
+    assert executor.calls[-1]["method"] == "mtp1_seed_then_table_burst"
+    assert _resolve_output_tokens(outputs[0]) == [100, 101, 201, 102, 202]
+    assert _resolve_output_tokens(runner._mtp1_drafts[0]) == [301]
+    assert runner.stats.get("fallback_seeded_main_steps", 0) == 0
 
 
 def test_k1_commit_b1_accepted_invariants_and_parity(monkeypatch):

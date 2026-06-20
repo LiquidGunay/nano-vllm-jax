@@ -66,6 +66,10 @@ This roadmap is grouped by work type. It is not a production-readiness claim.
   builds vLLM-style flattened verifier metadata, the compiled JAX step consumes
   resident decode/GDN state with MaxText-style donation, and the step returns
   compact per-row commit metadata rather than logits or prefix-state tensors.
+  The first implementation checkpoint now exists as the K=1 resident
+  seed-then-table burst route: it seeds, verifies, commits, compacts emitted
+  tokens, and generates the next draft inside one compiled boundary. Continue
+  from this route rather than Python-side accept/reject repair.
 - Treat verifier speed as the MTP release gate. MTP should stay disabled or
   scheduler-gated unless verified rows amortize target verification, draft
   generation, and commit bookkeeping enough to beat the accepted no-MTP

@@ -11,6 +11,7 @@ from nanovllm_jax.engine.llm_engine import (
     LLMEngine,
     _trace_token_prefetch_enabled,
 )
+from nanovllm_jax.engine import model_runner as model_runner_module
 from nanovllm_jax.engine.model_runner import ModelRunner
 from nanovllm_jax.engine.scheduled_batch import ScheduledBatch
 from nanovllm_jax.engine.scheduler import Scheduler
@@ -41,6 +42,19 @@ def test_trace_token_prefetch_env_can_disable_config_default(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "0")
 
     assert _trace_token_prefetch_enabled(config) is False
+
+
+def test_device_token_carry_env_overrides_config_default(monkeypatch):
+    config = Qwen3_5Config(device_token_carry=False)
+
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+
+    assert Scheduler(config).device_token_carry is True
+    assert model_runner_module._config_or_env_flag(
+        config,
+        "device_token_carry",
+        "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+    ) is True
 
 
 def test_sequence_materializes_deferred_device_tokens():

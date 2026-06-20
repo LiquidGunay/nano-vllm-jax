@@ -31,7 +31,7 @@ engine:
   draft_sample_method: "greedy"
   mtp_verifier_impl: "two_decode"
   mtp_batch_accept_policy: "rowwise"
-  mtp_seed_after_bonus: false
+  mtp_seed_after_bonus: true
   mtp_hidden_source: "final_normed"
   mtp_lm_head_greedy_top1_impl: "triton"
   num_speculative_tokens: 1
