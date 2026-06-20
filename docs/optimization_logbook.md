@@ -13459,3 +13459,59 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     either avoid materializing full token ids for throughput-only summaries, or
     produce and consume output tokens through a resident result buffer without a
     per-step scatter that competes with decode.
+
+#### Entry 316 - Thresholded Host Token Sink for Long Summary Runs
+
+- date: 2026-06-20
+- trigger:
+  - user asked for a way around the remaining final materialization bucket and
+    asked to check how vLLM handles output token transfer.
+- vLLM reference lesson:
+  - vLLM starts sampled-token D2H transfer immediately after sampling on a
+    separate CUDA stream (`AsyncOutput` in `vllm/v1/worker/gpu/async_utils.py`)
+    and lets output processing consume the CPU tensor later;
+  - the important part for our summary path is not a GPU output table. It is
+    early async transfer plus delayed host consumption, without adding a hot
+    per-step GPU scatter to decode.
+- implementation:
+  - added a summary-mode host token sink in `LLMEngine` for long-output runs;
+  - the sink snapshots newly generated `DeviceTokenSlot`s, calls
+    `copy_to_host_async` during generation, and harvests the accumulated slots
+    once at final result build with `_resolve_device_token_slots_without_mutation`;
+  - it writes final result token ids from a side host buffer and leaves
+    `Sequence._device_token_slots` intact, so the device-token carry state is
+    not broken by in-loop materialization;
+  - the sink is thresholded by planned completion budget
+    (`summary_host_token_sink_min_completion_tokens`, default `1024`) because
+    short-output active prefetch was already known to regress `hetero8`.
+- validation:
+  - `.venv/bin/python -m pytest tests/test_device_token_carry.py -q`:
+    `35 passed`;
+  - fixed-B8 random thresholded artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_token_sink_20260620/full_random_b8_host_token_sink_threshold_r1.json`;
+  - JAX sidecar:
+    `803.64 output tok/s`, `6126` generated tokens, `0.096 s` final post-loop,
+    `0.095 s` host-sink harvest, `0.0 s` final device-token materialization,
+    host sink enabled for planned budget `6126`, no missing host-sink tokens;
+  - same-manifest vLLM reference:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/b8_full_random_20260619/full_random_b8_sidecar_r1_vllm.json`,
+    `1000.98 output tok/s`, so the current ratio is `0.803x`;
+  - prior safe JAX reference:
+    `770.12 output tok/s`, `0.365 s` post-last-token drain. The new path
+    improves throughput by `+33.52 output tok/s` and cuts the drain by
+    about `269 ms`;
+  - hetero8 guard artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_token_sink_20260620/hetero8_host_token_sink_threshold_r1.json`;
+  - hetero8 stayed on final materialization (`host_token_sink_enabled=false`,
+    planned budget `256 < 1024`) and measured `579.72 output tok/s`, matching
+    the prior healthy `581.30 output tok/s` within run noise;
+  - the deliberately unthresholded deferred-harvest hetero8 check reproduced
+    the bad short-output pattern at `481.83 output tok/s`, confirming the guard
+    is necessary.
+- interpretation:
+  - this is a real B8 improvement and crosses the near-term `0.8x` target for
+    the fixed-8 random-large lane;
+  - this does not solve the remaining vLLM gap. The next major gap is no longer
+    bulk final token readback on long-output summary runs; remaining work should
+    focus on TTFT and decode GPU work/launch structure, while keeping the
+    thresholded sink for long summaries and avoiding it for short outputs.

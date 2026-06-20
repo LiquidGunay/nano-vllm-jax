@@ -63,15 +63,16 @@
   extra measured-phase compilation.
 - As of the 2026-06-19 reset, the default random sidecar request count is fixed
   at `8` requests. Treat the old 15-request stress as a future B16/B32 scaling
-  lane, not the active B8 target. The current fixed-8 best is close to target:
-  `788.34 output tok/s` (`0.788x` vLLM) total and `809.28 output tok/s`
-  (`0.808x` vLLM) token-event throughput after finished-row summary prefetch
-  plus direct vector-token host fetch. Remaining miss is about `1.6%`, mostly
-  residual final token materialization/drain and TTFT.
+  lane, not the active B8 target. The current fixed-8 best uses the
+  thresholded summary host-token sink: `803.64 output tok/s` (`0.803x` vLLM),
+  final drain `0.096 s`, with host sink enabled only when planned completion
+  budget is at least `1024` tokens.
 - Do not retry summary-mode per-step token prefetch as a hetero8 fix without a
   broader device-owned output boundary. The 2026-06-19 short-output prefetch
   experiment regressed `hetero8` from `581.38` to `482.70 output tok/s` while
-  barely reducing final drain.
+  barely reducing final drain. The 2026-06-20 thresholded host sink keeps
+  `hetero8` on final materialization (`256 < 1024` planned tokens) and measured
+  `579.72 output tok/s`, matching the prior healthy `581.30 tok/s` result.
 - Do not retry final-token materialization fixes that only move the sync point:
   on 2026-06-19, a resident output-token table made scalar finalization cheap
   but added a hot decode scatter and collapsed fixed-B8 random throughput to
@@ -80,8 +81,9 @@
   `1006` decode token refs but regressed to `778 output tok/s`; a two-worker
   background `device_get` resolver made the final pending block `~6 ms` but
   added a `~146 ms` mandatory flush and regressed to `768 output tok/s`.
-  Keep the safe direct-vector materializer until a broader device-owned output
-  boundary eliminates result readback without stealing from the decode loop.
+  The accepted exception is the thresholded host-token sink, which prefetches
+  long-output token refs during generation but harvests them only once at final
+  drain and stays disabled for short-output runs.
 - XLA low-memory allocator/platform flags are diagnostic only: they can reduce
   GPU memory to about `5 GiB`, but they regressed random/hetero throughput in
   the accepted benchmark lane. XLA Triton GEMM and B16-capacity diagnostics

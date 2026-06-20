@@ -220,9 +220,21 @@ Current accepted random sidecar default:
     tok/s` on the old 15-request stress, but startup/compile cost was very
     high and this still only reached `0.589x`; do not promote it as the B8
     default.
-- 2026-06-19 materialization status:
+- 2026-06-20 materialization status:
   - accepted: finished-row summary prefetch plus direct vector-token host fetch
     reduces fixed-B8 final drain from `0.365 s` to `0.201 s`;
+  - accepted follow-up: the thresholded summary host-token sink mirrors vLLM's
+    async output-copy shape for long-output runs. It snapshots active-row token
+    refs and calls `copy_to_host_async` during generation, but harvests the
+    prefetched slots only once at final drain and does not mutate
+    `Sequence._device_token_slots`. On fixed-B8 random it reached
+    `803.64 output tok/s` (`0.803x` same-manifest vLLM `1000.98`), reduced
+    final drain to `0.096 s`, and stored all `6126` generated tokens through
+    the host sink with no missing slots;
+  - short-output guard: the sink is enabled only when planned completion budget
+    is at least `1024` tokens. `hetero8` has `256` planned tokens, kept the
+    old final-materialization path, and measured `579.72 output tok/s` versus
+    the prior healthy `581.30 output tok/s`;
   - rejected: periodic/live per-step summary prefetch. On fixed-B8 random it
     was neutral/slightly negative, and on `hetero8` it regressed total
     throughput from `581.38` to `482.70 output tok/s` while barely changing
@@ -235,10 +247,10 @@ Current accepted random sidecar default:
 
 Immediate final speedup pass for the fixed-8 lane:
 
-1. Remove or overlap final device-token materialization in summary mode. The
-   current fixed-8 JAX run spends `0.355-0.365 s` after the last token; removing
-   only this drain is enough to move total throughput from `0.769x` to about
-   `0.806x` vLLM.
+1. Done: remove or overlap final device-token materialization in summary mode.
+   The thresholded host-token sink moves fixed-B8 random from `770.12` to
+   `803.64 output tok/s` (`0.803x` vLLM) while preserving the hetero8 short
+   path.
 2. Keep the RAM guard enabled for all validation. Full XLA profiling on this
    lane hit the guard at `82.4%` system RAM; engine-step-only profiling
    completed at `52.4%`.

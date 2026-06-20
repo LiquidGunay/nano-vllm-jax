@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.kv_cache import KVCacheSpec, cap_num_kv_cache_blocks
-from nanovllm_jax.engine.sequence import DeviceTokenSlot, Sequence, SamplingParams
+from nanovllm_jax.engine.sequence import DeviceTokenRef, DeviceTokenSlot, Sequence, SamplingParams
 from nanovllm_jax.engine.scheduler import Scheduler
 from nanovllm_jax.engine.model_runner import ModelRunner
 from nanovllm_jax.model import ModelParams
@@ -23,6 +23,7 @@ except ImportError:
 
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
+_SUMMARY_HOST_TOKEN_SINK_MIN_COMPLETION_TOKENS = 1024
 
 
 def _config_or_env_flag(config: Qwen3_5Config | None, attr: str, env_name: str, *, default: bool = False) -> bool:
@@ -48,6 +49,15 @@ def _trace_token_prefetch_enabled(config: Qwen3_5Config | None = None) -> bool:
         "NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH",
         default=True,
     )
+
+
+def _summary_host_token_sink_min_completion_tokens(config: Qwen3_5Config | None = None) -> int:
+    value = getattr(
+        config,
+        "summary_host_token_sink_min_completion_tokens",
+        _SUMMARY_HOST_TOKEN_SINK_MIN_COMPLETION_TOKENS,
+    )
+    return max(0, int(value))
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:
@@ -99,6 +109,75 @@ class _DeferredTokenStreamRecord:
     step_end_seconds: float
     scheduler_step_tokens: int
     scheduler_step_is_decode: bool
+
+
+def _resolve_device_token_slots_without_mutation(
+    slots: tuple[DeviceTokenSlot, ...],
+) -> list[tuple[DeviceTokenSlot, int]]:
+    """Resolve deferred token slots without changing the owning sequences."""
+    entries: list[DeviceTokenSlot] = []
+    scalar_entries: list[int] = []
+    scalar_arrays = []
+    vector_entries: list[tuple[int, int, int]] = []
+    vector_arrays = []
+    vector_slots: dict[int, int] = {}
+
+    for slot in slots:
+        entries.append(slot)
+        entry_index = len(entries) - 1
+        if isinstance(slot.token, DeviceTokenRef):
+            vector_id = id(slot.token.tokens)
+            vector_slot = vector_slots.get(vector_id)
+            if vector_slot is None:
+                vector_slot = len(vector_arrays)
+                vector_slots[vector_id] = vector_slot
+                vector_arrays.append(slot.token.tokens)
+            vector_entries.append((entry_index, vector_slot, int(slot.token.row)))
+        else:
+            scalar_entries.append(entry_index)
+            scalar_arrays.append(slot.token)
+
+    if not scalar_arrays and not vector_arrays:
+        return []
+
+    import jax
+    import jax.numpy as jnp
+
+    values_by_entry: dict[int, int] = {}
+    if scalar_arrays:
+        scalar_arrays = [jnp.asarray(token, dtype=jnp.int32).reshape(()) for token in scalar_arrays]
+        scalar_values = jax.device_get(jnp.stack(scalar_arrays)).tolist()
+        for entry_index, value in zip(scalar_entries, scalar_values):
+            values_by_entry[entry_index] = int(value)
+    if vector_arrays:
+        vector_arrays = [
+            jnp.asarray(tokens, dtype=jnp.int32).reshape(-1)
+            for tokens in vector_arrays
+        ]
+        host_vectors = jax.device_get(vector_arrays)
+        for entry_index, vector_slot, row in vector_entries:
+            values_by_entry[entry_index] = int(host_vectors[vector_slot][row])
+
+    return [(slot, values_by_entry[entry_index]) for entry_index, slot in enumerate(entries)]
+
+
+def _store_resolved_slots_in_host_token_sink(
+    host_completion_tokens: dict[int, list[int | None]],
+    resolved_slots: list[tuple[DeviceTokenSlot, int]],
+) -> int:
+    stored = 0
+    for slot, value in resolved_slots:
+        seq = slot.seq
+        completion_index = int(slot.index) - int(seq.num_prompt_tokens)
+        if completion_index < 0:
+            continue
+        row = host_completion_tokens.setdefault(int(seq.seq_id), [])
+        if len(row) <= completion_index:
+            row.extend([None] * (completion_index + 1 - len(row)))
+        if row[completion_index] is None:
+            stored += 1
+        row[completion_index] = int(value)
+    return stored
 
 
 class LLMEngine:
@@ -961,20 +1040,34 @@ class LLMEngine:
         events = []
         config = getattr(self, "config", None)
         trace_token_prefetch_enabled = _trace_token_prefetch_enabled(config)
+        planned_completion_budget = sum(
+            max(0, int(sp.max_tokens)) for sp in sampling_params
+        )
+        host_token_sink_min_completion_tokens = (
+            _summary_host_token_sink_min_completion_tokens(config)
+        )
         prefetch_trace_tokens = trace_events and trace_token_prefetch_enabled
-        prefetch_finished_tokens = (not trace_events) and trace_token_prefetch_enabled
+        host_token_sink_enabled = (
+            (not trace_events)
+            and trace_token_prefetch_enabled
+            and planned_completion_budget >= host_token_sink_min_completion_tokens
+        )
         snapshotted_completion_lengths = {seq.seq_id: 0 for seq in seqs}
         pending_prefetch_slots: tuple[DeviceTokenSlot, ...] = ()
-        pending_finished_slots: tuple[DeviceTokenSlot, ...] = ()
-        prefetched_finished_seq_ids: set[int] = set()
+        host_sink_slots: list[DeviceTokenSlot] = []
+        host_completion_tokens: dict[int, list[int | None]] = {
+            int(seq.seq_id): [] for seq in seqs
+        }
+        host_sink_resolve_seconds = 0.0
+        host_sink_prefetch_seconds = 0.0
+        host_sink_resolved_slots = 0
+        host_sink_stored_tokens = 0
+        host_sink_prefetched_slots = 0
 
         while not self.is_finished():
             step_start = perf_counter()
             _, num_tokens = self._step_without_finished_output_materialization()
             step_end = perf_counter()
-            if prefetch_finished_tokens and pending_finished_slots:
-                Sequence.materialize_device_token_slots(pending_finished_slots)
-                pending_finished_slots = ()
             if prefetch_trace_tokens:
                 if pending_prefetch_slots:
                     Sequence.prefetch_device_token_slots(pending_prefetch_slots)
@@ -983,6 +1076,23 @@ class LLMEngine:
                     snapshotted_completion_lengths,
                 )
                 pending_prefetch_slots = slots
+                snapshotted_completion_lengths.update(
+                    {
+                        int(seq.seq_id): int(seq.num_completion_tokens)
+                        for seq in seqs
+                    }
+                )
+            if host_token_sink_enabled:
+                slots = Sequence.snapshot_new_device_token_slots_for_sequences(
+                    seqs,
+                    snapshotted_completion_lengths,
+                )
+                if slots:
+                    host_prefetch_start = perf_counter()
+                    Sequence.prefetch_device_token_slots(slots)
+                    host_sink_prefetch_seconds += perf_counter() - host_prefetch_start
+                    host_sink_prefetched_slots += len(slots)
+                    host_sink_slots.extend(slots)
                 snapshotted_completion_lengths.update(
                     {
                         int(seq.seq_id): int(seq.num_completion_tokens)
@@ -1034,19 +1144,6 @@ class LLMEngine:
                             "completion_tokens": seq.num_completion_tokens,
                         }
                     )
-            if prefetch_finished_tokens:
-                newly_finished = [
-                    seq
-                    for seq in seqs
-                    if seq.is_finished and int(seq.seq_id) not in prefetched_finished_seq_ids
-                ]
-                if newly_finished:
-                    slots = Sequence.snapshot_device_token_slots_for_sequences(newly_finished)
-                    prefetched_finished_seq_ids.update(int(seq.seq_id) for seq in newly_finished)
-                    if slots:
-                        pending_finished_slots = slots
-                        Sequence.prefetch_device_token_slots(slots)
-
         if prefetch_trace_tokens and pending_prefetch_slots:
             Sequence.prefetch_device_token_slots(pending_prefetch_slots)
         final_post_loop_start = perf_counter()
@@ -1054,19 +1151,46 @@ class LLMEngine:
         final_device_token_materialize_seconds = 0.0
         final_result_build_seconds = 0.0
         final_slots_before = sum(len(seq._device_token_slots) for seq in seqs)
-        if prefetch_finished_tokens and pending_finished_slots:
+        if host_token_sink_enabled and host_sink_slots:
             final_pending_start = perf_counter()
-            Sequence.materialize_device_token_slots(pending_finished_slots)
+            resolved_slots = _resolve_device_token_slots_without_mutation(
+                tuple(host_sink_slots)
+            )
+            host_sink_resolved_slots += len(resolved_slots)
+            host_sink_stored_tokens += _store_resolved_slots_in_host_token_sink(
+                host_completion_tokens,
+                resolved_slots,
+            )
             final_pending_materialize_seconds = perf_counter() - final_pending_start
+            host_sink_resolve_seconds += final_pending_materialize_seconds
         final_slots_after_pending = sum(len(seq._device_token_slots) for seq in seqs)
-        final_device_materialize_start = perf_counter()
-        Sequence.materialize_device_tokens_for_sequences(seqs)
-        final_device_token_materialize_seconds = perf_counter() - final_device_materialize_start
+        host_sink_missing_tokens = 0
+        host_sink_complete = host_token_sink_enabled
+        if host_token_sink_enabled:
+            for seq in seqs:
+                row = host_completion_tokens.get(int(seq.seq_id), [])
+                expected = int(seq.num_completion_tokens)
+                missing = max(0, expected - len(row))
+                missing += sum(1 for value in row[:expected] if value is None)
+                host_sink_missing_tokens += missing
+            host_sink_complete = host_sink_missing_tokens == 0
+        if not host_sink_complete:
+            final_device_materialize_start = perf_counter()
+            Sequence.materialize_device_tokens_for_sequences(seqs)
+            final_device_token_materialize_seconds = perf_counter() - final_device_materialize_start
         final_slots_after_device_materialize = sum(len(seq._device_token_slots) for seq in seqs)
         final_result_build_start = perf_counter()
         results = []
         for index, seq in enumerate(seqs):
-            token_ids = [int(token) for token in seq.completion_token_ids]
+            if host_sink_complete:
+                row = host_completion_tokens.get(int(seq.seq_id), [])
+                token_ids = [
+                    int(token)
+                    for token in row[: int(seq.num_completion_tokens)]
+                    if token is not None
+                ]
+            else:
+                token_ids = [int(token) for token in seq.completion_token_ids]
             results.append(
                 {
                     "request_index": index,
@@ -1119,6 +1243,18 @@ class LLMEngine:
                     "final_device_token_slots_before": final_slots_before,
                     "final_device_token_slots_after_pending": final_slots_after_pending,
                     "final_device_token_slots_after_device_materialize": final_slots_after_device_materialize,
+                    "host_token_sink_enabled": bool(host_token_sink_enabled),
+                    "host_token_sink_planned_completion_budget": int(planned_completion_budget),
+                    "host_token_sink_min_completion_tokens": int(
+                        host_token_sink_min_completion_tokens
+                    ),
+                    "host_token_sink_complete": bool(host_sink_complete),
+                    "host_token_sink_prefetch_seconds": host_sink_prefetch_seconds,
+                    "host_token_sink_resolve_seconds": host_sink_resolve_seconds,
+                    "host_token_sink_prefetched_slots": int(host_sink_prefetched_slots),
+                    "host_token_sink_resolved_slots": int(host_sink_resolved_slots),
+                    "host_token_sink_stored_tokens": int(host_sink_stored_tokens),
+                    "host_token_sink_missing_tokens": int(host_sink_missing_tokens),
                 },
             ),
         }

@@ -1,5 +1,7 @@
 """Focused tests for deferred greedy token materialization."""
 
+from types import SimpleNamespace
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -1145,7 +1147,7 @@ def test_generate_with_trace_prefetches_when_trace_prefetch_enabled(monkeypatch)
     ]
 
 
-def test_generate_with_trace_summary_prefetches_finished_rows(monkeypatch):
+def test_generate_with_trace_summary_prefetches_active_rows_to_host_sink(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "1")
     events: list[str] = []
@@ -1185,6 +1187,7 @@ def test_generate_with_trace_summary_prefetches_finished_rows(monkeypatch):
     engine.is_finished = is_finished
     engine.step = step
     engine._detokenize = lambda token_ids: ""
+    engine.config = SimpleNamespace(summary_host_token_sink_min_completion_tokens=1)
 
     trace = engine.generate_with_trace(
         [[101], [102]],
@@ -1203,19 +1206,78 @@ def test_generate_with_trace_summary_prefetches_finished_rows(monkeypatch):
     ]
     assert events == [
         "step-0",
-        "step-1",
         "prefetch-200",
-        "prefetch-201",
-        "step-2",
-        "materialize-200",
-        "materialize-201",
         "prefetch-300",
+        "step-1",
+        "prefetch-201",
         "prefetch-301",
+        "step-2",
         "prefetch-302",
+        "materialize-200",
         "materialize-300",
+        "materialize-201",
         "materialize-301",
         "materialize-302",
     ]
+    assert trace["timing_summary"]["host_token_sink_enabled"] is True
+    assert trace["timing_summary"]["host_token_sink_complete"] is True
+    assert trace["timing_summary"]["host_token_sink_stored_tokens"] == 5
+    assert trace["timing_summary"]["host_token_sink_missing_tokens"] == 0
+    assert trace["timing_summary"]["final_device_token_materialize_seconds"] == 0.0
+    assert all(seq.has_unmaterialized_device_tokens for seq in seqs.values())
+
+
+def test_generate_with_trace_summary_keeps_short_outputs_on_final_materialization(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "1")
+    events: list[str] = []
+    seq_holder: dict[str, Sequence] = {}
+    remaining_steps = {"value": 2}
+
+    def add_request(prompt, sampling_params):
+        seq = Sequence(prompt, sampling_params, seq_id=7)
+        seq.status = SequenceStatus.RUNNING
+        seq_holder["seq"] = seq
+        return seq
+
+    def is_finished():
+        return remaining_steps["value"] <= 0
+
+    def step():
+        step_index = 2 - remaining_steps["value"]
+        events.append(f"step-{step_index}")
+        seq = seq_holder["seq"]
+        seq.append_token_device(_AsyncScalar(202 + step_index, events))
+        remaining_steps["value"] -= 1
+        if remaining_steps["value"] <= 0:
+            seq.status = SequenceStatus.FINISHED
+        return [], -1
+
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.add_request = add_request
+    engine.is_finished = is_finished
+    engine.step = step
+    engine._detokenize = lambda token_ids: ""
+
+    trace = engine.generate_with_trace(
+        [[101]],
+        SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True),
+        include_text=False,
+        trace_events=False,
+    )
+
+    assert trace["results"][0]["token_ids"] == [202, 203]
+    assert events == [
+        "step-0",
+        "step-1",
+        "materialize-202",
+        "materialize-203",
+    ]
+    assert trace["timing_summary"]["host_token_sink_enabled"] is False
+    assert trace["timing_summary"]["host_token_sink_planned_completion_budget"] == 2
+    assert trace["timing_summary"]["host_token_sink_min_completion_tokens"] == 1024
+    assert trace["timing_summary"]["final_device_token_materialize_seconds"] > 0.0
+    assert not seq_holder["seq"].has_unmaterialized_device_tokens
 
 
 def test_generate_with_trace_keeps_eos_compatible_path_when_ignore_eos_false(monkeypatch):
