@@ -71,12 +71,35 @@ def test_speculative_config_rejects_unimplemented_probabilistic_mtp():
 
 
 def test_speculative_config_rejects_k_gt_1_without_true_k_verifier():
+    config = Qwen3_5Config(
+        speculative_method="mtp",
+        num_speculative_tokens=2,
+        mtp_verifier_impl="commit_select",
+    )
+    assert config.mtp_verifier_impl == "commit_select"
+
     with pytest.raises(ValueError, match="K>1 requires mtp_verifier_impl='k_decode'"):
         Qwen3_5Config(
             speculative_method="mtp",
-            num_speculative_tokens=2,
+            num_speculative_tokens=3,
             mtp_verifier_impl="two_decode",
         )
+
+
+def test_speculative_config_accepts_mtp_chain_hidden_source():
+    config = Qwen3_5Config(
+        mtp_chain_hidden_source="final_normed",
+        mtp_chain_mode="sequence",
+    )
+
+    assert config.mtp_chain_hidden_source == "final_normed"
+    assert config.mtp_chain_mode == "sequence"
+
+    with pytest.raises(ValueError, match="mtp_chain_hidden_source"):
+        Qwen3_5Config(mtp_chain_hidden_source="pre_norm")
+
+    with pytest.raises(ValueError, match="mtp_chain_mode"):
+        Qwen3_5Config(mtp_chain_mode="parallel")
 
 
 @pytest.mark.parametrize(
@@ -579,7 +602,7 @@ def test_gpu_optimal_config_is_non_mtp_promoted_path(monkeypatch):
     assert loaded.engine["resident_decode_metadata"] is True
 
 
-def test_mtp_experimental_config_is_exact_true_k_and_separate(monkeypatch):
+def test_mtp_experimental_config_is_exact_k2_and_separate(monkeypatch):
     _clear_config_env(monkeypatch)
 
     loaded = load_server_config(REPO_ROOT / "configs/server/mtp_experimental.yaml")
@@ -587,7 +610,9 @@ def test_mtp_experimental_config_is_exact_true_k_and_separate(monkeypatch):
     assert loaded.engine["speculative_method"] == "mtp"
     assert loaded.engine["num_speculative_tokens"] == 2
     assert loaded.engine["draft_sample_method"] == "greedy"
-    assert loaded.engine["mtp_verifier_impl"] == "k_decode"
+    assert loaded.engine["mtp_verifier_impl"] == "commit_select"
+    assert loaded.engine["mtp_chain_hidden_source"] == "final_normed"
+    assert loaded.engine["mtp_chain_mode"] == "sequence"
     assert loaded.engine["mtp_prefill_seed"] is False
     assert loaded.engine["mtp_unverified_draft_append"] is False
     assert loaded.engine["mtp_unverified_fused_append"] is False

@@ -42,9 +42,9 @@ architecture/correctness checkpoint rather than a speed claim.
 
 ## Current GPU caveat
 
-As of 2026-06-20, the active MTP research config targets true K-token
-verification (`mtp_verifier_impl=k_decode`, currently K=2) rather than the old
-repeated K=1 burst route. MTP remains an explicit opt-in serving mode rather
+As of 2026-06-20, the active MTP research config targets exact K=2
+verification (`mtp_verifier_impl=commit_select`) rather than the old repeated
+K=1 burst route. MTP remains an explicit opt-in serving mode rather
 than an environment-only diagnostic. The server config fields are:
 
 - `speculative_method`: `none` or `mtp`;
@@ -52,9 +52,9 @@ than an environment-only diagnostic. The server config fields are:
   experimental true-K verifier target. K=3 should wait until K=2 has useful
   second-position draft quality;
 - `draft_sample_method`: currently only `greedy` is implemented for MTP;
-- `mtp_verifier_impl`: `k_decode` for true K-token verification, `two_decode`
-  for the historical width-2 K=1 verifier, or `commit_select` for the older
-  exact sequential K=1 reference;
+- `mtp_verifier_impl`: `commit_select` for the current exact K=2 sequential
+  verifier or the older exact K=1 reference, `k_decode` for generic true-K
+  verification, and `two_decode` for the historical width-2 K=1 verifier;
 - `mtp_batch_accept_policy`: `rowwise` or `all_or_none`;
 - `mtp_seed_after_bonus`: default `false`.
 - `mtp_prefill_seed`: default `false`. Prefill draft seeding is now opt-in
@@ -65,7 +65,7 @@ Legacy configs that set only `num_speculative_tokens=1` are interpreted as
 `speculative_method=mtp` for compatibility. Invalid or unimplemented MTP modes
 fail at startup instead of silently taking a partial speculative path.
 
-The true-K GPU route is correctness-first:
+The current GPU route is correctness-first:
 
 - the target model remains canonical;
 - the scheduler marks admitted speculative rows in `ScheduledBatch`;
@@ -106,9 +106,35 @@ The exact true-K route now has the first strict B=2 smoke checkpoint:
   events, but position 1 target in top-5 for `0/6`; offsets `-1` and `+1` did
   not change acceptance.
 
-Treat K=2/K=3 as research-only until a better draft contract, confidence gate,
-or model head makes the second and later draft positions useful enough to
-amortize the wider verifier.
+2026-06-20 follow-up:
+
+- the chain input bug was real: feeding final-normed MTP hidden forward raised
+  the strict K=2 B=2 smoke from `22.78` to `26.00 output tok/s` and made the
+  second draft position nonzero (`[4, 0] / [10, 10]` to `[4, 1] / [9, 9]`);
+- sequence-context chaining improved the draft contract further by running the
+  MTP layer over the accumulated draft sequence and top-1ing only the final
+  position. Strict K=2 B=2 reached `26.77 output tok/s`, exact parity, and
+  position acceptance `[3, 3] / [7, 7]`;
+- K=3 sequence-context did not help. Debug acceptance dropped to `3/21`, so
+  this checkpoint should stay at K=2;
+- K=2 `commit_select` with final-normed sequence drafts is the best exact route
+  from this pass: strict B=2 len-12 reached `27.47 output tok/s`, and len-64
+  reached `70.31 output tok/s` with exact parity. The len-64 no-MTP reference
+  remained much faster at `361.05 output tok/s`;
+- the concrete speed blocker is verifier cost, not output materialization. A
+  profiled K=2 commit-select run showed steady verifier calls around `25 ms`
+  and fused seed around `10 ms`, while adaptive admission measured the B=2
+  speculative bucket at `14.9 ms/token` versus `2.1 ms/token` baseline and
+  disabled the bucket for low throughput;
+- packed-prefill verification is not currently usable under strict no-fallback
+  GDN policy because it needs prefix-state output from the packed prefill GDN
+  route and would otherwise use the slow recurrent scan.
+
+Treat K=2 as research-only until the verifier boundary is substantially
+cheaper. For Qwen/Qwen3.5-0.8B, exact MTP does not provide a throughput win
+over the current non-speculative path even after the draft-chain correctness
+fixes. Scheduler admission should remain enabled for serving so slow buckets
+fall back to ordinary decode.
 
 The current GPU correctness contract is `dtype=float32` with `weight_dtype=bfloat16` for Qwen3.5 real weights. Under that contract:
 

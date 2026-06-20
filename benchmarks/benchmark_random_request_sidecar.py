@@ -162,6 +162,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jax-mtp-bonus-margin", type=float, default=0.0)
     parser.add_argument("--jax-mtp-draft-margin", type=float, default=0.0)
     parser.add_argument("--jax-mtp-hidden-source", choices=["pre_norm", "final_normed"], default="final_normed")
+    parser.add_argument("--jax-mtp-chain-hidden-source", choices=["raw", "final_normed"], default="raw")
+    parser.add_argument("--jax-mtp-chain-mode", choices=["recursive", "sequence"], default="recursive")
     parser.add_argument("--jax-mtp-token-source", choices=["generated", "current"], default="generated")
     parser.add_argument("--jax-mtp-position-offset", type=int, default=0)
     parser.add_argument("--jax-mtp-lm-head-greedy-top1-impl", default="triton")
@@ -842,6 +844,8 @@ def _build_jax_command(
         "mtp_bonus_margin": args.jax_mtp_bonus_margin,
         "mtp_draft_margin": args.jax_mtp_draft_margin,
         "mtp_hidden_source": args.jax_mtp_hidden_source,
+        "mtp_chain_hidden_source": args.jax_mtp_chain_hidden_source,
+        "mtp_chain_mode": args.jax_mtp_chain_mode,
         "mtp_token_source": args.jax_mtp_token_source,
         "mtp_position_offset": args.jax_mtp_position_offset,
         "mtp_lm_head_greedy_top1_impl": args.jax_mtp_lm_head_greedy_top1_impl,
@@ -1115,6 +1119,8 @@ def _run() -> None:
                 "mtp_bonus_margin": args.jax_mtp_bonus_margin,
                 "mtp_draft_margin": args.jax_mtp_draft_margin,
                 "mtp_hidden_source": args.jax_mtp_hidden_source,
+                "mtp_chain_hidden_source": args.jax_mtp_chain_hidden_source,
+                "mtp_chain_mode": args.jax_mtp_chain_mode,
                 "mtp_token_source": args.jax_mtp_token_source,
                 "mtp_position_offset": args.jax_mtp_position_offset,
                 "mtp_lm_head_greedy_top1_impl": args.jax_mtp_lm_head_greedy_top1_impl,

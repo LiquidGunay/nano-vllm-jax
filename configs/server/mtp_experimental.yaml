@@ -29,10 +29,12 @@ engine:
   prefix_cache: true
   speculative_method: "mtp"
   draft_sample_method: "greedy"
-  mtp_verifier_impl: "k_decode"
+  mtp_verifier_impl: "commit_select"
   mtp_batch_accept_policy: "rowwise"
   mtp_seed_after_bonus: true
   mtp_hidden_source: "final_normed"
+  mtp_chain_hidden_source: "final_normed"
+  mtp_chain_mode: "sequence"
   mtp_lm_head_greedy_top1_impl: "triton"
   num_speculative_tokens: 2
   mtp_burst_groups: 1

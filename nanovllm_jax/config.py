@@ -67,6 +67,8 @@ class Qwen3_5Config:
     mtp_bonus_margin: float = 0.0
     mtp_draft_margin: float = 0.0
     mtp_hidden_source: str = "pre_norm"
+    mtp_chain_hidden_source: str = "raw"
+    mtp_chain_mode: str = "recursive"
     mtp_token_source: str = "generated"
     mtp_position_offset: int = 0
     mtp_lm_head_greedy_top1_impl: str = "jax"
@@ -205,9 +207,12 @@ class Qwen3_5Config:
         if (
             speculative_method == "mtp"
             and num_speculative_tokens > 1
-            and mtp_verifier_impl != "k_decode"
+            and not (
+                mtp_verifier_impl == "k_decode"
+                or (mtp_verifier_impl == "commit_select" and num_speculative_tokens == 2)
+            )
         ):
-            raise ValueError("MTP K>1 requires mtp_verifier_impl='k_decode'")
+            raise ValueError("MTP K>1 requires mtp_verifier_impl='k_decode' or K=2 commit_select")
         mtp_batch_accept_policy = str(self.mtp_batch_accept_policy or "rowwise").strip().lower()
         if mtp_batch_accept_policy not in {"rowwise", "all_or_none"}:
             raise ValueError("mtp_batch_accept_policy must be 'rowwise' or 'all_or_none'")
@@ -221,6 +226,12 @@ class Qwen3_5Config:
         mtp_hidden_source = str(self.mtp_hidden_source or "pre_norm").strip().lower()
         if mtp_hidden_source not in {"pre_norm", "final_normed"}:
             raise ValueError("mtp_hidden_source must be 'pre_norm' or 'final_normed'")
+        mtp_chain_hidden_source = str(self.mtp_chain_hidden_source or "raw").strip().lower()
+        if mtp_chain_hidden_source not in {"raw", "final_normed"}:
+            raise ValueError("mtp_chain_hidden_source must be 'raw' or 'final_normed'")
+        mtp_chain_mode = str(self.mtp_chain_mode or "recursive").strip().lower()
+        if mtp_chain_mode not in {"recursive", "sequence"}:
+            raise ValueError("mtp_chain_mode must be 'recursive' or 'sequence'")
         mtp_token_source = str(self.mtp_token_source or "generated").strip().lower()
         if mtp_token_source not in {"generated", "current"}:
             raise ValueError("mtp_token_source must be 'generated' or 'current'")
@@ -241,6 +252,8 @@ class Qwen3_5Config:
                 "mtp_lm_head_greedy_top1_impl must be jax, triton, or cutlass"
             )
         object.__setattr__(self, "mtp_hidden_source", mtp_hidden_source)
+        object.__setattr__(self, "mtp_chain_hidden_source", mtp_chain_hidden_source)
+        object.__setattr__(self, "mtp_chain_mode", mtp_chain_mode)
         object.__setattr__(self, "mtp_token_source", mtp_token_source)
         object.__setattr__(self, "mtp_position_offset", int(self.mtp_position_offset or 0))
         object.__setattr__(
@@ -401,6 +414,8 @@ class Qwen3_5Config:
             self.mtp_bonus_margin,
             self.mtp_draft_margin,
             self.mtp_hidden_source,
+            self.mtp_chain_hidden_source,
+            self.mtp_chain_mode,
             self.mtp_token_source,
             self.mtp_position_offset,
             self.mtp_lm_head_greedy_top1_impl,
@@ -571,6 +586,8 @@ class Qwen3_5Config:
             "mtp_bonus_margin": self.mtp_bonus_margin,
             "mtp_draft_margin": self.mtp_draft_margin,
             "mtp_hidden_source": self.mtp_hidden_source,
+            "mtp_chain_hidden_source": self.mtp_chain_hidden_source,
+            "mtp_chain_mode": self.mtp_chain_mode,
             "mtp_token_source": self.mtp_token_source,
             "mtp_position_offset": self.mtp_position_offset,
             "mtp_lm_head_greedy_top1_impl": self.mtp_lm_head_greedy_top1_impl,

@@ -9,6 +9,8 @@ from nanovllm_jax.mtp.mtp_layer import (
     _mtp_greedy_top1_token_ids,
     init_mtp_params,
     mtp_forward,
+    mtp_forward_last,
+    mtp_forward_last_token_ids,
     mtp_forward_token_ids,
 )
 
@@ -68,6 +70,86 @@ def test_mtp_forward_returns_raw_hidden_for_chaining():
     assert jnp.allclose(chained_hidden, raw_hidden)
     assert jnp.allclose(chained_hidden_from_top1, raw_hidden)
     assert not jnp.allclose(chained_hidden, normed_hidden)
+
+
+def test_mtp_forward_can_return_normed_hidden_for_chaining():
+    config = _tiny_config()
+    params = init_mtp_params(jax.random.PRNGKey(0), config)
+    embed_tokens = jax.random.normal(jax.random.PRNGKey(1), (config.vocab_size, config.hidden_size))
+    hidden = jax.random.normal(jax.random.PRNGKey(2), (2, 1, config.hidden_size))
+    token_ids = jnp.array([[3], [7]], dtype=jnp.int32)
+    positions = jnp.array([[4], [11]], dtype=jnp.int32)
+
+    normed_hidden, raw_hidden = _mtp_forward_hidden(
+        hidden_state=hidden,
+        next_token_ids=token_ids,
+        embed_tokens=embed_tokens,
+        params=params,
+        config=config,
+        positions=positions,
+    )
+    _, chained_hidden = mtp_forward(
+        hidden_state=hidden,
+        next_token_ids=token_ids,
+        embed_tokens=embed_tokens,
+        params=params,
+        config=config,
+        positions=positions,
+        return_normed_hidden=True,
+    )
+    _, chained_hidden_from_top1 = mtp_forward_token_ids(
+        hidden_state=hidden,
+        next_token_ids=token_ids,
+        embed_tokens=embed_tokens,
+        params=params,
+        config=config,
+        positions=positions,
+        return_normed_hidden=True,
+    )
+
+    assert jnp.allclose(chained_hidden, normed_hidden)
+    assert jnp.allclose(chained_hidden_from_top1, normed_hidden)
+    assert not jnp.allclose(chained_hidden, raw_hidden)
+
+
+def test_mtp_forward_last_uses_final_sequence_position():
+    config = _tiny_config()
+    params = init_mtp_params(jax.random.PRNGKey(0), config)
+    embed_tokens = jax.random.normal(jax.random.PRNGKey(1), (config.vocab_size, config.hidden_size))
+    hidden = jax.random.normal(jax.random.PRNGKey(2), (2, 3, config.hidden_size))
+    token_ids = jnp.array([[3, 4, 5], [7, 8, 9]], dtype=jnp.int32)
+    positions = jnp.array([[4, 5, 6], [11, 12, 13]], dtype=jnp.int32)
+
+    logits, chained_hidden = mtp_forward(
+        hidden_state=hidden,
+        next_token_ids=token_ids,
+        embed_tokens=embed_tokens,
+        params=params,
+        config=config,
+        positions=positions,
+    )
+    last_logits, last_hidden = mtp_forward_last(
+        hidden_state=hidden,
+        next_token_ids=token_ids,
+        embed_tokens=embed_tokens,
+        params=params,
+        config=config,
+        positions=positions,
+    )
+    last_token_ids, last_hidden_from_top1 = mtp_forward_last_token_ids(
+        hidden_state=hidden,
+        next_token_ids=token_ids,
+        embed_tokens=embed_tokens,
+        params=params,
+        config=config,
+        positions=positions,
+    )
+
+    assert last_logits.shape == (2, 1, config.vocab_size)
+    assert last_token_ids.shape == (2, 1)
+    assert jnp.allclose(last_logits[:, 0, :], logits[:, -1, :])
+    assert jnp.allclose(last_hidden[:, 0, :], chained_hidden[:, -1, :])
+    assert jnp.allclose(last_hidden_from_top1, last_hidden)
 
 
 def test_mtp_triton_top1_casts_hidden_to_weight_dtype(monkeypatch):

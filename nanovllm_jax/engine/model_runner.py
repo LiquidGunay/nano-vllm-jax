@@ -23,7 +23,13 @@ from nanovllm_jax.kv_cache import (
     init_linear_attention_states,
     compute_slot_mapping,
 )
-from nanovllm_jax.mtp.mtp_layer import MTPParams, mtp_forward, mtp_forward_token_ids
+from nanovllm_jax.mtp.mtp_layer import (
+    MTPParams,
+    mtp_forward,
+    mtp_forward_last,
+    mtp_forward_last_token_ids,
+    mtp_forward_token_ids,
+)
 from nanovllm_jax.mtp.speculative import generate_draft_tokens, verify_draft_tokens, apply_acceptance
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
@@ -1131,6 +1137,12 @@ class CanonicalModelRunner:
         self.mtp_bonus_margin = float(getattr(config, "mtp_bonus_margin", 0.0) or 0.0)
         self.mtp_draft_margin = float(getattr(config, "mtp_draft_margin", 0.0) or 0.0)
         self.mtp_hidden_source = str(getattr(config, "mtp_hidden_source", "pre_norm") or "pre_norm").lower()
+        self.mtp_chain_hidden_source = str(
+            getattr(config, "mtp_chain_hidden_source", "raw") or "raw"
+        ).lower()
+        self.mtp_chain_mode = str(
+            getattr(config, "mtp_chain_mode", "recursive") or "recursive"
+        ).lower()
         self.mtp_token_source = str(getattr(config, "mtp_token_source", "generated") or "generated").lower()
         self.mtp_burst_groups = max(1, int(getattr(config, "mtp_burst_groups", 1) or 1))
         self.mtp_max_active_rows = max(0, int(getattr(config, "mtp_max_active_rows", 0) or 0))
@@ -2078,11 +2090,13 @@ class CanonicalModelRunner:
                     if hasattr(self.executor, "forward_step_token_ids_mtp_draft_chain_jit"):
                         fused_chain_seed_output = self.executor.forward_step_token_ids_mtp_draft_chain_jit(
                             batch,
-                            cache_storage=self.cache_storage,
-                            hybrid_state=mtp_hybrid_state,
-                            mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
-                            draft_len=draft_len,
-                        )
+                                cache_storage=self.cache_storage,
+                                hybrid_state=mtp_hybrid_state,
+                                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                                mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                                draft_len=draft_len,
+                                mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
+                            )
                         _record_decode_warmup(
                             fused_chain_seed_output,
                             "forward_step_token_ids_mtp_draft_chain_jit:decode",
@@ -2119,6 +2133,8 @@ class CanonicalModelRunner:
                             draft_tokens=jnp.zeros((int(batch_size), 2), dtype=jnp.int32),
                             next_mtp_position=next_positions,
                             mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                            mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                            mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                         )
                         _record_decode_warmup(
                             k2_fallback_output,
@@ -2232,6 +2248,8 @@ class CanonicalModelRunner:
                                 draft_tokens=jnp.zeros((int(batch_size), 1), dtype=jnp.int32),
                                 next_mtp_position=next_positions,
                                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                                mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                                mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                                 burst_groups=mtp_burst_groups,
                             )
                             _record_decode_warmup(
@@ -2245,6 +2263,8 @@ class CanonicalModelRunner:
                             draft_tokens=jnp.zeros((int(batch_size), 1), dtype=jnp.int32),
                             next_mtp_position=next_positions,
                             mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                            mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                            mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                         )
                         _record_decode_warmup(output, "mtp_k_decode_greedy_step_jit:decode")
                         warmed_mtp_k_decode = True
@@ -2371,6 +2391,8 @@ class CanonicalModelRunner:
                             draft_tokens=jnp.zeros((int(batch_size), 2), dtype=jnp.int32),
                             next_mtp_position=next_positions,
                             mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                            mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                            mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                         )
                         _record_decode_warmup(output, "mtp2_commit_select_greedy_step_jit:decode")
                     elif (
@@ -2388,6 +2410,8 @@ class CanonicalModelRunner:
                                 draft_tokens=jnp.zeros((int(batch_size), draft_len), dtype=jnp.int32),
                                 next_mtp_position=next_positions,
                                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                                mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                                mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                             )
                             _record_decode_warmup(output, "mtp_k_decode_greedy_step_jit:decode")
                             warmed_mtp_k_decode = True
@@ -2402,6 +2426,8 @@ class CanonicalModelRunner:
                                 draft_tokens=jnp.zeros((int(batch_size), draft_len), dtype=jnp.int32),
                                 next_mtp_position=next_positions,
                                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                                mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                                mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                                 burst_groups=mtp_burst_groups,
                             )
                             _record_decode_warmup(
@@ -2440,6 +2466,8 @@ class CanonicalModelRunner:
                                 ),
                                 next_mtp_position=compact_next_positions,
                                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                                mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                                mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                             )
                             _record_decode_warmup(
                                 compact_output,
@@ -2461,6 +2489,8 @@ class CanonicalModelRunner:
                             draft_tokens=jnp.zeros((int(batch_size), draft_len), dtype=jnp.int32),
                             next_mtp_position=next_positions,
                             mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                            mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                            mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                         )
                         _record_decode_warmup(
                             fallback_output,
@@ -4672,18 +4702,41 @@ class CanonicalModelRunner:
             current_hidden = hidden_arg
             current_token = token_arg
             current_position = position_arg
+            return_normed_hidden = (
+                getattr(self.config, "mtp_chain_hidden_source", "raw") == "final_normed"
+            )
+            chain_mode = getattr(self.config, "mtp_chain_mode", "recursive")
+            hidden_seq = current_hidden
+            token_seq = current_token
+            position_seq = current_position
             drafts = []
             for _ in range(draft_len):
-                current_token, current_hidden = mtp_forward_token_ids(
-                    hidden_state=current_hidden,
-                    next_token_ids=current_token,
-                    embed_tokens=embed_tokens_arg,
-                    params=mtp_params,
-                    config=self.config,
-                    positions=current_position,
-                )
+                if chain_mode == "sequence":
+                    current_token, current_hidden = mtp_forward_last_token_ids(
+                        hidden_state=hidden_seq,
+                        next_token_ids=token_seq,
+                        embed_tokens=embed_tokens_arg,
+                        params=mtp_params,
+                        config=self.config,
+                        positions=position_seq,
+                        return_normed_hidden=return_normed_hidden,
+                    )
+                else:
+                    current_token, current_hidden = mtp_forward_token_ids(
+                        hidden_state=current_hidden,
+                        next_token_ids=current_token,
+                        embed_tokens=embed_tokens_arg,
+                        params=mtp_params,
+                        config=self.config,
+                        positions=current_position,
+                        return_normed_hidden=return_normed_hidden,
+                    )
                 drafts.append(current_token[:, 0])
                 current_position = current_position + 1
+                if chain_mode == "sequence":
+                    hidden_seq = jnp.concatenate([hidden_seq, current_hidden], axis=1)
+                    token_seq = jnp.concatenate([token_seq, current_token], axis=1)
+                    position_seq = jnp.concatenate([position_seq, current_position], axis=1)
             return jnp.stack(drafts, axis=1)
 
         mtp_params_tree = self._mtp1_params_tree()
@@ -4707,23 +4760,48 @@ class CanonicalModelRunner:
             current_hidden = hidden_arg
             current_token = token_arg
             current_position = position_arg
+            return_normed_hidden = (
+                getattr(self.config, "mtp_chain_hidden_source", "raw") == "final_normed"
+            )
+            chain_mode = getattr(self.config, "mtp_chain_mode", "recursive")
+            hidden_seq = current_hidden
+            token_seq = current_token
+            position_seq = current_position
             drafts = []
             first_margin = None
             for idx in range(draft_len):
-                logits, current_hidden = mtp_forward(
-                    hidden_state=current_hidden,
-                    next_token_ids=current_token,
-                    embed_tokens=embed_tokens_arg,
-                    params=mtp_params,
-                    config=self.config,
-                    positions=current_position,
-                )
+                if chain_mode == "sequence":
+                    logits, current_hidden = mtp_forward_last(
+                        hidden_state=hidden_seq,
+                        next_token_ids=token_seq,
+                        embed_tokens=embed_tokens_arg,
+                        params=mtp_params,
+                        config=self.config,
+                        positions=position_seq,
+                        return_normed_hidden=return_normed_hidden,
+                    )
+                    step_logits = logits[:, 0, :]
+                else:
+                    logits, current_hidden = mtp_forward(
+                        hidden_state=current_hidden,
+                        next_token_ids=current_token,
+                        embed_tokens=embed_tokens_arg,
+                        params=mtp_params,
+                        config=self.config,
+                        positions=current_position,
+                        return_normed_hidden=return_normed_hidden,
+                    )
+                    step_logits = logits[:, 0, :]
                 if idx == 0:
-                    top2, _ = jax.lax.top_k(logits[:, 0].astype(jnp.float32), 2)
+                    top2, _ = jax.lax.top_k(step_logits.astype(jnp.float32), 2)
                     first_margin = top2[:, 0] - top2[:, 1]
-                current_token = jnp.argmax(logits[:, 0], axis=-1).astype(jnp.int32)[:, None]
+                current_token = jnp.argmax(step_logits, axis=-1).astype(jnp.int32)[:, None]
                 drafts.append(current_token[:, 0])
                 current_position = current_position + 1
+                if chain_mode == "sequence":
+                    hidden_seq = jnp.concatenate([hidden_seq, current_hidden], axis=1)
+                    token_seq = jnp.concatenate([token_seq, current_token], axis=1)
+                    position_seq = jnp.concatenate([position_seq, current_position], axis=1)
             if first_margin is None:
                 first_margin = jnp.zeros((hidden_arg.shape[0],), dtype=jnp.float32)
             return jnp.stack(drafts, axis=1), first_margin
@@ -4757,24 +4835,49 @@ class CanonicalModelRunner:
             current_hidden = hidden_arg
             current_token = token_arg
             current_position = position_arg
+            return_normed_hidden = (
+                getattr(self.config, "mtp_chain_hidden_source", "raw") == "final_normed"
+            )
+            chain_mode = getattr(self.config, "mtp_chain_mode", "recursive")
+            hidden_seq = current_hidden
+            token_seq = current_token
+            position_seq = current_position
             drafts = []
             top_ids = []
             top_values = []
             for _idx in range(draft_len):
-                logits, current_hidden = mtp_forward(
-                    hidden_state=current_hidden,
-                    next_token_ids=current_token,
-                    embed_tokens=embed_tokens_arg,
-                    params=mtp_params,
-                    config=self.config,
-                    positions=current_position,
-                )
-                values, ids = jax.lax.top_k(logits[:, 0].astype(jnp.float32), top_k)
-                current_token = jnp.argmax(logits[:, 0], axis=-1).astype(jnp.int32)[:, None]
+                if chain_mode == "sequence":
+                    logits, current_hidden = mtp_forward_last(
+                        hidden_state=hidden_seq,
+                        next_token_ids=token_seq,
+                        embed_tokens=embed_tokens_arg,
+                        params=mtp_params,
+                        config=self.config,
+                        positions=position_seq,
+                        return_normed_hidden=return_normed_hidden,
+                    )
+                    step_logits = logits[:, 0, :]
+                else:
+                    logits, current_hidden = mtp_forward(
+                        hidden_state=current_hidden,
+                        next_token_ids=current_token,
+                        embed_tokens=embed_tokens_arg,
+                        params=mtp_params,
+                        config=self.config,
+                        positions=current_position,
+                        return_normed_hidden=return_normed_hidden,
+                    )
+                    step_logits = logits[:, 0, :]
+                values, ids = jax.lax.top_k(step_logits.astype(jnp.float32), top_k)
+                current_token = jnp.argmax(step_logits, axis=-1).astype(jnp.int32)[:, None]
                 drafts.append(current_token[:, 0])
                 top_ids.append(ids.astype(jnp.int32))
                 top_values.append(values.astype(jnp.float32))
                 current_position = current_position + 1
+                if chain_mode == "sequence":
+                    hidden_seq = jnp.concatenate([hidden_seq, current_hidden], axis=1)
+                    token_seq = jnp.concatenate([token_seq, current_token], axis=1)
+                    position_seq = jnp.concatenate([position_seq, current_position], axis=1)
             return (
                 jnp.stack(drafts, axis=1),
                 jnp.stack(top_ids, axis=1),
@@ -6216,7 +6319,9 @@ class CanonicalModelRunner:
             cache_storage=self.cache_storage,
             hybrid_state=hybrid_state,
             mtp_hidden_final_normed=(self.mtp_hidden_source == "final_normed"),
+            mtp_chain_return_normed=(self.mtp_chain_hidden_source == "final_normed"),
             draft_len=draft_len,
+            mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
         )
         if profile_mtp:
             _block_until_ready_tree(output)
@@ -7352,6 +7457,8 @@ class CanonicalModelRunner:
                 draft_tokens=_verifier_draft_token_chains_device(),
                 next_mtp_position=_next_mtp_positions_device(),
                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
             )
             _ready(output)
             t_profile = _mark("executor_mtp2_commit_select", t_profile)
@@ -7363,6 +7470,8 @@ class CanonicalModelRunner:
                 draft_tokens=_verifier_draft_token_chains_device(),
                 next_mtp_position=_next_mtp_positions_device(),
                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                 burst_groups=mtp_burst_groups,
             )
             _ready(output)
@@ -7377,6 +7486,8 @@ class CanonicalModelRunner:
                 draft_tokens=_verifier_draft_token_chains_device(),
                 next_mtp_position=_next_mtp_positions_device(),
                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
             )
             _ready(output)
             t_profile = _mark("executor_mtp_k_decode", t_profile)

@@ -23,7 +23,12 @@ from nanovllm_jax.model import (
     lm_head_sample_token_ids,
     lm_head_token_ids_and_topk,
 )
-from nanovllm_jax.mtp.mtp_layer import mtp_forward, mtp_forward_token_ids
+from nanovllm_jax.mtp.mtp_layer import (
+    mtp_forward,
+    mtp_forward_last,
+    mtp_forward_last_token_ids,
+    mtp_forward_token_ids,
+)
 
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
@@ -1663,7 +1668,9 @@ class ModelExecutor:
         cache_storage: KVCacheStorage,
         hybrid_state: HybridLayerState,
         mtp_hidden_final_normed: bool,
+        mtp_chain_return_normed: bool,
         draft_len: int,
+        mtp_chain_mode: str = "recursive",
     ) -> ExecutorOutput:
         """Decode one target token and seed a greedy MTP draft chain in one JIT."""
         if batch.is_prefill:
@@ -1684,17 +1691,22 @@ class ModelExecutor:
             "NANO_VLLM_JAX_MTP_CHAIN_LOGIT_DEBUG",
             "0",
         ) in {"1", "true", "yes", "on", "True"}
+        mtp_chain_mode = str(mtp_chain_mode or "recursive").strip().lower()
+        if mtp_chain_mode not in {"recursive", "sequence"}:
+            raise ValueError("mtp_chain_mode must be 'recursive' or 'sequence'")
 
         key = (
             "token-ids-mtp-draft-chain",
             "target-carry-v2",
             draft_len,
+            mtp_chain_mode,
             tuple(batch.tokens.shape),
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             tuple(hybrid_state.conv_state.shape),
             tuple(hybrid_state.recurrent_state.shape),
             bool(mtp_hidden_final_normed),
+            bool(mtp_chain_return_normed),
             bool(chain_logit_debug),
         )
         if key not in self._jit_cache:
@@ -1777,35 +1789,68 @@ class ModelExecutor:
                     seq_lens.astype(jnp.int32)
                     + jnp.asarray(int(getattr(self.config, "mtp_position_offset", 0)), dtype=jnp.int32)
                 )[:, None]
+                hidden_seq = current_hidden
+                token_seq = current_token
+                position_seq = current_position
                 draft_tokens = []
                 draft_top_ids = []
                 draft_top_values = []
                 for _ in range(draft_len):
                     if chain_logit_debug:
-                        draft_logits, current_hidden = mtp_forward(
-                            hidden_state=current_hidden,
-                            next_token_ids=current_token,
-                            embed_tokens=params.embed_tokens,
-                            params=params.mtp_params,
-                            config=self.config,
-                            positions=current_position,
-                        )
-                        values, ids = jax.lax.top_k(draft_logits[:, 0].astype(jnp.float32), 5)
-                        mtp_token_ids = jnp.argmax(draft_logits[:, 0], axis=-1).astype(jnp.int32)[:, None]
+                        if mtp_chain_mode == "sequence":
+                            draft_logits, current_hidden = mtp_forward_last(
+                                hidden_state=hidden_seq,
+                                next_token_ids=token_seq,
+                                embed_tokens=params.embed_tokens,
+                                params=params.mtp_params,
+                                config=self.config,
+                                positions=position_seq,
+                                return_normed_hidden=mtp_chain_return_normed,
+                            )
+                            step_logits = draft_logits[:, 0, :]
+                        else:
+                            draft_logits, current_hidden = mtp_forward(
+                                hidden_state=current_hidden,
+                                next_token_ids=current_token,
+                                embed_tokens=params.embed_tokens,
+                                params=params.mtp_params,
+                                config=self.config,
+                                positions=current_position,
+                                return_normed_hidden=mtp_chain_return_normed,
+                            )
+                            step_logits = draft_logits[:, 0, :]
+                        values, ids = jax.lax.top_k(step_logits.astype(jnp.float32), 5)
+                        mtp_token_ids = jnp.argmax(step_logits, axis=-1).astype(jnp.int32)[:, None]
                         draft_top_ids.append(ids.astype(jnp.int32))
                         draft_top_values.append(values.astype(jnp.float32))
                     else:
-                        mtp_token_ids, current_hidden = mtp_forward_token_ids(
-                            hidden_state=current_hidden,
-                            next_token_ids=current_token,
-                            embed_tokens=params.embed_tokens,
-                            params=params.mtp_params,
-                            config=self.config,
-                            positions=current_position,
-                        )
+                        if mtp_chain_mode == "sequence":
+                            mtp_token_ids, current_hidden = mtp_forward_last_token_ids(
+                                hidden_state=hidden_seq,
+                                next_token_ids=token_seq,
+                                embed_tokens=params.embed_tokens,
+                                params=params.mtp_params,
+                                config=self.config,
+                                positions=position_seq,
+                                return_normed_hidden=mtp_chain_return_normed,
+                            )
+                        else:
+                            mtp_token_ids, current_hidden = mtp_forward_token_ids(
+                                hidden_state=current_hidden,
+                                next_token_ids=current_token,
+                                embed_tokens=params.embed_tokens,
+                                params=params.mtp_params,
+                                config=self.config,
+                                positions=current_position,
+                                return_normed_hidden=mtp_chain_return_normed,
+                            )
                     current_token = mtp_token_ids[:, 0].astype(jnp.int32)[:, None]
                     draft_tokens.append(current_token[:, 0])
                     current_position = current_position + 1
+                    if mtp_chain_mode == "sequence":
+                        hidden_seq = jnp.concatenate([hidden_seq, current_hidden], axis=1)
+                        token_seq = jnp.concatenate([token_seq, current_token], axis=1)
+                        position_seq = jnp.concatenate([position_seq, current_position], axis=1)
                 token_rows = jnp.concatenate(
                     [target_token_ids[:, None], jnp.stack(draft_tokens, axis=1)],
                     axis=1,
@@ -7972,6 +8017,8 @@ class ModelExecutor:
         draft_tokens: jnp.ndarray,
         next_mtp_position: jnp.ndarray,
         mtp_hidden_final_normed: bool,
+        mtp_chain_return_normed: bool,
+        mtp_chain_mode: str = "recursive",
     ) -> MTP1GreedyOutput:
         """K=2 greedy MTP verifier with sequential target decodes."""
         if hybrid_state.conv_state is None or hybrid_state.recurrent_state is None:
@@ -7982,13 +8029,18 @@ class ModelExecutor:
             raise ValueError("draft_tokens must have shape [batch, 2]")
         self._log_step("mtp2_commit_select_greedy_step_jit", batch, return_hidden=True, last_logits_only=False)
         self._validate_batch_contract(batch)
+        mtp_chain_mode = str(mtp_chain_mode or "recursive").strip().lower()
+        if mtp_chain_mode not in {"recursive", "sequence"}:
+            raise ValueError("mtp_chain_mode must be 'recursive' or 'sequence'")
 
         key = (
             "mtp2-commit-select-greedy",
+            mtp_chain_mode,
             tuple(batch.tokens.shape),
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
+            bool(mtp_chain_return_normed),
             os.environ.get(
                 "NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY",
                 str(getattr(self.config, "mtp_batch_accept_policy", "rowwise") or "rowwise"),
@@ -8308,19 +8360,38 @@ class ModelExecutor:
                 current_hidden = selected_hidden
                 current_token = selected_next_token[:, None]
                 current_position = selected_mtp_position[:, None]
+                hidden_seq = current_hidden
+                token_seq = current_token
+                position_seq = current_position
                 next_drafts = []
                 for _ in range(2):
-                    mtp_token_ids, current_hidden = mtp_forward_token_ids(
-                        hidden_state=current_hidden,
-                        next_token_ids=current_token,
-                        embed_tokens=params.embed_tokens,
-                        params=params.mtp_params,
-                        config=self.config,
-                        positions=current_position,
-                    )
+                    if mtp_chain_mode == "sequence":
+                        mtp_token_ids, current_hidden = mtp_forward_last_token_ids(
+                            hidden_state=hidden_seq,
+                            next_token_ids=token_seq,
+                            embed_tokens=params.embed_tokens,
+                            params=params.mtp_params,
+                            config=self.config,
+                            positions=position_seq,
+                            return_normed_hidden=mtp_chain_return_normed,
+                        )
+                    else:
+                        mtp_token_ids, current_hidden = mtp_forward_token_ids(
+                            hidden_state=current_hidden,
+                            next_token_ids=current_token,
+                            embed_tokens=params.embed_tokens,
+                            params=params.mtp_params,
+                            config=self.config,
+                            positions=current_position,
+                            return_normed_hidden=mtp_chain_return_normed,
+                        )
                     current_token = mtp_token_ids[:, 0].astype(jnp.int32)[:, None]
                     next_drafts.append(current_token[:, 0])
                     current_position = current_position + 1
+                    if mtp_chain_mode == "sequence":
+                        hidden_seq = jnp.concatenate([hidden_seq, current_hidden], axis=1)
+                        token_seq = jnp.concatenate([token_seq, current_token], axis=1)
+                        position_seq = jnp.concatenate([position_seq, current_position], axis=1)
                 next_draft_tokens = jnp.stack(next_drafts, axis=1)
 
                 selected_conv = _select3(
@@ -8415,6 +8486,8 @@ class ModelExecutor:
         draft_tokens: jnp.ndarray,
         next_mtp_position: jnp.ndarray,
         mtp_hidden_final_normed: bool,
+        mtp_chain_return_normed: bool = False,
+        mtp_chain_mode: str = "recursive",
     ) -> MTP1GreedyOutput:
         """Greedy speculative verifier for a fixed-length MTP draft chain.
 
@@ -8457,15 +8530,20 @@ class ModelExecutor:
             "NANO_VLLM_JAX_MTP_K_LOGIT_DEBUG",
             "0",
         ) in {"1", "true", "yes", "on", "True"}
+        mtp_chain_mode = str(mtp_chain_mode or "recursive").strip().lower()
+        if mtp_chain_mode not in {"recursive", "sequence"}:
+            raise ValueError("mtp_chain_mode must be 'recursive' or 'sequence'")
 
         key = (
             "mtp-k-decode-greedy-prefix-select",
             verify_mode,
             draft_len,
+            mtp_chain_mode,
             tuple(batch.tokens.shape),
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
+            bool(mtp_chain_return_normed),
             bool(carry_bonus_as_draft),
             bool(logit_debug_enabled),
             batch_accept_policy,
@@ -8638,20 +8716,39 @@ class ModelExecutor:
                 current_hidden = selected_hidden_for_mtp
                 current_token = selected_next_token[:, None]
                 current_position = selected_mtp_position[:, None]
+                hidden_seq = current_hidden
+                token_seq = current_token
+                position_seq = current_position
                 next_drafts = [selected_next_token] if carry_bonus_as_draft else []
                 mtp_drafts_to_generate = draft_len - 1 if carry_bonus_as_draft else draft_len
                 for _ in range(mtp_drafts_to_generate):
-                    mtp_token_ids, current_hidden = mtp_forward_token_ids(
-                        hidden_state=current_hidden,
-                        next_token_ids=current_token,
-                        embed_tokens=params.embed_tokens,
-                        params=params.mtp_params,
-                        config=self.config,
-                        positions=current_position,
-                    )
+                    if mtp_chain_mode == "sequence":
+                        mtp_token_ids, current_hidden = mtp_forward_last_token_ids(
+                            hidden_state=hidden_seq,
+                            next_token_ids=token_seq,
+                            embed_tokens=params.embed_tokens,
+                            params=params.mtp_params,
+                            config=self.config,
+                            positions=position_seq,
+                            return_normed_hidden=mtp_chain_return_normed,
+                        )
+                    else:
+                        mtp_token_ids, current_hidden = mtp_forward_token_ids(
+                            hidden_state=current_hidden,
+                            next_token_ids=current_token,
+                            embed_tokens=params.embed_tokens,
+                            params=params.mtp_params,
+                            config=self.config,
+                            positions=current_position,
+                            return_normed_hidden=mtp_chain_return_normed,
+                        )
                     current_token = mtp_token_ids[:, 0].astype(jnp.int32)[:, None]
                     next_drafts.append(current_token[:, 0])
                     current_position = current_position + 1
+                    if mtp_chain_mode == "sequence":
+                        hidden_seq = jnp.concatenate([hidden_seq, current_hidden], axis=1)
+                        token_seq = jnp.concatenate([token_seq, current_token], axis=1)
+                        position_seq = jnp.concatenate([position_seq, current_position], axis=1)
                 next_draft_tokens = jnp.stack(next_drafts, axis=1)
                 selected_conv = (
                     _gather_prefix(prefix_hybrid_state.conv_state, prefix_len)
@@ -8828,6 +8925,8 @@ class ModelExecutor:
         draft_tokens: jnp.ndarray,
         next_mtp_position: jnp.ndarray,
         mtp_hidden_final_normed: bool,
+        mtp_chain_return_normed: bool,
+        mtp_chain_mode: str = "recursive",
         burst_groups: int,
     ) -> MTP1GreedyOutput:
         """Run several greedy MTP verifier groups before returning to Python.
@@ -8855,6 +8954,8 @@ class ModelExecutor:
                 draft_tokens=draft_tokens,
                 next_mtp_position=next_mtp_position,
                 mtp_hidden_final_normed=mtp_hidden_final_normed,
+                mtp_chain_return_normed=mtp_chain_return_normed,
+                mtp_chain_mode=mtp_chain_mode,
             )
         self._log_step("mtp_k_burst_greedy_step_jit", batch, return_hidden=True, last_logits_only=False)
         self._validate_batch_contract(batch)
@@ -8872,16 +8973,21 @@ class ModelExecutor:
             "NANO_VLLM_JAX_MTP_K_LOGIT_DEBUG",
             "0",
         ) in {"1", "true", "yes", "on", "True"}
+        mtp_chain_mode = str(mtp_chain_mode or "recursive").strip().lower()
+        if mtp_chain_mode not in {"recursive", "sequence"}:
+            raise ValueError("mtp_chain_mode must be 'recursive' or 'sequence'")
 
         key = (
             "mtp-k-burst-greedy-compact-lm-head",
             verify_mode,
             draft_len,
             burst_groups,
+            mtp_chain_mode,
             tuple(batch.tokens.shape),
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
+            bool(mtp_chain_return_normed),
             bool(logit_debug_enabled),
         )
         if key not in self._jit_cache:
@@ -9054,30 +9160,60 @@ class ModelExecutor:
                         )
                         debug_token_current = current_tokens
                         debug_position_current = current_positions
+                        debug_hidden_seq = debug_hidden_current
+                        debug_token_seq = debug_token_current
+                        debug_position_seq = debug_position_current
                         draft_top_ids = []
                         draft_top_values = []
                         draft_debug_tokens = []
                         for _debug_idx in range(draft_len):
-                            draft_logits, debug_hidden_current = mtp_forward(
-                                hidden_state=debug_hidden_current,
-                                next_token_ids=debug_token_current,
-                                embed_tokens=params.embed_tokens,
-                                params=params.mtp_params,
-                                config=self.config,
-                                positions=debug_position_current,
-                            )
+                            if mtp_chain_mode == "sequence":
+                                draft_logits, debug_hidden_current = mtp_forward_last(
+                                    hidden_state=debug_hidden_seq,
+                                    next_token_ids=debug_token_seq,
+                                    embed_tokens=params.embed_tokens,
+                                    params=params.mtp_params,
+                                    config=self.config,
+                                    positions=debug_position_seq,
+                                    return_normed_hidden=mtp_chain_return_normed,
+                                )
+                                step_logits = draft_logits[:, 0, :]
+                            else:
+                                draft_logits, debug_hidden_current = mtp_forward(
+                                    hidden_state=debug_hidden_current,
+                                    next_token_ids=debug_token_current,
+                                    embed_tokens=params.embed_tokens,
+                                    params=params.mtp_params,
+                                    config=self.config,
+                                    positions=debug_position_current,
+                                    return_normed_hidden=mtp_chain_return_normed,
+                                )
+                                step_logits = draft_logits[:, 0, :]
                             top_values, top_ids = jax.lax.top_k(
-                                draft_logits[:, 0].astype(jnp.float32),
+                                step_logits.astype(jnp.float32),
                                 5,
                             )
                             debug_token_current = jnp.argmax(
-                                draft_logits[:, 0],
+                                step_logits,
                                 axis=-1,
                             ).astype(jnp.int32)[:, None]
                             draft_top_ids.append(top_ids.astype(jnp.int32))
                             draft_top_values.append(top_values.astype(jnp.float32))
                             draft_debug_tokens.append(debug_token_current[:, 0])
                             debug_position_current = debug_position_current + 1
+                            if mtp_chain_mode == "sequence":
+                                debug_hidden_seq = jnp.concatenate(
+                                    [debug_hidden_seq, debug_hidden_current],
+                                    axis=1,
+                                )
+                                debug_token_seq = jnp.concatenate(
+                                    [debug_token_seq, debug_token_current],
+                                    axis=1,
+                                )
+                                debug_position_seq = jnp.concatenate(
+                                    [debug_position_seq, debug_position_current],
+                                    axis=1,
+                                )
                         debug_draft_top_ids_groups.append(
                             jnp.stack(draft_top_ids, axis=1)
                         )
@@ -9124,18 +9260,46 @@ class ModelExecutor:
                     mtp_position_current = (
                         current_next_mtp_position - (draft_len - prefix_len)
                     )[:, None]
+                    mtp_hidden_seq = mtp_hidden_current
+                    mtp_token_seq = mtp_token_current
+                    mtp_position_seq = mtp_position_current
                     for _draft_idx in range(draft_len):
-                        mtp_token_ids, mtp_hidden_current = mtp_forward_token_ids(
-                            hidden_state=mtp_hidden_current,
-                            next_token_ids=mtp_token_current,
-                            embed_tokens=params.embed_tokens,
-                            params=params.mtp_params,
-                            config=self.config,
-                            positions=mtp_position_current,
-                        )
+                        if mtp_chain_mode == "sequence":
+                            mtp_token_ids, mtp_hidden_current = mtp_forward_last_token_ids(
+                                hidden_state=mtp_hidden_seq,
+                                next_token_ids=mtp_token_seq,
+                                embed_tokens=params.embed_tokens,
+                                params=params.mtp_params,
+                                config=self.config,
+                                positions=mtp_position_seq,
+                                return_normed_hidden=mtp_chain_return_normed,
+                            )
+                        else:
+                            mtp_token_ids, mtp_hidden_current = mtp_forward_token_ids(
+                                hidden_state=mtp_hidden_current,
+                                next_token_ids=mtp_token_current,
+                                embed_tokens=params.embed_tokens,
+                                params=params.mtp_params,
+                                config=self.config,
+                                positions=mtp_position_current,
+                                return_normed_hidden=mtp_chain_return_normed,
+                            )
                         mtp_token_current = mtp_token_ids[:, 0].astype(jnp.int32)[:, None]
                         mtp_drafts.append(mtp_token_current[:, 0])
                         mtp_position_current = mtp_position_current + 1
+                        if mtp_chain_mode == "sequence":
+                            mtp_hidden_seq = jnp.concatenate(
+                                [mtp_hidden_seq, mtp_hidden_current],
+                                axis=1,
+                            )
+                            mtp_token_seq = jnp.concatenate(
+                                [mtp_token_seq, mtp_token_current],
+                                axis=1,
+                            )
+                            mtp_position_seq = jnp.concatenate(
+                                [mtp_position_seq, mtp_position_current],
+                                axis=1,
+                            )
                     next_draft_tokens = jnp.stack(mtp_drafts, axis=1)
 
                     emit_columns = jnp.arange(draft_len + 1, dtype=jnp.int32)[None, :]

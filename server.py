@@ -70,6 +70,8 @@ _ENGINE_CLI_FIELDS = (
     "mtp_batch_accept_policy",
     "mtp_seed_after_bonus",
     "mtp_hidden_source",
+    "mtp_chain_hidden_source",
+    "mtp_chain_mode",
     "mtp_lm_head_greedy_top1_impl",
     "num_speculative_tokens",
     "mtp_burst_groups",
@@ -631,6 +633,8 @@ def main():
     parser.add_argument("--mtp-batch-accept-policy", choices=["rowwise", "all_or_none"], default=cfg.engine["mtp_batch_accept_policy"])
     parser.add_argument("--mtp-seed-after-bonus", action=argparse.BooleanOptionalAction, default=cfg.engine["mtp_seed_after_bonus"])
     parser.add_argument("--mtp-hidden-source", choices=["pre_norm", "final_normed"], default=cfg.engine["mtp_hidden_source"])
+    parser.add_argument("--mtp-chain-hidden-source", choices=["raw", "final_normed"], default=cfg.engine["mtp_chain_hidden_source"])
+    parser.add_argument("--mtp-chain-mode", choices=["recursive", "sequence"], default=cfg.engine["mtp_chain_mode"])
     parser.add_argument("--mtp-lm-head-greedy-top1-impl", default=cfg.engine["mtp_lm_head_greedy_top1_impl"])
     parser.add_argument("--num-speculative-tokens", type=int, choices=list(range(0, 9)), default=cfg.engine["num_speculative_tokens"])
     parser.add_argument("--mtp-burst-groups", type=int, default=cfg.engine["mtp_burst_groups"])

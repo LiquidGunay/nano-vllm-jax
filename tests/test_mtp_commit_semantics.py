@@ -133,6 +133,8 @@ class _FakeExecutor:
         draft_tokens,
         next_mtp_position,
         mtp_hidden_final_normed,
+        mtp_chain_return_normed=False,
+        mtp_chain_mode="recursive",
     ):
         self.calls.append(
             {
@@ -268,6 +270,8 @@ class _FakeExecutor:
         draft_tokens,
         next_mtp_position,
         mtp_hidden_final_normed,
+        mtp_chain_return_normed=False,
+        mtp_chain_mode="recursive",
     ):
         self.calls.append(
             {
@@ -362,7 +366,9 @@ class _FakeExecutor:
         cache_storage,
         hybrid_state,
         mtp_hidden_final_normed,
+        mtp_chain_return_normed=False,
         draft_len,
+        mtp_chain_mode="recursive",
     ):
         self.calls.append(
             {
@@ -404,6 +410,8 @@ class _FakeExecutor:
         draft_tokens,
         next_mtp_position,
         mtp_hidden_final_normed,
+        mtp_chain_return_normed=False,
+        mtp_chain_mode="recursive",
         burst_groups,
     ):
         self.calls.append(
@@ -703,6 +711,7 @@ class _FakeRunner:
         self.num_speculative_tokens = num_speculative_tokens
         self.mtp_position_offset = 0
         self.mtp_hidden_source = "final_normed"
+        self.mtp_chain_hidden_source = "raw"
         self.mtp_token_source = "generated"
         self.mtp_verifier_impl = "two_decode"
         self.mtp_batch_accept_policy = "rowwise"

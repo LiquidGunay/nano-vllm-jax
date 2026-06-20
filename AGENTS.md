@@ -216,6 +216,15 @@
   stayed exact against no-MTP on that same non-boundary smoke while no-MTP
   reached `77.34 output tok/s`. Do not promote packed-prefill verification
   until verifier logits/acceptance match decode verifier under the same inputs.
+  A later 2026-06-20 K=2 chain-input pass found a real draft-quality issue:
+  `mtp_chain_hidden_source=final_normed` plus `mtp_chain_mode=sequence`
+  improved second-position acceptance and stayed exact, but did not produce a
+  speed path. The best exact checkpoint was K=2 `commit_select` with
+  final-normed sequence drafts: B=2 len-64 reached `70.31 output tok/s` versus
+  `361.05` no-MTP, and adaptive admission disabled the bucket after measuring
+  speculative `14.9 ms/token` versus baseline `2.1 ms/token`. Do not retry raw
+  recursive K=2/K=3 chain variants as speed paths; the remaining blocker is the
+  verifier boundary cost, not the next-position draft input.
 - Keep these work items in order: accepted FA/FLA policy validation, broader
   resident/scheduler decode metadata reduction, coarse GDN decode/prefill
   kernels, and model-family-general batched GEMM/fusion improvements.

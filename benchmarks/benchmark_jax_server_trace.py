@@ -70,6 +70,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mtp-bonus-margin", type=float, default=0.0)
     parser.add_argument("--mtp-draft-margin", type=float, default=0.0)
     parser.add_argument("--mtp-hidden-source", choices=["pre_norm", "final_normed"], default="pre_norm")
+    parser.add_argument("--mtp-chain-hidden-source", choices=["raw", "final_normed"], default="raw")
+    parser.add_argument("--mtp-chain-mode", choices=["recursive", "sequence"], default="recursive")
     parser.add_argument("--mtp-token-source", choices=["generated", "current"], default="generated")
     parser.add_argument("--mtp-position-offset", type=int, default=0)
     parser.add_argument("--mtp-lm-head-greedy-top1-impl", default="jax")
@@ -492,6 +494,8 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "mtp_bonus_margin": args.mtp_bonus_margin,
         "mtp_draft_margin": args.mtp_draft_margin,
         "mtp_hidden_source": args.mtp_hidden_source,
+        "mtp_chain_hidden_source": args.mtp_chain_hidden_source,
+        "mtp_chain_mode": args.mtp_chain_mode,
         "mtp_token_source": args.mtp_token_source,
         "mtp_position_offset": args.mtp_position_offset,
         "mtp_lm_head_greedy_top1_impl": args.mtp_lm_head_greedy_top1_impl,
@@ -749,6 +753,8 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "mtp_bonus_margin": float(engine.config.mtp_bonus_margin),
             "mtp_draft_margin": float(engine.config.mtp_draft_margin),
             "mtp_hidden_source": str(engine.config.mtp_hidden_source),
+            "mtp_chain_hidden_source": str(engine.config.mtp_chain_hidden_source),
+            "mtp_chain_mode": str(engine.config.mtp_chain_mode),
             "mtp_token_source": str(engine.config.mtp_token_source),
             "mtp_position_offset": int(engine.config.mtp_position_offset),
             "mtp_lm_head_greedy_top1_impl": str(engine.config.mtp_lm_head_greedy_top1_impl),

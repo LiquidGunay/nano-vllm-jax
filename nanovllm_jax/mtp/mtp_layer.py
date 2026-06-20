@@ -251,6 +251,7 @@ def mtp_forward(
     params: MTPParams,
     config: Qwen3_5Config,
     positions: Optional[jnp.ndarray] = None,
+    return_normed_hidden: bool = False,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """MTP forward pass to generate draft logits.
 
@@ -282,7 +283,7 @@ def mtp_forward(
     output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
     logits = jnp.dot(x_normed, output_weight)
 
-    return logits, x
+    return logits, x_normed if return_normed_hidden else x
 
 
 def mtp_forward_token_ids(
@@ -292,6 +293,7 @@ def mtp_forward_token_ids(
     params: MTPParams,
     config: Qwen3_5Config,
     positions: Optional[jnp.ndarray] = None,
+    return_normed_hidden: bool = False,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """MTP forward pass for greedy draft token ids without materializing logits."""
     x_normed, x = _mtp_forward_hidden(
@@ -305,7 +307,57 @@ def mtp_forward_token_ids(
     output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
     x_normed = x_normed.astype(_mtp_decode_activation_dtype(config))
     token_ids = _mtp_greedy_top1_token_ids(x_normed, output_weight, config)
-    return token_ids, x
+    return token_ids, x_normed if return_normed_hidden else x
+
+
+def mtp_forward_last(
+    hidden_state: jnp.ndarray,
+    next_token_ids: jnp.ndarray,
+    embed_tokens: jnp.ndarray,
+    params: MTPParams,
+    config: Qwen3_5Config,
+    positions: Optional[jnp.ndarray] = None,
+    return_normed_hidden: bool = False,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """MTP logits and chain hidden for the final position only."""
+    x_normed, x = _mtp_forward_hidden(
+        hidden_state=hidden_state,
+        next_token_ids=next_token_ids,
+        embed_tokens=embed_tokens,
+        params=params,
+        config=config,
+        positions=positions,
+    )
+    output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
+    last_normed = x_normed[:, -1:, :]
+    logits = jnp.dot(last_normed, output_weight)
+    chain_hidden = x_normed if return_normed_hidden else x
+    return logits, chain_hidden[:, -1:, :]
+
+
+def mtp_forward_last_token_ids(
+    hidden_state: jnp.ndarray,
+    next_token_ids: jnp.ndarray,
+    embed_tokens: jnp.ndarray,
+    params: MTPParams,
+    config: Qwen3_5Config,
+    positions: Optional[jnp.ndarray] = None,
+    return_normed_hidden: bool = False,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Greedy MTP token IDs and chain hidden for the final position only."""
+    x_normed, x = _mtp_forward_hidden(
+        hidden_state=hidden_state,
+        next_token_ids=next_token_ids,
+        embed_tokens=embed_tokens,
+        params=params,
+        config=config,
+        positions=positions,
+    )
+    output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
+    last_normed = x_normed[:, -1:, :].astype(_mtp_decode_activation_dtype(config))
+    token_ids = _mtp_greedy_top1_token_ids(last_normed, output_weight, config)
+    chain_hidden = x_normed if return_normed_hidden else x
+    return token_ids, chain_hidden[:, -1:, :]
 
 
 def mtp_layer_forward(
