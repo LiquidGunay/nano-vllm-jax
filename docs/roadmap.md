@@ -31,6 +31,29 @@ This roadmap is grouped by work type. It is not a production-readiness claim.
 
 ## Optimization
 
+- Active MTP implementation target: promote the true K-token verifier as the
+  next speculative path. K=2 now has an exact strict B=2 smoke with compact-tail
+  row mapping fixed, while K=3 is covered only by focused runner semantics.
+  Do not spend GPU time on K=3 until K=2 draft-position quality improves. Do
+  not rely on `NANO_VLLM_JAX_MTP_FORCE_GENERIC_K`; the server config must
+  select `mtp_verifier_impl=k_decode` and `num_speculative_tokens>1`.
+- True-K verifier contract: draft `[d1..dK]` on device, verify
+  `[current, d1..dK]` in one target pass, compute longest accepted prefix on
+  device, select KV/GDN state at that prefix, emit accepted drafts plus one
+  target recovery/bonus token, seed the next draft chain on device, and return
+  only compact per-row commit metadata to Python.
+- Validation order for the promoted true-K route: K=1 equivalence, K=2 B=1
+  exact greedy parity, B=2 same-length, B=2 heterogeneous, then only proceed to
+  K=3, hetero8, and random-large B=8 after K=2 has evidence that second draft
+  positions are worth verifying. Any failed exact greedy run is a blocker for
+  speed claims.
+- Latest K=2 smoke diagnosis: exact generated-token parity holds against the
+  no-MTP reference with zero measured-phase JIT growth, but K=2 is slower than
+  K=1 and no-MTP. On the B=2 synthetic smoke, K=2 forced true-K reached `22.16
+  output tok/s` versus `100.63` no-MTP; K=1 reached `43.41`. Logit debug showed
+  draft position 0 target in MTP top-5 for `6/6` verifier events, but draft
+  position 1 target in top-5 for `0/6`. Position offsets `-1` and `+1` did not
+  change acceptance, so this is not a simple off-by-one positional bug.
 - Reduce host synchronization in token materialization and MTP accounting.
 - K=1 burst MTP accounting now uses compact device-side emitted-token output
   and per-row summary metadata; continue reducing verifier work rather than

@@ -83,7 +83,7 @@ The local chat UI uses the EOS-compatible mode by default.
 - Server-side chat template support and EOS termination.
 - Local browser chat UI showing TTFT and tokens/sec after each response.
 - Optional optimized kernel routes in the promoted config: FlashInfer paged full-attention decode, Triton packed full-attention prefill, Triton/FLA GDN prefill, Triton greedy LM-head top-1, BF16 decode projection paths, and accepted compact prefill routes.
-- Experimental MTP-1 speculative decoding kept separate in [configs/server/mtp_experimental.yaml](configs/server/mtp_experimental.yaml). It keeps target-model verification enabled and unverified draft append disabled.
+- Experimental true-K MTP speculative decoding kept separate in [configs/server/mtp_experimental.yaml](configs/server/mtp_experimental.yaml). It keeps target-model verification enabled and unverified draft append disabled.
 - Benchmark and profiling harnesses for JAX server traces, vLLM comparison, random workloads, and optimization log summaries.
 
 ## Benchmark Snapshot

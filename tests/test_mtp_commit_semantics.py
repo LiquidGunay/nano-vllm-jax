@@ -288,20 +288,58 @@ class _FakeExecutor:
             (-1, 1, 1, 1)
         )
         width = int(draft_tokens.shape[1])
+        target_rows = [
+            self._row_values(self.target, row, width)
+            for row in output_rows
+        ]
+        accepted_rows = [
+            [bool(value) for value in self._row_values(self.accepted, row, width)]
+            for row in output_rows
+        ]
+        emitted_rows = []
+        emitted_count_rows = []
+        accepted_count_rows = []
+        draft_token_rows = draft_tokens.tolist()
+        for row_idx, (row, target_values, accepted_values) in enumerate(
+            zip(output_rows, target_rows, accepted_rows)
+        ):
+            accepted_count = 0
+            for value in accepted_values:
+                if not value:
+                    break
+                accepted_count += 1
+            draft_values = self._row_values(draft_token_rows, row_idx, width)
+            row_emitted = []
+            for pos in range(width + 1):
+                if pos < accepted_count:
+                    row_emitted.append(draft_values[pos])
+                elif pos == accepted_count:
+                    if accepted_count == width:
+                        row_emitted.append(int(self.bonus[row]))
+                    else:
+                        row_emitted.append(target_values[pos])
+                else:
+                    row_emitted.append(0)
+            emitted_rows.append(row_emitted)
+            emitted_count_rows.append(accepted_count + 1)
+            accepted_count_rows.append(accepted_count)
+        emitted_tokens = jnp.array(emitted_rows, dtype=jnp.int32).reshape(
+            (len(output_rows), 1, width + 1)
+        )
+        emitted_counts = jnp.array(emitted_count_rows, dtype=jnp.int32).reshape(
+            (len(output_rows), 1)
+        )
+        accepted_counts = jnp.array(accepted_count_rows, dtype=jnp.int32).reshape(
+            (len(output_rows), 1)
+        )
         return MTP1GreedyOutput(
-            target_token=jnp.array(
-                [self._row_values(self.target, row, width) for row in output_rows],
-                dtype=jnp.int32,
-            ),
+            target_token=jnp.array(target_rows, dtype=jnp.int32),
             bonus_token=jnp.array([self.bonus[row] for row in output_rows], dtype=jnp.int32),
             next_draft_token=jnp.array(
                 [self._row_values(self.next_draft, row, width) for row in output_rows],
                 dtype=jnp.int32,
             ),
-            accepted=jnp.array(
-                [self._row_values(self.accepted, row, width) for row in output_rows],
-                dtype=jnp.bool_,
-            ),
+            accepted=jnp.array(accepted_rows, dtype=jnp.bool_),
             cache_storage=KVCacheStorage(
                 k_cache=jnp.array(self.kv_slots, dtype=jnp.float32),
                 v_cache=jnp.array(self.kv_slots, dtype=jnp.float32) + 100,
@@ -311,6 +349,10 @@ class _FakeExecutor:
                 [self.committed_seq_lens[row] for row in output_rows],
                 dtype=jnp.int32,
             ),
+            emitted_tokens=emitted_tokens,
+            emitted_counts=emitted_counts,
+            accepted_counts=accepted_counts,
+            burst_groups=1,
         )
 
     def forward_step_token_ids_mtp_draft_chain_jit(
@@ -703,6 +745,21 @@ class _FakeRunner:
 
     def _compact_decode_batch(self, batch, rows):
         row_idx = jnp.array(rows, dtype=jnp.int32)
+        seq_ids_host = None
+        if batch.seq_ids_host is not None:
+            seq_ids_host = tuple(int(batch.seq_ids_host[row]) for row in rows)
+        query_lens_host = None
+        if batch.query_lens_host is not None:
+            query_lens_host = tuple(int(batch.query_lens_host[row]) for row in rows)
+        seq_lens_host = None
+        if batch.seq_lens_host is not None:
+            seq_lens_host = tuple(int(batch.seq_lens_host[row]) for row in rows)
+        block_tables_host = None
+        if batch.block_tables_host is not None:
+            block_tables_host = tuple(tuple(batch.block_tables_host[row]) for row in rows)
+        hybrid_slot_ids_host = None
+        if batch.hybrid_slot_ids_host is not None:
+            hybrid_slot_ids_host = tuple(int(batch.hybrid_slot_ids_host[row]) for row in rows)
         return ScheduledBatch(
             tokens=batch.tokens[row_idx],
             positions=batch.positions[row_idx],
@@ -713,6 +770,11 @@ class _FakeRunner:
             num_decode_tokens=len(rows),
             block_tables=batch.block_tables[row_idx],
             seq_lens=batch.seq_lens[row_idx],
+            seq_ids_host=seq_ids_host,
+            query_lens_host=query_lens_host,
+            seq_lens_host=seq_lens_host,
+            block_tables_host=block_tables_host,
+            hybrid_slot_ids_host=hybrid_slot_ids_host,
         )
 
     def _masked_decode_batch(
@@ -799,6 +861,12 @@ class _FakeRunner:
 
     def _record_kv_snapshot(self, batch, hybrid_state=None):
         self.snapshots.append((batch, hybrid_state))
+
+    def _record_resident_committed_seq_lens(self, batch):
+        self.resident_committed_seq_lens = batch.seq_lens
+
+    def _record_resident_committed_seq_lens_host(self, batch, row_to_committed_len):
+        self.resident_committed_seq_lens_host = dict(row_to_committed_len)
 
     def _record_draft_position_acceptance(self, accepted_matrix):
         self.draft_position_acceptance.append(accepted_matrix)
@@ -974,6 +1042,7 @@ def test_seed_then_table_burst_compacts_outputs_and_seeds_next_draft(monkeypatch
     seqs = [_seq(0, seq_lens[0], max_tokens=64, ignore_eos=True)]
 
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "3")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_MULTI_GROUP_BURST", "1")
 
     outputs = ModelRunner._run_mtp1_seed_then_table_burst(
         runner,
@@ -1019,6 +1088,7 @@ def test_run_uses_seed_then_table_burst_for_missing_draft_rows(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "3")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_MULTI_GROUP_BURST", "1")
     monkeypatch.delenv("NANO_VLLM_JAX_MTP_COMMIT_SELECT", raising=False)
 
     outputs = ModelRunner.run(
@@ -1354,9 +1424,10 @@ def test_generic_k_commits_partial_prefix_without_repair(monkeypatch):
         num_speculative_tokens=3,
     )
     seqs = [_seq(i, seq_lens[i]) for i in range(2)]
+    runner.mtp_verifier_impl = "k_decode"
 
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FORCE_GENERIC_K", "1")
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_FORCE_GENERIC_K", raising=False)
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "1")
 
@@ -1367,7 +1438,10 @@ def test_generic_k_commits_partial_prefix_without_repair(monkeypatch):
         [0, 1],
     )
 
-    assert outputs == {0: [10, 101], 1: 201}
+    assert {row: _resolve_output_tokens(value) for row, value in outputs.items()} == {
+        0: [10, 101],
+        1: [201],
+    }
     assert len(runner.executor.calls) == 1
     assert runner.executor.calls[-1]["method"] == "mtp_k_decode"
     assert runner.executor.calls[-1]["draft_tokens"] == [[10, 11, 12], [99, 98, 97]]
@@ -1381,8 +1455,57 @@ def test_generic_k_commits_partial_prefix_without_repair(monkeypatch):
         [True, False, False],
         [False, False, False],
     ]
-    assert runner._mtp1_drafts == {0: [30, 31, 32], 1: [40, 41, 42]}
+    assert _resolve_output_tokens(runner._mtp1_drafts[0]) == [30, 31, 32]
+    assert _resolve_output_tokens(runner._mtp1_drafts[1]) == [40, 41, 42]
     assert runner.stored[-1][0].seq_lens.tolist() == [6, 7]
+
+
+def test_generic_k_compacts_partial_physical_rows(monkeypatch):
+    seq_lens = [5, 7]
+    executor = _FakeExecutor(
+        accepted=[[True, False]],
+        target=[[10, 101]],
+        bonus=[20],
+        next_draft=[[30, 31]],
+        state_marker=[901],
+        committed_seq_lens=[6],
+        kv_slots=[[1000, 1001, 1002]],
+    )
+    runner = _FakeRunner(
+        executor,
+        {1: [10, 11]},
+        block_size=16,
+        num_speculative_tokens=2,
+    )
+    runner.mtp_verifier_impl = "k_decode"
+    seqs = [_seq(i, seq_lens[i]) for i in range(2)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_FORCE_GENERIC_K", raising=False)
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "1")
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_COMPACT_VERIFIER", raising=False)
+
+    outputs = ModelRunner._run_mtp1_batched(
+        runner,
+        seqs,
+        _batch(seq_lens),
+        [1],
+    )
+
+    assert {row: _resolve_output_tokens(value) for row, value in outputs.items()} == {
+        1: [10, 101],
+    }
+    assert runner.executor.calls[-1]["method"] == "mtp_k_decode"
+    assert runner.executor.calls[-1]["batch_size"] == 1
+    assert runner.executor.calls[-1]["draft_tokens"] == [[10, 11]]
+    assert runner.stored[-1][0].seq_lens.tolist() == [6]
+    assert runner.stored[-1][0].seq_ids_host == (1,)
+    assert runner.mtp_output_carry[1] == [seqs[1]]
+    assert {
+        row: _resolve_output_tokens(value)
+        for row, value in runner.mtp_output_carry[2].items()
+    } == {0: [10, 101]}
 
 
 def test_generic_k1_rejected_prefix_seeds_next_draft(monkeypatch):
@@ -1416,7 +1539,9 @@ def test_generic_k1_rejected_prefix_seeds_next_draft(monkeypatch):
         [0],
     )
 
-    assert outputs == {0: 101}
+    assert {row: _resolve_output_tokens(value) for row, value in outputs.items()} == {
+        0: [101],
+    }
     assert runner.executor.calls[-1]["method"] == "mtp_k_decode"
     assert runner.stats == {
         "drafts_proposed": 1,
@@ -1424,7 +1549,7 @@ def test_generic_k1_rejected_prefix_seeds_next_draft(monkeypatch):
         "drafts_rejected": 1,
         "bonus_tokens": 0,
     }
-    assert runner._mtp1_drafts == {0: 301}
+    assert _resolve_output_tokens(runner._mtp1_drafts[0]) == [301]
     assert runner.stored[-1][0].seq_lens.tolist() == [5]
 
 
@@ -1463,11 +1588,14 @@ def test_k1_k_decode_verifier_uses_expanded_boundary_without_env(monkeypatch):
         [0, 1],
     )
 
-    assert outputs == {0: [10, 20], 1: 101}
+    assert {row: _resolve_output_tokens(value) for row, value in outputs.items()} == {
+        0: [10, 20],
+        1: [101],
+    }
     assert runner.executor.calls[-1]["method"] == "mtp_k_decode"
     assert runner.executor.calls[-1]["draft_tokens"] == [[10], [11]]
     assert runner.stats == {
-        "drafts_proposed": 0,
+        "drafts_proposed": 2,
         "drafts_accepted": 1,
         "drafts_rejected": 1,
         "bonus_tokens": 1,
@@ -1604,6 +1732,7 @@ def test_k2_burst_exact_commits_all_groups_and_seeds_next_chain(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FORCE_GENERIC_K", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "3")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_MULTI_GROUP_BURST", "1")
 
     outputs = ModelRunner._run_mtp1_batched(
         runner,
@@ -1652,6 +1781,7 @@ def test_k2_burst_exact_commits_multirow_all_accept(monkeypatch):
 
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "2")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_MULTI_GROUP_BURST", "1")
 
     outputs = ModelRunner._run_mtp1_batched(
         runner,
@@ -1704,6 +1834,7 @@ def test_k1_k_decode_burst_commits_multiple_verified_groups(monkeypatch):
 
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "3")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_MULTI_GROUP_BURST", "1")
 
     outputs = ModelRunner._run_mtp1_batched(
         runner,
@@ -1750,6 +1881,7 @@ def test_k1_k_decode_burst_compact_output_tracks_rejections(monkeypatch):
 
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "3")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_MULTI_GROUP_BURST", "1")
 
     outputs = ModelRunner._run_mtp1_batched(
         runner,
@@ -1803,6 +1935,7 @@ def test_k2_burst_mixed_reject_commits_without_repair(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FORCE_GENERIC_K", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "3")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_MULTI_GROUP_BURST", "1")
 
     outputs = ModelRunner._run_mtp1_batched(
         runner,
@@ -2145,9 +2278,10 @@ def _format_mtp_fast_safe_mismatch(safe_fields, fast_fields):
     return f"fast-vs-safe K=1 rowwise verifier mismatch: {differing}"
 
 
-def test_generic_k_verifier_supports_strict_multitoken_gdn_prefix_state():
+def test_generic_k_verifier_supports_strict_multitoken_gdn_prefix_state(monkeypatch):
     import jax
 
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", raising=False)
     config = _tiny_mtp_verifier_config()
     config.num_speculative_tokens = 3
     config.gdn_disable_fallbacks = True

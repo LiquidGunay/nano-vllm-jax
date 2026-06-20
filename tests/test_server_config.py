@@ -70,6 +70,15 @@ def test_speculative_config_rejects_unimplemented_probabilistic_mtp():
         )
 
 
+def test_speculative_config_rejects_k_gt_1_without_true_k_verifier():
+    with pytest.raises(ValueError, match="K>1 requires mtp_verifier_impl='k_decode'"):
+        Qwen3_5Config(
+            speculative_method="mtp",
+            num_speculative_tokens=2,
+            mtp_verifier_impl="two_decode",
+        )
+
+
 @pytest.mark.parametrize(
     "field",
     ["mtp_unverified_draft_append", "mtp_unverified_fused_append"],
@@ -570,15 +579,18 @@ def test_gpu_optimal_config_is_non_mtp_promoted_path(monkeypatch):
     assert loaded.engine["resident_decode_metadata"] is True
 
 
-def test_mtp_experimental_config_is_exact_and_separate(monkeypatch):
+def test_mtp_experimental_config_is_exact_true_k_and_separate(monkeypatch):
     _clear_config_env(monkeypatch)
 
     loaded = load_server_config(REPO_ROOT / "configs/server/mtp_experimental.yaml")
 
     assert loaded.engine["speculative_method"] == "mtp"
-    assert loaded.engine["num_speculative_tokens"] == 1
+    assert loaded.engine["num_speculative_tokens"] == 2
     assert loaded.engine["draft_sample_method"] == "greedy"
-    assert loaded.engine["mtp_verifier_impl"] == "two_decode"
+    assert loaded.engine["mtp_verifier_impl"] == "k_decode"
     assert loaded.engine["mtp_prefill_seed"] is False
     assert loaded.engine["mtp_unverified_draft_append"] is False
     assert loaded.engine["mtp_unverified_fused_append"] is False
+    assert loaded.engine["gdn_disable_fallbacks"] is True
+    assert loaded.engine["gdn_packed_decode_impl"] == "reference"
+    assert loaded.engine["gdn_packed_decode_qkv_dtype"] == "bf16"

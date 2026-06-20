@@ -4025,6 +4025,7 @@ def gdn_conv_packed_projection_decode_step_bf16_raw_gates(
         jax.ShapeDtypeStruct(conv_state.shape, jnp.float32),
         jax.ShapeDtypeStruct(recurrent_state.shape, jnp.float32),
     )
+    valid_rows = jnp.ones((batch,), dtype=jnp.int32)
     return jt.triton_call(
         packed_proj,
         decay,

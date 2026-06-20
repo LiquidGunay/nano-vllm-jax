@@ -153,10 +153,10 @@
   `mtp_verifier_impl=k_decode`. On the two-request smoke manifest it matched
   the diagnostic acceptance (`11/13`, `84.6%`) with zero measured JIT growth,
   reaching about `28.55-30.41 output tok/s` depending on run variance, still
-  below the no-MTP control (`47.25 output tok/s`). K=1 burst verification now
-  supports `mtp_burst_groups>1`; burst-2 reached `29.83 output tok/s` with the
-  same acceptance and zero JIT growth, so it is only a small host-sync
-  amortization win, not a final speed path. A K=1 logit-debug burst run showed
+  below the no-MTP control (`47.25 output tok/s`). An older K=1 burst
+  experiment tried `mtp_burst_groups>1`; burst-2 reached `29.83 output tok/s`
+  with the same acceptance and zero JIT growth, so it was only a small
+  host-sync amortization win, not a final speed path. A K=1 logit-debug burst run showed
   seed-time MTP top-1 matching verifier top-1 for `5/6` first-group drafts and
   target-in-MTP-top5 for `5/6`; the remaining rejection was a real logit
   disagreement, not a draft bookkeeping bug. A 2026-06-15 follow-up fixed the
@@ -169,6 +169,19 @@
   `k_decode` (`28.97`) and no-MTP (`47.25`). Do not spend more iterations on
   per-token/per-layer GDN kernel swaps for MTP; the remaining verifier blocker
   is the coarse width-2 target-model boundary.
+  On 2026-06-20, non-trace seed-then-table K=1 multi-group burst verification
+  was rejected for correctness. `burst_groups=4` diverged on the two-request
+  synthetic smoke at request 0 token index 14 even after device-token carry,
+  committed seq-len, duplicate carry-recording, and resident host-len fixes
+  (`b2_synthetic16_burst4_resident_host_len_fix.json`). The same workload with
+  `burst_groups=1` is exact, but slow: packed verifier
+  `193.19 decode tok/s` vs no-MTP `410.39` (`0.471x`, `acceptance_rate=0.5`,
+  runner device time `158.07 ms` vs baseline `50.71 ms`), and decode-mode
+  verifier is worse (`164.91 decode tok/s`, `0.398x`, runner device time
+  `185.12 ms`, warmup `59.55 s`). Keep `mtp_burst_groups=1` for exact MTP
+  diagnostics. Do not use `burst_groups>1` for MTP speed claims until the
+  multi-group device carry/state boundary is proven exact without trace-step
+  materialization.
   Later on 2026-06-15, the verified K=1 burst boundary was widened: the
   executor now compacts emitted burst tokens on device and returns per-row
   emitted/accepted/rejected/bonus totals plus an acceptance bitmask, so Python

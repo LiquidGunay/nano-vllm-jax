@@ -202,6 +202,12 @@ class Qwen3_5Config:
             mtp_verifier_impl = "k_decode"
         if mtp_verifier_impl not in {"two_decode", "commit_select", "k_decode"}:
             raise ValueError("mtp_verifier_impl must be 'two_decode', 'commit_select', or 'k_decode'")
+        if (
+            speculative_method == "mtp"
+            and num_speculative_tokens > 1
+            and mtp_verifier_impl != "k_decode"
+        ):
+            raise ValueError("MTP K>1 requires mtp_verifier_impl='k_decode'")
         mtp_batch_accept_policy = str(self.mtp_batch_accept_policy or "rowwise").strip().lower()
         if mtp_batch_accept_policy not in {"rowwise", "all_or_none"}:
             raise ValueError("mtp_batch_accept_policy must be 'rowwise' or 'all_or_none'")

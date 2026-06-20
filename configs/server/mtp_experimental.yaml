@@ -1,4 +1,4 @@
-# Experimental exact MTP-1 config.
+# Experimental exact true-K MTP config.
 #
 # This is not a speed-claim path. It keeps target-model verification enabled
 # and exists so MTP work is isolated from the promoted non-MTP server config.
@@ -29,13 +29,13 @@ engine:
   prefix_cache: true
   speculative_method: "mtp"
   draft_sample_method: "greedy"
-  mtp_verifier_impl: "two_decode"
+  mtp_verifier_impl: "k_decode"
   mtp_batch_accept_policy: "rowwise"
   mtp_seed_after_bonus: true
   mtp_hidden_source: "final_normed"
   mtp_lm_head_greedy_top1_impl: "triton"
-  num_speculative_tokens: 1
-  mtp_burst_groups: 2
+  num_speculative_tokens: 2
+  mtp_burst_groups: 1
   mtp_prefill_seed: false
   skip_compile: false
 
@@ -78,13 +78,13 @@ kernels:
     prefill_impl: "triton_packed"
     decode_impl: "reference"
   gdn:
-    disable_fallbacks: false
+    disable_fallbacks: true
     prefill_post_conv_impl: "triton_fla_padded"
     prefill_qkv_dtype: "fp32"
     prefill_post_conv_output_dtype: "fp32"
     prefill_block_dot: true
     packed_decode:
-      impl: "off"
+      impl: "reference"
       qkv_dtype: "bf16"
 
 env: {}

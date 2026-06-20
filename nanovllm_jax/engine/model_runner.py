@@ -2410,6 +2410,43 @@ class CanonicalModelRunner:
                             )
                     if (
                         draft_len > 1
+                        and use_generic_k_warmup
+                        and mtp_burst_groups <= 1
+                        and int(batch_size) > 1
+                        and hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
+                    ):
+                        for compact_rows in range(1, int(batch_size)):
+                            compact_batch = self._compact_decode_batch(
+                                batch,
+                                list(range(compact_rows)),
+                            )
+                            compact_hybrid_state = init_hybrid_state(
+                                self.config,
+                                batch_size=compact_rows,
+                                dtype=self.config.get_dtype(),
+                            )
+                            compact_next_positions = jnp.full(
+                                (compact_rows,),
+                                2,
+                                dtype=jnp.int32,
+                            )
+                            compact_output = self.executor.mtp_k_decode_greedy_step_jit(
+                                compact_batch,
+                                cache_storage=self.cache_storage,
+                                hybrid_state=compact_hybrid_state,
+                                draft_tokens=jnp.zeros(
+                                    (compact_rows, draft_len),
+                                    dtype=jnp.int32,
+                                ),
+                                next_mtp_position=compact_next_positions,
+                                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                            )
+                            _record_decode_warmup(
+                                compact_output,
+                                f"mtp_k_decode_greedy_step_jit:decode-compact-{compact_rows}",
+                            )
+                    if (
+                        draft_len > 1
                         and not warmed_mtp_k_decode
                         and hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
                     ):
@@ -3759,7 +3796,22 @@ class CanonicalModelRunner:
             jnp.asarray(committed_seq_lens, dtype=jnp.int32),
             batch.seq_lens.astype(jnp.int32),
         )
-        return replace(batch, seq_lens=seq_lens)
+        seq_lens_host = batch.seq_lens_host
+        if seq_lens_host is not None:
+            committed_host = np.asarray(jax.device_get(committed_seq_lens), dtype=np.int32).reshape(-1)
+            seq_lens_values = [int(value) for value in seq_lens_host]
+            seq_ids_host = batch.seq_ids_host
+            query_lens_host = batch.query_lens_host
+            for row in range(min(len(seq_lens_values), int(committed_host.shape[0]))):
+                active_host = True
+                if seq_ids_host is not None and row < len(seq_ids_host):
+                    active_host = active_host and int(seq_ids_host[row]) >= 0
+                if query_lens_host is not None and row < len(query_lens_host):
+                    active_host = active_host and int(query_lens_host[row]) > 0
+                if active_host:
+                    seq_lens_values[row] = int(committed_host[row])
+            seq_lens_host = tuple(seq_lens_values)
+        return replace(batch, seq_lens=seq_lens, seq_lens_host=seq_lens_host)
 
     def _compact_decode_batch(
         self,
@@ -3791,6 +3843,20 @@ class CanonicalModelRunner:
         block_tables_host = None
         if batch.block_tables_host is not None:
             block_tables_host = tuple(tuple(batch.block_tables_host[row]) for row in rows)
+        seq_ids_host = None
+        if batch.seq_ids_host is not None:
+            seq_ids_host = tuple(int(batch.seq_ids_host[row]) for row in rows)
+        query_lens_host = None
+        if batch.query_lens_host is not None:
+            query_lens_host = tuple(int(batch.query_lens_host[row]) for row in rows)
+        seq_lens_host = None
+        if seq_len_values is not None:
+            seq_lens_host = tuple(int(value) for value in seq_len_values)
+        elif batch.seq_lens_host is not None:
+            seq_lens_host = tuple(int(batch.seq_lens_host[row]) for row in rows)
+        hybrid_slot_ids_host = None
+        if batch.hybrid_slot_ids_host is not None:
+            hybrid_slot_ids_host = tuple(int(batch.hybrid_slot_ids_host[row]) for row in rows)
 
         compact_size = len(rows)
         return ScheduledBatch(
@@ -3803,7 +3869,11 @@ class CanonicalModelRunner:
             num_decode_tokens=compact_size,
             block_tables=batch.block_tables[row_ids],
             seq_lens=seq_lens,
+            seq_ids_host=seq_ids_host,
+            query_lens_host=query_lens_host,
+            seq_lens_host=seq_lens_host,
             block_tables_host=block_tables_host,
+            hybrid_slot_ids_host=hybrid_slot_ids_host,
         )
 
     def _batch_hybrid_state(self, batch: ScheduledBatch) -> HybridLayerState:
@@ -4245,6 +4315,68 @@ class CanonicalModelRunner:
             conv_state=hybrid_state.conv_state,
             recurrent_state=hybrid_state.recurrent_state,
         )
+
+    def _record_resident_committed_seq_lens(self, batch: ScheduledBatch) -> None:
+        """Mirror committed per-row decode lengths into resident metadata."""
+        if (
+            not bool(getattr(self, "resident_decode_metadata", False))
+            or not hasattr(self, "_resident_seq_lens")
+            or batch.hybrid_slot_ids_host is None
+            or batch.seq_ids_host is None
+            or batch.query_lens_host is None
+        ):
+            return
+        slots: list[int] = []
+        rows: list[int] = []
+        for row, (slot, seq_id, query_len) in enumerate(
+            zip(batch.hybrid_slot_ids_host, batch.seq_ids_host, batch.query_lens_host)
+        ):
+            if int(slot) < 0 or int(seq_id) < 0 or int(query_len) <= 0:
+                continue
+            slots.append(int(slot))
+            rows.append(row)
+        if not slots:
+            return
+        row_ids = jnp.asarray(rows, dtype=jnp.int32)
+        committed_lens = batch.seq_lens.astype(jnp.int32)[row_ids]
+        self._resident_seq_lens = self._scatter_resident_seq_lens(
+            self._resident_seq_lens,
+            self._resident_update_slots_device(slots),
+            committed_lens,
+        )
+
+    def _record_resident_committed_seq_lens_host(
+        self,
+        batch: ScheduledBatch,
+        row_to_committed_len: dict[int, int],
+    ) -> None:
+        """Mirror committed per-row decode lengths into the resident host cache."""
+        if (
+            not row_to_committed_len
+            or not bool(getattr(self, "resident_decode_metadata", False))
+            or not hasattr(self, "_resident_seq_lens_host")
+            or batch.hybrid_slot_ids_host is None
+            or batch.seq_ids_host is None
+            or batch.query_lens_host is None
+        ):
+            return
+        for row, committed_len in row_to_committed_len.items():
+            row = int(row)
+            if (
+                row < 0
+                or row >= len(batch.hybrid_slot_ids_host)
+                or row >= len(batch.seq_ids_host)
+                or row >= len(batch.query_lens_host)
+            ):
+                continue
+            slot = int(batch.hybrid_slot_ids_host[row])
+            if (
+                slot < 0
+                or int(batch.seq_ids_host[row]) < 0
+                or int(batch.query_lens_host[row]) <= 0
+            ):
+                continue
+            self._resident_seq_lens_host[slot] = int(committed_len)
 
     def _step_fn(self, batch: ScheduledBatch):
         execution = getattr(self, "execution", "eager")
@@ -5807,6 +5939,19 @@ class CanonicalModelRunner:
         )
         if configured_burst_groups <= 1:
             return None
+        if os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_MULTI_GROUP_BURST", "0") not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }:
+            raise RuntimeError(
+                "MTP seed-then-table burst_groups>1 is not correctness-safe "
+                "without trace-step materialization; use mtp_burst_groups=1 "
+                "or set NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_MULTI_GROUP_BURST=1 "
+                "for diagnostics only."
+            )
         seed_burst_groups = max(1, configured_burst_groups - 1)
         max_emit_tokens = 1 + 2 * seed_burst_groups
         relax_bonus_boundary = os.environ.get(
@@ -5891,6 +6036,7 @@ class CanonicalModelRunner:
             decode_batch,
             output.committed_seq_lens,
         )
+        self._record_resident_committed_seq_lens(committed_batch)
         self._hybrid_state_table = output.hybrid_state
         self._mark_hybrid_slots_written(list(decode_batch.hybrid_slot_ids_host or ()))
         _mark("install_hybrid_table")
@@ -5933,6 +6079,8 @@ class CanonicalModelRunner:
         stats = self._speculative_stats()
         accepted_matrix: list[list[bool]] = []
         max_seeded_chain = int(os.environ.get("NANO_VLLM_JAX_MTP_MAX_SEEDED_CHAIN", "0") or "0")
+        row_to_committed_len_host: dict[int, int] = {}
+        seq_lens_host = decode_batch.seq_lens_host
         for local_row, row in enumerate(active_rows):
             seq = seqs[row]
             verifier_idx = verifier_index_for_local[local_row]
@@ -5963,6 +6111,10 @@ class CanonicalModelRunner:
                 for group_idx in range(seed_burst_groups)
             )
             outputs[row] = row_outputs
+            if seq_lens_host is not None and verifier_idx < len(seq_lens_host):
+                row_to_committed_len_host[verifier_idx] = (
+                    int(seq_lens_host[verifier_idx]) + emitted_total
+                )
             stats["drafts_proposed"] += seed_burst_groups
             stats["drafts_accepted"] += accepted_total
             stats["drafts_rejected"] += rejected_total
@@ -5991,7 +6143,12 @@ class CanonicalModelRunner:
         self._record_draft_position_acceptance(accepted_matrix)
         if not ModelRunner._device_token_carry_enabled(self):
             outputs = ModelRunner._materialize_device_token_outputs(outputs)
+        self._record_resident_committed_seq_lens_host(
+            committed_batch,
+            row_to_committed_len_host,
+        )
         self._record_mtp_output_token_carry(committed_batch, seqs, outputs)
+        self._mtp_carry_recorded_this_call = True
         _mark("commit")
         return outputs
 
@@ -6656,11 +6813,24 @@ class CanonicalModelRunner:
             return None
         draft_token_chains = [chain[:draft_len] for chain in draft_chains]
         draft_tokens = [chain[0] for chain in draft_token_chains]
+        verifier_impl = str(getattr(self, "mtp_verifier_impl", "two_decode") or "two_decode")
+        force_generic_k_verifier = os.environ.get(
+            "NANO_VLLM_JAX_MTP_FORCE_GENERIC_K",
+            "0",
+        ) in {"1", "true", "yes", "on", "True"}
+        use_generic_k_verifier = (
+            force_generic_k_verifier
+            or verifier_impl in {"k_decode", "generic_k", "expanded"}
+        )
         compact_verifier_enabled = (
             os.environ.get("NANO_VLLM_JAX_MTP_COMPACT_VERIFIER", "1")
             in {"1", "true", "yes", "on", "True"}
         )
-        if use_static_verifier_batch and static_verifier_rows > len(rows):
+        if (
+            use_static_verifier_batch
+            and static_verifier_rows > len(rows)
+            and not (draft_len > 1 and use_generic_k_verifier)
+        ):
             compact_verifier_enabled = False
         use_compact_verifier = (
             partial_physical_batch
@@ -6672,6 +6842,11 @@ class CanonicalModelRunner:
                 or (
                     draft_len == 2
                     and hasattr(self.executor, "mtp2_commit_select_greedy_step_jit")
+                )
+                or (
+                    draft_len > 1
+                    and use_generic_k_verifier
+                    and hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
                 )
             )
         )
@@ -6756,7 +6931,6 @@ class CanonicalModelRunner:
             return verifier_draft_token_chains_device
 
         t_profile = _mark("verifier_inputs_host_setup", t_profile)
-        verifier_impl = str(getattr(self, "mtp_verifier_impl", "two_decode") or "two_decode")
         force_commit_select = (
             os.environ.get(
                 "NANO_VLLM_JAX_MTP_COMMIT_SELECT",
@@ -6817,14 +6991,6 @@ class CanonicalModelRunner:
             os.environ.get("NANO_VLLM_JAX_MTP_ENABLE_ROWWISE_REPAIR", "1")
             in {"1", "true", "yes", "on", "True"}
         )
-        force_generic_k_verifier = os.environ.get(
-            "NANO_VLLM_JAX_MTP_FORCE_GENERIC_K",
-            "0",
-        ) in {"1", "true", "yes", "on", "True"}
-        use_generic_k_verifier = (
-            force_generic_k_verifier
-            or verifier_impl in {"k_decode", "generic_k", "expanded"}
-        )
         use_one_pass_table_k1 = (
             draft_len == 1
             and verifier_impl == "two_decode"
@@ -6871,6 +7037,17 @@ class CanonicalModelRunner:
                 or "1"
             ),
         )
+        if (
+            mtp_burst_groups > 1
+            and os.environ.get("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_MULTI_GROUP_BURST", "0")
+            not in {"1", "true", "yes", "on", "True"}
+        ):
+            raise RuntimeError(
+                "MTP verifier burst_groups>1 is not correctness-safe without "
+                "trace-step materialization; use mtp_burst_groups=1 or set "
+                "NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_MULTI_GROUP_BURST=1 for "
+                "diagnostics only."
+            )
         use_mtp2_commit_select = (
             draft_len == 2
             and mtp_burst_groups <= 1
@@ -7218,6 +7395,7 @@ class CanonicalModelRunner:
                     decode_batch,
                     output.committed_seq_lens,
                 )
+            self._record_resident_committed_seq_lens(committed_batch)
             self._hybrid_state_table = output.hybrid_state
             self._mark_hybrid_slots_written(list(decode_batch.hybrid_slot_ids_host or ()))
             self._record_kv_snapshot(committed_batch, output.hybrid_state)
@@ -7273,6 +7451,7 @@ class CanonicalModelRunner:
                     decode_batch,
                     output.committed_seq_lens,
                 )
+            self._record_resident_committed_seq_lens(committed_batch)
             self._store_batch_hybrid_state(committed_batch, output.hybrid_state)
             self._record_kv_snapshot(committed_batch, output.hybrid_state)
 
@@ -7330,6 +7509,7 @@ class CanonicalModelRunner:
                     decode_batch,
                     output.committed_seq_lens,
                 )
+            self._record_resident_committed_seq_lens(committed_batch)
             self._store_batch_hybrid_state(committed_batch, output.hybrid_state)
             self._record_kv_snapshot(committed_batch, output.hybrid_state)
 
@@ -7415,6 +7595,7 @@ class CanonicalModelRunner:
                 decode_batch,
                 output.committed_seq_lens,
             )
+            self._record_resident_committed_seq_lens(committed_batch)
             if getattr(output, "hybrid_state_is_table", False):
                 self._hybrid_state_table = output.hybrid_state
                 self._mark_hybrid_slots_written(list(decode_batch.hybrid_slot_ids_host or ()))
@@ -7577,6 +7758,8 @@ class CanonicalModelRunner:
             outputs: dict[int, List[int] | int] = {}
             stats = self._speculative_stats()
             max_seeded_chain = int(os.environ.get("NANO_VLLM_JAX_MTP_MAX_SEEDED_CHAIN", "0") or "0")
+            row_to_committed_len_host: dict[int, int] = {}
+            seq_lens_host = decode_batch.seq_lens_host
             for local_row, row in enumerate(rows):
                 row = rows[local_row]
                 seq = seqs[row]
@@ -7644,6 +7827,10 @@ class CanonicalModelRunner:
                         else:
                             bonus_total += 1
                 outputs[row] = row_outputs
+                if seq_lens_host is not None and verifier_idx < len(seq_lens_host):
+                    row_to_committed_len_host[verifier_idx] = (
+                        int(seq_lens_host[verifier_idx]) + emitted_total
+                    )
                 stats["drafts_proposed"] += max(0, (resident_burst_groups - 1) * draft_len)
                 stats["drafts_accepted"] += accepted_total
                 stats["drafts_rejected"] += rejected_total
@@ -7674,7 +7861,25 @@ class CanonicalModelRunner:
                     self._mtp1_seeded_chain.pop(seq.seq_id, None)
             if not ModelRunner._device_token_carry_enabled(self):
                 outputs = ModelRunner._materialize_device_token_outputs(outputs)
-            self._record_mtp_output_token_carry(committed_batch, seqs, outputs)
+            self._record_resident_committed_seq_lens_host(
+                committed_batch,
+                row_to_committed_len_host,
+            )
+            if use_compact_verifier:
+                compact_seqs = [seqs[row] for row in rows]
+                compact_outputs = {
+                    local_row: outputs[row]
+                    for local_row, row in enumerate(rows)
+                    if row in outputs
+                }
+                self._record_mtp_output_token_carry(
+                    committed_batch,
+                    compact_seqs,
+                    compact_outputs,
+                )
+            else:
+                self._record_mtp_output_token_carry(committed_batch, seqs, outputs)
+            self._mtp_carry_recorded_this_call = True
             t_profile = _mark("resident_burst_commit", t_profile)
             return outputs
 
@@ -7768,6 +7973,7 @@ class CanonicalModelRunner:
                 output.committed_seq_lens,
             )
             self.cache_storage = output.cache_storage
+            self._record_resident_committed_seq_lens(committed_batch)
             self._store_batch_hybrid_state(committed_batch, output.hybrid_state)
             self._record_kv_snapshot(committed_batch, output.hybrid_state)
 
@@ -7852,6 +8058,7 @@ class CanonicalModelRunner:
                 decode_batch,
                 output.committed_seq_lens,
             )
+        self._record_resident_committed_seq_lens(committed_batch)
         self._store_batch_hybrid_state(committed_batch, output.hybrid_state)
         t_profile = _mark("store_hybrid_state", t_profile)
         self._record_kv_snapshot(committed_batch, output.hybrid_state)
@@ -8684,6 +8891,7 @@ class CanonicalModelRunner:
                 and can_seed_for_decode_shape
             )
             if can_run_fused_batch:
+                self._mtp_carry_recorded_this_call = False
                 fused_outputs = self._run_mtp1_batched(
                     seqs,
                     batch,
@@ -8742,15 +8950,16 @@ class CanonicalModelRunner:
                             )
                             for row in unresolved_rows:
                                 outputs[row] = fallback_outputs[row]
-                    self._record_mtp_output_token_carry(
-                        batch,
-                        seqs,
-                        {
-                            row: value
-                            for row, value in enumerate(outputs)
-                            if value is not None
-                        },
-                    )
+                    if not getattr(self, "_mtp_carry_recorded_this_call", False):
+                        self._record_mtp_output_token_carry(
+                            batch,
+                            seqs,
+                            {
+                                row: value
+                                for row, value in enumerate(outputs)
+                                if value is not None
+                            },
+                        )
                     return [outputs[row] for row in range(len(seqs))]  # type: ignore[list-item]
             elif profile_mtp:
                 print(
@@ -8782,6 +8991,7 @@ class CanonicalModelRunner:
             )
             stats = self._speculative_stats()
             if main_seed_mtp1:
+                self._mtp_carry_recorded_this_call = False
                 seed_then_outputs = self._run_mtp1_seed_then_table_burst(
                     seqs,
                     batch,
@@ -8822,15 +9032,16 @@ class CanonicalModelRunner:
                         )
                         for row in unresolved_rows:
                             outputs[row] = fallback_outputs[row]
-                    self._record_mtp_output_token_carry(
-                        batch,
-                        seqs,
-                        {
-                            row: value
-                            for row, value in enumerate(outputs)
-                            if value is not None
-                        },
-                    )
+                    if not getattr(self, "_mtp_carry_recorded_this_call", False):
+                        self._record_mtp_output_token_carry(
+                            batch,
+                            seqs,
+                            {
+                                row: value
+                                for row, value in enumerate(outputs)
+                                if value is not None
+                            },
+                        )
                     return [outputs[row] for row in range(len(seqs))]  # type: ignore[list-item]
                 stats["fallback_seeded_main_steps"] += 1
                 fused_seed_outputs = self._run_main_and_seed_mtp_chain_fused(

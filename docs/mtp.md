@@ -42,14 +42,19 @@ architecture/correctness checkpoint rather than a speed claim.
 
 ## Current GPU caveat
 
-As of 2026-06-11, MTP-1 is an explicit opt-in serving mode rather than an
-environment-only diagnostic. The server config fields are:
+As of 2026-06-20, the active MTP research config targets true K-token
+verification (`mtp_verifier_impl=k_decode`, currently K=2) rather than the old
+repeated K=1 burst route. MTP remains an explicit opt-in serving mode rather
+than an environment-only diagnostic. The server config fields are:
 
 - `speculative_method`: `none` or `mtp`;
-- `num_speculative_tokens`: currently `0` or `1`;
+- `num_speculative_tokens`: `0` for regular serving; K=2 is the current
+  experimental true-K verifier target. K=3 should wait until K=2 has useful
+  second-position draft quality;
 - `draft_sample_method`: currently only `greedy` is implemented for MTP;
-- `mtp_verifier_impl`: `two_decode` for the width-2 target verifier, or
-  `commit_select` for the older exact sequential reference;
+- `mtp_verifier_impl`: `k_decode` for true K-token verification, `two_decode`
+  for the historical width-2 K=1 verifier, or `commit_select` for the older
+  exact sequential K=1 reference;
 - `mtp_batch_accept_policy`: `rowwise` or `all_or_none`;
 - `mtp_seed_after_bonus`: default `false`.
 - `mtp_prefill_seed`: default `false`. Prefill draft seeding is now opt-in
@@ -60,15 +65,19 @@ Legacy configs that set only `num_speculative_tokens=1` are interpreted as
 `speculative_method=mtp` for compatibility. Invalid or unimplemented MTP modes
 fail at startup instead of silently taking a partial speculative path.
 
-The first GPU MTP-1 route is correctness-first:
+The true-K GPU route is correctness-first:
 
 - the target model remains canonical;
 - the scheduler marks admitted speculative rows in `ScheduledBatch`;
 - generic warmup compiles the configured MTP verifier buckets;
+- accept/reject and prefix-state selection happen inside the compiled verifier;
+- Python may drain compact emitted-token metadata after a verifier call, but it
+  must not choose the accepted prefix before the next device commit is valid;
 - `flashinfer_paged` full-attention decode is rejected for `two_decode` because
   the current FlashInfer route is width-1 only;
-- packed GDN decode kernels are also width-1 only for this verifier shape, so
-  the MTP two-decode diagnostic leaves packed GDN decode off;
+- the strict MTP diagnostic path disables GDN fallbacks and uses explicit
+  packed GDN decode `reference` with BF16 QKV rather than silently selecting
+  `off`;
 - `benchmarks/configs/gpu_mtp1_two_decode.json` uses the reference
   full-attention decode backend for the width-2 verifier until a real width-2
   FlashInfer or equivalent verifier exists.
@@ -76,6 +85,30 @@ The first GPU MTP-1 route is correctness-first:
 Do not use the new MTP config as a speed-claim artifact yet. It is the first
 clean GPU implementation target for measuring acceptance, verifier cost, and
 whether a width-2 verifier can beat the current non-speculative kernel path.
+
+## GPU 2026-06-20 true-K status
+
+The exact true-K route now has the first strict B=2 smoke checkpoint:
+
+- `mtp_verifier_impl=k_decode`, `num_speculative_tokens=2`,
+  `mtp_burst_groups=1`, generic warmup, strict GDN no-fallback settings, and
+  compact-tail verifier rows are correctness-clean against the no-MTP reference;
+- compact verifier batches now preserve host seq/slot metadata and record
+  device-token carry with local row ids, fixing the previous tail-row
+  divergence;
+- the forced K=2 smoke is exact and has no measured-phase JIT growth, but is
+  slow: `22.16 output tok/s` versus `100.63` no-MTP on the same B=2 synthetic
+  smoke;
+- forced K=1 on the same route is also exact and faster than K=2, but still
+  loses to no-MTP: `43.41 output tok/s`;
+- K=2 draft quality is the current blocker, not an obvious verifier
+  correctness bug. Logit debug showed position 0 target in MTP top-5 for `6/6`
+  events, but position 1 target in top-5 for `0/6`; offsets `-1` and `+1` did
+  not change acceptance.
+
+Treat K=2/K=3 as research-only until a better draft contract, confidence gate,
+or model head makes the second and later draft positions useful enough to
+amortize the wider verifier.
 
 The current GPU correctness contract is `dtype=float32` with `weight_dtype=bfloat16` for Qwen3.5 real weights. Under that contract:
 

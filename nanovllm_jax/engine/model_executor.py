@@ -4440,21 +4440,32 @@ class ModelExecutor:
                 row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
                 row_valid = (row_query_lens > 0) & (seq_ids >= 0)
                 row_has_draft = row_valid & (draft_token_arg >= 0)
-                verify_query_lens = row_query_lens + row_has_draft.astype(jnp.int32)
+                verify_query_lens = (
+                    jnp.where(row_valid, jnp.full_like(row_query_lens, 2), jnp.zeros_like(row_query_lens))
+                    if not one_pass_decode_mode
+                    else row_query_lens + row_has_draft.astype(jnp.int32)
+                )
                 verify_query_start_loc = jnp.concatenate(
                     [
                         jnp.zeros((1,), dtype=jnp.int32),
                         jnp.cumsum(verify_query_lens),
                     ]
                 )
-                packed_prefill_token_row_ids = (
-                    jnp.zeros_like(verify_positions, dtype=jnp.int32)
-                    if (not one_pass_decode_mode and tokens.shape[0] == 1)
-                    else None
-                )
+                if not one_pass_decode_mode:
+                    packed_width = int(tokens.shape[0]) * int(verify_tokens.shape[1])
+                    packed_prefill_token_row_ids = jnp.broadcast_to(
+                        jnp.arange(tokens.shape[0], dtype=jnp.int32)[:, None],
+                        verify_tokens.shape,
+                    ).reshape((1, packed_width))
+                    verify_model_tokens = verify_tokens.reshape((1, packed_width))
+                    verify_model_positions = verify_positions.reshape((1, packed_width))
+                else:
+                    packed_prefill_token_row_ids = None
+                    verify_model_tokens = verify_tokens
+                    verify_model_positions = verify_positions
                 verify_batch = ScheduledBatch(
-                    tokens=verify_tokens,
-                    positions=verify_positions,
+                    tokens=verify_model_tokens,
+                    positions=verify_model_positions,
                     seq_ids=seq_ids,
                     query_start_loc=verify_query_start_loc,
                     is_prefill=not one_pass_decode_mode,
@@ -4512,6 +4523,8 @@ class ModelExecutor:
                         first_prefix_hybrid_state,
                     ) = forward_result
 
+                if not one_pass_decode_mode:
+                    hidden = hidden.reshape((tokens.shape[0], verify_tokens.shape[1], hidden.shape[-1]))
                 hidden_norm = rms_norm(hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                 token_ids, bonus_topk_values, _ = lm_head_token_ids_and_topk(
                     hidden_norm,
@@ -4627,12 +4640,11 @@ class ModelExecutor:
                 )
 
                 # Slot 0 is the canonical current-token write for every active
-                # row. Rejected draft slots are allowed to remain dirty: they
-                # are not logically committed because committed_seq_lens does
-                # not advance, and the next decode overwrites the same slot.
+                # row. Rejected draft slots are allowed to remain dirty: only
+                # the current token is logically committed on reject, and the
+                # next decode overwrites the draft slot.
                 selected_k_cache = updated_kv_state.k_cache
                 selected_v_cache = updated_kv_state.v_cache
-                committed_seq_lens = seq_lens + accepted.astype(jnp.int32)
                 emitted_tokens = jnp.stack(
                     [
                         jnp.where(row_valid, target_token, jnp.zeros_like(target_token)),
@@ -4645,6 +4657,7 @@ class ModelExecutor:
                     jnp.asarray(1, dtype=jnp.int32) + accepted.astype(jnp.int32),
                     jnp.zeros_like(accepted.astype(jnp.int32)),
                 )[:, None]
+                committed_seq_lens = seq_lens + emitted_counts[:, 0]
                 accepted_counts = accepted.astype(jnp.int32)[:, None]
                 emitted_totals = emitted_counts[:, 0].astype(jnp.int32)
                 accepted_totals = accepted.astype(jnp.int32)
@@ -4847,21 +4860,32 @@ class ModelExecutor:
                 verify_tokens = jnp.concatenate([tokens, draft_token_arg[:, None]], axis=1)
                 verify_positions = jnp.concatenate([positions, positions + 1], axis=1)
                 row_has_draft = row_valid & (draft_token_arg >= 0)
-                verify_query_lens = row_query_lens + row_has_draft.astype(jnp.int32)
+                verify_query_lens = (
+                    jnp.where(row_valid, jnp.full_like(row_query_lens, 2), jnp.zeros_like(row_query_lens))
+                    if not one_pass_decode_mode
+                    else row_query_lens + row_has_draft.astype(jnp.int32)
+                )
                 verify_query_start_loc = jnp.concatenate(
                     [
                         jnp.zeros((1,), dtype=jnp.int32),
                         jnp.cumsum(verify_query_lens),
                     ]
                 )
-                packed_prefill_token_row_ids = (
-                    jnp.zeros_like(verify_positions, dtype=jnp.int32)
-                    if (not one_pass_decode_mode and tokens.shape[0] == 1)
-                    else None
-                )
+                if not one_pass_decode_mode:
+                    packed_width = int(tokens.shape[0]) * int(verify_tokens.shape[1])
+                    packed_prefill_token_row_ids = jnp.broadcast_to(
+                        jnp.arange(tokens.shape[0], dtype=jnp.int32)[:, None],
+                        verify_tokens.shape,
+                    ).reshape((1, packed_width))
+                    verify_model_tokens = verify_tokens.reshape((1, packed_width))
+                    verify_model_positions = verify_positions.reshape((1, packed_width))
+                else:
+                    packed_prefill_token_row_ids = None
+                    verify_model_tokens = verify_tokens
+                    verify_model_positions = verify_positions
                 verify_batch = ScheduledBatch(
-                    tokens=verify_tokens,
-                    positions=verify_positions,
+                    tokens=verify_model_tokens,
+                    positions=verify_model_positions,
                     seq_ids=seq_ids,
                     query_start_loc=verify_query_start_loc,
                     is_prefill=not one_pass_decode_mode,
@@ -4913,6 +4937,8 @@ class ModelExecutor:
                     return_first_prefix_hybrid=True,
                     backend=self.backend,
                 )
+                if not one_pass_decode_mode:
+                    hidden = hidden.reshape((tokens.shape[0], verify_tokens.shape[1], hidden.shape[-1]))
 
                 hidden_norm = rms_norm(hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                 token_ids, bonus_topk_values, _ = lm_head_token_ids_and_topk(
@@ -5020,7 +5046,6 @@ class ModelExecutor:
                     mode="drop",
                 )
 
-                committed_seq_lens = seq_lens + accepted.astype(jnp.int32)
                 emitted_tokens = jnp.stack(
                     [
                         jnp.where(row_valid, target_token, jnp.zeros_like(target_token)),
@@ -5033,6 +5058,7 @@ class ModelExecutor:
                     jnp.asarray(1, dtype=jnp.int32) + accepted.astype(jnp.int32),
                     jnp.zeros_like(accepted.astype(jnp.int32)),
                 )[:, None]
+                committed_seq_lens = seq_lens + emitted_counts[:, 0]
                 accepted_counts = accepted.astype(jnp.int32)[:, None]
                 emitted_totals = emitted_counts[:, 0].astype(jnp.int32)
                 accepted_totals = accepted.astype(jnp.int32)
@@ -5264,21 +5290,36 @@ class ModelExecutor:
                     row_has_draft = current_active & (current_draft_token >= 0)
                     verify_tokens = jnp.concatenate([current_tokens, current_draft_token[:, None]], axis=1)
                     verify_positions = jnp.concatenate([current_positions, current_positions + 1], axis=1)
-                    verify_query_lens = current_active.astype(jnp.int32) + row_has_draft.astype(jnp.int32)
+                    verify_query_lens = (
+                        jnp.where(
+                            current_active,
+                            jnp.full_like(current_active.astype(jnp.int32), 2),
+                            jnp.zeros_like(current_active.astype(jnp.int32)),
+                        )
+                        if not one_pass_decode_mode
+                        else current_active.astype(jnp.int32) + row_has_draft.astype(jnp.int32)
+                    )
                     verify_query_start_loc = jnp.concatenate(
                         [
                             jnp.zeros((1,), dtype=jnp.int32),
                             jnp.cumsum(verify_query_lens),
                         ]
                     )
-                    packed_prefill_token_row_ids = (
-                        jnp.zeros_like(verify_positions, dtype=jnp.int32)
-                        if (not one_pass_decode_mode and tokens.shape[0] == 1)
-                        else None
-                    )
+                    if not one_pass_decode_mode:
+                        packed_width = int(tokens.shape[0]) * int(verify_tokens.shape[1])
+                        packed_prefill_token_row_ids = jnp.broadcast_to(
+                            jnp.arange(tokens.shape[0], dtype=jnp.int32)[:, None],
+                            verify_tokens.shape,
+                        ).reshape((1, packed_width))
+                        verify_model_tokens = verify_tokens.reshape((1, packed_width))
+                        verify_model_positions = verify_positions.reshape((1, packed_width))
+                    else:
+                        packed_prefill_token_row_ids = None
+                        verify_model_tokens = verify_tokens
+                        verify_model_positions = verify_positions
                     verify_batch = ScheduledBatch(
-                        tokens=verify_tokens,
-                        positions=verify_positions,
+                        tokens=verify_model_tokens,
+                        positions=verify_model_positions,
                         seq_ids=jnp.where(
                             current_active,
                             seq_ids,
@@ -5334,6 +5375,8 @@ class ModelExecutor:
                         return_first_prefix_hybrid=True,
                         backend=self.backend,
                     )
+                    if not one_pass_decode_mode:
+                        hidden = hidden.reshape((tokens.shape[0], verify_tokens.shape[1], hidden.shape[-1]))
 
                     hidden_norm = rms_norm(hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                     token_ids, bonus_topk_values, _ = lm_head_token_ids_and_topk(
@@ -5430,8 +5473,17 @@ class ModelExecutor:
                         current_recurrent_state,
                     )
 
-                    next_seq_lens = current_seq_lens + accepted.astype(jnp.int32)
-                    next_active = current_active & (next_draft_token >= 0)
+                    emitted_counts = jnp.where(
+                        current_active,
+                        jnp.asarray(1, dtype=jnp.int32) + accepted.astype(jnp.int32),
+                        jnp.zeros_like(accepted.astype(jnp.int32)),
+                    )
+                    next_seq_lens = current_seq_lens + emitted_counts
+                    # A rejected row has only committed the target token. Stop
+                    # it inside this burst and resume from the next scheduler
+                    # step so rowwise mixed batches keep the same boundary as
+                    # canonical one-token decode.
+                    next_active = current_active & accepted & (next_draft_token >= 0)
                     emitted_tokens = jnp.stack(
                         [
                             jnp.where(current_active, target_token, jnp.zeros_like(target_token)),
@@ -5439,11 +5491,6 @@ class ModelExecutor:
                         ],
                         axis=1,
                     ).astype(jnp.int32)
-                    emitted_counts = jnp.where(
-                        current_active,
-                        jnp.asarray(1, dtype=jnp.int32) + accepted.astype(jnp.int32),
-                        jnp.zeros_like(accepted.astype(jnp.int32)),
-                    )
                     accepted_counts = accepted.astype(jnp.int32)
                     next_carry = (
                         selected_mtp_token[:, None].astype(current_tokens.dtype),
@@ -5753,21 +5800,36 @@ class ModelExecutor:
                     row_has_draft = current_active & (current_draft_token >= 0)
                     verify_tokens = jnp.concatenate([current_tokens, current_draft_token[:, None]], axis=1)
                     verify_positions = jnp.concatenate([current_positions, current_positions + 1], axis=1)
-                    verify_query_lens = current_active.astype(jnp.int32) + row_has_draft.astype(jnp.int32)
+                    verify_query_lens = (
+                        jnp.where(
+                            current_active,
+                            jnp.full_like(current_active.astype(jnp.int32), 2),
+                            jnp.zeros_like(current_active.astype(jnp.int32)),
+                        )
+                        if not one_pass_decode_mode
+                        else current_active.astype(jnp.int32) + row_has_draft.astype(jnp.int32)
+                    )
                     verify_query_start_loc = jnp.concatenate(
                         [
                             jnp.zeros((1,), dtype=jnp.int32),
                             jnp.cumsum(verify_query_lens),
                         ]
                     )
-                    packed_prefill_token_row_ids = (
-                        jnp.zeros_like(verify_positions, dtype=jnp.int32)
-                        if (not one_pass_decode_mode and tokens.shape[0] == 1)
-                        else None
-                    )
+                    if not one_pass_decode_mode:
+                        packed_width = int(tokens.shape[0]) * int(verify_tokens.shape[1])
+                        packed_prefill_token_row_ids = jnp.broadcast_to(
+                            jnp.arange(tokens.shape[0], dtype=jnp.int32)[:, None],
+                            verify_tokens.shape,
+                        ).reshape((1, packed_width))
+                        verify_model_tokens = verify_tokens.reshape((1, packed_width))
+                        verify_model_positions = verify_positions.reshape((1, packed_width))
+                    else:
+                        packed_prefill_token_row_ids = None
+                        verify_model_tokens = verify_tokens
+                        verify_model_positions = verify_positions
                     verify_batch = ScheduledBatch(
-                        tokens=verify_tokens,
-                        positions=verify_positions,
+                        tokens=verify_model_tokens,
+                        positions=verify_model_positions,
                         seq_ids=jnp.where(
                             current_active,
                             seq_ids,
@@ -5823,6 +5885,8 @@ class ModelExecutor:
                         return_first_prefix_hybrid=True,
                         backend=self.backend,
                     )
+                    if not one_pass_decode_mode:
+                        hidden = hidden.reshape((tokens.shape[0], verify_tokens.shape[1], hidden.shape[-1]))
 
                     hidden_norm = rms_norm(hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                     token_ids, bonus_topk_values, _ = lm_head_token_ids_and_topk(
@@ -5916,8 +5980,17 @@ class ModelExecutor:
                         current_recurrent_state,
                     )
 
-                    next_seq_lens = current_seq_lens + accepted.astype(jnp.int32)
-                    next_active = current_active & (next_draft_token >= 0)
+                    emitted_counts = jnp.where(
+                        current_active,
+                        jnp.asarray(1, dtype=jnp.int32) + accepted.astype(jnp.int32),
+                        jnp.zeros_like(accepted.astype(jnp.int32)),
+                    )
+                    next_seq_lens = current_seq_lens + emitted_counts
+                    # A rejected row has only committed the target token. Stop
+                    # it inside this burst and resume from the next scheduler
+                    # step so rowwise mixed batches keep the same boundary as
+                    # canonical one-token decode.
+                    next_active = current_active & accepted & (next_draft_token >= 0)
                     emitted_tokens = jnp.stack(
                         [
                             jnp.where(current_active, target_token, jnp.zeros_like(target_token)),
@@ -5925,11 +5998,6 @@ class ModelExecutor:
                         ],
                         axis=1,
                     ).astype(jnp.int32)
-                    emitted_counts = jnp.where(
-                        current_active,
-                        jnp.asarray(1, dtype=jnp.int32) + accepted.astype(jnp.int32),
-                        jnp.zeros_like(accepted.astype(jnp.int32)),
-                    )
                     accepted_counts = accepted.astype(jnp.int32)
                     next_carry = (
                         selected_mtp_token[:, None].astype(current_tokens.dtype),
@@ -8385,6 +8453,10 @@ class ModelExecutor:
             "NANO_VLLM_JAX_MTP_CARRY_BONUS_AS_DRAFT",
             "0",
         ) in {"1", "true", "yes", "on", "True"}
+        logit_debug_enabled = os.environ.get(
+            "NANO_VLLM_JAX_MTP_K_LOGIT_DEBUG",
+            "0",
+        ) in {"1", "true", "yes", "on", "True"}
 
         key = (
             "mtp-k-decode-greedy-prefix-select",
@@ -8395,6 +8467,7 @@ class ModelExecutor:
             tuple(batch.block_tables.shape),
             bool(mtp_hidden_final_normed),
             bool(carry_bonus_as_draft),
+            bool(logit_debug_enabled),
             batch_accept_policy,
         )
         if key not in self._jit_cache:
@@ -8525,6 +8598,15 @@ class ModelExecutor:
                 ).reshape(hidden_norm.shape[0], hidden_norm.shape[1]).astype(jnp.int32)
                 target_tokens = token_ids[:, :draft_len]
                 bonus_token = token_ids[:, draft_len]
+                if logit_debug_enabled:
+                    verifier_logits = jnp.dot(
+                        hidden_norm[:, :draft_len, :],
+                        output_weight,
+                    ).astype(jnp.float32)
+                    verifier_top_values, verifier_top_ids = jax.lax.top_k(
+                        verifier_logits,
+                        5,
+                    )
                 row_query_lens = jnp.diff(verify_query_start_loc).astype(jnp.int32)
                 row_active = (row_query_lens > 0) & (seq_ids >= 0)
                 raw_accepted = (target_tokens == draft_tokens_arg) & row_active[:, None]
@@ -8634,6 +8716,23 @@ class ModelExecutor:
                         ],
                         axis=1,
                     ).astype(jnp.int32)
+                if logit_debug_enabled:
+                    debug_payload = (
+                        jnp.zeros(
+                            (row_count, 1, draft_len, 5),
+                            dtype=jnp.int32,
+                        ),
+                        jnp.zeros(
+                            (row_count, 1, draft_len, 5),
+                            dtype=jnp.float32,
+                        ),
+                        verifier_top_ids[:, None, :, :].astype(jnp.int32),
+                        verifier_top_values[:, None, :, :].astype(jnp.float32),
+                        draft_tokens_arg[:, None, :].astype(jnp.int32),
+                        target_tokens[:, None, :].astype(jnp.int32),
+                    )
+                else:
+                    debug_payload = None
                 return (
                     target_tokens,
                     bonus_token,
@@ -8653,6 +8752,7 @@ class ModelExecutor:
                     bonus_totals,
                     accepted_bitmask,
                     compact_summary,
+                    debug_payload,
                 )
 
             self._jit_cache[key] = jax.jit(compiled, donate_argnums=(8, 9))
@@ -8676,6 +8776,7 @@ class ModelExecutor:
             bonus_totals,
             accepted_bitmask,
             compact_summary,
+            debug_payload,
         ) = self._profile_jit_call(
             key,
             self._jit_cache[key],
@@ -8714,6 +8815,7 @@ class ModelExecutor:
             bonus_totals=bonus_totals,
             accepted_bitmask=accepted_bitmask,
             compact_summary=compact_summary,
+            debug_payload=debug_payload,
             burst_groups=1,
         )
 
