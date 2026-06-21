@@ -100,6 +100,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size-buckets", default="1,2,4")
     parser.add_argument("--max-blocks-per-seq", type=int, default=16)
     parser.add_argument("--decode-block-table-buckets", default="")
+    parser.add_argument("--startup-warmup-prefill-token-buckets", default="")
+    parser.add_argument("--startup-warmup-batch-size-buckets", default="")
+    parser.add_argument("--startup-warmup-decode-block-table-buckets", default="")
+    parser.add_argument(
+        "--startup-warmup-include-sampled-routes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--greedy-token-fastpath", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sampled-token-fastpath", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--greedy-decode-burst-steps", type=int, default=1)
@@ -577,6 +585,8 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 and float(args.top_p) == 1.0
                 and int(args.sampling_top_k) == -1
             )
+            if args.startup_warmup_include_sampled_routes is not None:
+                include_sampled_routes = bool(args.startup_warmup_include_sampled_routes)
             warmup_summary = engine.warmup_compilation(
                 max_prefill_len=max(
                     tuple(getattr(engine.config, "prefill_token_buckets", ()) or ())
@@ -589,6 +599,15 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                     or (int(args.max_num_seqs),)
                 ),
                 include_sampled_routes=include_sampled_routes,
+                prefill_token_buckets=tuple(
+                    _parse_ints(args.startup_warmup_prefill_token_buckets)
+                ) or None,
+                batch_size_buckets=tuple(
+                    _parse_ints(args.startup_warmup_batch_size_buckets)
+                ) or None,
+                decode_block_table_buckets=tuple(
+                    _parse_ints(args.startup_warmup_decode_block_table_buckets)
+                ) or None,
             )
         else:
             warmup_params = _build_sampling_params(

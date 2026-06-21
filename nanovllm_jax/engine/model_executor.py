@@ -7057,7 +7057,12 @@ class ModelExecutor:
                     selected_v_cache,
                     selected_conv,
                     selected_recurrent,
-                    seq_lens + accepted.astype(jnp.int32),
+                    seq_lens
+                    + jnp.where(
+                        row_valid,
+                        jnp.asarray(1, dtype=jnp.int32) + accepted.astype(jnp.int32),
+                        jnp.zeros_like(accepted.astype(jnp.int32)),
+                    ),
                 )
 
             self._jit_cache[key] = jax.jit(compiled)
@@ -7948,8 +7953,11 @@ class ModelExecutor:
                     lambda _: (hybrid_after_current.conv_state, hybrid_after_current.recurrent_state),
                     operand=None,
                 )
-                # Rejected draft slots are dirty but uncommitted because the
-                # committed length stays at the current-token prefix.
+                emitted_count = jnp.where(
+                    row_active,
+                    jnp.asarray(1, dtype=jnp.int32) + accepted.astype(jnp.int32),
+                    jnp.zeros_like(seq_lens),
+                )
                 selected_k_cache = draft_k_cache
                 selected_v_cache = draft_v_cache
 
@@ -7962,7 +7970,7 @@ class ModelExecutor:
                     selected_v_cache,
                     selected_conv,
                     selected_recurrent,
-                    seq_lens + accepted.astype(jnp.int32),
+                    seq_lens + emitted_count,
                 )
 
             self._jit_cache[key] = jax.jit(compiled, donate_argnums=(8, 9))
@@ -8133,29 +8141,29 @@ class ModelExecutor:
                 if batch_accept_policy == "all_or_none":
                     accepted0 = accepted0 & jnp.all(jnp.where(row_active, accepted0, True))
 
+                def restore_slots(new_cache, old_cache, slots, keep_new):
+                    leading_shape = new_cache.shape[:-4] if new_cache.ndim == 5 else new_cache.shape[:-3]
+                    flat_new = new_cache.reshape(leading_shape + (-1,) + new_cache.shape[-2:])
+                    flat_old = old_cache.reshape(leading_shape + (-1,) + old_cache.shape[-2:])
+                    new_values = flat_new[..., slots, :, :]
+                    old_values = flat_old[..., slots, :, :]
+                    slot_mask = keep_new.reshape((1,) * len(leading_shape) + (keep_new.shape[0], 1, 1))
+                    selected_values = jnp.where(slot_mask, new_values, old_values)
+                    flat_new = flat_new.at[..., slots, :, :].set(selected_values)
+                    return flat_new.reshape(new_cache.shape)
+
                 def run_second_decode(_):
-                    second_query_lens = accepted0.astype(jnp.int32)
-                    second_query_start_loc = jnp.concatenate(
-                        [
-                            jnp.zeros((1,), dtype=jnp.int32),
-                            jnp.cumsum(second_query_lens),
-                        ]
-                    )
-                    second_seq_lens = jnp.where(accepted0, seq_lens + 1, jnp.zeros_like(seq_lens))
+                    row_count = int(tokens.shape[0])
                     second_batch = ScheduledBatch(
-                        tokens=jnp.where(accepted0[:, None], target0[:, None], jnp.zeros_like(tokens)),
-                        positions=jnp.where(accepted0[:, None], positions + 1, jnp.zeros_like(positions)),
-                        seq_ids=jnp.where(accepted0, seq_ids, jnp.full_like(seq_ids, -1)),
-                        query_start_loc=second_query_start_loc,
+                        tokens=target0[:, None].astype(tokens.dtype),
+                        positions=(positions + 1).astype(positions.dtype),
+                        seq_ids=seq_ids,
+                        query_start_loc=jnp.arange(row_count + 1, dtype=jnp.int32),
                         is_prefill=False,
                         num_prefill_tokens=0,
-                        num_decode_tokens=jnp.sum(second_query_lens),
-                        block_tables=jnp.where(
-                            accepted0[:, None],
-                            block_tables,
-                            jnp.zeros_like(block_tables),
-                        ),
-                        seq_lens=second_seq_lens,
+                        num_decode_tokens=jnp.asarray(row_count, dtype=jnp.int32),
+                        block_tables=block_tables,
+                        seq_lens=seq_lens + 1,
                     )
                     second_metadata = self.backend.build_attention_metadata(
                         positions=second_batch.positions,
@@ -8188,6 +8196,18 @@ class ModelExecutor:
                         last_logits_only=False,
                         backend=self.backend,
                     )
+                    next_k_cache = restore_slots(
+                        next_kv.k_cache,
+                        kv_after_current.k_cache,
+                        second_metadata.slot_mapping[:, 0],
+                        accepted0,
+                    )
+                    next_v_cache = restore_slots(
+                        next_kv.v_cache,
+                        kv_after_current.v_cache,
+                        second_metadata.slot_mapping[:, 0],
+                        accepted0,
+                    )
                     next_target_ids, _, _ = lm_head_token_ids_and_topk(
                         next_hidden[:, :1, :],
                         params,
@@ -8199,8 +8219,8 @@ class ModelExecutor:
                     return (
                         next_hidden,
                         next_target_ids[:, 0].astype(jnp.int32),
-                        next_kv.k_cache,
-                        next_kv.v_cache,
+                        next_k_cache,
+                        next_v_cache,
                         next_hybrid.conv_state,
                         next_hybrid.recurrent_state,
                         second_metadata.slot_mapping[:, 0],
@@ -8241,28 +8261,17 @@ class ModelExecutor:
                     accepted1 = accepted1 & jnp.all(jnp.where(row_active, accepted1, True))
 
                 def run_third_decode(_):
-                    third_query_lens = accepted1.astype(jnp.int32)
-                    third_query_start_loc = jnp.concatenate(
-                        [
-                            jnp.zeros((1,), dtype=jnp.int32),
-                            jnp.cumsum(third_query_lens),
-                        ]
-                    )
-                    third_seq_lens = jnp.where(accepted1, seq_lens + 2, jnp.zeros_like(seq_lens))
+                    row_count = int(tokens.shape[0])
                     third_batch = ScheduledBatch(
-                        tokens=jnp.where(accepted1[:, None], target1[:, None], jnp.zeros_like(tokens)),
-                        positions=jnp.where(accepted1[:, None], positions + 2, jnp.zeros_like(positions)),
-                        seq_ids=jnp.where(accepted1, seq_ids, jnp.full_like(seq_ids, -1)),
-                        query_start_loc=third_query_start_loc,
+                        tokens=target1[:, None].astype(tokens.dtype),
+                        positions=(positions + 2).astype(positions.dtype),
+                        seq_ids=seq_ids,
+                        query_start_loc=jnp.arange(row_count + 1, dtype=jnp.int32),
                         is_prefill=False,
                         num_prefill_tokens=0,
-                        num_decode_tokens=jnp.sum(third_query_lens),
-                        block_tables=jnp.where(
-                            accepted1[:, None],
-                            block_tables,
-                            jnp.zeros_like(block_tables),
-                        ),
-                        seq_lens=third_seq_lens,
+                        num_decode_tokens=jnp.asarray(row_count, dtype=jnp.int32),
+                        block_tables=block_tables,
+                        seq_lens=seq_lens + 2,
                     )
                     third_metadata = self.backend.build_attention_metadata(
                         positions=third_batch.positions,
@@ -8295,6 +8304,18 @@ class ModelExecutor:
                         last_logits_only=False,
                         backend=self.backend,
                     )
+                    next_k_cache = restore_slots(
+                        next_kv.k_cache,
+                        kv_after_token1.k_cache,
+                        third_metadata.slot_mapping[:, 0],
+                        accepted1,
+                    )
+                    next_v_cache = restore_slots(
+                        next_kv.v_cache,
+                        kv_after_token1.v_cache,
+                        third_metadata.slot_mapping[:, 0],
+                        accepted1,
+                    )
                     next_target_ids, _, _ = lm_head_token_ids_and_topk(
                         next_hidden[:, :1, :],
                         params,
@@ -8306,8 +8327,8 @@ class ModelExecutor:
                     return (
                         next_hidden,
                         next_target_ids[:, 0].astype(jnp.int32),
-                        next_kv.k_cache,
-                        next_kv.v_cache,
+                        next_k_cache,
+                        next_v_cache,
                         next_hybrid.conv_state,
                         next_hybrid.recurrent_state,
                         third_metadata.slot_mapping[:, 0],
@@ -8344,7 +8365,21 @@ class ModelExecutor:
                     recurrent_state=token2_recurrent_state,
                 )
 
-                prefix_len = accepted0.astype(jnp.int32) + accepted1.astype(jnp.int32)
+                # For the K=2 commit-select route, only the fully accepted
+                # chain has a proven resident/static metadata contract. A
+                # partial [accept, reject] row emits only the verifier target
+                # and lets the next decode process it normally.
+                committed_accepted0 = accepted1
+                committed_accepted1 = accepted1
+                prefix_len = (
+                    committed_accepted0.astype(jnp.int32)
+                    + committed_accepted1.astype(jnp.int32)
+                )
+                emitted_count = jnp.where(
+                    row_active,
+                    prefix_len + jnp.asarray(1, dtype=jnp.int32),
+                    jnp.zeros_like(prefix_len),
+                )
                 hidden0_norm = rms_norm(hidden0, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                 hidden1_norm = rms_norm(hidden1, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
                 hidden2_norm = rms_norm(hidden2, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
@@ -8407,15 +8442,28 @@ class ModelExecutor:
                     hybrid_after_token2.recurrent_state,
                 )
 
-                selected_k_cache = kv_after_token2.k_cache
-                selected_v_cache = kv_after_token2.v_cache
+                selected_k_cache = restore_slots(
+                    kv_after_token2.k_cache,
+                    kv_after_current.k_cache,
+                    token1_slots,
+                    committed_accepted0,
+                )
+                selected_v_cache = restore_slots(
+                    kv_after_token2.v_cache,
+                    kv_after_current.v_cache,
+                    token1_slots,
+                    committed_accepted0,
+                )
 
                 host_payload = jnp.concatenate(
                     [
                         jnp.stack([target0, target1], axis=1).astype(jnp.int32),
                         target2.astype(jnp.int32)[:, None],
                         next_draft_tokens.astype(jnp.int32),
-                        jnp.stack([accepted0, accepted1], axis=1).astype(jnp.int32),
+                        jnp.stack(
+                            [committed_accepted0, committed_accepted1],
+                            axis=1,
+                        ).astype(jnp.int32),
                     ],
                     axis=1,
                 )
@@ -8423,12 +8471,12 @@ class ModelExecutor:
                     jnp.stack([target0, target1], axis=1),
                     target2,
                     next_draft_tokens,
-                    jnp.stack([accepted0, accepted1], axis=1),
+                    jnp.stack([committed_accepted0, committed_accepted1], axis=1),
                     selected_k_cache,
                     selected_v_cache,
                     selected_conv,
                     selected_recurrent,
-                    seq_lens + prefix_len,
+                    seq_lens + emitted_count,
                     host_payload,
                 )
 
@@ -8603,11 +8651,10 @@ class ModelExecutor:
                     verify_tokens = verify_tokens_rows
                     verify_positions = verify_positions_rows
                     token_row_ids = None
-                # Packed prefill writes all verifier tokens before attention, so
-                # kv_lens must include the current token and every draft token.
-                verify_seq_lens = seq_lens + (
-                    draft_len + 1 if verify_as_prefill else draft_len
-                )
+                # Decode seq_lens already includes the current input token
+                # logically; the verifier extends the visible window by only
+                # the speculative draft slots.
+                verify_seq_lens = seq_lens + draft_len
                 verify_batch = ScheduledBatch(
                     tokens=verify_tokens,
                     positions=verify_positions,
@@ -8766,13 +8813,13 @@ class ModelExecutor:
                     else updated_hybrid_state.recurrent_state
                 )
                 emit_columns = jnp.arange(draft_len + 1, dtype=jnp.int32)[None, :]
-                draft_columns = jnp.broadcast_to(
+                target_columns = jnp.broadcast_to(
                     jnp.clip(emit_columns, 0, draft_len - 1),
-                    (draft_tokens_arg.shape[0], draft_len + 1),
+                    (target_tokens.shape[0], draft_len + 1),
                 )
-                draft_values = jnp.take_along_axis(
-                    draft_tokens_arg,
-                    draft_columns,
+                target_values = jnp.take_along_axis(
+                    target_tokens,
+                    target_columns,
                     axis=1,
                 )
                 emitted_counts = jnp.where(
@@ -8780,13 +8827,14 @@ class ModelExecutor:
                     prefix_len + jnp.asarray(1, dtype=jnp.int32),
                     jnp.zeros_like(prefix_len),
                 )[:, None]
+                committed_seq_lens = seq_lens + emitted_counts[:, 0]
                 group_emitted = jnp.where(
                     emit_columns < prefix_len[:, None],
-                    draft_values,
+                    target_values,
                     jnp.where(
                         emit_columns == prefix_len[:, None],
                         selected_next_token[:, None],
-                        jnp.zeros_like(draft_values),
+                        jnp.zeros_like(target_values),
                     ),
                 ).astype(jnp.int32)
                 emitted_tokens = group_emitted[:, None, :]
@@ -8844,7 +8892,7 @@ class ModelExecutor:
                     updated_kv_state.v_cache,
                     selected_conv,
                     selected_recurrent,
-                    seq_lens + prefix_len,
+                    committed_seq_lens,
                     emitted_tokens,
                     emitted_counts,
                     accepted_counts,
@@ -9101,11 +9149,10 @@ class ModelExecutor:
                         verify_tokens = verify_tokens_rows
                         verify_positions = verify_positions_rows
                         token_row_ids = None
-                    # Packed prefill writes all verifier tokens before attention,
-                    # so kv_lens must include the current token and every draft token.
-                    verify_seq_lens = current_seq_lens + (
-                        draft_len + 1 if verify_as_prefill else draft_len
-                    )
+                    # Decode seq_lens already includes the current input token
+                    # logically; the verifier extends the visible window by
+                    # only the speculative draft slots.
+                    verify_seq_lens = current_seq_lens + draft_len
                     verify_batch = ScheduledBatch(
                         tokens=verify_tokens,
                         positions=verify_positions,
@@ -9339,22 +9386,22 @@ class ModelExecutor:
                     next_draft_tokens = jnp.stack(mtp_drafts, axis=1)
 
                     emit_columns = jnp.arange(draft_len + 1, dtype=jnp.int32)[None, :]
-                    draft_columns = jnp.broadcast_to(
+                    target_columns = jnp.broadcast_to(
                         jnp.clip(emit_columns, 0, draft_len - 1),
-                        (current_drafts.shape[0], draft_len + 1),
+                        (target_tokens.shape[0], draft_len + 1),
                     )
-                    draft_values = jnp.take_along_axis(
-                        current_drafts,
-                        draft_columns,
+                    target_values = jnp.take_along_axis(
+                        target_tokens,
+                        target_columns,
                         axis=1,
                     )
                     group_emitted = jnp.where(
                         emit_columns < prefix_len[:, None],
-                        draft_values,
+                        target_values,
                         jnp.where(
                             emit_columns == prefix_len[:, None],
                             selected_next_token[:, None],
-                            jnp.zeros_like(draft_values),
+                            jnp.zeros_like(target_values),
                         ),
                     ).astype(jnp.int32)
                     selected_conv = (

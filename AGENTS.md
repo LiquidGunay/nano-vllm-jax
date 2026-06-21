@@ -232,6 +232,19 @@
   speculative `14.9 ms/token` versus baseline `2.1 ms/token`. Do not retry raw
   recursive K=2/K=3 chain variants as speed paths; the remaining blocker is the
   verifier boundary cost, not the next-position draft input.
+  On 2026-06-21, the exact K=2 `commit_select` path was made conservative:
+  raw partial K2 acceptance (`[accept, reject]`) is no longer committed as a
+  two-token partial prefix. It is exposed to the runner as a one-token target
+  commit so the next decode step owns the skipped state transition. The fused
+  seed-main path was parity-checked against the normal greedy token path and
+  matched emitted tokens, current KV slots, and hybrid state; the drift came
+  from partial K2 commit semantics. The corrected small GPU diagnostics are:
+  `commit_select_fullonly_jax_12.json` exact through 12 tokens at `15.71`
+  output tok/s (`acceptance_rate=0.091`) and
+  `commit_select_fullonly_jax_16.json` exact through 16 tokens at `15.96`
+  output tok/s (`acceptance_rate=0.214`). Keep this as the correctness oracle,
+  not a speed claim; do not re-enable partial K2 commits without a verifier
+  state proof and matching focused GPU parity.
 - Keep these work items in order: accepted FA/FLA policy validation, broader
   resident/scheduler decode metadata reduction, coarse GDN decode/prefill
   kernels, and model-family-general batched GEMM/fusion improvements.

@@ -18,6 +18,10 @@ engine:
   prefill_token_buckets: "64,128,256,512,1024,2048,4096"
   prefill_layout: "packed"
   batch_size_buckets: "1,2,3,4,5,6,7,8"
+  startup_warmup_prefill_token_buckets: "64,128"
+  startup_warmup_batch_size_buckets: "1,2"
+  startup_warmup_decode_block_table_buckets: "128"
+  startup_warmup_include_sampled_routes: false
   decode_block_table_buckets: "128,256,320"
   max_prefill: 4096
   max_kv_cache_mb: 3072
@@ -29,7 +33,7 @@ engine:
   prefix_cache: true
   speculative_method: "mtp"
   draft_sample_method: "greedy"
-  mtp_verifier_impl: "packed_prefix"
+  mtp_verifier_impl: "commit_select"
   mtp_batch_accept_policy: "rowwise"
   mtp_seed_after_bonus: true
   mtp_hidden_source: "final_normed"
@@ -78,7 +82,7 @@ kernels:
     kv_cache_dtype: "bf16"
     kv_append_impl: "reference"
     prefill_impl: "triton_packed"
-    decode_impl: "reference"
+    decode_impl: "flashinfer_paged"
   gdn:
     disable_fallbacks: true
     prefill_post_conv_impl: "triton_fla_padded"

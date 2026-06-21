@@ -45,20 +45,22 @@ architecture/correctness checkpoint rather than a speed claim.
 
 ## Current GPU caveat
 
-As of 2026-06-21, the active MTP research config targets exact K=2
-packed-prefix verification (`mtp_verifier_impl=packed_prefix`) rather than
-sequential K=2 `commit_select` as a speed path. MTP remains an explicit opt-in serving mode rather
-than an environment-only diagnostic. The server config fields are:
+As of 2026-06-21, the active MTP research config uses conservative exact K=2
+`commit_select` verification. Packed-prefix verification remains the intended
+future speed boundary, but it is not the current config because it is not yet
+correctness-clean under the strict no-fallback GDN policy. MTP remains an
+explicit opt-in serving mode rather than an environment-only diagnostic. The
+server config fields are:
 
 - `speculative_method`: `none` or `mtp`;
 - `num_speculative_tokens`: `0` for regular serving; K=2 is the current
   experimental true-K verifier target. K=3 should wait until K=2 has useful
   second-position draft quality;
 - `draft_sample_method`: currently only `greedy` is implemented for MTP;
-- `mtp_verifier_impl`: `packed_prefix` for the experimental speed boundary,
-  `commit_select` for the exact K=1/K=2 sequential oracle, `k_decode` for
-  generic decode-shaped true-K verification, and `two_decode` for the
-  historical width-2 K=1 verifier;
+- `mtp_verifier_impl`: `commit_select` for the exact K=1/K=2 sequential
+  diagnostic path, `packed_prefix` for the unpromoted future speed boundary,
+  `k_decode` for generic decode-shaped true-K verification, and `two_decode`
+  for the historical width-2 K=1 verifier;
 - `mtp_batch_accept_policy`: `rowwise` or `all_or_none`;
 - `mtp_seed_after_bonus`: default `false`.
 - `mtp_prefill_seed`: default `false`. Prefill draft seeding is now opt-in
@@ -89,6 +91,22 @@ The current GPU route is correctness-first:
 Do not use the new MTP config as a speed-claim artifact yet. It is the first
 clean GPU implementation target for measuring acceptance, verifier cost, and
 whether a width-2 verifier can beat the current non-speculative kernel path.
+
+2026-06-21 follow-up: K=2 `commit_select` is now conservative for partial
+acceptance. A raw `[accept, reject]` K=2 row is exposed to the runner as a
+one-token target commit rather than a two-token partial-prefix commit. The
+partial-prefix skip was the source of row drift in the two-request smoke: the
+fused seed-main path matched the normal greedy path exactly on emitted tokens,
+current KV slots, and hybrid state, but partial K=2 commits later diverged.
+With partial commits disabled, the same two-request Qwen3.5-0.8B smoke is
+exact through 12 and 16 output tokens:
+
+- `commit_select_fullonly_jax_12.json`: exact through 12 tokens, `15.71`
+  output tok/s, acceptance `0.091`;
+- `commit_select_fullonly_jax_16.json`: exact through 16 tokens, `15.96`
+  output tok/s, acceptance `0.214`.
+
+This restores a correctness oracle; it is not a speed path.
 
 ## GPU 2026-06-20 true-K status
 

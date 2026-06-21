@@ -285,6 +285,11 @@ kernels:
     packed_decode:
       impl: triton_fla_conv_raw_gates
       qkv_dtype: bf16
+engine:
+  startup_warmup_prefill_token_buckets: "64,128"
+  startup_warmup_batch_size_buckets: "1,2"
+  startup_warmup_decode_block_table_buckets: "128"
+  startup_warmup_include_sampled_routes: false
 """.strip()
     )
     args = sidecar.parse_args(
@@ -318,6 +323,10 @@ kernels:
     assert "--gdn-disable-fallbacks" in command
     assert command[command.index("--gdn-packed-decode-impl") + 1] == "triton_fla_conv_raw_gates"
     assert command[command.index("--gdn-packed-decode-qkv-dtype") + 1] == "bf16"
+    assert command[command.index("--startup-warmup-prefill-token-buckets") + 1] == "64,128"
+    assert command[command.index("--startup-warmup-batch-size-buckets") + 1] == "1,2"
+    assert command[command.index("--startup-warmup-decode-block-table-buckets") + 1] == "128"
+    assert "--no-startup-warmup-include-sampled-routes" in command
     policy = sidecar._effective_jax_kernel_policy(args, loaded["engine_overrides"])
     assert policy["full_attention_decode_impl"] == "triton_paged"
     assert policy["full_attention_prefill_impl"] == "triton_packed"

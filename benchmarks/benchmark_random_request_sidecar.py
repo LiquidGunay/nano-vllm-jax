@@ -57,6 +57,12 @@ DEFAULT_WORKER_NICE = int(os.environ.get("NANO_VLLM_JAX_RANDOM_WORKER_NICE", "10
 DEFAULT_MAX_SYSTEM_RAM_PERCENT = float(
     os.environ.get("NANO_VLLM_JAX_RANDOM_MAX_SYSTEM_RAM_PERCENT", "70")
 )
+_STARTUP_WARMUP_ENGINE_KEYS = (
+    "startup_warmup_prefill_token_buckets",
+    "startup_warmup_batch_size_buckets",
+    "startup_warmup_decode_block_table_buckets",
+    "startup_warmup_include_sampled_routes",
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -255,10 +261,15 @@ def _load_jax_config(path: str) -> dict[str, Any]:
 
     config_path = Path(path)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    engine_overrides = engine_overrides_from_config(raw)
+    engine_section = raw.get("engine", {}) or {}
+    for key in _STARTUP_WARMUP_ENGINE_KEYS:
+        if key in engine_section and engine_section[key] not in (None, ""):
+            engine_overrides[key] = engine_section[key]
     return {
         "source": str(config_path),
         "raw": raw,
-        "engine_overrides": engine_overrides_from_config(raw),
+        "engine_overrides": engine_overrides,
         "env": runtime_env_from_config(raw),
     }
 
@@ -840,6 +851,9 @@ def _build_jax_command(
         "prefill_layout": args.prefill_layout,
         "batch_size_buckets": args.batch_size_buckets,
         "max_blocks_per_seq": args.max_blocks_per_seq,
+        "startup_warmup_prefill_token_buckets": "",
+        "startup_warmup_batch_size_buckets": "",
+        "startup_warmup_decode_block_table_buckets": "",
         "speculative_method": args.jax_speculative_method,
         "draft_sample_method": args.jax_draft_sample_method,
         "mtp_verifier_impl": args.jax_mtp_verifier_impl,
@@ -1110,6 +1124,18 @@ def _run() -> None:
                 "batch_size_buckets": args.batch_size_buckets,
                 "max_blocks_per_seq": args.max_blocks_per_seq,
                 "decode_block_table_buckets": args.decode_block_table_buckets,
+                "startup_warmup_prefill_token_buckets": (
+                    jax_config["engine_overrides"].get("startup_warmup_prefill_token_buckets", "")
+                ),
+                "startup_warmup_batch_size_buckets": (
+                    jax_config["engine_overrides"].get("startup_warmup_batch_size_buckets", "")
+                ),
+                "startup_warmup_decode_block_table_buckets": (
+                    jax_config["engine_overrides"].get("startup_warmup_decode_block_table_buckets", "")
+                ),
+                "startup_warmup_include_sampled_routes": (
+                    jax_config["engine_overrides"].get("startup_warmup_include_sampled_routes")
+                ),
                 "resident_decode_metadata": args.resident_decode_metadata,
                 "full_attention_kv_cache_dtype": args.full_attention_kv_cache_dtype,
                 "full_attention_kv_append_impl": args.full_attention_kv_append_impl,

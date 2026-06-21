@@ -179,11 +179,10 @@ class _FakeExecutor:
                 if not value:
                     break
                 accepted_count += 1
-            draft_values = self._row_values(draft_token_rows, row_idx, width)
             row_emitted = []
             for pos in range(width + 1):
                 if pos < accepted_count:
-                    row_emitted.append(draft_values[pos])
+                    row_emitted.append(target_values[pos])
                 elif pos == accepted_count:
                     if accepted_count == width:
                         row_emitted.append(int(self.bonus[row]))
@@ -312,11 +311,10 @@ class _FakeExecutor:
                 if not value:
                     break
                 accepted_count += 1
-            draft_values = self._row_values(draft_token_rows, row_idx, width)
             row_emitted = []
             for pos in range(width + 1):
                 if pos < accepted_count:
-                    row_emitted.append(draft_values[pos])
+                    row_emitted.append(target_values[pos])
                 elif pos == accepted_count:
                     if accepted_count == width:
                         row_emitted.append(int(self.bonus[row]))
@@ -985,10 +983,13 @@ def _run_case(
     n = len(seq_lens or accepted)
     rows = list(range(n)) if rows is None else rows
     seq_lens = seq_lens or [5 + i for i in range(n)]
-    target = target or [100 + i for i in range(n)]
     bonus = bonus or [200 + i for i in range(n)]
     next_draft = next_draft or [300 + i for i in range(n)]
     drafts = drafts or {i: 10 + i for i in range(n)}
+    target = target or [
+        int(drafts[i]) if bool(accepted[i]) else 100 + i
+        for i in range(n)
+    ]
     max_tokens = max_tokens or [64 for _ in range(n)]
     committed_seq_lens = [
         seq_lens[i] + (1 if accepted[i] else 0)
@@ -1352,12 +1353,12 @@ def test_k2_commit_select_compacts_partial_physical_rows(monkeypatch):
     assert runner.executor.calls[-1]["batch_size"] == 2
     assert runner.executor.calls[-1]["draft_tokens"] == [[10, 11], [12, 13]]
     assert runner.stats == {
-        "drafts_proposed": 2,
+        "drafts_proposed": 0,
         "drafts_accepted": 2,
         "drafts_rejected": 1,
         "bonus_tokens": 1,
     }
-    assert runner._mtp1_drafts == {2: [32, 33]}
+    assert runner._mtp1_drafts == {}
     assert runner.stored[-1][0].seq_lens.tolist() == [7, 7]
 
 
@@ -1492,6 +1493,59 @@ def test_generic_k_commits_partial_prefix_without_repair(monkeypatch):
     assert _resolve_output_tokens(runner._mtp1_drafts[0]) == [30, 31, 32]
     assert _resolve_output_tokens(runner._mtp1_drafts[1]) == [40, 41, 42]
     assert runner.stored[-1][0].seq_lens.tolist() == [6, 7]
+
+
+def test_generic_k_host_commit_emits_verifier_targets_not_stale_drafts(monkeypatch):
+    seq_lens = [5, 7]
+    executor = _FakeExecutor(
+        accepted=[
+            [True, True],
+            [True, False],
+        ],
+        target=[
+            [10, 11],
+            [20, 21],
+        ],
+        bonus=[30, 31],
+        next_draft=[
+            [40, 41],
+            [50, 51],
+        ],
+        state_marker=[902, 911],
+        committed_seq_lens=[7, 8],
+        kv_slots=[
+            [1000, 1001, 1002],
+            [1010, 1011, 2012],
+        ],
+    )
+    runner = _FakeRunner(
+        executor,
+        {0: [910, 911], 1: [920, 921]},
+        block_size=16,
+        num_speculative_tokens=2,
+    )
+    runner.mtp_verifier_impl = "k_decode"
+    seqs = [_seq(i, seq_lens[i]) for i in range(2)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "1")
+
+    outputs = ModelRunner._run_mtp1_batched(
+        runner,
+        seqs,
+        _batch(seq_lens),
+        [0, 1],
+    )
+
+    assert {row: _resolve_output_tokens(value) for row, value in outputs.items()} == {
+        0: [10, 11, 30],
+        1: [20, 21],
+    }
+    assert runner.executor.calls[-1]["draft_tokens"] == [[910, 911], [920, 921]]
+    assert runner.stats["drafts_accepted"] == 3
+    assert runner.stats["drafts_rejected"] == 1
+    assert runner.stats["bonus_tokens"] == 1
 
 
 def test_generic_k_compacts_partial_physical_rows(monkeypatch):
@@ -1721,16 +1775,16 @@ def test_fused_chain_seed_supports_partial_padded_rows():
     )
 
     assert executor.calls[-1]["method"] == "forward_step_token_ids_mtp_draft_chain"
-    assert executor.calls[-1]["seq_ids"] == [-1, 1, -1]
-    assert executor.calls[-1]["query_lens"] == [0, 1, 0]
+    assert executor.calls[-1]["seq_ids"] == [1]
+    assert executor.calls[-1]["query_lens"] == [1]
     assert _resolve_output_tokens(output[0]) == []
     assert _resolve_output_tokens(output[1]) == [101]
     assert _resolve_output_tokens(runner._mtp1_drafts[1]) == [40, 41, 42]
     assert runner.stats["drafts_proposed"] == 3
     stored_batch, stored_state = runner.stored[-1]
-    assert stored_batch.query_lens_host == (0, 1, 0)
-    assert stored_batch.seq_ids_host == (-1, 1, -1)
-    assert stored_state.conv_state.reshape(-1).tolist() == [0.0, 910.0, 0.0]
+    assert stored_batch.query_lens_host == (1,)
+    assert stored_batch.seq_ids_host == (1,)
+    assert stored_state.conv_state.reshape(-1).tolist() == [910.0]
 
 
 def test_partial_verifier_rows_seed_missing_admitted_rows(monkeypatch):
@@ -1788,7 +1842,7 @@ def test_partial_verifier_rows_seed_missing_admitted_rows(monkeypatch):
     assert _resolve_output_tokens(runner._mtp1_drafts[1]) == [40]
     assert any(
         call.get("method") == "forward_step_token_ids_mtp_draft_chain"
-        and call.get("seq_ids") == [-1, 1, -1]
+        and call.get("seq_ids") == [1]
         for call in executor.calls
     )
 
@@ -2411,6 +2465,86 @@ def test_generic_k_verifier_supports_strict_multitoken_gdn_prefix_state(monkeypa
     assert output.committed_seq_lens.shape == (2,)
     assert output.hybrid_state.conv_state.shape == base_hybrid.conv_state.shape
     assert output.hybrid_state.recurrent_state.shape == base_hybrid.recurrent_state.shape
+
+
+def test_k2_commit_select_exposes_partial_accept_as_one_token_commit(monkeypatch):
+    import jax
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", raising=False)
+
+    config = _tiny_mtp_verifier_config()
+    config.num_speculative_tokens = 2
+    params = init_params(jax.random.PRNGKey(0), config)
+    params.mtp_params = init_mtp_params(jax.random.PRNGKey(1), config)
+    executor = ModelExecutor(config, params, backend="pure_jax")
+    batch = ScheduledBatch(
+        tokens=jnp.array([[3], [4]], dtype=jnp.int32),
+        positions=jnp.array([[0], [0]], dtype=jnp.int32),
+        seq_ids=jnp.array([0, 1], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 2], dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=2,
+        block_tables=jnp.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=jnp.int32),
+        seq_lens=jnp.array([1, 1], dtype=jnp.int32),
+    )
+    kv_spec = KVCacheSpec(
+        num_layers=config.num_hidden_layers,
+        num_blocks=config.num_kvcache_blocks,
+        block_size=config.block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        dtype=config.get_dtype(),
+        max_kv_cache_bytes=config.max_kv_cache_bytes,
+    )
+    base_cache = executor.backend.allocate_kv_cache(kv_spec, max_seqs=2, max_blocks_per_seq=4)
+    base_hybrid = init_hybrid_state(config, batch_size=2, dtype=config.get_dtype())
+
+    target0_probe = executor.mtp2_commit_select_greedy_step_jit(
+        batch,
+        cache_storage=_clone_cache_storage(base_cache),
+        hybrid_state=_clone_hybrid_state(base_hybrid),
+        draft_tokens=jnp.array([[-1, -1], [-1, -1]], dtype=jnp.int32),
+        next_mtp_position=jnp.array([3, 3], dtype=jnp.int32),
+        mtp_hidden_final_normed=True,
+        mtp_chain_return_normed=False,
+        mtp_chain_mode="sequence",
+    )
+    target0 = int(target0_probe.target_token.tolist()[0][0])
+    target1_probe = executor.mtp2_commit_select_greedy_step_jit(
+        batch,
+        cache_storage=_clone_cache_storage(base_cache),
+        hybrid_state=_clone_hybrid_state(base_hybrid),
+        draft_tokens=jnp.array([[target0, -1], [-1, -1]], dtype=jnp.int32),
+        next_mtp_position=jnp.array([3, 3], dtype=jnp.int32),
+        mtp_hidden_final_normed=True,
+        mtp_chain_return_normed=False,
+        mtp_chain_mode="sequence",
+    )
+    target1 = int(target1_probe.target_token.tolist()[0][1])
+    wrong_target1 = (target1 + 1) % config.vocab_size
+    if wrong_target1 == target1:
+        wrong_target1 = (target1 + 2) % config.vocab_size
+
+    output = executor.mtp2_commit_select_greedy_step_jit(
+        batch,
+        cache_storage=_clone_cache_storage(base_cache),
+        hybrid_state=_clone_hybrid_state(base_hybrid),
+        draft_tokens=jnp.array([[target0, wrong_target1], [-1, -1]], dtype=jnp.int32),
+        next_mtp_position=jnp.array([3, 3], dtype=jnp.int32),
+        mtp_hidden_final_normed=True,
+        mtp_chain_return_normed=False,
+        mtp_chain_mode="sequence",
+    )
+
+    assert int(output.target_token[0, 0]) == target0
+    assert int(output.target_token[0, 1]) == target1
+    assert wrong_target1 != target1
+    assert output.accepted.tolist()[0] == [False, False]
+    assert output.committed_seq_lens.tolist()[0] == 2
+    assert output.host_payload.tolist()[0][-2:] == [0, 0]
 
 
 def test_first_prefix_hybrid_matches_full_prefix_gather():

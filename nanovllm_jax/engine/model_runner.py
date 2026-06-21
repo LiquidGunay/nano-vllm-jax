@@ -2478,15 +2478,24 @@ class CanonicalModelRunner:
                             )
                     if (
                         draft_len > 1
-                            and use_generic_k_warmup
-                            and mtp_burst_groups <= 1
-                            and int(batch_size) > 1
-                            and (
-                                hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
-                                or hasattr(self.executor, "mtp_k_packed_prefix_greedy_step_jit")
-                            )
-                        ):
-                        for compact_rows in range(1, int(batch_size)):
+                        and use_generic_k_warmup
+                        and mtp_burst_groups <= 1
+                        and int(batch_size) > 1
+                        and (
+                            hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
+                            or hasattr(self.executor, "mtp_k_packed_prefix_greedy_step_jit")
+                        )
+                    ):
+                        compact_row_counts = tuple(range(1, int(batch_size)))
+                        if use_packed_prefix_warmup:
+                            # Packed-prefix verification has a much larger
+                            # compile surface than decode-shaped K verification.
+                            # Warm one representative compact tail shape per
+                            # warmed physical bucket; broader active-row
+                            # coverage should be requested through explicit
+                            # startup batch buckets.
+                            compact_row_counts = (int(batch_size) - 1,)
+                        for compact_rows in compact_row_counts:
                             compact_batch = self._compact_decode_batch(
                                 batch,
                                 list(range(compact_rows)),
@@ -4430,6 +4439,10 @@ class CanonicalModelRunner:
             self._resident_update_slots_device(slots),
             committed_lens,
         )
+        if hasattr(self, "_resident_seq_lens_host") and batch.seq_lens_host is not None:
+            for slot, row in zip(slots, rows):
+                if row < len(batch.seq_lens_host):
+                    self._resident_seq_lens_host[int(slot)] = int(batch.seq_lens_host[row])
 
     def _record_resident_committed_seq_lens_host(
         self,
@@ -6363,13 +6376,45 @@ class CanonicalModelRunner:
 
         batch = self._materialize_static_decode_metadata_batch(batch)
         _mark("materialize_static_decode_metadata")
+        token_row_for_row = {int(row): int(row) for row in active_rows}
         if active_rows != list(range(int(batch.tokens.shape[0]))):
-            batch = self._masked_decode_batch(batch, active_rows)
-            _mark("masked_batch")
+            original_active_rows = list(active_rows)
+            batch = self._compact_decode_batch(batch, active_rows)
+            token_row_for_row = {
+                int(row): int(local_row)
+                for local_row, row in enumerate(original_active_rows)
+            }
+            _mark("compact_batch")
         batch = self._maybe_apply_device_token_carry(batch)
         _mark("apply_device_token_carry")
         hybrid_state = self._batch_hybrid_state(batch)
         _mark("batch_hybrid_state")
+        parity_output = None
+        seed_parity_debug = (
+            os.environ.get("NANO_VLLM_JAX_MTP_SEED_PARITY_DEBUG", "0")
+            in {"1", "true", "yes", "on", "True"}
+            and hasattr(self.executor, "forward_step_token_ids_jit")
+        )
+        if seed_parity_debug:
+            parity_cache_storage = KVCacheStorage(
+                self.cache_storage.k_cache.copy(),
+                self.cache_storage.v_cache.copy(),
+            )
+            parity_hybrid_state = HybridLayerState(
+                conv_state=hybrid_state.conv_state.copy()
+                if hybrid_state.conv_state is not None
+                else None,
+                recurrent_state=hybrid_state.recurrent_state.copy()
+                if hybrid_state.recurrent_state is not None
+                else None,
+            )
+            parity_output = self.executor.forward_step_token_ids_jit(
+                batch,
+                cache_storage=parity_cache_storage,
+                hybrid_state=parity_hybrid_state,
+            )
+            _block_until_ready_tree(parity_output)
+            _mark("parity_executor")
         output = self.executor.forward_step_token_ids_mtp_draft_chain_jit(
             batch,
             cache_storage=self.cache_storage,
@@ -6382,10 +6427,74 @@ class CanonicalModelRunner:
         if profile_mtp:
             _block_until_ready_tree(output)
         _mark("executor")
+        if parity_output is not None:
+            seed_targets = output.resident_last_tokens
+            if seed_targets is None:
+                seed_targets = output.activations[:, :1]
+            seed_target_vec = jnp.asarray(seed_targets, dtype=jnp.int32).reshape(-1)
+            parity_target_vec = jnp.asarray(parity_output.activations, dtype=jnp.int32).reshape(-1)
+            token_mismatch = jnp.any(seed_target_vec != parity_target_vec)
+
+            slot_positions = jnp.maximum(batch.seq_lens - 1, 0).astype(jnp.int32)[:, None]
+            seed_slots = compute_slot_mapping(
+                positions=slot_positions,
+                block_table=batch.block_tables,
+                block_size=self.config.block_size,
+                is_prefill=False,
+            )[:, 0]
+
+            def _slot_max_abs(left, right, slots) -> float:
+                leading_shape = left.shape[:-4] if left.ndim == 5 else left.shape[:-3]
+                flat_left = left.reshape(leading_shape + (-1,) + left.shape[-2:])
+                flat_right = right.reshape(leading_shape + (-1,) + right.shape[-2:])
+                left_values = flat_left[..., slots, :, :].astype(jnp.float32)
+                right_values = flat_right[..., slots, :, :].astype(jnp.float32)
+                return float(jnp.max(jnp.abs(left_values - right_values)).item())
+
+            def _state_max_abs(left, right) -> float:
+                if left is None or right is None:
+                    return 0.0
+                return float(jnp.max(jnp.abs(left.astype(jnp.float32) - right.astype(jnp.float32))).item())
+
+            k_slot_diff = _slot_max_abs(
+                output.cache_storage.k_cache,
+                parity_output.cache_storage.k_cache,
+                seed_slots,
+            )
+            v_slot_diff = _slot_max_abs(
+                output.cache_storage.v_cache,
+                parity_output.cache_storage.v_cache,
+                seed_slots,
+            )
+            conv_diff = _state_max_abs(
+                output.hybrid_state.conv_state,
+                parity_output.hybrid_state.conv_state,
+            )
+            recurrent_diff = _state_max_abs(
+                output.hybrid_state.recurrent_state,
+                parity_output.hybrid_state.recurrent_state,
+            )
+            print(
+                "[MTP_SEED_PARITY] "
+                f"rows={active_rows} seq_ids={tuple(int(x) for x in (batch.seq_ids_host or ())) } "
+                f"tokens_seed={seed_target_vec.tolist()} "
+                f"tokens_normal={parity_target_vec.tolist()} "
+                f"token_mismatch={bool(token_mismatch.item())} "
+                f"k_slot_max_abs={k_slot_diff:.6g} "
+                f"v_slot_max_abs={v_slot_diff:.6g} "
+                f"conv_max_abs={conv_diff:.6g} "
+                f"recurrent_max_abs={recurrent_diff:.6g}",
+                flush=True,
+            )
         self.cache_storage = output.cache_storage
-        self._store_batch_hybrid_state(batch, output.hybrid_state)
+        committed_batch = self._with_committed_seq_lens(
+            batch,
+            batch.seq_lens + batch.query_lens.astype(jnp.int32),
+        )
+        self._record_resident_committed_seq_lens(committed_batch)
+        self._store_batch_hybrid_state(committed_batch, output.hybrid_state)
         _mark("store_hybrid_state")
-        self._record_kv_snapshot(batch, output.hybrid_state)
+        self._record_kv_snapshot(committed_batch, output.hybrid_state)
         _mark("record_kv_snapshot")
 
         token_rows = output.activations
@@ -6404,10 +6513,11 @@ class CanonicalModelRunner:
         )
         stale_seq_ids = getattr(self, "_resident_last_tokens_stale_seq_ids", None)
         for row in active_rows:
-            seq_id = int(batch.seq_ids_host[row]) if batch.seq_ids_host is not None else -1
+            token_row = token_row_for_row[int(row)]
+            seq_id = int(batch.seq_ids_host[token_row]) if batch.seq_ids_host is not None else -1
             if seq_id < 0:
                 continue
-            carry_by_seq_id[seq_id] = DeviceTokenRef(tokens=target_tokens, row=row)
+            carry_by_seq_id[seq_id] = DeviceTokenRef(tokens=target_tokens, row=token_row)
             if stale_seq_ids is not None:
                 stale_seq_ids.add(seq_id)
         self._device_token_carry_seq_ids = None
@@ -6421,22 +6531,39 @@ class CanonicalModelRunner:
         stats = self._speculative_stats()
         for row in active_rows:
             seq = seqs[row]
-            outputs[row] = DeviceTokenRef(tokens=target_tokens, row=row)
+            token_row = token_row_for_row[int(row)]
+            outputs[row] = DeviceTokenRef(tokens=target_tokens, row=token_row)
             chain_refs = [
-                DeviceTokenRef(tokens=token_rows, row=row * width + offset)
+                DeviceTokenRef(tokens=token_rows, row=token_row * width + offset)
                 for offset in range(1, width)
             ]
             if chain_refs:
                 self._mtp1_drafts[seq.seq_id] = chain_refs if len(chain_refs) > 1 else chain_refs[0]
                 self._mtp1_seeded_chain[seq.seq_id] = 0
                 stats["drafts_proposed"] += len(chain_refs)
+                if profile_mtp:
+                    _draft_debug, debug_events = self._mtp1_debug_state()
+                    debug_events.append(
+                        {
+                            "kind": "mtp_seeded_main",
+                            "seq_id": int(seq.seq_id),
+                            "row": int(row),
+                            "seq_tokens": int(seq.num_tokens),
+                            "completion_tokens": int(seq.num_completion_tokens),
+                            "target_ref_row": int(token_row),
+                            "draft_chain": [
+                                {"device_ref_row": int(ref.row)}
+                                for ref in chain_refs
+                            ],
+                        }
+                    )
                 if chain_debug_host is not None and token_rows_host is not None:
                     draft_top_ids, draft_top_values = chain_debug_host
                     draft_debug, _ = self._mtp1_debug_state()
                     draft_debug[seq.seq_id] = {
-                        "confirmed_token_id": int(token_rows_host[row, 0]),
+                        "confirmed_token_id": int(token_rows_host[token_row, 0]),
                         "draft_chain": [
-                            int(token_rows_host[row, offset])
+                            int(token_rows_host[token_row, offset])
                             for offset in range(1, width)
                         ],
                         "position": int(seqs[row].num_tokens),
@@ -6447,11 +6574,11 @@ class CanonicalModelRunner:
                             {
                                 "ids": [
                                     int(value)
-                                    for value in draft_top_ids[row, pos].tolist()
+                                    for value in draft_top_ids[token_row, pos].tolist()
                                 ],
                                 "values": [
                                     float(value)
-                                    for value in draft_top_values[row, pos].tolist()
+                                    for value in draft_top_values[token_row, pos].tolist()
                                 ],
                             }
                             for pos in range(len(chain_refs))
@@ -6461,6 +6588,15 @@ class CanonicalModelRunner:
                 self._mtp1_drafts.pop(seq.seq_id, None)
                 self._mtp1_seeded_chain.pop(seq.seq_id, None)
         _mark("build_outputs")
+        if not ModelRunner._device_token_carry_enabled(self):
+            output_by_row = {
+                row: outputs[row]
+                for row in active_rows
+                if outputs[row] != []
+            }
+            materialized = ModelRunner._materialize_device_token_outputs(output_by_row)
+            for row, value in materialized.items():
+                outputs[row] = value
         return outputs
 
     def _seed_mtp1_drafts(
@@ -8198,7 +8334,7 @@ class CanonicalModelRunner:
                     stats["drafts_accepted"] += 1
                     stats["bonus_tokens"] += 1
                     emitted_len = 2
-                    outputs[row] = draft_token_chains[local_row] + [bonus_values[idx]]
+                    outputs[row] = [target_values[idx], bonus_values[idx]]
                     if (
                         self.mtp1_enabled
                         and seq.temperature == 0
@@ -8502,6 +8638,14 @@ class CanonicalModelRunner:
         rejected_lookahead_rows: List[int] = []
         rejected_lookahead_targets: List[int] = []
 
+        def _debug_token_value(value: object) -> object:
+            if isinstance(value, DeviceTokenRef):
+                return {"device_ref_row": int(value.row)}
+            try:
+                return int(value)
+            except Exception:
+                return str(type(value).__name__)
+
         for local_row, row in enumerate(rows):
             seq = seqs[row]
             self._mtp1_drafts.pop(seq.seq_id, None)
@@ -8518,19 +8662,16 @@ class CanonicalModelRunner:
                 if prefix_len == 0:
                     outputs[row] = target_token_rows[idx][0]
                 else:
-                    outputs[row] = (
-                        draft_token_chains[local_row][:prefix_len]
-                        + [target_token_rows[idx][prefix_len]]
-                    )
+                    outputs[row] = target_token_rows[idx][: prefix_len + 1]
             elif accepted:
                 stats["drafts_accepted"] += draft_len
                 if disable_bonus:
                     emitted_len = draft_len
-                    outputs[row] = draft_token_chains[local_row]
+                    outputs[row] = target_token_rows[idx][:draft_len]
                 else:
                     stats["bonus_tokens"] += 1
                     emitted_len = draft_len + 1
-                    outputs[row] = draft_token_chains[local_row] + [bonus_tokens[idx]]
+                    outputs[row] = target_token_rows[idx][:draft_len] + [bonus_tokens[idx]]
             else:
                 if not forced_reject_probe:
                     stats["drafts_rejected"] += 1
@@ -8556,6 +8697,45 @@ class CanonicalModelRunner:
                     rejected_lookahead_rows.append(row)
                     rejected_lookahead_targets.append(int(target_tokens[idx]))
 
+            if profile_mtp:
+                _draft_debug, debug_events = self._mtp1_debug_state()
+                emitted_debug = outputs.get(row, [])
+                if not isinstance(emitted_debug, list):
+                    emitted_debug = [emitted_debug]
+                debug_events.append(
+                    {
+                        "kind": "mtp_k_commit",
+                        "seq_id": int(seq.seq_id),
+                        "row": int(row),
+                        "verifier_row": int(idx),
+                        "verifier_mode": str(verifier_mode),
+                        "seq_tokens": int(seq.num_tokens),
+                        "completion_tokens": int(seq.num_completion_tokens),
+                        "draft_chain": [
+                            _debug_token_value(token)
+                            for token in draft_token_chains[local_row]
+                        ],
+                        "target_row": [
+                            int(token)
+                            for token in target_token_rows[idx][:draft_len]
+                        ],
+                        "bonus_token": int(bonus_tokens[idx]),
+                        "accepted": [
+                            bool(value)
+                            for value in (
+                                accepted_matrix[idx]
+                                if draft_len > 1
+                                else [accepted_flags[idx]]
+                            )
+                        ],
+                        "prefix_len": int(prefix_len),
+                        "emitted": [
+                            _debug_token_value(token)
+                            for token in emitted_debug
+                        ],
+                    }
+                )
+
             emitted_bonus = accepted and not disable_bonus
             if draft_len == 1:
                 # The rejected-row next-draft invariant is not proven for K=1:
@@ -8569,7 +8749,13 @@ class CanonicalModelRunner:
                 seed_rejected_k1 = seed_rejected_k1 or bool(use_generic_k_verifier)
                 can_seed_next_chain = seed_after_bonus and (accepted or seed_rejected_k1)
             else:
-                can_seed_next_chain = prefix_len < draft_len or seed_after_bonus
+                seed_partial_k = os.environ.get(
+                    "NANO_VLLM_JAX_MTP_SEED_PARTIAL_K",
+                    "0",
+                ) in {"1", "true", "yes", "on", "True"}
+                can_seed_next_chain = (accepted and seed_after_bonus) or (
+                    seed_partial_k and prefix_len < draft_len
+                )
             if (
                 self.mtp1_enabled
                 and seq.temperature == 0
