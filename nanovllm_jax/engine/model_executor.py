@@ -8488,6 +8488,7 @@ class ModelExecutor:
         mtp_hidden_final_normed: bool,
         mtp_chain_return_normed: bool = False,
         mtp_chain_mode: str = "recursive",
+        verify_mode: str | None = None,
     ) -> MTP1GreedyOutput:
         """Greedy speculative verifier for a fixed-length MTP draft chain.
 
@@ -8508,10 +8509,14 @@ class ModelExecutor:
             raise ValueError("draft_tokens must contain at least one draft token")
         self._log_step("mtp_k_decode_greedy_step_jit", batch, return_hidden=True, last_logits_only=False)
         self._validate_batch_contract(batch)
-        verify_mode = os.environ.get(
-            "NANO_VLLM_JAX_MTP_K_VERIFY_MODE",
-            "decode",
-        ).strip().lower()
+        verify_mode = (
+            str(verify_mode).strip().lower()
+            if verify_mode is not None
+            else os.environ.get(
+                "NANO_VLLM_JAX_MTP_K_VERIFY_MODE",
+                "decode",
+            ).strip().lower()
+        )
         if verify_mode in {"packed_prefill", "prefill_packed"}:
             verify_mode = "prefill"
         if verify_mode not in {"decode", "prefill"}:
@@ -8914,6 +8919,37 @@ class ModelExecutor:
             compact_summary=compact_summary,
             debug_payload=debug_payload,
             burst_groups=1,
+        )
+
+    def mtp_k_packed_prefix_greedy_step_jit(
+        self,
+        batch: ScheduledBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state: HybridLayerState,
+        draft_tokens: jnp.ndarray,
+        next_mtp_position: jnp.ndarray,
+        mtp_hidden_final_normed: bool,
+        mtp_chain_return_normed: bool = False,
+        mtp_chain_mode: str = "recursive",
+    ) -> MTP1GreedyOutput:
+        """K-token verifier using one packed prefill-shaped target pass.
+
+        This is the explicit config-owned route for `mtp_verifier_impl=packed_prefix`.
+        It intentionally does not depend on `NANO_VLLM_JAX_MTP_K_VERIFY_MODE`.
+        Under strict GDN no-fallback policy it will fail until the packed-prefix
+        GDN verifier can return prefix states without the slow recurrent fallback.
+        """
+        return self.mtp_k_decode_greedy_step_jit(
+            batch,
+            cache_storage=cache_storage,
+            hybrid_state=hybrid_state,
+            draft_tokens=draft_tokens,
+            next_mtp_position=next_mtp_position,
+            mtp_hidden_final_normed=mtp_hidden_final_normed,
+            mtp_chain_return_normed=mtp_chain_return_normed,
+            mtp_chain_mode=mtp_chain_mode,
+            verify_mode="prefill",
         )
 
     def mtp_k_burst_greedy_step_jit(

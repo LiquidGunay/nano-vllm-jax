@@ -64,7 +64,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--speculative-method", choices=["none", "mtp"], default="none")
     parser.add_argument("--draft-sample-method", choices=["greedy", "probabilistic"], default="greedy")
-    parser.add_argument("--mtp-verifier-impl", choices=["two_decode", "commit_select", "k_decode"], default="two_decode")
+    parser.add_argument(
+        "--mtp-verifier-impl",
+        choices=["two_decode", "commit_select", "k_decode", "packed_prefix"],
+        default="two_decode",
+    )
     parser.add_argument("--mtp-batch-accept-policy", choices=["rowwise", "all_or_none"], default="rowwise")
     parser.add_argument("--mtp-seed-after-bonus", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--mtp-bonus-margin", type=float, default=0.0)

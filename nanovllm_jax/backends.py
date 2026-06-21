@@ -758,7 +758,8 @@ class InferenceBackend(Protocol):
         initial_state: jnp.ndarray | None,
         use_qk_l2norm_in_kernel: bool,
         max_row_tokens: int | None = None,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        return_prefix_state: bool = False,
+    ) -> tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         ...
 
     def gated_delta_decode(
@@ -2157,7 +2158,8 @@ class PureJAXBackend:
         initial_state: jnp.ndarray | None,
         use_qk_l2norm_in_kernel: bool,
         max_row_tokens: int | None = None,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        return_prefix_state: bool = False,
+    ) -> tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         impl = _gdn_prefill_post_conv_impl(self.config)
         if impl == "off":
             raise RuntimeError(
@@ -2199,7 +2201,7 @@ class PureJAXBackend:
             config=self.config,
         )
 
-        def reference_scan() -> tuple[jnp.ndarray, jnp.ndarray]:
+        def reference_scan() -> tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
             token_positions = jnp.arange(token_bucket, dtype=jnp.int32)
             cu = query_start_loc.astype(jnp.int32)
             row_ids = jnp.sum(
@@ -2227,9 +2229,9 @@ class PureJAXBackend:
                 next_row_state = jnp.where(valid, next_row_state, previous_row_state)
                 state = state.at[row].set(next_row_state)
                 out_t = jnp.where(valid, out_t, jnp.zeros_like(out_t))
-                return state, out_t
+                return state, (out_t, next_row_state)
 
-            final_state, output_tokens = jax.lax.scan(
+            final_state, (output_tokens, prefix_states) = jax.lax.scan(
                 recurrent_scan,
                 initial_state.astype(jnp.float32),
                 (
@@ -2243,6 +2245,8 @@ class PureJAXBackend:
                 ),
             )
             output = _cast_gdn_prefill_post_conv_output(output_tokens, self.config)
+            if return_prefix_state:
+                return output[None, :, :, :], final_state, prefix_states
             return output[None, :, :, :], final_state
 
         if impl in {
@@ -2277,6 +2281,50 @@ class PureJAXBackend:
                 self.config,
             )
             return reference_scan()
+
+        if return_prefix_state:
+            if max_row_tokens is None:
+                _raise_if_gdn_fallback_disabled(
+                    "Packed-prefix GDN verifier requires static max_row_tokens",
+                    self.config,
+                )
+                return reference_scan()
+            if int(max_row_tokens) > 16:
+                _raise_if_gdn_fallback_disabled(
+                    "Packed-prefix GDN verifier requires max_row_tokens <= 16",
+                    self.config,
+                )
+                return reference_scan()
+            try:
+                from nanovllm_jax.kernels.gdn_fla_triton import (
+                    gdn_packed_prefix_state_triton,
+                )
+            except (ImportError, ModuleNotFoundError, AttributeError):
+                gdn_packed_prefix_state_triton = None
+            if gdn_packed_prefix_state_triton is None:
+                _raise_if_gdn_fallback_disabled(
+                    "Tiny packed-prefix GDN kernel is unavailable",
+                    self.config,
+                )
+                return reference_scan()
+            output, final_state, prefix_states = gdn_packed_prefix_state_triton(
+                packed_query,
+                packed_key,
+                packed_value,
+                packed_gate,
+                packed_beta,
+                query_start_loc.astype(jnp.int32),
+                initial_state.astype(jnp.float32),
+                max_row_tokens=int(max_row_tokens),
+            )
+            output = jnp.where(valid_tokens[:, None, None], output, 0.0)
+            output = _cast_gdn_prefill_post_conv_output(output, self.config)
+            prefix_states = jnp.where(
+                valid_tokens[:, None, None, None],
+                prefix_states,
+                0.0,
+            )
+            return output[None, :, :, :], final_state, prefix_states
 
         chunk_indices, chunk_offsets, max_row_chunks = (
             _static_packed_gdn_chunk_metadata(

@@ -359,6 +359,31 @@ class _FakeExecutor:
             burst_groups=1,
         )
 
+    def mtp_k_packed_prefix_greedy_step_jit(
+        self,
+        batch,
+        *,
+        cache_storage,
+        hybrid_state,
+        draft_tokens,
+        next_mtp_position,
+        mtp_hidden_final_normed,
+        mtp_chain_return_normed=False,
+        mtp_chain_mode="recursive",
+    ):
+        output = self.mtp_k_decode_greedy_step_jit(
+            batch,
+            cache_storage=cache_storage,
+            hybrid_state=hybrid_state,
+            draft_tokens=draft_tokens,
+            next_mtp_position=next_mtp_position,
+            mtp_hidden_final_normed=mtp_hidden_final_normed,
+            mtp_chain_return_normed=mtp_chain_return_normed,
+            mtp_chain_mode=mtp_chain_mode,
+        )
+        self.calls[-1]["method"] = "mtp_k_packed_prefix"
+        return output
+
     def forward_step_token_ids_mtp_draft_chain_jit(
         self,
         batch,
@@ -1515,6 +1540,55 @@ def test_generic_k_compacts_partial_physical_rows(monkeypatch):
         row: _resolve_output_tokens(value)
         for row, value in runner.mtp_output_carry[2].items()
     } == {0: [10, 101]}
+
+
+def test_packed_prefix_uses_explicit_verifier_route(monkeypatch):
+    seq_lens = [5, 7]
+    executor = _FakeExecutor(
+        accepted=[[True, False], [False, False]],
+        target=[[10, 101], [201, 202]],
+        bonus=[20, 21],
+        next_draft=[[30, 31], [40, 41]],
+        state_marker=[901, 910],
+        committed_seq_lens=[6, 7],
+        kv_slots=[
+            [1000, 1001, 1002],
+            [1010, 2011, 2012],
+        ],
+    )
+    runner = _FakeRunner(
+        executor,
+        {0: [10, 11], 1: [99, 98]},
+        block_size=16,
+        num_speculative_tokens=2,
+    )
+    runner.mtp_verifier_impl = "packed_prefix"
+    seqs = [_seq(i, seq_lens[i]) for i in range(2)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_FORCE_GENERIC_K", raising=False)
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "1")
+
+    outputs = ModelRunner._run_mtp1_batched(
+        runner,
+        seqs,
+        _batch(seq_lens),
+        [0, 1],
+    )
+
+    assert {row: _resolve_output_tokens(value) for row, value in outputs.items()} == {
+        0: [10, 101],
+        1: [201],
+    }
+    assert runner.executor.calls[-1]["method"] == "mtp_k_packed_prefix"
+    assert runner.executor.calls[-1]["draft_tokens"] == [[10, 11], [99, 98]]
+    assert runner.stats == {
+        "drafts_proposed": 4,
+        "drafts_accepted": 1,
+        "drafts_rejected": 2,
+        "bonus_tokens": 0,
+    }
 
 
 def test_generic_k1_rejected_prefix_seeds_next_draft(monkeypatch):

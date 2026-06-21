@@ -78,6 +78,13 @@ def test_speculative_config_rejects_k_gt_1_without_true_k_verifier():
     )
     assert config.mtp_verifier_impl == "commit_select"
 
+    packed = Qwen3_5Config(
+        speculative_method="mtp",
+        num_speculative_tokens=2,
+        mtp_verifier_impl="packed_prefill",
+    )
+    assert packed.mtp_verifier_impl == "packed_prefix"
+
     with pytest.raises(ValueError, match="K>1 requires mtp_verifier_impl='k_decode'"):
         Qwen3_5Config(
             speculative_method="mtp",
@@ -610,7 +617,7 @@ def test_mtp_experimental_config_is_exact_k2_and_separate(monkeypatch):
     assert loaded.engine["speculative_method"] == "mtp"
     assert loaded.engine["num_speculative_tokens"] == 2
     assert loaded.engine["draft_sample_method"] == "greedy"
-    assert loaded.engine["mtp_verifier_impl"] == "commit_select"
+    assert loaded.engine["mtp_verifier_impl"] == "packed_prefix"
     assert loaded.engine["mtp_chain_hidden_source"] == "final_normed"
     assert loaded.engine["mtp_chain_mode"] == "sequence"
     assert loaded.engine["mtp_prefill_seed"] is False

@@ -2018,10 +2018,18 @@ def gated_deltanet_block(
                 0,
                 seq_len - 1,
             )
+            packed_prefix_state_post_conv = (
+                return_prefix_state
+                and not return_first_prefix_state
+                and use_cached_prefill
+                and int(getattr(config, "num_speculative_tokens", 0) or 0) > 0
+                and row_query_len
+                <= max(1, int(getattr(config, "num_speculative_tokens", 0) or 0) + 1)
+            )
             use_packed_post_conv_prefill = (
                 gdn_prefill_post_conv_enabled(config)
-                and not use_recurrent_prefill
-                and not return_prefix_state
+                and (not use_recurrent_prefill or packed_prefix_state_post_conv)
+                and (not return_prefix_state or packed_prefix_state_post_conv)
                 and not return_first_prefix_state
             )
             if (
@@ -2031,10 +2039,10 @@ def gated_deltanet_block(
                 reasons = []
                 if not gdn_prefill_post_conv_enabled(config):
                     reasons.append("packed post-conv prefill kernel is disabled")
-                if use_recurrent_prefill:
+                if use_recurrent_prefill and not packed_prefix_state_post_conv:
                     reasons.append("recurrent prefill is requested")
-                if return_prefix_state:
-                    reasons.append("return_prefix_state needs state-sequence output")
+                if return_prefix_state and not packed_prefix_state_post_conv:
+                    reasons.append("return_prefix_state needs a kernel-backed tiny prefix output")
                 if return_first_prefix_state:
                     reasons.append("return_first_prefix_state needs prefix-state output")
                 if not reasons:
@@ -2086,8 +2094,9 @@ def gated_deltanet_block(
                     dtype=jnp.float32,
                 )
             )
+            flat_prefix_recurrent_state = None
             if use_packed_post_conv_prefill:
-                core_attn_out, final_state = backend.gated_delta_packed_prefill_post_conv(
+                post_conv_result = backend.gated_delta_packed_prefill_post_conv(
                     conv_out,
                     a,
                     b,
@@ -2101,8 +2110,13 @@ def gated_deltanet_block(
                     chunk_size=config.linear_chunk_size,
                     initial_state=initial_recurrent,
                     use_qk_l2norm_in_kernel=config.use_qk_norm_in_gdn,
-                    max_row_tokens=max_row_tokens,
+                    max_row_tokens=row_query_len if return_prefix_state else max_row_tokens,
+                    return_prefix_state=return_prefix_state,
                 )
+                if return_prefix_state:
+                    core_attn_out, final_state, flat_prefix_recurrent_state = post_conv_result
+                else:
+                    core_attn_out, final_state = post_conv_result
                 core_attn_out = core_attn_out.astype(dtype)
             else:
                 query = conv_out[:, :, :key_dim].reshape(
@@ -2169,75 +2183,78 @@ def gated_deltanet_block(
                 )
                 core_attn_out = recurrent_out_tokens[None, :, :, :].astype(dtype)
                 if return_prefix_state or return_first_prefix_state:
-                    prefix_recurrent_rows = recurrent_state_tokens[safe_token_indices_by_row]
-                    prefix_recurrent_rows = jnp.where(
-                        valid_queries_by_row[
-                            :,
-                            :,
-                            None,
-                            None,
-                            None,
-                        ],
-                        prefix_recurrent_rows,
-                        initial_recurrent[:, None, :, :, :],
-                    )
-                    prefix_recurrent_state_single = (
-                        prefix_recurrent_rows
-                        if return_prefix_state
-                        else prefix_recurrent_rows[:, 0]
-                    )
-                    mixed_rows = mixed_qkv[0][safe_token_indices_by_row]
-                    mixed_rows = jnp.where(
-                        valid_queries_by_row[:, :, None],
-                        mixed_rows,
-                        0.0,
-                    )
-                    conv_input_by_row = jnp.concatenate(
-                        [
-                            initial_conv_state.astype(mixed_qkv.dtype),
-                            mixed_rows.transpose(0, 2, 1),
-                        ],
-                        axis=-1,
-                    )
-                    kernel_size = config.linear_conv_kernel_size
-                    gather_starts = row_offsets + 1
-                    gather_idx = gather_starts[:, None] + jnp.arange(
+                    flat_prefix_recurrent_state = recurrent_state_tokens
+
+            if (return_prefix_state or return_first_prefix_state) and flat_prefix_recurrent_state is not None:
+                prefix_recurrent_rows = flat_prefix_recurrent_state[safe_token_indices_by_row]
+                prefix_recurrent_rows = jnp.where(
+                    valid_queries_by_row[
+                        :,
+                        :,
+                        None,
+                        None,
+                        None,
+                    ],
+                    prefix_recurrent_rows,
+                    initial_recurrent[:, None, :, :, :],
+                )
+                prefix_recurrent_state_single = (
+                    prefix_recurrent_rows
+                    if return_prefix_state
+                    else prefix_recurrent_rows[:, 0]
+                )
+                mixed_rows = mixed_qkv[0][safe_token_indices_by_row]
+                mixed_rows = jnp.where(
+                    valid_queries_by_row[:, :, None],
+                    mixed_rows,
+                    0.0,
+                )
+                conv_input_by_row = jnp.concatenate(
+                    [
+                        initial_conv_state.astype(mixed_qkv.dtype),
+                        mixed_rows.transpose(0, 2, 1),
+                    ],
+                    axis=-1,
+                )
+                kernel_size = config.linear_conv_kernel_size
+                gather_starts = row_offsets + 1
+                gather_idx = gather_starts[:, None] + jnp.arange(
+                    kernel_size,
+                    dtype=jnp.int32,
+                )[None, :]
+                gather_idx = jnp.broadcast_to(
+                    gather_idx[None, :, None, :],
+                    (
+                        row_count,
+                        row_query_len,
+                        conv_dim,
                         kernel_size,
-                        dtype=jnp.int32,
-                    )[None, :]
-                    gather_idx = jnp.broadcast_to(
-                        gather_idx[None, :, None, :],
-                        (
-                            row_count,
-                            row_query_len,
-                            conv_dim,
-                            kernel_size,
-                        ),
-                    )
-                    conv_input_expanded = jnp.broadcast_to(
-                        conv_input_by_row[:, None, :, :],
-                        (
-                            row_count,
-                            row_query_len,
-                            conv_dim,
-                            conv_input_by_row.shape[-1],
-                        ),
-                    )
-                    prefix_conv_rows = jnp.take_along_axis(
-                        conv_input_expanded,
-                        gather_idx,
-                        axis=3,
-                    )
-                    prefix_conv_rows = jnp.where(
-                        valid_queries_by_row[:, :, None, None],
-                        prefix_conv_rows,
-                        initial_conv_state[:, None, :, :],
-                    )
-                    prefix_layer_conv_state = (
-                        prefix_conv_rows.astype(dtype)
-                        if return_prefix_state
-                        else prefix_conv_rows[:, 0].astype(dtype)
-                    )
+                    ),
+                )
+                conv_input_expanded = jnp.broadcast_to(
+                    conv_input_by_row[:, None, :, :],
+                    (
+                        row_count,
+                        row_query_len,
+                        conv_dim,
+                        conv_input_by_row.shape[-1],
+                    ),
+                )
+                prefix_conv_rows = jnp.take_along_axis(
+                    conv_input_expanded,
+                    gather_idx,
+                    axis=3,
+                )
+                prefix_conv_rows = jnp.where(
+                    valid_queries_by_row[:, :, None, None],
+                    prefix_conv_rows,
+                    initial_conv_state[:, None, :, :],
+                )
+                prefix_layer_conv_state = (
+                    prefix_conv_rows.astype(dtype)
+                    if return_prefix_state
+                    else prefix_conv_rows[:, 0].astype(dtype)
+                )
 
             if (
                 hybrid_state is not None

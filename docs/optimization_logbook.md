@@ -13563,3 +13563,38 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     no-MTP control in the smoke, and the first full hetero8 server-style
     attempt timed out compiling before this env/config fix. Continue from this
     boundary and attack verifier GPU work/compile surface next.
+
+#### Entry 318 - Packed-Prefix MTP Verifier Route
+
+- date: 2026-06-21
+- trigger:
+  - sequential K-token verification cannot be the MTP speed path because it
+    pays K target decode calls; user asked to borrow the prefill-shaped path so
+    verification runs as one packed target pass.
+- implementation:
+  - added `mtp_verifier_impl=packed_prefix` as an explicit server config route;
+  - routed warmup and measurement through
+    `mtp_k_packed_prefix_greedy_step_jit`, independent of
+    `NANO_VLLM_JAX_MTP_K_VERIFY_MODE`;
+  - allowed the packed prefill GDN post-conv path to return every short-prefix
+    recurrent state for MTP verification;
+  - added a tiny Triton packed-prefix GDN state kernel for rows up to 16 tokens,
+    intended for `[current, draft_1..draft_K]` verifier rows rather than long
+    prefill;
+  - kept strict no-fallback behavior: if the tiny prefix kernel is unavailable
+    or the row bound is too large, the route errors instead of silently using
+    the slow recurrent scan.
+- validation:
+  - direct CUDA synthetic comparison of the tiny Triton prefix-state kernel
+    against the reference recurrence matched output, final state, and per-token
+    prefix states with max abs error below `1e-8`;
+  - `python -m pytest tests/test_server_config.py tests/test_mtp_commit_semantics.py tests/test_benchmark_random_request_sidecar.py -q`:
+    `72 passed, 1 xfailed`;
+  - guarded sidecar smoke artifact:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_packed_prefix_20260621/jax_packed_prefix_smoke.json`.
+- smoke result:
+  - route compiled and ran through strict GDN no-fallback without the previous
+    `return_prefix_state` recurrent-scan error;
+  - JIT-cache audit stayed flat during measurement (`growth_during_measurement=0`);
+  - generated `4` tokens on a single 16-token prompt. This is only a route
+    validation smoke, not a throughput claim.

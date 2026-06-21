@@ -2143,8 +2143,14 @@ class CanonicalModelRunner:
                     mtp_verifier_impl = str(
                         getattr(self, "mtp_verifier_impl", "two_decode") or "two_decode"
                     ).lower()
+                    use_packed_prefix_warmup = mtp_verifier_impl in {
+                        "packed_prefix",
+                        "packed_prefill",
+                        "prefill_packed",
+                    }
                     use_generic_k_warmup = (
                         mtp_verifier_impl in {"k_decode", "generic_k", "expanded"}
+                        or use_packed_prefix_warmup
                         or os.environ.get(
                             "NANO_VLLM_JAX_MTP_FORCE_GENERIC_K",
                             "0",
@@ -2234,13 +2240,18 @@ class CanonicalModelRunner:
                         and use_generic_k_warmup
                         and (
                             hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
+                            or hasattr(self.executor, "mtp_k_packed_prefix_greedy_step_jit")
                             or (
                                 mtp_burst_groups > 1
                                 and hasattr(self.executor, "mtp_k_burst_greedy_step_jit")
                             )
                         )
                     ):
-                        if mtp_burst_groups > 1 and hasattr(self.executor, "mtp_k_burst_greedy_step_jit"):
+                        if (
+                            mtp_burst_groups > 1
+                            and not use_packed_prefix_warmup
+                            and hasattr(self.executor, "mtp_k_burst_greedy_step_jit")
+                        ):
                             burst_output = self.executor.mtp_k_burst_greedy_step_jit(
                                 batch,
                                 cache_storage=self.cache_storage,
@@ -2256,7 +2267,13 @@ class CanonicalModelRunner:
                                 burst_output,
                                 "mtp_k_burst_greedy_step_jit:decode",
                             )
-                        output = self.executor.mtp_k_decode_greedy_step_jit(
+                        verifier_method = (
+                            self.executor.mtp_k_packed_prefix_greedy_step_jit
+                            if use_packed_prefix_warmup
+                            and hasattr(self.executor, "mtp_k_packed_prefix_greedy_step_jit")
+                            else self.executor.mtp_k_decode_greedy_step_jit
+                        )
+                        output = verifier_method(
                             batch,
                             cache_storage=self.cache_storage,
                             hybrid_state=mtp_hybrid_state,
@@ -2266,7 +2283,12 @@ class CanonicalModelRunner:
                             mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
                             mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                         )
-                        _record_decode_warmup(output, "mtp_k_decode_greedy_step_jit:decode")
+                        _record_decode_warmup(
+                            output,
+                            "mtp_k_packed_prefix_greedy_step_jit:decode"
+                            if use_packed_prefix_warmup
+                            else "mtp_k_decode_greedy_step_jit:decode",
+                        )
                         warmed_mtp_k_decode = True
                     elif draft_len == 1:
                         warmed_exact_table = False
@@ -2397,13 +2419,27 @@ class CanonicalModelRunner:
                         _record_decode_warmup(output, "mtp2_commit_select_greedy_step_jit:decode")
                     elif (
                         hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
+                        or hasattr(self.executor, "mtp_k_packed_prefix_greedy_step_jit")
                         or (
                             mtp_burst_groups > 1
+                            and not use_packed_prefix_warmup
                             and hasattr(self.executor, "mtp_k_burst_greedy_step_jit")
                         )
                     ):
-                        if mtp_burst_groups <= 1 and hasattr(self.executor, "mtp_k_decode_greedy_step_jit"):
-                            output = self.executor.mtp_k_decode_greedy_step_jit(
+                        if (
+                            mtp_burst_groups <= 1
+                            and (
+                                hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
+                                or hasattr(self.executor, "mtp_k_packed_prefix_greedy_step_jit")
+                            )
+                        ):
+                            verifier_method = (
+                                self.executor.mtp_k_packed_prefix_greedy_step_jit
+                                if use_packed_prefix_warmup
+                                and hasattr(self.executor, "mtp_k_packed_prefix_greedy_step_jit")
+                                else self.executor.mtp_k_decode_greedy_step_jit
+                            )
+                            output = verifier_method(
                                 batch,
                                 cache_storage=self.cache_storage,
                                 hybrid_state=mtp_hybrid_state,
@@ -2413,10 +2449,16 @@ class CanonicalModelRunner:
                                 mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
                                 mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                             )
-                            _record_decode_warmup(output, "mtp_k_decode_greedy_step_jit:decode")
+                            _record_decode_warmup(
+                                output,
+                                "mtp_k_packed_prefix_greedy_step_jit:decode"
+                                if use_packed_prefix_warmup
+                                else "mtp_k_decode_greedy_step_jit:decode",
+                            )
                             warmed_mtp_k_decode = True
                         if (
                             mtp_burst_groups > 1
+                            and not use_packed_prefix_warmup
                             and hasattr(self.executor, "mtp_k_burst_greedy_step_jit")
                         ):
                             burst_output = self.executor.mtp_k_burst_greedy_step_jit(
@@ -2436,11 +2478,14 @@ class CanonicalModelRunner:
                             )
                     if (
                         draft_len > 1
-                        and use_generic_k_warmup
-                        and mtp_burst_groups <= 1
-                        and int(batch_size) > 1
-                        and hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
-                    ):
+                            and use_generic_k_warmup
+                            and mtp_burst_groups <= 1
+                            and int(batch_size) > 1
+                            and (
+                                hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
+                                or hasattr(self.executor, "mtp_k_packed_prefix_greedy_step_jit")
+                            )
+                        ):
                         for compact_rows in range(1, int(batch_size)):
                             compact_batch = self._compact_decode_batch(
                                 batch,
@@ -2456,7 +2501,13 @@ class CanonicalModelRunner:
                                 2,
                                 dtype=jnp.int32,
                             )
-                            compact_output = self.executor.mtp_k_decode_greedy_step_jit(
+                            verifier_method = (
+                                self.executor.mtp_k_packed_prefix_greedy_step_jit
+                                if use_packed_prefix_warmup
+                                and hasattr(self.executor, "mtp_k_packed_prefix_greedy_step_jit")
+                                else self.executor.mtp_k_decode_greedy_step_jit
+                            )
+                            compact_output = verifier_method(
                                 compact_batch,
                                 cache_storage=self.cache_storage,
                                 hybrid_state=compact_hybrid_state,
@@ -2471,7 +2522,12 @@ class CanonicalModelRunner:
                             )
                             _record_decode_warmup(
                                 compact_output,
-                                f"mtp_k_decode_greedy_step_jit:decode-compact-{compact_rows}",
+                                (
+                                    "mtp_k_packed_prefix_greedy_step_jit"
+                                    if use_packed_prefix_warmup
+                                    else "mtp_k_decode_greedy_step_jit"
+                                )
+                                + f":decode-compact-{compact_rows}",
                             )
                     if (
                         draft_len > 1
@@ -6919,6 +6975,11 @@ class CanonicalModelRunner:
         draft_token_chains = [chain[:draft_len] for chain in draft_chains]
         draft_tokens = [chain[0] for chain in draft_token_chains]
         verifier_impl = str(getattr(self, "mtp_verifier_impl", "two_decode") or "two_decode")
+        use_packed_prefix_verifier = verifier_impl in {
+            "packed_prefix",
+            "packed_prefill",
+            "prefill_packed",
+        }
         force_generic_k_verifier = os.environ.get(
             "NANO_VLLM_JAX_MTP_FORCE_GENERIC_K",
             "0",
@@ -6926,6 +6987,7 @@ class CanonicalModelRunner:
         use_generic_k_verifier = (
             force_generic_k_verifier
             or verifier_impl in {"k_decode", "generic_k", "expanded"}
+            or use_packed_prefix_verifier
         )
         compact_verifier_enabled = (
             os.environ.get("NANO_VLLM_JAX_MTP_COMPACT_VERIFIER", "1")
@@ -6948,13 +7010,16 @@ class CanonicalModelRunner:
                     draft_len == 2
                     and hasattr(self.executor, "mtp2_commit_select_greedy_step_jit")
                 )
-                or (
-                    draft_len > 1
-                    and use_generic_k_verifier
-                    and hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
+                    or (
+                        draft_len > 1
+                        and use_generic_k_verifier
+                        and (
+                            hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
+                            or hasattr(self.executor, "mtp_k_packed_prefix_greedy_step_jit")
+                        )
+                    )
                 )
             )
-        )
         if use_compact_verifier:
             decode_batch = self._compact_decode_batch(batch, rows)
         elif rows == list(range(physical_batch_size)):
@@ -7189,6 +7254,7 @@ class CanonicalModelRunner:
             mtp_burst_groups > 1
             and (draft_len > 1 or use_generic_k_verifier)
             and not use_mtp2_commit_select
+            and not use_packed_prefix_verifier
             and verifier_full_physical_batch
             and all(
                 seq.num_completion_tokens + burst_emit_tokens <= seq.max_tokens
@@ -7285,6 +7351,8 @@ class CanonicalModelRunner:
                 verifier_mode = "mtp2_commit_select"
             elif use_k_burst:
                 verifier_mode = "mtp_k_burst"
+            elif use_packed_prefix_verifier:
+                verifier_mode = "mtp_k_packed_prefix"
             elif draft_len == 1 and not use_generic_k_verifier:
                 verifier_mode = "fallback_k1_no_verifier"
             elif partial_physical_batch and not use_compact_verifier:
@@ -7462,6 +7530,24 @@ class CanonicalModelRunner:
             )
             _ready(output)
             t_profile = _mark("executor_mtp2_commit_select", t_profile)
+        elif use_packed_prefix_verifier:
+            if not hasattr(self.executor, "mtp_k_packed_prefix_greedy_step_jit"):
+                raise RuntimeError(
+                    "mtp_verifier_impl=packed_prefix requires "
+                    "executor.mtp_k_packed_prefix_greedy_step_jit"
+                )
+            output = self.executor.mtp_k_packed_prefix_greedy_step_jit(
+                decode_batch,
+                cache_storage=self.cache_storage,
+                hybrid_state=hybrid_state,
+                draft_tokens=_verifier_draft_token_chains_device(),
+                next_mtp_position=_next_mtp_positions_device(),
+                mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
+                mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
+                mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
+            )
+            _ready(output)
+            t_profile = _mark("executor_mtp_k_packed_prefix", t_profile)
         elif use_k_burst:
             output = self.executor.mtp_k_burst_greedy_step_jit(
                 decode_batch,

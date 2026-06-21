@@ -1822,6 +1822,178 @@ def _gdn_packed_decode_kernel(
 
 
 @triton.jit
+def _gdn_packed_prefix_state_kernel(
+    query,
+    key,
+    value,
+    gate,
+    beta,
+    cu_seqlens,
+    initial_state,
+    out,
+    final_state,
+    prefix_state,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    SCALE: tl.constexpr,
+    FULL_K: tl.constexpr,
+    FULL_V: tl.constexpr,
+):
+    i_v = tl.program_id(0)
+    row = tl.program_id(1)
+    head = tl.program_id(2)
+
+    offs_k = tl.arange(0, BK)
+    offs_v = i_v * BV + tl.arange(0, BV)
+    mask_k = offs_k < K
+    mask_v = offs_v < V
+    mask_state = mask_v[:, None] & mask_k[None, :]
+
+    row_start = tl.load(cu_seqlens + row).to(tl.int32)
+    row_end = tl.load(cu_seqlens + row + 1).to(tl.int32)
+    row_len = row_end - row_start
+
+    p_state = initial_state + ((row * H + head) * V * K)
+    h = tl.load(
+        p_state + offs_v[:, None] * K + offs_k[None, :],
+        mask=mask_state,
+        other=0.0,
+    ).to(tl.float32)
+
+    for t in range(BLOCK_T):
+        token_valid = t < row_len
+        token_idx = row_start + t
+
+        q = tl.load(
+            query + (token_idx * H + head) * K + offs_k,
+            mask=token_valid & mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        k = tl.load(
+            key + (token_idx * H + head) * K + offs_k,
+            mask=token_valid & mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        v = tl.load(
+            value + (token_idx * H + head) * V + offs_v,
+            mask=token_valid & mask_v,
+            other=0.0,
+        ).to(tl.float32)
+        gate_val = tl.load(
+            gate + token_idx * H + head,
+            mask=token_valid,
+            other=0.0,
+        ).to(tl.float32)
+        beta_val = tl.load(
+            beta + token_idx * H + head,
+            mask=token_valid,
+            other=0.0,
+        ).to(tl.float32)
+
+        h = h * tl.exp(gate_val)
+        q = q * SCALE
+        kv_mem = tl.sum(h * k[None, :], axis=1)
+        state_dot_q = tl.sum(h * q[None, :], axis=1)
+        qk_dot = tl.sum(q * k, axis=0)
+        delta = (v - kv_mem) * beta_val
+        o = state_dot_q + delta * qk_dot
+        h = h + delta[:, None] * k[None, :]
+
+        p_out = out + (token_idx * H + head) * V + offs_v
+        tl.store(p_out, o, mask=token_valid & mask_v)
+
+        p_prefix = prefix_state + (token_idx * H + head) * V * K
+        tl.store(
+            p_prefix + offs_v[:, None] * K + offs_k[None, :],
+            h,
+            mask=token_valid & mask_state,
+        )
+
+    p_final = final_state + ((row * H + head) * V * K)
+    tl.store(
+        p_final + offs_v[:, None] * K + offs_k[None, :],
+        h,
+        mask=mask_state,
+    )
+
+
+def gdn_packed_prefix_state_triton(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    gate: jax.Array,
+    beta: jax.Array,
+    cu_seqlens: jax.Array,
+    initial_state: jax.Array,
+    *,
+    max_row_tokens: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Tiny packed GDN verifier kernel returning every token prefix state."""
+
+    if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+        raise ValueError("query/key/value must have shape [tokens, value_heads, dim]")
+    if query.shape != key.shape:
+        raise ValueError("query and key shapes must match")
+    if query.shape[:2] != value.shape[:2]:
+        raise ValueError("value token/head dimensions must match query")
+    if gate.shape != query.shape[:2] or beta.shape != query.shape[:2]:
+        raise ValueError("gate and beta must have shape [tokens, value_heads]")
+    if initial_state.ndim != 4:
+        raise ValueError("initial_state must have shape [rows, value_heads, value_dim, key_dim]")
+    if initial_state.shape[1] != query.shape[1]:
+        raise ValueError("initial_state head count must match query")
+
+    token_count, value_heads, key_dim = query.shape
+    value_dim = value.shape[2]
+    row_count = int(cu_seqlens.shape[0]) - 1
+    if initial_state.shape != (row_count, value_heads, value_dim, key_dim):
+        raise ValueError("initial_state shape must match cu_seqlens/query/value")
+    if max_row_tokens <= 0:
+        raise ValueError("max_row_tokens must be positive")
+    if max_row_tokens > 16:
+        _raise_if_gdn_fallback_disabled(
+            "Tiny packed-prefix GDN kernel supports max_row_tokens <= 16"
+        )
+        raise ValueError("max_row_tokens must be <= 16 for packed-prefix GDN")
+
+    block_t = int(jt.next_power_of_2(max_row_tokens))
+    block_k = int(jt.next_power_of_2(key_dim))
+    block_v = _decode_triton_block_v(value_dim)
+    out_shape = (
+        jax.ShapeDtypeStruct((token_count, value_heads, value_dim), jnp.float32),
+        jax.ShapeDtypeStruct(initial_state.shape, jnp.float32),
+        jax.ShapeDtypeStruct((token_count, value_heads, value_dim, key_dim), jnp.float32),
+    )
+    return jt.triton_call(
+        query.astype(jnp.float32),
+        key.astype(jnp.float32),
+        value.astype(jnp.float32),
+        gate.astype(jnp.float32),
+        beta.astype(jnp.float32),
+        cu_seqlens.astype(jnp.int32),
+        initial_state.astype(jnp.float32),
+        kernel=_gdn_packed_prefix_state_kernel,
+        out_shape=out_shape,
+        grid=(jt.cdiv(value_dim, block_v), row_count, value_heads),
+        H=int(value_heads),
+        K=int(key_dim),
+        V=int(value_dim),
+        BK=block_k,
+        BV=block_v,
+        BLOCK_T=block_t,
+        SCALE=1.0 / (key_dim**0.5),
+        FULL_K=key_dim == block_k,
+        FULL_V=value_dim % block_v == 0,
+        num_warps=_decode_triton_num_warps(value_dim),
+        num_stages=_decode_triton_num_stages(),
+    )
+
+
+@triton.jit
 def _gdn_packed_decode_raw_gate_kernel(
     mixed_qkv,
     a,

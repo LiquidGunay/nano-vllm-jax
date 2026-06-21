@@ -132,6 +132,13 @@
   still not a speed path: the same short diagnostic improved from `26.13` to
   `57.87 output tok/s` after the guardrail fixes, but the no-MTP control is
   `84.01 output tok/s`.
+  On 2026-06-21 the MTP speed target moved from sequential K=2 `commit_select`
+  to a first-class `mtp_verifier_impl=packed_prefix` route. `commit_select`
+  remains the exact oracle only. The packed-prefix route must verify
+  `[current, draft_1..draft_K]` as one packed prefill-shaped target pass, select
+  accepted-prefix KV/GDN state on device, emit compact token refs, and fail
+  under strict GDN no-fallback until prefix-state output is kernel-backed or
+  otherwise demonstrably faster than sequential decode verification.
   Follow-up exact K>1 GPU diagnostics on 2026-06-14 also failed to produce a
   speed path. The warmup reset fix made K=2 packed-prefill verification
   correctness-clean on the short two-request probe

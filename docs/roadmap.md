@@ -31,17 +31,22 @@ This roadmap is grouped by work type. It is not a production-readiness claim.
 
 ## Optimization
 
-- Active MTP implementation target: promote the true K-token verifier as the
-  next speculative path. K=2 now has an exact strict B=2 smoke with compact-tail
-  row mapping fixed, while K=3 is covered only by focused runner semantics.
-  Do not spend GPU time on K=3 until K=2 draft-position quality improves. Do
-  not rely on `NANO_VLLM_JAX_MTP_FORCE_GENERIC_K`; the server config must
-  select `mtp_verifier_impl=k_decode` and `num_speculative_tokens>1`.
-- True-K verifier contract: draft `[d1..dK]` on device, verify
-  `[current, d1..dK]` in one target pass, compute longest accepted prefix on
-  device, select KV/GDN state at that prefix, emit accepted drafts plus one
-  target recovery/bonus token, seed the next draft chain on device, and return
-  only compact per-row commit metadata to Python.
+- Active MTP implementation target: replace the sequential K-token verifier
+  speed path with a packed-prefix verifier boundary. `commit_select` remains the
+  exact oracle for K=1/K=2 debugging, but it is not a speed target because it
+  still pays separate target decode work. Do not spend GPU time on K=3 until
+  K=2 has a packed-prefix route that beats K=1 and the no-MTP baseline.
+- Packed-prefix verifier contract: draft `[d1..dK]` on device, verify
+  `[current, d1..dK]` as one packed prefill-shaped target pass, compute longest
+  accepted prefix on device, select KV/GDN state at that prefix, emit accepted
+  drafts plus one target recovery/bonus token, seed the next draft chain on
+  device, and return only compact per-row commit metadata to Python.
+- New implementation checkpoint: add `mtp_verifier_impl=packed_prefix` as the
+  explicit config-owned route. It must use packed verifier metadata rather than
+  the `NANO_VLLM_JAX_MTP_K_VERIFY_MODE` env switch, and it must fail clearly
+  when strict GDN no-fallback mode cannot provide prefix states. This route is
+  not promotable until the GDN prefix-state path is kernel-backed or otherwise
+  demonstrably faster than sequential decode verification.
 - Validation order for the promoted true-K route: K=1 equivalence, K=2 B=1
   exact greedy parity, B=2 same-length, B=2 heterogeneous, then only proceed to
   K=3, hetero8, and random-large B=8 after K=2 has evidence that second draft
@@ -73,13 +78,13 @@ This roadmap is grouped by work type. It is not a production-readiness claim.
   lever: on the same smoke, reference/packed-projection and raw-tail Triton GDN
   one-pass were neutral (`22.52-22.60 output tok/s`), while conv-tail Triton
   GDN was much slower (`2.20 output tok/s`).
-- Keep packed-prefill K verifier work diagnostic-only until its verifier logits
-  and accept/reject decisions match the decode verifier. The 2026-06-15 B=2
+- Keep packed-prefix verifier work diagnostic-only until its verifier logits and
+  accept/reject decisions match the decode verifier. The 2026-06-15 B=2
   non-boundary FlashInfer smoke validated the packed shape and fixed packed
-  `kv_lens` visibility, but packed-prefill still diverged from no-MTP at one
+  `kv_lens` visibility, but packed-prefix still diverged from no-MTP at one
   generated token while decode verification remained exact.
-- Strict GDN fallback mode must error on prefill prefix-state verifier routes
-  until there is a kernel-backed prefix-state boundary. Do not let
+- Strict GDN fallback mode must error on packed-prefix verifier routes until
+  there is a kernel-backed prefix-state boundary. Do not let
   `return_prefix_hybrid` or `return_first_prefix_hybrid` silently select the
   slow JAX recurrent/chunked path in GDN prefill.
 - Use the vLLM/MaxText references for the next boundary design: vLLM flattens

@@ -156,7 +156,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--full-attention-prefill-impl", default="reference")
     parser.add_argument("--jax-speculative-method", choices=["none", "mtp"], default="none")
     parser.add_argument("--jax-draft-sample-method", choices=["greedy", "probabilistic"], default="greedy")
-    parser.add_argument("--jax-mtp-verifier-impl", choices=["two_decode", "commit_select", "k_decode"], default="commit_select")
+    parser.add_argument(
+        "--jax-mtp-verifier-impl",
+        choices=["two_decode", "commit_select", "k_decode", "packed_prefix"],
+        default="commit_select",
+    )
     parser.add_argument("--jax-mtp-batch-accept-policy", choices=["rowwise", "all_or_none"], default="rowwise")
     parser.add_argument("--jax-mtp-seed-after-bonus", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--jax-mtp-bonus-margin", type=float, default=0.0)

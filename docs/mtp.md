@@ -2,7 +2,7 @@
 
 MTP is experimental in this repository. This page records the current GPU serving posture plus TPU-era K=1 semantics and benchmark findings. For current GPU correctness, use [GPU correctness guardrails](gpu_correctness_guardrails.md) and [benchmarks](benchmarks.md).
 
-Do not describe the current MTP path as production-ready. Current GPU server-shape artifacts show exact commit-select MTP1 matching JAX/HF generated tokens across the suite, but still slower than the regular JAX paged baseline. Treat the TPU results below as historical for current GPU work.
+Do not describe the current MTP path as production-ready. Current GPU server-shape artifacts show exact commit-select MTP matching JAX/HF generated tokens on focused probes, but still slower than the regular JAX paged baseline. Treat the TPU results below as historical for current GPU work.
 
 ## No-Host-Sync MTP Target
 
@@ -24,10 +24,13 @@ can update `Sequence` objects and stream results; that drain is not allowed to
 control intra-burst commit. A future resident output ring should remove even
 that post-burst length drain from the decode scheduling loop.
 
-The first concrete boundary is K-burst greedy MTP: each compiled burst handles
-mixed accepted/rejected rows by selecting prefix state per row and continuing
-from the selected committed token. This replaces the old K-burst behavior where
-any rejected row returned to Python for repair.
+The current concrete boundary target is packed-prefix K-token verification:
+each admitted row forms `[current, draft_1, ..., draft_K]`, the target model
+verifies that short prefix in one packed prefill-shaped forward pass, and the
+compiled step selects the committed prefix state per row. This is the only
+route that can amortize verifier work enough to be a valid speed target. The
+sequential `commit_select` route stays as an oracle for correctness and drift
+debugging.
 
 2026-06-20 update: the current implementation checkpoint is a resident
 seed-then-table burst for K=1. The compiled step seeds the first draft when no
@@ -42,9 +45,9 @@ architecture/correctness checkpoint rather than a speed claim.
 
 ## Current GPU caveat
 
-As of 2026-06-20, the active MTP research config targets exact K=2
-verification (`mtp_verifier_impl=commit_select`) rather than the old repeated
-K=1 burst route. MTP remains an explicit opt-in serving mode rather
+As of 2026-06-21, the active MTP research config targets exact K=2
+packed-prefix verification (`mtp_verifier_impl=packed_prefix`) rather than
+sequential K=2 `commit_select` as a speed path. MTP remains an explicit opt-in serving mode rather
 than an environment-only diagnostic. The server config fields are:
 
 - `speculative_method`: `none` or `mtp`;
@@ -52,9 +55,10 @@ than an environment-only diagnostic. The server config fields are:
   experimental true-K verifier target. K=3 should wait until K=2 has useful
   second-position draft quality;
 - `draft_sample_method`: currently only `greedy` is implemented for MTP;
-- `mtp_verifier_impl`: `commit_select` for the current exact K=2 sequential
-  verifier or the older exact K=1 reference, `k_decode` for generic true-K
-  verification, and `two_decode` for the historical width-2 K=1 verifier;
+- `mtp_verifier_impl`: `packed_prefix` for the experimental speed boundary,
+  `commit_select` for the exact K=1/K=2 sequential oracle, `k_decode` for
+  generic decode-shaped true-K verification, and `two_decode` for the
+  historical width-2 K=1 verifier;
 - `mtp_batch_accept_policy`: `rowwise` or `all_or_none`;
 - `mtp_seed_after_bonus`: default `false`.
 - `mtp_prefill_seed`: default `false`. Prefill draft seeding is now opt-in
@@ -73,8 +77,8 @@ The current GPU route is correctness-first:
 - accept/reject and prefix-state selection happen inside the compiled verifier;
 - Python may drain compact emitted-token metadata after a verifier call, but it
   must not choose the accepted prefix before the next device commit is valid;
-- `flashinfer_paged` full-attention decode is rejected for `two_decode` because
-  the current FlashInfer route is width-1 only;
+- packed-prefix verification borrows the prefill-shaped full-attention route,
+  not the width-1 decode route;
 - the strict MTP diagnostic path disables GDN fallbacks and uses explicit
   packed GDN decode `reference` with BF16 QKV rather than silently selecting
   `off`;
@@ -126,9 +130,9 @@ The exact true-K route now has the first strict B=2 smoke checkpoint:
   and fused seed around `10 ms`, while adaptive admission measured the B=2
   speculative bucket at `14.9 ms/token` versus `2.1 ms/token` baseline and
   disabled the bucket for low throughput;
-- packed-prefill verification is not currently usable under strict no-fallback
-  GDN policy because it needs prefix-state output from the packed prefill GDN
-  route and would otherwise use the slow recurrent scan.
+- packed-prefix verification is not currently promotable under strict
+  no-fallback GDN policy because it needs prefix-state output from the packed
+  prefill GDN route and would otherwise use the slow recurrent scan.
 
 Treat K=2 as research-only until the verifier boundary is substantially
 cheaper. For Qwen/Qwen3.5-0.8B, exact MTP does not provide a throughput win

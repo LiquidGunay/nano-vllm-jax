@@ -202,17 +202,25 @@ class Qwen3_5Config:
         mtp_verifier_impl = str(self.mtp_verifier_impl or "two_decode").strip().lower()
         if mtp_verifier_impl in {"generic_k", "expanded"}:
             mtp_verifier_impl = "k_decode"
-        if mtp_verifier_impl not in {"two_decode", "commit_select", "k_decode"}:
-            raise ValueError("mtp_verifier_impl must be 'two_decode', 'commit_select', or 'k_decode'")
+        if mtp_verifier_impl in {"packed_prefill", "prefill_packed"}:
+            mtp_verifier_impl = "packed_prefix"
+        if mtp_verifier_impl not in {"two_decode", "commit_select", "k_decode", "packed_prefix"}:
+            raise ValueError(
+                "mtp_verifier_impl must be 'two_decode', 'commit_select', "
+                "'k_decode', or 'packed_prefix'"
+            )
         if (
             speculative_method == "mtp"
             and num_speculative_tokens > 1
             and not (
-                mtp_verifier_impl == "k_decode"
+                mtp_verifier_impl in {"k_decode", "packed_prefix"}
                 or (mtp_verifier_impl == "commit_select" and num_speculative_tokens == 2)
             )
         ):
-            raise ValueError("MTP K>1 requires mtp_verifier_impl='k_decode' or K=2 commit_select")
+            raise ValueError(
+                "MTP K>1 requires mtp_verifier_impl='k_decode', "
+                "'packed_prefix', or K=2 commit_select"
+            )
         mtp_batch_accept_policy = str(self.mtp_batch_accept_policy or "rowwise").strip().lower()
         if mtp_batch_accept_policy not in {"rowwise", "all_or_none"}:
             raise ValueError("mtp_batch_accept_policy must be 'rowwise' or 'all_or_none'")
