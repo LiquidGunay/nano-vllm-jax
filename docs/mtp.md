@@ -108,6 +108,26 @@ exact through 12 and 16 output tokens:
 
 This restores a correctness oracle; it is not a speed path.
 
+The same pass also isolated the broader verifier candidates:
+
+- `k_decode_force_reject_fixed_jax_8.json` is exact when every K=2 draft is
+  forced to reject, so the decode-shaped K verifier can reproduce the next
+  target token for one-token commits.
+- `k_decode_retest_fixed_jax_16.json` still diverges when accepted K=2 draft
+  tokens are committed. The first row drifts at token index 9, which means the
+  width-3 verifier's accepted-prefix state is not equivalent to sequential
+  decode state.
+- `packed_prefix_force_reject_fixed_jax_8.json` diverges even with zero accepted
+  drafts. Row 0 expects `12` at index 5 but the packed-prefix target pass emits
+  `220`; `12` is only second in the packed verifier top-k.
+- A packed-prefix run with config-owned reference GDN prefill
+  (`packed_prefix_force_reject_gdn_ref_config_jax_8.json`) also diverges, so the
+  issue is not limited to the Triton packed-prefix kernel.
+
+Current implication: use sequential `commit_select` as the exact K=2 oracle.
+Do not promote packed-prefix or width>1 decode accepted-prefix commits until the
+target logits and committed GDN/full-attention state match sequential decode.
+
 ## GPU 2026-06-20 true-K status
 
 The exact true-K route now has the first strict B=2 smoke checkpoint:

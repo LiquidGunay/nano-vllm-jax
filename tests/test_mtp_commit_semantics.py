@@ -1548,6 +1548,57 @@ def test_generic_k_host_commit_emits_verifier_targets_not_stale_drafts(monkeypat
     assert runner.stats["bonus_tokens"] == 1
 
 
+def test_generic_k_force_reject_overrides_full_draft_chain(monkeypatch):
+    seq_lens = [5, 7]
+    executor = _FakeExecutor(
+        accepted=[
+            [False, False],
+            [False, False],
+        ],
+        target=[
+            [10, 11],
+            [20, 21],
+        ],
+        bonus=[30, 31],
+        next_draft=[
+            [40, 41],
+            [50, 51],
+        ],
+        state_marker=[900, 910],
+        committed_seq_lens=[6, 8],
+        kv_slots=[
+            [1000, 1001, 1002],
+            [1010, 2011, 2012],
+        ],
+    )
+    runner = _FakeRunner(
+        executor,
+        {0: [910, 911], 1: [920, 921]},
+        block_size=16,
+        num_speculative_tokens=2,
+    )
+    runner.mtp_verifier_impl = "k_decode"
+    seqs = [_seq(i, seq_lens[i]) for i in range(2)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FORCE_REJECT", "1")
+
+    outputs = ModelRunner._run_mtp1_batched(
+        runner,
+        seqs,
+        _batch(seq_lens),
+        [0, 1],
+    )
+
+    assert runner.executor.calls[-1]["draft_tokens"] == [[-1, -1], [-1, -1]]
+    assert {row: _resolve_output_tokens(value) for row, value in outputs.items()} == {
+        0: [10],
+        1: [20],
+    }
+
+
 def test_generic_k_compacts_partial_physical_rows(monkeypatch):
     seq_lens = [5, 7]
     executor = _FakeExecutor(

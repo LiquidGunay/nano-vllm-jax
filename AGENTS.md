@@ -245,6 +245,17 @@
   output tok/s (`acceptance_rate=0.214`). Keep this as the correctness oracle,
   not a speed claim; do not re-enable partial K2 commits without a verifier
   state proof and matching focused GPU parity.
+  Follow-up forced-reject probes showed `k_decode` is exact only when it emits
+  one verifier target per row (`k_decode_force_reject_fixed_jax_8.json` exact,
+  `22.22` output tok/s, acceptance `0.0`). When it commits accepted K=2 draft
+  tokens, it still diverges (`k_decode_retest_fixed_jax_16.json`, first row
+  drift at token index 9). Packed-prefix is worse: even with every K=2 draft
+  forced to reject, its target pass diverges (`packed_prefix_force_reject_fixed_jax_8.json`,
+  row 0 index 5: expected `12`, got `220`). A config-owned GDN reference
+  packed-prefill diagnostic also diverged (`packed_prefix_force_reject_gdn_ref_config_jax_8.json`,
+  row 0 index 1), so this is not just the Triton packed-prefix kernel. Do not
+  promote packed-prefix or width>1 decode accepted-prefix commits until their
+  target logits and committed GDN/full-attention state match sequential decode.
 - Keep these work items in order: accepted FA/FLA policy validation, broader
   resident/scheduler decode metadata reduction, coarse GDN decode/prefill
   kernels, and model-family-general batched GEMM/fusion improvements.

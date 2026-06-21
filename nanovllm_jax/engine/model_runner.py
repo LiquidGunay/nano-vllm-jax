@@ -7110,6 +7110,16 @@ class CanonicalModelRunner:
             return None
         draft_token_chains = [chain[:draft_len] for chain in draft_chains]
         draft_tokens = [chain[0] for chain in draft_token_chains]
+        force_reject_mtp = os.environ.get("NANO_VLLM_JAX_MTP_FORCE_REJECT", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }
+        if force_reject_mtp:
+            draft_token_chains = [[-1 for _ in range(draft_len)] for _ in draft_token_chains]
+            draft_tokens = [-1 for _ in draft_tokens]
         verifier_impl = str(getattr(self, "mtp_verifier_impl", "two_decode") or "two_decode")
         use_packed_prefix_verifier = verifier_impl in {
             "packed_prefix",
@@ -7174,14 +7184,6 @@ class CanonicalModelRunner:
         for local_row, row in enumerate(rows):
             draft_token_chains_for_batch[verifier_index_for_local[local_row]] = draft_token_chains[local_row]
         verifier_draft_tokens = draft_tokens
-        if os.environ.get("NANO_VLLM_JAX_MTP_FORCE_REJECT", "0") in {
-            "1",
-            "true",
-            "yes",
-            "on",
-            "True",
-        }:
-            verifier_draft_tokens = [-1 for _ in draft_tokens]
         verifier_draft_tokens_for_batch = [0 for _ in range(verifier_physical_batch_size)]
         next_mtp_positions_for_batch = [0 for _ in range(verifier_physical_batch_size)]
         for local_row, row in enumerate(rows):
