@@ -431,7 +431,8 @@ Preserved TPU findings from `docs/mtp_tpu_spot_findings_2026-05-09.md`; keep the
 
 Interpretation:
 
-- K=1 can be neutral or faster depending on workload and measured latency.
+- Historical TPU-only: K=1 was neutral or faster on a few narrow TPU
+  workloads, but this is not a current GPU serving-speed criterion.
 - Acceptance alone is insufficient; serving gates must use measured decode throughput.
 - Mixed/heterogeneous B=4 is still below baseline; the latest forced-reject probe patch reduces fallback-heavy overhead but does not create speedup when acceptance is low.
 - K=2 is correctness-clean but slower in observed benchmarks, so it remains experimental/non-serving.
