@@ -10082,9 +10082,11 @@ class ModelExecutor:
 
         This is the vLLM-style MTP boundary for this repo: one packed
         target-model pass verifies current plus draft tokens, accept/reject is
-        computed on device, KV slots beyond the committed prefix are restored,
-        and the selected GDN state is scattered directly back to the resident
-        hybrid table. It intentionally has no scanned decode repair path.
+        computed on device, and the selected GDN state is scattered directly
+        back to the resident hybrid table. Speculative KV writes beyond the
+        committed prefix are allowed to remain dirty; correctness relies on the
+        committed seq-lens/resident lengths masking those slots from later
+        reads. It intentionally has no scanned decode repair path.
         """
         burst_groups = int(burst_groups)
         if burst_groups < 1:
