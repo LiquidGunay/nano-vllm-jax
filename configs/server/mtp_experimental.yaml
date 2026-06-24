@@ -33,7 +33,7 @@ engine:
   prefix_cache: true
   speculative_method: "mtp"
   draft_sample_method: "greedy"
-  mtp_verifier_impl: "commit_select"
+  mtp_verifier_impl: "packed_prefix"
   mtp_batch_accept_policy: "rowwise"
   mtp_seed_after_bonus: true
   mtp_hidden_source: "final_normed"
