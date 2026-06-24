@@ -339,6 +339,19 @@ class BlockManager:
             self._allocate_block(block_id)
             block_table.append(block_id)
 
+    def trim_append_slots(self, seq: Sequence, num_slots: int):
+        """Release unused decode lookahead blocks after admission changes."""
+        block_table = seq.block_table
+        target_tokens = len(seq) + max(0, int(num_slots) - 1)
+        required_blocks = (target_tokens + self.block_size - 1) // self.block_size
+        while len(block_table) > required_blocks:
+            block_id = block_table.pop()
+            block = self.blocks[block_id]
+            if block.hash != -1 or block.token_ids:
+                raise AssertionError("cannot trim a materialized KV block")
+            block.ref_count -= 1
+            self._deallocate_block(block_id)
+
     def commit_processed_token(self, seq: Sequence):
         """Record metadata for an already-processed appended token.
 

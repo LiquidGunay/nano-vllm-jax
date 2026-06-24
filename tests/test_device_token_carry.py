@@ -57,6 +57,21 @@ def test_device_token_carry_env_overrides_config_default(monkeypatch):
     ) is True
 
 
+@pytest.mark.parametrize(
+    ("attr", "env_name"),
+    [
+        ("mtp_unverified_draft_append", "NANO_VLLM_JAX_MTP_UNVERIFIED_DRAFT_APPEND"),
+        ("mtp_unverified_fused_append", "NANO_VLLM_JAX_MTP_UNVERIFIED_FUSED_APPEND"),
+    ],
+)
+def test_unverified_mtp_append_env_overrides_are_rejected(monkeypatch, attr, env_name):
+    config = Qwen3_5Config()
+    monkeypatch.setenv(env_name, "1")
+
+    with pytest.raises(ValueError, match="Unverified MTP draft append"):
+        model_runner_module._unverified_mtp_append_enabled(config, attr, env_name)
+
+
 def test_sequence_materializes_deferred_device_tokens():
     Sequence.block_size = 16
     seq = Sequence([11, 22], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
@@ -635,6 +650,99 @@ def test_scheduler_resident_capacity_can_exceed_execution_batch():
     assert len(decode_seqs) == 2
     assert decode_batch.tokens.shape[0] == 2
     assert len(scheduler.running) == 2
+
+
+def test_scheduler_trims_mtp_lookahead_when_final_bucket_denies():
+    scheduler = Scheduler(
+        Qwen3_5Config(
+            block_size=2,
+            num_kvcache_blocks=4,
+            max_num_seqs=2,
+            max_num_batched_tokens=4,
+            batch_size_buckets=(1, 2),
+            speculative_method="mtp",
+            num_speculative_tokens=1,
+            mtp_verifier_impl="two_decode",
+        )
+    )
+    final_key = scheduler._mtp_bucket_key(batch_size_bucket=2, active_decode_rows=2)
+    final_stats = scheduler._new_mtp_bucket_stats()
+    final_stats["spec_ms_per_token"] = 2.0
+    final_stats["spec_latency_steps"] = 1
+    scheduler.mtp_bucket_stats[final_key] = final_stats
+    seqs = [
+        Sequence(
+            [10 + idx, 20 + idx],
+            SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True),
+            seq_id=idx,
+        )
+        for idx in range(2)
+    ]
+    for seq in seqs:
+        seq.status = SequenceStatus.RUNNING
+        scheduler.block_manager.allocate(seq, use_prefix_cache=False)
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        scheduler.running.append(seq)
+
+    scheduled_seqs, batch = scheduler.schedule()
+
+    assert scheduled_seqs == seqs
+    assert batch.speculative_method == "none"
+    assert batch.decode_step_count_host == 1
+    assert [bool(getattr(seq, "mtp_admitted", False)) for seq in seqs] == [False, False]
+    assert [len(seq.block_table) for seq in seqs] == [1, 1]
+    assert scheduler.block_manager.stats() == {
+        "total_blocks": 4,
+        "free_blocks": 2,
+        "used_blocks": 2,
+    }
+
+
+def test_scheduler_caps_decode_steps_to_reserved_slots_after_mtp_denial():
+    scheduler = Scheduler(
+        Qwen3_5Config(
+            block_size=2,
+            num_kvcache_blocks=5,
+            max_num_seqs=2,
+            max_num_batched_tokens=8,
+            batch_size_buckets=(1, 2),
+            speculative_method="mtp",
+            num_speculative_tokens=1,
+            mtp_verifier_impl="two_decode",
+            greedy_decode_burst_steps=4,
+        )
+    )
+    final_key = scheduler._mtp_bucket_key(batch_size_bucket=2, active_decode_rows=2)
+    final_stats = scheduler._new_mtp_bucket_stats()
+    final_stats["spec_ms_per_token"] = 2.0
+    final_stats["spec_latency_steps"] = 1
+    scheduler.mtp_bucket_stats[final_key] = final_stats
+    seqs = [
+        Sequence(
+            [10 + idx, 20 + idx],
+            SamplingParams(temperature=0.0, max_tokens=6, ignore_eos=True),
+            seq_id=idx,
+        )
+        for idx in range(2)
+    ]
+    for seq in seqs:
+        seq.status = SequenceStatus.RUNNING
+        scheduler.block_manager.allocate(seq, use_prefix_cache=False)
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        scheduler.running.append(seq)
+
+    scheduled_seqs, batch = scheduler.schedule()
+
+    assert scheduled_seqs == seqs
+    assert batch.speculative_method == "none"
+    assert batch.decode_step_count_host == 3
+    assert [getattr(seq, "decode_lookahead_tokens", None) for seq in seqs] == [3, 4]
+    assert [len(seq.block_table) for seq in seqs] == [2, 3]
+    assert scheduler.block_manager.stats() == {
+        "total_blocks": 5,
+        "free_blocks": 0,
+        "used_blocks": 5,
+    }
 
 
 def test_scheduler_static_decode_metadata_can_reuse_seq_lens_placeholder(monkeypatch):

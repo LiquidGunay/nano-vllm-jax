@@ -33,6 +33,10 @@ from nanovllm_jax.mtp.mtp_layer import (
 from nanovllm_jax.mtp.speculative import generate_draft_tokens, verify_draft_tokens, apply_acceptance
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
+_UNVERIFIED_MTP_APPEND_ERROR = (
+    "Unverified MTP draft append is not supported. "
+    "All MTP benchmark and serving paths must verify drafts with the target model."
+)
 
 
 def _block_until_ready_tree(value: object) -> None:
@@ -75,6 +79,15 @@ def _config_or_env_int(config: Qwen3_5Config | None, attr: str, env_name: str, *
     if config is not None and hasattr(config, attr):
         return int(getattr(config, attr) or default)
     return int(default)
+
+
+def _unverified_mtp_append_enabled(config: Qwen3_5Config | None, attr: str, env_name: str) -> bool:
+    env_value = os.environ.get(env_name)
+    if env_value is not None and env_value in _TRUE_ENV_VALUES:
+        raise ValueError(_UNVERIFIED_MTP_APPEND_ERROR)
+    if config is not None and bool(getattr(config, attr, False)):
+        raise ValueError(_UNVERIFIED_MTP_APPEND_ERROR)
+    return False
 
 
 def _int32_device_vector(value) -> jnp.ndarray:
@@ -1934,12 +1947,10 @@ class CanonicalModelRunner:
                         )
                         _record_decode_warmup(output, "forward_step_jit:decode")
                 if warm_decode_mtp and self.num_speculative_tokens >= 1:
-                    warm_unverified_fused_append = (
-                        _config_or_env_flag(
-                            getattr(self, "config", None),
-                            "mtp_unverified_fused_append",
-                            "NANO_VLLM_JAX_MTP_UNVERIFIED_FUSED_APPEND",
-                        )
+                    warm_unverified_fused_append = _unverified_mtp_append_enabled(
+                        getattr(self, "config", None),
+                        "mtp_unverified_fused_append",
+                        "NANO_VLLM_JAX_MTP_UNVERIFIED_FUSED_APPEND",
                     )
                     if warm_unverified_fused_append:
                         if (
@@ -2075,7 +2086,7 @@ class CanonicalModelRunner:
                         ),
                     )
                     if (
-                        _config_or_env_flag(
+                        _unverified_mtp_append_enabled(
                             getattr(self, "config", None),
                             "mtp_unverified_fused_append",
                             "NANO_VLLM_JAX_MTP_UNVERIFIED_FUSED_APPEND",
@@ -6103,7 +6114,7 @@ class CanonicalModelRunner:
         The cache/hybrid state is still consistent for the next step because the
         target decode has committed state through the first emitted token.
         """
-        use_fused_append = _config_or_env_flag(
+        use_fused_append = _unverified_mtp_append_enabled(
             getattr(self, "config", None),
             "mtp_unverified_fused_append",
             "NANO_VLLM_JAX_MTP_UNVERIFIED_FUSED_APPEND",
@@ -9802,7 +9813,7 @@ class CanonicalModelRunner:
             if non_admitted_rows:
                 self._clear_mtp1_drafts_for_rows(seqs, non_admitted_rows)
         if self.mtp1_enabled and not batch.is_prefill and admitted_mtp_rows:
-            if _config_or_env_flag(
+            if _unverified_mtp_append_enabled(
                 getattr(self, "config", None),
                 "mtp_unverified_draft_append",
                 "NANO_VLLM_JAX_MTP_UNVERIFIED_DRAFT_APPEND",

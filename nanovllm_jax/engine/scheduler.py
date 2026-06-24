@@ -473,25 +473,7 @@ class Scheduler:
                 )
             seq.mtp_admitted = mtp_admitted
             seq.mtp_admission_reason = self.mtp_admission_reason if mtp_admitted else "scheduler_gate"
-            remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
-            mtp_burst_groups = 1
-            if mtp_admitted and self.num_speculative_tokens > 0:
-                mtp_burst_groups = self.mtp_burst_groups
-            lookahead_tokens = min(
-                (
-                    mtp_burst_groups * (1 + self.num_speculative_tokens)
-                    if mtp_admitted
-                    else 1
-                ),
-                remaining_tokens,
-            )
-            if (
-                not mtp_admitted
-                and self.greedy_decode_burst_steps > 1
-                and seq.temperature == 0
-                and seq.ignore_eos
-            ):
-                lookahead_tokens = min(self.greedy_decode_burst_steps, remaining_tokens)
+            lookahead_tokens = self._decode_lookahead_tokens_for_seq(seq, mtp_admitted)
             while not self.block_manager.can_append_slots(seq, lookahead_tokens):
                 if self.running:
                     # Preempt a running sequence
@@ -504,6 +486,7 @@ class Scheduler:
                 # Can append - schedule for decode
                 num_seqs += 1
                 self.block_manager.may_append_slots(seq, lookahead_tokens)
+                seq.decode_lookahead_tokens = lookahead_tokens
                 scheduled_seqs.append(seq)
         
         if not scheduled_seqs:
@@ -516,6 +499,7 @@ class Scheduler:
             for seq in scheduled_seqs:
                 seq.mtp_admitted = False
                 seq.mtp_admission_reason = "active_rows_cap"
+                self._trim_decode_lookahead_to_final_admission(seq)
         elif self.num_speculative_tokens > 0:
             final_active_rows = len(scheduled_seqs)
             final_batch_size_bucket = self._select_mtp_static_batch_size_bucket(final_active_rows)
@@ -529,18 +513,23 @@ class Scheduler:
                     active_decode_rows=final_active_rows,
                 )
                 if final_admitted:
-                    remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
-                    lookahead_tokens = min(
-                        self.mtp_burst_groups * (1 + self.num_speculative_tokens),
-                        remaining_tokens,
+                    lookahead_tokens = self._decode_lookahead_tokens_for_seq(seq, True)
+                    reserved_lookahead_tokens = int(
+                        getattr(seq, "decode_lookahead_tokens", 0) or 0
                     )
-                    if self.block_manager.can_append_slots(seq, lookahead_tokens):
+                    if reserved_lookahead_tokens >= lookahead_tokens:
+                        seq.decode_lookahead_tokens = lookahead_tokens
+                        self.block_manager.trim_append_slots(seq, lookahead_tokens)
+                    elif self.block_manager.can_append_slots(seq, lookahead_tokens):
                         self.block_manager.may_append_slots(seq, lookahead_tokens)
+                        seq.decode_lookahead_tokens = lookahead_tokens
                     else:
                         final_admitted = False
                         self.mtp_admission_reason = "lookahead_capacity"
                 seq.mtp_admitted = final_admitted
                 seq.mtp_admission_reason = self.mtp_admission_reason if final_admitted else "scheduler_gate"
+                if not final_admitted:
+                    self._trim_decode_lookahead_to_final_admission(seq)
         self.running.extendleft(reversed(scheduled_seqs))
         decode_step_count = self._decode_step_count_for_scheduled_batch(scheduled_seqs)
         return scheduled_seqs, self.build_scheduled_batch(
@@ -549,24 +538,53 @@ class Scheduler:
             decode_step_count=decode_step_count,
         )
 
+    def _decode_lookahead_tokens_for_seq(self, seq: Sequence, mtp_admitted: bool) -> int:
+        remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
+        if mtp_admitted and self.num_speculative_tokens > 0:
+            return min(
+                self.mtp_burst_groups * (1 + self.num_speculative_tokens),
+                remaining_tokens,
+            )
+        if (
+            self.greedy_decode_burst_steps > 1
+            and seq.temperature == 0
+            and seq.ignore_eos
+        ):
+            return min(self.greedy_decode_burst_steps, remaining_tokens)
+        return 1
+
+    def _trim_decode_lookahead_to_final_admission(self, seq: Sequence) -> None:
+        lookahead_tokens = self._decode_lookahead_tokens_for_seq(
+            seq,
+            bool(getattr(seq, "mtp_admitted", False)),
+        )
+        actual_lookahead_tokens = lookahead_tokens
+        if self.block_manager.can_append_slots(seq, lookahead_tokens):
+            self.block_manager.may_append_slots(seq, lookahead_tokens)
+        else:
+            actual_lookahead_tokens = min(
+                lookahead_tokens,
+                self._reserved_decode_lookahead_tokens(seq),
+            )
+        seq.decode_lookahead_tokens = actual_lookahead_tokens
+        self.block_manager.trim_append_slots(seq, actual_lookahead_tokens)
+
+    def _reserved_decode_lookahead_tokens(self, seq: Sequence) -> int:
+        reserved_token_capacity = len(seq.block_table) * self.block_size
+        return max(1, reserved_token_capacity - len(seq) + 1)
+
     def _decode_step_count_for_scheduled_batch(self, seqs: List[Sequence]) -> int:
         step_counts: List[int] = []
         for seq in seqs:
-            remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
-            if bool(getattr(seq, "mtp_admitted", False)) and self.num_speculative_tokens > 0:
-                step_count = min(
-                    self.mtp_burst_groups * (1 + self.num_speculative_tokens),
-                    remaining_tokens,
+            reserved_lookahead = int(getattr(seq, "decode_lookahead_tokens", 0) or 0)
+            if reserved_lookahead <= 0:
+                reserved_lookahead = int(
+                    self._decode_lookahead_tokens_for_seq(
+                        seq,
+                        bool(getattr(seq, "mtp_admitted", False)),
+                    )
                 )
-            elif (
-                self.greedy_decode_burst_steps > 1
-                and seq.temperature == 0
-                and seq.ignore_eos
-            ):
-                step_count = min(self.greedy_decode_burst_steps, remaining_tokens)
-            else:
-                step_count = 1
-            step_counts.append(int(step_count))
+            step_counts.append(reserved_lookahead)
         return min(step_counts) if step_counts else 1
 
     def _max_prefill_token_budget(self) -> int:
