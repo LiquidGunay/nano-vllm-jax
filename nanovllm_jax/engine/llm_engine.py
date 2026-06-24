@@ -60,6 +60,15 @@ def _summary_host_token_sink_min_completion_tokens(config: Qwen3_5Config | None 
     return max(0, int(value))
 
 
+def _summary_host_token_sink_min_avg_completion_tokens(
+    config: Qwen3_5Config | None = None,
+) -> int | None:
+    value = getattr(config, "summary_host_token_sink_min_avg_completion_tokens", None)
+    if value is None:
+        return None
+    return max(0, int(value))
+
+
 def _percentile(values: list[float], percentile: float) -> float | None:
     if not values:
         return None
@@ -1043,14 +1052,25 @@ class LLMEngine:
         planned_completion_budget = sum(
             max(0, int(sp.max_tokens)) for sp in sampling_params
         )
+        request_count = max(1, len(sampling_params))
+        average_completion_budget = planned_completion_budget / request_count
         host_token_sink_min_completion_tokens = (
             _summary_host_token_sink_min_completion_tokens(config)
+        )
+        host_token_sink_min_avg_completion_tokens = (
+            _summary_host_token_sink_min_avg_completion_tokens(config)
         )
         prefetch_trace_tokens = trace_events and trace_token_prefetch_enabled
         host_token_sink_enabled = (
             (not trace_events)
             and trace_token_prefetch_enabled
-            and planned_completion_budget >= host_token_sink_min_completion_tokens
+            and (
+                planned_completion_budget >= host_token_sink_min_completion_tokens
+                or (
+                    host_token_sink_min_avg_completion_tokens is not None
+                    and average_completion_budget >= host_token_sink_min_avg_completion_tokens
+                )
+            )
         )
         snapshotted_completion_lengths = {seq.seq_id: 0 for seq in seqs}
         pending_prefetch_slots: tuple[DeviceTokenSlot, ...] = ()
@@ -1245,9 +1265,17 @@ class LLMEngine:
                     "final_device_token_slots_after_device_materialize": final_slots_after_device_materialize,
                     "host_token_sink_enabled": bool(host_token_sink_enabled),
                     "host_token_sink_planned_completion_budget": int(planned_completion_budget),
+                    "host_token_sink_average_completion_budget": float(
+                        average_completion_budget
+                    ),
                     "host_token_sink_min_completion_tokens": int(
                         host_token_sink_min_completion_tokens
                     ),
+                    "host_token_sink_min_avg_completion_tokens": int(
+                        host_token_sink_min_avg_completion_tokens
+                    )
+                    if host_token_sink_min_avg_completion_tokens is not None
+                    else None,
                     "host_token_sink_complete": bool(host_sink_complete),
                     "host_token_sink_prefetch_seconds": host_sink_prefetch_seconds,
                     "host_token_sink_resolve_seconds": host_sink_resolve_seconds,

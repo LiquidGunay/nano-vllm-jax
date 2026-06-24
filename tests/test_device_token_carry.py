@@ -1289,9 +1289,61 @@ def test_generate_with_trace_summary_keeps_short_outputs_on_final_materializatio
     ]
     assert trace["timing_summary"]["host_token_sink_enabled"] is False
     assert trace["timing_summary"]["host_token_sink_planned_completion_budget"] == 2
+    assert trace["timing_summary"]["host_token_sink_average_completion_budget"] == 2.0
     assert trace["timing_summary"]["host_token_sink_min_completion_tokens"] == 1024
+    assert trace["timing_summary"]["host_token_sink_min_avg_completion_tokens"] is None
     assert trace["timing_summary"]["final_device_token_materialize_seconds"] > 0.0
     assert not seq_holder["seq"].has_unmaterialized_device_tokens
+
+
+def test_generate_with_trace_summary_sinks_explicit_long_single_request(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "1")
+    events: list[str] = []
+    seq_holder: dict[str, Sequence] = {}
+    remaining_steps = {"value": 3}
+
+    def add_request(prompt, sampling_params):
+        seq = Sequence(prompt, sampling_params, seq_id=11)
+        seq.status = SequenceStatus.RUNNING
+        seq_holder["seq"] = seq
+        return seq
+
+    def is_finished():
+        return remaining_steps["value"] <= 0
+
+    def step():
+        step_index = 3 - remaining_steps["value"]
+        seq = seq_holder["seq"]
+        seq.append_token_device(_AsyncScalar(300 + step_index, events))
+        remaining_steps["value"] -= 1
+        if remaining_steps["value"] <= 0:
+            seq.status = SequenceStatus.FINISHED
+        return [], -1
+
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.add_request = add_request
+    engine.is_finished = is_finished
+    engine.step = step
+    engine._detokenize = lambda token_ids: ""
+    engine.config = SimpleNamespace(
+        block_size=16,
+        summary_host_token_sink_min_completion_tokens=1024,
+        summary_host_token_sink_min_avg_completion_tokens=128,
+    )
+
+    trace = engine.generate_with_trace(
+        [[101]],
+        SamplingParams(temperature=0.0, max_tokens=128, ignore_eos=True),
+        include_text=False,
+        trace_events=False,
+    )
+
+    assert trace["results"][0]["token_ids"] == [300, 301, 302]
+    assert trace["timing_summary"]["host_token_sink_enabled"] is True
+    assert trace["timing_summary"]["host_token_sink_complete"] is True
+    assert trace["timing_summary"]["host_token_sink_min_avg_completion_tokens"] == 128
+    assert trace["timing_summary"]["final_device_token_materialize_seconds"] == 0.0
 
 
 def test_generate_with_trace_keeps_eos_compatible_path_when_ignore_eos_false(monkeypatch):
