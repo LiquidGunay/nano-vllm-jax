@@ -105,6 +105,8 @@ class Qwen3_5Config:
     resident_decode_metadata: bool = False
     greedy_decode_burst_steps: int = 1
     trace_token_prefetch: bool = True
+    summary_host_token_sink_min_completion_tokens: int = 1024
+    summary_host_token_sink_min_avg_completion_tokens: Optional[int] = None
 
     # Accepted serving fast paths. Environment variables remain supported as
     # compatibility overrides, but server/benchmark configs should set these
@@ -182,6 +184,17 @@ class Qwen3_5Config:
             self,
             "greedy_decode_burst_steps",
             max(1, int(self.greedy_decode_burst_steps or 1)),
+        )
+        object.__setattr__(
+            self,
+            "summary_host_token_sink_min_completion_tokens",
+            max(0, int(self.summary_host_token_sink_min_completion_tokens or 0)),
+        )
+        min_avg_completion = self.summary_host_token_sink_min_avg_completion_tokens
+        object.__setattr__(
+            self,
+            "summary_host_token_sink_min_avg_completion_tokens",
+            None if min_avg_completion is None else max(0, int(min_avg_completion or 0)),
         )
         num_speculative_tokens = max(0, int(self.num_speculative_tokens or 0))
         if num_speculative_tokens > 8:
@@ -447,6 +460,8 @@ class Qwen3_5Config:
             self.resident_decode_metadata,
             self.greedy_decode_burst_steps,
             self.trace_token_prefetch,
+            self.summary_host_token_sink_min_completion_tokens,
+            self.summary_host_token_sink_min_avg_completion_tokens,
             self.materialize_tied_lm_head,
             self.compact_prefill_in_proj_qkv,
             self.compact_prefill_gdn_z,
@@ -624,6 +639,12 @@ class Qwen3_5Config:
             "resident_decode_metadata": self.resident_decode_metadata,
             "greedy_decode_burst_steps": self.greedy_decode_burst_steps,
             "trace_token_prefetch": self.trace_token_prefetch,
+            "summary_host_token_sink_min_completion_tokens": (
+                self.summary_host_token_sink_min_completion_tokens
+            ),
+            "summary_host_token_sink_min_avg_completion_tokens": (
+                self.summary_host_token_sink_min_avg_completion_tokens
+            ),
             "materialize_tied_lm_head": self.materialize_tied_lm_head,
             "compact_prefill_in_proj_qkv": self.compact_prefill_in_proj_qkv,
             "compact_prefill_gdn_z": self.compact_prefill_gdn_z,

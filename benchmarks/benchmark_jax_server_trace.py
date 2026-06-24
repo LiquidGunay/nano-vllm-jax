@@ -116,6 +116,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--static-decode-seq-lens-carry", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--resident-decode-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--trace-token-prefetch", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--summary-host-token-sink-min-completion-tokens", type=int, default=1024)
+    parser.add_argument("--summary-host-token-sink-min-avg-completion-tokens", type=int, default=0)
     parser.add_argument("--materialize-tied-lm-head", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compact-prefill-in-proj-qkv", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compact-prefill-gdn-z", action=argparse.BooleanOptionalAction, default=False)
@@ -523,6 +525,14 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "static_decode_seq_lens_carry": args.static_decode_seq_lens_carry,
         "resident_decode_metadata": args.resident_decode_metadata,
         "trace_token_prefetch": args.trace_token_prefetch,
+        "summary_host_token_sink_min_completion_tokens": (
+            args.summary_host_token_sink_min_completion_tokens
+        ),
+        "summary_host_token_sink_min_avg_completion_tokens": (
+            args.summary_host_token_sink_min_avg_completion_tokens
+            if args.summary_host_token_sink_min_avg_completion_tokens > 0
+            else None
+        ),
         "materialize_tied_lm_head": args.materialize_tied_lm_head,
         "compact_prefill_in_proj_qkv": args.compact_prefill_in_proj_qkv,
         "compact_prefill_gdn_z": args.compact_prefill_gdn_z,
@@ -825,6 +835,14 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                 "resident_decode_metadata": bool(engine.config.resident_decode_metadata),
                 "greedy_decode_burst_steps": int(engine.config.greedy_decode_burst_steps),
                 "trace_token_prefetch": bool(engine.config.trace_token_prefetch),
+                "summary_host_token_sink_min_completion_tokens": int(
+                    engine.config.summary_host_token_sink_min_completion_tokens
+                ),
+                "summary_host_token_sink_min_avg_completion_tokens": int(
+                    engine.config.summary_host_token_sink_min_avg_completion_tokens
+                )
+                if engine.config.summary_host_token_sink_min_avg_completion_tokens is not None
+                else None,
             },
             "trace_mode": "events" if args.trace_events else "summary",
         },

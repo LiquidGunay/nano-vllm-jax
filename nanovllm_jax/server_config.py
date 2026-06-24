@@ -117,6 +117,14 @@ _ENGINE_ENV_MAP: dict[str, tuple[str, type]] = {
     "resident_decode_metadata": ("NANO_VLLM_JAX_RESIDENT_DECODE_METADATA", bool),
     "greedy_decode_burst_steps": ("NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS", int),
     "trace_token_prefetch": ("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", bool),
+    "summary_host_token_sink_min_completion_tokens": (
+        "NANO_VLLM_JAX_SUMMARY_HOST_TOKEN_SINK_MIN_COMPLETION_TOKENS",
+        int,
+    ),
+    "summary_host_token_sink_min_avg_completion_tokens": (
+        "NANO_VLLM_JAX_SUMMARY_HOST_TOKEN_SINK_MIN_AVG_COMPLETION_TOKENS",
+        int,
+    ),
     "materialize_tied_lm_head": ("NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD", bool),
     "compact_prefill_in_proj_qkv": ("NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV", bool),
     "compact_prefill_gdn_z": ("NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z", bool),
@@ -294,6 +302,12 @@ def _runtime_fastpaths_to_engine(runtime_section: dict) -> dict[str, Any]:
         "resident_decode_metadata": "resident_decode_metadata",
         "greedy_decode_burst_steps": "greedy_decode_burst_steps",
         "trace_token_prefetch": "trace_token_prefetch",
+        "summary_host_token_sink_min_completion_tokens": (
+            "summary_host_token_sink_min_completion_tokens"
+        ),
+        "summary_host_token_sink_min_avg_completion_tokens": (
+            "summary_host_token_sink_min_avg_completion_tokens"
+        ),
         "decode_block_table_buckets": "decode_block_table_buckets",
         "materialize_tied_lm_head": "materialize_tied_lm_head",
         "compact_prefill_in_proj_qkv": "compact_prefill_in_proj_qkv",
@@ -401,6 +415,12 @@ def _runtime_section_to_env(runtime_section: dict) -> dict[str, str]:
         "resident_decode_metadata": "NANO_VLLM_JAX_RESIDENT_DECODE_METADATA",
         "greedy_decode_burst_steps": "NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS",
         "trace_token_prefetch": "NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH",
+        "summary_host_token_sink_min_completion_tokens": (
+            "NANO_VLLM_JAX_SUMMARY_HOST_TOKEN_SINK_MIN_COMPLETION_TOKENS"
+        ),
+        "summary_host_token_sink_min_avg_completion_tokens": (
+            "NANO_VLLM_JAX_SUMMARY_HOST_TOKEN_SINK_MIN_AVG_COMPLETION_TOKENS"
+        ),
         "lm_head_decode_act_dtype": "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE",
         "lm_head_topk_impl": "NANO_VLLM_JAX_LM_HEAD_TOPK_IMPL",
         "decode_proj_act_dtype": "NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE",
@@ -679,6 +699,8 @@ def load_server_config(path: str | Path | None = None) -> ServerConfig:
         "resident_decode_metadata": False,
         "greedy_decode_burst_steps": 1,
         "trace_token_prefetch": True,
+        "summary_host_token_sink_min_completion_tokens": 1024,
+        "summary_host_token_sink_min_avg_completion_tokens": None,
         "materialize_tied_lm_head": False,
         "compact_prefill_in_proj_qkv": False,
         "compact_prefill_gdn_z": False,
