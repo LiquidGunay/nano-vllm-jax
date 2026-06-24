@@ -636,6 +636,12 @@ class Qwen3_5Config:
             "resident_decode_metadata": self.resident_decode_metadata,
             "greedy_decode_burst_steps": self.greedy_decode_burst_steps,
             "trace_token_prefetch": self.trace_token_prefetch,
+            "summary_host_token_sink_min_completion_tokens": (
+                self.summary_host_token_sink_min_completion_tokens
+            ),
+            "summary_host_token_sink_min_avg_completion_tokens": (
+                self.summary_host_token_sink_min_avg_completion_tokens
+            ),
             "materialize_tied_lm_head": self.materialize_tied_lm_head,
             "compact_prefill_in_proj_qkv": self.compact_prefill_in_proj_qkv,
             "compact_prefill_gdn_z": self.compact_prefill_gdn_z,

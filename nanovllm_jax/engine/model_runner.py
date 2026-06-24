@@ -10212,6 +10212,12 @@ class CanonicalModelRunner:
                     "NANO_VLLM_JAX_MTP_ENABLE_LEGACY_COMPACT_REUSE", "0"
                 ) in {"1", "true", "yes", "on", "True"}
                 if legacy_compact_reuse:
+                    if strict_k_verifier and strict_k_draft_rows:
+                        raise RuntimeError(
+                            "K>1 MTP verifier fallback is disabled; legacy "
+                            "compact reuse fallback was requested for rows "
+                            f"{strict_k_draft_rows}"
+                        )
                     return self._run_main_and_sample_with_mtp1_reuse(
                         seqs,
                         batch,

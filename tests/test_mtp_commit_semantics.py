@@ -1855,6 +1855,42 @@ def test_packed_prefix_uses_explicit_verifier_route(monkeypatch):
     }
 
 
+def test_strict_k_rejects_legacy_compact_reuse_fallback(monkeypatch):
+    seq_lens = [5, 6]
+    executor = _FakeExecutor(
+        accepted=[[True, False], [False, False]],
+        target=[[10, 101], [201, 202]],
+        bonus=[20, 21],
+        next_draft=[[30, 31], [40, 41]],
+        state_marker=[901, 910],
+        committed_seq_lens=[7, 8],
+        kv_slots=[
+            [1000, 1001, 1002],
+            [1010, 2011, 2012],
+        ],
+    )
+    runner = _FakeRunner(
+        executor,
+        {0: [10, 11], 1: [99, 98]},
+        block_size=16,
+        num_speculative_tokens=2,
+    )
+    runner.mtp_verifier_impl = "packed_prefix"
+    seqs = [_seq(i, seq_lens[i]) for i in range(2)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ENABLE_COMPACT_COMMIT_SELECT", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_ENABLE_LEGACY_COMPACT_REUSE", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1", raising=False)
+
+    with pytest.raises(RuntimeError, match="legacy compact reuse fallback"):
+        ModelRunner.run(
+            runner,
+            seqs,
+            batch=_batch(seq_lens),
+        )
+
+
 def test_generic_k1_rejected_prefix_seeds_next_draft(monkeypatch):
     seq_lens = [5]
     executor = _FakeExecutor(

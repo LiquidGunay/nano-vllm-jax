@@ -629,7 +629,20 @@ def main():
     parser.add_argument("--max-tokens-default", type=int, default=cfg.server["max_tokens_default"])
     parser.add_argument("--speculative-method", choices=["none", "mtp"], default=cfg.engine["speculative_method"])
     parser.add_argument("--draft-sample-method", choices=["greedy", "probabilistic"], default=cfg.engine["draft_sample_method"])
-    parser.add_argument("--mtp-verifier-impl", choices=["two_decode", "commit_select", "k_decode"], default=cfg.engine["mtp_verifier_impl"])
+    parser.add_argument(
+        "--mtp-verifier-impl",
+        choices=[
+            "two_decode",
+            "commit_select",
+            "k_decode",
+            "generic_k",
+            "expanded",
+            "packed_prefix",
+            "packed_prefill",
+            "prefill_packed",
+        ],
+        default=cfg.engine["mtp_verifier_impl"],
+    )
     parser.add_argument("--mtp-batch-accept-policy", choices=["rowwise", "all_or_none"], default=cfg.engine["mtp_batch_accept_policy"])
     parser.add_argument("--mtp-seed-after-bonus", action=argparse.BooleanOptionalAction, default=cfg.engine["mtp_seed_after_bonus"])
     parser.add_argument("--mtp-hidden-source", choices=["pre_norm", "final_normed"], default=cfg.engine["mtp_hidden_source"])

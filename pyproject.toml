@@ -44,6 +44,9 @@ dev = [
 [tool.ruff.lint]
 select = ["F821"]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

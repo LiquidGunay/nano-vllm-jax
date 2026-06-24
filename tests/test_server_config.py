@@ -122,6 +122,21 @@ def test_speculative_config_rejects_unverified_mtp_append(field):
         )
 
 
+def test_config_to_dict_preserves_summary_host_token_sink_fields():
+    config = Qwen3_5Config(
+        summary_host_token_sink_min_completion_tokens=7,
+        summary_host_token_sink_min_avg_completion_tokens=3,
+    )
+
+    payload = config.to_dict()
+
+    assert payload["summary_host_token_sink_min_completion_tokens"] == 7
+    assert payload["summary_host_token_sink_min_avg_completion_tokens"] == 3
+    round_trip = Qwen3_5Config.from_dict(payload)
+    assert round_trip.summary_host_token_sink_min_completion_tokens == 7
+    assert round_trip.summary_host_token_sink_min_avg_completion_tokens == 3
+
+
 def test_runtime_and_kernel_sections_translate_to_env():
     env = runtime_env_from_config(
         {
