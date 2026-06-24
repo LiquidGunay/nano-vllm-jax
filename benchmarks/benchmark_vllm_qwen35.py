@@ -63,6 +63,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true", default=True)
     parser.add_argument("--no-trust-remote-code", dest="trust_remote_code", action="store_false")
+    parser.add_argument(
+        "--vllm-log-stats",
+        action="store_true",
+        default=False,
+        help="Enable vLLM stats logging so speculative-decoding acceptance metrics are emitted.",
+    )
+    parser.add_argument(
+        "--vllm-log-stats-interval",
+        type=float,
+        default=0.1,
+        help="VLLM_LOG_STATS_INTERVAL to use when --vllm-log-stats is set.",
+    )
     parser.add_argument("--mode", default="baseline", choices=["baseline", "mtp"])
     parser.add_argument("--execution", default="offline", choices=["offline", "async"])
     parser.add_argument("--speculative-method", default="mtp")
@@ -486,6 +498,9 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     if args.execution == "async":
         return asyncio.run(run_vllm_async(args, recorder))
 
+    if args.vllm_log_stats:
+        os.environ["VLLM_LOG_STATS_INTERVAL"] = str(float(args.vllm_log_stats_interval))
+
     try:
         from transformers import AutoTokenizer
         from vllm import LLM, SamplingParams
@@ -519,6 +534,7 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "gpu_memory_utilization": float(args.gpu_memory_utilization),
         "trust_remote_code": bool(args.trust_remote_code),
         "enforce_eager": bool(args.enforce_eager),
+        "disable_log_stats": not bool(args.vllm_log_stats),
     }
     if speculative_config is not None:
         llm_kwargs["speculative_config"] = speculative_config
@@ -551,6 +567,11 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     started = time.perf_counter()
     outputs = llm.generate(prompt_token_ids, sampling)
     elapsed = time.perf_counter() - started
+    if args.vllm_log_stats:
+        maybe_engine = getattr(llm, "llm_engine", None)
+        maybe_log_stats = getattr(maybe_engine, "do_log_stats", None)
+        if maybe_log_stats is not None:
+            maybe_log_stats()
 
     rows = []
     total_tokens = 0
@@ -599,6 +620,8 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "mode": args.mode,
             "execution": args.execution,
             "speculative_config": speculative_config,
+            "vllm_log_stats": bool(args.vllm_log_stats),
+            "vllm_log_stats_interval": float(args.vllm_log_stats_interval),
             **prompt_info,
             "top_k": args.top_k,
             "sampling": {
@@ -614,6 +637,8 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
 
 
 async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dict:
+    if args.vllm_log_stats:
+        os.environ["VLLM_LOG_STATS_INTERVAL"] = str(float(args.vllm_log_stats_interval))
     try:
         from transformers import AutoTokenizer
         from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
@@ -649,7 +674,7 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
         trust_remote_code=bool(args.trust_remote_code),
         enforce_eager=bool(args.enforce_eager),
         speculative_config=speculative_config,
-        disable_log_stats=True,
+        disable_log_stats=not bool(args.vllm_log_stats),
     )
     load_t0 = time.perf_counter()
     engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -760,6 +785,12 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
         _timing_metrics(rows, elapsed, total_tokens, "vllm_async_generate"),
         elapsed,
     )
+    if args.vllm_log_stats:
+        maybe_log_stats = getattr(engine, "do_log_stats", None)
+        if maybe_log_stats is not None:
+            maybe_result = maybe_log_stats()
+            if asyncio.iscoroutine(maybe_result):
+                await maybe_result
 
     shutdown = getattr(engine, "shutdown", None)
     if shutdown is not None:
@@ -780,6 +811,8 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
             "mode": args.mode,
             "execution": args.execution,
             "speculative_config": speculative_config,
+            "vllm_log_stats": bool(args.vllm_log_stats),
+            "vllm_log_stats_interval": float(args.vllm_log_stats_interval),
             **prompt_info,
             "top_k": args.top_k,
             "sampling": {

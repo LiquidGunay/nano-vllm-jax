@@ -554,8 +554,7 @@ def test_backend_local_cuda_probe_routes_require_explicit_opt_in(monkeypatch):
 
 
 def test_load_server_config_applies_typed_runtime_env(tmp_path, monkeypatch):
-    monkeypatch.delenv("JAX_PLATFORMS", raising=False)
-    monkeypatch.delenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", raising=False)
+    _clear_config_env(monkeypatch)
     config = tmp_path / "server_config.yaml"
     config.write_text(
         """

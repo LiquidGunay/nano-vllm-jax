@@ -440,6 +440,9 @@ def test_model_runner_release_preserves_carry_for_still_running_rows():
 def test_scheduler_static_decode_metadata_reuses_fixed_device_arrays(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_METADATA", "1")
+    monkeypatch.delenv("NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_RESIDENT_DECODE_METADATA", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS", raising=False)
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
         Qwen3_5Config(
@@ -652,7 +655,9 @@ def test_scheduler_resident_capacity_can_exceed_execution_batch():
     assert len(scheduler.running) == 2
 
 
-def test_scheduler_trims_mtp_lookahead_when_final_bucket_denies():
+def test_scheduler_trims_mtp_lookahead_when_final_bucket_denies(monkeypatch):
+    monkeypatch.delenv("NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", raising=False)
     scheduler = Scheduler(
         Qwen3_5Config(
             block_size=2,
@@ -698,7 +703,9 @@ def test_scheduler_trims_mtp_lookahead_when_final_bucket_denies():
     }
 
 
-def test_scheduler_caps_decode_steps_to_reserved_slots_after_mtp_denial():
+def test_scheduler_caps_decode_steps_to_reserved_slots_after_mtp_denial(monkeypatch):
+    monkeypatch.delenv("NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", raising=False)
     scheduler = Scheduler(
         Qwen3_5Config(
             block_size=2,
