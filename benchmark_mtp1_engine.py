@@ -135,6 +135,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mtp-position-offset", type=int, default=0)
     parser.add_argument("--mtp-token-source", choices=["generated", "current"], default="generated")
     parser.add_argument("--mtp-hidden-source", choices=["pre_norm", "final_normed"], default="final_normed")
+    parser.add_argument(
+        "--mtp-verifier-impl",
+        choices=["two_decode", "k_decode", "generic_k", "packed_prefix"],
+        default="packed_prefix",
+        help="Verifier implementation passed into Qwen3_5Config for strict MTP runs.",
+    )
     parser.add_argument("--sweep-alignments", action="store_true")
     parser.add_argument("--exec-log-steps", action="store_true", help="Enable executor per-step logging")
     parser.add_argument("--step-profile", action="store_true", help="Collect per-step decode profiling")
@@ -2305,6 +2311,7 @@ def _main_impl(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         max_blocks_per_seq=args.max_blocks_per_seq,
         jax_execution=args.jax_execution,
         num_speculative_tokens=args.num_speculative_tokens,
+        mtp_verifier_impl=args.mtp_verifier_impl,
     )
     load_seconds = time.perf_counter() - load_t0
     print(f"load_seconds={load_seconds:.3f}")

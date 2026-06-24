@@ -259,7 +259,7 @@ def _engine_kwargs(args: argparse.Namespace, config: dict[str, Any]) -> dict[str
         "jax_execution": config_args["jax_execution"],
         "speculative_method": str(config_args.get("speculative_method", "none")),
         "draft_sample_method": str(config_args.get("draft_sample_method", "greedy")),
-        "mtp_verifier_impl": str(config_args.get("mtp_verifier_impl", "two_decode")),
+        "mtp_verifier_impl": str(config_args.get("mtp_verifier_impl", "packed_prefix")),
         "mtp_batch_accept_policy": str(config_args.get("mtp_batch_accept_policy", "rowwise")),
         "mtp_seed_after_bonus": bool(config_args.get("mtp_seed_after_bonus", False)),
         "mtp_bonus_margin": float(config_args.get("mtp_bonus_margin", 0.0)),

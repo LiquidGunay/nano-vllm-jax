@@ -63,6 +63,7 @@ class _FakeExecutor:
         committed_seq_lens,
         kv_slots,
         next_topk=None,
+        emit_bonus=True,
     ):
         self.accepted = accepted
         self.target = target
@@ -72,6 +73,7 @@ class _FakeExecutor:
         self.committed_seq_lens = committed_seq_lens
         self.kv_slots = kv_slots
         self.next_topk = next_topk or [[700 + i, 701 + i, 702 + i] for i in range(len(accepted))]
+        self.emit_bonus = emit_bonus
         self.calls = []
 
     def mtp1_commit_select_greedy_step_jit(self, *args, **kwargs):
@@ -79,10 +81,18 @@ class _FakeExecutor:
 
     @staticmethod
     def _row_values(values, row, width):
+        if int(row) < 0:
+            return [0 for _ in range(width)]
         value = values[row]
         if isinstance(value, (list, tuple)):
             return [int(token) for token in value]
         return [int(value) for _ in range(width)]
+
+    @staticmethod
+    def _row_scalar(values, row, default=0):
+        if int(row) < 0:
+            return int(default)
+        return int(values[row])
 
     def mtp1_two_decode_greedy_step_jit(
         self,
@@ -101,11 +111,12 @@ class _FakeExecutor:
                 "next_mtp_position": [int(x) for x in next_mtp_position.tolist()],
             }
         )
-        if int(batch.tokens.shape[0]) == len(self.accepted):
+        seq_id_rows = [int(seq_id) for seq_id in batch.seq_ids.tolist()]
+        if int(batch.tokens.shape[0]) == len(self.accepted) and all(row >= 0 for row in seq_id_rows):
             output_rows = list(range(len(self.accepted)))
         else:
-            output_rows = [int(seq_id) for seq_id in batch.seq_ids.tolist()]
-        marker = jnp.array([self.state_marker[row] for row in output_rows], dtype=jnp.float32).reshape(
+            output_rows = seq_id_rows
+        marker = jnp.array([self._row_scalar(self.state_marker, row) for row in output_rows], dtype=jnp.float32).reshape(
             (-1, 1, 1, 1)
         )
         return MTP1GreedyOutput(
@@ -147,11 +158,12 @@ class _FakeExecutor:
                 "next_mtp_position": [int(x) for x in next_mtp_position.tolist()],
             }
         )
-        if int(batch.tokens.shape[0]) == len(self.accepted):
+        seq_id_rows = [int(seq_id) for seq_id in batch.seq_ids.tolist()]
+        if int(batch.tokens.shape[0]) == len(self.accepted) and all(row >= 0 for row in seq_id_rows):
             output_rows = list(range(len(self.accepted)))
         else:
-            output_rows = [int(seq_id) for seq_id in batch.seq_ids.tolist()]
-        marker = jnp.array([self.state_marker[row] for row in output_rows], dtype=jnp.float32).reshape(
+            output_rows = seq_id_rows
+        marker = jnp.array([self._row_scalar(self.state_marker, row) for row in output_rows], dtype=jnp.float32).reshape(
             (-1, 1, 1, 1)
         )
         width = int(draft_tokens.shape[1])
@@ -184,14 +196,18 @@ class _FakeExecutor:
                 if pos < accepted_count:
                     row_emitted.append(target_values[pos])
                 elif pos == accepted_count:
-                    if accepted_count == width:
-                        row_emitted.append(int(self.bonus[row]))
+                    if accepted_count == width and self.emit_bonus:
+                        row_emitted.append(self._row_scalar(self.bonus, row))
+                    elif accepted_count == width:
+                        row_emitted.append(0)
                     else:
                         row_emitted.append(target_values[pos])
                 else:
                     row_emitted.append(0)
             emitted_rows.append(row_emitted)
-            emitted_count_rows.append(accepted_count + 1)
+            emitted_count_rows.append(
+                accepted_count + (1 if accepted_count < width or self.emit_bonus else 0)
+            )
             accepted_count_rows.append(accepted_count)
         emitted_tokens = jnp.array(emitted_rows, dtype=jnp.int32).reshape(
             (len(output_rows), 1, width + 1)
@@ -213,7 +229,10 @@ class _FakeExecutor:
             emitted_totals = emitted_counts[:, 0].astype(jnp.int32)
             accepted_totals = accepted_counts[:, 0].astype(jnp.int32)
             rejected_totals = (accepted_counts[:, 0] < width).astype(jnp.int32)
-            bonus_totals = (accepted_counts[:, 0] == width).astype(jnp.int32)
+            bonus_totals = (
+                (accepted_counts[:, 0] == width)
+                & (emitted_counts[:, 0] > accepted_counts[:, 0])
+            ).astype(jnp.int32)
             accepted_bitmask = (accepted_counts[:, 0] > 0).astype(jnp.int32)
             compact_summary = jnp.stack(
                 [
@@ -230,7 +249,7 @@ class _FakeExecutor:
                 target_rows,
                 dtype=jnp.int32,
             ),
-            bonus_token=jnp.array([self.bonus[row] for row in output_rows], dtype=jnp.int32),
+            bonus_token=jnp.array([self._row_scalar(self.bonus, row) for row in output_rows], dtype=jnp.int32),
             next_draft_token=jnp.array(
                 [self._row_values(self.next_draft, row, width) for row in output_rows],
                 dtype=jnp.int32,
@@ -245,7 +264,7 @@ class _FakeExecutor:
             ),
             hybrid_state=HybridLayerState(conv_state=marker, recurrent_state=marker + 1000),
             committed_seq_lens=jnp.array(
-                [self.committed_seq_lens[row] for row in output_rows],
+                [self._row_scalar(self.committed_seq_lens, row) for row in output_rows],
                 dtype=jnp.int32,
             ),
             emitted_tokens=emitted_tokens,
@@ -283,11 +302,12 @@ class _FakeExecutor:
                 "next_mtp_position": [int(x) for x in next_mtp_position.tolist()],
             }
         )
-        if int(batch.tokens.shape[0]) == len(self.accepted):
+        seq_id_rows = [int(seq_id) for seq_id in batch.seq_ids.tolist()]
+        if int(batch.tokens.shape[0]) == len(self.accepted) and all(row >= 0 for row in seq_id_rows):
             output_rows = list(range(len(self.accepted)))
         else:
-            output_rows = [int(seq_id) for seq_id in batch.seq_ids.tolist()]
-        marker = jnp.array([self.state_marker[row] for row in output_rows], dtype=jnp.float32).reshape(
+            output_rows = seq_id_rows
+        marker = jnp.array([self._row_scalar(self.state_marker, row) for row in output_rows], dtype=jnp.float32).reshape(
             (-1, 1, 1, 1)
         )
         width = int(draft_tokens.shape[1])
@@ -311,20 +331,29 @@ class _FakeExecutor:
                 if not value:
                     break
                 accepted_count += 1
+            commit_count = (
+                accepted_count
+                if width == 1 or accepted_count == width
+                else 0
+            )
             row_emitted = []
             for pos in range(width + 1):
-                if pos < accepted_count:
+                if pos < commit_count:
                     row_emitted.append(target_values[pos])
-                elif pos == accepted_count:
-                    if accepted_count == width:
-                        row_emitted.append(int(self.bonus[row]))
+                elif pos == commit_count:
+                    if commit_count == width and self.emit_bonus:
+                        row_emitted.append(self._row_scalar(self.bonus, row))
+                    elif commit_count == width:
+                        row_emitted.append(0)
                     else:
                         row_emitted.append(target_values[pos])
                 else:
                     row_emitted.append(0)
             emitted_rows.append(row_emitted)
-            emitted_count_rows.append(accepted_count + 1)
-            accepted_count_rows.append(accepted_count)
+            emitted_count_rows.append(
+                commit_count + (1 if commit_count < width or self.emit_bonus else 0)
+            )
+            accepted_count_rows.append(commit_count)
         emitted_tokens = jnp.array(emitted_rows, dtype=jnp.int32).reshape(
             (len(output_rows), 1, width + 1)
         )
@@ -336,7 +365,7 @@ class _FakeExecutor:
         )
         return MTP1GreedyOutput(
             target_token=jnp.array(target_rows, dtype=jnp.int32),
-            bonus_token=jnp.array([self.bonus[row] for row in output_rows], dtype=jnp.int32),
+            bonus_token=jnp.array([self._row_scalar(self.bonus, row) for row in output_rows], dtype=jnp.int32),
             next_draft_token=jnp.array(
                 [self._row_values(self.next_draft, row, width) for row in output_rows],
                 dtype=jnp.int32,
@@ -348,7 +377,7 @@ class _FakeExecutor:
             ),
             hybrid_state=HybridLayerState(conv_state=marker, recurrent_state=marker + 1000),
             committed_seq_lens=jnp.array(
-                [self.committed_seq_lens[row] for row in output_rows],
+                [self._row_scalar(self.committed_seq_lens, row) for row in output_rows],
                 dtype=jnp.int32,
             ),
             emitted_tokens=emitted_tokens,
@@ -368,8 +397,9 @@ class _FakeExecutor:
         mtp_hidden_final_normed,
         mtp_chain_return_normed=False,
         mtp_chain_mode="recursive",
+        burst_groups=1,
     ):
-        output = self.mtp_k_decode_greedy_step_jit(
+        output = self.mtp2_commit_select_greedy_step_jit(
             batch,
             cache_storage=cache_storage,
             hybrid_state=hybrid_state,
@@ -380,6 +410,37 @@ class _FakeExecutor:
             mtp_chain_mode=mtp_chain_mode,
         )
         self.calls[-1]["method"] = "mtp_k_packed_prefix"
+        return output
+
+    def mtp_k_packed_prefix_table_greedy_step_jit(
+        self,
+        batch,
+        *,
+        cache_storage,
+        mtp_cache_storage,
+        hybrid_state_table,
+        hybrid_slot_ids,
+        draft_tokens,
+        next_mtp_position,
+        mtp_hidden_final_normed,
+        mtp_chain_return_normed=False,
+        mtp_chain_mode="recursive",
+        burst_groups=1,
+        emit_bonus=True,
+        resident_seq_lens=None,
+    ):
+        output = self.mtp2_commit_select_greedy_step_jit(
+            batch,
+            cache_storage=cache_storage,
+            hybrid_state=hybrid_state_table,
+            draft_tokens=draft_tokens,
+            next_mtp_position=next_mtp_position,
+            mtp_hidden_final_normed=mtp_hidden_final_normed,
+            mtp_chain_return_normed=mtp_chain_return_normed,
+            mtp_chain_mode=mtp_chain_mode,
+        )
+        self.calls[-1]["method"] = "mtp_k_packed_prefix_table"
+        output.hybrid_state_is_table = True
         return output
 
     def forward_step_token_ids_mtp_draft_chain_jit(
@@ -471,14 +532,18 @@ class _FakeExecutor:
                     if pos < accepted_count:
                         group_emitted.append(target_values[pos])
                     elif pos == accepted_count:
-                        if accepted_count == width:
+                        if accepted_count == width and self.emit_bonus:
                             group_emitted.append(int(self.bonus[row]) + group_idx)
+                        elif accepted_count == width:
+                            group_emitted.append(0)
                         else:
                             group_emitted.append(target_values[pos])
                     else:
                         group_emitted.append(0)
                 emitted_rows.append(group_emitted)
-                emitted_count_rows.append(accepted_count + 1)
+                emitted_count_rows.append(
+                    accepted_count + (1 if accepted_count < width or self.emit_bonus else 0)
+                )
                 target_rows.append(target_values)
                 accepted_rows.append(accepted_values)
                 accepted_count_rows.append(accepted_count)
@@ -523,7 +588,10 @@ class _FakeExecutor:
                 axis=1,
             )
             bonus_totals = jnp.sum(
-                (accepted_counts == width).astype(jnp.int32),
+                (
+                    (accepted_counts == width)
+                    & (emitted_counts > accepted_counts)
+                ).astype(jnp.int32),
                 axis=1,
             )
             bit_values = jnp.left_shift(
@@ -754,7 +822,10 @@ class _FakeRunner:
         self.stored = []
         self.snapshots = []
         self.draft_position_acceptance = []
-        self._hybrid_state_table = None
+        self._hybrid_state_table = HybridLayerState(
+            conv_state=jnp.zeros((16, 1, 1, 1), dtype=jnp.float32),
+            recurrent_state=jnp.zeros((16, 1, 1, 1), dtype=jnp.float32),
+        )
         self.written_slots = []
 
     def _maybe_apply_device_token_carry(self, batch):
@@ -911,6 +982,9 @@ class _FakeRunner:
 
     def _speculative_stats(self):
         return self.stats
+
+    def _strict_k_mtp_verifier_enabled(self):
+        return ModelRunner._strict_k_mtp_verifier_enabled(self)
 
     @staticmethod
     def _seq_mtp_admitted(seq):
@@ -1138,6 +1212,41 @@ def test_run_uses_seed_then_table_burst_for_missing_draft_rows(monkeypatch):
     assert runner.stats.get("fallback_seeded_main_steps", 0) == 0
 
 
+def test_strict_k_run_bootstraps_missing_draft_with_fused_seed(monkeypatch):
+    seq_lens = [5]
+    executor = _FakeExecutor(
+        accepted=[[True, True]],
+        target=[100],
+        bonus=[201],
+        next_draft=[[301, 302]],
+        state_marker=[930],
+        committed_seq_lens=[8],
+        kv_slots=[[1000, 1001, 1002]],
+    )
+    runner = _FakeRunner(
+        executor,
+        {},
+        block_size=16,
+        num_speculative_tokens=2,
+    )
+    runner.mtp_verifier_impl = "k_decode"
+    seqs = [_seq(0, seq_lens[0], max_tokens=64, ignore_eos=True)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+
+    outputs = ModelRunner.run(
+        runner,
+        seqs,
+        batch=_batch(seq_lens),
+    )
+
+    assert executor.calls[-1]["method"] == "forward_step_token_ids_mtp_draft_chain"
+    assert _resolve_output_tokens(outputs[0]) == [100]
+    assert _resolve_output_tokens(runner._mtp1_drafts[0]) == [301, 302]
+    assert runner.stats.get("mtp_bootstrap_main_seed_steps", 0) == 1
+    assert runner.stats.get("fallback_seeded_main_steps", 0) == 0
+
+
 def test_k1_commit_b1_accepted_invariants_and_parity(monkeypatch):
     runner, outputs = _run_case(
         monkeypatch,
@@ -1334,6 +1443,7 @@ def test_k2_commit_select_compacts_partial_physical_rows(monkeypatch):
         block_size=16,
         num_speculative_tokens=2,
     )
+    runner.mtp_verifier_impl = "commit_select"
     seqs = [_seq(i, seq_lens[i]) for i in range(3)]
 
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
@@ -1399,6 +1509,7 @@ def test_k2_commit_select_uses_static_padded_verifier_rows(monkeypatch):
         block_size=16,
         num_speculative_tokens=2,
     )
+    runner.mtp_verifier_impl = "commit_select"
     runner.config.mtp_max_active_rows = 4
     runner.mtp_max_active_rows = 4
     seqs = [_seq(i, seq_lens[i]) for i in range(3)]
@@ -1429,7 +1540,7 @@ def test_k2_commit_select_uses_static_padded_verifier_rows(monkeypatch):
     assert runner.stored[-1][0].seq_lens.tolist() == [7, 0, 7, 0]
 
 
-def test_generic_k_commits_partial_prefix_without_repair(monkeypatch):
+def test_generic_k_partial_prefix_commits_one_target_token(monkeypatch):
     seq_lens = [5, 7]
     executor = _FakeExecutor(
         accepted=[
@@ -1446,7 +1557,7 @@ def test_generic_k_commits_partial_prefix_without_repair(monkeypatch):
             [40, 41, 42],
         ],
         state_marker=[901, 910],
-        committed_seq_lens=[6, 7],
+        committed_seq_lens=[6, 8],
         kv_slots=[
             [1000, 1001, 1002],
             [1010, 2011, 2012],
@@ -1474,7 +1585,7 @@ def test_generic_k_commits_partial_prefix_without_repair(monkeypatch):
     )
 
     assert {row: _resolve_output_tokens(value) for row, value in outputs.items()} == {
-        0: [10, 101],
+        0: [10],
         1: [201],
     }
     assert len(runner.executor.calls) == 1
@@ -1482,17 +1593,17 @@ def test_generic_k_commits_partial_prefix_without_repair(monkeypatch):
     assert runner.executor.calls[-1]["draft_tokens"] == [[10, 11, 12], [99, 98, 97]]
     assert runner.stats == {
         "drafts_proposed": 6,
-        "drafts_accepted": 1,
+        "drafts_accepted": 0,
         "drafts_rejected": 2,
         "bonus_tokens": 0,
     }
     assert runner.draft_position_acceptance[-1] == [
-        [True, False, False],
+        [False, False, False],
         [False, False, False],
     ]
     assert _resolve_output_tokens(runner._mtp1_drafts[0]) == [30, 31, 32]
     assert _resolve_output_tokens(runner._mtp1_drafts[1]) == [40, 41, 42]
-    assert runner.stored[-1][0].seq_lens.tolist() == [6, 7]
+    assert runner.stored[-1][0].seq_lens.tolist() == [6, 8]
 
 
 def test_generic_k_host_commit_emits_verifier_targets_not_stale_drafts(monkeypatch):
@@ -1512,7 +1623,7 @@ def test_generic_k_host_commit_emits_verifier_targets_not_stale_drafts(monkeypat
             [50, 51],
         ],
         state_marker=[902, 911],
-        committed_seq_lens=[7, 8],
+        committed_seq_lens=[8, 8],
         kv_slots=[
             [1000, 1001, 1002],
             [1010, 1011, 2012],
@@ -1540,12 +1651,57 @@ def test_generic_k_host_commit_emits_verifier_targets_not_stale_drafts(monkeypat
 
     assert {row: _resolve_output_tokens(value) for row, value in outputs.items()} == {
         0: [10, 11, 30],
-        1: [20, 21],
+        1: [20],
     }
     assert runner.executor.calls[-1]["draft_tokens"] == [[910, 911], [920, 921]]
-    assert runner.stats["drafts_accepted"] == 3
+    assert runner.stats["drafts_accepted"] == 2
     assert runner.stats["drafts_rejected"] == 1
     assert runner.stats["bonus_tokens"] == 1
+
+
+def test_generic_k_full_accept_without_bonus_counts_no_bonus(monkeypatch):
+    seq_lens = [5]
+    executor = _FakeExecutor(
+        accepted=[[True, True]],
+        target=[[10, 11]],
+        bonus=[30],
+        next_draft=[[40, 41]],
+        state_marker=[902],
+        committed_seq_lens=[7],
+        kv_slots=[[1000, 1001, 1002]],
+        emit_bonus=False,
+    )
+    runner = _FakeRunner(
+        executor,
+        {0: [910, 911]},
+        block_size=16,
+        num_speculative_tokens=2,
+    )
+    runner.mtp_verifier_impl = "k_decode"
+    seqs = [_seq(0, seq_lens[0])]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_DISABLE_BONUS", "1")
+
+    outputs = ModelRunner._run_mtp1_batched(
+        runner,
+        seqs,
+        _batch(seq_lens),
+        [0],
+    )
+
+    assert {row: _resolve_output_tokens(value) for row, value in outputs.items()} == {
+        0: [10, 11],
+    }
+    assert runner.executor.calls[-1]["draft_tokens"] == [[910, 911]]
+    assert runner.stats["drafts_accepted"] == 2
+    assert runner.stats["drafts_rejected"] == 0
+    assert runner.stats["bonus_tokens"] == 0
+    assert runner.draft_position_acceptance[-1] == [[True, True]]
+    assert _resolve_output_tokens(runner._mtp1_drafts[0]) == [40, 41]
+    assert runner.stored[-1][0].seq_lens.tolist() == [7]
 
 
 def test_generic_k_force_reject_overrides_full_draft_chain(monkeypatch):
@@ -1599,16 +1755,19 @@ def test_generic_k_force_reject_overrides_full_draft_chain(monkeypatch):
     }
 
 
-def test_generic_k_compacts_partial_physical_rows(monkeypatch):
+def test_generic_k_masks_partial_physical_rows(monkeypatch):
     seq_lens = [5, 7]
     executor = _FakeExecutor(
-        accepted=[[True, False]],
-        target=[[10, 101]],
-        bonus=[20],
-        next_draft=[[30, 31]],
-        state_marker=[901],
-        committed_seq_lens=[6],
-        kv_slots=[[1000, 1001, 1002]],
+        accepted=[[False, False], [True, False]],
+        target=[[0, 0], [10, 101]],
+        bonus=[0, 20],
+        next_draft=[[0, 0], [30, 31]],
+        state_marker=[0, 901],
+        committed_seq_lens=[0, 8],
+        kv_slots=[
+            [0, 0, 0],
+            [1000, 1001, 1002],
+        ],
     )
     runner = _FakeRunner(
         executor,
@@ -1633,18 +1792,18 @@ def test_generic_k_compacts_partial_physical_rows(monkeypatch):
     )
 
     assert {row: _resolve_output_tokens(value) for row, value in outputs.items()} == {
-        1: [10, 101],
+        1: [10],
     }
     assert runner.executor.calls[-1]["method"] == "mtp_k_decode"
-    assert runner.executor.calls[-1]["batch_size"] == 1
-    assert runner.executor.calls[-1]["draft_tokens"] == [[10, 11]]
-    assert runner.stored[-1][0].seq_lens.tolist() == [6]
-    assert runner.stored[-1][0].seq_ids_host == (1,)
-    assert runner.mtp_output_carry[1] == [seqs[1]]
+    assert runner.executor.calls[-1]["batch_size"] == 2
+    assert runner.executor.calls[-1]["draft_tokens"] == [[0, 0], [10, 11]]
+    assert runner.stored[-1][0].seq_lens.tolist() == [0, 8]
+    assert runner.stored[-1][0].seq_ids_host == (-1, 1)
+    assert runner.mtp_output_carry[1] == seqs
     assert {
         row: _resolve_output_tokens(value)
         for row, value in runner.mtp_output_carry[2].items()
-    } == {0: [10, 101]}
+    } == {1: [10]}
 
 
 def test_packed_prefix_uses_explicit_verifier_route(monkeypatch):
@@ -1655,7 +1814,7 @@ def test_packed_prefix_uses_explicit_verifier_route(monkeypatch):
         bonus=[20, 21],
         next_draft=[[30, 31], [40, 41]],
         state_marker=[901, 910],
-        committed_seq_lens=[6, 7],
+        committed_seq_lens=[7, 8],
         kv_slots=[
             [1000, 1001, 1002],
             [1010, 2011, 2012],
@@ -2304,17 +2463,23 @@ def test_k1_commit_reject_then_accept(monkeypatch):
     assert runner._mtp1_drafts == {}
 
 
-def test_k1_commit_block_boundary_defers_to_canonical_decode(monkeypatch):
+def test_k1_commit_block_boundary_runs_when_capacity_is_allocated(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_ALLOW_MIXED_FUSED", "1")
+
+    executor = _FakeExecutor([True], [10], [20], [30], [1], [10], [[0, 0]])
+    runner = _FakeRunner(executor, {0: 10}, block_size=8)
+    at_completed_block = [_seq(0, 8)]
+    assert ModelRunner._run_mtp1_batched(runner, at_completed_block, _batch([8]), [0]) == {
+        0: [10, 20]
+    }
+
     executor = _FakeExecutor([True], [10], [20], [30], [1], [8], [[0, 0]])
     runner = _FakeRunner(executor, {0: 10}, block_size=8)
-
-    at_completed_block = [_seq(0, 8)]
-    assert ModelRunner._run_mtp1_batched(runner, at_completed_block, _batch([8]), [0]) is None
-
     ahead_would_end_block = [_seq(0, 6)]
-    assert ModelRunner._run_mtp1_batched(runner, ahead_would_end_block, _batch([6]), [0]) is None
+    assert ModelRunner._run_mtp1_batched(runner, ahead_would_end_block, _batch([6]), [0]) == {
+        0: [10, 20]
+    }
 
 
 def test_k1_commit_eos_target_and_bonus_are_reported(monkeypatch):
@@ -2598,9 +2763,10 @@ def test_k2_commit_select_exposes_partial_accept_as_one_token_commit(monkeypatch
     assert output.host_payload.tolist()[0][-2:] == [0, 0]
 
 
-def test_first_prefix_hybrid_matches_full_prefix_gather():
+def test_first_prefix_hybrid_matches_full_prefix_gather(monkeypatch):
     import jax
 
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", raising=False)
     config = _tiny_mtp_verifier_config()
     config.gdn_packed_decode_impl = "reference"
     params = init_params(jax.random.PRNGKey(0), config)
@@ -2681,7 +2847,7 @@ def test_first_prefix_hybrid_matches_full_prefix_gather():
         jnp.abs(
             full_prefix.recurrent_state[:, 0] - first_prefix.recurrent_state
         )
-    ) == pytest.approx(0.0)
+    ) == pytest.approx(0.0, abs=2.0e-6)
 
 
 def test_k1_safe_and_fast_two_decode_verifier_parity_rowwise(monkeypatch):

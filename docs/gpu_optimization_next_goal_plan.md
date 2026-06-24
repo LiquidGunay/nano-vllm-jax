@@ -99,14 +99,14 @@ optimization work starts.
     not promote MTP as a default random-serving route. Short 64-token output
     still loses, and the `204.09 tok/s` all-accept result is an unsafe upper
     bound because it skips acceptance transfer.
-20. The active MTP follow-up is to broaden Entry 303 from B=1 to realistic
-    hetero/random decode buckets without benchmark-specific shape assumptions.
-    The first implementation target is an exact multi-row K-burst verifier:
-    fixed physical buckets, paged KV attention, generic warmup, commit all
-    rows that accept every burst group, and repair only rejected rows from the
-    already-computed target-token output. Any speed claim must compare against
-    the same no-MTP config on `hetero8` and `random_large`; unsafe all-accept
-    shortcuts remain upper bounds only.
+20. Historical checkpoint (2026-06-13 to 2026-06-14):
+    Entry 303 follow-up broadened from B=1 toward larger buckets.
+    Historical route details are `exact multi-row K-burst verifier` with
+    fixed physical buckets, paged KV attention, generic warmup, commit-all-accept
+    rows, and rejected-row repair from previously computed target-token output.
+    This was a diagnostic checkpoint. Any speed claim from this row was
+    compared against same-surface no-MTP controls; unsafe all-accept shortcuts
+    remain upper bounds only.
 21. As of 2026-06-15, verified K=1 uses explicit
     `mtp_verifier_impl=k_decode` rather than the old
     `NANO_VLLM_JAX_MTP_FORCE_GENERIC_K=1` diagnostic. On the two-request smoke
@@ -122,23 +122,13 @@ optimization work starts.
     reference/packed projection and raw-tail GDN; `2.20 output tok/s` for
     conv-tail GDN). The next speed lever is a coarser width-2 target-model
     verifier boundary, not another per-token GDN kernel swap.
-22. The active MTP route is now the exact resident-table K=1 two-decode
-    verifier. It gathers active hybrid state rows from the resident table,
-    verifies `[current, draft]`, selects the after-current or after-draft
-    hybrid state per row, scatters the selected state back to the resident
-    table inside the compiled boundary, and returns compact emitted token
-    summaries. On the two-row smoke lane it is exact and JIT-stable with
-    `12/13` accepted drafts, improving the compact one-pass verifier from
-    `22.52 output tok/s` to `28.23 output tok/s`, close to the `k_decode`
-    route's `28.97 output tok/s`. This is still well below the no-MTP control
-    at `47.25 output tok/s`, so the current blocker is no longer only the
-    prefix-state verifier selection. The next work must profile and remove the
-    remaining host/token-carry/scheduler overhead around verified MTP groups:
-    postprocess materialization placement, device-token prefetch, block commit
-    bookkeeping, MTP admission/update cost, and any first-use/final-drain
-    synchronizations. Do not resume isolated GDN decode-kernel swaps for this
-    goal unless the integrated verified MTP path shows the verifier kernel
-    itself has returned as the dominant bucket.
+22. Historical checkpoint (2026-06-15): exact resident-table K=1 two-decode
+    verifier. It gathered active hybrid state rows from the resident table,
+    verified `[current, draft]`, selected after-current/after-draft hybrid state,
+    scattered selected state back to the resident table, and returned compact
+    emitted summaries. On the two-row smoke lane it was exact/JIT-stable
+    (`12/13` accepted) and improved from `22.52` to `28.23 output tok/s`,
+    but it remained diagnostic-only versus `k_decode` and no-MTP controls.
 23. A 2026-06-15 prefill-seeded resident-table diagnostic did not solve the
     verifier bottleneck. It removed the explicit fallback seed step
     (`fallback_seeded_main_steps=0`) but only reached `29.37 output tok/s`
@@ -3567,10 +3557,11 @@ Model-specific assumptions to track:
     `233.48 s` warmup. `--xla_gpu_cudnn_gemm_fusion_level=1` tied throughput
     but expanded warmup to `235.44 s`. Keep these as diagnostics only; do not
     add them to the accepted serving config.
-33. Entry 303 changes the MTP status from diagnostic-only to narrow controlled
-    speedup only. Keep the exact B=1 K=2/K>1 burst route available for
-    high-acceptance long-output experiments, but do not retry burst4+ unrolling
-    or prefill-seed device refs without new evidence. Do not use the
+33. Historical checkpoint: Entry 303 was a constrained narrow-lane diagnostic,
+    not a change to the active strict MTP contract. Keep the exact B=1 K=2/K>1
+    burst route available for high-acceptance long-output experiments, but do
+    not retry burst4+ unrolling or prefill-seed device refs without new evidence.
+    Do not use the
     all-accept shortcut as a correctness claim; it is an upper bound for the
     remaining acceptance-transfer cost.
 34. For the next MTP pass, do not add a benchmark-specific route. Reuse the
@@ -3663,7 +3654,7 @@ Model-specific assumptions to track:
       verifier/MTP-head work below ordinary decode. Do not retry generic K=2,
       generic K=4, or packed-prefill K verification as a default speed route.
 41. No-host-sync MTP boundary, 2026-06-15:
-    - the active MTP implementation target is a resident K-burst greedy
+    - the historical MTP implementation target was a resident K-burst greedy
       verifier, not another Python repair path;
     - within one compiled burst, each group must compute accepted prefix length,
       select the corresponding KV/hybrid/GDN state, emit a fixed-width token row
@@ -3746,6 +3737,25 @@ state ABI with kernel-native V,K layout, then replace the few serving kernels
 where vLLM/FlashInfer/FLA have structural advantage. Local CUDA probes are
 historical diagnostics only; production speed work should come from FlashInfer
 paged-attention/KV kernels and vLLM/FLA-style GDN kernels.
+
+## Current Broad Benchmark Status
+
+2026-06-23 actual-envelope rerun:
+
+- `hetero8`: `580.12 output tok/s`, `0.671x` stored vLLM; token-event
+  throughput `763.48 tok/s`.
+- `decode_heavy_128x128`: `154.83 output tok/s`, `0.725x` stored vLLM;
+  token-event throughput `177.20 tok/s`.
+- `random_large` compact 8-request envelope: `772.26 output tok/s`, `0.756x`
+  stored vLLM; token-event throughput `814.98 tok/s`.
+- full fixed-B8 random stress: `785.49 output tok/s`, `0.785x` stored vLLM;
+  token-event throughput `810.11 tok/s`.
+
+All four runs used generic/server warmup and had zero measured-phase JIT cache
+growth. The current best broad path is still non-MTP; strict verified MTP is
+diagnostic-only until it beats this path on actual envelopes. The next speed
+work should target TTFT/prefill scheduling and a broader result/output boundary,
+not another narrow final-token materialization tweak.
 
 ## Reference Links From The Proposal
 

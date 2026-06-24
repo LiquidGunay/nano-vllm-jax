@@ -1201,7 +1201,9 @@ def test_generate_with_trace_summary_prefetches_active_rows_to_host_sink(monkeyp
     engine.is_finished = is_finished
     engine.step = step
     engine._detokenize = lambda token_ids: ""
-    engine.config = SimpleNamespace(summary_host_token_sink_min_completion_tokens=1)
+    engine.config = SimpleNamespace(
+        summary_host_token_sink_min_completion_tokens=1,
+    )
 
     trace = engine.generate_with_trace(
         [[101], [102]],

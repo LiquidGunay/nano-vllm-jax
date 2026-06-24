@@ -165,7 +165,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--jax-mtp-verifier-impl",
         choices=["two_decode", "commit_select", "k_decode", "packed_prefix"],
-        default="commit_select",
+        default="packed_prefix",
     )
     parser.add_argument("--jax-mtp-batch-accept-policy", choices=["rowwise", "all_or_none"], default="rowwise")
     parser.add_argument("--jax-mtp-seed-after-bonus", action=argparse.BooleanOptionalAction, default=False)

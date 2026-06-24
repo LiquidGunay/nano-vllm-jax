@@ -9,7 +9,12 @@ from dataclasses import dataclass, replace
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.kv_cache import KVCacheSpec, cap_num_kv_cache_blocks
-from nanovllm_jax.engine.sequence import DeviceTokenRef, DeviceTokenSlot, Sequence, SamplingParams
+from nanovllm_jax.engine.sequence import (
+    DeviceTokenRef,
+    DeviceTokenSlot,
+    Sequence,
+    SamplingParams,
+)
 from nanovllm_jax.engine.scheduler import Scheduler
 from nanovllm_jax.engine.model_runner import ModelRunner
 from nanovllm_jax.model import ModelParams
@@ -24,8 +29,6 @@ except ImportError:
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
 _SUMMARY_HOST_TOKEN_SINK_MIN_COMPLETION_TOKENS = 1024
-
-
 def _config_or_env_flag(config: Qwen3_5Config | None, attr: str, env_name: str, *, default: bool = False) -> bool:
     if config is not None and hasattr(config, attr):
         return bool(getattr(config, attr))

@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mtp-verifier-impl",
         choices=["two_decode", "commit_select", "k_decode", "packed_prefix"],
-        default="two_decode",
+        default="packed_prefix",
     )
     parser.add_argument("--mtp-batch-accept-policy", choices=["rowwise", "all_or_none"], default="rowwise")
     parser.add_argument("--mtp-seed-after-bonus", action=argparse.BooleanOptionalAction, default=False)

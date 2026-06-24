@@ -8,6 +8,12 @@
 
 ## GPU And Benchmark Commands
 
+- Strict MTP speed work must use `mtp_verifier_impl=packed_prefix`,
+  `mtp_chain_mode=recursive`, target-model verification, persistent MTP KV
+  cache, and prefill cache seeding. `two_decode`, `commit_select`, `k_decode`,
+  stateless sequence drafts, unverified/forced accept, forced reject, and
+  sequential decode repair are diagnostics/oracles only; do not use them for
+  MTP speed claims or as hidden fallbacks.
 - Use `configs/server/gpu_optimal.yaml` as the promoted non-MTP server path.
   The root `server_config.yaml` intentionally mirrors it. Keep optional MTP,
   local CUDA probes, raw GDN experiments, and route-specific warmups in
@@ -94,6 +100,11 @@
   sidecar may regenerate/rewrite prompt manifests, so exact-envelope A/B runs
   should either call the JAX trace benchmark directly or use a fresh unique
   sidecar output prefix.
+- When using `benchmarks/benchmark_random_request_sidecar.py` with
+  `--jax-config`, remember that the config's `args` section is not imported
+  wholesale. Pass `--dtype bfloat16 --weight-dtype bfloat16` explicitly for the
+  promoted BF16 serving lane, or the sidecar default will run FP32 activations
+  and produce a non-comparable random result.
 - Push checkpoint commits to the remote periodically while working on long GPU
   optimization passes so the current best state is not only local.
 
@@ -123,15 +134,12 @@
   Keep `NANO_VLLM_JAX_MTP_ALLOW_UNSAFE_ONE_PASS_K1=0` and
   `NANO_VLLM_JAX_MTP_K1_COMMIT_REJECTED=0` for correctness and speed runs
   unless the run is explicitly labeled as an unsafe diagnostic.
-  Verified MTP should not pre-seed drafts during prefill by default
-  (`mtp_prefill_seed=false`); on the 2026-06-14 short verified diagnostic this
-  reduced TTFT from `335.3 ms` to about `74 ms`. When MTP is scheduler-gated
+  Current strict MTP speed work must pre-seed the persistent MTP draft cache
+  during prefill (`mtp_prefill_seed=true`) so the first measured speculative
+  group does not run a hidden sequential seed path. When MTP is scheduler-gated
   off, the decode batch must still use the static/resident metadata hot path;
   otherwise "MTP enabled but gated" remains slower than the accepted no-MTP
-  path and benchmark results become misleading. Current exact verified MTP is
-  still not a speed path: the same short diagnostic improved from `26.13` to
-  `57.87 output tok/s` after the guardrail fixes, but the no-MTP control is
-  `84.01 output tok/s`.
+  path and benchmark results become misleading.
   On 2026-06-21 the MTP speed target moved from sequential K=2 `commit_select`
   to a first-class `mtp_verifier_impl=packed_prefix` route. `commit_select`
   remains the exact oracle only. The packed-prefix route must verify
@@ -185,10 +193,11 @@
   `193.19 decode tok/s` vs no-MTP `410.39` (`0.471x`, `acceptance_rate=0.5`,
   runner device time `158.07 ms` vs baseline `50.71 ms`), and decode-mode
   verifier is worse (`164.91 decode tok/s`, `0.398x`, runner device time
-  `185.12 ms`, warmup `59.55 s`). Keep `mtp_burst_groups=1` for exact MTP
-  diagnostics. Do not use `burst_groups>1` for MTP speed claims until the
-  multi-group device carry/state boundary is proven exact without trace-step
-  materialization.
+  `185.12 ms`, warmup `59.55 s`). That warning applied to the older
+  seed-then-table implementation. Current strict speed work may use
+  `mtp_burst_groups>1` only on the resident-table packed-prefix route after the
+  generic server warmup covers the full burst and masked tail routes and
+  `--fail-on-jit-cache-growth` proves the measured phase does not compile.
   Later on 2026-06-15, the verified K=1 burst boundary was widened: the
   executor now compacts emitted burst tokens on device and returns per-row
   emitted/accepted/rejected/bonus totals plus an acceptance bitmask, so Python
@@ -256,6 +265,130 @@
   row 0 index 1), so this is not just the Triton packed-prefix kernel. Do not
   promote packed-prefix or width>1 decode accepted-prefix commits until their
   target logits and committed GDN/full-attention state match sequential decode.
+  Later on 2026-06-21, the temporary K=2 exact-repair fallback was removed.
+  `mtp_verifier_impl=k_decode` and `mtp_verifier_impl=packed_prefix` must now
+  exercise the actual grouped verifier boundary. `commit_select` remains the
+  correctness oracle for diagnostics only; do not reintroduce it as a runtime
+  fallback for K=2 grouped verification.
+  Historical bridge checkpoint: keep `commit_select` as the sequential correctness
+  oracle, use `k_decode` as the same-width decode oracle for
+  `[current, draft_1, draft_2]`, then keep packed-prefix work as the speed
+  target that must reproduce that contract. Do not treat `k_decode` as the
+  expected speed path; it is the correctness oracle for parity.
+  A clean runtime smoke without parity/debug probes,
+  `k2_strict_runtime_no_parity_jax_12.json`, completed with every K=2 verifier
+  step on `mtp_k_decode` and no `commit_select` labels. It reported
+  `fallback_steps=0`, `fallback_partial_rows=0`, four resident grouped commits,
+  and acceptance `4/12`; the remaining `fallback_seeded_main_steps=2` and
+  `fallback_gated_no_spec_steps=1` are initial missing-draft seeding and the
+  final `max_tokens` tail where K+bonus speculation cannot run, not sequential
+  verifier repair.
+  A later 2026-06-21 strict-K pass proved compact rows were not the only
+  problem: masked physical partial K batches still diverged if they committed a
+  partial accepted prefix. The active `mtp_k_decode` contract is now
+  conservative for K>1: run the grouped verifier, but only commit accepted
+  draft tokens when the whole K block verifies; partial accepts emit one
+  target-model token and count as a rejected block. The exact no-fallback GPU
+  checkpoint is `k2_kdecode_fullonly_no_fallback_b2_len16.json`, matching the
+  same B=2 16-token no-MTP reference with `fallback_steps=0` and masked partial
+  rows labeled `mtp_k_decode_masked_partial`. It is not a speed path
+  (`19.73 output tok/s` vs `110.32` no-MTP) and should be treated as the
+  correctness bridge for packed-prefix or broader verifier work. Do not
+  re-enable partial K-prefix commits until their KV/GDN/full-attention state is
+  parity-proven against sequential decode on GPU.
+  Later in the same pass, stale references caused false divergence reports.
+  Always regenerate a current no-MTP reference after verifier/config changes
+  before judging MTP correctness. The current-reference smoke artifacts are:
+  `no_mtp_current_b2_len16.json`,
+  `kdecode_prefill_seed_strict_force_reject_currentref_b2_len16.json`
+  (exact forced-reject oracle, `fallback_seeded_main_steps=0`, steady
+  `mtp_k_decode` about 29-30 ms), and
+  `kdecode_prefill_seed_verified_finalnorm_sequence_currentref_b2_len16.json`
+  (exact verified K=2, final-normed sequence drafts, `12/36` accepted drafts,
+  six bonus tokens, `fallback_seeded_main_steps=0`). The final-normed sequence
+  convention is the best draft-quality convention found so far, but it is still
+  not a speed path because partial-row verifier batches spend hundreds of ms in
+  host/hybrid-state gather/store work. A K=1 `two_decode` retry with the same
+  convention (`k1_twodecode_prefill_seed_verified_finalnorm_currentref_b2_len16_nowarmup.json`)
+  diverged at row 1 token 7; do not promote K=1 until its table/prefix state
+  path is parity-proven.
+  The follow-up slot preservation patch keeps `hybrid_slot_ids_host` through
+  masked verifier batches and stops `_batch_hybrid_state` from reallocating
+  inactive `-1` rows. It preserves exactness
+  (`kdecode_prefill_seed_verified_finalnorm_sequence_slotfix_currentref_b2_len16.json`)
+  and improves the smoke modestly (`4.22 -> 4.54 output tok/s`, mean ITL
+  `85.1 -> 63.0 ms`), but masked batch construction and hybrid-state
+  gather/store are still large. The next real fix is to make partial-row K
+  verification use resident slot ids/state directly instead of constructing a
+  masked physical batch on the host.
+  On 2026-06-22, packed/broad verifier work confirmed the next blocker. The
+  true flattened packed-prefill route and the decode-shaped broad route can be
+  made exact under forced rejection by repairing rejected rows inside the JIT
+  with a single exact width-1 target decode. The artifacts are
+  `packed_prefill_reject_repair_force_reject_b2_len8.json` (exact, but steady
+  verifier about `47 ms`) and
+  `packed_decode_reject_repair_force_reject_b2_len8.json` (exact, steady
+  verifier about `36-37 ms`). This is not a speed path: verified mode still
+  diverges once a row fully accepts because the broad verifier commits its
+  broad GDN/KV state for accepted rows. Both
+  `packed_prefill_reject_repair_verified_b2_len16.json` and
+  `packed_decode_reject_repair_verified_b2_len16.json` diverge at row 1 token
+  index 10 (`109120` expected, `98874` emitted) with `10/36` accepted drafts.
+  Do not promote packed-prefix/broad K verification until full-accept state
+  parity is proven against `k_decode`; repairing accepted rows exactly would
+  collapse the path back toward `k_decode` cost.
+  The next implementation direction is to make `mtp_verifier_impl=packed_prefix`
+  exact by construction with an on-device scanned verifier. It should reuse
+  the width-1 decode cell inside one JIT boundary, make all accept/reject and
+  commit decisions on device, and keep broad packed decode/prefill
+  verification as a diagnostic-only path until full-accept GDN/KV state
+  parity is proven.
+  This exact scanned packed-prefix route is now implemented. The B=2 len-16
+  artifact `packed_prefix_exact_scan_norepair_donate_b2_len16.json` is exact,
+  fixes the previous token-10 accepted-state divergence, has no measured JIT
+  growth, accepts `12/36` drafts with six bonus tokens, and reaches
+  `4.38 output tok/s`. It is still not a speed win versus the prior exact
+  `k_decode` artifact (`4.54 output tok/s`) or no-MTP, so keep broad packed
+  verification diagnostic-only until accepted-state parity is proven and use
+  the scanned route as the correctness bridge for replacing individual
+  expensive pieces.
+- Central MTP directive as of 2026-06-22:
+  - do not cycle through "disable MTP, run a probe" or sequential decode-verifier
+    fallbacks as a speed route;
+  - required path is a vLLM-style packed target verifier: pack
+    `[current, draft_1, ... draft_K]` into one target-model forward, gather
+    verifier and bonus logits by index, run accept/reject on device, and commit
+    only the accepted prefix;
+  - any route that emits draft tokens without target verification, repairs grouped
+    verification by looping target decodes, or silently falls back to ordinary
+    decode must fail or be labeled diagnostic-only and cannot be counted as MTP
+    progress;
+  - solve the packed-prefix GDN/hybrid state commit blocker with a device-side
+    selected-prefix/state-commit epilogue or equivalent packed-state ABI; do not
+    progress based on host-side repair/materialization.
+
+  Current plan:
+
+  1. Keep `k_decode` as the exact same-width decode oracle and diagnostic parity
+     target.
+  2. Make `mtp_verifier_impl=packed_prefix` exact with on-device accepted-prefix
+     selection and commit before any optimization.
+  3. Use the resident-table packed-prefix verifier as the active strict MTP
+     route when resident decode metadata is enabled. The older row-state path
+     remains useful as a diagnostic fallback for isolating table gather/scatter
+     overhead, but speed work should not regress to host-side hybrid-state
+     gather/store or sequential decode repair.
+  4. Stale speculative KV slots beyond `committed_seq_lens` are allowed. Future
+     attention is bounded by committed sequence lengths and those physical slots
+     are overwritten before becoming visible, so restoring rejected speculative
+     KV slots is a misleading full-cache materialization.
+  5. Keep broad packed decode/prefill routes explicitly labeled diagnostic until
+     full-accept state parity is proven against the oracle.
+  6. Continue reporting speed only relative to the accepted non-MTP best path and
+     only when exact parity is demonstrated. Exact verified MTP must beat the
+     same best config before it can be described as a speedup; unverified draft
+     append, forced accept, forced reject, sequential decode repair, or ordinary
+     decode fallback are diagnostics only.
 - Keep these work items in order: accepted FA/FLA policy validation, broader
   resident/scheduler decode metadata reduction, coarse GDN decode/prefill
   kernels, and model-family-general batched GEMM/fusion improvements.
@@ -525,14 +658,17 @@
   variants were already slower. Do not retry isolated GDN decode replacement as
   the 0.9x lever on A10G; the next speed route needs a broader serving boundary
   than per-layer GDN decode or a different bottleneck.
-- Entry 299 tightened strict GDN fallback behavior for prefill. With
+- Historical Entry 299 tightened strict GDN fallback behavior for prefill. With
   `gdn_disable_fallbacks=True`/`NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS=1`, packed
   and non-packed GDN prefill now error before the slow recurrent/chunked branch
   if `return_prefix_state`, `return_first_prefix_state`, recurrent prefill, or
   disabled post-conv kernels would prevent the post-conv kernel path. This
-  intentionally rejects the packed-prefill MTP verifier route until a
-  kernel-backed prefix-state boundary exists; do not re-enable this fallback
-  for benchmark runs.
+  used to reject packed-prefill MTP verifier experiments before prefix-state
+  output existed. That part is superseded by the 2026-06-22 strict
+  resident-table packed-prefix route above: current work must keep GDN
+  fallbacks disabled, but it must make packed-prefix verification succeed
+  through an on-device selected-prefix/table commit instead of treating the
+  historical rejection as an active instruction.
 - Entry 329 restored the then-best exact MTP route after rejecting the earlier
   decode-side seed-plus-table-burst experiments. That route was the
   resident-table K=1 two-decode verifier with burst2 steady groups:
@@ -547,3 +683,65 @@
   blockers are the cold first fused seed execution (~493 ms), a measured
   scheduler gap before the first steady burst in short smokes, and the
   target-model verifier cost itself.
+- Historical Entry 330 checked the K>1 packed-prefix verifier after switching it to the
+  exact scanned route. `packed_prefix_exact_scan_burst1_after_loopfix_b2_len8.json`
+  matched the no-MTP reference prefix and measured `2.11 output tok/s`, in line
+  with the earlier exact-scan smoke. The burst-loop emitted-group assembly bug
+  is fixed, but exact-scan `mtp_burst_groups=2` remained too slow on the B=2
+  length-16 smoke. This remains useful evidence against exact-scan multi-group
+  verification as a speed route, but it is superseded for the active route by
+  the resident-table packed-prefix verifier. Do not interpret any exact-scan
+  escape hatch as permission to fall back to ordinary/sequential decode
+  verification for speed claims.
+- Strict resident-table MTP update on 2026-06-22: the active exact route is
+  `mtp_verifier_impl=packed_prefix`, `mtp_chain_mode=recursive`,
+  `NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE=decode_rectangular`, persistent MTP KV
+  cache, and prefill cache seeding. K=3 with `mtp_burst_groups=4` is the current
+  hill-climb point. The promoted speed fix is masked tail bursting: when the
+  final full K+bonus burst would exceed `max_tokens` only by the last bonus,
+  keep the burst inside one resident-table verifier call, clamp host-visible
+  emitted token refs to the remaining output budget, and skip device-token
+  carry for rows that finish in that call. The temporary cached-MTP projection
+  packing experiment was rejected as neutral/slightly slower and should not be
+  reintroduced without an integrated benchmark win. Broad packed-prefill
+  attention modes still drift and remain diagnostics only.
+- Verified MTP speed checkpoint on 2026-06-22: B=2 prompts `64,128`,
+  output length `128`, K=3, `mtp_burst_groups=4`, rectangular target verifier,
+  generic warmup, and `--fail-on-jit-cache-growth` matched the no-MTP reference
+  exactly with `100%` draft acceptance, `0` fallbacks, and `0` measured JIT
+  growth. Artifact
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_strict_20260622/mtp_k3_decode_rectangular_burst4_tailclamp_clean_b2_len128_r1.json`
+  reached `285.10 output tok/s` versus the fresh no-MTP reference
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_strict_20260622/no_mtp_b2_len128_ref_r1.json`
+  at `240.76 output tok/s` (`1.18x`). The shorter output-64 smoke is now near
+  parity (`196.83` vs `197.58 output tok/s`) and remains dominated by MTP
+  prefill-seed TTFT plus the first speculative burst.
+  Broader same-shape sweep
+  `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_broad_20260623/` confirms the
+  amortization curve: output-32 loses (`0.883x`), output-64 is near/slightly
+  above parity (`1.039x`), output-128 wins (`1.241x`), and output-256 wins
+  (`1.261x`), all exact with zero measured JIT growth.
+- Exact K no-bonus verification was corrected on 2026-06-22. When
+  `NANO_VLLM_JAX_MTP_DISABLE_BONUS=1`, the verifier must emit only accepted
+  drafts or the fallback target, run K target forwards for K draft tokens, and
+  commit KV/GDN state through the carried-token boundary (`K-1` verifier input
+  stream position on full accept). Do not reintroduce the older K+1 no-bonus
+  scan or count full accepts as bonus tokens. The corrected B=2 len-8 smoke
+  `mtp_packed_prefix_exact_scan_no_bonus_kforward_b2_len8.json` matched the
+  no-MTP reference exactly at `16.26 output tok/s` with `6/18` accepted drafts
+  and `0` bonus tokens; the same-shape no-MTP reference was `78.60 output
+  tok/s`, so this is a verifier-cost reduction, not a serving speed win.
+- Broad packed-prefix K=2 decode verification can now be compared against the
+  exact no-bonus oracle with
+  `NANO_VLLM_JAX_MTP_K_VERIFY_MODE=decode`. The B=2 len-8 smoke matched the
+  exact reference and improved K=2 MTP from `16.26` to about `17.1-17.4 output
+  tok/s`, but warmup/measurement GPU memory rose to about `9.2 GB` and the
+  path was still far below the `78.60 output tok/s` no-MTP reference. Do not
+  treat this as a promoted serving speed path without larger-benchmark wins.
+- K=1 verified-bonus MTP was retested on the same tiny smoke. With admission
+  forced (`NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE=0`,
+  `NANO_VLLM_JAX_MTP_MIN_SPEEDUP=0`), packed-prefix K=1 reached only `17.70
+  output tok/s` at `4/10` accepted drafts, and the resident-table two-decode
+  verifier reached `23.14 output tok/s` at `1/13` accepted drafts. The higher
+  gated packed-prefix number (`40.85 output tok/s`) was mostly no-spec fallback
+  after admission disabled MTP, not a real speculation speedup.

@@ -3,8 +3,10 @@
 import jax
 import jax.numpy as jnp
 from typing import Dict, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.backends import InferenceBackend, select_backend
+from nanovllm_jax.kv_cache import AttentionMetadata, KVCacheState
 from nanovllm_jax.layers import rms_norm, apply_rope, causal_mask, get_activation, silu
 
 
@@ -135,7 +137,7 @@ def init_mtp_layer(key: jax.Array, config: Qwen3_5Config) -> Dict[str, jnp.ndarr
     """
     keys = jax.random.split(key, 8)
     attn_out_dim = config.num_attention_heads * config.head_dim
-    
+
     return {
         # Self-attention
         "q_proj": jax.random.normal(
@@ -224,7 +226,20 @@ def _mtp_greedy_top1_token_ids(
     if impl in {"triton", "triton_tensorcore", "triton_top1"}:
         from nanovllm_jax.kernels.lm_head_triton import lm_head_greedy_top1_triton
 
-        return lm_head_greedy_top1_triton(x_normed.astype(output_weight.dtype), output_weight).astype(jnp.int32)
+        if x_normed.ndim != 3:
+            raise ValueError("Triton MTP greedy top1 expects hidden shape [B, T, H]")
+        if int(x_normed.shape[1]) == 1:
+            return lm_head_greedy_top1_triton(
+                x_normed.astype(output_weight.dtype),
+                output_weight,
+            ).astype(jnp.int32)
+        batch, seq_len, hidden_dim = x_normed.shape
+        flat_hidden = x_normed.reshape((batch * seq_len, 1, hidden_dim))
+        flat_token_ids = lm_head_greedy_top1_triton(
+            flat_hidden.astype(output_weight.dtype),
+            output_weight,
+        ).astype(jnp.int32)
+        return flat_token_ids.reshape((batch, seq_len))
     if impl in {"cutlass", "cutlass_top1", "cutlass_fused_gemm", "fused_gemm"}:
         raise NotImplementedError(
             "lm_head_greedy_top1_impl='cutlass' is not implemented for MTP draft seeding"
@@ -308,6 +323,134 @@ def mtp_forward_token_ids(
     x_normed = x_normed.astype(_mtp_decode_activation_dtype(config))
     token_ids = _mtp_greedy_top1_token_ids(x_normed, output_weight, config)
     return token_ids, x_normed if return_normed_hidden else x
+
+
+def _mtp_forward_hidden_cached(
+    hidden_state: jnp.ndarray,
+    next_token_ids: jnp.ndarray,
+    embed_tokens: jnp.ndarray,
+    params: MTPParams,
+    config: Qwen3_5Config,
+    positions: jnp.ndarray,
+    kv_cache_state: KVCacheState,
+    attention_metadata: AttentionMetadata,
+    backend: Optional[InferenceBackend] = None,
+    is_prefill: bool = False,
+) -> Tuple[jnp.ndarray, jnp.ndarray, KVCacheState]:
+    """Run the MTP block with a persistent draft-model KV cache.
+
+    vLLM's Qwen3.5 MTP predictor is an autoregressive full-attention decoder
+    layer. The draft input ids are shifted, but the MTP positions stay aligned
+    with the target hidden positions. This cached path keeps that draft decoder
+    state in the same paged block layout as the target model.
+    """
+    if backend is None:
+        backend = select_backend("pure_jax", config=config)
+
+    next_token_embed = embed_tokens[next_token_ids]
+    hidden_norm = rms_norm(hidden_state, params.pre_fc_norm_hidden, config.rms_norm_eps)
+    embed_norm = rms_norm(next_token_embed, params.pre_fc_norm_embedding, config.rms_norm_eps)
+    x = jnp.dot(jnp.concatenate([embed_norm, hidden_norm], axis=-1), params.eh_proj)
+
+    for layer_idx, layer_params in enumerate(params.layers):
+        x, kv_cache_state = mtp_layer_forward_cached(
+            x,
+            layer_params,
+            config,
+            positions=positions,
+            kv_cache_state=kv_cache_state,
+            attention_metadata=attention_metadata,
+            backend=backend,
+            layer_idx=layer_idx,
+            is_prefill=is_prefill,
+        )
+
+    x_normed = rms_norm(x, params.final_norm, config.rms_norm_eps)
+    return x_normed, x, kv_cache_state
+
+
+def mtp_forward_token_ids_cached(
+    hidden_state: jnp.ndarray,
+    next_token_ids: jnp.ndarray,
+    embed_tokens: jnp.ndarray,
+    params: MTPParams,
+    config: Qwen3_5Config,
+    positions: jnp.ndarray,
+    kv_cache_state: KVCacheState,
+    attention_metadata: AttentionMetadata,
+    backend: Optional[InferenceBackend] = None,
+    return_normed_hidden: bool = False,
+    is_prefill: bool = False,
+) -> Tuple[jnp.ndarray, jnp.ndarray, KVCacheState]:
+    """Greedy MTP token ids while updating the persistent draft KV cache."""
+    x_normed, x, kv_cache_state = _mtp_forward_hidden_cached(
+        hidden_state=hidden_state,
+        next_token_ids=next_token_ids,
+        embed_tokens=embed_tokens,
+        params=params,
+        config=config,
+        positions=positions,
+        kv_cache_state=kv_cache_state,
+        attention_metadata=attention_metadata,
+        backend=backend,
+        is_prefill=is_prefill,
+    )
+    output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
+    token_ids = _mtp_greedy_top1_token_ids(
+        x_normed.astype(_mtp_decode_activation_dtype(config)),
+        output_weight,
+        config,
+    )
+    return token_ids, x_normed if return_normed_hidden else x, kv_cache_state
+
+
+def mtp_forward_selected_token_ids_cached(
+    hidden_state: jnp.ndarray,
+    next_token_ids: jnp.ndarray,
+    embed_tokens: jnp.ndarray,
+    params: MTPParams,
+    config: Qwen3_5Config,
+    positions: jnp.ndarray,
+    kv_cache_state: KVCacheState,
+    attention_metadata: AttentionMetadata,
+    selected_indices: jnp.ndarray,
+    backend: Optional[InferenceBackend] = None,
+    return_normed_hidden: bool = False,
+    is_prefill: bool = False,
+) -> Tuple[jnp.ndarray, jnp.ndarray, KVCacheState]:
+    """Update cached MTP state for a span and score only selected rows.
+
+    The persistent MTP KV cache still needs every committed verifier position,
+    but recursive draft generation only consumes one selected hidden state per
+    request. Avoid running the vocabulary top-1 GEMM for unused positions.
+    """
+    x_normed, x, kv_cache_state = _mtp_forward_hidden_cached(
+        hidden_state=hidden_state,
+        next_token_ids=next_token_ids,
+        embed_tokens=embed_tokens,
+        params=params,
+        config=config,
+        positions=positions,
+        kv_cache_state=kv_cache_state,
+        attention_metadata=attention_metadata,
+        backend=backend,
+        is_prefill=is_prefill,
+    )
+    batch, _seq_len, hidden_dim = x_normed.shape
+    selected_indices = selected_indices.astype(jnp.int32)
+    if selected_indices.shape[0] != batch and batch == 1:
+        selected_normed = x_normed[0, selected_indices, :][:, None, :]
+    else:
+        gather_idx = selected_indices.reshape(batch, 1, 1)
+        gather_idx = jnp.broadcast_to(gather_idx, (batch, 1, hidden_dim))
+        selected_normed = jnp.take_along_axis(x_normed, gather_idx, axis=1)
+    output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
+    token_ids = _mtp_greedy_top1_token_ids(
+        selected_normed.astype(_mtp_decode_activation_dtype(config)),
+        output_weight,
+        config,
+    )
+    return token_ids, x_normed if return_normed_hidden else x, kv_cache_state
 
 
 def mtp_forward_last(
@@ -471,6 +614,104 @@ def mtp_layer_forward(
     x = x + mlp_out
     
     return x
+
+
+def mtp_layer_forward_cached(
+    x: jnp.ndarray,
+    params: Dict[str, jnp.ndarray],
+    config: Qwen3_5Config,
+    positions: jnp.ndarray,
+    kv_cache_state: KVCacheState,
+    attention_metadata: AttentionMetadata,
+    backend: InferenceBackend,
+    layer_idx: int = 0,
+    is_prefill: bool = False,
+) -> Tuple[jnp.ndarray, KVCacheState]:
+    """Single cached full-attention MTP decoder layer."""
+    batch, seq_len, _ = x.shape
+    dtype = config.get_dtype()
+    x_cast = x.astype(dtype)
+
+    x_norm = rms_norm(x_cast, params["input_norm"], config.rms_norm_eps)
+    attn_out_dim = config.num_attention_heads * config.head_dim
+    q_gate = jnp.dot(x_norm, params["q_proj"])
+    key_raw = jnp.dot(x_norm, params["k_proj"])
+    value_raw = jnp.dot(x_norm, params["v_proj"])
+    q_gate = q_gate.reshape(
+        batch,
+        seq_len,
+        config.num_attention_heads,
+        2 * config.head_dim,
+    )
+    query, gate = jnp.split(q_gate, 2, axis=-1)
+    gate = gate.reshape(batch, seq_len, -1)
+    key = key_raw.reshape(
+        batch,
+        seq_len,
+        config.num_key_value_heads,
+        config.head_dim,
+    )
+    value = value_raw.reshape(
+        batch,
+        seq_len,
+        config.num_key_value_heads,
+        config.head_dim,
+    )
+
+    query = rms_norm(query, params["q_norm"], config.rms_norm_eps).transpose(0, 2, 1, 3)
+    key = rms_norm(key, params["k_norm"], config.rms_norm_eps).transpose(0, 2, 1, 3)
+    value = value.transpose(0, 2, 1, 3)
+    query = apply_rope(
+        query,
+        positions,
+        config.head_dim,
+        config.rope_theta,
+        config.partial_rotary_factor,
+        layout="BHTD",
+        mrope_section=None,
+    )
+    key = apply_rope(
+        key,
+        positions,
+        config.head_dim,
+        config.rope_theta,
+        config.partial_rotary_factor,
+        layout="BHTD",
+        mrope_section=None,
+    )
+
+    query_btnh = query.transpose(0, 2, 1, 3)
+    key_btnh = key.transpose(0, 2, 1, 3)
+    value_btnh = value.transpose(0, 2, 1, 3)
+    cache_storage, attn_out = backend.write_kv_and_attention(
+        layer_id=layer_idx,
+        query=query_btnh,
+        k=key_btnh,
+        v=value_btnh,
+        cache=kv_cache_state.storage,
+        metadata=attention_metadata,
+        block_size=config.block_size,
+        scale=1.0 / jnp.sqrt(config.head_dim),
+        num_key_value_groups=config.num_attention_heads // config.num_key_value_heads,
+        is_prefill=is_prefill,
+    )
+    kv_cache_state = replace(
+        kv_cache_state,
+        k_cache=cache_storage.k_cache,
+        v_cache=cache_storage.v_cache,
+        slot_mapping=attention_metadata.slot_mapping,
+    )
+
+    attn_out = attn_out * jax.nn.sigmoid(gate)
+    attn_out = jnp.dot(attn_out.astype(dtype), params["o_proj"])
+    x = x + attn_out
+
+    x_norm = rms_norm(x, params["post_attn_norm"], config.rms_norm_eps)
+    gate_proj = jnp.dot(x_norm.astype(dtype), params["gate_proj"])
+    up_proj = jnp.dot(x_norm.astype(dtype), params["up_proj"])
+    mlp_out = jnp.dot(get_activation(config.hidden_act)(gate_proj) * up_proj, params["down_proj"])
+    x = x + mlp_out
+    return x, kv_cache_state
 
 
 def _mtp_params_flatten(params):

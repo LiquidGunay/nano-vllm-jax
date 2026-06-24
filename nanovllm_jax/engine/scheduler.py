@@ -117,6 +117,9 @@ class Scheduler:
             if self.speculative_method == "mtp"
             else 0
         )
+        self.mtp_verifier_impl = str(
+            getattr(config, "mtp_verifier_impl", "packed_prefix") or "packed_prefix"
+        ).strip().lower()
         self.mtp_burst_groups = max(
             1,
             _config_or_env_int(
@@ -161,9 +164,22 @@ class Scheduler:
             )
             or "1"
         )
+        strict_k_verifier = (
+            self.num_speculative_tokens > 1
+            and self.mtp_verifier_impl
+            in {
+                "k_decode",
+                "generic_k",
+                "expanded",
+                "packed_prefix",
+                "packed_prefill",
+                "prefill_packed",
+            }
+        )
         self.mtp_scheduler_gate_enabled = (
             self.speculative_method == "mtp"
             and self.num_speculative_tokens > 0
+            and not strict_k_verifier
             and (self.mtp_min_accept_rate > 0 or self.mtp_min_speedup > 0)
         )
         self.mtp_dtype = str(config.get_dtype())
@@ -512,6 +528,17 @@ class Scheduler:
                     batch_size_bucket=final_batch_size_bucket,
                     active_decode_rows=final_active_rows,
                 )
+                if final_admitted:
+                    remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
+                    lookahead_tokens = min(
+                        self.mtp_burst_groups * (1 + self.num_speculative_tokens),
+                        remaining_tokens,
+                    )
+                    if self.block_manager.can_append_slots(seq, lookahead_tokens):
+                        self.block_manager.may_append_slots(seq, lookahead_tokens)
+                    else:
+                        final_admitted = False
+                        self.mtp_admission_reason = "lookahead_capacity"
                 seq.mtp_admitted = final_admitted
                 seq.mtp_admission_reason = self.mtp_admission_reason if final_admitted else "scheduler_gate"
         self.running.extendleft(reversed(scheduled_seqs))
@@ -1354,26 +1381,6 @@ class Scheduler:
         remaining = seq.max_tokens - seq.num_completion_tokens
         if remaining <= 1:
             self.mtp_admission_reason = "remaining_tokens"
-            return False
-        relax_start_boundary = (
-            os.environ.get("NANO_VLLM_JAX_MTP_RELAX_START_BOUNDARY", "0")
-            in {"1", "true", "yes", "on", "True"}
-        )
-        if (
-            for_decode
-            and self.num_speculative_tokens == 1
-            and not relax_start_boundary
-            and seq.num_tokens % self.block_size == 0
-        ):
-            self.mtp_admission_reason = "start_boundary"
-            return False
-        if (
-            for_decode
-            and self.num_speculative_tokens == 1
-            and not relax_start_boundary
-            and (seq.num_tokens + 2) % self.block_size == 0
-        ):
-            self.mtp_admission_reason = "bonus_boundary"
             return False
         if for_decode and self.mtp_max_active_rows > 0:
             if active_decode_rows is None:

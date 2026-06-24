@@ -61,7 +61,7 @@ class Qwen3_5Config:
     mtp_use_dedicated_embeddings: bool = False
     speculative_method: str = "none"
     draft_sample_method: str = "greedy"
-    mtp_verifier_impl: str = "two_decode"
+    mtp_verifier_impl: str = "packed_prefix"
     mtp_batch_accept_policy: str = "rowwise"
     mtp_seed_after_bonus: bool = False
     mtp_bonus_margin: float = 0.0
@@ -212,7 +212,7 @@ class Qwen3_5Config:
             raise ValueError("speculative_method='mtp' requires num_speculative_tokens >= 1")
         if speculative_method == "mtp" and draft_sample_method != "greedy":
             raise ValueError("MTP probabilistic draft sampling is not implemented yet")
-        mtp_verifier_impl = str(self.mtp_verifier_impl or "two_decode").strip().lower()
+        mtp_verifier_impl = str(self.mtp_verifier_impl or "packed_prefix").strip().lower()
         if mtp_verifier_impl in {"generic_k", "expanded"}:
             mtp_verifier_impl = "k_decode"
         if mtp_verifier_impl in {"packed_prefill", "prefill_packed"}:
@@ -225,14 +225,11 @@ class Qwen3_5Config:
         if (
             speculative_method == "mtp"
             and num_speculative_tokens > 1
-            and not (
-                mtp_verifier_impl in {"k_decode", "packed_prefix"}
-                or (mtp_verifier_impl == "commit_select" and num_speculative_tokens == 2)
-            )
+            and mtp_verifier_impl not in {"k_decode", "packed_prefix"}
         ):
             raise ValueError(
                 "MTP K>1 requires mtp_verifier_impl='k_decode', "
-                "'packed_prefix', or K=2 commit_select"
+                "or 'packed_prefix'; sequential commit_select is debug-only"
             )
         mtp_batch_accept_policy = str(self.mtp_batch_accept_policy or "rowwise").strip().lower()
         if mtp_batch_accept_policy not in {"rowwise", "all_or_none"}:
@@ -639,12 +636,6 @@ class Qwen3_5Config:
             "resident_decode_metadata": self.resident_decode_metadata,
             "greedy_decode_burst_steps": self.greedy_decode_burst_steps,
             "trace_token_prefetch": self.trace_token_prefetch,
-            "summary_host_token_sink_min_completion_tokens": (
-                self.summary_host_token_sink_min_completion_tokens
-            ),
-            "summary_host_token_sink_min_avg_completion_tokens": (
-                self.summary_host_token_sink_min_avg_completion_tokens
-            ),
             "materialize_tied_lm_head": self.materialize_tied_lm_head,
             "compact_prefill_in_proj_qkv": self.compact_prefill_in_proj_qkv,
             "compact_prefill_gdn_z": self.compact_prefill_gdn_z,

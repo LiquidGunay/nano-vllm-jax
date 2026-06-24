@@ -302,12 +302,8 @@ def _runtime_fastpaths_to_engine(runtime_section: dict) -> dict[str, Any]:
         "resident_decode_metadata": "resident_decode_metadata",
         "greedy_decode_burst_steps": "greedy_decode_burst_steps",
         "trace_token_prefetch": "trace_token_prefetch",
-        "summary_host_token_sink_min_completion_tokens": (
-            "summary_host_token_sink_min_completion_tokens"
-        ),
-        "summary_host_token_sink_min_avg_completion_tokens": (
-            "summary_host_token_sink_min_avg_completion_tokens"
-        ),
+        "summary_host_token_sink_min_completion_tokens": "summary_host_token_sink_min_completion_tokens",
+        "summary_host_token_sink_min_avg_completion_tokens": "summary_host_token_sink_min_avg_completion_tokens",
         "decode_block_table_buckets": "decode_block_table_buckets",
         "materialize_tied_lm_head": "materialize_tied_lm_head",
         "compact_prefill_in_proj_qkv": "compact_prefill_in_proj_qkv",
@@ -415,12 +411,8 @@ def _runtime_section_to_env(runtime_section: dict) -> dict[str, str]:
         "resident_decode_metadata": "NANO_VLLM_JAX_RESIDENT_DECODE_METADATA",
         "greedy_decode_burst_steps": "NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS",
         "trace_token_prefetch": "NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH",
-        "summary_host_token_sink_min_completion_tokens": (
-            "NANO_VLLM_JAX_SUMMARY_HOST_TOKEN_SINK_MIN_COMPLETION_TOKENS"
-        ),
-        "summary_host_token_sink_min_avg_completion_tokens": (
-            "NANO_VLLM_JAX_SUMMARY_HOST_TOKEN_SINK_MIN_AVG_COMPLETION_TOKENS"
-        ),
+        "summary_host_token_sink_min_completion_tokens": "NANO_VLLM_JAX_SUMMARY_HOST_TOKEN_SINK_MIN_COMPLETION_TOKENS",
+        "summary_host_token_sink_min_avg_completion_tokens": "NANO_VLLM_JAX_SUMMARY_HOST_TOKEN_SINK_MIN_AVG_COMPLETION_TOKENS",
         "lm_head_decode_act_dtype": "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE",
         "lm_head_topk_impl": "NANO_VLLM_JAX_LM_HEAD_TOPK_IMPL",
         "decode_proj_act_dtype": "NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE",
@@ -674,7 +666,7 @@ def load_server_config(path: str | Path | None = None) -> ServerConfig:
         "prefix_cache": True,
         "speculative_method": "none",
         "draft_sample_method": "greedy",
-        "mtp_verifier_impl": "two_decode",
+        "mtp_verifier_impl": "packed_prefix",
         "mtp_batch_accept_policy": "rowwise",
         "mtp_seed_after_bonus": False,
         "mtp_bonus_margin": 0.0,
@@ -685,7 +677,7 @@ def load_server_config(path: str | Path | None = None) -> ServerConfig:
         "mtp_token_source": "generated",
         "mtp_position_offset": 0,
         "mtp_lm_head_greedy_top1_impl": "jax",
-        "mtp_prefill_seed": False,
+        "mtp_prefill_seed": True,
         "mtp_unverified_draft_append": False,
         "mtp_unverified_fused_append": False,
         "num_speculative_tokens": 0,

@@ -10,8 +10,8 @@ Use these YAML files with `python server.py --config <path>`.
   compile profile to common shapes.
 - `gpu_minimal_pure_jax.yaml`: small pure-JAX CUDA smoke path for installation
   checks and low compile cost.
-- `mtp_experimental.yaml`: exact target-verified true-K MTP diagnostic path
-  (`k_decode`, currently K=2) with strict GDN no-fallback settings. It is
+- `mtp_experimental.yaml`: exact target-verified true-K MTP work path
+  (`packed_prefix`, currently K=2) with strict GDN no-fallback settings. It is
   intentionally separate from the default path and should not be used for speed
   claims until MTP beats the same non-MTP config.
 

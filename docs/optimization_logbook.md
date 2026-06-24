@@ -8,6 +8,19 @@ tensorboard --logdir /mountpoint/.exp/profiles
 
 Perfetto can open the `*.trace.json.gz` file inside each profile directory.
 
+## Current MTP Direction (2026-06-22)
+
+- The MTP speed direction is a vLLM-style packed target verifier: one packed
+  forward over `[current, draft_1..draft_K]` per admitted row, indexed verifier
+  and bonus logits, and on-device accept/reject/commit decisions.
+- `commit_select`, `k_decode`, and broad/repair-mode pathways are for correctness
+  or parity diagnostics only.
+- Any route that emits draft tokens without target verification or falls back to
+  host/device sequential repair is not counted as MTP progress.
+- Speed entries in this logbook should only be promoted when exact parity is
+  demonstrated and the packed-verifier route is faster than the accepted non-MTP
+  serving baseline.
+
 ## Entry 001 - Heterogeneous Batch Baseline
 
 - run id: `20260525-180419-1816768-jax_hetero8_64_512x32_baseline`
@@ -12371,8 +12384,9 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     `results/mtp_opt_mtp2_prefillseed_device_refs_64.json`, `89.32 tok/s`, so
     do not reapply that variant.
 - decision:
-  - MTP speculative decoding now has a demonstrated exact speedup on a longer
-    B=1, greedy, high-acceptance decode lane;
+  - Historical: MTP speculative decoding showed high-acceptance behavior on a
+    longer B=1, greedy, narrow diagnostic lane; this is not a global serving
+    speed claim under the current strict same-config policy;
   - do not promote it as a default random-serving speed path yet. The current
     accepted burst route is narrow (`B=1`, greedy, K=2/K>1, all groups must
     accept), and short outputs still lose to no-MTP;
@@ -13516,7 +13530,7 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     focus on TTFT and decode GPU work/launch structure, while keeping the
     thresholded sink for long summaries and avoiding it for short outputs.
 
-#### Entry 317 - Resident Seed-Then-Table MTP Burst Boundary
+#### Entry 317 - Resident Seed-Then-Table MTP Burst Boundary (diagnostic)
 
 - date: 2026-06-20
 - trigger:
@@ -13558,13 +13572,15 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - acceptance for the required metrics row: `0.667`.
 - interpretation:
   - this is the first correctness-clean device-resident drafting/verification
-    boundary for the current GPU MTP path;
+    boundary for the historical GPU MTP checkpoint;
+  - do not treat the observed `0.684x` delta versus no-MTP as a speed
+    gain; it is a diagnostic checkpoint only;
   - it is not a serving speed claim. The verifier remains slower than the
     no-MTP control in the smoke, and the first full hetero8 server-style
     attempt timed out compiling before this env/config fix. Continue from this
     boundary and attack verifier GPU work/compile surface next.
 
-#### Entry 318 - Packed-Prefix MTP Verifier Route
+#### Entry 318 - Packed-Prefix MTP Verifier Route (diagnostic-only route validation)
 
 - date: 2026-06-21
 - trigger:
@@ -13598,3 +13614,293 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - JIT-cache audit stayed flat during measurement (`growth_during_measurement=0`);
   - generated `4` tokens on a single 16-token prompt. This is only a route
     validation smoke, not a throughput claim.
+- interpretation:
+  - treat this as route-structure validation only; no speed-route inference
+    should be made from this smoke.
+
+#### Entry 319 - Exact MTP K No-Bonus Carry Boundary (diagnostic-only parity work)
+
+- date: 2026-06-22
+- trigger:
+  - user asked to make verification cheaper than multiple decode passes after
+    packed-prefix exact scan remained dominated by target-model verifier work.
+- implementation:
+  - extended exact K verification so `NANO_VLLM_JAX_MTP_DISABLE_BONUS=1`
+    removes speculative bonus LM-head/top-1 work and bonus emission;
+  - changed no-bonus exact verification from K+1 target forwards to K target
+    forwards for K draft tokens;
+  - fixed no-bonus commit semantics: on full accept, the last emitted draft
+    token is carried as the next decode input, while KV/GDN/hybrid state is
+    committed through the previous verifier input position;
+  - applied the same no-bonus semantics to `mtp_k_decode_greedy_step_jit` and
+    `mtp_k_burst_greedy_step_jit`;
+  - changed runner bonus accounting so a full accept only increments
+    `bonus_tokens` when `emitted_count > accepted_count`;
+  - enabled `NANO_VLLM_JAX_MTP_DISABLE_BONUS=1` in
+    `configs/server/mtp_experimental.yaml`;
+  - added a focused commit-semantics regression for full K accept without
+    bonus.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_executor.py nanovllm_jax/engine/model_runner.py tests/test_mtp_commit_semantics.py`;
+  - `pytest -q tests/test_mtp_commit_semantics.py -k "generic_k or packed_prefix or strict"`:
+    `9 passed, 32 deselected`;
+  - `pytest -q tests/test_server_config.py -k "mtp_experimental or speculative_config_rejects_k_gt_1"`:
+    `3 passed, 22 deselected`;
+  - `git diff --check`: clean.
+- smoke result:
+  - no-MTP reference `no_mtp_b2_len8_current_for_mtp_no_bonus.json`:
+    `78.60 output tok/s`;
+  - first no-bonus exact scan before the carried-token fix
+    `mtp_packed_prefix_exact_scan_no_bonus_b2_len8.json`: `15.21 output
+    tok/s`, `6/18` accepted drafts, `0` bonus tokens, unchecked against a
+    reference;
+  - corrected K-forward no-bonus verifier
+    `mtp_packed_prefix_exact_scan_no_bonus_kforward_b2_len8.json`: exact
+    generated-token match against the no-MTP reference, `16.26 output tok/s`,
+    `6/18` accepted drafts, `0` bonus tokens.
+- interpretation:
+  - this is diagnostic parity work for the exact-K path;
+  - this removes one target-model forward from full-accept K=2 exact
+    verification and fixes no-bonus state semantics;
+  - it is still not a speed path. The exact verifier remains much slower than
+    no-MTP on the tiny smoke because draft acceptance is low and MTP-head
+    chaining plus target forwards dominate. The next valid speed lever is
+    broad packed-prefix state parity against this exact K-forward oracle.
+  - do not count this entry as progress toward serving speed claims.
+
+#### Entry 320 - Broad Packed-Prefix Verifier Parity And K1 Retest (diagnostic)
+
+- date: 2026-06-22
+- trigger:
+  - after correcting no-bonus K-forward semantics, user asked to keep pushing
+    until verification is cheaper than repeated decode passes.
+- implementation:
+  - let `mtp_k_packed_prefix_greedy_step_jit` honor
+    `NANO_VLLM_JAX_MTP_K_VERIFY_MODE` while keeping exact scan as the default;
+  - changed broad K verification to respect `verify_width`, so
+    `NANO_VLLM_JAX_MTP_DISABLE_BONUS=1` runs K target positions instead of the
+    old K+1 bonus-shaped verifier;
+  - used full prefix-state return for broad packed-prefill, because the strict
+    FLA packed-prefix kernel does not support the old first-prefix shortcut;
+  - used the first-prefix shortcut for broad decode-shaped verification, where
+    the current K>1 all-or-nothing commit policy only needs reject state
+    through the current token and full-accept final state.
+- validation:
+  - `python -m py_compile nanovllm_jax/engine/model_executor.py`;
+  - `pytest -q tests/test_mtp_commit_semantics.py -k "generic_k or packed_prefix or strict"`:
+    `9 passed, 32 deselected`;
+  - `pytest -q tests/test_server_config.py -k "mtp_experimental or speculative_config_rejects_k_gt_1"`:
+    `3 passed, 22 deselected`;
+  - `git diff --check`: clean.
+- smoke results on B=2 len-16 input, len-8 output, exact no-MTP reference
+  token match required:
+  - exact scanned no-bonus K=2:
+    `mtp_packed_prefix_exact_scan_no_bonus_kforward_b2_len8.json`,
+    `16.26 output tok/s`, `6/18` accepted, warmup GPU memory `5093 MB`;
+  - broad packed-prefill no-bonus K=2:
+    `mtp_packed_prefix_broad_prefill_no_bonus_kforward_b2_len8.json`,
+    exact match, `14.28 output tok/s`, `6/18` accepted, warmup GPU memory
+    `9185 MB`;
+  - broad decode-shaped no-bonus K=2:
+    `mtp_packed_prefix_broad_decode_no_bonus_kforward_b2_len8.json`,
+    exact match, `17.35 output tok/s`, `6/18` accepted, warmup GPU memory
+    `9185 MB`;
+  - broad decode-shaped no-bonus K=2 with first-prefix shortcut:
+    `mtp_packed_prefix_broad_decode_no_bonus_firstprefix_b2_len8.json`,
+    exact match, `17.10 output tok/s`, `6/18` accepted, warmup GPU memory
+    `9185 MB`;
+  - broad decode-shaped K=2 with raw MTP chaining:
+    `mtp_packed_prefix_broad_decode_no_bonus_rawchain_b2_len8.json`,
+    exact match only because it rejected every draft, `29.61 output tok/s`,
+    `0/24` accepted. Reject this as a draft-quality route.
+  - broad packed-prefix K=1 with verified bonus and default admission:
+    `mtp_packed_prefix_broad_decode_k1_bonus_b2_len8.json`, exact match,
+    `40.85 output tok/s`, `1/4` accepted, `1` bonus, but admission gated MTP
+    off after the low-throughput probe, so this is not a valid speculation
+    speedup;
+  - broad packed-prefix K=1 with admission forced
+    (`NANO_VLLM_JAX_MTP_MIN_ACCEPT_RATE=0`,
+    `NANO_VLLM_JAX_MTP_MIN_SPEEDUP=0`):
+    `mtp_packed_prefix_broad_decode_k1_bonus_forced_b2_len8.json`, exact
+    match, `17.70 output tok/s`, `4/10` accepted, `4` bonus;
+  - resident-table two-decode K=1 with admission forced:
+    `mtp_two_decode_k1_bonus_forced_b2_len8.json`, exact match, `23.14 output
+    tok/s`, `1/13` accepted, `1` bonus, warmup GPU memory `5055 MB`.
+- interpretation:
+  - broad decode-shaped K=2 is now correctness-clean against the exact
+    no-bonus oracle and slightly cheaper than scan, but the gain is small and
+    the compiled route holds much more GPU memory;
+  - packed-prefill broad verification is not the speed route on this shape;
+  - K=1 verified-bonus speculation only looked better when scheduler admission
+    turned it off after a failed probe. With admission forced, both K=1
+    verifiers remain far slower than the no-MTP `78.60 output tok/s`
+    reference;
+  - the next MTP speed lever is not another narrow verifier-mode toggle; broad-mode
+    results above are diagnostic-only. Progress needs either a cheaper target
+    verifier/draft-head boundary or a materially
+    better draft/admission contract before exact MTP can beat the baseline.
+
+#### Entry 321 - MTP Packed-Prefix Table Copy Removal And Row-State Route (diagnostic)
+
+- date: 2026-06-22
+- trigger:
+  - the packed-prefix resident-table verifier was exact but still far slower
+    than no-MTP, with B=2 len-8 verifier executor calls around `125-154 ms`.
+- implementation:
+  - removed rejected-slot KV rollback from the resident-table verifier. The
+    verifier now leaves speculative KV writes dirty beyond `committed_seq_lens`;
+    those slots are ignored by future attention and overwritten before use;
+  - replaced the default `mtp_verifier_impl=packed_prefix` serving and warmup
+    route with a row-state packed verifier. The old resident-table verifier is
+    kept as a callable diagnostic, but it is no longer the default path;
+  - the row-state verifier still packs `[current, draft_1, ... draft_K]` into
+    one target-model forward, computes accept/reject on device, emits verified
+    tokens only, and returns selected row GDN state. It does not use sequential
+    decode repair.
+- validation so far:
+  - `python -m py_compile nanovllm_jax/engine/model_executor.py
+    nanovllm_jax/engine/model_runner.py`;
+  - dirty-KV table smoke `mtp_table_decode_dirty_kv_k2_b2_len8.json` matched
+    the no-MTP reference exactly, had no measured JIT cache growth, and improved
+    from `15.56` to `15.92 output tok/s`.
+- profiling:
+  - after removing KV rollback, the table verifier trace still showed
+    `~105 ms` of GPU `MemcpyD2D` versus `~1.7 ms` in the no-MTP trace. The top
+    HLO copies were full-buffer D2D copies, consistent with gathering from and
+    scattering back into the large resident hybrid-state table inside the same
+    donated verifier JIT;
+  - this is the reason the default route now uses row-state verification and
+    stores selected row state back into the resident table outside the verifier.
+- interpretation:
+  - this remains a diagnostic validation pass until row-state parity holds against
+    parity oracles without host-side repair and the route is faster than accepted
+    non-MTP serving on the same benchmark surface.
+- next step:
+  - rerun the same B=2 len-8 exact smoke on the row-state packed-prefix route.
+    The expected win is removing the `MemcpyD2D` table-copy bucket; if the row
+    route remains slow, inspect the next trace bucket before touching draft
+    policy or admission.
+
+#### Entry 322 - Broad Actual-Envelope Benchmark After MTP And Host-Sink Audit
+
+- date: 2026-06-23
+- trigger:
+  - user asked for a broader benchmark because we had multiple denominators,
+    and asked to include hetero, random, and the long-decode vLLM comparison
+    without changing output lengths or buckets.
+- implementation checked:
+  - kept the promoted non-MTP serving path as the broad best. Verified MTP is
+    still diagnostic-only: the controlled B=2 long-output sweep can speed up,
+    but actual B=1 `decode_heavy_128x128` with strict packed-prefix K=3 was
+    slower (`127.65 output tok/s`) despite 100% acceptance, because the first
+    speculative group and verifier boundary dominate;
+  - added a config-level average-completion gate for the summary host-token
+    sink (`summary_host_token_sink_min_avg_completion_tokens`, default
+    `8 * block_size`). This enables the existing long-output sink for B1
+    128-token decode without enabling it for short `hetero8`; it did not solve
+    the remaining final-harvest cost, so do not treat it as the long-decode
+    fix.
+- actual-envelope results:
+  - deterministic matrix:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_sink_avg_gate_20260623/matrix_hetero_longdecode_r1.json`;
+  - `hetero8`: `580.12 output tok/s`, stored vLLM `864.18`, ratio `0.671x`;
+    token-event throughput `763.48 tok/s`, post-last-token drain `0.106 s`,
+    no measured JIT cache growth;
+  - `decode_heavy_128x128`: `154.83 output tok/s`, stored vLLM `213.54`,
+    ratio `0.725x`; token-event throughput `177.20 tok/s`, post-last-token
+    drain `0.104 s`, no measured JIT cache growth. The host sink was enabled
+    by the average gate, but final host-sink harvest still cost `0.104 s`, so
+    the wall-clock result remains far below the old trace-era `~198 tok/s`
+    artifact and below vLLM;
+  - compact `random_large` multisuite, standard 8-request 512-1024 input /
+    128-256 output envelope:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_sink_avg_gate_20260623/random_large_multisuite_r1.json`,
+    `772.26 output tok/s`, stored vLLM `1021.59`, ratio `0.756x`;
+    token-event throughput `814.98 tok/s`, post-last-token drain `0.107 s`,
+    no measured JIT cache growth;
+  - full fixed-B8 random sidecar, standard 512-4096 input / 256-1024 output
+    stress:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/host_sink_avg_gate_20260623/full_random_b8_sidecar_bf16_r1.json`,
+    `785.49 output tok/s`, stored vLLM `1000.98`, ratio `0.785x`;
+    token-event throughput `810.11 tok/s`, post-last-token drain `0.237 s`,
+    no measured JIT cache growth;
+  - all current broad runs used stored vLLM denominators and generic/server
+    warmup. Exact-token comparison against old JAX references can fail after
+    accepted numeric/runtime changes; the speed comparison above is against
+    same-envelope vLLM throughput, not stale exact-token references.
+- pitfall:
+  - `benchmark_random_request_sidecar.py --jax-config ...` does not import the
+    benchmark config's `args` section wholesale. Passing only `--jax-config`
+    left the sidecar at its default FP32 activations and produced a
+    non-comparable full-random result (`720.24 output tok/s`). Promoted random
+    BF16 runs must pass `--dtype bfloat16 --weight-dtype bfloat16` explicitly
+    unless the sidecar is refactored to consume config args directly.
+- interpretation:
+  - broad serving is not at `0.9x` vLLM yet. The steady token-event rates are
+    closer (`~0.80-0.88x` on hetero/random), but wall-clock throughput is still
+    pulled down by TTFT/prefill scheduling and final result harvest;
+  - long decode does not currently beat vLLM. Its model-token phase is closer
+    than headline throughput, but the `~0.10 s` final result harvest is too
+    large for a 128-token B1 benchmark;
+  - do not keep pushing narrow output-materialization variants. Prior entries
+    show that they can reduce the visible drain but regress decode or random.
+    The next useful work should be a broader device-owned result/output
+    boundary that avoids hot per-step scatter, or TTFT/prefill scheduling work
+    that directly reduces the large random/hetero first-token gap.
+
+#### Entry 323 - BF16 Decode-Heavy Reclaim And Host-Sink Default Cleanup
+
+- date: 2026-06-24
+- trigger:
+  - user asked whether BF16 should be faster than FP32 and whether we can beat
+    the current long-decode result.
+- finding:
+  - yes, BF16 is faster on the current decode-heavy path, but the delta is
+    modest because the promoted "FP32" serving path already uses BF16 for the
+    expensive decode projection, LM-head greedy path, full-attention KV cache,
+    and GDN packed-decode QKV. The remaining `dtype=float32` pieces are not the
+    dominant decode cost.
+- implementation:
+  - changed `summary_host_token_sink_min_avg_completion_tokens=None` back to
+    meaning "disabled" instead of silently normalizing to `8 * block_size`;
+  - kept the long-output host sink available only when an explicit average
+    threshold is configured;
+  - preserved optional `summary_host_token_sink_*` values as `null` in benchmark
+    artifacts instead of converting disabled optional gates to integers.
+- controlled decode-heavy results:
+  - BF16 cleaned default:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/bf16_decode_reclaim_20260624/bf16_final_clean_default.json`,
+    `175.30 output tok/s`, token-event `211.64 tok/s`, post-last-token drain
+    `0.125 s`, host sink disabled, no measured JIT cache growth;
+  - current-code FP32 config with the same BF16-heavy fastpaths:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/bf16_decode_reclaim_20260624/fp32_default_no_avg_sink.json`,
+    `172.66 output tok/s`, token-event `210.26 tok/s`, post-last-token drain
+    `0.133 s`, host sink disabled, no measured JIT cache growth;
+  - previous average-host-sink default was rejected for this benchmark: BF16
+    with the sink enabled was `156.50 output tok/s`, and FP32 was `155.22
+    output tok/s`. It reduced visible final drain but slowed the token loop
+    enough to lose wall-clock throughput;
+  - the older comparable FP32 summary artifact
+    `decode_heavy_128x128_nomtp_fp32act_r1.json` was `162.04 output tok/s`, so
+    the cleaned BF16 default beats the comparable FP32 results. It still does
+    not beat stored vLLM `213.54 output tok/s` on this shape.
+- rejected probes:
+  - block-batched host-sink prefetching at a 16-token interval lost:
+    `157.71 output tok/s`. It reduced neither the real wall-clock path nor the
+    final harvest enough to justify adding another runtime knob;
+  - grouping the final 128 tiny device token arrays into a stacked transfer
+    preserved token-event speed but worsened final drain to `~0.246 s`; do not
+    use this as a serving materialization fix;
+  - enabling XLA Triton GEMM (`--xla_gpu_enable_triton_gemm=true`) lost on this
+    path: `171.96 output tok/s` and longer startup compile than the no-Triton
+    GEMM default;
+  - a diagnostic "true FP32 decode" variant that also changed KV/cache/QKV
+    policies away from the BF16 serving contract failed during warmup on A10G
+    with a FlashInfer shared-memory request above the device limit, so it is
+    not a serving candidate.
+- interpretation:
+  - BF16 does beat the comparable FP32 path, but the long-decode headline is
+    now mostly limited by remaining decode work plus final result harvest. The
+    next non-speculative long-decode gain needs a broader device-owned output
+    boundary or an actual decode-kernel/graph-boundary improvement, not another
+    host-sink prefetch tweak.

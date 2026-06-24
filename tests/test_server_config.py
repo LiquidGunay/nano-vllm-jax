@@ -58,7 +58,7 @@ def test_speculative_config_legacy_num_tokens_selects_mtp():
     assert config.speculative_method == "mtp"
     assert config.num_speculative_tokens == 1
     assert config.draft_sample_method == "greedy"
-    assert config.mtp_verifier_impl == "two_decode"
+    assert config.mtp_verifier_impl == "packed_prefix"
 
 
 def test_speculative_config_rejects_unimplemented_probabilistic_mtp():
@@ -71,12 +71,12 @@ def test_speculative_config_rejects_unimplemented_probabilistic_mtp():
 
 
 def test_speculative_config_rejects_k_gt_1_without_true_k_verifier():
-    config = Qwen3_5Config(
-        speculative_method="mtp",
-        num_speculative_tokens=2,
-        mtp_verifier_impl="commit_select",
-    )
-    assert config.mtp_verifier_impl == "commit_select"
+    with pytest.raises(ValueError, match="K>1 requires mtp_verifier_impl='k_decode'"):
+        Qwen3_5Config(
+            speculative_method="mtp",
+            num_speculative_tokens=2,
+            mtp_verifier_impl="commit_select",
+        )
 
     packed = Qwen3_5Config(
         speculative_method="mtp",
@@ -137,8 +137,6 @@ def test_runtime_and_kernel_sections_translate_to_env():
                     "resident_decode_metadata": True,
                     "greedy_decode_burst_steps": 2,
                     "trace_token_prefetch": True,
-                    "summary_host_token_sink_min_completion_tokens": 4096,
-                    "summary_host_token_sink_min_avg_completion_tokens": 128,
                     "lm_head_decode_act_dtype": "bf16",
                     "lm_head_topk_impl": "flashinfer",
                     "lm_head_greedy_top1_impl": "cutlass",
@@ -208,8 +206,6 @@ def test_runtime_and_kernel_sections_translate_to_env():
     assert env["NANO_VLLM_JAX_RESIDENT_DECODE_METADATA"] == "1"
     assert env["NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS"] == "2"
     assert env["NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH"] == "1"
-    assert env["NANO_VLLM_JAX_SUMMARY_HOST_TOKEN_SINK_MIN_COMPLETION_TOKENS"] == "4096"
-    assert env["NANO_VLLM_JAX_SUMMARY_HOST_TOKEN_SINK_MIN_AVG_COMPLETION_TOKENS"] == "128"
     assert env["NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE"] == "bf16"
     assert env["NANO_VLLM_JAX_LM_HEAD_TOPK_IMPL"] == "flashinfer"
     assert "NANO_VLLM_JAX_LM_HEAD_GREEDY_TOP1_IMPL" not in env
@@ -261,8 +257,6 @@ def test_runtime_fastpaths_project_to_engine_config(tmp_path, monkeypatch):
         "NANO_VLLM_JAX_RESIDENT_DECODE_METADATA",
         "NANO_VLLM_JAX_GREEDY_DECODE_BURST_STEPS",
         "NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH",
-        "NANO_VLLM_JAX_SUMMARY_HOST_TOKEN_SINK_MIN_COMPLETION_TOKENS",
-        "NANO_VLLM_JAX_SUMMARY_HOST_TOKEN_SINK_MIN_AVG_COMPLETION_TOKENS",
         "NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD",
         "NANO_VLLM_JAX_COMPACT_PREFILL_MLP",
         "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE",
@@ -281,8 +275,6 @@ runtime:
     resident_decode_metadata: true
     greedy_decode_burst_steps: 3
     trace_token_prefetch: false
-    summary_host_token_sink_min_completion_tokens: 4096
-    summary_host_token_sink_min_avg_completion_tokens: 128
     materialize_tied_lm_head: true
     compact_prefill_mlp: true
     lm_head_decode_act_dtype: bf16
@@ -301,8 +293,6 @@ runtime:
     assert loaded.engine["resident_decode_metadata"] is True
     assert loaded.engine["greedy_decode_burst_steps"] == 3
     assert loaded.engine["trace_token_prefetch"] is False
-    assert loaded.engine["summary_host_token_sink_min_completion_tokens"] == 4096
-    assert loaded.engine["summary_host_token_sink_min_avg_completion_tokens"] == 128
     assert loaded.engine["materialize_tied_lm_head"] is True
     assert loaded.engine["compact_prefill_mlp"] is True
     assert loaded.engine["lm_head_decode_act_dtype"] == "bf16"
@@ -420,8 +410,6 @@ def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy
                 "fastpaths": {
                     "materialize_tied_lm_head": True,
                     "trace_token_prefetch": False,
-                    "summary_host_token_sink_min_completion_tokens": 4096,
-                    "summary_host_token_sink_min_avg_completion_tokens": 128,
                     "compact_prefill_in_proj_qkv": True,
                     "lm_head_decode_act_dtype": "bf16",
                     "lm_head_topk_impl": "flashinfer",
@@ -451,8 +439,6 @@ def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy
 
     assert overrides["materialize_tied_lm_head"] is True
     assert overrides["trace_token_prefetch"] is False
-    assert overrides["summary_host_token_sink_min_completion_tokens"] == 4096
-    assert overrides["summary_host_token_sink_min_avg_completion_tokens"] == 128
     assert overrides["compact_prefill_in_proj_qkv"] is True
     assert overrides["lm_head_decode_act_dtype"] == "bf16"
     assert overrides["lm_head_topk_impl"] == "flashinfer"
@@ -633,10 +619,12 @@ def test_mtp_experimental_config_is_exact_k2_and_separate(monkeypatch):
     assert loaded.engine["draft_sample_method"] == "greedy"
     assert loaded.engine["mtp_verifier_impl"] == "packed_prefix"
     assert loaded.engine["mtp_chain_hidden_source"] == "final_normed"
-    assert loaded.engine["mtp_chain_mode"] == "sequence"
-    assert loaded.engine["mtp_prefill_seed"] is False
+    assert loaded.engine["mtp_chain_mode"] == "recursive"
+    assert loaded.engine["mtp_prefill_seed"] is True
     assert loaded.engine["mtp_unverified_draft_append"] is False
     assert loaded.engine["mtp_unverified_fused_append"] is False
     assert loaded.engine["gdn_disable_fallbacks"] is True
     assert loaded.engine["gdn_packed_decode_impl"] == "reference"
     assert loaded.engine["gdn_packed_decode_qkv_dtype"] == "bf16"
+    assert "NANO_VLLM_JAX_MTP_DISABLE_BONUS" not in loaded.env
+    assert "NANO_VLLM_JAX_PROFILE_MTP_RUN" not in loaded.env

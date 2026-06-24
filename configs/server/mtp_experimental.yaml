@@ -38,11 +38,11 @@ engine:
   mtp_seed_after_bonus: true
   mtp_hidden_source: "final_normed"
   mtp_chain_hidden_source: "final_normed"
-  mtp_chain_mode: "sequence"
+  mtp_chain_mode: "recursive"
   mtp_lm_head_greedy_top1_impl: "triton"
   num_speculative_tokens: 2
   mtp_burst_groups: 1
-  mtp_prefill_seed: false
+  mtp_prefill_seed: true
   skip_compile: false
 
 runtime:

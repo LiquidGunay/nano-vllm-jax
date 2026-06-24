@@ -786,6 +786,24 @@ class InferenceBackend(Protocol):
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         ...
 
+    def gated_delta_packed_decode_prefix_state(
+        self,
+        conv_out: jnp.ndarray,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        initial_state: jnp.ndarray,
+        *,
+        num_key_heads: int,
+        num_value_heads: int,
+        key_head_dim: int,
+        value_head_dim: int,
+        use_qk_l2norm_in_kernel: bool,
+        max_row_tokens: int,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        ...
+
     def gated_delta_conv_packed_decode(
         self,
         mixed_qkv: jnp.ndarray,
@@ -1259,42 +1277,86 @@ class PureJAXBackend:
                     "NHD KV cache; set full_attention_kv_cache_dtype to bf16 or fp16"
                 )
             from nanovllm_jax.kernels.flashinfer_ffi import (
-                paged_decode_attention_with_kv_append_gqa_nhd,
+                kv_append_paged_nhd,
+                paged_decode_attention_gqa_nhd,
             )
             from nanovllm_jax.kernels.paged_attention import (
-                dense_block_tables_to_kv_indptr,
                 kv_last_page_len_from_seq_lens,
             )
 
-            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
-                metadata.block_tables,
-            )
             width = int(query.shape[1])
-            k_cache = cache.k_cache
-            v_cache = cache.v_cache
-            outputs = []
-            for token_idx in range(width):
-                seq_lens_step = metadata.seq_lens - jnp.asarray(
-                    width - 1 - token_idx,
-                    dtype=metadata.seq_lens.dtype,
-                )
-                out, k_cache, v_cache = paged_decode_attention_with_kv_append_gqa_nhd(
-                    query[:, token_idx].astype(cache.k_cache.dtype),
-                    k[:, token_idx].astype(cache.k_cache.dtype),
-                    v[:, token_idx].astype(cache.v_cache.dtype),
-                    k_cache,
-                    v_cache,
-                    kv_indptr,
-                    kv_indices,
-                    kv_last_page_len_from_seq_lens(seq_lens_step, block_size),
-                    metadata.positions[:, token_idx].astype(jnp.int32),
-                    layer_id=layer_id,
-                    scale=scale,
-                )
-                outputs.append(
-                    out.reshape(query.shape[0], 1, query.shape[2] * query.shape[3])
-                )
-            return KVCacheStorage(k_cache, v_cache), jnp.concatenate(outputs, axis=1)
+            batch = int(query.shape[0])
+            max_pages_per_seq = int(metadata.block_tables.shape[1])
+            expanded_batch = batch * width
+            append_key = k.reshape(
+                expanded_batch,
+                k.shape[2],
+                k.shape[3],
+            ).astype(cache.k_cache.dtype)
+            append_value = v.reshape(
+                expanded_batch,
+                v.shape[2],
+                v.shape[3],
+            ).astype(cache.v_cache.dtype)
+            append_batch_indices = jnp.repeat(
+                jnp.arange(batch, dtype=jnp.int32),
+                width,
+                axis=0,
+            )
+            append_positions = metadata.positions.reshape(-1).astype(jnp.int32)
+            base_kv_indices = metadata.block_tables.reshape(-1).astype(jnp.int32)
+            base_kv_indptr = (
+                jnp.arange(batch + 1, dtype=jnp.int32)
+                * jnp.asarray(max_pages_per_seq, dtype=jnp.int32)
+            )
+            k_cache_layer, v_cache_layer = kv_append_paged_nhd(
+                append_key,
+                append_value,
+                append_batch_indices,
+                append_positions,
+                cache.k_cache[layer_id],
+                cache.v_cache[layer_id],
+                base_kv_indices,
+                base_kv_indptr,
+                kv_last_page_len_from_seq_lens(metadata.seq_lens, block_size),
+            )
+            expanded_query = query.reshape(
+                expanded_batch,
+                query.shape[2],
+                query.shape[3],
+            ).astype(cache.k_cache.dtype)
+            expanded_block_tables = jnp.repeat(
+                metadata.block_tables.astype(jnp.int32),
+                width,
+                axis=0,
+            )
+            kv_indices = expanded_block_tables.reshape(-1)
+            kv_indptr = (
+                jnp.arange(expanded_batch + 1, dtype=jnp.int32)
+                * jnp.asarray(max_pages_per_seq, dtype=jnp.int32)
+            )
+            width_offsets = jnp.arange(width, dtype=metadata.seq_lens.dtype)
+            seq_lens_per_query = (
+                metadata.seq_lens[:, None]
+                - (jnp.asarray(width - 1, dtype=metadata.seq_lens.dtype) - width_offsets[None, :])
+            ).reshape(-1)
+            out = paged_decode_attention_gqa_nhd(
+                expanded_query,
+                k_cache_layer,
+                v_cache_layer,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_len_from_seq_lens(seq_lens_per_query, block_size),
+                scale=scale,
+            )
+            k_cache = cache.k_cache.at[layer_id].set(k_cache_layer)
+            v_cache = cache.v_cache.at[layer_id].set(v_cache_layer)
+            out = out.reshape(
+                batch,
+                width,
+                query.shape[2] * query.shape[3],
+            )
+            return KVCacheStorage(k_cache, v_cache), out
         if (
             not is_prefill
             and decode_impl == "flashinfer_paged"
@@ -2680,6 +2742,143 @@ class PureJAXBackend:
             )
 
         raise AssertionError(f"Unhandled packed GDN decode implementation {impl!r}")
+
+    def gated_delta_packed_decode_prefix_state(
+        self,
+        conv_out: jnp.ndarray,
+        a: jnp.ndarray,
+        b: jnp.ndarray,
+        decay: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        initial_state: jnp.ndarray,
+        *,
+        num_key_heads: int,
+        num_value_heads: int,
+        key_head_dim: int,
+        value_head_dim: int,
+        use_qk_l2norm_in_kernel: bool,
+        max_row_tokens: int,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Decode-shaped tiny prefix-state GDN recurrence.
+
+        This keeps the verifier in decode numerics while avoiding one
+        recurrent kernel invocation per speculative token. Inputs are already
+        post-convolution and rectangular `[B, T, ...]`; the helper packs rows
+        only for the recurrent kernel boundary.
+        """
+
+        impl = _gdn_prefill_post_conv_impl(self.config)
+        if impl == "off":
+            raise RuntimeError(
+                f"{_GDN_PREFILL_POST_CONV_IMPL_ENV} is off; packed decode "
+                "prefix-state recurrence is unavailable"
+            )
+        if conv_out.ndim != 3:
+            raise ValueError("conv_out must have shape [batch, time, conv_dim]")
+        if a.ndim != 3 or b.ndim != 3:
+            raise ValueError("a and b must have shape [batch, time, value_heads]")
+        if initial_state.ndim != 4:
+            raise ValueError("initial_state must have shape [batch, heads, value_dim, key_dim]")
+        batch, seq_len, _ = conv_out.shape
+        if seq_len <= 0:
+            raise ValueError("seq_len must be positive")
+        if max_row_tokens < seq_len:
+            raise ValueError("max_row_tokens must cover the decode width")
+        if initial_state.shape != (
+            batch,
+            num_value_heads,
+            value_head_dim,
+            key_head_dim,
+        ):
+            raise ValueError("initial_state shape does not match GDN dimensions")
+
+        from nanovllm_jax.kernels.gdn_fla import (
+            prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
+        )
+
+        query, key, value, gate, beta, _seq_lens = (
+            prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
+                conv_out,
+                a,
+                b,
+                decay,
+                dt_bias,
+                None,
+                num_key_heads=num_key_heads,
+                num_value_heads=num_value_heads,
+                key_head_dim=key_head_dim,
+                value_head_dim=value_head_dim,
+                normalize_qk=use_qk_l2norm_in_kernel,
+            )
+        )
+        qkv_dtype = _gdn_packed_decode_qkv_activation_jnp_dtype(self.config)
+        query = query.astype(qkv_dtype)
+        key = key.astype(qkv_dtype)
+        value = value.astype(qkv_dtype)
+        gate = gate.astype(jnp.float32)
+        beta = beta.astype(jnp.float32)
+        initial_state = initial_state.astype(jnp.float32)
+
+        def reference_scan():
+            from nanovllm_jax.model import jax_recurrent_gated_delta_rule
+
+            output, final_state, prefix_state = jax_recurrent_gated_delta_rule(
+                query.transpose(0, 2, 1, 3),
+                key.transpose(0, 2, 1, 3),
+                value.transpose(0, 2, 1, 3),
+                gate.transpose(0, 2, 1),
+                beta.transpose(0, 2, 1),
+                initial_state=initial_state,
+                use_qk_l2norm_in_kernel=False,
+                return_state_sequence=True,
+            )
+            return output, final_state, prefix_state
+
+        if impl in {
+            "reference",
+            "reference_fla_chunk32",
+            "reference_fla_packed",
+        }:
+            return reference_scan()
+
+        try:
+            from nanovllm_jax.kernels.gdn_fla_triton import (
+                gdn_packed_prefix_state_triton,
+            )
+        except (ImportError, ModuleNotFoundError, AttributeError):
+            gdn_packed_prefix_state_triton = None
+
+        if gdn_packed_prefix_state_triton is None:
+            _raise_if_gdn_fallback_disabled(
+                "Tiny packed-prefix GDN kernel is unavailable",
+                self.config,
+            )
+            return reference_scan()
+
+        cu_seqlens = (
+            jnp.arange(batch + 1, dtype=jnp.int32) * jnp.asarray(seq_len, dtype=jnp.int32)
+        )
+        flat_tokens = batch * seq_len
+        output_flat, final_state, prefix_flat = gdn_packed_prefix_state_triton(
+            query.reshape(flat_tokens, num_value_heads, key_head_dim),
+            key.reshape(flat_tokens, num_value_heads, key_head_dim),
+            value.reshape(flat_tokens, num_value_heads, value_head_dim),
+            gate.reshape(flat_tokens, num_value_heads),
+            beta.reshape(flat_tokens, num_value_heads),
+            cu_seqlens,
+            initial_state,
+            max_row_tokens=int(max_row_tokens),
+        )
+        output = output_flat.reshape(batch, seq_len, num_value_heads, value_head_dim)
+        output = output.transpose(0, 2, 1, 3).astype(jnp.float32)
+        prefix_state = prefix_flat.reshape(
+            batch,
+            seq_len,
+            num_value_heads,
+            value_head_dim,
+            key_head_dim,
+        )
+        return output, final_state, prefix_state
 
     def gated_delta_conv_packed_decode(
         self,
