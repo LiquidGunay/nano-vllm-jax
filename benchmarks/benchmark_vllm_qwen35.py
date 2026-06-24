@@ -494,6 +494,26 @@ def _performance_with_token_scopes(rows: list[dict[str, Any]], performance: dict
     return performance
 
 
+def _log_vllm_stats_now(target: Any) -> bool:
+    maybe_log_stats = getattr(target, "do_log_stats", None)
+    if maybe_log_stats is None:
+        return False
+    maybe_result = maybe_log_stats()
+    if asyncio.iscoroutine(maybe_result):
+        asyncio.run(maybe_result)
+    return True
+
+
+async def _log_vllm_stats_now_async(target: Any) -> bool:
+    maybe_log_stats = getattr(target, "do_log_stats", None)
+    if maybe_log_stats is None:
+        return False
+    maybe_result = maybe_log_stats()
+    if asyncio.iscoroutine(maybe_result):
+        await maybe_result
+    return True
+
+
 def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     if args.execution == "async":
         return asyncio.run(run_vllm_async(args, recorder))
@@ -563,15 +583,20 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         sampling_top_k=args.sampling_top_k,
     )
     _ = llm.generate([prompt_token_ids[0]], warm_sampling)
+    stats_warmup_flushed = False
+    if args.vllm_log_stats:
+        # vLLM's spec-decode logger resets when log() is called. Flush once
+        # after warmup so the post-measurement log is scoped to the timed run.
+        maybe_engine = getattr(llm, "llm_engine", None)
+        stats_warmup_flushed = _log_vllm_stats_now(maybe_engine)
 
     started = time.perf_counter()
     outputs = llm.generate(prompt_token_ids, sampling)
     elapsed = time.perf_counter() - started
+    stats_measurement_logged = False
     if args.vllm_log_stats:
         maybe_engine = getattr(llm, "llm_engine", None)
-        maybe_log_stats = getattr(maybe_engine, "do_log_stats", None)
-        if maybe_log_stats is not None:
-            maybe_log_stats()
+        stats_measurement_logged = _log_vllm_stats_now(maybe_engine)
 
     rows = []
     total_tokens = 0
@@ -622,6 +647,8 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
             "speculative_config": speculative_config,
             "vllm_log_stats": bool(args.vllm_log_stats),
             "vllm_log_stats_interval": float(args.vllm_log_stats_interval),
+            "vllm_log_stats_warmup_flushed": bool(stats_warmup_flushed),
+            "vllm_log_stats_measurement_logged": bool(stats_measurement_logged),
             **prompt_info,
             "top_k": args.top_k,
             "sampling": {
@@ -770,6 +797,11 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
             for index, prompt in enumerate(prompts)
         ]
     )
+    stats_warmup_flushed = False
+    if args.vllm_log_stats:
+        # vLLM's spec-decode logger resets when log() is called. Flush once
+        # after warmup so the post-measurement log is scoped to the timed run.
+        stats_warmup_flushed = await _log_vllm_stats_now_async(engine)
 
     started = time.perf_counter()
     rows = await asyncio.gather(
@@ -785,12 +817,9 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
         _timing_metrics(rows, elapsed, total_tokens, "vllm_async_generate"),
         elapsed,
     )
+    stats_measurement_logged = False
     if args.vllm_log_stats:
-        maybe_log_stats = getattr(engine, "do_log_stats", None)
-        if maybe_log_stats is not None:
-            maybe_result = maybe_log_stats()
-            if asyncio.iscoroutine(maybe_result):
-                await maybe_result
+        stats_measurement_logged = await _log_vllm_stats_now_async(engine)
 
     shutdown = getattr(engine, "shutdown", None)
     if shutdown is not None:
@@ -813,6 +842,8 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
             "speculative_config": speculative_config,
             "vllm_log_stats": bool(args.vllm_log_stats),
             "vllm_log_stats_interval": float(args.vllm_log_stats_interval),
+            "vllm_log_stats_warmup_flushed": bool(stats_warmup_flushed),
+            "vllm_log_stats_measurement_logged": bool(stats_measurement_logged),
             **prompt_info,
             "top_k": args.top_k,
             "sampling": {

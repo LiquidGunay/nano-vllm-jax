@@ -2822,6 +2822,159 @@ def test_packed_prefix_verifier_real_executor_accept_reject_and_partial(monkeypa
     ]
 
 
+def test_packed_prefix_table_verifier_real_executor_updates_resident_table(monkeypatch):
+    import jax
+    import numpy as np
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_DISABLE_BONUS", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE", raising=False)
+
+    config = _tiny_mtp_verifier_config()
+    config.num_speculative_tokens = 2
+    params = init_params(jax.random.PRNGKey(0), config)
+    params.mtp_params = init_mtp_params(jax.random.PRNGKey(1), config)
+    executor = ModelExecutor(config, params, backend="pure_jax")
+    batch = ScheduledBatch(
+        tokens=jnp.array([[3], [4]], dtype=jnp.int32),
+        positions=jnp.array([[0], [0]], dtype=jnp.int32),
+        seq_ids=jnp.array([0, 1], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 2], dtype=jnp.int32),
+        is_prefill=False,
+        num_prefill_tokens=0,
+        num_decode_tokens=2,
+        block_tables=jnp.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=jnp.int32),
+        seq_lens=jnp.array([1, 1], dtype=jnp.int32),
+    )
+    kv_spec = KVCacheSpec(
+        num_layers=config.num_hidden_layers,
+        num_blocks=config.num_kvcache_blocks,
+        block_size=config.block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        dtype=config.get_dtype(),
+        max_kv_cache_bytes=config.max_kv_cache_bytes,
+    )
+    base_cache = executor.backend.allocate_kv_cache(kv_spec, max_seqs=2, max_blocks_per_seq=4)
+    base_mtp_cache = executor.backend.allocate_kv_cache(kv_spec, max_seqs=2, max_blocks_per_seq=4)
+    table_template = init_hybrid_state(config, batch_size=3, dtype=config.get_dtype())
+    base_table = HybridLayerState(
+        conv_state=jnp.arange(
+            table_template.conv_state.size,
+            dtype=jnp.float32,
+        ).reshape(table_template.conv_state.shape)
+        / 100.0,
+        recurrent_state=jnp.arange(
+            table_template.recurrent_state.size,
+            dtype=jnp.float32,
+        ).reshape(table_template.recurrent_state.shape)
+        / 100.0,
+    )
+    slot_ids = jnp.array([1, 2], dtype=jnp.int32)
+    resident_seq_lens = jnp.array([99, 1, 1], dtype=jnp.int32)
+
+    def table_run(drafts):
+        return executor.mtp_k_packed_prefix_table_greedy_step_jit(
+            batch,
+            cache_storage=_clone_cache_storage(base_cache),
+            mtp_cache_storage=_clone_cache_storage(base_mtp_cache),
+            hybrid_state_table=_clone_hybrid_state(base_table),
+            hybrid_slot_ids=slot_ids,
+            draft_tokens=jnp.array(drafts, dtype=jnp.int32),
+            next_mtp_position=jnp.array([3, 3], dtype=jnp.int32),
+            mtp_hidden_final_normed=True,
+            mtp_chain_return_normed=False,
+            mtp_chain_mode="recursive",
+            resident_seq_lens=resident_seq_lens,
+        )
+
+    first_probe = table_run([[-1, -1], [-1, -1]])
+    first_targets = first_probe.target_token.tolist()
+    row0_t0 = int(first_targets[0][0][0])
+    row1_t0 = int(first_targets[1][0][0])
+    second_probe = table_run([[row0_t0, -1], [row1_t0, -1]])
+    second_targets = second_probe.target_token.tolist()
+    row0_t1 = int(second_targets[0][0][1])
+    row1_t1 = int(second_targets[1][0][1])
+    wrong_row0_t1 = (row0_t1 + 1) % config.vocab_size
+    if wrong_row0_t1 == row0_t1:
+        wrong_row0_t1 = (row0_t1 + 2) % config.vocab_size
+    wrong_row1_t0 = (row1_t0 + 1) % config.vocab_size
+    if wrong_row1_t0 == row1_t0:
+        wrong_row1_t0 = (row1_t0 + 2) % config.vocab_size
+
+    def assert_table_updates(table_output, expected_seq_lens):
+        assert table_output.hybrid_state_is_table is True
+        np.testing.assert_array_equal(
+            np.asarray(table_output.resident_seq_lens),
+            np.asarray(resident_seq_lens.at[slot_ids].set(jnp.asarray(expected_seq_lens))),
+        )
+        np.testing.assert_allclose(
+            np.asarray(table_output.hybrid_state.conv_state[0]),
+            np.asarray(base_table.conv_state[0]),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            np.asarray(table_output.hybrid_state.recurrent_state[0]),
+            np.asarray(base_table.recurrent_state[0]),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        assert np.max(
+            np.abs(
+                np.asarray(table_output.hybrid_state.conv_state[slot_ids])
+                - np.asarray(base_table.conv_state[slot_ids])
+            )
+        ) > 1e-6
+        assert np.max(
+            np.abs(
+                np.asarray(table_output.hybrid_state.recurrent_state[slot_ids])
+                - np.asarray(base_table.recurrent_state[slot_ids])
+            )
+        ) > 1e-6
+
+    full_accept_and_reject_drafts = [[row0_t0, row0_t1], [wrong_row1_t0, row1_t1]]
+    full_accept_and_reject = table_run(full_accept_and_reject_drafts)
+
+    assert full_accept_and_reject.accepted.tolist() == [[[True, True]], [[False, False]]]
+    assert full_accept_and_reject.accepted_counts.tolist() == [[2], [0]]
+    assert full_accept_and_reject.emitted_counts.tolist() == [[3], [1]]
+    assert full_accept_and_reject.committed_seq_lens.tolist() == [4, 2]
+    assert full_accept_and_reject.emitted_tokens.tolist()[0][0] == [
+        row0_t0,
+        row0_t1,
+        int(full_accept_and_reject.bonus_token.tolist()[0][0]),
+    ]
+    assert full_accept_and_reject.emitted_tokens.tolist()[1][0] == [
+        int(full_accept_and_reject.target_token.tolist()[1][0][0]),
+        0,
+        0,
+    ]
+    assert_table_updates(full_accept_and_reject, [4, 2])
+
+    partial_and_full_accept_drafts = [[row0_t0, wrong_row0_t1], [row1_t0, row1_t1]]
+    partial_and_full_accept = table_run(partial_and_full_accept_drafts)
+
+    assert partial_and_full_accept.accepted.tolist() == [[[True, False]], [[True, True]]]
+    assert partial_and_full_accept.accepted_counts.tolist() == [[1], [2]]
+    assert partial_and_full_accept.emitted_counts.tolist() == [[2], [3]]
+    assert partial_and_full_accept.committed_seq_lens.tolist() == [3, 4]
+    assert partial_and_full_accept.emitted_tokens.tolist()[0][0] == [
+        row0_t0,
+        int(partial_and_full_accept.target_token.tolist()[0][0][1]),
+        0,
+    ]
+    assert partial_and_full_accept.emitted_tokens.tolist()[1][0] == [
+        row1_t0,
+        row1_t1,
+        int(partial_and_full_accept.bonus_token.tolist()[1][0]),
+    ]
+    assert_table_updates(partial_and_full_accept, [3, 4])
+
+
 def test_k2_commit_select_exposes_partial_accept_as_one_token_commit(monkeypatch):
     import jax
 
