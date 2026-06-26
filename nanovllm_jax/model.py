@@ -1,13 +1,13 @@
 """Qwen 3.5 model implementation in pure JAX - matching HF exactly."""
 
-import os
 import jax
 import jax.numpy as jnp
 from jax import nn, lax
 from typing import Optional, List, Dict
 from dataclasses import dataclass, replace
-from nanovllm_jax.backends import (
-    InferenceBackend,
+from nanovllm_jax.ops import (
+    ServingOps,
+    ServingOpsProtocol,
     gdn_disable_fallbacks_enabled,
     gdn_packed_decode_conv_enabled,
     gdn_packed_decode_enabled,
@@ -15,13 +15,10 @@ from nanovllm_jax.backends import (
     gdn_packed_decode_max_batch,
     gdn_packed_decode_tail_fused_enabled,
     gdn_prefill_post_conv_enabled,
-    select_backend,
 )
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.layers import rms_norm, apply_rope, repeat_kv, causal_mask, get_activation, l2norm, causal_conv1d_update
-from nanovllm_jax.kv_cache import AttentionMetadata, HybridLayerState, KVCacheState, init_linear_attention_states
-from nanovllm_jax.mtp.mtp_layer import MTPParams
-from nanovllm_jax.conv1d_metal import causal_conv1d_metal
+from nanovllm_jax.cache import AttentionMetadata, HybridLayerState, KVCacheState, init_linear_attention_states
 
 
 @dataclass
@@ -30,55 +27,62 @@ class ModelParams:
     layers: List[Dict[str, jnp.ndarray]]
     norm_weight: jnp.ndarray
     lm_head: Optional[jnp.ndarray] = None
-    mtp_params: Optional[MTPParams] = None  # MTP head parameters for speculative decoding
 
 
 _GDN_DECODE_IN_PROJ_PACKED_KEY = "in_proj_qkv_abz"
 _FULL_ATTN_DECODE_QKV_PACKED_KEY = "qkv_proj_decode"
 _MLP_GATE_UP_PACKED_KEY = "gate_up_proj"
-_TRUE_CONFIG_VALUES = {"1", "true", "yes", "on", "True"}
+def _causal_conv1d(
+    x: jnp.ndarray,
+    weight: jnp.ndarray,
+    bias: Optional[jnp.ndarray] = None,
+    activation: str = "silu",
+) -> jnp.ndarray:
+    """Reference grouped causal 1D convolution for GDN projections."""
+
+    batch, dim, seq_len = x.shape
+    kernel_size = int(weight.shape[-1])
+    padded = jnp.pad(x, ((0, 0), (0, 0), (kernel_size - 1, 0)))
+    out = jnp.zeros((batch, dim, seq_len), dtype=x.dtype)
+    for k in range(kernel_size):
+        out = out + padded[:, :, k : k + seq_len] * weight[:, k : k + 1]
+    if bias is not None:
+        out = out + bias[:, None]
+    if activation == "silu":
+        return jax.nn.silu(out)
+    if activation == "relu":
+        return jax.nn.relu(out)
+    return out
 
 
-def _config_or_env_bool(
+def _config_bool(
     config: Optional[Qwen3_5Config],
     attr: str,
-    env_name: str,
     *,
     default: bool = False,
 ) -> bool:
-    env_value = os.environ.get(env_name)
-    if env_value is not None:
-        return env_value in _TRUE_CONFIG_VALUES
     if config is not None and hasattr(config, attr):
         return bool(getattr(config, attr))
     return default
 
 
-def _config_or_env_str(
+def _config_str(
     config: Optional[Qwen3_5Config],
     attr: str,
-    env_name: str,
     *,
     default: str,
 ) -> str:
-    env_value = os.environ.get(env_name)
-    if env_value is not None:
-        return str(env_value).strip().lower()
     if config is not None and hasattr(config, attr):
         return str(getattr(config, attr) or default).strip().lower()
     return default
 
 
-def _config_or_env_int(
+def _config_int(
     config: Optional[Qwen3_5Config],
     attr: str,
-    env_name: str,
     *,
     default: int,
 ) -> int:
-    env_value = os.environ.get(env_name)
-    if env_value is not None:
-        return int(env_value or default)
     if config is not None and hasattr(config, attr):
         return int(getattr(config, attr) or default)
     return default
@@ -87,10 +91,10 @@ def _config_or_env_int(
 def _tokenwise_decode_dot(x: jnp.ndarray, weight: jnp.ndarray, *, force_width1: bool = False) -> jnp.ndarray:
     """Apply a tokenwise linear with width-1 matmul shapes for multi-token decode.
 
-    TPU bf16 matmuls can be shape dependent. For cached speculative decode, the
-    first token in a width-2 verifier must match a standalone width-1 decode
-    before any commit decision. Slicing the sequence dimension keeps the matmul
-    shape aligned with sequential decode while preserving one compiled graph.
+    BF16 matmuls can be shape dependent. For cached decode, the first token in
+    a width-2 route must match a standalone width-1 decode before any commit
+    decision. Slicing the sequence dimension keeps the matmul shape aligned
+    with sequential decode while preserving one compiled graph.
     """
     if not force_width1 or x.ndim != 3 or x.shape[1] <= 1:
         return jnp.dot(x, weight)
@@ -156,7 +160,7 @@ def _packed_causal_conv1d_prefill(
         [initial_conv_state, mixed_rows.transpose(0, 2, 1)],
         axis=-1,
     )
-    conv_all = causal_conv1d_metal(
+    conv_all = _causal_conv1d(
         conv_input,
         conv_weight,
         conv_bias,
@@ -192,20 +196,14 @@ def _decode_width1_rms_norm(
 ) -> jnp.ndarray:
     """Apply RMSNorm with width-1 sequence shapes for multi-token decode.
 
-    The K=1 one-pass verifier evaluates a two-token decode block, but its first
+    The compact decode route evaluates a two-token block, but its first
     token must match the canonical single-token decode path exactly enough for
-    greedy parity. TPU BF16 reductions can be shape-dependent even when each
-    token is independent along the normalized dimension, so run the same
-    `[B, 1, ...]` RMSNorm shape used by baseline decode and concatenate the
-    token results inside the compiled graph.
+    greedy parity. BF16 reductions can be shape-dependent even when each token
+    is independent along the normalized dimension, so run the same `[B, 1, ...]`
+    RMSNorm shape used by baseline decode and concatenate the token results
+    inside the compiled graph.
     """
-    stable_decode_norm = os.environ.get("NANO_VLLM_JAX_STABLE_DECODE_RMSNORM", "0") in {
-        "1",
-        "true",
-        "yes",
-        "on",
-        "True",
-    }
+    stable_decode_norm = False
     if force_width1:
         from nanovllm_jax.kernels.decode_reductions import (
             decode_rms_norm,
@@ -217,21 +215,6 @@ def _decode_width1_rms_norm(
     if not force_width1 or x.ndim < 3 or x.shape[1] <= 1:
         return _stable_rmsnorm_fp32(x, weight, eps) if stable_decode_norm and force_width1 else rms_norm(x, weight, eps)
     norm_fn = _stable_rmsnorm_fp32 if stable_decode_norm else rms_norm
-    if os.environ.get("NANO_VLLM_JAX_SCAN_WIDTH1_RMSNORM", "0") in {
-        "1",
-        "true",
-        "yes",
-        "on",
-        "True",
-    }:
-        x_time_major = jnp.swapaxes(x, 0, 1)
-
-        def scan_norm(_, x_t):
-            y_t = norm_fn(x_t[:, None, ...], weight, eps)
-            return None, y_t[:, 0, ...]
-
-        _, y_time_major = lax.scan(scan_norm, None, x_time_major)
-        return jnp.swapaxes(y_time_major, 0, 1)
     parts = [norm_fn(x[:, t : t + 1, ...], weight, eps) for t in range(x.shape[1])]
     return jnp.concatenate(parts, axis=1)
 
@@ -239,25 +222,18 @@ def _decode_width1_rms_norm(
 def _force_width1_decode_math() -> bool:
     """Use width-1-shaped matmuls in multi-token decode by default.
 
-    K=1 MTP verifies a width-2 decode block but must match the canonical
-    width-1 baseline token for every physical batch shape. TPU BF16 matmuls are
-    shape-sensitive enough that the width-2 verifier can diverge at larger
-    batches unless tokenwise projections use the width-1 decode shape.
+    Multi-token decode must match the canonical width-1 baseline token for
+    every physical batch shape. BF16 matmuls are shape-sensitive enough that
+    wider decode can diverge at larger batches unless tokenwise projections use
+    the width-1 decode shape.
     """
-    return os.environ.get("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH", "1") in {
-        "1",
-        "true",
-        "yes",
-        "on",
-        "True",
-    }
+    return True
 
 
 def _lm_head_decode_activation_dtype(config: Optional[Qwen3_5Config] = None) -> jnp.dtype:
-    value = _config_or_env_str(
+    value = _config_str(
         config,
         "lm_head_decode_act_dtype",
-        "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE",
         default="fp32",
     )
     if value in {"", "0", "false", "no", "off", "none", "fp32", "float32"}:
@@ -265,24 +241,21 @@ def _lm_head_decode_activation_dtype(config: Optional[Qwen3_5Config] = None) -> 
     if value in {"bf16", "bfloat16"}:
         return jnp.bfloat16
     raise ValueError(
-        "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE must be fp32 or bf16, "
-        f"got {value!r}"
+        f"lm_head_decode_act_dtype must be fp32 or bf16, got {value!r}"
     )
 
 
 def _decode_padded_gemm_enabled(config: Optional[Qwen3_5Config] = None) -> bool:
-    return _config_or_env_bool(
+    return _config_bool(
         config,
         "decode_padded_gemm",
-        "NANO_VLLM_JAX_DECODE_PADDED_GEMM",
     )
 
 
 def _decode_padded_gemm_gate_up_enabled(config: Optional[Qwen3_5Config] = None) -> bool:
-    return _config_or_env_bool(
+    return _config_bool(
         config,
         "decode_padded_gemm_gate_up",
-        "NANO_VLLM_JAX_DECODE_PADDED_GEMM_GATE_UP",
     )
 
 
@@ -291,48 +264,43 @@ def _decode_rms_padded_gemm_enabled(config: Optional[Qwen3_5Config] = None) -> b
 
 
 def _decode_padded_gemm_rows(config: Optional[Qwen3_5Config] = None) -> int:
-    value = _config_or_env_int(
+    value = _config_int(
         config,
         "decode_padded_gemm_rows",
-        "NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS",
         default=8,
     )
     try:
         rows = int(value)
     except ValueError as exc:
         raise ValueError(
-            "NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS must be an integer, "
-            f"got {value!r}"
+            f"decode_padded_gemm_rows must be an integer, got {value!r}"
         ) from exc
     if rows < 1:
-        raise ValueError("NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS must be positive")
+        raise ValueError("decode_padded_gemm_rows must be positive")
     return rows
 
 
 def _decode_padded_gemm_max_out_dim(config: Optional[Qwen3_5Config] = None) -> int:
-    value = _config_or_env_int(
+    value = _config_int(
         config,
         "decode_padded_gemm_max_out_dim",
-        "NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM",
         default=300000,
     )
     try:
         out_dim = int(value)
     except ValueError as exc:
         raise ValueError(
-            "NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM must be an integer, "
-            f"got {value!r}"
+            f"decode_padded_gemm_max_out_dim must be an integer, got {value!r}"
         ) from exc
     if out_dim < 1:
-        raise ValueError("NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM must be positive")
+        raise ValueError("decode_padded_gemm_max_out_dim must be positive")
     return out_dim
 
 
 def _lm_head_topk_impl(config: Optional[Qwen3_5Config] = None) -> str:
-    value = _config_or_env_str(
+    value = _config_str(
         config,
         "lm_head_topk_impl",
-        "NANO_VLLM_JAX_LM_HEAD_TOPK_IMPL",
         default="jax",
     )
     if value in {"", "0", "false", "no", "off", "none", "jax", "reference"}:
@@ -340,8 +308,7 @@ def _lm_head_topk_impl(config: Optional[Qwen3_5Config] = None) -> str:
     if value in {"flashinfer", "fi", "radix_topk"}:
         return "flashinfer"
     raise ValueError(
-        "NANO_VLLM_JAX_LM_HEAD_TOPK_IMPL must be jax or flashinfer, "
-        f"got {value!r}"
+        f"lm_head_topk_impl must be jax or flashinfer, got {value!r}"
     )
 
 
@@ -439,10 +406,9 @@ def _decode_projection_activation_dtype(
     batch_size: int | None = None,
     config: Optional[Qwen3_5Config] = None,
 ) -> jnp.dtype:
-    value = _config_or_env_str(
+    value = _config_str(
         config,
         "decode_proj_act_dtype",
-        "NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE",
         default="fp32",
     )
     if value in {"", "0", "false", "no", "off", "none", "fp32", "float32"}:
@@ -452,9 +418,7 @@ def _decode_projection_activation_dtype(
     if value in {"bf16_single_seq", "bfloat16_single_seq", "bf16_single_sequence"}:
         return jnp.bfloat16 if batch_size == 1 else jnp.float32
     raise ValueError(
-        "NANO_VLLM_JAX_DECODE_PROJ_ACT_DTYPE must be fp32, bf16, "
-        "or bf16_single_seq, "
-        f"got {value!r}"
+        f"decode_proj_act_dtype must be fp32, bf16, or bf16_single_seq, got {value!r}"
     )
 
 
@@ -517,49 +481,39 @@ def _use_full_attention_prefill_packed_qkv(
 
 
 def _enable_chunked_gdn_prefill() -> bool:
-    """Use the chunked cached-prefill GDN path; set env to 0 for fallback."""
-    return os.environ.get("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1") in {
-        "1",
-        "true",
-        "yes",
-        "on",
-        "True",
-    }
+    """Use the promoted chunked cached-prefill GDN path."""
+    return True
 
 
 def _enable_compact_prefill_in_proj_qkv(config: Optional[Qwen3_5Config] = None) -> bool:
     """Compact true prefill tokens for the GDN QKV input projection."""
-    return _config_or_env_bool(
+    return _config_bool(
         config,
         "compact_prefill_in_proj_qkv",
-        "NANO_VLLM_JAX_COMPACT_PREFILL_IN_PROJ_QKV",
     )
 
 
 def _enable_compact_prefill_mlp(config: Optional[Qwen3_5Config] = None) -> bool:
     """Compact true prefill tokens for tokenwise MLP projections."""
-    return _config_or_env_bool(
+    return _config_bool(
         config,
         "compact_prefill_mlp",
-        "NANO_VLLM_JAX_COMPACT_PREFILL_MLP",
     )
 
 
 def _enable_compact_prefill_gdn_z(config: Optional[Qwen3_5Config] = None) -> bool:
     """Compact true prefill tokens for the GDN Z input projection."""
-    return _config_or_env_bool(
+    return _config_bool(
         config,
         "compact_prefill_gdn_z",
-        "NANO_VLLM_JAX_COMPACT_PREFILL_GDN_Z",
     )
 
 
 def _enable_compact_prefill_full_attn_proj(config: Optional[Qwen3_5Config] = None) -> bool:
     """Compact true prefill tokens for full-attention Q/K/V projections."""
-    return _config_or_env_bool(
+    return _config_bool(
         config,
         "compact_prefill_full_attn_proj",
-        "NANO_VLLM_JAX_COMPACT_PREFILL_FULL_ATTN_PROJ",
     )
 
 
@@ -760,7 +714,7 @@ def _lm_head_greedy_top1_token_ids(
         raise NotImplementedError(
             "lm_head_greedy_top1_impl='cutlass' requires a true fused "
             "LM-head GEMM+top1 backend. Dense-logit fallback is disabled so "
-            "benchmarks cannot accidentally report the unfused path."
+            "diagnostics cannot accidentally report the unfused path."
         )
     raise AssertionError(f"unexpected LM-head greedy top1 impl: {impl!r}")
 
@@ -776,10 +730,10 @@ def lm_head_token_ids_and_topk(
 ):
     """Return greedy LM-head token ids and optional top-k values on device.
 
-    Speculative verification needs exact target token ids and sometimes a
-    top-2 margin, but returning full `[B, width, vocab]` logits from the JIT
-    bloats the verifier path. Keep the dense LM-head computation inside the
-    compiled graph and return only small verifier products.
+    Decode needs exact target token ids and sometimes a top-k summary, but
+    returning full `[B, width, vocab]` logits from the JIT is unnecessarily
+    expensive. Keep the dense LM-head computation inside the compiled graph
+    and return only small products.
     """
     if (
         (not is_prefill)
@@ -887,27 +841,25 @@ def _model_params_flatten(params: ModelParams):
         layer_aux.append(keys)
         for k in keys:
             layer_children.append(layer[k])
-    
+
     children = (
         params.embed_tokens,
         *layer_children,
         params.norm_weight,
         params.lm_head if params.lm_head is not None else jnp.zeros((1,), dtype=jnp.float16),
-        params.mtp_params if params.mtp_params is not None else jnp.zeros((1,), dtype=jnp.float16),
     )
     aux_data = (
         len(params.layers),
         layer_aux,
         params.lm_head is not None,
-        params.mtp_params is not None,
     )
     return children, aux_data
 
 
 def _model_params_unflatten(aux_data, children):
     """Unflatten children and auxiliary data into ModelParams."""
-    num_layers, layer_aux, has_lm_head, has_mtp = aux_data
-    
+    num_layers, layer_aux, has_lm_head = aux_data
+
     # Reconstruct layers
     layers = []
     child_idx = 1  # Skip embed_tokens
@@ -917,20 +869,17 @@ def _model_params_unflatten(aux_data, children):
             layer[k] = children[child_idx]
             child_idx += 1
         layers.append(layer)
-    
+
     # Get remaining fields
     norm_weight = children[child_idx]
     child_idx += 1
     lm_head = children[child_idx] if has_lm_head else None
-    child_idx += 1
-    mtp_params = children[child_idx] if has_mtp else None
-    
+
     return ModelParams(
         embed_tokens=children[0],
         layers=layers,
         norm_weight=norm_weight,
         lm_head=lm_head,
-        mtp_params=mtp_params,
     )
 
 
@@ -1012,7 +961,7 @@ def init_transformer_block(key: jax.Array, config: Qwen3_5Config, layer_idx: int
         }
 
 
-def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initial_state=None, 
+def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initial_state=None,
                                 output_final_state=False, use_qk_l2norm_in_kernel=False):
     """
     JAX implementation of chunk gated delta rule (matching HF torch_chunk_gated_delta_rule).
@@ -1035,24 +984,24 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
         return output, final_state if output_final_state else None
 
     import jax
-    
+
     initial_dtype = query.dtype
-    
+
     # Apply L2 norm if requested
     if use_qk_l2norm_in_kernel:
         query = l2norm(query.astype(jnp.float32), axis=-1, eps=1e-6)
         key = l2norm(key.astype(jnp.float32), axis=-1, eps=1e-6)
-    
+
     # Convert to float32 for computation
     query = query.astype(jnp.float32)
     key = key.astype(jnp.float32)
     value = value.astype(jnp.float32)
     beta = beta.astype(jnp.float32)
     g = g.astype(jnp.float32)
-    
+
     batch_size, num_heads, seq_len, k_head_dim = key.shape
     v_head_dim = value.shape[-1]
-    
+
     # Pad to chunk_size
     pad_size = (chunk_size - seq_len % chunk_size) % chunk_size
     if pad_size > 0:
@@ -1061,54 +1010,49 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
         value = jnp.pad(value, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
         beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_size)))
         g = jnp.pad(g, ((0, 0), (0, 0), (0, pad_size)))
-    
+
     total_seq_len = seq_len + pad_size
     scale = 1.0 / jnp.sqrt(k_head_dim)
     query = query * scale
-    
+
     # v_beta = value * beta[..., None]
     v_beta = value * beta[..., None]
     # k_beta = key * beta[..., None]
     k_beta = key * beta[..., None]
-    
+
     # Reshape to chunks: [B, H, n_chunks, chunk_size, D]
     def reshape_to_chunks(x):
         return x.reshape(batch_size, num_heads, -1, chunk_size, x.shape[-1])
-    
+
     query_chunks = reshape_to_chunks(query)
     key_chunks = reshape_to_chunks(key)
     value_chunks = reshape_to_chunks(value)
     k_beta_chunks = reshape_to_chunks(k_beta)
     v_beta_chunks = reshape_to_chunks(v_beta)
-    
+
     # g reshaped: [B, H, n_chunks, chunk_size]
     g_chunks = g.reshape(batch_size, num_heads, -1, chunk_size)
     n_chunks = g_chunks.shape[2]
-    
+
     # Create mask for upper triangle (within chunk)
     mask_upper = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_))
     mask_strict_upper = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=1)
-    
-    # Compute decay: cumulative sum of g within each chunk
-    # Use Metal-compatible cumsum if on Metal backend
-    if jax.default_backend() == 'METAL':
-        from nanovllm_jax.metal_ops import cumsum_metal
-        g_cumsum = cumsum_metal(g_chunks, axis=-1)
-    else:
-        g_cumsum = jnp.cumsum(g_chunks, axis=-1)
-    
+
+    # Compute decay: cumulative sum of g within each chunk.
+    g_cumsum = jnp.cumsum(g_chunks, axis=-1)
+
     # decay_mask[b,h,n,i,j] = exp(g_cumsum[b,h,n,i] - g_cumsum[b,h,n,j]) for i >= j, else 0
     decay_mask = jnp.tril(jnp.exp(g_cumsum[..., :, None] - g_cumsum[..., None, :]))
-    
+
     # Compute k_beta @ key.transpose(-1, -2) for each chunk
     # k_beta_chunks: [B, H, n, cs, K], key_chunks: [B, H, n, cs, K]
     # Result: [B, H, n, cs, cs] where result[b,h,n,i,j] = sum_k(k_beta[b,h,n,i,k] * key[b,h,n,j,k])
     kkt = jnp.einsum('bhnck,bhnjk->bhncj', k_beta_chunks, key_chunks)
-    
+
     # attn = -((k_beta @ k.T) * decay_mask), masked to lower triangle
     attn = -(kkt * decay_mask)
     attn = jnp.where(mask_upper, 0.0, attn)  # Zero out diagonal and upper triangle
-    
+
     # Recursive computation within chunk (matching HF exactly)
     # for i in range(1, chunk_size):
     #     row = attn[..., i, :i].clone()  # [B, H, n, i]
@@ -1116,50 +1060,50 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
     #     attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
     def update_row(carry, i):
         attn_carry = carry
-        
+
         # Create a mask that's True for indices < i
         mask = jnp.arange(chunk_size) < i  # [cs]
-        
+
         # Extract row i, cols 0:i -> shape [B, H, n, cs] but only first i entries are valid
         row_i = attn_carry[..., i, :] * mask[None, None, None, :]  # [B, H, n, cs]
-        
+
         # Extract submatrix [0:i, 0:i] -> shape [B, H, n, cs, cs] but only [0:i, 0:i] is valid
         # Multiply by mask on both dimensions
         sub_i = attn_carry * mask[None, None, None, :, None] * mask[None, None, None, None, :]  # [B, H, n, cs, cs]
-        
+
         # HF: (row.unsqueeze(-1) * sub).sum(-2)
         # This computes: contribution[k] = sum_j(row[j] * sub[j, k]) for j,k in 0:i
         # Using einsum: 'bhnj,bhnjk->bhnk'
         contribution = jnp.einsum('bhnj,bhnjk->bhnk', row_i, sub_i)  # [B, H, n, cs]
-        
+
         # new_row for cols 0:i
         new_row = row_i + contribution
         # Mask to keep only cols 0:i
         new_row = new_row * mask[None, None, None, :]
-        
+
         # Update attn at row i
         attn_carry = attn_carry.at[..., i, :].set(new_row)
         return attn_carry, i
-    
+
     attn, _ = lax.scan(update_row, attn, jnp.arange(1, chunk_size))
-    
+
     # Add identity matrix
     attn = attn + jnp.eye(chunk_size, dtype=jnp.float32)[None, None, None, :, :]
-    
+
     # value_transformed = attn @ v_beta
     # attn: [B, H, n, cs, cs], v_beta: [B, H, n, cs, V]
     # result: [B, H, n, cs, V]
     value_transformed = jnp.einsum('bhnct,bhntv->bhncv', attn, v_beta_chunks)
-    
+
     # Initial-state correction uses decay from the start of each chunk.
     k_cumdecay = jnp.einsum('bhnct,bhntv->bhncv', attn, k_beta_chunks * jnp.exp(g_cumsum)[..., None])
-    
+
     # Initialize state [B, H, V, K].
     if initial_state is None:
         state = jnp.zeros((batch_size, num_heads, v_head_dim, k_head_dim), dtype=jnp.float32)
     else:
         state = initial_state.astype(jnp.float32)
-    
+
     # Process each chunk sequentially
     def process_chunk(carry, i):
         state = carry
@@ -1169,30 +1113,30 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
         decay_mask_i = decay_mask[:, :, i]  # [B, H, cs, cs]
         k_cumdecay_i = k_cumdecay[:, :, i]  # [B, H, cs, K]
         g_cumsum_i = g_cumsum[:, :, i]    # [B, H, cs] - use cumsum version!
-        
+
         # Within-chunk attention: attn = (q @ k.T * decay_mask), masked to strict upper triangle
         attn_i = jnp.einsum('bhck,bhdk->bhcd', q_i, k_i) * decay_mask_i
         attn_i = jnp.where(mask_strict_upper, 0.0, attn_i)
-        
+
         # v_prime = k_cumdecay @ state
         # k_cumdecay_i: [B, H, cs, K], state: [B, H, V, K]
         # v_prime[b,h,c,v] = sum_k(k_cumdecay_i[b,h,c,k] * state[b,h,v,k])
         v_prime = jnp.einsum('bhck,bhvk->bhcv', k_cumdecay_i, state)
-        
+
         # v_new = v_i - v_prime
         v_new = v_i - v_prime
-        
+
         # attn_inter = (q * exp(g)) @ state
         # q_i * exp(g_cumsum_i): [B, H, cs, K]
         # result: [B, H, cs, V] = sum_K(q[b,h,c,k] * exp(g_cumsum[b,h,c]) * state[b,h,v,k])
         attn_inter = jnp.einsum('bhck,bhvk->bhcv', q_i * jnp.exp(g_cumsum_i)[..., None], state)
-        
+
         # core_attn_out = attn_inter + attn @ v_new
         # attn_i: [B, H, cs, cs], v_new: [B, H, cs, V]
         # result: [B, H, cs, V] = sum_d(attn_i[b,h,c,d] * v_new[b,h,d,v])
         attn_v_new = jnp.einsum('bhcd,bhdv->bhcv', attn_i, v_new)
         core_attn_out_i = attn_inter + attn_v_new
-        
+
         # Update state
         # state = state * exp(g_cumsum[b,h,cs-1]) + (k * exp(g_cumsum[cs-1] - g_cumsum)).T @ v_new
         # g_last_minus_g[b,h,c] = g_cumsum[b,h,-1] - g_cumsum[b,h,c]
@@ -1202,11 +1146,11 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
         # state_update[b,h,v,k] = sum_c(v_new[b,h,c,v] * k_weighted[b,h,c,k])
         state_update = jnp.einsum('bhcv,bhck->bhvk', v_new, k_weighted)
         state = state * jnp.exp(g_cumsum_i[..., -1, None, None]) + state_update
-        
+
         return state, core_attn_out_i
-    
+
     final_state, core_attn_out_chunks = lax.scan(process_chunk, state, jnp.arange(n_chunks))
-    
+
     # lax.scan returns [n_chunks, B, H, chunk, V]; HF keeps chunk as the
     # third dimension [B, H, n_chunks, chunk, V] before flattening time.
     core_attn_out = core_attn_out_chunks.transpose(1, 2, 0, 3, 4).reshape(
@@ -1216,10 +1160,10 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
         v_head_dim,
     )
     core_attn_out = core_attn_out[:, :, :seq_len]  # Remove padding
-    
+
     if not output_final_state:
         final_state = None
-    
+
     core_attn_out = core_attn_out.astype(initial_dtype)
     return core_attn_out, final_state
 
@@ -1241,7 +1185,7 @@ def jax_recurrent_gated_delta_rule(
 
     # Keep as [B, H, T, D]. For cached decode, normalize q/k in
     # float32 before l2norm so width-2 recurrent scans match the width-1
-    # sequential decode path as closely as possible on TPU bf16.
+    # sequential decode path as closely as possible in bf16.
     query = query.astype(jnp.float32)
     key = key.astype(jnp.float32)
     if use_qk_l2norm_in_kernel:
@@ -1300,7 +1244,7 @@ def jax_recurrent_gated_delta_rule(
         )
 
     if time_dim == 2:
-        # Cached K=1 verifier uses width-2 decode. Avoid a two-step scan so the
+        # Cached K=1 route uses width-2 decode. Avoid a two-step scan so the
         # first token is computed as the same explicit width-1 recurrence used by
         # the sequential commit-select reference, then apply the second token.
         state_0, out_0 = step_one(
@@ -1371,7 +1315,7 @@ def gated_deltanet_block(
     hybrid_state: Optional[HybridLayerState] = None,
     valid_token_mask: Optional[jnp.ndarray] = None,
     compact_prefill_tokens: Optional[int] = None,
-    backend: Optional[InferenceBackend] = None,
+    backend: Optional[ServingOpsProtocol] = None,
     return_prefix_state: bool = False,
     return_first_prefix_state: bool = False,
     hybrid_state_is_layer: bool = False,
@@ -1379,7 +1323,7 @@ def gated_deltanet_block(
     packed_query_start_loc: Optional[jnp.ndarray] = None,
 ):
     """Gated DeltaNet block with decode mode support.
-    
+
     Args:
         x: Input [batch, seq_len, hidden]
         params: Layer parameters
@@ -1388,33 +1332,33 @@ def gated_deltanet_block(
         layer_idx: Layer index (0-based)
         is_prefill: Whether this is prefill (True) or decode (False)
         hybrid_state: Optional linear-attention state for this batch
-        
+
     Returns:
         tuple: (output, updated_hybrid_state) or just output for prefill
     """
     batch, seq_len, _ = x.shape
     if backend is None:
-        backend = select_backend("pure_jax", config=config)
+        backend = ServingOps(config=config)
     prefix_layer_state = None
-    
-    # Cast to target dtype (bfloat16 for CPU/CUDA, float16 for Metal)
+
+    # Cast to target dtype for the promoted CUDA/JAX path.
     dtype = config.get_dtype()
     x_cast = x.astype(
         _decode_projection_activation_dtype(batch, config) if not is_prefill else dtype
     )
-    
+
     key_dim = config.linear_num_key_heads * config.linear_key_head_dim
     value_dim = config.linear_num_value_heads * config.linear_value_head_dim
     v_heads_per_k = config.linear_num_value_heads // config.linear_num_key_heads
     conv_dim = key_dim * 2 + value_dim
-    
+
     # Check if we can use cached states
     use_cached = (
-        not is_prefill and 
-        hybrid_state is not None and 
+        not is_prefill and
+        hybrid_state is not None and
         hybrid_state.conv_state is not None and
         hybrid_state.recurrent_state is not None and
-        seq_len <= max(2, 1 + int(getattr(config, "num_speculative_tokens", 0) or 0))
+        seq_len <= 2
     )
     use_cached_prefill = (
         is_prefill
@@ -1431,7 +1375,7 @@ def gated_deltanet_block(
     )
     linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
     row_valid = None
-    
+
     # === PROJECTIONS (same for both modes) ===
     force_width1_dot = (not is_prefill) and seq_len > 1 and _force_width1_decode_math()
     use_packed_decode_in_proj = _use_gdn_decode_packed_in_proj(
@@ -1555,11 +1499,8 @@ def gated_deltanet_block(
             and not return_first_prefix_state
             and initial_recurrent is not None
         )
-        # Width>1 decode is used by speculative verification: the current token
-        # and one or more draft tokens are replayed through the target model in a
-        # single JIT boundary. The packed GDN kernel is width-1 only, but the
-        # explicit unrolled decode path below preserves decode semantics and
-        # avoids forcing speculative decode through a prefill-shaped verifier.
+        # Width>1 decode is kept on an explicit unrolled path because the
+        # packed GDN decode kernel is width-1 only.
         allow_explicit_multitoken_decode = (
             seq_len > 1
             and initial_recurrent is not None
@@ -1959,7 +1900,7 @@ def gated_deltanet_block(
         else:
             new_recurrent_state = new_recurrent_state_single[jnp.newaxis, :, :, :, :]  # Add layer dim
             new_conv_state = new_layer_conv_state[jnp.newaxis, :, :, :]  # Add layer dim
-        
+
         hybrid_state = replace(
             hybrid_state,
             conv_state=new_conv_state,
@@ -1973,13 +1914,13 @@ def gated_deltanet_block(
             if return_prefix_state or return_first_prefix_state
             else None
         )
-        
+
         if not tail_fused_gdn_decode:
             # core_attn_out is [B, H, T, D_v] - transpose to [B, T, H, D_v] for reshaping.
             core_attn_out = core_attn_out.transpose(0, 2, 1, 3)
-        
+
     else:
-        # === PREFILL MODE (Metal-compatible implementation) ===
+        # === PREFILL MODE ===
         mixed_qkv_t = mixed_qkv.transpose(0, 2, 1)  # [B, D, T]
         if packed_token_row_ids is not None:
             if packed_query_start_loc is None:
@@ -2018,14 +1959,7 @@ def gated_deltanet_block(
                 0,
                 seq_len - 1,
             )
-            packed_prefix_state_post_conv = (
-                return_prefix_state
-                and not return_first_prefix_state
-                and use_cached_prefill
-                and int(getattr(config, "num_speculative_tokens", 0) or 0) > 0
-                and row_query_len
-                <= max(1, int(getattr(config, "num_speculative_tokens", 0) or 0) + 1)
-            )
+            packed_prefix_state_post_conv = False
             use_packed_post_conv_prefill = (
                 gdn_prefill_post_conv_enabled(config)
                 and (not use_recurrent_prefill or packed_prefix_state_post_conv)
@@ -2310,7 +2244,7 @@ def gated_deltanet_block(
                 else hybrid_state.conv_state[:, linear_layer_idx]
             )
             conv_input = jnp.concatenate([layer_conv_state, mixed_qkv_t], axis=-1)
-            conv_out = causal_conv1d_metal(
+            conv_out = _causal_conv1d(
                 conv_input,
                 params["conv1d_weight"],
                 params.get("conv1d_bias"),
@@ -2335,15 +2269,14 @@ def gated_deltanet_block(
                     axis=3,
                 )
         else:
-            # Use Metal-compatible conv1d (no lax.conv_general_dilated)
-            conv_out = causal_conv1d_metal(
+            conv_out = _causal_conv1d(
                 mixed_qkv_t,
                 params["conv1d_weight"],
                 params.get("conv1d_bias"),
                 activation="silu",
             )
         conv_out = conv_out.transpose(0, 2, 1)  # [B, T, D]
-        
+
         initial_recurrent = (
             (
                 hybrid_state.recurrent_state
@@ -2457,7 +2390,7 @@ def gated_deltanet_block(
                     initial_state=initial_recurrent,
                     use_qk_l2norm_in_kernel=True,
                 )
-        
+
         # Save final state to cache for decode mode
         if (
             hybrid_state is not None
@@ -2523,10 +2456,10 @@ def gated_deltanet_block(
                     else None,
                     recurrent_state=prefix_recurrent_state_single,
                 )
-        
+
         # Output is [B, H, T, D] - transpose to [B, T, H, D] for reshaping
         core_attn_out = core_attn_out.transpose(0, 2, 1, 3)  # [B, H, T, D] -> [B, T, H, D]
-    
+
     # === OUTPUT PROCESSING (same for both modes) ===
     if tail_fused_gdn_decode:
         core_attn_out = core_attn_out.reshape(batch, seq_len, -1)
@@ -2536,7 +2469,7 @@ def gated_deltanet_block(
         z = z.reshape(batch * seq_len, -1, config.linear_value_head_dim)
 
         # Apply gated RMSNorm per head. HF-style RMSNorm computes the reduction in
-        # fp32, which also removes one source of width-dependent TPU bf16 drift.
+        # fp32, which also removes one source of width-dependent bf16 drift.
         core_attn_out = _stable_rmsnorm_fp32(core_attn_out, params["norm_weight"], config.rms_norm_eps)
         core_attn_out = core_attn_out * nn.silu(z)
 
@@ -2550,7 +2483,7 @@ def gated_deltanet_block(
         params["out_proj"],
         force_width1=(not is_prefill) and seq_len > 1 and _force_width1_decode_math(),
     )
-    
+
     if use_cached:
         if return_prefix_state or return_first_prefix_state:
             return attn_out, hybrid_state, prefix_layer_state
@@ -2575,11 +2508,11 @@ def full_attention_block(
     is_prefill: bool = True,
     layer_idx: int = 0,
     attention_metadata: Optional[AttentionMetadata] = None,
-    backend: Optional[InferenceBackend] = None,
+    backend: Optional[ServingOpsProtocol] = None,
     return_kv_prewrite: bool = False,
 ):
     """Full attention block with optional KV cache support.
-    
+
     Args:
         x: Input tensor [batch, seq_len, hidden_dim]
         params: Layer parameters
@@ -2589,13 +2522,13 @@ def full_attention_block(
         kv_cache_state: Optional KV cache state (None for no cache)
         is_prefill: Whether this is prefill (vs decode)
         layer_idx: Layer index for per-layer KV cache
-    
+
     Returns:
         tuple: (output, updated_kv_cache_state)
     """
     batch, seq_len, _ = x.shape
-    
-    # Cast to target dtype (bfloat16 for CPU/CUDA, float16 for Metal)
+
+    # Cast to target dtype for the promoted CUDA/JAX path.
     dtype = config.get_dtype()
     x_cast = x.astype(
         _decode_projection_activation_dtype(batch, config) if not is_prefill else dtype
@@ -2635,18 +2568,13 @@ def full_attention_block(
             )
         out = jnp.dot(inp.reshape(-1, inp.shape[-1]), weight)
         return out.reshape(batch, seq_len, -1)
-    
+
     # Qwen3.5 full attention uses fused Q + gate projection
     # q_proj: [hidden_size, hidden_size] -> output split into query and gate
     # query: [batch, seq_len, num_attention_heads * head_dim]
     # gate: [batch, seq_len, num_attention_heads * head_dim]
     attn_out_dim = config.num_attention_heads * config.head_dim
-    force_width1_full_attn = (
-        (not is_prefill)
-        and seq_len > 1
-        and os.environ.get("NANO_VLLM_JAX_FORCE_WIDTH1_FULL_ATTN", "0")
-        in {"1", "true", "yes", "on", "True"}
-    )
+    force_width1_full_attn = False
 
     if force_width1_full_attn:
         query_parts = []
@@ -2752,15 +2680,15 @@ def full_attention_block(
         # Apply RoPE (now in [B, H, T, D] layout)
         query = apply_rope(query, positions, config.head_dim, config.rope_theta, config.partial_rotary_factor, layout="BHTD", mrope_section=config.mrope_section)
         k = apply_rope(k, positions, config.head_dim, config.rope_theta, config.partial_rotary_factor, layout="BHTD", mrope_section=config.mrope_section)
-    
+
     prewrite_k_cache_input = jnp.zeros((batch, seq_len, config.num_key_value_heads, config.head_dim), dtype=dtype)
     prewrite_v_cache_input = jnp.zeros((batch, seq_len, config.num_key_value_heads, config.head_dim), dtype=dtype)
 
     num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-    
+
     if kv_cache_state is not None:
         if backend is None:
-            backend = select_backend("pure_jax", config=config)
+            backend = ServingOps(config=config)
 
         # Transpose K, V back to [B, T, K, H] for cache storage
         k_cache_input = k.transpose(0, 2, 1, 3)  # [B, T, K, H]
@@ -2794,12 +2722,12 @@ def full_attention_block(
             num_key_value_groups=num_key_value_groups,
             is_prefill=is_prefill,
         )
-        
+
         # Reshape out to [batch, seq_len, hidden_dim]
         # For prefill: out is [batch, seq_len, hidden_dim]
         # For decode: out is [batch, 1, hidden_dim]
         # Both are already in the correct format
-        
+
         # Update KV cache state (preserve linear attention states)
         kv_cache_state = replace(
             kv_cache_state,
@@ -2811,10 +2739,10 @@ def full_attention_block(
         # No cache - standard attention (for prefill without caching)
         k = jnp.repeat(k, num_key_value_groups, axis=1)
         v = jnp.repeat(v, num_key_value_groups, axis=1)
-        
+
         attn = nn.softmax(jnp.einsum("bhtd,bhsd->bhts", query, k) / jnp.sqrt(config.head_dim) + mask[None, None, :, :].astype(query.dtype), -1)
         out = jnp.einsum("bhts,bhsd->bhtd", attn, v).transpose(0, 2, 1, 3).reshape(batch, seq_len, -1)
-    
+
     out = out * nn.sigmoid(gate)
     out = out.astype(
         _decode_projection_activation_dtype(batch, config) if not is_prefill else dtype
@@ -2824,7 +2752,7 @@ def full_attention_block(
         params["o_proj"],
         force_width1=(not is_prefill) and seq_len > 1 and _force_width1_decode_math(),
     )
-    
+
     if return_kv_prewrite:
         return out, kv_cache_state, prewrite_k_cache_input, prewrite_v_cache_input
     return out, kv_cache_state
@@ -2842,7 +2770,7 @@ def transformer_block(
     hybrid_state: Optional[HybridLayerState] = None,
     prefix_hybrid_state: Optional[HybridLayerState] = None,
     is_prefill=True,
-    backend: Optional[InferenceBackend] = None,
+    backend: Optional[ServingOpsProtocol] = None,
     return_prefix_hybrid: bool = False,
     return_first_prefix_hybrid: bool = False,
     return_layer_hidden: bool = False,
@@ -3128,7 +3056,7 @@ def forward_step(
     return_hidden_with_logits: bool = False,
     last_logits_only: bool = False,
     logit_positions: Optional[jnp.ndarray] = None,
-    backend: Optional[InferenceBackend] = None,
+    backend: Optional[ServingOpsProtocol] = None,
     return_prefix_hybrid: bool = False,
     return_first_prefix_hybrid: bool = False,
     return_layer_hidden: bool = False,
@@ -3374,7 +3302,7 @@ def forward(
     positions=None,
     attention_metadata: Optional[AttentionMetadata] = None,
     hybrid_state: Optional[HybridLayerState] = None,
-    backend: Optional[InferenceBackend] = None,
+    backend: Optional[ServingOpsProtocol] = None,
 ):
     """Compatibility wrapper over the canonical forward step."""
     if is_prefill and kv_cache_state is not None and hybrid_state is None:
@@ -3411,19 +3339,3 @@ def forward(
         )
 
     return result, updated_kv_state
-
-
-class Qwen3_5:
-    def __init__(self, config, key):
-        self.config, self.params = config, init_params(key, config)
-    
-    def forward(self, tokens, kv_cache_state=None, is_prefill=True, backend: Optional[InferenceBackend] = None):
-        """Forward pass with optional KV cache."""
-        return forward(
-            tokens,
-            self.params,
-            self.config,
-            kv_cache_state=kv_cache_state,
-            is_prefill=is_prefill,
-            backend=backend,
-        )

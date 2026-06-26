@@ -1,53 +1,30 @@
-# Nano-vLLM-JAX
+# Nano-VLLM-JAX
 
-Nano-vLLM-JAX is a compact, pedagogical serving runtime for Qwen3.5-family checkpoints on JAX/CUDA. It keeps the serving stack small enough to inspect while implementing the core pieces expected from a modern LLM server: paged KV cache, chunked/ragged prefill, continuous batching, reusable prefix cache, optimized attention/GDN routes, and a local chat UI.
+Nano-VLLM-JAX is a compact CUDA/JAX serving engine for Qwen3.5-family text
+checkpoints. The cleaned mainline is intentionally narrow: it executes and
+explains one accepted serving path instead of exposing the full experimental
+search space as runtime configuration.
 
-The current promoted artifact is a non-MTP GPU serving path for `Qwen/Qwen3.5-0.8B`. MTP speculative decoding remains in the repo as an experimental path, but it is not the default serving configuration and should not be used for speed claims until it beats the same non-MTP baseline with target-model verification enabled.
+The promoted target is `Qwen/Qwen3.5-0.8B` with BF16 weights and compute,
+packed prefill, paged decode, prefix caching, device token carry, resident
+decode metadata, and queue-driven continuous batching.
 
-## One-Command Startup
-
-From the repository root:
+## Start The Server
 
 ```bash
 pip install -e ".[cuda13,flashinfer-ffi,gdn-fla-triton]"
-tools/start_local_chat.sh
+python server.py
 ```
 
-This starts:
+[server.yaml](server.yaml) controls model id, serving capacity, bucket sizes,
+KV budget, warmup buckets, and prefix-cache enablement.
 
-- model server: `http://127.0.0.1:6791`
-- chat UI: `http://127.0.0.1:6789`
-- logs: `/mountpoint/.exp/run_logs/nvj_model_server_6791.log` and `/mountpoint/.exp/run_logs/nvj_chat_ui_6789.log`
-
-The launcher uses [configs/server/gpu_optimal.yaml](configs/server/gpu_optimal.yaml), waits for the model server to finish loading and generic compilation warmup, then starts the browser UI. The root [server_config.yaml](server_config.yaml) mirrors the same promoted config, so `python server.py` uses the same path.
-
-The promoted config can serve the full configured bucket set, but startup only
-warms a bounded common profile by default:
-
-- prefill token buckets: `64,128`
-- batch-size buckets: `1,4`
-- decode block-table buckets: `128,320`
-- greedy and full-vocab temperature sampled trace routes
-
-This keeps first startup practical on a 0.8B model while still compiling real
-serving paths before the UI is exposed. On the current A10G test host, this
-compiled startup completed in `216.51s` on the first bounded run and `76.92s`
-on the next run with the persistent JAX cache populated, with `26` JIT cache
-entries.
-
-For a faster installation smoke test that skips startup compilation:
-
-```bash
-NANO_VLLM_JAX_SERVER_CONFIG=configs/server/gpu_minimal_pure_jax.yaml \
-NANO_VLLM_JAX_SKIP_COMPILE_STARTUP=1 \
-tools/start_local_chat.sh
-```
-
-With `--skip-compile`, startup mostly pays model loading; the first request compiles whatever shape it uses. With the compiled path, startup is slower, but the server is warmed for the startup profile before the UI is exposed. Persistent JAX compilation cache entries are stored under `/mountpoint/.exp/.cache/jax` by default, so repeated startups with the same model, JAX/XLA version, hardware, dtype, bucket shapes, and kernel/config choices should reuse compiled artifacts where JAX can cache them.
+[nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py) owns implementation
+policy: dtypes, attention/GDN routes, LM-head route, device token carry, and
+metadata residency. Users should not switch kernels through YAML on the cleaned
+branch.
 
 ## API Smoke
-
-Raw completion-style request:
 
 ```bash
 curl http://127.0.0.1:6791/v1/generate \
@@ -55,170 +32,61 @@ curl http://127.0.0.1:6791/v1/generate \
   -d '{"prompt":"Write one sentence about JAX serving.","max_tokens":32}'
 ```
 
-Chat-template request:
+Streaming:
 
 ```bash
-curl http://127.0.0.1:6791/v1/generate_trace \
+curl http://127.0.0.1:6791/v1/generate_stream \
   -H 'content-type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Reply with one short sentence about JAX."}],"max_tokens":32,"temperature":0}'
+  -d '{"prompt":"Reply with one short sentence.","max_tokens":32,"temperature":0}'
 ```
 
-The Flask routes accept raw `prompt`, pre-tokenized `input_ids`, or chat `messages`. Chat messages are formatted on the server with the loaded tokenizer's chat template and `add_generation_prompt=True`. EOS stopping is enabled by default unless `ignore_eos` is explicitly set.
+HTTP handlers submit work to `EngineService`. A single worker admits queued
+requests, calls `LLMEngine.step()`, and publishes per-request results so
+independent clients can batch together.
 
-`/v1/generate_trace` has two trace modes in the promoted config:
-
-- `ignore_eos: false` uses the EOS-compatible trace path and reports TTFT/TPS.
-- `ignore_eos: true` uses the faster device-token-carry trace path that avoids per-token readback and runs to `max_tokens`.
-
-The local chat UI uses the EOS-compatible mode by default.
-
-## Current Capabilities
-
-- CUDA/JAX serving for `Qwen/Qwen3.5-0.8B` real weights.
-- Config-owned server startup through YAML rather than a large pile of required environment variables.
-- Paged full-attention KV cache and block-table scheduling.
-- Chunked/ragged packed prefill with generic bucket warmup.
-- Continuous batching for prefill, decode, and mixed prefill/decode serving.
-- Prefix caching for reusable full-block prompt prefixes. For Qwen3.5 hybrid GDN layers, a prefix is skipped only when both paged full-attention KV blocks and the matching GDN hybrid state for that exact prefix hash are recorded.
-- Server-side chat template support and EOS termination.
-- Local browser chat UI showing TTFT and tokens/sec after each response.
-- Optional optimized kernel routes in the promoted config: FlashInfer paged full-attention decode, Triton packed full-attention prefill, Triton/FLA GDN prefill, Triton greedy LM-head top-1, BF16 decode projection paths, and accepted compact prefill routes.
-- Experimental true-K MTP speculative decoding kept separate in [configs/server/mtp_experimental.yaml](configs/server/mtp_experimental.yaml). It keeps target-model verification enabled and unverified draft append disabled.
-- Benchmark and profiling harnesses for JAX server traces, vLLM comparison, random workloads, and optimization log summaries.
-
-## Benchmark Snapshot
-
-These are the best recorded local A10G numbers currently worth showcasing. They
-are benchmark artifacts, not startup smoke tests. vLLM ratios use the matching
-stored or live vLLM reference recorded with each artifact.
-
-| workload | status | JAX | vLLM reference | ratio | evidence |
-| --- | --- | ---: | ---: | ---: | --- |
-| Long prefill `512..2048 -> 16`, 4 requests | exact token parity, no-profile sanity | `106.08 tok/s` | stored reference | `0.912x` | [docs/gpu_optimization_next_goal_plan.md](docs/gpu_optimization_next_goal_plan.md) |
-| Decode-heavy `128 -> 128`, 1 request | exact token parity, no-profile sanity | `197.60 tok/s` | fresh vLLM | `0.902x` | [docs/gpu_optimization_next_goal_plan.md](docs/gpu_optimization_next_goal_plan.md) |
-| Heterogeneous `64..512 -> 32`, 8 requests | exact token parity, zero measured-phase JIT growth | `514.16 tok/s` | `864.18 tok/s` | `0.595x` | [docs/gpu_optimization_next_goal_plan.md](docs/gpu_optimization_next_goal_plan.md) |
-| Random medium, 4 requests, `1787` input / `290` output tokens | zero measured-phase JIT growth | `359.34 output tok/s` | stored `471.06 output tok/s` | `0.763x` | [docs/gpu_optimization_next_goal_plan.md](docs/gpu_optimization_next_goal_plan.md) |
-| Random large, 8 requests, `6240` input / `1582` output tokens | best accepted large-random JAX route, zero measured-phase JIT growth | `757.24 output tok/s` | stored reference | `0.857x` | [docs/gpu_optimization_next_goal_plan.md](docs/gpu_optimization_next_goal_plan.md) |
-| Full random stress, 15 requests, `30506` input / `11602` output tokens | current broad stress target, not close to vLLM yet | `437.63 output tok/s` | `1541.89 output tok/s` | `0.284x` | [docs/gpu_optimization_next_goal_plan.md](docs/gpu_optimization_next_goal_plan.md) |
-
-The long-prefill and decode-heavy rows clear the `0.9x` vLLM target in the
-recorded no-profile sanity runs. Random serving is still the hard gap: the
-8-request large-random lane has a strong local best, while the 15-request full
-stress run remains far behind vLLM. MTP speculative decoding is excluded from
-these speed claims because verified MTP has not beaten the same non-MTP
-baseline.
-
-## Current Artifact Configuration
-
-The promoted path is [configs/server/gpu_optimal.yaml](configs/server/gpu_optimal.yaml):
-
-- model: `Qwen/Qwen3.5-0.8B`
-- model server port: `6791`
-- UI port: `6789`
-- dtype and weights: BF16
-- execution: JAX JIT
-- max resident sequences: `8`
-- max prefill: `4096`
-- KV budget: `3072 MiB`
-- startup warmup profile: prefill `64,128`, batch `1,4`, decode block tables `128,320`
-- prefix cache: enabled
-- MTP: off
-- local CUDA probe kernels: disabled
-
-Useful overrides:
-
-```bash
-NANO_VLLM_JAX_SERVER_CONFIG=configs/server/gpu_minimal_pure_jax.yaml tools/start_local_chat.sh
-NANO_VLLM_JAX_SKIP_COMPILE_STARTUP=1 tools/start_local_chat.sh
-NANO_VLLM_JAX_PORT=6792 NANO_VLLM_JAX_CHAT_UI_PORT=6793 tools/start_local_chat.sh
-NANO_VLLM_JAX_PREFIX_CACHE=0 tools/start_local_chat.sh
-NANO_VLLM_JAX_STARTUP_WARMUP_PREFILL_TOKEN_BUCKETS=64,128,512 tools/start_local_chat.sh
-NANO_VLLM_JAX_STARTUP_WARMUP_BATCH_SIZE_BUCKETS=1,4,8 tools/start_local_chat.sh
-NANO_VLLM_JAX_COMPILE_CACHE_DIR=/mountpoint/.exp/.cache/jax tools/start_local_chat.sh
-```
-
-## Vision
-
-The goal is a performant and understandable serving library, not a black-box production server. The target shape is:
-
-- close enough to vLLM-style serving to teach the important systems ideas;
-- small and readable enough to follow scheduler, cache, kernel, and model-state ownership end to end;
-- correctness-first for hybrid Qwen3.5 models, where full-attention KV state and GDN recurrent/conv state must advance together;
-- benchmarkable against vLLM with clear baselines and no benchmark-specific warmup tricks;
-- extensible across the Qwen3.5 family through config and bucket choices rather than model/GPU-specific hand tuning;
-- honest about experimental routes, especially MTP speculative decoding and borrowed/custom kernels.
-
-## Repository Structure
+## Runtime Path
 
 ```text
-nanovllm_jax/
-  config.py                  Model and serving config dataclass
-  server_config.py           YAML config loader and env override projection
-  engine/
-    llm_engine.py            Public generation loop
-    scheduler.py             Continuous batching, prefix cache, block allocation
-    block_manager.py         Paged block tables, refcounts, prefix hashes
-    model_runner.py          Serving fast-path selection and mutable runtime state
-    model_executor.py        JIT/executor boundary and compiled step variants
-    scheduled_batch.py       Scheduler-to-executor batch contract
-  model.py                   Qwen3.5 forward pass and hybrid state logic
-  kernels/                   FlashInfer/Triton/Pallas/CUDA-probe integration points
-configs/server/
-  gpu_optimal.yaml           Promoted non-MTP CUDA serving path
-  gpu_minimal_pure_jax.yaml  Small installation and endpoint smoke path
-  mtp_experimental.yaml      Verified MTP diagnostic path
-benchmarks/
-  benchmark_jax_server_trace.py  JAX server TTFT/ITL tracing
-  benchmark_vllm_qwen35.py       vLLM comparison harness
-  run_gpu_matrix.py              Matrix benchmark runner
-tools/
-  start_local_chat.sh        One-command model server + chat UI launcher
-  chat_ui_server.py          Local browser UI and backend proxy
-docs/
-  serving_paths.md           Current serving recipes and path separation
-  architecture.md            Engine/scheduler/runner/executor architecture
-  gpu_correctness_guardrails.md  Correctness and cache-root rules
-  optimization_logbook.md    Historical optimization experiments and decisions
+server.py
+  -> EngineService
+  -> LLMEngine
+  -> Scheduler -> BlockManager
+  -> ScheduledBatch
+  -> ModelRunner
+  -> ModelExecutor
+  -> Qwen3.5 model
+  -> attention / GDN / LM-head kernels
 ```
 
-## Runtime Paths And Cache
+The central invariant is:
 
-GPU runs should keep caches and temporary files under `/mountpoint/.exp`:
+```text
+logical sequence length, allocated block capacity, full-attention KV state,
+and GDN hybrid state advance by the same committed prefix.
+```
+
+## Reading Path
+
+1. [nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py) - promoted operation policy.
+2. [server.yaml](server.yaml) and [nanovllm_jax/config.py](nanovllm_jax/config.py) - capacity and buckets.
+3. [nanovllm_jax/service.py](nanovllm_jax/service.py) - online request queue.
+4. [nanovllm_jax/engine.py](nanovllm_jax/engine.py) - request lifecycle and step loop.
+5. [nanovllm_jax/scheduler.py](nanovllm_jax/scheduler.py) and [nanovllm_jax/block_manager.py](nanovllm_jax/block_manager.py) - work selection and cache pages.
+6. [nanovllm_jax/batch.py](nanovllm_jax/batch.py) - Python-to-JAX batch contract.
+7. [nanovllm_jax/runner.py](nanovllm_jax/runner.py) and [nanovllm_jax/executor.py](nanovllm_jax/executor.py) - persistent device state and compiled calls.
+8. [nanovllm_jax/model.py](nanovllm_jax/model.py), [nanovllm_jax/cache.py](nanovllm_jax/cache.py), and [nanovllm_jax/kernels](nanovllm_jax/kernels) - model math and low-level routes.
+
+## Development
+
+Generated results, profiles, and benchmark artifacts are not part of the
+cleaned branch. Keep ad hoc diagnostics under `/mountpoint/.exp/diagnostics` or
+another external scratch path.
+
+CPU-safe control-plane checks:
 
 ```bash
-export NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp
-export TMPDIR=/mountpoint/.exp/tmp
-export XDG_CACHE_HOME=/mountpoint/.exp/.cache
-export HF_HOME=/mountpoint/.exp/.cache/huggingface
-export HF_HUB_CACHE=/mountpoint/.exp/.cache/huggingface/hub
-export JAX_COMPILATION_CACHE_DIR=/mountpoint/.exp/.cache/jax
-export NANO_VLLM_JAX_COMPILE_CACHE_DIR=/mountpoint/.exp/.cache/jax
+PYTHONPATH=$PWD python tests/ram_guard.py -- pytest -q tests/test_fastpath_config.py tests/test_service.py tests/test_server_config.py tests/test_public_imports.py
 ```
 
-The launcher and server set sensible CUDA/JAX defaults from the YAML config, including `JAX_PLATFORMS=cuda`, `XLA_PYTHON_CLIENT_PREALLOCATE=false`, and `TF_GPU_ALLOCATOR=cuda_malloc_async`. Runtime env vars remain available for compatibility and quick experiments, but promoted serving behavior should live in config files.
-
-## Documentation
-
-- [Documentation index](docs/README.md)
-- [Serving paths](docs/serving_paths.md)
-- [Architecture](docs/architecture.md)
-- [GPU correctness guardrails](docs/gpu_correctness_guardrails.md)
-- [KV cache](docs/kv_cache.md)
-- [MTP speculative decoding](docs/mtp.md)
-- [Scheduler](docs/scheduler.md)
-- [Benchmarks](docs/benchmarks.md)
-- [Roadmap](docs/roadmap.md)
-
-Historical and obsolete notes are archived under [docs/archive/2026-05-pre-latency-gate](docs/archive/2026-05-pre-latency-gate/).
-
-## Programmatic Minimal Usage
-
-```python
-from nanovllm_jax.config import Qwen3_5Config
-from nanovllm_jax.load_weights import load_weights_from_hf
-from nanovllm_jax.engine.model_runner import ModelRunner
-
-config = Qwen3_5Config.qwen3_5_0_8b()
-params = load_weights_from_hf("Qwen/Qwen3.5-0.8B", config)
-runner = ModelRunner(config, params)
-```
+For GPU correctness, verify CUDA visibility first and run JAX with
+`JAX_PLATFORMS=cuda`; do not hide missing GPU access with CPU fallback.

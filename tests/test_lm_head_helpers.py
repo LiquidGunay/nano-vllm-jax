@@ -20,11 +20,6 @@ from nanovllm_jax.model import (
 
 
 def test_lm_head_token_ids_and_topk_matches_full_logits(monkeypatch):
-    monkeypatch.delenv("NANO_VLLM_JAX_PALLAS_DECODE_RMSNORM", raising=False)
-    monkeypatch.delenv("NANO_VLLM_JAX_TRITON_DECODE_RMSNORM", raising=False)
-    monkeypatch.setenv("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH", "0")
-    monkeypatch.setenv("NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE", "fp32")
-    monkeypatch.setenv("NANO_VLLM_JAX_DECODE_PADDED_GEMM", "0")
     hidden = jnp.array(
         [
             [[0.2, -0.4, 0.7, 1.0], [1.1, 0.3, -0.2, 0.5]],
@@ -123,8 +118,6 @@ def test_lm_head_can_use_decode_padded_gemm_when_vocab_allowed():
 
 
 def test_lm_head_greedy_top1_impl_rejects_unimplemented_cutlass_backend(monkeypatch):
-    monkeypatch.delenv("NANO_VLLM_JAX_PALLAS_DECODE_RMSNORM", raising=False)
-    monkeypatch.delenv("NANO_VLLM_JAX_TRITON_DECODE_RMSNORM", raising=False)
     hidden = jnp.array([[[0.2, -0.4, 0.7, 1.0]]], dtype=jnp.float32)
     embed_tokens = jnp.linspace(-0.7, 0.9, 28, dtype=jnp.float32).reshape(7, 4)
     params = ModelParams(
@@ -160,8 +153,6 @@ def test_lm_head_greedy_top1_triton_matches_jax_on_cuda(monkeypatch):
     pytest.importorskip("jax_triton")
     if jax.default_backend() != "gpu":
         pytest.skip("Triton LM-head top1 requires the CUDA backend")
-    monkeypatch.delenv("NANO_VLLM_JAX_PALLAS_DECODE_RMSNORM", raising=False)
-    monkeypatch.delenv("NANO_VLLM_JAX_TRITON_DECODE_RMSNORM", raising=False)
     key_hidden, key_embed = jax.random.split(jax.random.PRNGKey(19))
     hidden = jax.random.normal(key_hidden, (3, 1, 32), dtype=jnp.float32).astype(jnp.bfloat16)
     embed_tokens = jax.random.normal(key_embed, (257, 32), dtype=jnp.float32).astype(jnp.bfloat16)
@@ -216,9 +207,6 @@ def test_decode_padded_gemm_default_cap_admits_qwen_vocab_projection():
 
 
 def test_lm_head_sample_token_ids_matches_greedy_and_categorical(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH", "0")
-    monkeypatch.setenv("NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE", "fp32")
-    monkeypatch.setenv("NANO_VLLM_JAX_DECODE_PADDED_GEMM", "0")
     hidden = jnp.array(
         [
             [[0.2, -0.4, 0.7, 1.0]],
@@ -262,8 +250,7 @@ def test_lm_head_sample_token_ids_matches_greedy_and_categorical(monkeypatch):
     np.testing.assert_array_equal(np.array(actual), np.array(expected))
 
 
-def test_compact_prefill_mlp_matches_dense_on_valid_tokens(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_COMPACT_PREFILL_MLP", "1")
+def test_compact_prefill_mlp_matches_dense_on_valid_tokens():
     x = jnp.array(
         [
             [[0.2, -0.4, 0.7], [1.1, 0.3, -0.2], [0.5, 0.6, -0.8], [0.9, -0.1, 0.4]],
@@ -289,6 +276,7 @@ def test_compact_prefill_mlp_matches_dense_on_valid_tokens(monkeypatch):
         nn.silu,
         valid_mask,
         compact_num_tokens=4,
+        config=Qwen3_5Config(compact_prefill_mlp=True),
     )
     dense = jnp.dot(nn.silu(jnp.dot(x, gate_weight)) * jnp.dot(x, up_weight), down_weight)
 

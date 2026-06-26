@@ -1,7 +1,8 @@
 """JAX/Triton Gated DeltaNet kernels shaped after vLLM/FLA.
 
-These kernels are optional and are intentionally kept behind explicit backend
-flags. The correctness reference remains in :mod:`nanovllm_jax.kernels.gdn_fla`.
+These kernels are optional and are intentionally kept behind the promoted
+fastpath policy. The correctness reference remains in
+:mod:`nanovllm_jax.kernels.gdn_fla`.
 """
 
 from __future__ import annotations
@@ -18,38 +19,10 @@ import jax_triton as jt
 import triton
 import triton.language as tl
 
-_TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
-_GDN_DISABLE_FALLBACKS_ENV = "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS"
-
-
-def _gdn_disable_fallbacks() -> bool:
-    return (
-        os.environ.get(_GDN_DISABLE_FALLBACKS_ENV, "0").strip().lower()
-        in _TRUE_ENV_VALUES
-    )
-
-
 def _raise_if_gdn_fallback_disabled(reason: str) -> None:
-    if _gdn_disable_fallbacks():
-        raise RuntimeError(
-            f"{reason}; implicit GDN kernel fallbacks are disabled by "
-            f"{_GDN_DISABLE_FALLBACKS_ENV}=1"
-        )
-
-
-def _normalize_int_env(name: str, default: int, *, min_value: int, max_value: int) -> int:
-    """Read an integer env override with bounds; return ``default`` when unset."""
-
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        parsed = int(value.strip())
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer; got {value!r}") from exc
-    if not (min_value <= parsed <= max_value):
-        raise ValueError(f"{name} must be between {min_value} and {max_value}; got {parsed}")
-    return parsed
+    raise RuntimeError(
+        f"{reason}; implicit GDN kernel fallbacks are disabled on the cleaned mainline"
+    )
 
 
 def _runtime_root() -> Path:
@@ -66,57 +39,36 @@ def _runtime_root() -> Path:
 
 
 def _decode_triton_num_warps(value_dim: int) -> int:
-    env_name = "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_WARPS"
-    default = 1 if value_dim <= 128 else 2
-    return _normalize_int_env(env_name, default, min_value=1, max_value=8)
+    return 1 if value_dim <= 128 else 2
 
 
 def _decode_triton_full_state_num_warps(key_dim: int, value_dim: int) -> int:
-    env_name = "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_WARPS"
-    if os.environ.get(env_name) is not None:
-        return _decode_triton_num_warps(value_dim)
     tile_elems = int(key_dim) * int(value_dim)
-    default = 4 if tile_elems >= 8192 else _decode_triton_num_warps(value_dim)
-    return _normalize_int_env(env_name, default, min_value=1, max_value=8)
+    return 4 if tile_elems >= 8192 else _decode_triton_num_warps(value_dim)
 
 
 def _decode_triton_num_stages() -> int:
-    env_name = "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_NUM_STAGES"
-    return _normalize_int_env(env_name, 3, min_value=1, max_value=8)
+    return 3
 
 
 def _decode_triton_block_v(value_dim: int) -> int:
-    env_name = "NANO_VLLM_JAX_GDN_PACKED_DECODE_TRITON_BLOCK_V"
-    block_v = min(jt.next_power_of_2(value_dim), 32)
-    return _normalize_int_env(env_name, block_v, min_value=1, max_value=128)
+    return min(jt.next_power_of_2(value_dim), 32)
 
 
 def _kkt_block_dot_enabled() -> bool:
-    return (
-        os.environ.get("NANO_VLLM_JAX_GDN_KKT_BLOCK_DOT", "0").strip().lower()
-        in _TRUE_ENV_VALUES
-    )
+    return False
 
 
 def _fwd_o_block_dot_enabled() -> bool:
-    return (
-        os.environ.get("NANO_VLLM_JAX_GDN_FWD_O_BLOCK_DOT", "0").strip().lower()
-        in _TRUE_ENV_VALUES
-    )
+    return False
 
 
 def _delta_h_block_dot_enabled() -> bool:
-    return (
-        os.environ.get("NANO_VLLM_JAX_GDN_DELTA_H_BLOCK_DOT", "0").strip().lower()
-        in _TRUE_ENV_VALUES
-    )
+    return False
 
 
 def _recompute_block_dot_enabled() -> bool:
-    return (
-        os.environ.get("NANO_VLLM_JAX_GDN_RECOMPUTE_BLOCK_DOT", "0").strip().lower()
-        in _TRUE_ENV_VALUES
-    )
+    return False
 
 
 def _configure_triton_runtime() -> None:
@@ -1932,7 +1884,7 @@ def gdn_packed_prefix_state_triton(
     *,
     max_row_tokens: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Tiny packed GDN verifier kernel returning every token prefix state."""
+    """Tiny packed GDN prefix-state kernel returning every token prefix state."""
 
     if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
         raise ValueError("query/key/value must have shape [tokens, value_heads, dim]")

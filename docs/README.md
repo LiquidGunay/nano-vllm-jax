@@ -1,30 +1,9 @@
-# Documentation Index
+# Documentation
 
-Start here for current documentation. Archived notes may be useful for history, but they are not current serving guidance.
+Current docs describe the cleaned serving path only.
 
-## Canonical docs
+- [Architecture](architecture.md): ownership boundaries and the engine loop.
+- [Walkthrough](walkthrough.md): one request through packed prefill, decode, and a prefix-cache hit.
 
-- [Architecture](architecture.md): engine loop, scheduler/runner/executor/backend boundaries, state ownership.
-- [GPU correctness guardrails](gpu_correctness_guardrails.md): current GPU correctness contract, runtime cache roots, and guard commands.
-- [Serving paths](serving_paths.md): promoted server config, small smoke config, and separated experimental paths.
-- [GDN FLA kernel flow](gdn_fla_kernel_flow.md): block-dot GDN/FLA prefill route, model-specific assumptions, and benchmark interpretation.
-- [KV cache](kv_cache.md): block tables, slot mapping, masks, block-boundary behavior.
-- [MTP](mtp.md): historical TPU K=1 terminology and invariants, with current GPU caveats.
-- [Scheduler](scheduler.md): prefill chunks, decode buckets, inactive rows, preemption, MTP lookahead.
-- [Benchmarks](benchmarks.md): GPU benchmark rules, warmup, server-shape recipe, current GPU caveats, and historical TPU table.
-- [Optimization logbook](optimization_logbook.md): profile-linked optimization runs and decisions.
-- [Roadmap](roadmap.md): pending correctness, serving, benchmark, optimization, and cleanup work.
-
-## Current GPU findings
-
-- [GPU correctness guardrails](gpu_correctness_guardrails.md): current BF16-weight/FP32-activation reference and guard commands.
-- [Benchmark/profile strategy crosscheck - 2026-06-01](benchmark_profile_strategy_crosscheck_2026-06-01.md): decode and long-prefill profile checklist against upstream nano-vLLM/vLLM strategy surfaces.
-
-## Historical findings retained
-
-- [MTP TPU spot findings - 2026-05-09](mtp_tpu_spot_findings_2026-05-09.md): historical TPU findings and preserved benchmark numbers; do not use these as current GPU serving evidence.
-- [K=1 MTP controlled experiments - 2026-05-11](mtp_controlled_experiments_2026-05-11.md): historical TPU experiments for MTP speedup analysis.
-
-## Archive
-
-- [2026-05 pre-latency-gate archive](archive/2026-05-pre-latency-gate/): obsolete debug plans, historical status notes, and duplicated root documentation.
+Historical logs, optimization notes, and removed experimental-path writeups
+belong outside this branch.

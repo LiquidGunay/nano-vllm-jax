@@ -2,24 +2,8 @@
 
 from __future__ import annotations
 
-import os
-
 import jax
 import jax.numpy as jnp
-
-_TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
-
-
-def pallas_decode_rms_norm_enabled() -> bool:
-    return os.environ.get("NANO_VLLM_JAX_PALLAS_DECODE_RMSNORM", "0") in _TRUE_ENV_VALUES
-
-
-def triton_decode_rms_norm_enabled() -> bool:
-    return os.environ.get("NANO_VLLM_JAX_TRITON_DECODE_RMSNORM", "0") in _TRUE_ENV_VALUES
-
-
-def pallas_gdn_qk_prenorm_enabled() -> bool:
-    return os.environ.get("NANO_VLLM_JAX_PALLAS_GDN_QK_PRENORM", "0") in _TRUE_ENV_VALUES
 
 
 def _pallas_modules():
@@ -267,16 +251,12 @@ def triton_decode_rms_padded_gemm(
 
 
 def decode_rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
-    """Dispatch decode RMSNorm through the selected strict opt-in implementation."""
-    if triton_decode_rms_norm_enabled():
-        return triton_decode_rms_norm(x, weight, eps)
-    if pallas_decode_rms_norm_enabled():
-        return pallas_decode_rms_norm(x, weight, eps)
-    raise RuntimeError("decode_rms_norm called without an enabled lowered implementation")
+    """Deprecated dispatcher retained for compatibility with older call sites."""
+    raise RuntimeError("decode_rms_norm has no implicit lowered implementation")
 
 
 def lowered_decode_rms_norm_enabled() -> bool:
-    return triton_decode_rms_norm_enabled() or pallas_decode_rms_norm_enabled()
+    return False
 
 
 def pallas_decode_rms_norm(x: jnp.ndarray, weight: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:

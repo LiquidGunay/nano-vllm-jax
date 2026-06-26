@@ -1,13 +1,11 @@
 import jax.numpy as jnp
 import numpy as np
 
-from nanovllm_jax.backends import PureJAXBackend
+from nanovllm_jax.ops import ServingOps
 from nanovllm_jax.config import Qwen3_5Config
 
 
-def test_packed_post_conv_prefill_returns_prefix_states(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PREFILL_POST_CONV_IMPL", "reference")
-
+def test_packed_post_conv_prefill_returns_prefix_states():
     num_key_heads = 1
     num_value_heads = 2
     key_dim = 3
@@ -34,7 +32,7 @@ def test_packed_post_conv_prefill_returns_prefix_states(monkeypatch):
         (2, num_value_heads, value_dim, key_dim),
         dtype=jnp.float32,
     )
-    backend = PureJAXBackend(Qwen3_5Config())
+    backend = ServingOps(Qwen3_5Config(gdn_prefill_post_conv_impl="reference"))
 
     without_prefix = backend.gated_delta_packed_prefill_post_conv(
         conv_out,

@@ -1,7 +1,242 @@
-"""Configuration for Qwen 3.5 model."""
+"""Configuration for Qwen 3.5 serving.
+
+The small immutable configs below are the mainline boundary: architecture and
+serving capacity are configurable, implementation policy is not.
+"""
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional
+
+from nanovllm_jax.fastpath import FASTPATH, engine_overrides
+
+
+def _int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+    else:
+        parts = list(value)
+    try:
+        parsed = tuple(int(part) for part in parts)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must contain integers") from exc
+    if any(item <= 0 for item in parsed):
+        raise ValueError(f"{field_name} must contain positive integers")
+    return parsed
+
+
+def _bool_value(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if value in (0, 1):
+        return bool(value)
+    raise ValueError(f"{field_name} must be a boolean")
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """Architectural values read from the checkpoint config."""
+
+    model: str = "Qwen/Qwen3.5-0.8B"
+    vocab_size: int = 248320
+    hidden_size: int = 1024
+    intermediate_size: int = 3584
+    num_hidden_layers: int = 24
+    num_attention_heads: int = 8
+    num_key_value_heads: int = 2
+    head_dim: int = 256
+    linear_num_key_heads: int = 16
+    linear_num_value_heads: int = 16
+    linear_key_head_dim: int = 128
+    linear_value_head_dim: int = 128
+    linear_conv_kernel_size: int = 4
+    linear_chunk_size: int = 32
+    rope_theta: float = 10_000_000
+    max_position_embeddings: int = 262144
+
+    @classmethod
+    def from_qwen_config(cls, config: "Qwen3_5Config", model: str = "Qwen/Qwen3.5-0.8B") -> "ModelConfig":
+        return cls(
+            model=model,
+            vocab_size=config.vocab_size,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            linear_num_key_heads=config.linear_num_key_heads,
+            linear_num_value_heads=config.linear_num_value_heads,
+            linear_key_head_dim=config.linear_key_head_dim,
+            linear_value_head_dim=config.linear_value_head_dim,
+            linear_conv_kernel_size=config.linear_conv_kernel_size,
+            linear_chunk_size=config.linear_chunk_size,
+            rope_theta=config.rope_theta,
+            max_position_embeddings=config.max_position_embeddings,
+        )
+
+
+@dataclass(frozen=True)
+class WarmupConfig:
+    """Static buckets compiled at startup before the HTTP server is ready."""
+
+    prefill_token_buckets: tuple[int, ...] = (64, 128)
+    batch_size_buckets: tuple[int, ...] = (1, 4)
+    decode_block_buckets: tuple[int, ...] = (128, 320)
+    include_sampled_routes: bool = True
+    enabled: bool = True
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any] | None) -> "WarmupConfig":
+        raw = raw or {}
+        return cls(
+            prefill_token_buckets=_int_tuple(
+                raw.get("prefill_token_buckets", cls.prefill_token_buckets),
+                "warmup.prefill_token_buckets",
+            ),
+            batch_size_buckets=_int_tuple(
+                raw.get("batch_size_buckets", cls.batch_size_buckets),
+                "warmup.batch_size_buckets",
+            ),
+            decode_block_buckets=_int_tuple(
+                raw.get("decode_block_buckets", cls.decode_block_buckets),
+                "warmup.decode_block_buckets",
+            ),
+            include_sampled_routes=_bool_value(raw.get("include_sampled_routes", True), "warmup.include_sampled_routes"),
+            enabled=_bool_value(raw.get("enabled", True), "warmup.enabled"),
+        )
+
+
+@dataclass(frozen=True)
+class EngineConfig:
+    """Workload and capacity config for the serving engine."""
+
+    model: str = "Qwen/Qwen3.5-0.8B"
+    max_prefill: int = 4096
+    max_num_seqs: int = 8
+    max_num_resident_seqs: int = 8
+    max_num_batched_tokens: int = 4096
+    max_blocks_per_seq: int = 320
+    kv_cache_bytes: int = 3072 * 1024 * 1024
+    num_kvcache_blocks: int = 2048
+    prefill_token_buckets: tuple[int, ...] = (64, 128, 256, 512, 1024, 2048, 4096)
+    batch_size_buckets: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8)
+    decode_block_buckets: tuple[int, ...] = (128, 256, 320)
+    warmup: WarmupConfig = field(default_factory=WarmupConfig)
+    prefix_cache: bool = True
+
+    def __post_init__(self):
+        if self.max_num_seqs <= 0:
+            raise ValueError("max_num_seqs must be positive")
+        if self.max_num_resident_seqs < self.max_num_seqs:
+            raise ValueError("max_num_resident_seqs must be >= max_num_seqs")
+        if self.max_num_batched_tokens <= 0:
+            raise ValueError("max_num_batched_tokens must be positive")
+        if self.max_blocks_per_seq <= 0:
+            raise ValueError("max_blocks_per_seq must be positive")
+        if self.kv_cache_bytes <= 0:
+            raise ValueError("kv_cache_bytes must be positive")
+        if self.num_kvcache_blocks <= 0:
+            raise ValueError("num_kvcache_blocks must be positive")
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any] | None) -> "EngineConfig":
+        raw = raw or {}
+        kv_cache_bytes = raw.get("kv_cache_bytes")
+        if kv_cache_bytes is None and raw.get("kv_cache_mb") is not None:
+            kv_cache_bytes = int(raw["kv_cache_mb"]) * 1024 * 1024
+        if kv_cache_bytes is None and raw.get("max_kv_cache_mb") is not None:
+            kv_cache_bytes = int(raw["max_kv_cache_mb"]) * 1024 * 1024
+        if kv_cache_bytes is None:
+            kv_cache_bytes = cls.kv_cache_bytes
+        return cls(
+            model=str(raw.get("model", cls.model)),
+            max_prefill=int(raw.get("max_prefill", cls.max_prefill)),
+            max_num_seqs=int(raw.get("max_num_seqs", cls.max_num_seqs)),
+            max_num_resident_seqs=int(
+                raw.get("max_num_resident_seqs", raw.get("max_num_seqs", cls.max_num_resident_seqs))
+            ),
+            max_num_batched_tokens=int(raw.get("max_num_batched_tokens", cls.max_num_batched_tokens)),
+            max_blocks_per_seq=int(raw.get("max_blocks_per_seq", cls.max_blocks_per_seq)),
+            kv_cache_bytes=int(kv_cache_bytes),
+            num_kvcache_blocks=int(raw.get("num_kvcache_blocks", raw.get("num_kv_cache_blocks", cls.num_kvcache_blocks))),
+            prefill_token_buckets=_int_tuple(
+                raw.get("prefill_token_buckets", cls.prefill_token_buckets),
+                "prefill_token_buckets",
+            ),
+            batch_size_buckets=_int_tuple(
+                raw.get("batch_size_buckets", cls.batch_size_buckets),
+                "batch_size_buckets",
+            ),
+            decode_block_buckets=_int_tuple(
+                raw.get("decode_block_buckets", raw.get("decode_block_table_buckets", cls.decode_block_buckets)),
+                "decode_block_buckets",
+            ),
+            warmup=WarmupConfig.from_mapping(raw.get("warmup")),
+            prefix_cache=_bool_value(raw.get("prefix_cache", True), "prefix_cache"),
+        )
+
+    def to_engine_kwargs(self) -> dict[str, Any]:
+        """Project public capacity plus canonical policy into engine kwargs."""
+
+        kwargs = dict(engine_overrides(FASTPATH))
+        kwargs.update(
+            {
+                "max_prefill": self.max_prefill,
+                "num_kvcache_blocks": self.num_kvcache_blocks,
+                "max_kv_cache_bytes": self.kv_cache_bytes,
+                "max_num_seqs": self.max_num_seqs,
+                "max_num_resident_seqs": self.max_num_resident_seqs,
+                "max_num_batched_tokens": self.max_num_batched_tokens,
+                "max_blocks_per_seq": self.max_blocks_per_seq,
+                "prefill_buckets": self.prefill_token_buckets,
+                "prefill_token_buckets": self.prefill_token_buckets,
+                "batch_size_buckets": self.batch_size_buckets,
+                "decode_block_table_buckets": self.decode_block_buckets,
+                "prefix_cache": self.prefix_cache,
+            }
+        )
+        return kwargs
+
+
+@dataclass(frozen=True)
+class ServerSettings:
+    """Transport settings plus the engine capacity config."""
+
+    host: str = "127.0.0.1"
+    port: int = 6791
+    max_tokens_default: int = 128
+    engine: EngineConfig = field(default_factory=EngineConfig)
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any] | None) -> "ServerSettings":
+        raw = raw or {}
+        server = raw.get("server", {}) or {}
+        return cls(
+            host=str(server.get("host", cls.host)),
+            port=int(server.get("port", cls.port)),
+            max_tokens_default=int(server.get("max_tokens_default", cls.max_tokens_default)),
+            engine=EngineConfig.from_mapping(raw.get("engine")),
+        )
+
+
+def load_engine_config(path: str | Path = "server.yaml") -> ServerSettings:
+    """Load the new serving config without projecting policy from YAML."""
+
+    import yaml
+
+    config_path = Path(path)
+    with config_path.open() as fh:
+        raw = yaml.safe_load(fh) or {}
+    return ServerSettings.from_mapping(raw)
 
 
 @dataclass(eq=True, frozen=False)
@@ -53,31 +288,8 @@ class Qwen3_5Config:
     attention_bias: bool = False
     tie_word_embeddings: bool = True
     
-    # Computation dtype (bfloat16 for CPU/CUDA, float32 for Metal)
+    # Computation dtype for the promoted JAX/CUDA path.
     dtype: str = "float32"  # Options: "bfloat16", "float16", "float32"
-    
-    # MTP config
-    mtp_num_hidden_layers: int = 1
-    mtp_use_dedicated_embeddings: bool = False
-    speculative_method: str = "none"
-    draft_sample_method: str = "greedy"
-    mtp_verifier_impl: str = "two_decode"
-    mtp_batch_accept_policy: str = "rowwise"
-    mtp_seed_after_bonus: bool = False
-    mtp_bonus_margin: float = 0.0
-    mtp_draft_margin: float = 0.0
-    mtp_hidden_source: str = "pre_norm"
-    mtp_chain_hidden_source: str = "raw"
-    mtp_chain_mode: str = "recursive"
-    mtp_token_source: str = "generated"
-    mtp_position_offset: int = 0
-    mtp_lm_head_greedy_top1_impl: str = "jax"
-    num_speculative_tokens: int = 0
-    mtp_burst_groups: int = 1
-    mtp_max_active_rows: int = 0
-    mtp_prefill_seed: bool = False
-    mtp_unverified_draft_append: bool = False
-    mtp_unverified_fused_append: bool = False
     
     # KV cache config (for vLLM paging)
     block_size: int = 16
@@ -104,11 +316,9 @@ class Qwen3_5Config:
     static_decode_seq_lens_carry: bool = False
     resident_decode_metadata: bool = False
     greedy_decode_burst_steps: int = 1
-    trace_token_prefetch: bool = True
 
-    # Accepted serving fast paths. Environment variables remain supported as
-    # compatibility overrides, but server/benchmark configs should set these
-    # fields directly.
+    # Internal implementation policy projected from nanovllm_jax.fastpath.
+    # These fields stay here because the model and executor read one config.
     materialize_tied_lm_head: bool = False
     compact_prefill_in_proj_qkv: bool = False
     compact_prefill_gdn_z: bool = False
@@ -125,8 +335,7 @@ class Qwen3_5Config:
     decode_padded_gemm_rows: int = 8
     decode_padded_gemm_max_out_dim: int = 300000
 
-    # Kernel policy carried by config. Low-level diagnostic CUDA switches stay
-    # env-only; accepted serving kernels should flow through these fields.
+    # Kernel policy projected from nanovllm_jax.fastpath, not user config.
     full_attention_kv_cache_dtype: str = "default"
     full_attention_kv_append_impl: str = "reference"
     full_attention_decode_impl: str = "reference"
@@ -183,102 +392,6 @@ class Qwen3_5Config:
             "greedy_decode_burst_steps",
             max(1, int(self.greedy_decode_burst_steps or 1)),
         )
-        num_speculative_tokens = max(0, int(self.num_speculative_tokens or 0))
-        if num_speculative_tokens > 8:
-            raise ValueError("MTP speculative decoding currently supports num_speculative_tokens <= 8")
-        speculative_method = str(self.speculative_method or "none").strip().lower()
-        if speculative_method == "none" and num_speculative_tokens > 0:
-            # Legacy configs selected MTP by setting only num_speculative_tokens.
-            speculative_method = "mtp"
-        if speculative_method not in {"none", "mtp"}:
-            raise ValueError("speculative_method must be 'none' or 'mtp'")
-        draft_sample_method = str(self.draft_sample_method or "greedy").strip().lower()
-        if draft_sample_method not in {"greedy", "probabilistic"}:
-            raise ValueError("draft_sample_method must be 'greedy' or 'probabilistic'")
-        if speculative_method == "mtp" and num_speculative_tokens < 1:
-            raise ValueError("speculative_method='mtp' requires num_speculative_tokens >= 1")
-        if speculative_method == "mtp" and draft_sample_method != "greedy":
-            raise ValueError("MTP probabilistic draft sampling is not implemented yet")
-        mtp_verifier_impl = str(self.mtp_verifier_impl or "two_decode").strip().lower()
-        if mtp_verifier_impl in {"generic_k", "expanded"}:
-            mtp_verifier_impl = "k_decode"
-        if mtp_verifier_impl in {"packed_prefill", "prefill_packed"}:
-            mtp_verifier_impl = "packed_prefix"
-        if mtp_verifier_impl not in {"two_decode", "commit_select", "k_decode", "packed_prefix"}:
-            raise ValueError(
-                "mtp_verifier_impl must be 'two_decode', 'commit_select', "
-                "'k_decode', or 'packed_prefix'"
-            )
-        if (
-            speculative_method == "mtp"
-            and num_speculative_tokens > 1
-            and not (
-                mtp_verifier_impl in {"k_decode", "packed_prefix"}
-                or (mtp_verifier_impl == "commit_select" and num_speculative_tokens == 2)
-            )
-        ):
-            raise ValueError(
-                "MTP K>1 requires mtp_verifier_impl='k_decode', "
-                "'packed_prefix', or K=2 commit_select"
-            )
-        mtp_batch_accept_policy = str(self.mtp_batch_accept_policy or "rowwise").strip().lower()
-        if mtp_batch_accept_policy not in {"rowwise", "all_or_none"}:
-            raise ValueError("mtp_batch_accept_policy must be 'rowwise' or 'all_or_none'")
-        object.__setattr__(self, "num_speculative_tokens", num_speculative_tokens)
-        object.__setattr__(self, "speculative_method", speculative_method)
-        object.__setattr__(self, "draft_sample_method", draft_sample_method)
-        object.__setattr__(self, "mtp_verifier_impl", mtp_verifier_impl)
-        object.__setattr__(self, "mtp_batch_accept_policy", mtp_batch_accept_policy)
-        object.__setattr__(self, "mtp_bonus_margin", max(0.0, float(self.mtp_bonus_margin or 0.0)))
-        object.__setattr__(self, "mtp_draft_margin", max(0.0, float(self.mtp_draft_margin or 0.0)))
-        mtp_hidden_source = str(self.mtp_hidden_source or "pre_norm").strip().lower()
-        if mtp_hidden_source not in {"pre_norm", "final_normed"}:
-            raise ValueError("mtp_hidden_source must be 'pre_norm' or 'final_normed'")
-        mtp_chain_hidden_source = str(self.mtp_chain_hidden_source or "raw").strip().lower()
-        if mtp_chain_hidden_source not in {"raw", "final_normed"}:
-            raise ValueError("mtp_chain_hidden_source must be 'raw' or 'final_normed'")
-        mtp_chain_mode = str(self.mtp_chain_mode or "recursive").strip().lower()
-        if mtp_chain_mode not in {"recursive", "sequence"}:
-            raise ValueError("mtp_chain_mode must be 'recursive' or 'sequence'")
-        mtp_token_source = str(self.mtp_token_source or "generated").strip().lower()
-        if mtp_token_source not in {"generated", "current"}:
-            raise ValueError("mtp_token_source must be 'generated' or 'current'")
-        mtp_lm_head_greedy_top1_impl = str(
-            self.mtp_lm_head_greedy_top1_impl or "jax"
-        ).strip().lower()
-        if mtp_lm_head_greedy_top1_impl not in {
-            "jax",
-            "triton",
-            "triton_tensorcore",
-            "triton_top1",
-            "cutlass",
-            "cutlass_top1",
-            "cutlass_fused_gemm",
-            "fused_gemm",
-        }:
-            raise ValueError(
-                "mtp_lm_head_greedy_top1_impl must be jax, triton, or cutlass"
-            )
-        object.__setattr__(self, "mtp_hidden_source", mtp_hidden_source)
-        object.__setattr__(self, "mtp_chain_hidden_source", mtp_chain_hidden_source)
-        object.__setattr__(self, "mtp_chain_mode", mtp_chain_mode)
-        object.__setattr__(self, "mtp_token_source", mtp_token_source)
-        object.__setattr__(self, "mtp_position_offset", int(self.mtp_position_offset or 0))
-        object.__setattr__(
-            self,
-            "mtp_lm_head_greedy_top1_impl",
-            mtp_lm_head_greedy_top1_impl,
-        )
-        object.__setattr__(self, "mtp_burst_groups", max(1, int(self.mtp_burst_groups or 1)))
-        object.__setattr__(self, "mtp_max_active_rows", max(0, int(self.mtp_max_active_rows or 0)))
-        object.__setattr__(self, "mtp_prefill_seed", bool(self.mtp_prefill_seed))
-        if bool(self.mtp_unverified_draft_append) or bool(self.mtp_unverified_fused_append):
-            raise ValueError(
-                "Unverified MTP draft append is not supported. "
-                "All MTP benchmark and serving paths must verify drafts with the target model."
-            )
-        object.__setattr__(self, "mtp_unverified_draft_append", bool(self.mtp_unverified_draft_append))
-        object.__setattr__(self, "mtp_unverified_fused_append", bool(self.mtp_unverified_fused_append))
         object.__setattr__(
             self,
             "compact_prefill_token_count_mode",
@@ -412,27 +525,6 @@ class Qwen3_5Config:
             self.hidden_act,
             self.rms_norm_eps,
             self.dtype,
-            self.mtp_num_hidden_layers,
-            self.mtp_use_dedicated_embeddings,
-            self.speculative_method,
-            self.draft_sample_method,
-            self.mtp_verifier_impl,
-            self.mtp_batch_accept_policy,
-            self.mtp_seed_after_bonus,
-            self.mtp_bonus_margin,
-            self.mtp_draft_margin,
-            self.mtp_hidden_source,
-            self.mtp_chain_hidden_source,
-            self.mtp_chain_mode,
-            self.mtp_token_source,
-            self.mtp_position_offset,
-            self.mtp_lm_head_greedy_top1_impl,
-            self.num_speculative_tokens,
-            self.mtp_burst_groups,
-            self.mtp_max_active_rows,
-            self.mtp_prefill_seed,
-            self.mtp_unverified_draft_append,
-            self.mtp_unverified_fused_append,
             self.block_size,
             self.max_kv_cache_bytes,
             self.prefill_token_buckets,
@@ -446,7 +538,6 @@ class Qwen3_5Config:
             self.static_decode_seq_lens_carry,
             self.resident_decode_metadata,
             self.greedy_decode_burst_steps,
-            self.trace_token_prefetch,
             self.materialize_tied_lm_head,
             self.compact_prefill_in_proj_qkv,
             self.compact_prefill_gdn_z,
@@ -584,27 +675,6 @@ class Qwen3_5Config:
             "attention_dropout": self.attention_dropout,
             "attention_bias": self.attention_bias,
             "tie_word_embeddings": self.tie_word_embeddings,
-            "mtp_num_hidden_layers": self.mtp_num_hidden_layers,
-            "mtp_use_dedicated_embeddings": self.mtp_use_dedicated_embeddings,
-            "speculative_method": self.speculative_method,
-            "draft_sample_method": self.draft_sample_method,
-            "mtp_verifier_impl": self.mtp_verifier_impl,
-            "mtp_batch_accept_policy": self.mtp_batch_accept_policy,
-            "mtp_seed_after_bonus": self.mtp_seed_after_bonus,
-            "mtp_bonus_margin": self.mtp_bonus_margin,
-            "mtp_draft_margin": self.mtp_draft_margin,
-            "mtp_hidden_source": self.mtp_hidden_source,
-            "mtp_chain_hidden_source": self.mtp_chain_hidden_source,
-            "mtp_chain_mode": self.mtp_chain_mode,
-            "mtp_token_source": self.mtp_token_source,
-            "mtp_position_offset": self.mtp_position_offset,
-            "mtp_lm_head_greedy_top1_impl": self.mtp_lm_head_greedy_top1_impl,
-            "num_speculative_tokens": self.num_speculative_tokens,
-            "mtp_burst_groups": self.mtp_burst_groups,
-            "mtp_max_active_rows": self.mtp_max_active_rows,
-            "mtp_prefill_seed": self.mtp_prefill_seed,
-            "mtp_unverified_draft_append": self.mtp_unverified_draft_append,
-            "mtp_unverified_fused_append": self.mtp_unverified_fused_append,
             "max_kv_cache_bytes": self.max_kv_cache_bytes,
             "max_num_seqs": self.max_num_seqs,
             "max_num_resident_seqs": self.max_num_resident_seqs,
@@ -623,7 +693,6 @@ class Qwen3_5Config:
             "static_decode_seq_lens_carry": self.static_decode_seq_lens_carry,
             "resident_decode_metadata": self.resident_decode_metadata,
             "greedy_decode_burst_steps": self.greedy_decode_burst_steps,
-            "trace_token_prefetch": self.trace_token_prefetch,
             "materialize_tied_lm_head": self.materialize_tied_lm_head,
             "compact_prefill_in_proj_qkv": self.compact_prefill_in_proj_qkv,
             "compact_prefill_gdn_z": self.compact_prefill_gdn_z,

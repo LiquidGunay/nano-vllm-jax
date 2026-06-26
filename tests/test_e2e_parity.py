@@ -27,7 +27,7 @@ torch = pytest.importorskip("torch")
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import List, Optional
 from nanovllm_jax.config import Qwen3_5Config
-from nanovllm_jax.load_weights import load_weights_from_hf
+from nanovllm_jax.weights import load_weights_from_hf
 from nanovllm_jax.model import forward
  
 jax.config.update("jax_default_matmul_precision", "highest")

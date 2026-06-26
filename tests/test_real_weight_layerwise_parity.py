@@ -18,7 +18,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.layers import causal_mask, rms_norm
-from nanovllm_jax.load_weights import load_weights_from_hf
+from nanovllm_jax.weights import load_weights_from_hf
 from nanovllm_jax.model import _stable_rmsnorm_fp32, forward_step, transformer_block
 
 

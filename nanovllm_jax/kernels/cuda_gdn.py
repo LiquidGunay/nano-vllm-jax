@@ -1,35 +1,11 @@
-"""Historical CUDA GDN placeholders and JAX reference packing helpers."""
+"""GDN state-layout helpers."""
 
 from __future__ import annotations
 
-from typing import Any
-
-import jax
 import jax.numpy as jnp
 import numpy as np
 
-from nanovllm_jax.kernels.registry import KernelBackendUnavailable, backend_status
 from nanovllm_jax.model import jax_chunk_gated_delta_rule
-
-
-def availability():
-    return backend_status("gdn_cuda")
-
-
-def require_available() -> None:
-    status = availability()
-    if not status.external_kernels_enabled:
-        raise KernelBackendUnavailable(status.reason)
-
-
-def gdn_recurrent_decode_step(*args: Any, **kwargs: Any):
-    require_available()
-    raise NotImplementedError("gdn_recurrent_decode_step CUDA wrapper is not implemented yet")
-
-
-def gdn_segmented_prefill_chunk32(*args: Any, **kwargs: Any):
-    require_available()
-    raise NotImplementedError("gdn_segmented_prefill_chunk32 CUDA wrapper is not implemented yet")
 
 
 def local_gdn_state_to_k_last(state: jnp.ndarray) -> jnp.ndarray:

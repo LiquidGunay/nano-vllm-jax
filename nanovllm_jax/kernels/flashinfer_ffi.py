@@ -1,14 +1,7 @@
-"""FlashInfer/JAX FFI prototypes.
-
-FlashInfer integration is optional and not yet wired into serving. Prototype
-kernels in this module can be exercised directly by focused tests, while the
-runtime backend registry keeps the pure-JAX path as the default until integrated
-correctness and performance gates pass.
-"""
+"""FlashInfer/JAX FFI wrappers for promoted full-attention decode."""
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import threading
 from pathlib import Path
@@ -17,7 +10,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from nanovllm_jax.kernels.registry import KernelBackendUnavailable, backend_status
+from nanovllm_jax.kernels import KernelUnavailable, missing_modules, require_modules
 
 _APPEND_PAGED_KV_CACHE_TARGET = "nanovllm_jax_flashinfer_append_paged_kv_cache"
 _RADIX_TOPK_TARGET = "nanovllm_jax_flashinfer_radix_topk"
@@ -44,14 +37,18 @@ _FLASHINFER_INT_WORKSPACE_BYTES = 8 * 1024 * 1024
 _FLASHINFER_BATCH_DECODE_PLAN_FIELDS = 10
 
 
-def availability():
-    return backend_status("flashinfer")
+def availability() -> dict[str, object]:
+    required = ("flashinfer", "jax_tvm_ffi")
+    missing = missing_modules(required)
+    return {
+        "feature": "flashinfer",
+        "available": not missing,
+        "missing_modules": missing,
+    }
 
 
 def require_available() -> None:
-    status = availability()
-    if not status.external_kernels_enabled:
-        raise KernelBackendUnavailable(status.reason)
+    require_modules(("flashinfer", "jax_tvm_ffi"), "FlashInfer FFI")
 
 
 def _default_runtime_root() -> Path:
@@ -101,16 +98,7 @@ def _configure_flashinfer_cuda_arch() -> None:
 
 
 def _require_flashinfer_modules() -> None:
-    missing = [
-        module
-        for module in ("flashinfer", "jax_tvm_ffi")
-        if importlib.util.find_spec(module) is None
-    ]
-    if missing:
-        raise KernelBackendUnavailable(
-            "FlashInfer/JAX FFI dependencies are unavailable; missing optional modules: "
-            + ", ".join(missing)
-        )
+    require_available()
 
 
 def _register_append_paged_kv_cache() -> None:

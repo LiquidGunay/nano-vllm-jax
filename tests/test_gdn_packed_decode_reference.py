@@ -2,7 +2,6 @@
 
 import os
 import sys
-import shutil
 import importlib.util
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,7 +16,7 @@ except ModuleNotFoundError:
     jax = None
     jnp = None
 else:
-    from nanovllm_jax.backends import PureJAXBackend
+    from nanovllm_jax.ops import ServingOps
     from nanovllm_jax.kernels.gdn_fla import (
         availability,
         gdn_packed_decode_pre_normalize_qk,
@@ -28,9 +27,9 @@ else:
         local_gdn_state_to_k_last,
         split_packed_gdn_decode_mixed_qkv,
     )
-    from nanovllm_jax.kernels.registry import KernelBackendUnavailable
+    from nanovllm_jax.kernels import KernelUnavailable
     from nanovllm_jax.config import Qwen3_5Config
-    from nanovllm_jax.kv_cache import HybridLayerState
+    from nanovllm_jax.cache import HybridLayerState
     from nanovllm_jax.layers import causal_conv1d_update
     from nanovllm_jax.model import (
         gated_deltanet_block,
@@ -44,11 +43,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(autouse=True)
-def _allow_local_cuda_probe_backend_routes(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_ALLOW_LOCAL_CUDA_PROBES", "1")
-
-
 def _has_cuda_backend() -> bool:
     if jax is None:
         return False
@@ -58,26 +52,54 @@ def _has_cuda_backend() -> bool:
         return False
 
 
-def _has_nvcc() -> bool:
-    if os.getenv("NANO_VLLM_JAX_NVCC"):
-        return True
-    return shutil.which("nvcc") is not None
-
-
 def _has_jax_triton() -> bool:
     return importlib.util.find_spec("jax_triton") is not None
+
+
+def _packed_decode_ops(
+    impl: str,
+    *,
+    qkv_dtype: str = "fp32",
+    disable_fallbacks: bool = False,
+    max_batch: int | None = None,
+) -> "ServingOps":
+    return ServingOps(
+        Qwen3_5Config(
+            gdn_packed_decode_impl=impl,
+            gdn_packed_decode_qkv_dtype=qkv_dtype,
+            gdn_disable_fallbacks=disable_fallbacks,
+            gdn_packed_decode_max_batch=max_batch,
+        )
+    )
+
+
+def _tiny_gdn_decode_config(**overrides) -> "Qwen3_5Config":
+    fields = dict(
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_size=4,
+        layer_types=("linear_attention",),
+        linear_attn_layers=(0,),
+        dtype="float32",
+    )
+    fields.update(overrides)
+    return Qwen3_5Config(**fields)
 
 
 def test_gdn_fla_reference_module_is_fallback_compatible():
     status = availability()
 
-    assert status.requested == "gdn_fla"
-    if status.available:
-        assert status.selected == "gdn_fla"
-        assert status.external_kernels_enabled
-    else:
-        assert status.selected == "pure_jax"
-        assert not status.external_kernels_enabled
+    assert status["feature"] == "gdn_fla"
+    assert isinstance(status["available"], bool)
 
     query = jnp.zeros((2, 3, 1, 4), dtype=jnp.float32)
     key = jnp.ones_like(query)
@@ -326,26 +348,9 @@ def test_packed_gdn_decode_from_decay_matches_a_log_reference():
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
-def test_model_packed_gdn_decode_reference_matches_default(monkeypatch):
-    monkeypatch.delenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", raising=False)
-
-    config = Qwen3_5Config(
-        vocab_size=16,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=1,
-        num_key_value_heads=1,
-        head_dim=4,
-        linear_num_key_heads=1,
-        linear_num_value_heads=2,
-        linear_key_head_dim=4,
-        linear_value_head_dim=4,
-        linear_conv_kernel_size=4,
-        layer_types=("linear_attention",),
-        linear_attn_layers=(0,),
-        dtype="float32",
-    )
+def test_model_packed_gdn_decode_reference_matches_default():
+    config = _tiny_gdn_decode_config()
+    actual_config = _tiny_gdn_decode_config(gdn_packed_decode_impl="reference")
     params = init_transformer_block(jax.random.PRNGKey(0), config, layer_idx=0)
     batch = 2
     seq_len = 1
@@ -394,12 +399,11 @@ def test_model_packed_gdn_decode_reference_matches_default(monkeypatch):
         hybrid_state=hybrid_state,
     )
 
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", "reference")
     actual_out, actual_state = gated_deltanet_block(
         x,
         params,
         positions,
-        config,
+        actual_config,
         layer_idx=0,
         is_prefill=False,
         hybrid_state=hybrid_state,
@@ -425,14 +429,7 @@ def test_model_packed_gdn_decode_reference_matches_default(monkeypatch):
     )
 
 
-def test_strict_gdn_packed_decode_rejects_model_level_fallback(monkeypatch):
-    for env_name in (
-        "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS",
-        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
-        "NANO_VLLM_JAX_GDN_PACKED_DECODE_MAX_BATCH",
-    ):
-        monkeypatch.delenv(env_name, raising=False)
-
+def test_strict_gdn_packed_decode_rejects_model_level_fallback():
     config = Qwen3_5Config(
         vocab_size=16,
         hidden_size=8,
@@ -580,9 +577,10 @@ def test_packed_gdn_decode_reference_bf16_mixed_qkv_keeps_fp32_output_state(monk
         use_qk_l2norm_in_kernel=True,
     )
 
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", "reference")
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE", "bf16")
-    actual_out, actual_state = PureJAXBackend().gated_delta_packed_decode(
+    actual_out, actual_state = _packed_decode_ops(
+        "reference",
+        qkv_dtype="bf16",
+    ).gated_delta_packed_decode(
         mixed_qkv,
         a,
         b,
@@ -619,7 +617,6 @@ def test_packed_gdn_decode_reference_bf16_mixed_qkv_keeps_fp32_output_state(monk
     ],
 )
 def test_packed_gdn_decode_reference_bf16_path_rejects_gate_like_bf16_inputs(
-    monkeypatch,
     invalid_name: str,
     mutate,
     match: str,
@@ -652,72 +649,8 @@ def test_packed_gdn_decode_reference_bf16_path_rejects_gate_like_bf16_inputs(
     invalid_dt_bias = mutate(dt_bias) if invalid_name == "dt_bias" else dt_bias
     invalid_state = mutate(state) if invalid_name == "state" else state
 
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", "reference")
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE", "bf16")
     with pytest.raises(ValueError, match=match):
-        PureJAXBackend().gated_delta_packed_decode(
-            base,
-            invalid_a,
-            invalid_b,
-            invalid_decay,
-            invalid_dt_bias,
-            invalid_state,
-            use_qk_l2norm_in_kernel=True,
-        )
-
-
-@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
-@pytest.mark.parametrize(
-    ("invalid_name", "mutate", "match"),
-    [
-        ("a", lambda a: a.astype(jnp.bfloat16), "a must be float32"),
-        ("b", lambda b: b.astype(jnp.bfloat16), "b must be float32"),
-        ("decay", lambda d: d.astype(jnp.bfloat16), "decay must be float32"),
-        ("dt_bias", lambda d: d.astype(jnp.bfloat16), "dt_bias must be float32"),
-        ("state", lambda s: s.astype(jnp.bfloat16), "state must be float32"),
-    ],
-)
-def test_packed_gdn_decode_cuda_bf16_path_rejects_gate_like_bf16_inputs(
-    monkeypatch,
-    invalid_name: str,
-    mutate,
-    match: str,
-):
-    if not _has_nvcc():
-        pytest.skip("nvcc is required for CUDA packed GDN decode BF16 path")
-
-    batch = 1
-    num_q_heads = 1
-    num_value_heads = 2
-    key_dim = 4
-    value_dim = 3
-    packed_dim = 2 * num_q_heads * key_dim + num_value_heads * value_dim
-    base = jnp.linspace(-0.4, 0.4, batch * packed_dim, dtype=jnp.float32).reshape(
-        batch,
-        packed_dim,
-    )
-    a = jnp.linspace(-0.2, 0.2, batch * num_value_heads, dtype=jnp.float32).reshape(
-        batch,
-        num_value_heads,
-    )
-    b = jnp.linspace(-0.1, 0.1, batch * num_value_heads, dtype=jnp.float32).reshape(
-        batch,
-        num_value_heads,
-    )
-    decay = jnp.linspace(0.9, 1.1, num_value_heads, dtype=jnp.float32)
-    dt_bias = jnp.linspace(-0.2, 0.2, num_value_heads, dtype=jnp.float32)
-    state = jnp.zeros((batch, num_value_heads, value_dim, key_dim), dtype=jnp.float32)
-
-    invalid_a = mutate(a) if invalid_name == "a" else a
-    invalid_b = mutate(b) if invalid_name == "b" else b
-    invalid_decay = mutate(decay) if invalid_name == "decay" else decay
-    invalid_dt_bias = mutate(dt_bias) if invalid_name == "dt_bias" else dt_bias
-    invalid_state = mutate(state) if invalid_name == "state" else state
-
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", "cuda_fp32")
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE", "bf16")
-    with pytest.raises(ValueError, match=match):
-        PureJAXBackend().gated_delta_packed_decode(
+        _packed_decode_ops("reference", qkv_dtype="bf16").gated_delta_packed_decode(
             base,
             invalid_a,
             invalid_b,
@@ -795,7 +728,7 @@ def test_packed_gdn_decode_pre_normalize_qk_matches_reference():
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
 @pytest.mark.parametrize("impl", ["triton_fla", "triton_fla_raw_gates"])
-def test_packed_gdn_decode_triton_bf16_matches_reference(monkeypatch, impl):
+def test_packed_gdn_decode_triton_bf16_matches_reference(impl):
     batch = 2
     num_q_heads = 2
     num_value_heads = 4
@@ -838,9 +771,7 @@ def test_packed_gdn_decode_triton_bf16_matches_reference(monkeypatch, impl):
         use_qk_l2norm_in_kernel=True,
     )
 
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", impl)
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE", "bf16")
-    backend = PureJAXBackend()
+    backend = _packed_decode_ops(impl, qkv_dtype="bf16")
     actual_out, actual_state = jax.jit(
         lambda mixed, a_in, b_in, decay_in, dt_bias_in, state_in: (
             backend.gated_delta_packed_decode(
@@ -881,7 +812,7 @@ def test_packed_gdn_decode_triton_bf16_matches_reference(monkeypatch, impl):
         "triton_fla_raw_gates_split_tail",
     ],
 )
-def test_packed_gdn_decode_raw_tail_matches_split_tail(monkeypatch, impl):
+def test_packed_gdn_decode_raw_tail_matches_split_tail(impl):
     batch = 2
     num_q_heads = 2
     num_value_heads = 4
@@ -944,9 +875,7 @@ def test_packed_gdn_decode_raw_tail_matches_split_tail(monkeypatch, impl):
     )
     expected_tail = expected_tail.reshape(batch, 1, num_value_heads * value_dim)
 
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", impl)
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_QKV_DTYPE", "bf16")
-    backend = PureJAXBackend()
+    backend = _packed_decode_ops(impl, qkv_dtype="bf16")
     actual_tail, actual_state = jax.jit(
         lambda mixed, a_in, b_in, decay_in, dt_bias_in, state_in, z_in, norm_in: (
             backend.gated_delta_packed_decode(
@@ -990,7 +919,7 @@ def test_packed_gdn_decode_raw_tail_matches_split_tail(monkeypatch, impl):
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
-def test_conv_packed_gdn_decode_triton_matches_reference(monkeypatch):
+def test_conv_packed_gdn_decode_triton_matches_reference():
     batch = 2
     num_q_heads = 2
     num_value_heads = 4
@@ -1059,11 +988,7 @@ def test_conv_packed_gdn_decode_triton_matches_reference(monkeypatch):
         use_qk_l2norm_in_kernel=False,
     )
 
-    monkeypatch.setenv(
-        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
-        "triton_fla_conv_raw_gates",
-    )
-    backend = PureJAXBackend()
+    backend = _packed_decode_ops("triton_fla_conv_raw_gates")
     actual_out, actual_conv_state, actual_state = jax.jit(
         lambda mixed, a_in, b_in, decay_in, dt_bias_in, conv_s, conv_w, conv_b, state_in: (
             backend.gated_delta_conv_packed_decode(
@@ -1109,7 +1034,7 @@ def test_conv_packed_gdn_decode_triton_matches_reference(monkeypatch):
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
-def test_gdn_conv_packed_projection_decode_matches_split_kernel(monkeypatch):
+def test_gdn_conv_packed_projection_decode_matches_split_kernel():
     batch = 2
     num_key_heads = 2
     num_value_heads = 4
@@ -1140,11 +1065,7 @@ def test_gdn_conv_packed_projection_decode_matches_split_kernel(monkeypatch):
         dtype=jnp.float32,
     ) * 0.025
 
-    monkeypatch.setenv(
-        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
-        "triton_fla_conv_raw_gates",
-    )
-    backend = PureJAXBackend()
+    backend = _packed_decode_ops("triton_fla_conv_raw_gates")
     expected_out, expected_conv_state, expected_state = jax.jit(
         lambda mixed, a_in, b_in, decay_in, dt_bias_in, conv_s, conv_w, conv_b, state_in: (
             backend.gated_delta_conv_packed_decode(
@@ -1216,7 +1137,7 @@ def test_gdn_conv_packed_projection_decode_matches_split_kernel(monkeypatch):
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
-def test_gdn_conv_packed_projection_tail_decode_matches_split_tail(monkeypatch):
+def test_gdn_conv_packed_projection_tail_decode_matches_split_tail():
     batch = 2
     num_key_heads = 2
     num_value_heads = 4
@@ -1251,14 +1172,10 @@ def test_gdn_conv_packed_projection_tail_decode_matches_split_tail(monkeypatch):
     ) * 0.025
     norm_weight = jnp.linspace(0.6, 1.4, value_dim, dtype=jnp.float32)
 
-    backend = PureJAXBackend()
-    monkeypatch.setenv(
-        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
-        "triton_fla_conv_raw_gates",
-    )
+    split_backend = _packed_decode_ops("triton_fla_conv_raw_gates")
     expected_core, expected_conv_state, expected_state = jax.jit(
         lambda mixed, a_in, b_in, decay_in, dt_bias_in, conv_s, conv_w, conv_b, state_in: (
-            backend.gated_delta_conv_packed_decode(
+            split_backend.gated_delta_conv_packed_decode(
                 mixed,
                 a_in,
                 b_in,
@@ -1294,13 +1211,10 @@ def test_gdn_conv_packed_projection_tail_decode_matches_split_tail(monkeypatch):
     expected_tail = expected_tail * jax.nn.silu(z.astype(jnp.float32).reshape(batch, num_value_heads, value_dim))
     expected_tail = expected_tail.reshape(batch, 1, num_value_heads * value_dim)
 
-    monkeypatch.setenv(
-        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
-        "triton_fla_conv_raw_gates_tail",
-    )
+    tail_backend = _packed_decode_ops("triton_fla_conv_raw_gates_tail")
     actual_tail, actual_conv_state, actual_state = jax.jit(
         lambda packed, decay_in, dt_bias_in, conv_s, conv_w, conv_b, state_in, norm_in: (
-            backend.gated_delta_conv_packed_projection_decode(
+            tail_backend.gated_delta_conv_packed_projection_decode(
                 packed,
                 decay_in,
                 dt_bias_in,
@@ -1345,7 +1259,7 @@ def test_gdn_conv_packed_projection_tail_decode_matches_split_tail(monkeypatch):
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
-def test_gdn_conv_packed_projection_tail_state_pool_updates_one_layer(monkeypatch):
+def test_gdn_conv_packed_projection_tail_state_pool_updates_one_layer():
     batch = 3
     num_layers = 3
     layer_idx = 1
@@ -1383,11 +1297,7 @@ def test_gdn_conv_packed_projection_tail_state_pool_updates_one_layer(monkeypatc
     norm_weight = jnp.linspace(0.6, 1.4, value_dim, dtype=jnp.float32)
     valid_rows = jnp.asarray([1, 0, 1], dtype=jnp.int32)
 
-    backend = PureJAXBackend()
-    monkeypatch.setenv(
-        "NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL",
-        "triton_fla_conv_raw_gates_tail",
-    )
+    backend = _packed_decode_ops("triton_fla_conv_raw_gates_tail")
     expected_tail, expected_conv_layer, expected_state_layer = jax.jit(
         lambda packed, decay_in, dt_bias_in, conv_s, conv_w, conv_b, state_in, norm_in: (
             backend.gated_delta_conv_packed_projection_decode(

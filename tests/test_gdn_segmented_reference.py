@@ -13,7 +13,7 @@ import pytest
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
-from nanovllm_jax.backends import _static_packed_gdn_chunk_metadata
+from nanovllm_jax.ops import _static_packed_gdn_chunk_metadata
 from nanovllm_jax.kernels.gdn_fla import (
     gdn_fla_chunk_delta_h_packed_reference,
     gdn_fla_chunk_fwd_o_packed_reference,
@@ -691,12 +691,11 @@ def test_gdn_fla_recompute_w_u_packed_triton_matches_reference():
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax_triton is required")
-def test_gdn_fla_recompute_w_u_packed_triton_block_dot_matches_reference(monkeypatch):
+def test_gdn_fla_recompute_w_u_packed_triton_matches_reference():
     from nanovllm_jax.kernels.gdn_fla_triton import (
         gdn_fla_recompute_w_u_packed_triton,
     )
 
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_RECOMPUTE_BLOCK_DOT", "1")
     cu_seqlens = jnp.array([0, 96], dtype=jnp.int32)
     chunk_size = 64
     chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=chunk_size)
@@ -993,12 +992,11 @@ def test_gdn_fla_chunk_delta_h_packed_triton_matches_reference():
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
-def test_gdn_fla_chunk_delta_h_packed_triton_block_dot_matches_reference(monkeypatch):
+def test_gdn_fla_chunk_delta_h_packed_triton_matches_reference():
     from nanovllm_jax.kernels.gdn_fla_triton import (
         gdn_fla_chunk_delta_h_packed_triton,
     )
 
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_DELTA_H_BLOCK_DOT", "1")
     cu_seqlens = jnp.array([0, 96], dtype=jnp.int32)
     chunk_size = 64
     chunk_indices, chunk_offsets = prepare_gdn_fla_chunk_metadata(
@@ -1315,9 +1313,7 @@ def test_gdn_fla_chunk_fwd_o_packed_triton_block_dot_matches_reference_shape():
     )
 
 
-def test_gdn_fla_chunk_gated_delta_rule_packed_reference_matches_segmented(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1")
-
+def test_gdn_fla_chunk_gated_delta_rule_packed_reference_matches_segmented():
     batch = 4
     num_heads = 3
     seq_len = 9
@@ -1554,21 +1550,10 @@ def test_gdn_fla_chunk_gated_delta_rule_packed_triton_matches_reference():
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
-def test_gdn_fla_chunk_gated_delta_rule_packed_triton_block_dot_mixed_lengths(
-    monkeypatch,
-):
+def test_gdn_fla_chunk_gated_delta_rule_packed_triton_mixed_lengths():
     from nanovllm_jax.kernels.gdn_fla_triton import (
         gdn_fla_chunk_gated_delta_rule_packed_triton,
     )
-
-    for env_name in (
-        "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS",
-        "NANO_VLLM_JAX_GDN_KKT_BLOCK_DOT",
-        "NANO_VLLM_JAX_GDN_RECOMPUTE_BLOCK_DOT",
-        "NANO_VLLM_JAX_GDN_DELTA_H_BLOCK_DOT",
-        "NANO_VLLM_JAX_GDN_FWD_O_BLOCK_DOT",
-    ):
-        monkeypatch.setenv(env_name, "1")
 
     chunk_size = 64
     cu_seqlens = jnp.array([0, 0, 17, 81, 160, 290], dtype=jnp.int32)
@@ -1657,12 +1642,11 @@ def test_gdn_fla_chunk_gated_delta_rule_packed_triton_block_dot_mixed_lengths(
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
-def test_gdn_fla_packed_triton_static_bucket_metadata_matches_reference(monkeypatch):
+def test_gdn_fla_packed_triton_static_bucket_metadata_matches_reference():
     from nanovllm_jax.kernels.gdn_fla_triton import (
         gdn_fla_chunk_gated_delta_rule_packed_triton,
     )
 
-    monkeypatch.setenv("NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS", "1")
     chunk_size = 8
     token_bucket = 48
     cu_seqlens = jnp.array([0, 0, 7, 29, 31], dtype=jnp.int32)
@@ -1993,9 +1977,7 @@ def test_gdn_fla_chunk_gated_delta_rule_triton_stage_diagnostics():
 
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
-def test_segmented_gdn_prefill_reference_matches_padded_chunk32(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1")
-
+def test_segmented_gdn_prefill_reference_matches_padded_chunk32():
     batch = 5
     num_heads = 3
     seq_len = 64
@@ -2115,10 +2097,7 @@ def test_segmented_gdn_prefill_reference_matches_padded_chunk32(monkeypatch):
     assert float(jnp.max(jnp.abs(padded_state_diff))) <= 1e-5
 
 
-def test_gdn_segmented_prefill_chunk32_matches_reference(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_KERNEL_BACKEND", "gdn_fla")
-
+def test_gdn_segmented_prefill_chunk32_rejects_implicit_l2norm_fallback(monkeypatch):
     batch = 2
     num_heads = 2
     key_dim = 4
@@ -2148,43 +2127,20 @@ def test_gdn_segmented_prefill_chunk32_matches_reference(monkeypatch):
         cu_seqlens,
     ) = pack_padded_gdn_inputs(query, key, value, gate, beta, lengths)
 
-    ref_out, ref_state = gdn_segmented_prefill_chunk32_reference(
-        packed_query,
-        packed_key,
-        packed_value,
-        packed_beta,
-        packed_gate,
-        cu_seqlens,
-        initial_state,
-        chunk_size=32,
-        use_qk_l2norm_in_kernel=True,
-    )
-
-    # Monkeypatch require_available so the public wrapper does not raise
+    # Monkeypatch require_available so this test reaches the explicit
+    # unsupported-shape guard in the Triton wrapper.
     import nanovllm_jax.kernels.gdn_fla as _gdn_fla_mod
     monkeypatch.setattr(_gdn_fla_mod, "require_available", lambda: None)
 
-    wrapper_out, wrapper_state = gdn_segmented_prefill_chunk32(
-        packed_query,
-        packed_key,
-        packed_value,
-        packed_beta,
-        packed_gate,
-        cu_seqlens,
-        initial_state,
-        chunk_size=32,
-        use_qk_l2norm_in_kernel=True,
-    )
-
-    np.testing.assert_allclose(
-        np.asarray(wrapper_out),
-        np.asarray(ref_out),
-        rtol=2e-5,
-        atol=2e-5,
-    )
-    np.testing.assert_allclose(
-        np.asarray(wrapper_state),
-        np.asarray(ref_state),
-        rtol=2e-5,
-        atol=2e-5,
-    )
+    with pytest.raises(RuntimeError, match="implicit GDN kernel fallbacks are disabled"):
+        gdn_segmented_prefill_chunk32(
+            packed_query,
+            packed_key,
+            packed_value,
+            packed_beta,
+            packed_gate,
+            cu_seqlens,
+            initial_state,
+            chunk_size=32,
+            use_qk_l2norm_in_kernel=True,
+        )

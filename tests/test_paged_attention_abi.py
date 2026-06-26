@@ -14,7 +14,7 @@ from nanovllm_jax.kernels.paged_attention import (
     kv_last_page_len_from_seq_lens,
     paged_decode_attention_gqa_nhd_reference,
 )
-from nanovllm_jax.kv_cache import paged_attention_decode
+from nanovllm_jax.cache import paged_attention_decode
 
 
 def test_paged_decode_attention_gqa_nhd_reference_matches_current_decode_path():

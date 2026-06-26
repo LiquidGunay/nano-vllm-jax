@@ -1,7 +1,7 @@
 [project]
 name = "nano-vllm-jax"
 version = "0.1.0"
-description = "A pedagogical vLLM implementation in JAX for TPU and GPU"
+description = "A pedagogical JAX/CUDA continuous-batching text generation engine"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
     "sentencepiece>=0.2.0",
     "optax>=0.2.2",
     "flask>=2.0.0",
+    "PyYAML>=6.0.1",
     "xxhash>=3.0.0",
     "huggingface_hub>=0.20.0",
 ]

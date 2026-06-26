@@ -7,16 +7,11 @@ import numpy as np
 import pytest
 
 from nanovllm_jax.config import Qwen3_5Config
-from nanovllm_jax.engine.llm_engine import (
-    LLMEngine,
-    _trace_token_prefetch_enabled,
-)
-from nanovllm_jax.engine import model_runner as model_runner_module
-from nanovllm_jax.engine.model_runner import ModelRunner
-from nanovllm_jax.engine.scheduled_batch import ScheduledBatch
-from nanovllm_jax.engine.scheduler import Scheduler
-from nanovllm_jax.engine.sequence import SequenceStatus
-from nanovllm_jax.engine.sequence import DeviceTokenRef, SamplingParams, Sequence
+from nanovllm_jax.engine import LLMEngine
+from nanovllm_jax.batch import ScheduledBatch
+from nanovllm_jax.runner import ModelRunner
+from nanovllm_jax.scheduler import Scheduler
+from nanovllm_jax.sequence import DeviceTokenRef, SamplingParams, Sequence, SequenceStatus
 
 
 class _AsyncScalar:
@@ -36,25 +31,12 @@ class _AsyncScalar:
         return np.asarray(self.value, dtype=dtype)
 
 
-def test_trace_token_prefetch_env_can_disable_config_default(monkeypatch):
-    config = Qwen3_5Config(trace_token_prefetch=True)
+def test_device_token_carry_comes_from_config():
+    enabled = Qwen3_5Config(device_token_carry=True)
+    disabled = Qwen3_5Config(device_token_carry=False)
 
-    monkeypatch.setenv("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "0")
-
-    assert _trace_token_prefetch_enabled(config) is False
-
-
-def test_device_token_carry_env_overrides_config_default(monkeypatch):
-    config = Qwen3_5Config(device_token_carry=False)
-
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-
-    assert Scheduler(config).device_token_carry is True
-    assert model_runner_module._config_or_env_flag(
-        config,
-        "device_token_carry",
-        "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
-    ) is True
+    assert Scheduler(enabled).device_token_carry is True
+    assert Scheduler(disabled).device_token_carry is False
 
 
 def test_sequence_materializes_deferred_device_tokens():
@@ -209,8 +191,10 @@ def _prefill_batch(
 
 
 def test_model_runner_device_token_carry_uses_whole_vector_when_seq_ids_match(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.device_token_carry = True
+    runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
     runner._device_token_carry_tokens = None
     runner._device_token_carry_by_seq_id = {}
@@ -233,8 +217,10 @@ def test_model_runner_device_token_carry_uses_whole_vector_when_seq_ids_match(mo
 
 
 def test_model_runner_device_token_carry_records_full_static_decode_rows(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.device_token_carry = True
+    runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
     runner._device_token_carry_tokens = None
     runner._device_token_carry_by_seq_id = {}
@@ -261,8 +247,10 @@ def test_model_runner_device_token_carry_records_full_static_decode_rows(monkeyp
 
 
 def test_model_runner_device_token_carry_updates_resident_last_tokens(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.device_token_carry = True
+    runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
     runner._device_token_carry_tokens = None
     runner._device_token_carry_by_seq_id = {}
@@ -290,8 +278,10 @@ def test_model_runner_device_token_carry_updates_resident_last_tokens(monkeypatc
 def test_model_runner_device_token_carry_clears_resident_stale_when_tokens_already_current(
     monkeypatch,
 ):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.device_token_carry = True
+    runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
     runner._device_token_carry_tokens = None
     runner._device_token_carry_by_seq_id = {}
@@ -317,8 +307,10 @@ def test_model_runner_device_token_carry_clears_resident_stale_when_tokens_alrea
 def test_model_runner_device_token_carry_marks_resident_stale_when_not_updated(
     monkeypatch,
 ):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.device_token_carry = True
+    runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
     runner._device_token_carry_tokens = None
     runner._device_token_carry_by_seq_id = {}
@@ -339,8 +331,10 @@ def test_model_runner_device_token_carry_marks_resident_stale_when_not_updated(
 
 
 def test_model_runner_device_token_carry_follows_seq_ids_after_row_order_change(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.device_token_carry = True
+    runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
     runner._device_token_carry_tokens = None
     runner._device_token_carry_by_seq_id = {}
@@ -363,8 +357,10 @@ def test_model_runner_device_token_carry_follows_seq_ids_after_row_order_change(
 
 
 def test_model_runner_device_token_carry_survives_nonfinal_prefill_chunk(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.device_token_carry = True
+    runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
     runner._device_token_carry_tokens = None
     runner._device_token_carry_by_seq_id = {}
@@ -402,10 +398,12 @@ def test_model_runner_device_token_carry_survives_nonfinal_prefill_chunk(monkeyp
 
 def test_model_runner_release_preserves_carry_for_still_running_rows():
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.device_token_carry = True
+    runner.static_decode_seq_lens_carry = False
     runner.hybrid_states = {}
     runner._hybrid_slots = {}
     runner._free_hybrid_slots = []
-    runner._mtp1_drafts = {}
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     runner._device_token_carry_seq_ids = (7, 8)
     runner._device_token_carry_tokens = token_vector
@@ -423,8 +421,6 @@ def test_model_runner_release_preserves_carry_for_still_running_rows():
 
 
 def test_scheduler_static_decode_metadata_reuses_fixed_device_arrays(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_METADATA", "1")
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
         Qwen3_5Config(
@@ -554,8 +550,10 @@ def test_scheduler_mixed_prefill_decode_backfills_underfull_decode_batch():
 
 
 def test_model_runner_applies_device_token_carry_to_mixed_packed_decode_rows(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.device_token_carry = True
+    runner.static_decode_seq_lens_carry = False
     runner.device_token_carry = True
     runner.config = Qwen3_5Config(device_token_carry=True)
     token_vector = jnp.asarray([70], dtype=jnp.int32)
@@ -638,9 +636,6 @@ def test_scheduler_resident_capacity_can_exceed_execution_batch():
 
 
 def test_scheduler_static_decode_metadata_can_reuse_seq_lens_placeholder(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_METADATA", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY", "1")
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
         Qwen3_5Config(
@@ -675,9 +670,6 @@ def test_scheduler_static_decode_metadata_can_reuse_seq_lens_placeholder(monkeyp
 
 
 def test_scheduler_resident_decode_metadata_uses_device_placeholders(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_METADATA", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_RESIDENT_DECODE_METADATA", "1")
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
         Qwen3_5Config(
@@ -718,9 +710,6 @@ def test_scheduler_resident_decode_metadata_uses_device_placeholders(monkeypatch
 
 
 def test_scheduler_resident_decode_metadata_reuses_placeholders_across_seq_ids(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_METADATA", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_RESIDENT_DECODE_METADATA", "1")
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
         Qwen3_5Config(
@@ -771,8 +760,6 @@ def test_scheduler_resident_decode_metadata_reuses_placeholders_across_seq_ids(m
 
 
 def test_scheduler_static_decode_metadata_allows_greedy_burst(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_METADATA", "1")
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
         Qwen3_5Config(
@@ -802,8 +789,10 @@ def test_scheduler_static_decode_metadata_allows_greedy_burst(monkeypatch):
 
 
 def test_model_runner_static_decode_metadata_requires_token_carry(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.device_token_carry = True
+    runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
     runner._device_token_carry_tokens = None
     runner._device_token_carry_by_seq_id = {}
@@ -815,9 +804,13 @@ def test_model_runner_static_decode_metadata_requires_token_carry(monkeypatch):
 
 
 def test_model_runner_static_decode_metadata_applies_carried_seq_lens(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY", "1")
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = Qwen3_5Config(
+        device_token_carry=True,
+        static_decode_seq_lens_carry=True,
+    )
+    runner.device_token_carry = True
+    runner.static_decode_seq_lens_carry = True
     runner._device_token_carry_seq_ids = None
     runner._device_token_carry_tokens = None
     runner._device_token_carry_by_seq_id = {}
@@ -844,9 +837,13 @@ def test_model_runner_static_decode_metadata_applies_carried_seq_lens(monkeypatc
 
 
 def test_model_runner_first_static_decode_can_use_scheduler_seq_lens(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_SEQ_LENS_CARRY", "1")
     runner = ModelRunner.__new__(ModelRunner)
+    runner.config = Qwen3_5Config(
+        device_token_carry=True,
+        static_decode_seq_lens_carry=True,
+    )
+    runner.device_token_carry = True
+    runner.static_decode_seq_lens_carry = True
     runner._device_token_carry_seq_ids = None
     runner._device_token_carry_tokens = None
     runner._device_token_carry_by_seq_id = {}
@@ -873,7 +870,6 @@ def test_model_runner_first_static_decode_can_use_scheduler_seq_lens(monkeypatch
 
 
 def test_scheduler_postprocess_can_defer_greedy_device_token(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     scheduler = Scheduler(
         Qwen3_5Config(
             max_num_seqs=1,
@@ -897,7 +893,6 @@ def test_scheduler_postprocess_can_defer_greedy_device_token(monkeypatch):
 
 
 def test_scheduler_postprocess_can_defer_sampled_device_token_ref(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     scheduler = Scheduler(
         Qwen3_5Config(
             max_num_seqs=1,
@@ -919,399 +914,3 @@ def test_scheduler_postprocess_can_defer_sampled_device_token_ref(monkeypatch):
     assert seq.num_completion_tokens == 1
     assert seq.has_unmaterialized_device_tokens
     assert seq.completion_token_ids == [202]
-
-
-def test_iter_generate_overlapped_prefetch_emits_after_next_step(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_OVERLAPPED_STREAMING_TOKEN_PREFETCH", "1")
-    events: list[str] = []
-    deferred_tokens: list[_AsyncScalar] = []
-    engine = LLMEngine.__new__(LLMEngine)
-    seq_holder: dict[str, Sequence] = {}
-    remaining_steps = {"value": 2}
-
-    def add_request(prompt, sampling_params):
-        seq = Sequence(prompt, sampling_params, seq_id=7)
-        seq.status = SequenceStatus.RUNNING
-        seq_holder["seq"] = seq
-        return seq
-
-    def is_finished():
-        return remaining_steps["value"] <= 0
-
-    def step():
-        step_index = 2 - remaining_steps["value"]
-        events.append(f"step-{step_index}")
-        token = _AsyncScalar(202 + step_index, events)
-        deferred_tokens.append(token)
-        seq = seq_holder["seq"]
-        seq.append_token_device(token)
-        remaining_steps["value"] -= 1
-        if remaining_steps["value"] <= 0:
-            seq.status = SequenceStatus.FINISHED
-        return [], -1
-
-    engine.add_request = add_request
-    engine.is_finished = is_finished
-    engine.step = step
-    engine._detokenize = lambda token_ids: ""
-
-    stream_events = list(
-        engine.iter_generate(
-            [[101]],
-            SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True),
-            include_text=False,
-        )
-    )
-
-    token_events = [event for event in stream_events if event["event"] == "token"]
-    assert [event["token_id"] for event in token_events] == [202, 203]
-    assert [event["completion_index"] for event in token_events] == [0, 1]
-    assert stream_events[-1]["event"] == "done"
-    assert stream_events[-1]["results"][0]["token_ids"] == [202, 203]
-    assert all(token.prefetch_count == 1 for token in deferred_tokens)
-    assert events.index("step-1") < events.index("materialize-202")
-    assert events == [
-        "step-0",
-        "prefetch-202",
-        "step-1",
-        "prefetch-203",
-        "materialize-202",
-        "materialize-203",
-    ]
-
-
-def test_iter_generate_offline_events_preserve_final_tokens(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_OFFLINE_STREAMING_TOKEN_EVENTS", "1")
-    events: list[str] = []
-    deferred_tokens: list[_AsyncScalar] = []
-    engine = LLMEngine.__new__(LLMEngine)
-    seq_holder: dict[str, Sequence] = {}
-    remaining_steps = {"value": 2}
-
-    def add_request(prompt, sampling_params):
-        seq = Sequence(prompt, sampling_params, seq_id=7)
-        seq.status = SequenceStatus.RUNNING
-        seq_holder["seq"] = seq
-        return seq
-
-    def is_finished():
-        return remaining_steps["value"] <= 0
-
-    def step():
-        step_index = 2 - remaining_steps["value"]
-        token = _AsyncScalar(202 + step_index, events)
-        seq = seq_holder["seq"]
-        seq.append_token_device(token)
-        deferred_tokens.append(token)
-        remaining_steps["value"] -= 1
-        if remaining_steps["value"] <= 0:
-            seq.status = SequenceStatus.FINISHED
-        return [], -1
-
-    engine.add_request = add_request
-    engine.is_finished = is_finished
-    engine.step = step
-    engine._detokenize = lambda token_ids: ""
-
-    stream_events = list(
-        engine.iter_generate(
-            [[101]],
-            SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True),
-            include_text=False,
-        )
-    )
-
-    token_events = [event for event in stream_events if event["event"] == "token"]
-    assert [event["token_id"] for event in token_events] == [None, None]
-    assert len(token_events) == 2
-    assert token_events[0]["completion_index"] == 0
-    assert token_events[1]["completion_index"] == 1
-    assert stream_events[-1]["event"] == "done"
-    assert stream_events[-1]["results"][0]["token_ids"] == [202, 203]
-    assert [event for event in events if event.startswith("materialize-")] == [
-        "materialize-202",
-        "materialize-203",
-    ]
-
-
-def test_generate_with_trace_disables_overlapped_prefetch(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_OVERLAPPED_STREAMING_TOKEN_PREFETCH", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "0")
-    prefetch_calls: list[tuple] = []
-    events: list[str] = []
-    remaining_steps = {"value": 2}
-    seq_holder: dict[str, Sequence] = {}
-
-    original_prefetch = Sequence.prefetch_device_token_slots
-
-    def _prefetch_device_token_slots(slots):
-        prefetch_calls.append(tuple(slots))
-        return original_prefetch(slots)
-
-    def add_request(prompt, sampling_params):
-        seq = Sequence(prompt, sampling_params, seq_id=7)
-        seq.status = SequenceStatus.RUNNING
-        seq_holder["seq"] = seq
-        return seq
-
-    def is_finished():
-        return remaining_steps["value"] <= 0
-
-    def step():
-        step_index = 2 - remaining_steps["value"]
-        token = _AsyncScalar(202 + step_index, events)
-        seq = seq_holder["seq"]
-        seq.append_token_device(token)
-        remaining_steps["value"] -= 1
-        if remaining_steps["value"] <= 0:
-            seq.status = SequenceStatus.FINISHED
-        return [], -1
-
-    monkeypatch.setattr(
-        Sequence,
-        "prefetch_device_token_slots",
-        staticmethod(_prefetch_device_token_slots),
-    )
-    engine = LLMEngine.__new__(LLMEngine)
-    engine.add_request = add_request
-    engine.is_finished = is_finished
-    engine.step = step
-    engine._detokenize = lambda token_ids: ""
-
-    trace = engine.generate_with_trace(
-        [[101]],
-        SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True),
-        include_text=False,
-    )
-
-    assert prefetch_calls == []
-    token_events = [event for event in trace["events"] if event["event"] == "token"]
-    assert [event["token_id"] for event in token_events] == [202, 203]
-    assert trace["events"][-1]["event"] == "done"
-    assert trace["events"][-1]["results"] == trace["results"]
-    assert isinstance(trace["events"][-1]["elapsed_seconds"], float)
-    assert trace["results"][0]["token_ids"] == [202, 203]
-
-
-def test_generate_with_trace_prefetches_when_trace_prefetch_enabled(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "1")
-    prefetch_calls: list[tuple] = []
-    events: list[str] = []
-    remaining_steps = {"value": 2}
-    seq_holder: dict[str, Sequence] = {}
-
-    original_prefetch = Sequence.prefetch_device_token_slots
-
-    def _prefetch_device_token_slots(slots):
-        prefetch_calls.append(tuple(slots))
-        return original_prefetch(slots)
-
-    def add_request(prompt, sampling_params):
-        seq = Sequence(prompt, sampling_params, seq_id=7)
-        seq.status = SequenceStatus.RUNNING
-        seq_holder["seq"] = seq
-        return seq
-
-    def is_finished():
-        return remaining_steps["value"] <= 0
-
-    def step():
-        step_index = 2 - remaining_steps["value"]
-        events.append(f"step-{step_index}")
-        token = _AsyncScalar(202 + step_index, events)
-        seq = seq_holder["seq"]
-        seq.append_token_device(token)
-        remaining_steps["value"] -= 1
-        if remaining_steps["value"] <= 0:
-            seq.status = SequenceStatus.FINISHED
-        return [], -1
-
-    monkeypatch.setattr(
-        Sequence,
-        "prefetch_device_token_slots",
-        staticmethod(_prefetch_device_token_slots),
-    )
-    engine = LLMEngine.__new__(LLMEngine)
-    engine.add_request = add_request
-    engine.is_finished = is_finished
-    engine.step = step
-    engine._detokenize = lambda token_ids: ""
-
-    trace = engine.generate_with_trace(
-        [[101]],
-        SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True),
-        include_text=False,
-    )
-
-    assert len(prefetch_calls) == 2
-    token_events = [event for event in trace["events"] if event["event"] == "token"]
-    assert [event["token_id"] for event in token_events] == [202, 203]
-    assert trace["events"][-1]["event"] == "done"
-    assert trace["results"][0]["token_ids"] == [202, 203]
-    assert events == [
-        "step-0",
-        "step-1",
-        "prefetch-202",
-        "prefetch-203",
-        "materialize-202",
-        "materialize-203",
-    ]
-
-
-def test_generate_with_trace_summary_prefetches_active_rows_to_host_sink(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "1")
-    events: list[str] = []
-    step_index = {"value": 0}
-    seqs: dict[int, Sequence] = {}
-
-    def add_request(prompt, sampling_params):
-        seq_id = len(seqs)
-        seq = Sequence(prompt, sampling_params, seq_id=seq_id)
-        seq.status = SequenceStatus.RUNNING
-        seqs[seq_id] = seq
-        return seq
-
-    def is_finished():
-        return bool(seqs) and all(seq.is_finished for seq in seqs.values())
-
-    def step():
-        step = step_index["value"]
-        events.append(f"step-{step}")
-        if step == 0:
-            seqs[0].append_token_device(_AsyncScalar(200, events))
-            seqs[1].append_token_device(_AsyncScalar(300, events))
-        elif step == 1:
-            seqs[0].append_token_device(_AsyncScalar(201, events))
-            seqs[0].status = SequenceStatus.FINISHED
-            seqs[1].append_token_device(_AsyncScalar(301, events))
-        elif step == 2:
-            seqs[1].append_token_device(_AsyncScalar(302, events))
-            seqs[1].status = SequenceStatus.FINISHED
-        else:
-            raise AssertionError("unexpected step")
-        step_index["value"] += 1
-        return [], -1
-
-    engine = LLMEngine.__new__(LLMEngine)
-    engine.add_request = add_request
-    engine.is_finished = is_finished
-    engine.step = step
-    engine._detokenize = lambda token_ids: ""
-    engine.config = SimpleNamespace(summary_host_token_sink_min_completion_tokens=1)
-
-    trace = engine.generate_with_trace(
-        [[101], [102]],
-        [
-            SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True),
-            SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True),
-        ],
-        include_text=False,
-        trace_events=False,
-    )
-
-    assert trace["events"] == []
-    assert [result["token_ids"] for result in trace["results"]] == [
-        [200, 201],
-        [300, 301, 302],
-    ]
-    assert events == [
-        "step-0",
-        "prefetch-200",
-        "prefetch-300",
-        "step-1",
-        "prefetch-201",
-        "prefetch-301",
-        "step-2",
-        "prefetch-302",
-        "materialize-200",
-        "materialize-300",
-        "materialize-201",
-        "materialize-301",
-        "materialize-302",
-    ]
-    assert trace["timing_summary"]["host_token_sink_enabled"] is True
-    assert trace["timing_summary"]["host_token_sink_complete"] is True
-    assert trace["timing_summary"]["host_token_sink_stored_tokens"] == 5
-    assert trace["timing_summary"]["host_token_sink_missing_tokens"] == 0
-    assert trace["timing_summary"]["final_device_token_materialize_seconds"] == 0.0
-    assert all(seq.has_unmaterialized_device_tokens for seq in seqs.values())
-
-
-def test_generate_with_trace_summary_keeps_short_outputs_on_final_materialization(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    monkeypatch.setenv("NANO_VLLM_JAX_TRACE_TOKEN_PREFETCH", "1")
-    events: list[str] = []
-    seq_holder: dict[str, Sequence] = {}
-    remaining_steps = {"value": 2}
-
-    def add_request(prompt, sampling_params):
-        seq = Sequence(prompt, sampling_params, seq_id=7)
-        seq.status = SequenceStatus.RUNNING
-        seq_holder["seq"] = seq
-        return seq
-
-    def is_finished():
-        return remaining_steps["value"] <= 0
-
-    def step():
-        step_index = 2 - remaining_steps["value"]
-        events.append(f"step-{step_index}")
-        seq = seq_holder["seq"]
-        seq.append_token_device(_AsyncScalar(202 + step_index, events))
-        remaining_steps["value"] -= 1
-        if remaining_steps["value"] <= 0:
-            seq.status = SequenceStatus.FINISHED
-        return [], -1
-
-    engine = LLMEngine.__new__(LLMEngine)
-    engine.add_request = add_request
-    engine.is_finished = is_finished
-    engine.step = step
-    engine._detokenize = lambda token_ids: ""
-
-    trace = engine.generate_with_trace(
-        [[101]],
-        SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True),
-        include_text=False,
-        trace_events=False,
-    )
-
-    assert trace["results"][0]["token_ids"] == [202, 203]
-    assert events == [
-        "step-0",
-        "step-1",
-        "materialize-202",
-        "materialize-203",
-    ]
-    assert trace["timing_summary"]["host_token_sink_enabled"] is False
-    assert trace["timing_summary"]["host_token_sink_planned_completion_budget"] == 2
-    assert trace["timing_summary"]["host_token_sink_min_completion_tokens"] == 1024
-    assert trace["timing_summary"]["final_device_token_materialize_seconds"] > 0.0
-    assert not seq_holder["seq"].has_unmaterialized_device_tokens
-
-
-def test_generate_with_trace_keeps_eos_compatible_path_when_ignore_eos_false(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
-    calls = []
-
-    def iter_generate(prompts, sampling_params=None, *, include_text=True):
-        calls.append((prompts, sampling_params, include_text))
-        yield {"event": "token", "token_id": 123}
-        yield {"event": "done", "results": [{"text": "ok", "token_ids": [123]}]}
-
-    engine = LLMEngine.__new__(LLMEngine)
-    engine.iter_generate = iter_generate
-
-    trace = engine.generate_with_trace(
-        [[101]],
-        SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=False),
-        include_text=False,
-    )
-
-    assert calls
-    assert trace["events"][0]["event"] == "token"
-    assert trace["results"] == [{"text": "ok", "token_ids": [123]}]

@@ -1,22 +1,26 @@
-"""Optional serving-kernel registry.
+"""Small helpers shared by optional serving-kernel wrappers."""
 
-The pure-JAX backend remains the correctness path. Modules in this package only
-describe and gate optional external kernels until each one passes the roadmap's
-correctness and integrated-performance gates.
-"""
+from __future__ import annotations
 
-from nanovllm_jax.kernels.registry import (
-    KernelBackendStatus,
-    KernelBackendUnavailable,
-    backend_status,
-    list_kernel_backends,
-    select_kernel_backend,
-)
+import importlib.util
 
-__all__ = [
-    "KernelBackendStatus",
-    "KernelBackendUnavailable",
-    "backend_status",
-    "list_kernel_backends",
-    "select_kernel_backend",
-]
+
+class KernelUnavailable(RuntimeError):
+    """Raised when a promoted optional kernel dependency cannot run."""
+
+
+def missing_modules(modules: tuple[str, ...]) -> tuple[str, ...]:
+    """Return optional Python modules that are not importable."""
+
+    return tuple(module for module in modules if importlib.util.find_spec(module) is None)
+
+
+def require_modules(modules: tuple[str, ...], feature: str) -> None:
+    missing = missing_modules(modules)
+    if missing:
+        raise KernelUnavailable(
+            f"{feature} requires optional modules: {', '.join(missing)}"
+        )
+
+
+__all__ = ["KernelUnavailable", "missing_modules", "require_modules"]

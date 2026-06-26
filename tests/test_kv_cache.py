@@ -28,7 +28,7 @@ import pytest
 jax.config.update("jax_default_matmul_precision", "highest")
 
 from nanovllm_jax.config import Qwen3_5Config
-from nanovllm_jax.kv_cache import (
+from nanovllm_jax.cache import (
     init_kv_cache,
     init_linear_attention_states,
     update_kv_cache,
@@ -173,9 +173,8 @@ def test_linear_attention_chunked_vs_recurrent(seq_len):
     print("  ✓ PASS: Chunked and recurrent match (MSE < 1e-6)")
 
 
-def test_linear_attention_multichunk_matches_recurrent(monkeypatch):
+def test_linear_attention_multichunk_matches_recurrent():
     """The multi-chunk GDN prefill path must preserve recurrent parity."""
-    monkeypatch.setenv("NANO_VLLM_JAX_ENABLE_CHUNKED_GDN_PREFILL", "1")
     key = jax.random.PRNGKey(123)
     keys = jax.random.split(key, 5)
     batch_size = 1
@@ -286,7 +285,7 @@ def test_kv_cache_block_allocation():
         head_dim=config.head_dim,
         max_seqs=2,
         max_blocks_per_seq=32,
-        dtype=jnp.float32,  # Use float32 for Metal compatibility
+        dtype=jnp.float32,
     )
     
     print(f"  Num blocks: {num_blocks}")
@@ -338,7 +337,7 @@ def test_multi_layer_linear_attention_states():
         head_dim=config.head_dim,
         max_seqs=1,
         max_blocks_per_seq=64,
-        dtype=jnp.float32,  # Use float32 for Metal compatibility
+        dtype=jnp.float32,
     )
     
     kv_cache = init_linear_attention_states(kv_cache, config, batch_size, dtype=jnp.float32)

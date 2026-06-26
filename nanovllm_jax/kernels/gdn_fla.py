@@ -7,7 +7,6 @@ activation math and native V,K recurrent state.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,30 +14,25 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from nanovllm_jax.kernels.registry import KernelBackendUnavailable, backend_status
+from nanovllm_jax.kernels import KernelUnavailable, missing_modules, require_modules
 
 
-def availability():
-    return backend_status("gdn_fla")
+def availability() -> dict[str, object]:
+    required = ("triton", "jax_triton")
+    missing = missing_modules(required)
+    return {
+        "feature": "gdn_fla",
+        "available": not missing,
+        "missing_modules": missing,
+    }
 
 
 def require_available() -> None:
-    status = availability()
-    if not status.external_kernels_enabled:
-        raise KernelBackendUnavailable(status.reason)
+    require_modules(("triton", "jax_triton"), "Triton FLA GDN")
 
 
 _GDN_QKV_PREFILL_DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
 _GDN_FLA_ACCUMULATOR_DTYPE = jnp.dtype(jnp.float32)
-_TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
-_GDN_DISABLE_FALLBACKS_ENV = "NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS"
-
-
-def _gdn_disable_fallbacks() -> bool:
-    return (
-        os.environ.get(_GDN_DISABLE_FALLBACKS_ENV, "0").strip().lower()
-        in _TRUE_ENV_VALUES
-    )
 
 
 @dataclass(frozen=True)
@@ -307,12 +301,6 @@ def gdn_segmented_prefill_chunk32(
             gdn_fla_chunk_gated_delta_rule_packed_triton,
         )
     except (ImportError, ModuleNotFoundError):
-        if _gdn_disable_fallbacks():
-            raise RuntimeError(
-                "Triton FLA segmented prefill kernel is unavailable; "
-                f"implicit GDN kernel fallbacks are disabled by "
-                f"{_GDN_DISABLE_FALLBACKS_ENV}=1"
-            )
         return gdn_segmented_prefill_chunk32_reference(
             query, key, value, beta, gate, cu_seqlens, initial_state,
             chunk_size=chunk_size,
@@ -405,18 +393,6 @@ def gdn_packed_decode_pre_normalize_qk(
     if qk_dim <= 0 or qk_dim % (2 * key_dim) != 0:
         raise ValueError("mixed_qkv has an invalid packed Q/K dimension")
     num_q_heads = qk_dim // (2 * key_dim)
-
-    from nanovllm_jax.kernels.decode_reductions import (
-        gdn_packed_decode_pre_normalize_qk_pallas,
-        pallas_gdn_qk_prenorm_enabled,
-    )
-
-    if pallas_gdn_qk_prenorm_enabled():
-        return gdn_packed_decode_pre_normalize_qk_pallas(
-            mixed_qkv,
-            state,
-            eps=eps,
-        )
 
     query, key, value = split_packed_gdn_decode_mixed_qkv(
         mixed_qkv,
@@ -565,7 +541,7 @@ def prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
 
     The returned query/key tensors have value-head count after GQA repeat. This
     is the stable ABI for a future vLLM/FLA-derived FP32 fast body; callers can
-    transpose to the legacy local `[B,H,T,D]` chunk reference as a fallback.
+    transpose to the local `[B,H,T,D]` chunk reference as a fallback.
     """
 
     if conv_out.ndim != 3:
@@ -1813,8 +1789,8 @@ def unpack_prepared_gdn_prefill_output(
     max_seq_len: int,
 ) -> jnp.ndarray:
     """Unpack `[nnz,H,V]` segmented output into FLA layout `[B,T,H,V]`."""
-    legacy = unpack_segmented_gdn_output(packed_output, cu_seqlens, max_seq_len)
-    return jnp.transpose(legacy, (0, 2, 1, 3))
+    local_reference = unpack_segmented_gdn_output(packed_output, cu_seqlens, max_seq_len)
+    return jnp.transpose(local_reference, (0, 2, 1, 3))
 
 
 def gdn_fla_prefill_varlen_reference(

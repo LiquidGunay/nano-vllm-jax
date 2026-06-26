@@ -1,0 +1,29 @@
+# Canonical serving configuration.
+#
+# This file controls workload shape and static capacity only. The operation
+# policy is the promoted CUDA/JAX fast path in nanovllm_jax/fastpath.py.
+
+server:
+  host: "127.0.0.1"
+  port: 6791
+  max_tokens_default: 128
+
+engine:
+  model: "Qwen/Qwen3.5-0.8B"
+  max_prefill: 4096
+  max_num_seqs: 8
+  max_num_resident_seqs: 8
+  max_num_batched_tokens: 4096
+  max_blocks_per_seq: 320
+  kv_cache_bytes: 3221225472
+  num_kvcache_blocks: 2048
+  prefill_token_buckets: [64, 128, 256, 512, 1024, 2048, 4096]
+  batch_size_buckets: [1, 2, 3, 4, 5, 6, 7, 8]
+  decode_block_buckets: [128, 256, 320]
+  prefix_cache: true
+  warmup:
+    enabled: true
+    prefill_token_buckets: [64, 128]
+    batch_size_buckets: [1, 4]
+    decode_block_buckets: [128, 320]
+    include_sampled_routes: true

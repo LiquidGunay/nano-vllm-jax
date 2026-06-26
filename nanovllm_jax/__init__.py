@@ -1,7 +1,11 @@
-"""Qwen 3.5 implementation in pure JAX."""
+"""Qwen3.5 serving engine in JAX."""
 
-from nanovllm_jax.config import Qwen3_5Config
-from nanovllm_jax.model import Qwen3_5
-from nanovllm_jax.backends import PureJAXBackend, select_backend
+from nanovllm_jax.config import EngineConfig
+from nanovllm_jax.engine import LLM
+from nanovllm_jax.sequence import SamplingParams
 
-__all__ = ["Qwen3_5Config", "Qwen3_5", "PureJAXBackend", "select_backend"]
+__all__ = [
+    "EngineConfig",
+    "LLM",
+    "SamplingParams",
+]

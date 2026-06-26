@@ -9,11 +9,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nanovllm_jax.backends import PureJAXBackend
+from nanovllm_jax.ops import ServingOps
 from nanovllm_jax.config import Qwen3_5Config
-from nanovllm_jax.engine.model_runner import ModelRunner
+from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.kernels.flashinfer_ffi import kv_append_paged_nhd_reference
-from nanovllm_jax.kv_cache import (
+from nanovllm_jax.cache import (
     KVCacheSpec,
     full_attention_nhd_kv_cache_shape,
     init_full_attention_nhd_kv_cache,
@@ -51,23 +51,21 @@ def _tiny_full_attention_config() -> Qwen3_5Config:
         max_num_seqs=1,
         max_blocks_per_seq=2,
         max_kv_cache_bytes=4 * 2 * 2 * 1 * 8 * 4 * 2,
+        full_attention_decode_impl="flashinfer_paged",
     )
 
 
-def test_nhd_full_attention_cache_disabled_by_default(monkeypatch):
-    monkeypatch.delenv("NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE", raising=False)
-
-    backend = PureJAXBackend()
+def test_nhd_full_attention_cache_disabled_by_default():
+    backend = ServingOps()
     cache = backend.allocate_full_attention_nhd_kv_cache(_spec(), full_attention_layers=(3, 7))
 
     assert cache is None
 
 
-def test_nhd_full_attention_cache_shape_when_enabled(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE", "1")
+def test_nhd_full_attention_cache_shape_for_flashinfer_decode():
     spec = _spec()
 
-    backend = PureJAXBackend()
+    backend = ServingOps(Qwen3_5Config(full_attention_decode_impl="flashinfer_paged"))
     nhd_cache = backend.allocate_full_attention_nhd_kv_cache(
         spec,
         full_attention_layers=(3, 7, 11, 15, 19, 23),
@@ -85,8 +83,7 @@ def test_nhd_full_attention_cache_shape_when_enabled(monkeypatch):
     assert canonical_cache.v_cache.shape == (24, 8, 16, 2, 256)
 
 
-def test_nhd_full_attention_cache_uses_main_cache_block_cap(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE", "1")
+def test_nhd_full_attention_cache_uses_main_cache_block_cap():
     spec = KVCacheSpec(
         num_layers=4,
         num_blocks=8,
@@ -97,7 +94,7 @@ def test_nhd_full_attention_cache_uses_main_cache_block_cap(monkeypatch):
         max_kv_cache_bytes=2 * 4 * 2 * 1 * 4 * 4 * 2,
     )
 
-    backend = PureJAXBackend()
+    backend = ServingOps(Qwen3_5Config(full_attention_decode_impl="flashinfer_paged"))
     nhd_cache = backend.allocate_full_attention_nhd_kv_cache(
         spec,
         full_attention_layers=(1, 3),
@@ -109,12 +106,11 @@ def test_nhd_full_attention_cache_uses_main_cache_block_cap(monkeypatch):
     assert canonical_cache.k_cache.shape == (4, 2, 2, 1, 4)
 
 
-def test_model_runner_sidecar_does_not_replace_canonical_cache(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_NHD_FULL_ATTN_KV_CACHE", "1")
+def test_model_runner_sidecar_does_not_replace_canonical_cache():
     config = _tiny_full_attention_config()
     params = init_params(jax.random.PRNGKey(0), config)
 
-    runner = ModelRunner(config, params, backend="auto")
+    runner = ModelRunner(config, params)
 
     assert runner.cache_storage.k_cache.shape == (1, 4, 2, 1, 8)
     assert runner.cache_storage.v_cache.shape == (1, 4, 2, 1, 8)

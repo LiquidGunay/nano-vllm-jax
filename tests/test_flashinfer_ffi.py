@@ -12,7 +12,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from nanovllm_jax.backends import PureJAXBackend
+from nanovllm_jax.ops import ServingOps
+from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.model import ModelParams, lm_head_token_ids_and_topk
 from nanovllm_jax.kernels.flashinfer_ffi import (
     kv_append_paged_nhd,
@@ -26,7 +27,7 @@ from nanovllm_jax.kernels.paged_attention import (
     kv_last_page_len_from_seq_lens,
     paged_decode_attention_gqa_nhd_reference,
 )
-from nanovllm_jax.kv_cache import (
+from nanovllm_jax.cache import (
     AttentionMetadata,
     KVCacheStorage,
     compute_slot_mapping,
@@ -388,9 +389,7 @@ def test_lm_head_flashinfer_topk_matches_jax_decode_top1():
     not _has_cuda_backend(),
     reason="FlashInfer FFI test requires a CUDA JAX backend",
 )
-def test_backend_flashinfer_kv_append_opt_in_matches_canonical_update(monkeypatch):
-    monkeypatch.setenv("NANO_VLLM_JAX_FLASHINFER_KV_APPEND", "1")
-
+def test_backend_flashinfer_kv_append_opt_in_matches_canonical_update():
     page_size = 4
     head_dim = 256
     layer_id = 1
@@ -443,7 +442,9 @@ def test_backend_flashinfer_kv_append_opt_in_matches_canonical_update(monkeypatc
         valid_mask=valid_mask,
     )
 
-    actual = PureJAXBackend().write_kv(
+    actual = ServingOps(
+        Qwen3_5Config(full_attention_kv_append_impl="flashinfer")
+    ).write_kv(
         layer_id=layer_id,
         k=k,
         v=v,
