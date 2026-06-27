@@ -34,38 +34,30 @@ Resolved in the structural cleanup:
   returning to a reference route.
 - Updated stale docs and tests for `cache.py`, guarded test commands, and
   fail-fast fallback expectations.
-
-Explicit structural residual:
-- The cleanup plan's ideal tree includes a larger split of `model.py` into
-  `model.py`, `attention.py`, and `gdn.py`. This branch keeps the high-level
-  layer helpers in `model.py` after removing experimental/MTP/compatibility
-  paths. Creating non-facade split modules remains a larger pedagogical
-  refactor, not a fallback or public-policy leak.
+- Split the old model monolith into non-facade modules: `model.py` keeps
+  parameters, the layer loop, and forward entrypoints; `projection.py`,
+  `attention.py`, `gdn.py`, and `lm_head.py` own the corresponding math.
+- Pruned stale operation variants so the runtime keeps one reference path and
+  one promoted fast path for each accepted speedup.
 
 Validation completed under `tests/ram_guard.py`:
-- `pytest -q` was attempted as a single run; RAM guard stopped it before server
-  memory pressure could crash the machine.
-- Split guarded pytest runs covered all 186 collected tests:
-  118 targeted kernel/cache/GDN tests, 27 lightweight API/config/service tests,
-  28 device-token tests, 2 E2E parity tests, 6 layer parity tests, and 5
-  real-weight parity tests.
 - `python -m compileall -q server.py nanovllm_jax tests`.
-
-Second audit follow-up validation under `tests/ram_guard.py`:
-- `pytest -q tests/test_fastpath_config.py tests/test_service.py
-  tests/test_server_config.py tests/test_public_imports.py`: 14 passed.
-- `pytest -q tests/test_gdn_post_conv_prefill_reference.py
-  tests/test_gdn_segmented_reference.py tests/test_gdn_packed_decode_reference.py
-  tests/test_gdn_packed_prefix_state.py tests/test_kv_cache.py
-  tests/test_nhd_kv_cache.py tests/test_paged_attention_abi.py
-  tests/test_flashinfer_ffi.py tests/test_decode_reductions.py
-  tests/test_lm_head_helpers.py`: 128 passed.
-- `pytest --collect-only -q`: 187 tests collected.
-- After the `engine.py` move, `pytest -q tests/test_device_token_carry.py`: 28
-  passed.
-- After removing YAML runtime policy and JIT-cache exposure, reran:
-  `pytest -q tests/test_fastpath_config.py tests/test_service.py
-  tests/test_server_config.py tests/test_public_imports.py` with 14 passed,
-  `pytest -q tests/test_device_token_carry.py` with 28 passed, and
-  `pytest --collect-only -q` with 187 collected.
-- `python -m compileall -q server.py nanovllm_jax tests`.
+- `python -m ruff check server.py nanovllm_jax tests`.
+- `pytest --collect-only -q`: 167 tests collected after removing obsolete
+  runtime variants.
+- `pytest -q tests/test_fastpath_config.py tests/test_public_imports.py
+  tests/test_service.py tests/test_server_config.py
+  tests/test_causal_conv1d_update.py tests/test_decode_reductions.py
+  tests/test_paged_attention_abi.py tests/test_nhd_kv_cache.py`: 34 passed.
+- `pytest -q tests/test_device_token_carry.py tests/test_kv_cache.py
+  tests/test_flashinfer_ffi.py tests/test_lm_head_helpers.py`: 55 passed.
+- `pytest -q tests/test_gdn_packed_decode_reference.py
+  tests/test_gdn_packed_prefix_state.py
+  tests/test_gdn_post_conv_prefill_reference.py`: 26 passed.
+- `pytest -q tests/test_gdn_segmented_reference.py`: 39 passed.
+- `pytest -q tests/test_layer_parity.py`: 6 passed.
+- `pytest -q tests/test_real_weight_layerwise_parity.py`: 5 passed.
+- `pytest -q tests/test_e2e_parity.py::test_logits_parity`: 1 passed.
+- `pytest -q tests/test_e2e_parity.py::test_generation_parity`: 1 passed.
+- Combined heavyweight parity runs were intentionally split because the RAM
+  guard terminated a larger batch at the configured RSS limit.

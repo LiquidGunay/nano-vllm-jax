@@ -117,36 +117,13 @@ def test_lm_head_can_use_decode_padded_gemm_when_vocab_allowed():
     np.testing.assert_array_equal(np.array(actual[2]), np.array(expected[2]))
 
 
-def test_lm_head_greedy_top1_impl_rejects_unimplemented_cutlass_backend(monkeypatch):
-    hidden = jnp.array([[[0.2, -0.4, 0.7, 1.0]]], dtype=jnp.float32)
-    embed_tokens = jnp.linspace(-0.7, 0.9, 28, dtype=jnp.float32).reshape(7, 4)
-    params = ModelParams(
-        embed_tokens=embed_tokens,
-        layers=[],
-        norm_weight=jnp.array([1.0, 0.8, 1.2, 0.6], dtype=jnp.float32),
-        lm_head=None,
-    )
+def test_lm_head_greedy_top1_impl_rejects_removed_cutlass_backend():
     config = SimpleNamespace(
-        rms_norm_eps=1e-6,
-        decode_padded_gemm=False,
-        lm_head_decode_act_dtype="fp32",
         lm_head_greedy_top1_impl="cutlass",
     )
 
-    assert _lm_head_greedy_top1_impl(config) == "cutlass"
-    with np.testing.assert_raises(NotImplementedError):
-        lm_head_token_ids_and_topk(hidden, params, config, is_prefill=False, top_k=0)
-
-    token_ids, top_values, top_indices = lm_head_token_ids_and_topk(
-        hidden,
-        params,
-        config,
-        is_prefill=False,
-        top_k=2,
-    )
-    assert token_ids.shape == (1, 1)
-    assert top_values.shape == (1, 1, 2)
-    assert top_indices.shape == (1, 1, 2)
+    with pytest.raises(ValueError, match="jax or triton"):
+        _lm_head_greedy_top1_impl(config)
 
 
 def test_lm_head_greedy_top1_triton_matches_jax_on_cuda(monkeypatch):

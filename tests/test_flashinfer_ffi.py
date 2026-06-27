@@ -3,7 +3,6 @@
 import importlib.util
 import os
 import sys
-from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,7 +13,6 @@ import pytest
 
 from nanovllm_jax.ops import ServingOps
 from nanovllm_jax.config import Qwen3_5Config
-from nanovllm_jax.model import ModelParams, lm_head_token_ids_and_topk
 from nanovllm_jax.kernels.flashinfer_ffi import (
     kv_append_paged_nhd,
     kv_append_paged_nhd_reference,
@@ -325,71 +323,7 @@ def test_paged_decode_fused_append_flashinfer_matches_reference():
     not _has_cuda_backend(),
     reason="FlashInfer FFI test requires a CUDA JAX backend",
 )
-def test_lm_head_flashinfer_topk_matches_jax_decode_top1():
-    hidden = jnp.array(
-        [
-            [[0.2, -0.4, 0.7, 1.0]],
-            [[-0.5, 0.8, 0.4, -0.1]],
-        ],
-        dtype=jnp.float32,
-    )
-    embed_tokens = jnp.array(
-        [
-            [-0.7, 0.1, 0.2, 0.4],
-            [0.3, -0.2, 0.6, 0.1],
-            [0.4, 0.7, -0.5, 0.2],
-            [-0.3, 0.5, 0.8, -0.1],
-        ],
-        dtype=jnp.float32,
-    )
-    params = ModelParams(
-        embed_tokens=embed_tokens,
-        layers=[],
-        norm_weight=jnp.ones((4,), dtype=jnp.float32),
-        lm_head=None,
-    )
-    base_config = SimpleNamespace(
-        rms_norm_eps=1e-6,
-        decode_padded_gemm=False,
-        lm_head_decode_act_dtype="fp32",
-        lm_head_topk_impl="jax",
-    )
-    flashinfer_config = SimpleNamespace(
-        rms_norm_eps=1e-6,
-        decode_padded_gemm=False,
-        lm_head_decode_act_dtype="fp32",
-        lm_head_topk_impl="flashinfer",
-    )
-
-    expected = lm_head_token_ids_and_topk(
-        hidden,
-        params,
-        base_config,
-        is_prefill=False,
-        top_k=1,
-    )
-    actual = lm_head_token_ids_and_topk(
-        hidden,
-        params,
-        flashinfer_config,
-        is_prefill=False,
-        top_k=1,
-    )
-
-    np.testing.assert_array_equal(np.asarray(actual[0]), np.asarray(expected[0]))
-    np.testing.assert_allclose(np.asarray(actual[1]), np.asarray(expected[1]), rtol=0, atol=0)
-    np.testing.assert_array_equal(np.asarray(actual[2]), np.asarray(expected[2]))
-
-
-@pytest.mark.skipif(
-    not (_has_module("flashinfer") and _has_module("jax_tvm_ffi")),
-    reason="FlashInfer/JAX FFI optional dependencies are not installed",
-)
-@pytest.mark.skipif(
-    not _has_cuda_backend(),
-    reason="FlashInfer FFI test requires a CUDA JAX backend",
-)
-def test_backend_flashinfer_kv_append_opt_in_matches_canonical_update():
+def test_backend_rejects_removed_flashinfer_kv_append_opt_in():
     page_size = 4
     head_dim = 256
     layer_id = 1
@@ -430,27 +364,11 @@ def test_backend_flashinfer_kv_append_opt_in_matches_canonical_update():
         num_decode_tokens=0,
         positions=positions,
     )
-    query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
-    valid_mask = jnp.arange(positions.shape[1])[None, :] < query_lens[:, None]
-    expected_k, expected_v = update_kv_cache(
-        k_cache,
-        v_cache,
-        metadata.slot_mapping,
-        k,
-        v,
-        layer_idx=layer_id,
-        valid_mask=valid_mask,
-    )
-
-    actual = ServingOps(
-        Qwen3_5Config(full_attention_kv_append_impl="flashinfer")
-    ).write_kv(
-        layer_id=layer_id,
-        k=k,
-        v=v,
-        cache=KVCacheStorage(k_cache, v_cache),
-        metadata=metadata,
-    )
-
-    np.testing.assert_array_equal(np.asarray(actual.k_cache), np.asarray(expected_k))
-    np.testing.assert_array_equal(np.asarray(actual.v_cache), np.asarray(expected_v))
+    with pytest.raises(ValueError, match="full_attention_kv_append_impl"):
+        ServingOps(Qwen3_5Config(full_attention_kv_append_impl="flashinfer")).write_kv(
+            layer_id=layer_id,
+            k=k,
+            v=v,
+            cache=KVCacheStorage(k_cache, v_cache),
+            metadata=metadata,
+        )

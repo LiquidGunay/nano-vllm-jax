@@ -12,8 +12,6 @@ from typing import Protocol
 
 import jax
 import jax.numpy as jnp
-from jax import core
-
 from nanovllm_jax.cache import (
     AttentionMetadata,
     FullAttentionNHDKVCacheStorage,
@@ -78,77 +76,24 @@ def _full_attention_kv_cache_dtype(default_dtype, config=None):
 
 
 def _full_attention_kv_append_impl(config=None) -> str:
-    value = str(
-        getattr(config, "full_attention_kv_append_impl", "reference")
-        if config is not None
-        else "reference"
-    ).strip().lower()
-    if value in _OFF_CONFIG_VALUES or value in {"reference", "jax", "pure_jax"}:
+    value = _config_str(config, "full_attention_kv_append_impl", default="reference")
+    if value == "reference":
         return "reference"
-    if value in {"flashinfer", "flashinfer_paged", "paged_flashinfer"}:
-        return "flashinfer"
-    raise ValueError(
-        "Unknown full_attention_kv_append_impl="
-        f"{value!r}; expected reference or flashinfer"
-    )
+    raise ValueError("full_attention_kv_append_impl must be exactly 'reference'")
 
 
 def _full_attention_decode_impl(config=None) -> str:
-    value = str(
-        getattr(config, "full_attention_decode_impl", "reference")
-        if config is not None
-        else "reference"
-    ).strip().lower()
-    if value in _OFF_CONFIG_VALUES or value in {"reference", "jax", "pure_jax"}:
-        return "reference"
-    if value in {
-        "triton",
-        "triton_paged",
-        "paged_triton",
-        "triton_paged_decode",
-    }:
-        return "triton_paged"
-    if value in {
-        "triton_paged_fused_append",
-        "triton_fused_append",
-        "paged_triton_fused_append",
-        "triton_paged_append",
-    }:
-        return "triton_paged_fused_append"
-    if value in {
-        "flashinfer",
-        "flashinfer_paged",
-        "paged_flashinfer",
-        "flashinfer_paged_decode",
-    }:
-        return "flashinfer_paged"
-    raise ValueError(
-        "Unknown full_attention_decode_impl="
-        f"{value!r}; expected reference, triton_paged, triton_paged_fused_append, "
-        "or flashinfer_paged"
-    )
+    value = _config_str(config, "full_attention_decode_impl", default="reference")
+    if value in {"reference", "flashinfer_paged"}:
+        return value
+    raise ValueError("full_attention_decode_impl must be 'reference' or 'flashinfer_paged'")
 
 
 def _full_attention_prefill_impl(config=None) -> str:
-    value = str(
-        getattr(config, "full_attention_prefill_impl", "reference")
-        if config is not None
-        else "reference"
-    ).strip().lower()
-    if value in _OFF_CONFIG_VALUES or value in {"reference", "jax", "pure_jax"}:
-        return "reference"
-    if value in {
-        "triton",
-        "triton_packed",
-        "packed_triton",
-        "triton_paged",
-        "packed_paged_triton",
-    }:
-        return "triton_packed"
-    raise ValueError(
-        "Unknown full_attention_prefill_impl="
-        f"{value!r}; expected reference or triton_packed"
-    )
+    value = _config_str(config, "full_attention_prefill_impl", default="reference")
+    if value in {"reference", "triton_packed"}:
+        return value
+    raise ValueError("full_attention_prefill_impl must be 'reference' or 'triton_packed'")
 
 
 def _gdn_disable_fallbacks(config=None) -> bool:
@@ -173,63 +118,10 @@ def _raise_if_gdn_fallback_disabled(reason: str, config=None) -> None:
 
 
 def _gdn_packed_decode_impl(config=None) -> str:
-    value = _config_str(
-        config,
-        "gdn_packed_decode_impl",
-        default="off",
-    )
-    normalized = value.lower()
-    if normalized in _OFF_CONFIG_VALUES:
-        return "off"
-    if normalized in {"reference", "jax", "pure_jax"}:
-        return "reference"
-    if normalized in {"triton_fla", "fla_triton", "jax_triton", "triton"}:
-        return "triton_fla"
-    if normalized in {
-        "triton_fla_raw_gates",
-        "triton_raw_gates",
-        "fla_triton_raw_gates",
-        "triton_fla_raw",
-    }:
-        return "triton_fla_raw_gates"
-    if normalized in {
-        "triton_fla_raw_gates_tail",
-        "triton_raw_gates_tail",
-        "fla_triton_raw_gates_tail",
-        "triton_fla_raw_tail",
-        "triton_fla_tail_fused",
-    }:
-        return "triton_fla_raw_gates_tail"
-    if normalized in {
-        "triton_fla_raw_gates_split_tail",
-        "triton_raw_gates_split_tail",
-        "fla_triton_raw_gates_split_tail",
-        "triton_fla_split_tail",
-    }:
-        return "triton_fla_raw_gates_split_tail"
-    if normalized in {
-        "triton_fla_conv_raw_gates",
-        "triton_conv_raw_gates",
-        "fla_triton_conv_raw_gates",
-        "triton_fla_conv",
-    }:
-        return "triton_fla_conv_raw_gates"
-    if normalized in {
-        "triton_fla_conv_raw_gates_tail",
-        "triton_conv_raw_gates_tail",
-        "fla_triton_conv_raw_gates_tail",
-        "triton_fla_conv_tail",
-        "triton_fla_conv_tail_fused",
-    }:
-        return "triton_fla_conv_raw_gates_tail"
-    raise ValueError(
-        f"Unknown gdn_packed_decode_impl={value!r}; "
-        "expected off, reference, triton_fla, triton_fla_raw_gates, "
-        "triton_fla_raw_gates_tail, "
-        "triton_fla_raw_gates_split_tail, "
-        "triton_fla_conv_raw_gates, "
-        "or triton_fla_conv_raw_gates_tail"
-    )
+    value = _config_str(config, "gdn_packed_decode_impl", default="off")
+    if value in {"off", "reference"}:
+        return value
+    raise ValueError("gdn_packed_decode_impl must be 'off' or 'reference'")
 
 
 def gdn_packed_decode_impl(config=None) -> str:
@@ -242,21 +134,6 @@ def gdn_packed_decode_enabled(config=None) -> bool:
     return _gdn_packed_decode_impl(config) != "off"
 
 
-def gdn_packed_decode_conv_enabled(config=None) -> bool:
-    return _gdn_packed_decode_impl(config) in {
-        "triton_fla_conv_raw_gates",
-        "triton_fla_conv_raw_gates_tail",
-    }
-
-
-def gdn_packed_decode_tail_fused_enabled(config=None) -> bool:
-    return _gdn_packed_decode_impl(config) in {
-        "triton_fla_raw_gates_tail",
-        "triton_fla_raw_gates_split_tail",
-        "triton_fla_conv_raw_gates_tail",
-    }
-
-
 def gdn_packed_decode_max_batch(config=None) -> int | None:
     return _config_int_or_none(
         config,
@@ -265,57 +142,10 @@ def gdn_packed_decode_max_batch(config=None) -> int | None:
 
 
 def _gdn_prefill_post_conv_impl(config=None) -> str:
-    value = _config_str(
-        config,
-        "gdn_prefill_post_conv_impl",
-        default="off",
-    )
-    if value in _TRUE_CONFIG_VALUES:
-        return "reference"
-    normalized = value.lower()
-    if normalized in _OFF_CONFIG_VALUES:
-        return "off"
-    if normalized in {"reference", "jax", "pure_jax"}:
-        return "reference"
-    if normalized in {"reference_fla", "reference_fla_chunk32", "fla_reference"}:
-        return "reference_fla_chunk32"
-    if normalized in {
-        "reference_fla_packed",
-        "reference_fla_composed",
-        "fla_packed_reference",
-        "fla_composed_reference",
-    }:
-        return "reference_fla_packed"
-    if normalized in {
-        "triton_fla_wrapper",
-        "fla_wrapper",
-    }:
-        return "triton_fla_wrapper"
-    if normalized in {
-        "triton_fla_packed",
-        "fla_triton_packed",
-        "triton_fla_packed_reference",
-        "packed_triton_fla",
-    }:
-        return "triton_fla_packed"
-    if normalized in {
-        "triton_fla_padded",
-        "triton_fla_grid",
-        "fla_triton_padded",
-    }:
-        return "triton_fla_padded"
-    if normalized in {
-        "triton_fla_prep_bf16",
-        "fla_triton_prep_bf16",
-        "triton_prep_bf16",
-        "jax_triton_prep_bf16",
-    }:
-        return "triton_fla_prep_bf16"
-    raise ValueError(
-        f"Unknown gdn_prefill_post_conv_impl={value!r}; "
-        "expected off, reference, reference_fla_chunk32, reference_fla_packed, "
-        "triton_fla_padded, triton_fla_packed, or triton_fla_prep_bf16"
-    )
+    value = _config_str(config, "gdn_prefill_post_conv_impl", default="off")
+    if value in {"off", "reference", "triton_fla_padded"}:
+        return value
+    raise ValueError("gdn_prefill_post_conv_impl must be 'off', 'reference', or 'triton_fla_padded'")
 
 
 def gdn_prefill_post_conv_enabled(config=None) -> bool:
@@ -689,62 +519,12 @@ class ServingOpsProtocol(Protocol):
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         ...
 
-    def gated_delta_conv_packed_decode(
-        self,
-        mixed_qkv: jnp.ndarray,
-        a: jnp.ndarray,
-        b: jnp.ndarray,
-        decay: jnp.ndarray,
-        dt_bias: jnp.ndarray,
-        conv_state: jnp.ndarray,
-        conv_weight: jnp.ndarray,
-        conv_bias: jnp.ndarray | None,
-        recurrent_state: jnp.ndarray,
-        use_qk_l2norm_in_kernel: bool,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        ...
-
-    def gated_delta_conv_packed_projection_decode(
-        self,
-        packed_proj: jnp.ndarray,
-        decay: jnp.ndarray,
-        dt_bias: jnp.ndarray,
-        conv_state: jnp.ndarray,
-        conv_weight: jnp.ndarray,
-        conv_bias: jnp.ndarray | None,
-        recurrent_state: jnp.ndarray,
-        *,
-        qkv_dim: int,
-        use_qk_l2norm_in_kernel: bool,
-        norm_weight: jnp.ndarray | None = None,
-        rms_norm_eps: float = 1.0e-6,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        ...
-
-    def gated_delta_conv_packed_projection_decode_state_pool(
-        self,
-        packed_proj: jnp.ndarray,
-        decay: jnp.ndarray,
-        dt_bias: jnp.ndarray,
-        conv_state_pool: jnp.ndarray,
-        conv_weight: jnp.ndarray,
-        conv_bias: jnp.ndarray | None,
-        recurrent_state_pool: jnp.ndarray,
-        *,
-        qkv_dim: int,
-        linear_layer_idx: int,
-        use_qk_l2norm_in_kernel: bool,
-        norm_weight: jnp.ndarray,
-        valid_rows: jnp.ndarray | None = None,
-        rms_norm_eps: float = 1.0e-6,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        ...
 
 
 class ServingOps:
     """Operation dispatcher for the promoted serving path."""
 
-    name = "pure_jax"
+    name = "serving_manifest"
 
     def __init__(self, config=None):
         self.config = config
@@ -869,37 +649,8 @@ class ServingOps:
         cache: KVCacheStorage,
         metadata: AttentionMetadata,
     ) -> KVCacheStorage:
-        kv_append_impl = _full_attention_kv_append_impl(self.config)
-        flashinfer_kv_append_requested = kv_append_impl == "flashinfer"
-        if flashinfer_kv_append_requested:
-            if metadata.token_row_ids is not None:
-                raise ValueError(
-                    "FlashInfer KV append currently supports rectangular scheduled "
-                    "K/V tensors only; packed prefill must use the reference append "
-                    "or a decode path that owns its append boundary"
-                )
-            if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
-                raise ValueError(
-                    "FlashInfer KV append requires cache shape "
-                    "[num_layers, num_pages, page_size, num_kv_heads, head_dim]"
-                )
-            from nanovllm_jax.kernels.flashinfer_ffi import (
-                kv_append_paged_nhd_from_metadata,
-            )
-
-            k_cache_layer, v_cache_layer = kv_append_paged_nhd_from_metadata(
-                k,
-                v,
-                cache.k_cache[layer_id],
-                cache.v_cache[layer_id],
-                metadata,
-                page_size=int(cache.k_cache.shape[2]),
-            )
-            return KVCacheStorage(
-                cache.k_cache.at[layer_id].set(k_cache_layer),
-                cache.v_cache.at[layer_id].set(v_cache_layer),
-            )
-
+        if _full_attention_kv_append_impl(self.config) != "reference":
+            raise AssertionError("KV append policy was validated incorrectly")
         if metadata.token_row_ids is not None:
             actual_tokens = metadata.query_start_loc[-1].astype(jnp.int32)
             valid_mask = jnp.arange(metadata.slot_mapping.size, dtype=jnp.int32).reshape(
@@ -952,10 +703,7 @@ class ServingOps:
                     use_triton=prefill_impl == "triton_packed",
                 )
             if prefill_impl != "reference":
-                raise ValueError(
-                    "full_attention.prefill_impl=triton_packed requires packed prefill "
-                    "metadata with token_row_ids"
-                )
+                raise ValueError("triton_packed full-attention prefill requires packed metadata")
             if metadata.positions is None:
                 return paged_attention(
                     query=query,
@@ -984,62 +732,17 @@ class ServingOps:
             raise ValueError("metadata.positions is required for decode attention")
         if metadata.positions.shape[0] != metadata.block_tables.shape[0]:
             raise ValueError("positions and block_tables batch dimensions must match")
-        decode_impl = _full_attention_decode_impl(self.config)
-        if decode_impl == "triton_paged":
-            if query.shape[1] != 1:
-                raise ValueError(
-                    "full_attention.decode_impl=triton_paged supports only "
-                    "width-1 decode attention"
-                )
+        if _full_attention_decode_impl(self.config) == "flashinfer_paged" and query.shape[1] == 1:
             if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
-                raise ValueError(
-                    "full_attention.decode_impl=triton_paged requires cache "
-                    "shape [num_layers, num_pages, page_size, num_kv_heads, head_dim]"
-                )
-            from nanovllm_jax.kernels.full_attention_triton import (
-                paged_decode_attention_triton,
-            )
-
-            return paged_decode_attention_triton(
-                query=query,
-                k_cache_layer=cache.k_cache[layer_id],
-                v_cache_layer=cache.v_cache[layer_id],
-                block_table=metadata.block_tables,
-                seq_lens=metadata.seq_lens,
-                block_size=block_size,
-                scale=scale,
-                num_key_value_groups=num_key_value_groups,
-            )
-        if decode_impl == "flashinfer_paged" and query.shape[1] == 1:
-            if query.shape[1] != 1:
-                raise ValueError(
-                    "full_attention.decode_impl=flashinfer_paged supports only "
-                    "width-1 decode attention"
-                )
-            if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
-                raise ValueError(
-                    "full_attention.decode_impl=flashinfer_paged requires cache "
-                    "shape [num_layers, num_pages, page_size, num_kv_heads, head_dim]"
-                )
+                raise ValueError("FlashInfer decode requires NHD cache storage")
             if cache.k_cache.dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
-                raise ValueError(
-                    "full_attention.decode_impl=flashinfer_paged requires BF16/FP16 "
-                    "NHD KV cache; set full_attention_kv_cache_dtype to bf16 or fp16"
-                )
-            from nanovllm_jax.kernels.flashinfer_ffi import (
-                paged_decode_attention_gqa_nhd,
-            )
-            from nanovllm_jax.kernels.paged_attention import (
-                dense_block_tables_to_kv_indptr,
-                kv_last_page_len_from_seq_lens,
-            )
+                raise ValueError("FlashInfer decode requires BF16/FP16 NHD KV cache")
+            from nanovllm_jax.kernels.flashinfer_ffi import paged_decode_attention_gqa_nhd
+            from nanovllm_jax.kernels.paged_attention import dense_block_tables_to_kv_indptr, kv_last_page_len_from_seq_lens
 
-            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
-                metadata.block_tables,
-            )
-            query_for_kernel = query[:, 0].astype(cache.k_cache.dtype)
+            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(metadata.block_tables)
             out = paged_decode_attention_gqa_nhd(
-                query_for_kernel,
+                query[:, 0].astype(cache.k_cache.dtype),
                 cache.k_cache[layer_id],
                 cache.v_cache[layer_id],
                 kv_indptr,
@@ -1047,11 +750,7 @@ class ServingOps:
                 kv_last_page_len_from_seq_lens(metadata.seq_lens, block_size),
                 scale=scale,
             )
-            return out.reshape(
-                query.shape[0],
-                1,
-                query.shape[2] * query.shape[3],
-            )
+            return out.reshape(query.shape[0], 1, query.shape[2] * query.shape[3])
         return paged_attention_decode(
             query=query,
             k_cache=cache.k_cache,
@@ -1079,40 +778,21 @@ class ServingOps:
         num_key_value_groups: int,
         is_prefill: bool,
     ) -> tuple[KVCacheStorage, jnp.ndarray]:
-        decode_impl = _full_attention_decode_impl(self.config)
-        if not is_prefill and decode_impl == "flashinfer_paged" and query.shape[1] > 1:
+        if not is_prefill and _full_attention_decode_impl(self.config) == "flashinfer_paged":
             if metadata.positions is None:
                 raise ValueError("metadata.positions is required for FlashInfer decode attention")
             if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
-                raise ValueError(
-                    "full_attention.decode_impl=flashinfer_paged requires cache shape "
-                    "[num_layers, num_pages, page_size, num_kv_heads, head_dim]"
-                )
+                raise ValueError("FlashInfer decode requires NHD cache storage")
             if cache.k_cache.dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
-                raise ValueError(
-                    "full_attention.decode_impl=flashinfer_paged requires BF16/FP16 "
-                    "NHD KV cache; set full_attention_kv_cache_dtype to bf16 or fp16"
-                )
-            from nanovllm_jax.kernels.flashinfer_ffi import (
-                paged_decode_attention_with_kv_append_gqa_nhd,
-            )
-            from nanovllm_jax.kernels.paged_attention import (
-                dense_block_tables_to_kv_indptr,
-                kv_last_page_len_from_seq_lens,
-            )
+                raise ValueError("FlashInfer decode requires BF16/FP16 NHD KV cache")
+            from nanovllm_jax.kernels.flashinfer_ffi import paged_decode_attention_with_kv_append_gqa_nhd
+            from nanovllm_jax.kernels.paged_attention import dense_block_tables_to_kv_indptr, kv_last_page_len_from_seq_lens
 
-            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
-                metadata.block_tables,
-            )
+            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(metadata.block_tables)
+            k_cache, v_cache, outputs = cache.k_cache, cache.v_cache, []
             width = int(query.shape[1])
-            k_cache = cache.k_cache
-            v_cache = cache.v_cache
-            outputs = []
             for token_idx in range(width):
-                seq_lens_step = metadata.seq_lens - jnp.asarray(
-                    width - 1 - token_idx,
-                    dtype=metadata.seq_lens.dtype,
-                )
+                seq_lens_step = metadata.seq_lens - jnp.asarray(width - 1 - token_idx, dtype=metadata.seq_lens.dtype)
                 out, k_cache, v_cache = paged_decode_attention_with_kv_append_gqa_nhd(
                     query[:, token_idx].astype(cache.k_cache.dtype),
                     k[:, token_idx].astype(cache.k_cache.dtype),
@@ -1126,101 +806,10 @@ class ServingOps:
                     layer_id=layer_id,
                     scale=scale,
                 )
-                outputs.append(
-                    out.reshape(query.shape[0], 1, query.shape[2] * query.shape[3])
-                )
+                outputs.append(out.reshape(query.shape[0], 1, query.shape[2] * query.shape[3]))
             return KVCacheStorage(k_cache, v_cache), jnp.concatenate(outputs, axis=1)
-        if (
-            not is_prefill
-            and decode_impl == "flashinfer_paged"
-            and query.shape[1] == 1
-            and k.shape[1] == 1
-            and v.shape[1] == 1
-        ):
-            if metadata.positions is None:
-                raise ValueError("metadata.positions is required for FlashInfer decode attention")
-            if query.shape[1] != 1 or k.shape[1] != 1 or v.shape[1] != 1:
-                raise ValueError(
-                    "full_attention.decode_impl=flashinfer_paged supports only width-1 decode"
-                )
-            if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
-                raise ValueError(
-                    "full_attention.decode_impl=flashinfer_paged requires cache shape "
-                    "[num_layers, num_pages, page_size, num_kv_heads, head_dim]"
-                )
-            if cache.k_cache.dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
-                raise ValueError(
-                    "full_attention.decode_impl=flashinfer_paged requires BF16/FP16 "
-                    "NHD KV cache; set full_attention_kv_cache_dtype to bf16 or fp16"
-                )
-            from nanovllm_jax.kernels.flashinfer_ffi import (
-                paged_decode_attention_with_kv_append_gqa_nhd,
-            )
-            from nanovllm_jax.kernels.paged_attention import (
-                dense_block_tables_to_kv_indptr,
-                kv_last_page_len_from_seq_lens,
-            )
 
-            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
-                metadata.block_tables,
-            )
-            out, k_cache, v_cache = paged_decode_attention_with_kv_append_gqa_nhd(
-                query[:, 0].astype(cache.k_cache.dtype),
-                k[:, 0].astype(cache.k_cache.dtype),
-                v[:, 0].astype(cache.v_cache.dtype),
-                cache.k_cache,
-                cache.v_cache,
-                kv_indptr,
-                kv_indices,
-                kv_last_page_len_from_seq_lens(metadata.seq_lens, block_size),
-                metadata.positions.reshape(query.shape[0]).astype(jnp.int32),
-                layer_id=layer_id,
-                scale=scale,
-            )
-            return (
-                KVCacheStorage(k_cache, v_cache),
-                out.reshape(query.shape[0], 1, query.shape[2] * query.shape[3]),
-            )
-        if not is_prefill and decode_impl == "triton_paged_fused_append":
-            if metadata.positions is None:
-                raise ValueError("metadata.positions is required for fused decode attention")
-            if query.shape[1] != 1 or k.shape[1] != 1 or v.shape[1] != 1:
-                raise ValueError(
-                    "full_attention.decode_impl=triton_paged_fused_append "
-                    "supports only width-1 decode"
-                )
-            if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
-                raise ValueError(
-                    "full_attention.decode_impl=triton_paged_fused_append requires "
-                    "cache shape [num_layers, num_pages, page_size, num_kv_heads, head_dim]"
-                )
-            from nanovllm_jax.kernels.full_attention_triton import (
-                paged_decode_attention_with_kv_append_triton,
-            )
-
-            out, k_cache, v_cache = paged_decode_attention_with_kv_append_triton(
-                query=query,
-                new_k=k,
-                new_v=v,
-                k_cache=cache.k_cache,
-                v_cache=cache.v_cache,
-                block_table=metadata.block_tables,
-                seq_lens=metadata.seq_lens,
-                positions=metadata.positions,
-                layer_id=layer_id,
-                block_size=block_size,
-                scale=scale,
-                num_key_value_groups=num_key_value_groups,
-            )
-            return KVCacheStorage(k_cache, v_cache), out
-
-        cache_storage = self.write_kv(
-            layer_id=layer_id,
-            k=k,
-            v=v,
-            cache=cache,
-            metadata=metadata,
-        )
+        cache_storage = self.write_kv(layer_id, k, v, cache, metadata)
         out = self.attention(
             layer_id=layer_id,
             query=query,
@@ -1277,13 +866,9 @@ class ServingOps:
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         impl = _gdn_prefill_post_conv_impl(self.config)
         if impl == "off":
-            raise RuntimeError(
-                "gdn_prefill_post_conv_impl is off; use gated_delta_prefill"
-            )
+            raise RuntimeError("gdn_prefill_post_conv_impl is off; use gated_delta_prefill")
         if impl == "reference":
-            from nanovllm_jax.kernels.gdn_fla import (
-                gdn_post_conv_prefill_reference_from_decay,
-            )
+            from nanovllm_jax.kernels.gdn_fla import gdn_post_conv_prefill_reference_from_decay
 
             return gdn_post_conv_prefill_reference_from_decay(
                 conv_out,
@@ -1300,331 +885,6 @@ class ServingOps:
                 initial_state=initial_state,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
-
-        if impl == "reference_fla_chunk32":
-            from nanovllm_jax.kernels.gdn_fla import (
-                gdn_fla_prefill_chunk32_fp32_reference,
-                prepare_gdn_fla_prefill_kernel_inputs,
-                prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
-            )
-
-            if initial_state is None:
-                initial_state = jnp.zeros(
-                    (
-                        conv_out.shape[0],
-                        num_value_heads,
-                        value_head_dim,
-                        key_head_dim,
-                    ),
-                    dtype=jnp.float32,
-                )
-            query, key, value, gate, beta, seq_lens = (
-                prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
-                    conv_out,
-                    a,
-                    b,
-                    decay,
-                    dt_bias,
-                    valid_token_mask,
-                    num_key_heads=num_key_heads,
-                    num_value_heads=num_value_heads,
-                    key_head_dim=key_head_dim,
-                    value_head_dim=value_head_dim,
-                    normalize_qk=use_qk_l2norm_in_kernel,
-                )
-            )
-            prepared = prepare_gdn_fla_prefill_kernel_inputs(
-                query,
-                key,
-                value,
-                gate.astype(jnp.float32),
-                beta.astype(jnp.float32),
-                seq_lens,
-                initial_state.astype(jnp.float32),
-                qkv_dtype=_gdn_prefill_qkv_activation_jnp_dtype(self.config),
-            )
-            output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
-                prepared.query,
-                prepared.key,
-                prepared.value,
-                prepared.gate,
-                prepared.beta,
-                prepared.seq_lens,
-                prepared.initial_state,
-                chunk_size=chunk_size,
-            )
-            output = _cast_gdn_prefill_post_conv_output(output, self.config)
-            return output.transpose(0, 2, 1, 3), final_state
-
-        if impl == "reference_fla_packed":
-            from nanovllm_jax.kernels.gdn_fla import (
-                gdn_fla_prefill_varlen_composed_reference,
-                prepare_gdn_fla_prefill_kernel_inputs,
-                prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
-            )
-
-            if initial_state is None:
-                initial_state = jnp.zeros(
-                    (
-                        conv_out.shape[0],
-                        num_value_heads,
-                        value_head_dim,
-                        key_head_dim,
-                    ),
-                    dtype=jnp.float32,
-                )
-            query, key, value, gate, beta, seq_lens = (
-                prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
-                    conv_out,
-                    a,
-                    b,
-                    decay,
-                    dt_bias,
-                    valid_token_mask,
-                    num_key_heads=num_key_heads,
-                    num_value_heads=num_value_heads,
-                    key_head_dim=key_head_dim,
-                    value_head_dim=value_head_dim,
-                    normalize_qk=use_qk_l2norm_in_kernel,
-                )
-            )
-            prepared = prepare_gdn_fla_prefill_kernel_inputs(
-                query,
-                key,
-                value,
-                gate.astype(jnp.float32),
-                beta.astype(jnp.float32),
-                seq_lens,
-                initial_state.astype(jnp.float32),
-                qkv_dtype=_gdn_prefill_qkv_activation_jnp_dtype(self.config),
-            )
-            output, final_state = gdn_fla_prefill_varlen_composed_reference(
-                prepared.query,
-                prepared.key,
-                prepared.value,
-                prepared.gate,
-                prepared.beta,
-                prepared.seq_lens,
-                prepared.initial_state,
-                chunk_size=chunk_size,
-                vllm_like=_gdn_prefill_fla_vllm_like_enabled(),
-            )
-            output = _cast_gdn_prefill_post_conv_output(output, self.config)
-            return output.transpose(0, 2, 1, 3), final_state
-
-        if impl == "triton_fla_packed":
-            from nanovllm_jax.kernels.gdn_fla import (
-                pack_prepared_gdn_prefill_inputs,
-                prepare_gdn_fla_prefill_kernel_inputs,
-                prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
-                gdn_fla_prefill_chunk32_fp32_reference,
-                unpack_prepared_gdn_prefill_output,
-            )
-            try:
-                from nanovllm_jax.kernels.gdn_fla_triton import (
-                    gdn_fla_chunk_gated_delta_rule_packed_triton,
-                )
-            except (ImportError, ModuleNotFoundError, AttributeError):
-                gdn_fla_chunk_gated_delta_rule_packed_triton = None
-
-            if initial_state is None:
-                initial_state = jnp.zeros(
-                    (
-                        conv_out.shape[0],
-                        num_value_heads,
-                        value_head_dim,
-                        key_head_dim,
-                    ),
-                    dtype=jnp.float32,
-                )
-            query, key, value, gate, beta, seq_lens = (
-                prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
-                    conv_out,
-                    a,
-                    b,
-                    decay,
-                    dt_bias,
-                    valid_token_mask,
-                    num_key_heads=num_key_heads,
-                    num_value_heads=num_value_heads,
-                    key_head_dim=key_head_dim,
-                    value_head_dim=value_head_dim,
-                    normalize_qk=use_qk_l2norm_in_kernel,
-                )
-            )
-            prepared = prepare_gdn_fla_prefill_kernel_inputs(
-                query,
-                key,
-                value,
-                gate.astype(jnp.float32),
-                beta.astype(jnp.float32),
-                seq_lens,
-                initial_state.astype(jnp.float32),
-                qkv_dtype=_gdn_prefill_qkv_activation_jnp_dtype(self.config),
-            )
-            if isinstance(prepared.seq_lens, core.Tracer):
-                _raise_if_gdn_fallback_disabled(
-                    "triton_fla_packed requires concrete seq_lens for packed prefill",
-                    self.config,
-                )
-                output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
-                    prepared.query,
-                    prepared.key,
-                    prepared.value,
-                    prepared.gate,
-                    prepared.beta,
-                    prepared.seq_lens,
-                    prepared.initial_state,
-                    chunk_size=chunk_size,
-                )
-                output = _cast_gdn_prefill_post_conv_output(output, self.config)
-                return output.transpose(0, 2, 1, 3), final_state
-
-            if gdn_fla_chunk_gated_delta_rule_packed_triton is None:
-                _raise_if_gdn_fallback_disabled(
-                    "Triton FLA packed prefill kernel is unavailable",
-                    self.config,
-                )
-                output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
-                    prepared.query,
-                    prepared.key,
-                    prepared.value,
-                    prepared.gate,
-                    prepared.beta,
-                    prepared.seq_lens,
-                    prepared.initial_state,
-                    chunk_size=chunk_size,
-                )
-                output = _cast_gdn_prefill_post_conv_output(output, self.config)
-                return output.transpose(0, 2, 1, 3), final_state
-
-            packed_query, packed_key, packed_value, packed_gate, packed_beta, cu_seqlens = (
-                pack_prepared_gdn_prefill_inputs(
-                    prepared.query,
-                    prepared.key,
-                    prepared.value,
-                    prepared.gate,
-                    prepared.beta,
-                    prepared.seq_lens,
-                )
-            )
-            output, final_state = gdn_fla_chunk_gated_delta_rule_packed_triton(
-                packed_query,
-                packed_key,
-                packed_value,
-                packed_gate,
-                packed_beta,
-                cu_seqlens,
-                prepared.initial_state,
-                chunk_size=chunk_size,
-                # Q/K normalization was already applied during post-conv prep
-                # when requested; do not normalize the packed tensors again.
-                use_qk_l2norm_in_kernel=False,
-            )
-            output = unpack_prepared_gdn_prefill_output(
-                output,
-                cu_seqlens,
-                prepared.query.shape[1],
-            )
-            output = _cast_gdn_prefill_post_conv_output(output, self.config)
-            return output.transpose(0, 2, 1, 3), final_state
-
-        if impl == "triton_fla_wrapper":
-            from nanovllm_jax.kernels.gdn_fla import (
-                pack_prepared_gdn_prefill_inputs,
-                prepare_gdn_fla_prefill_kernel_inputs,
-                prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
-                unpack_prepared_gdn_prefill_output,
-                gdn_segmented_prefill_chunk32,
-            )
-
-            if initial_state is None:
-                initial_state = jnp.zeros(
-                    (
-                        conv_out.shape[0],
-                        num_value_heads,
-                        value_head_dim,
-                        key_head_dim,
-                    ),
-                    dtype=jnp.float32,
-                )
-            query, key, value, gate, beta, seq_lens = (
-                prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
-                    conv_out,
-                    a,
-                    b,
-                    decay,
-                    dt_bias,
-                    valid_token_mask,
-                    num_key_heads=num_key_heads,
-                    num_value_heads=num_value_heads,
-                    key_head_dim=key_head_dim,
-                    value_head_dim=value_head_dim,
-                    normalize_qk=use_qk_l2norm_in_kernel,
-                )
-            )
-            prepared = prepare_gdn_fla_prefill_kernel_inputs(
-                query,
-                key,
-                value,
-                gate.astype(jnp.float32),
-                beta.astype(jnp.float32),
-                seq_lens,
-                initial_state.astype(jnp.float32),
-                qkv_dtype=_gdn_prefill_qkv_activation_jnp_dtype(self.config),
-            )
-            if isinstance(prepared.seq_lens, core.Tracer):
-                _raise_if_gdn_fallback_disabled(
-                    "triton_fla_wrapper requires concrete seq_lens for packed prefill",
-                    self.config,
-                )
-                from nanovllm_jax.kernels.gdn_fla import (
-                    gdn_fla_prefill_chunk32_fp32_reference,
-                )
-
-                output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
-                    prepared.query,
-                    prepared.key,
-                    prepared.value,
-                    prepared.gate,
-                    prepared.beta,
-                    prepared.seq_lens,
-                    prepared.initial_state,
-                    chunk_size=chunk_size,
-                )
-                output = _cast_gdn_prefill_post_conv_output(output, self.config)
-                return output.transpose(0, 2, 1, 3), final_state
-
-            packed_query, packed_key, packed_value, packed_gate, packed_beta, cu_seqlens = (
-                pack_prepared_gdn_prefill_inputs(
-                    prepared.query,
-                    prepared.key,
-                    prepared.value,
-                    prepared.gate,
-                    prepared.beta,
-                    prepared.seq_lens,
-                )
-            )
-            output, final_state = gdn_segmented_prefill_chunk32(
-                packed_query,
-                packed_key,
-                packed_value,
-                packed_beta,
-                packed_gate,
-                cu_seqlens,
-                prepared.initial_state,
-                chunk_size=chunk_size,
-                # Q/K normalization was already applied during post-conv prep
-                # when requested; do not normalize the packed tensors again.
-                use_qk_l2norm_in_kernel=False,
-            )
-            output = unpack_prepared_gdn_prefill_output(
-                output,
-                cu_seqlens,
-                prepared.query.shape[1],
-            )
-            output = _cast_gdn_prefill_post_conv_output(output, self.config)
-            return output.transpose(0, 2, 1, 3), final_state
 
         if impl == "triton_fla_padded":
             from nanovllm_jax.kernels.gdn_fla import (
@@ -1757,81 +1017,6 @@ class ServingOps:
             output = _cast_gdn_prefill_post_conv_output(output, self.config)
             return output.transpose(0, 2, 1, 3), final_state
 
-        if impl == "triton_fla_prep_bf16":
-            from nanovllm_jax.kernels.gdn_fla import (
-                gdn_fla_prefill_chunk32_fp32_reference,
-                prepare_gdn_fla_prefill_kernel_inputs,
-                prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
-            )
-            try:
-                from nanovllm_jax.kernels.gdn_fla_triton import (
-                    gdn_post_conv_prep_bf16,
-                )
-            except (ImportError, ModuleNotFoundError, AttributeError):
-                gdn_post_conv_prep_bf16 = None
-
-            if initial_state is None:
-                initial_state = jnp.zeros(
-                    (
-                        conv_out.shape[0],
-                        num_value_heads,
-                        value_head_dim,
-                        key_head_dim,
-                    ),
-                    dtype=jnp.float32,
-                )
-            if valid_token_mask is None:
-                valid_token_mask = jnp.ones(conv_out.shape[:2], dtype=jnp.int32)
-            else:
-                valid_token_mask = valid_token_mask.astype(jnp.int32)
-            if gdn_post_conv_prep_bf16 is None:
-                _raise_if_gdn_fallback_disabled(
-                    "Triton BF16 GDN post-conv prep kernel is unavailable",
-                    self.config,
-                )
-                query, key, value, gate, beta, seq_lens = (
-                    prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
-                        conv_out,
-                        a,
-                        b,
-                        decay,
-                        dt_bias,
-                        valid_token_mask,
-                        num_key_heads=num_key_heads,
-                        num_value_heads=num_value_heads,
-                        key_head_dim=key_head_dim,
-                        value_head_dim=value_head_dim,
-                        normalize_qk=use_qk_l2norm_in_kernel,
-                    )
-                )
-            else:
-                query, key, value, gate, beta = gdn_post_conv_prep_bf16(
-                    conv_out,
-                    a,
-                    b,
-                    decay,
-                    dt_bias,
-                    valid_token_mask,
-                    num_key_heads=num_key_heads,
-                    num_value_heads=num_value_heads,
-                    key_head_dim=key_head_dim,
-                    value_head_dim=value_head_dim,
-                    normalize_qk=use_qk_l2norm_in_kernel,
-                )
-                seq_lens = valid_token_mask.sum(axis=1).astype(jnp.int32)
-            output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
-                query,
-                key,
-                value,
-                gate,
-                beta,
-                seq_lens,
-                initial_state.astype(jnp.float32),
-                chunk_size=chunk_size,
-            )
-            output = _cast_gdn_prefill_post_conv_output(output, self.config)
-            return output.transpose(0, 2, 1, 3), final_state
-
 
         raise AssertionError(f"Unhandled GDN post-conv prefill implementation {impl!r}")
 
@@ -1943,19 +1128,9 @@ class ServingOps:
                 return output[None, :, :, :], final_state, prefix_states
             return output[None, :, :, :], final_state
 
-        if impl in {
-            "reference",
-            "reference_fla_chunk32",
-            "reference_fla_packed",
-        }:
+        if impl == "reference":
             return reference_scan()
-
-        if impl not in {
-            "triton_fla_packed",
-            "triton_fla_wrapper",
-            "triton_fla_padded",
-            "triton_fla_prep_bf16",
-        }:
+        if impl != "triton_fla_padded":
             _raise_if_gdn_fallback_disabled(
                 f"{impl!r} does not support packed GDN prefill ABI",
                 self.config,
@@ -2083,488 +1258,31 @@ class ServingOps:
         norm_weight: jnp.ndarray | None = None,
         rms_norm_eps: float = 1.0e-6,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        impl = _gdn_packed_decode_impl(self.config)
-        packed_qkv_dtype = _gdn_packed_decode_qkv_activation_jnp_dtype(self.config)
-        if impl == "off":
-            raise RuntimeError(
-                "gdn_packed_decode_impl is off; use gated_delta_decode"
-            )
-        tail_fused = impl in {
-            "triton_fla_raw_gates_tail",
-            "triton_fla_raw_gates_split_tail",
-        }
-        if tail_fused and (z is None or norm_weight is None):
-            raise ValueError(
-                "tail-fused raw-gate packed GDN decode requires z and norm_weight"
-            )
+        if _gdn_packed_decode_impl(self.config) != "reference":
+            raise RuntimeError("gdn_packed_decode_impl is off; use gated_delta_decode")
+        from nanovllm_jax.kernels.gdn_fla import (
+            gdn_packed_decode_reference_from_decay,
+            prepare_gdn_packed_decode_reference_from_decay_inputs,
+        )
 
-        def tail_from_core(core_out: jnp.ndarray) -> jnp.ndarray:
-            assert z is not None
-            assert norm_weight is not None
-            batch = core_out.shape[0]
-            value_heads = initial_state.shape[1]
-            value_dim = initial_state.shape[2]
-            tail = core_out.transpose(0, 2, 1, 3).reshape(
-                batch,
-                value_heads,
-                value_dim,
+        mixed_qkv, a, b, decay, dt_bias, initial_state = (
+            prepare_gdn_packed_decode_reference_from_decay_inputs(
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                decay=decay,
+                dt_bias=dt_bias,
+                state=initial_state,
+                qkv_dtype=_gdn_packed_decode_qkv_activation_jnp_dtype(self.config),
             )
-            tail = tail.astype(jnp.float32)
-            variance = jnp.mean(jnp.square(tail), axis=-1, keepdims=True)
-            tail = tail * jax.lax.rsqrt(variance + float(rms_norm_eps))
-            tail = tail * norm_weight.astype(jnp.float32)
-            tail = tail * jax.nn.silu(
-                z.astype(jnp.bfloat16)
-                .astype(jnp.float32)
-                .reshape(batch, value_heads, value_dim)
-            )
-            return tail.reshape(batch, 1, value_heads * value_dim)
-
-        if impl == "reference":
-            from nanovllm_jax.kernels.gdn_fla import (
-                prepare_gdn_packed_decode_reference_from_decay_inputs,
-                gdn_packed_decode_reference_from_decay,
-            )
-
-            mixed_qkv, a, b, decay, dt_bias, initial_state = (
-                prepare_gdn_packed_decode_reference_from_decay_inputs(
-                    mixed_qkv=mixed_qkv,
-                    a=a,
-                    b=b,
-                    decay=decay,
-                    dt_bias=dt_bias,
-                    state=initial_state,
-                    qkv_dtype=packed_qkv_dtype,
-                )
-            )
-            return gdn_packed_decode_reference_from_decay(
-                mixed_qkv,
-                a,
-                b,
-                decay,
-                dt_bias,
-                initial_state,
-                qkv_dtype=packed_qkv_dtype,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            )
-
-
-        if impl in {
-            "triton_fla",
-            "triton_fla_raw_gates",
-            "triton_fla_raw_gates_tail",
-            "triton_fla_raw_gates_split_tail",
-        }:
-            pre_normalize_qk = _gdn_packed_decode_pre_normalize_qk(self.config)
-            if pre_normalize_qk and use_qk_l2norm_in_kernel:
-                # q/k are already normalized before entering the kernel. Leave the
-                # argument False so triton avoids redundant reductions.
-                use_qk_l2norm_in_kernel = False
-            elif not use_qk_l2norm_in_kernel:
-                raise ValueError(
-                    "Triton FLA packed GDN decode requires q/k l2norm; "
-                    "set gdn_packed_decode_pre_normalize_qk=True on the config "
-                    "to pre-normalize outside the kernel"
-                )
-            from nanovllm_jax.kernels.gdn_fla import (
-                gdn_packed_decode_pre_normalize_qk,
-                prepare_gdn_packed_decode_reference_from_decay_inputs,
-                gdn_packed_decode_reference_from_decay,
-            )
-
-            if pre_normalize_qk:
-                mixed_qkv = gdn_packed_decode_pre_normalize_qk(
-                    mixed_qkv,
-                    initial_state,
-                )
-            mixed_qkv, a, b, decay, dt_bias, initial_state = (
-                prepare_gdn_packed_decode_reference_from_decay_inputs(
-                    mixed_qkv=mixed_qkv,
-                    a=a,
-                    b=b,
-                    decay=decay,
-                    dt_bias=dt_bias,
-                    state=initial_state,
-                    qkv_dtype=jnp.bfloat16,
-                )
-            )
-
-            try:
-                if impl == "triton_fla_raw_gates_tail":
-                    from nanovllm_jax.kernels.gdn_fla_triton import (
-                        gdn_packed_decode_step_bf16_raw_gates_tail,
-                    )
-                elif impl == "triton_fla_raw_gates_split_tail":
-                    from nanovllm_jax.kernels.gdn_fla_triton import (
-                        gdn_decode_tail_rms_silu_bf16,
-                        gdn_packed_decode_step_bf16_raw_gates,
-                    )
-                elif impl == "triton_fla_raw_gates":
-                    from nanovllm_jax.kernels.gdn_fla_triton import (
-                        gdn_packed_decode_step_bf16_raw_gates,
-                    )
-                else:
-                    from nanovllm_jax.kernels.gdn_fla_triton import (
-                        gdn_packed_decode_step_bf16,
-                    )
-            except (ImportError, ModuleNotFoundError, AttributeError):
-                _raise_if_gdn_fallback_disabled(
-                    "Triton FLA packed decode kernel is unavailable",
-                    self.config,
-                )
-                core_out, new_state = gdn_packed_decode_reference_from_decay(
-                    mixed_qkv,
-                    a,
-                    b,
-                    decay,
-                    dt_bias,
-                    initial_state,
-                    qkv_dtype=jnp.bfloat16,
-                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                )
-                if tail_fused:
-                    return tail_from_core(core_out), new_state
-                return core_out, new_state
-
-            if impl == "triton_fla_raw_gates_tail":
-                assert z is not None
-                assert norm_weight is not None
-                return gdn_packed_decode_step_bf16_raw_gates_tail(
-                    mixed_qkv,
-                    a,
-                    b,
-                    decay,
-                    dt_bias,
-                    initial_state,
-                    z.astype(jnp.bfloat16),
-                    norm_weight.astype(jnp.float32),
-                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                    rms_norm_eps=float(rms_norm_eps),
-                )
-
-            if impl == "triton_fla_raw_gates_split_tail":
-                assert z is not None
-                assert norm_weight is not None
-                core_out, new_state = gdn_packed_decode_step_bf16_raw_gates(
-                    mixed_qkv,
-                    a,
-                    b,
-                    decay,
-                    dt_bias,
-                    initial_state,
-                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                )
-                return (
-                    gdn_decode_tail_rms_silu_bf16(
-                        core_out,
-                        z.astype(jnp.bfloat16),
-                        norm_weight.astype(jnp.float32),
-                        rms_norm_eps=float(rms_norm_eps),
-                    ),
-                    new_state,
-                )
-
-            if impl == "triton_fla_raw_gates":
-                return gdn_packed_decode_step_bf16_raw_gates(
-                    mixed_qkv,
-                    a,
-                    b,
-                    decay,
-                    dt_bias,
-                    initial_state,
-                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                )
-
-            gate = -decay * jax.nn.softplus(a + dt_bias)
-            beta = jax.nn.sigmoid(b)
-            return gdn_packed_decode_step_bf16(
-                mixed_qkv,
-                gate,
-                beta,
-                initial_state,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            )
-
-        raise AssertionError(f"Unhandled packed GDN decode implementation {impl!r}")
-
-    def gated_delta_conv_packed_decode(
-        self,
-        mixed_qkv: jnp.ndarray,
-        a: jnp.ndarray,
-        b: jnp.ndarray,
-        decay: jnp.ndarray,
-        dt_bias: jnp.ndarray,
-        conv_state: jnp.ndarray,
-        conv_weight: jnp.ndarray,
-        conv_bias: jnp.ndarray | None,
-        recurrent_state: jnp.ndarray,
-        use_qk_l2norm_in_kernel: bool,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        impl = _gdn_packed_decode_impl(self.config)
-        if impl not in {"triton_fla_conv_raw_gates", "triton_fla_conv_raw_gates_tail"}:
-            raise RuntimeError(
-                "gated_delta_conv_packed_decode is only enabled by "
-                "gdn_packed_decode_impl=triton_fla_conv_raw_gates or "
-                "triton_fla_conv_raw_gates_tail"
-            )
-        if not use_qk_l2norm_in_kernel:
-            raise ValueError("conv packed GDN decode requires q/k l2norm")
-
-        def reference() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-            from nanovllm_jax.layers import causal_conv1d_update
-            from nanovllm_jax.kernels.gdn_fla import (
-                gdn_packed_decode_pre_normalize_qk,
-                gdn_packed_decode_reference_from_decay,
-            )
-
-            conv_out_t, new_conv_state = causal_conv1d_update(
-                mixed_qkv[:, :, None],
-                conv_state,
-                conv_weight,
-                conv_bias,
-                "silu",
-            )
-            conv_out = gdn_packed_decode_pre_normalize_qk(
-                conv_out_t[:, :, 0].astype(jnp.float32),
-                recurrent_state,
-            )
-            out, new_recurrent_state = gdn_packed_decode_reference_from_decay(
-                conv_out,
-                a,
-                b,
-                decay,
-                dt_bias,
-                recurrent_state,
-                qkv_dtype=jnp.bfloat16,
-                use_qk_l2norm_in_kernel=False,
-            )
-            return out, new_conv_state, new_recurrent_state
-
-        try:
-            from nanovllm_jax.kernels.gdn_fla_triton import (
-                gdn_conv_packed_decode_step_bf16_raw_gates,
-            )
-        except (ImportError, ModuleNotFoundError, AttributeError):
-            _raise_if_gdn_fallback_disabled(
-                "Triton FLA conv+packed decode kernel is unavailable",
-                self.config,
-            )
-            return reference()
-
-        if conv_bias is None:
-            conv_bias = jnp.zeros((conv_weight.shape[0],), dtype=conv_weight.dtype)
-        try:
-            return gdn_conv_packed_decode_step_bf16_raw_gates(
-                mixed_qkv.astype(jnp.bfloat16),
-                a.astype(jnp.float32),
-                b.astype(jnp.float32),
-                decay.astype(jnp.float32),
-                dt_bias.astype(jnp.float32),
-                conv_state.astype(jnp.float32),
-                conv_weight.astype(jnp.float32),
-                conv_bias.astype(jnp.float32),
-                recurrent_state.astype(jnp.float32),
-            )
-        except Exception:
-            _raise_if_gdn_fallback_disabled(
-                "Triton FLA conv+packed decode kernel cannot handle this shape",
-                self.config,
-            )
-            return reference()
-
-    def gated_delta_conv_packed_projection_decode(
-        self,
-        packed_proj: jnp.ndarray,
-        decay: jnp.ndarray,
-        dt_bias: jnp.ndarray,
-        conv_state: jnp.ndarray,
-        conv_weight: jnp.ndarray,
-        conv_bias: jnp.ndarray | None,
-        recurrent_state: jnp.ndarray,
-        *,
-        qkv_dim: int,
-        use_qk_l2norm_in_kernel: bool,
-        norm_weight: jnp.ndarray | None = None,
-        rms_norm_eps: float = 1.0e-6,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        impl = _gdn_packed_decode_impl(self.config)
-        if impl not in {"triton_fla_conv_raw_gates", "triton_fla_conv_raw_gates_tail"}:
-            raise RuntimeError(
-                "gated_delta_conv_packed_projection_decode is only enabled by "
-                "gdn_packed_decode_impl=triton_fla_conv_raw_gates or "
-                "triton_fla_conv_raw_gates_tail"
-            )
-        if not use_qk_l2norm_in_kernel:
-            raise ValueError("conv packed GDN decode requires q/k l2norm")
-        tail_fused = impl == "triton_fla_conv_raw_gates_tail"
-        if tail_fused and norm_weight is None:
-            raise ValueError("tail-fused packed-projection GDN decode requires norm_weight")
-
-        def reference_core() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-            from nanovllm_jax.layers import causal_conv1d_update
-            from nanovllm_jax.kernels.gdn_fla import (
-                gdn_packed_decode_pre_normalize_qk,
-                gdn_packed_decode_reference_from_decay,
-            )
-
-            mixed_qkv = packed_proj[:, :qkv_dim]
-            value_heads = recurrent_state.shape[1]
-            a = packed_proj[:, qkv_dim : qkv_dim + value_heads].astype(jnp.float32)
-            b = packed_proj[:, qkv_dim + value_heads : qkv_dim + 2 * value_heads].astype(jnp.float32)
-            conv_out_t, new_conv_state = causal_conv1d_update(
-                mixed_qkv[:, :, None],
-                conv_state,
-                conv_weight,
-                conv_bias,
-                "silu",
-            )
-            conv_out = gdn_packed_decode_pre_normalize_qk(
-                conv_out_t[:, :, 0].astype(jnp.float32),
-                recurrent_state,
-            )
-            out, new_recurrent_state = gdn_packed_decode_reference_from_decay(
-                conv_out,
-                a,
-                b,
-                decay,
-                dt_bias,
-                recurrent_state,
-                qkv_dtype=jnp.bfloat16,
-                use_qk_l2norm_in_kernel=False,
-            )
-            return out, new_conv_state, new_recurrent_state
-
-        def reference() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-            core_out, new_conv_state, new_recurrent_state = reference_core()
-            if not tail_fused:
-                return core_out, new_conv_state, new_recurrent_state
-            assert norm_weight is not None
-            batch = packed_proj.shape[0]
-            value_heads = recurrent_state.shape[1]
-            value_dim = recurrent_state.shape[2]
-            z_offset = qkv_dim + 2 * value_heads
-            if packed_proj.shape[1] < z_offset + value_heads * value_dim:
-                raise ValueError("tail-fused packed-projection GDN decode requires full z region")
-            z = packed_proj[:, z_offset : z_offset + value_heads * value_dim].reshape(
-                batch,
-                value_heads,
-                value_dim,
-            )
-            tail = core_out.transpose(0, 2, 1, 3).reshape(batch, value_heads, value_dim)
-            tail = tail.astype(jnp.float32)
-            variance = jnp.mean(jnp.square(tail), axis=-1, keepdims=True)
-            tail = tail * jax.lax.rsqrt(variance + float(rms_norm_eps))
-            tail = tail * norm_weight.astype(jnp.float32)
-            tail = tail * jax.nn.silu(z.astype(jnp.float32))
-            return tail.reshape(batch, 1, value_heads * value_dim), new_conv_state, new_recurrent_state
-
-        try:
-            if tail_fused:
-                from nanovllm_jax.kernels.gdn_fla_triton import (
-                    gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail,
-                )
-            else:
-                from nanovllm_jax.kernels.gdn_fla_triton import (
-                    gdn_conv_packed_projection_decode_step_bf16_raw_gates,
-                )
-        except (ImportError, ModuleNotFoundError, AttributeError):
-            _raise_if_gdn_fallback_disabled(
-                "Triton FLA packed-projection conv+decode kernel is unavailable",
-                self.config,
-            )
-            return reference()
-
-        if conv_bias is None:
-            conv_bias = jnp.zeros((conv_weight.shape[0],), dtype=conv_weight.dtype)
-        try:
-            if tail_fused:
-                assert norm_weight is not None
-                return gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail(
-                    packed_proj.astype(jnp.bfloat16),
-                    decay.astype(jnp.float32),
-                    dt_bias.astype(jnp.float32),
-                    conv_state.astype(jnp.float32),
-                    conv_weight.astype(jnp.float32),
-                    conv_bias.astype(jnp.float32),
-                    recurrent_state.astype(jnp.float32),
-                    norm_weight.astype(jnp.float32),
-                    qkv_dim=int(qkv_dim),
-                    rms_norm_eps=float(rms_norm_eps),
-                )
-            return gdn_conv_packed_projection_decode_step_bf16_raw_gates(
-                packed_proj.astype(jnp.bfloat16),
-                decay.astype(jnp.float32),
-                dt_bias.astype(jnp.float32),
-                conv_state.astype(jnp.float32),
-                conv_weight.astype(jnp.float32),
-                conv_bias.astype(jnp.float32),
-                recurrent_state.astype(jnp.float32),
-                qkv_dim=int(qkv_dim),
-            )
-        except Exception:
-            _raise_if_gdn_fallback_disabled(
-                "Triton FLA packed-projection conv+decode kernel cannot handle this shape",
-                self.config,
-            )
-            return reference()
-
-    def gated_delta_conv_packed_projection_decode_state_pool(
-        self,
-        packed_proj: jnp.ndarray,
-        decay: jnp.ndarray,
-        dt_bias: jnp.ndarray,
-        conv_state_pool: jnp.ndarray,
-        conv_weight: jnp.ndarray,
-        conv_bias: jnp.ndarray | None,
-        recurrent_state_pool: jnp.ndarray,
-        *,
-        qkv_dim: int,
-        linear_layer_idx: int,
-        use_qk_l2norm_in_kernel: bool,
-        norm_weight: jnp.ndarray,
-        valid_rows: jnp.ndarray | None = None,
-        rms_norm_eps: float = 1.0e-6,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        impl = _gdn_packed_decode_impl(self.config)
-        if impl != "triton_fla_conv_raw_gates_tail":
-            raise RuntimeError(
-                "state-pool packed-projection GDN decode is only enabled by "
-                "gdn_packed_decode_impl=triton_fla_conv_raw_gates_tail"
-            )
-        if not use_qk_l2norm_in_kernel:
-            raise ValueError("state-pool conv packed GDN decode requires q/k l2norm")
-        if conv_bias is None:
-            conv_bias = jnp.zeros((conv_weight.shape[0],), dtype=conv_weight.dtype)
-
-        try:
-            from nanovllm_jax.kernels.gdn_fla_triton import (
-                gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail_state_pool,
-            )
-        except (ImportError, ModuleNotFoundError, AttributeError):
-            _raise_if_gdn_fallback_disabled(
-                "Triton FLA state-pool packed-projection conv+decode kernel is unavailable",
-                self.config,
-            )
-            raise
-
-        try:
-            return gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail_state_pool(
-                packed_proj.astype(jnp.bfloat16),
-                decay.astype(jnp.float32),
-                dt_bias.astype(jnp.float32),
-                conv_state_pool.astype(jnp.float32),
-                conv_weight.astype(jnp.float32),
-                conv_bias.astype(jnp.float32),
-                recurrent_state_pool.astype(jnp.float32),
-                norm_weight.astype(jnp.float32),
-                valid_rows,
-                qkv_dim=int(qkv_dim),
-                linear_layer_idx=int(linear_layer_idx),
-                rms_norm_eps=float(rms_norm_eps),
-            )
-        except Exception:
-            _raise_if_gdn_fallback_disabled(
-                "Triton FLA state-pool packed-projection conv+decode kernel cannot handle this shape",
-                self.config,
-            )
-            raise
+        )
+        return gdn_packed_decode_reference_from_decay(
+            mixed_qkv,
+            a,
+            b,
+            decay,
+            dt_bias,
+            initial_state,
+            qkv_dtype=_gdn_packed_decode_qkv_activation_jnp_dtype(self.config),
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )

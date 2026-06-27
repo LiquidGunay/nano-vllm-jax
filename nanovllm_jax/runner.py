@@ -2364,51 +2364,6 @@ class ModelRunner:
         )
 
 
-    def _logits_from_hidden(self, hidden: jnp.ndarray) -> jnp.ndarray:
-        hidden = self._final_norm_hidden(hidden)
-        return self._logits_from_normed_hidden(hidden)
-
-    def _logits_from_normed_hidden(self, hidden: jnp.ndarray) -> jnp.ndarray:
-        if self.params.lm_head is not None:
-            return jnp.dot(hidden, self.params.lm_head)
-        return jnp.dot(hidden, self.params.embed_tokens.T)
-
-    def _final_norm_hidden(self, hidden: jnp.ndarray) -> jnp.ndarray:
-        from nanovllm_jax.layers import rms_norm
-
-        return rms_norm(hidden, self.params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
-
-
-    @staticmethod
-
-    @staticmethod
-
-
-    @staticmethod
-
-
-    def _greedy_tokens_from_hidden(self, hidden: jnp.ndarray) -> jnp.ndarray:
-        from nanovllm_jax.layers import rms_norm
-
-        output_weight = self.params.lm_head if self.params.lm_head is not None else self.params.embed_tokens.T
-
-        def forward(hidden_arg, norm_weight_arg, output_weight_arg):
-            hidden_norm = rms_norm(hidden_arg, norm_weight_arg, self.config.rms_norm_eps).astype(jnp.float32)
-            logits = jnp.dot(hidden_norm, output_weight_arg)
-            return jnp.argmax(logits, axis=-1).astype(jnp.int32)
-
-        if getattr(self, "execution", "eager") in {"decode-jit", "jit"}:
-            if getattr(self, "_hidden_token_jit", None) is None:
-                self._hidden_token_jit = jax.jit(forward)
-            return self._hidden_token_jit(hidden, self.params.norm_weight, output_weight)
-        return forward(hidden, self.params.norm_weight, output_weight)
-
-    @staticmethod
-    def _last_query_activations(activations: jnp.ndarray, batch: ScheduledBatch, num_seqs: int) -> jnp.ndarray:
-        query_lens = batch.query_lens[:num_seqs]
-        gather_idx = jnp.clip(query_lens - 1, 0, activations.shape[1] - 1).astype(jnp.int32)
-        return activations[jnp.arange(num_seqs), gather_idx]
-
     def _run_main_and_sample(
         self,
         seqs: List[Sequence],
@@ -2710,7 +2665,7 @@ class ModelRunner:
             )
         elif use_greedy_token_fastpath and decode_burst_steps > 1 and carry_device_tokens:
             self._record_device_token_carry(
-                snapshot_batch,
+                batch,
                 output.activations[:, -1:],
                 active_rows=active_rows,
                 prefill_final_flags=prefill_final_flags,

@@ -74,7 +74,9 @@ and GDN hybrid state advance by the same committed prefix.
 5. [nanovllm_jax/scheduler.py](nanovllm_jax/scheduler.py) and [nanovllm_jax/block_manager.py](nanovllm_jax/block_manager.py) - work selection and cache pages.
 6. [nanovllm_jax/batch.py](nanovllm_jax/batch.py) - Python-to-JAX batch contract.
 7. [nanovllm_jax/runner.py](nanovllm_jax/runner.py) and [nanovllm_jax/executor.py](nanovllm_jax/executor.py) - persistent device state and compiled calls.
-8. [nanovllm_jax/model.py](nanovllm_jax/model.py), [nanovllm_jax/cache.py](nanovllm_jax/cache.py), and [nanovllm_jax/kernels](nanovllm_jax/kernels) - model math and low-level routes.
+8. [nanovllm_jax/model.py](nanovllm_jax/model.py) - parameter structure, layer loop, and forward entrypoints.
+9. [nanovllm_jax/projection.py](nanovllm_jax/projection.py), [nanovllm_jax/attention.py](nanovllm_jax/attention.py), [nanovllm_jax/gdn.py](nanovllm_jax/gdn.py), and [nanovllm_jax/lm_head.py](nanovllm_jax/lm_head.py) - the model math split by role.
+10. [nanovllm_jax/cache.py](nanovllm_jax/cache.py) and [nanovllm_jax/kernels](nanovllm_jax/kernels) - cache layout and low-level routes.
 
 ## Development
 

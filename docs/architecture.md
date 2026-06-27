@@ -51,8 +51,15 @@ arrays that the runner and executor consume.
 
 `ModelExecutor` owns JIT cache keys and calls into `model.forward_step`.
 
-`model.py` owns the Qwen3.5 layer loop and high-level attention, GDN, and
-LM-head helpers. Low-level promoted kernels live under `nanovllm_jax/kernels/`.
+`model.py` owns parameter structure, the Qwen3.5 layer loop, and the exported
+forward entrypoints. The math is split by role:
+
+- `projection.py`: packed linear projection policy and helpers,
+- `attention.py`: full-attention prefill/decode wrappers,
+- `gdn.py`: Gated DeltaNet projection, recurrence, and state handling,
+- `lm_head.py`: final norm, logits, greedy top-1, and temperature sampling.
+
+Low-level promoted kernels live under `nanovllm_jax/kernels/`.
 
 ## Invariant
 

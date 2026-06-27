@@ -35,10 +35,11 @@ bucket, and calls `ModelExecutor`. The executor runs the Qwen layer loop:
 ```text
 embed
 for each layer:
-  full attention -> Triton packed prefill
-  or GDN          -> Triton/FLA padded prefill
+  projection     -> packed helpers in projection.py
+  full attention -> attention.py, Triton packed prefill
+  or GDN          -> gdn.py, Triton/FLA padded prefill
   MLP
-LM head          -> Triton greedy top-1 when greedy
+LM head          -> lm_head.py, Triton greedy top-1 when greedy
 ```
 
 After the step, the scheduler records computed prefix blocks and matching GDN
