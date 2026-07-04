@@ -93,4 +93,6 @@ kernels:
       impl: "reference"
       qkv_dtype: "bf16"
 
-env: {}
+env:
+  NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE: "decode_rectangular"
+  NANO_VLLM_JAX_MANIFEST_WARMUP_EXPAND_DECODE_ROWS: "0"

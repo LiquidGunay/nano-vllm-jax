@@ -9814,26 +9814,34 @@ class ModelExecutor:
                 verify_query_start_loc = (
                     jnp.arange(row_count + 1, dtype=jnp.int32) * verify_width
                 )
+                packed_width = row_count * verify_width
+                verify_token_row_ids = jnp.broadcast_to(
+                    jnp.arange(row_count, dtype=jnp.int32)[:, None],
+                    (row_count, verify_width),
+                ).reshape((1, packed_width))
                 verify_batch = ScheduledBatch(
-                    tokens=verify_tokens_rows,
-                    positions=verify_positions_rows,
+                    tokens=verify_tokens_rows.reshape((1, packed_width)),
+                    positions=verify_positions_rows.reshape((1, packed_width)),
                     seq_ids=seq_ids,
                     query_start_loc=verify_query_start_loc,
-                    is_prefill=False,
-                    num_prefill_tokens=0,
-                    num_decode_tokens=row_count * verify_width,
+                    is_prefill=True,
+                    num_prefill_tokens=packed_width,
+                    num_decode_tokens=0,
                     block_tables=block_tables,
-                    seq_lens=seq_lens + verify_width - 1,
+                    seq_lens=seq_lens + verify_width,
+                    packed_prefill=True,
+                    token_row_ids=verify_token_row_ids,
                 )
                 verify_metadata = self.backend.build_attention_metadata(
                     positions=verify_batch.positions,
                     block_tables=verify_batch.block_tables,
                     seq_lens=verify_batch.seq_lens,
                     block_size=self.config.block_size,
-                    is_prefill=False,
+                    is_prefill=True,
                     query_start_loc=verify_batch.query_start_loc,
                     num_prefill_tokens=verify_batch.num_prefill_tokens,
                     num_decode_tokens=verify_batch.num_decode_tokens,
+                    token_row_ids=verify_batch.token_row_ids,
                     max_query_len=verify_width,
                 )
                 verify_kv_state = KVCacheState(
@@ -9860,6 +9868,25 @@ class ModelExecutor:
                     return_prefix_hybrid=True,
                     hybrid_state_layerwise=True,
                     backend=self.backend,
+                    prefill_prefix_kernel_scope="all",
+                )
+                prefix_shape = (row_count, verify_width)
+                hidden = hidden.reshape(prefix_shape + (hidden.shape[-1],))
+                prefix_hybrid_state = HybridLayerState(
+                    conv_state=(
+                        prefix_hybrid_state.conv_state.reshape(
+                            prefix_shape + prefix_hybrid_state.conv_state.shape[2:]
+                        )
+                        if prefix_hybrid_state.conv_state is not None
+                        else None
+                    ),
+                    recurrent_state=(
+                        prefix_hybrid_state.recurrent_state.reshape(
+                            prefix_shape + prefix_hybrid_state.recurrent_state.shape[2:]
+                        )
+                        if prefix_hybrid_state.recurrent_state is not None
+                        else None
+                    ),
                 )
 
                 hidden_norm = rms_norm(

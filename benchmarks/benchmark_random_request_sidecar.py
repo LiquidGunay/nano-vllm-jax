@@ -233,7 +233,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_arg_parser()
+    raw_argv = sys.argv[1:] if argv is None else argv
     args = parser.parse_args(argv)
+    args.decode_block_table_buckets_explicit = any(
+        value == "--decode-block-table-buckets"
+        or value.startswith("--decode-block-table-buckets=")
+        for value in raw_argv
+    )
 
     if args.min_input_tokens < 1 or args.max_input_tokens < args.min_input_tokens:
         parser.error("--max-input-tokens must be >= --min-input-tokens and both > 0")
@@ -880,6 +886,10 @@ def _build_jax_command(
     command_args.update(config_engine_overrides or {})
     if args.decode_block_table_buckets:
         command_args["decode_block_table_buckets"] = args.decode_block_table_buckets
+        if bool(getattr(args, "decode_block_table_buckets_explicit", False)):
+            command_args["startup_warmup_decode_block_table_buckets"] = (
+                args.decode_block_table_buckets
+            )
     if args.resident_decode_metadata:
         command_args["resident_decode_metadata"] = True
     if args.full_attention_kv_cache_dtype != "default":

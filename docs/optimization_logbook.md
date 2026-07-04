@@ -13904,3 +13904,202 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     next non-speculative long-decode gain needs a broader device-owned output
     boundary or an actual decode-kernel/graph-boundary improvement, not another
     host-sink prefetch tweak.
+
+#### Entry 324 - Packed-Prefix Row Verifier Uses Packed Prefill Kernels
+
+- date: 2026-06-27
+- trigger:
+  - user asked to continue MTP speed work, but only test candidates that can
+    actually cheapen target verification.
+- implementation:
+  - changed `mtp_k_packed_prefix_greedy_step_jit` from decode-shaped
+    rectangular verifier metadata to true packed-prefill metadata for the
+    current+draft target verifier tokens;
+  - the row verifier now flattens verifier rows into one packed prefill row,
+    supplies `token_row_ids`, sets `is_prefill=True`, and forces
+    `prefill_prefix_kernel_scope="all"` so both attention and GDN take their
+    prefix-kernel paths;
+  - changed runner selection so `mtp_verifier_impl=packed_prefix` uses the
+    row-state verifier by default even when resident decode metadata exists.
+    The resident-table verifier is now an explicit diagnostic/tuning route
+    selected by setting `NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE`.
+- verification:
+  - CUDA visibility smoke passed on A10G;
+  - `python -m py_compile nanovllm_jax/engine/model_runner.py nanovllm_jax/engine/model_executor.py tests/test_mtp_commit_semantics.py`;
+  - RAM-guarded CUDA pytest:
+    `tests/test_mtp_commit_semantics.py::test_packed_prefix_uses_explicit_verifier_route`
+    and
+    `tests/test_mtp_commit_semantics.py::test_packed_prefix_verifier_real_executor_accept_reject_and_partial`
+    passed. The real-executor test runs strict GDN fallback-disabled with
+    `gdn_prefill_post_conv_impl=triton_fla_padded`, matching the serving
+    kernel contract;
+  - RAM-guarded strict serving smoke:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_prefill_row_20260627/row_packed_prefix_b2_len8_smoke_r2.json`.
+    The profiled measured phase selected `verifier mode=mtp_k_packed_prefix`,
+    not the table verifier; steady full-batch verifier calls were about
+    `11.1 ms`, output throughput was `25.52 tok/s`, acceptance was `5/18`
+    draft tokens, and JIT cache growth was `0` (`14 -> 14`). The first smoke
+    attempt correctly failed the JIT-growth guard on an unrelated missing
+    B=1 prefill-table warmup key; the accepted artifact warms both `64` and
+    `128` startup prefill-token buckets.
+- interpretation:
+  - this is a route-level verification-cost reduction, not yet a broad speed
+    claim. The tiny smoke proves the selected serving route is the cheaper
+    row packed-prefill verifier and remains cache-stable, but its low
+    acceptance and short output length are not a representative speedup
+    benchmark. Broad/table/scan diagnostics remain intentionally skipped
+    unless they test a verifier boundary that is cheaper than the current
+    default.
+
+#### Entry 325 - Long MTP Verification Speedup Target
+
+- date: 2026-06-28
+- target:
+  - exact MTP speculative decoding should beat the same-manifest base vLLM
+    `random_large` denominator, not merely reach the older non-MTP JAX
+    `0.8x` milestone;
+  - the primary lane is fixed-B8 `random_large`, seed `1234`, with the stored
+    base vLLM denominator `1000.98 output tok/s` unless a fresh base-vLLM
+    artifact is captured on the same manifest;
+  - verifier cost must look like packed prefill over `k` verifier tokens, not
+    `k` independent decode steps.
+- constraints:
+  - all model-serving and benchmark experiments must run under the RAM guard
+    or the random sidecar's resource guard;
+  - unverified/forced-accept paths are allowed only as diagnostics and cannot
+    be used for speed claims;
+  - if exact MTP cannot beat base vLLM on Qwen3.5-0.8B, identify the concrete
+    bottleneck. If the bottleneck is model-size specific, test the same-family
+    2B/4B lane before calling it architectural.
+- research plan:
+  - compare the JAX verifier boundary with vLLM's current MTP speculative
+    implementation and any other serving framework implementation needed;
+  - prioritize moving verification, acceptance, KV/GDN state commit, and output
+    emission into a cheap packed verifier boundary instead of adding host
+    repair or sequential decode fallback.
+
+#### Entry 326 - MTP Long-Pass Bottleneck Check
+
+- date: 2026-06-28
+- target:
+  - fixed B8 `random_large`, seed `1234`, must beat the stored same-manifest
+    base vLLM denominator
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/b8_full_random_20260619/full_random_b8_sidecar_r1_vllm.json`
+    at `1000.98 output tok/s`;
+  - JAX no-MTP same manifest remains
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/b8_full_random_20260619/full_random_b8_sidecar_r1.json`
+    at about `770.12 output tok/s`.
+- implementation:
+  - added manifest-derived resident-table verifier warmup specs so generic
+    warmup can compile the exact `(rows, block_table_width, draft_width,
+    burst_groups, emit_bonus)` routes used by the measured run;
+  - added a no-bonus safety warmup row for each measured decode shape to avoid
+    boundary/tail JIT growth;
+  - fixed 2B/4B config selection so same-family size probes use the correct
+    Qwen3.5 preset;
+  - added optional MTP packed QKV/gate-up projections behind
+    `NANO_VLLM_JAX_MTP_PACKED_PROJECTIONS=1`; the default loader does not add
+    those extra leaves because the B8 compile-cost probe regressed badly.
+- key artifacts:
+  - best guarded B8 K2/B3 table verifier:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_longpass_20260628/table_k2_burst3_b8_random_large_r18_safetynobonus.json`,
+    `470.15 output tok/s`, acceptance `98.81%`, no measured JIT growth,
+    `61 -> 61`;
+  - K2/B2 comparison:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_longpass_20260628/table_k2_burst2_b8_random_large_r10.json`,
+    `434.25 output tok/s`, no measured JIT growth;
+  - K3/B4 and K3/B2 exact-spec B8 attempts were terminated by the sidecar RAM
+    guard at about `82%` system RAM, so the higher-amortization K needed for a
+    plausible B8 speedup does not currently compile safely on this A10G path;
+  - 2B B1 128x128 no-MTP control:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_longpass_20260628/qwen35_2b_b1_128_nomtp_r4_warm32.json`,
+    `74.31 output tok/s`;
+  - 2B B1 128x128 K2/B3 with the packed-MTP-projection experiment:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_longpass_20260628/qwen35_2b_b1_128_mtp_k2b3_r1_packedmtp.json`,
+    `78.79 output tok/s`, `1.06x` local JAX speedup, acceptance `81.63%`;
+  - 4B load/config probe reached correct tensor shapes after adding the 4B
+    preset, then failed on GPU memory during LM-head autotuning with a
+    `2.38 GiB` allocation request. Host RAM was not the blocker.
+- rejected probe:
+  - making MTP packed projections default reduced one 2B B1 measured path
+    slightly, but the comparable B8 direct run spent about `17 min` in warmup
+    without producing a JSON artifact and reached about `7 GiB` process RSS.
+    This is a compile-cost regression, so packed MTP projections remain
+    opt-in only.
+- conclusion:
+  - acceptance is not the B8 blocker: the best K2/B3 run accepts about `99%`
+    of proposed drafts and still reaches only `0.47x` of base vLLM and `0.61x`
+    of JAX no-MTP;
+  - K2/B3 cannot amortize target verification plus MTP draft regeneration on
+    the 0.8B model, while K3/B2 and K3/B4 exceed the guarded compile/memory
+    envelope. The current architectural bottleneck is the size of the compiled
+    resident-table verifier graph and the remaining per-burst target+MTP work,
+    not draft quality.
+
+#### Entry 327 - XLA-Guarded MTP Verification Follow-Up
+
+- date: 2026-06-29
+- trigger:
+  - user correctly pointed out that the previous K3/B4 stop was not
+    conclusive without trying lower-memory XLA flags and a longer compile
+    timeout.
+- implementation:
+  - validated the local JAX/XLA flag subset before long runs. This build
+    rejects the OpenXLA guidance memory-scheduler flags
+    `--xla_memory_scheduler=kBrkga` and
+    `--xla_latency_hiding_scheduler_rerun=5`, but accepts
+    `--xla_gpu_autotune_level={0,1}`,
+    `--xla_gpu_autotune_max_solutions=1`,
+    `--xla_gpu_enable_triton_gemm=false`,
+    `--xla_gpu_enable_analytical_sol_latency_estimator=false`, and
+    `--xla_gpu_enable_latency_hiding_scheduler=false`;
+  - changed manifest table-verifier safety warmup to include both bonus and
+    no-bonus burst-1 tail specs for the full configured draft width. Warming
+    every smaller tail width remains available behind
+    `NANO_VLLM_JAX_MANIFEST_WARMUP_MTP_TABLE_ALL_TAIL_WIDTHS=1`, but is not
+    the default because it adds compile pressure without being needed by the
+    fixed B8 random-large manifest;
+  - extended the real-executor resident-table verifier test to cover
+    `prefill_prefix_kernel`, `prefill_gdn_prefix_kernel`, and
+    `prefill_attention_kernel` target modes in addition to the default mode.
+- key artifacts:
+  - best current B8 random-large exact MTP result:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_longpass_20260628/table_k2_burst4_b8_random_large_r37_decode_reducedtail_final_jax.json`,
+    `560.81 output tok/s`, `6126` output tokens in `10.92 s`, acceptance
+    `98.82%`, no measured JIT growth (`61 -> 61`);
+  - previous K2/B3 result:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_longpass_20260628/table_k2_burst3_b8_random_large_r18_safetynobonus_jax.json`,
+    `470.15 output tok/s`, so K2/B4 is a real `1.19x` improvement over the
+    previous MTP point;
+  - K2/B4 with all tail widths warmed:
+    `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_longpass_20260628/table_k2_burst4_b8_random_large_r26_tailwarm_xlaflags_jax.json`,
+    `549.01 output tok/s`, no measured JIT growth, but `79` warmup JIT entries
+    and `397.34 s` warmup versus `61` entries and `247.04 s` after the
+    reduced-tail change.
+- failed guarded compile checks:
+  - K3/B4 `decode_rectangular` with accepted XLA memory flags and a 3-hour
+    timeout reached the RAM guard before measurement;
+  - `prefill_prefix_kernel`, `prefill_gdn_prefix_kernel`, and
+    `prefill_attention_kernel` all passed the tiny real-executor semantics
+    test, but B8 random-large K2/B4 warmup hit the free-memory guard before
+    measurement. Retrying GDN-only and attention-only modes with
+    `--xla_gpu_autotune_level=0` and reduced-tail warmup still hit the guard;
+  - K2/B6 and K2/B8 `decode_rectangular` both hit the free-memory guard under
+    `--xla_gpu_autotune_level=1`; level-0 retries also hit the guard.
+- verification:
+  - `python -m py_compile benchmarks/benchmark_jax_server_trace.py`;
+  - RAM-guarded CUDA pytest:
+    `tests/test_mtp_commit_semantics.py::test_packed_prefix_table_verifier_real_executor_updates_resident_table`
+    passed for all four target modes;
+  - final K2/B4 benchmark above passed with `--fail-on-jit-cache-growth`.
+- conclusion:
+  - XLA flags improve compile memory enough to move from K2/B3 to K2/B4, but
+    they do not make prefill-style resident-table verification or wider bursts
+    fit on this A10G envelope;
+  - the best exact MTP point is still only `0.56x` of stored base vLLM
+    (`1000.98 output tok/s`) and `0.73x` of stored JAX no-MTP
+    (`770.12 output tok/s`). The remaining blocker is now concrete: the
+    verifier graph that would make verification prefill-like or wider than
+    B4 does not compile within the guarded host-memory envelope, while the
+    largest fitting decode-rectangular verifier is still slower than base
+    decode on the 0.8B model.

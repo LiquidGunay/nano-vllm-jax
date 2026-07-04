@@ -61,6 +61,10 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "on", "True"}
 
 
+def _mtp_packed_projections_enabled() -> bool:
+    return _env_flag("NANO_VLLM_JAX_MTP_PACKED_PROJECTIONS")
+
+
 def _materialize_tied_lm_head_enabled(config: Qwen3_5Config | None = None) -> bool:
     """Materialize tied embeddings as a separate [hidden, vocab] LM-head leaf."""
     env_value = os.environ.get("NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD")
@@ -285,7 +289,7 @@ def _load_mtp_weights_from_reader(
     layers = []
     for i in range(config.mtp_num_hidden_layers):
         prefix = f"mtp.layers.{i}."
-        layers.append({
+        layer = {
             "q_proj": _to_jax_weight(reader, f"{prefix}self_attn.q_proj.weight", config, transpose=True),
             "k_proj": _to_jax_weight(reader, f"{prefix}self_attn.k_proj.weight", config, transpose=True),
             "v_proj": _to_jax_weight(reader, f"{prefix}self_attn.v_proj.weight", config, transpose=True),
@@ -298,7 +302,11 @@ def _load_mtp_weights_from_reader(
             "up_proj": _to_jax_weight(reader, f"{prefix}mlp.up_proj.weight", config, transpose=True),
             "down_proj": _to_jax_weight(reader, f"{prefix}mlp.down_proj.weight", config, transpose=True),
             "ffn_norm": _to_jax_weight(reader, f"{prefix}post_attention_layernorm.weight", config),
-        })
+        }
+        if _mtp_packed_projections_enabled():
+            _add_full_attention_decode_packed_qkv(layer)
+            _add_mlp_packed_gate_up(layer)
+        layers.append(layer)
 
     return MTPParams(
         eh_proj=_to_jax_weight(reader, "mtp.fc.weight", config, transpose=True),
@@ -590,7 +598,10 @@ def load_mtp_weights_from_hf(hf_weights: dict, config: Qwen3_5Config, verbose: b
         layer["up_proj"] = convert_tensor(mtp_weights[f"{prefix}mlp.up_proj.weight"]).T
         layer["down_proj"] = convert_tensor(mtp_weights[f"{prefix}mlp.down_proj.weight"]).T
         layer["ffn_norm"] = convert_tensor(mtp_weights[f"{prefix}post_attention_layernorm.weight"])
-        
+        if _mtp_packed_projections_enabled():
+            _add_full_attention_decode_packed_qkv(layer)
+            _add_mlp_packed_gate_up(layer)
+
         layers.append(layer)
     
     # Final norm (mtp.norm.weight) - NO shift for Qwen3.5

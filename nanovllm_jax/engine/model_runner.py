@@ -1375,6 +1375,64 @@ class CanonicalModelRunner:
         summary["batch_size_buckets"] = list(batch_buckets)
         summary["decode_block_table_buckets"] = [int(width) for width in decode_block_table_buckets]
         row_prefill_buckets = tuple(getattr(self.config, "prefill_buckets", ()) or ())
+
+        def _warmup_shapes_from_env(name: str, width: int) -> tuple[tuple[int, ...], ...]:
+            raw = os.environ.get(name, "").strip()
+            if not raw:
+                return ()
+            shapes: list[tuple[int, ...]] = []
+            for item in raw.split(";"):
+                item = item.strip()
+                if not item:
+                    continue
+                parts = tuple(int(part) for part in item.replace("x", ":").split(":"))
+                if len(parts) != width:
+                    raise ValueError(
+                        f"{name} entries must have {width} integer fields, got {item!r}"
+                    )
+                shapes.append(parts)
+            return tuple(dict.fromkeys(shapes))
+
+        prefill_warmup_shapes = _warmup_shapes_from_env(
+            "NANO_VLLM_JAX_PREFILL_WARMUP_SHAPES",
+            3,
+        )
+        decode_warmup_shapes = _warmup_shapes_from_env(
+            "NANO_VLLM_JAX_DECODE_WARMUP_SHAPES",
+            2,
+        )
+        prefill_slot_carry_warmup_shapes = _warmup_shapes_from_env(
+            "NANO_VLLM_JAX_PREFILL_SLOT_CARRY_WARMUP_SHAPES",
+            3,
+        )
+        mtp_table_warmup_specs = _warmup_shapes_from_env(
+            "NANO_VLLM_JAX_MTP_TABLE_WARMUP_SPECS",
+            5,
+        )
+        mtp_table_warmup_specs_by_shape: dict[tuple[int, int], tuple[tuple[int, int, int], ...]] = {}
+        if mtp_table_warmup_specs:
+            grouped_specs: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+            for rows, block_table_width, draft_width, burst_groups, emit_bonus in mtp_table_warmup_specs:
+                grouped_specs.setdefault(
+                    (int(rows), int(block_table_width)),
+                    [],
+                ).append((int(draft_width), int(burst_groups), int(emit_bonus)))
+            mtp_table_warmup_specs_by_shape = {
+                shape: tuple(dict.fromkeys(specs))
+                for shape, specs in grouped_specs.items()
+            }
+        if prefill_warmup_shapes:
+            summary["prefill_shape_buckets"] = [list(shape) for shape in prefill_warmup_shapes]
+        if prefill_slot_carry_warmup_shapes:
+            summary["prefill_slot_carry_shape_buckets"] = [
+                list(shape) for shape in prefill_slot_carry_warmup_shapes
+            ]
+        if decode_warmup_shapes:
+            summary["decode_shape_buckets"] = [list(shape) for shape in decode_warmup_shapes]
+        if mtp_table_warmup_specs:
+            summary["mtp_table_warmup_specs"] = [
+                list(shape) for shape in mtp_table_warmup_specs
+            ]
         use_greedy_token_fastpath = bool(
             getattr(
                 self,
@@ -1465,6 +1523,48 @@ class CanonicalModelRunner:
             "True",
         }:
             prefill_seed_mtp1 = False
+        if seed_mtp1 and not (prefill_warmup_shapes or decode_warmup_shapes) and os.environ.get(
+            "NANO_VLLM_JAX_MTP_WARM_FULL_BUCKETS",
+            "0",
+        ) in {"1", "true", "yes", "on", "True"}:
+            configured_prefill_buckets = tuple(
+                int(bucket)
+                for bucket in (
+                    tuple(getattr(self.config, "prefill_token_buckets", ()) or ())
+                    or tuple(getattr(self.config, "prefill_buckets", ()) or ())
+                )
+            )
+            configured_batch_buckets = tuple(
+                int(bucket)
+                for bucket in (tuple(getattr(self.config, "batch_size_buckets", ()) or ()))
+            )
+            configured_decode_buckets = tuple(
+                int(bucket)
+                for bucket in (
+                    tuple(getattr(self.config, "decode_block_table_buckets", ()) or ())
+                )
+            )
+            prefill_buckets = tuple(
+                sorted(set(prefill_buckets) | set(configured_prefill_buckets))
+            )
+            batch_buckets = tuple(
+                sorted(set(batch_buckets) | set(configured_batch_buckets))
+            )
+            decode_block_table_buckets = tuple(
+                sorted(set(decode_block_table_buckets) | set(configured_decode_buckets))
+            )
+            sorted_batch_buckets = tuple(sorted(int(bucket) for bucket in batch_buckets))
+            padded_decode_buckets = {
+                bucket
+                for index, bucket in enumerate(sorted_batch_buckets)
+                if (sorted_batch_buckets[index - 1] + 1 if index > 0 else 1) < bucket
+            }
+            summary["mtp_warm_full_buckets"] = True
+            summary["prefill_buckets"] = list(prefill_buckets)
+            summary["batch_size_buckets"] = list(batch_buckets)
+            summary["decode_block_table_buckets"] = [
+                int(width) for width in decode_block_table_buckets
+            ]
         greedy_decode_burst_steps = max(
             1,
             _config_or_env_int(
@@ -1498,10 +1598,22 @@ class CanonicalModelRunner:
             )
         )
 
-        for prefill_len in prefill_buckets:
+        if prefill_warmup_shapes:
+            prefill_shape_iter = tuple(
+                (int(token_bucket), int(batch_size), int(block_width))
+                for token_bucket, batch_size, block_width in prefill_warmup_shapes
+            )
+        else:
+            prefill_shape_iter = tuple(
+                (int(prefill_len), int(batch_size), int(self.max_blocks_per_seq))
+                for prefill_len in prefill_buckets
+                for batch_size in prefill_warmup_batch_buckets
+            )
+
+        for prefill_len, batch_size, prefill_block_width in prefill_shape_iter:
             if self.execution != "jit":
                 break
-            for batch_size in prefill_warmup_batch_buckets:
+            for _single_shape in (None,):
                 prefill_seed_for_batch = prefill_seed_mtp1 and (
                     mtp_max_active_rows <= 0 or int(batch_size) <= mtp_max_active_rows
                 )
@@ -1529,18 +1641,44 @@ class CanonicalModelRunner:
                 if packed_prefill_layout and row_prefill_buckets:
                     max_row_tokens = int(max(row_prefill_buckets))
                     max_reachable_tokens = int(batch_size) * max_row_tokens
-                    if int(prefill_len) > max_reachable_tokens:
+                    token_buckets_for_guard = tuple(
+                        sorted(
+                            set(int(bucket) for bucket in prefill_buckets)
+                            | {
+                                int(shape[0])
+                                for shape in prefill_warmup_shapes
+                            }
+                        )
+                    )
+                    if token_buckets_for_guard:
+                        max_reachable_bucket = next(
+                            (
+                                bucket
+                                for bucket in token_buckets_for_guard
+                                if bucket >= max_reachable_tokens
+                            ),
+                            token_buckets_for_guard[-1],
+                        )
+                    else:
+                        max_reachable_bucket = max_reachable_tokens
+                    if int(prefill_len) > max_reachable_bucket:
                         summary["prefill_skipped"].append(
                             {
                                 "batch_size": int(batch_size),
                                 "query_len": int(prefill_len),
                                 "max_row_tokens": max_row_tokens,
                                 "max_reachable_tokens": max_reachable_tokens,
+                                "max_reachable_bucket": max_reachable_bucket,
                                 "reason": "packed_token_bucket_exceeds_row_bucket_capacity",
                             }
                         )
                         continue
-                batch = self._dummy_batch(batch_size=batch_size, query_len=prefill_len, is_prefill=True)
+                batch = self._dummy_batch(
+                    batch_size=batch_size,
+                    query_len=prefill_len,
+                    is_prefill=True,
+                    max_blocks_per_seq=prefill_block_width,
+                )
                 hybrid_state = init_hybrid_state(self.config, batch_size=batch_size, dtype=self.config.get_dtype())
                 if use_prefill_slot_carry_table and not prefill_seed_for_batch:
                     hybrid_slot_ids = jnp.arange(int(batch_size), dtype=jnp.int32)
@@ -1642,9 +1780,52 @@ class CanonicalModelRunner:
                             "route": "forward_step_sampled_token_ids_jit:prefill",
                         }
                     )
+                if (
+                    prefill_seed_for_batch
+                    and use_prefill_slot_carry_table
+                    and (int(prefill_len), int(batch_size), int(prefill_block_width))
+                    in prefill_slot_carry_warmup_shapes
+                ):
+                    hybrid_slot_ids = jnp.arange(int(batch_size), dtype=jnp.int32)
+                    batch.hybrid_slot_ids_host = tuple(range(int(batch_size)))
+                    slot_output = self.executor.forward_prefill_token_ids_slot_carry_table_jit(
+                        batch,
+                        cache_storage=self.cache_storage,
+                        hybrid_state_table=self._hybrid_state_table,
+                        hybrid_slot_ids=hybrid_slot_ids,
+                        prefill_final_flags=self._prefill_final_flags_device(batch),
+                        resident_last_tokens=self._resident_last_tokens,
+                    )
+                    _block_until_ready(slot_output.activations)
+                    self.cache_storage = slot_output.cache_storage
+                    self._hybrid_state_table = slot_output.hybrid_state
+                    if slot_output.resident_last_tokens is not None:
+                        self._resident_last_tokens = slot_output.resident_last_tokens
+                    summary["prefill_runs"].append(
+                        {
+                            "batch_size": int(batch_size),
+                            "query_len": int(prefill_len),
+                            "tokens_shape": list(batch.tokens.shape),
+                            "block_tables_shape": list(batch.block_tables.shape),
+                            "num_prefill_tokens": int(batch.num_prefill_tokens),
+                            "route": "forward_prefill_token_ids_slot_carry_table_jit:prefill-final",
+                        }
+                    )
 
-        for batch_size in decode_warmup_batch_buckets:
-            for block_table_width in decode_block_table_buckets:
+        if decode_warmup_shapes:
+            decode_shape_iter = tuple(
+                (int(batch_size), int(block_table_width))
+                for batch_size, block_table_width in decode_warmup_shapes
+            )
+        else:
+            decode_shape_iter = tuple(
+                (int(batch_size), int(block_table_width))
+                for batch_size in decode_warmup_batch_buckets
+                for block_table_width in decode_block_table_buckets
+            )
+
+        for batch_size, block_table_width in decode_shape_iter:
+            for _single_shape in (None,):
                 batch = self._dummy_batch(
                     batch_size=batch_size,
                     query_len=1,
@@ -1947,6 +2128,10 @@ class CanonicalModelRunner:
                         )
                         _record_decode_warmup(output, "forward_step_jit:decode")
                 if warm_decode_mtp and self.num_speculative_tokens >= 1:
+                    minimal_mtp_warmup = os.environ.get(
+                        "NANO_VLLM_JAX_MTP_WARMUP_MINIMAL",
+                        "0",
+                    ) in {"1", "true", "yes", "on", "True"}
                     warm_unverified_fused_append = _unverified_mtp_append_enabled(
                         getattr(self, "config", None),
                         "mtp_unverified_fused_append",
@@ -2008,24 +2193,9 @@ class CanonicalModelRunner:
                                 "forward_step_token_ids_mtp_draft_jit:decode",
                             )
                         continue
-                    seed_output = self.executor.forward_step_jit(
-                        batch,
-                        cache_storage=self.cache_storage,
-                        hybrid_state=init_hybrid_state(
-                            self.config,
-                            batch_size=batch_size,
-                            dtype=self.config.get_dtype(),
-                        ),
-                        return_hidden=True,
-                        return_hidden_with_logits=False,
-                        last_logits_only=True,
-                    )
-                    _record_decode_warmup(
-                        seed_output,
-                        "forward_step_jit:decode-mtp-seed-or-repair",
-                    )
-                    if self.num_speculative_tokens == 1:
-                        reuse_seed_output = self.executor.forward_step_jit(
+                    draft_len = max(1, int(getattr(self, "num_speculative_tokens", 1) or 1))
+                    if not minimal_mtp_warmup:
+                        seed_output = self.executor.forward_step_jit(
                             batch,
                             cache_storage=self.cache_storage,
                             hybrid_state=init_hybrid_state(
@@ -2034,40 +2204,56 @@ class CanonicalModelRunner:
                                 dtype=self.config.get_dtype(),
                             ),
                             return_hidden=True,
-                            return_hidden_with_logits=True,
+                            return_hidden_with_logits=False,
                             last_logits_only=True,
                         )
                         _record_decode_warmup(
-                            reuse_seed_output,
-                            "forward_step_jit:decode-mtp-reuse-main",
+                            seed_output,
+                            "forward_step_jit:decode-mtp-seed-or-repair",
                         )
-                    dummy_hidden = jnp.zeros(
-                        (int(batch_size), 1, int(self.config.hidden_size)),
-                        dtype=self.config.get_dtype(),
-                    )
-                    hidden_tokens = self._greedy_tokens_from_hidden(dummy_hidden)
-                    _block_until_ready(hidden_tokens)
-                    dummy_seed_hidden = self._hidden_for_mtp(dummy_hidden)
-                    draft_len = max(1, int(getattr(self, "num_speculative_tokens", 1) or 1))
-                    dummy_tokens = jnp.zeros((int(batch_size), 1), dtype=jnp.int32)
-                    dummy_positions = jnp.ones((int(batch_size), 1), dtype=jnp.int32)
-                    draft_output = self._mtp1_draft_chain(
-                        hidden_state=dummy_seed_hidden,
-                        token_ids=dummy_tokens,
-                        positions=dummy_positions,
-                        draft_len=draft_len,
-                    )
-                    _block_until_ready(draft_output)
-                    summary["decode_runs"].append(
-                        {
-                            "batch_size": int(batch_size),
-                            "tokens_shape": [int(batch_size), 1],
-                            "block_tables_shape": list(batch.block_tables.shape),
-                            "num_decode_tokens": int(batch.num_decode_tokens),
-                            "route": "mtp1_seed_helpers:decode",
-                            "decode_steps": 1,
-                        }
-                    )
+                        if self.num_speculative_tokens == 1:
+                            reuse_seed_output = self.executor.forward_step_jit(
+                                batch,
+                                cache_storage=self.cache_storage,
+                                hybrid_state=init_hybrid_state(
+                                    self.config,
+                                    batch_size=batch_size,
+                                    dtype=self.config.get_dtype(),
+                                ),
+                                return_hidden=True,
+                                return_hidden_with_logits=True,
+                                last_logits_only=True,
+                            )
+                            _record_decode_warmup(
+                                reuse_seed_output,
+                                "forward_step_jit:decode-mtp-reuse-main",
+                            )
+                        dummy_hidden = jnp.zeros(
+                            (int(batch_size), 1, int(self.config.hidden_size)),
+                            dtype=self.config.get_dtype(),
+                        )
+                        hidden_tokens = self._greedy_tokens_from_hidden(dummy_hidden)
+                        _block_until_ready(hidden_tokens)
+                        dummy_seed_hidden = self._hidden_for_mtp(dummy_hidden)
+                        dummy_tokens = jnp.zeros((int(batch_size), 1), dtype=jnp.int32)
+                        dummy_positions = jnp.ones((int(batch_size), 1), dtype=jnp.int32)
+                        draft_output = self._mtp1_draft_chain(
+                            hidden_state=dummy_seed_hidden,
+                            token_ids=dummy_tokens,
+                            positions=dummy_positions,
+                            draft_len=draft_len,
+                        )
+                        _block_until_ready(draft_output)
+                        summary["decode_runs"].append(
+                            {
+                                "batch_size": int(batch_size),
+                                "tokens_shape": [int(batch_size), 1],
+                                "block_tables_shape": list(batch.block_tables.shape),
+                                "num_decode_tokens": int(batch.num_decode_tokens),
+                                "route": "mtp1_seed_helpers:decode",
+                                "decode_steps": 1,
+                            }
+                        )
                     mtp_hybrid_state = init_hybrid_state(
                         self.config,
                         batch_size=batch_size,
@@ -2177,8 +2363,12 @@ class CanonicalModelRunner:
                         use_packed_prefix_warmup
                         and hasattr(self.executor, "mtp_k_packed_prefix_greedy_step_jit")
                     )
+                    use_packed_prefix_table_opt_in = bool(
+                        os.environ.get("NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE", "").strip()
+                    )
                     use_packed_prefix_table_warmup = (
                         use_packed_prefix_warmup
+                        and use_packed_prefix_table_opt_in
                         and bool(getattr(self, "resident_decode_metadata", False))
                         and getattr(self, "_hybrid_state_table", None) is not None
                         and self._hybrid_state_table.conv_state is not None
@@ -2233,6 +2423,37 @@ class CanonicalModelRunner:
                                     "mtp_k_packed_prefix_table_greedy_step_jit:"
                                     f"{route_suffix}:burst{warm_burst_groups}"
                                 ),
+                            )
+                        return table_output
+
+                    def _warm_packed_prefix_table_specs(
+                        warm_batch: ScheduledBatch,
+                        *,
+                        next_positions_arg: jnp.ndarray,
+                        route_prefix: str,
+                    ):
+                        specs = mtp_table_warmup_specs_by_shape.get(
+                            (
+                                int(warm_batch.tokens.shape[0]),
+                                int(warm_batch.block_tables.shape[1]),
+                            ),
+                            (),
+                        )
+                        table_output = None
+                        for draft_width, burst_groups_arg, emit_bonus_int in specs:
+                            if draft_width < 1:
+                                continue
+                            table_output = _warm_packed_prefix_table_verifier(
+                                warm_batch,
+                                draft_width=int(draft_width),
+                                next_positions_arg=next_positions_arg,
+                                route_suffix=(
+                                    f"{route_prefix}-exact-k{int(draft_width)}-"
+                                    f"burst{int(burst_groups_arg)}-"
+                                    f"{'bonus' if int(emit_bonus_int) else 'no-bonus'}"
+                                ),
+                                emit_bonus=bool(emit_bonus_int),
+                                burst_groups_arg=int(burst_groups_arg),
                             )
                         return table_output
                     if (
@@ -2347,12 +2568,19 @@ class CanonicalModelRunner:
                             )
                         if use_packed_prefix_warmup:
                             if use_packed_prefix_table_warmup:
-                                output = _warm_packed_prefix_table_verifier(
-                                    batch,
-                                    draft_width=1,
-                                    next_positions_arg=next_positions,
-                                    route_suffix="decode",
-                                )
+                                if mtp_table_warmup_specs_by_shape:
+                                    output = _warm_packed_prefix_table_specs(
+                                        batch,
+                                        next_positions_arg=next_positions,
+                                        route_prefix="decode",
+                                    )
+                                else:
+                                    output = _warm_packed_prefix_table_verifier(
+                                        batch,
+                                        draft_width=1,
+                                        next_positions_arg=next_positions,
+                                        route_suffix="decode",
+                                    )
                             else:
                                 output = self.executor.mtp_k_packed_prefix_greedy_step_jit(
                                     batch,
@@ -2531,13 +2759,20 @@ class CanonicalModelRunner:
                         ):
                             if use_packed_prefix_warmup:
                                 if use_packed_prefix_table_warmup:
-                                    output = _warm_packed_prefix_table_verifier(
-                                        batch,
-                                        draft_width=draft_len,
-                                        next_positions_arg=next_positions,
-                                        route_suffix="decode",
-                                    )
-                                    if draft_len > 1:
+                                    if mtp_table_warmup_specs_by_shape:
+                                        output = _warm_packed_prefix_table_specs(
+                                            batch,
+                                            next_positions_arg=next_positions,
+                                            route_prefix="decode",
+                                        )
+                                    else:
+                                        output = _warm_packed_prefix_table_verifier(
+                                            batch,
+                                            draft_width=draft_len,
+                                            next_positions_arg=next_positions,
+                                            route_suffix="decode",
+                                        )
+                                    if draft_len > 1 and not mtp_table_warmup_specs_by_shape:
                                         if mtp_burst_groups > 1:
                                             _warm_packed_prefix_table_verifier(
                                                 batch,
@@ -2611,6 +2846,8 @@ class CanonicalModelRunner:
                     if (
                         draft_len > 1
                         and use_generic_k_warmup
+                        and not minimal_mtp_warmup
+                        and not mtp_table_warmup_specs_by_shape
                         and int(batch_size) > 1
                         and (
                             hasattr(self.executor, "mtp_k_decode_greedy_step_jit")
@@ -7663,6 +7900,9 @@ class CanonicalModelRunner:
             (seq.num_tokens + burst_emit_tokens) % self.block_size == 0
             for seq in mtp_seqs
         )
+        use_packed_prefix_table_opt_in = bool(
+            os.environ.get("NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE", "").strip()
+        )
         burst_fits_completion_budget = all(
             seq.num_completion_tokens + burst_emit_tokens <= seq.max_tokens
             for seq in mtp_seqs
@@ -7674,6 +7914,7 @@ class CanonicalModelRunner:
         packed_prefix_burst_groups = 1
         if (
             use_packed_prefix_verifier
+            and use_packed_prefix_table_opt_in
             and mtp_burst_groups > 1
             and bool(getattr(self, "resident_decode_metadata", False))
             and getattr(self, "_hybrid_state_table", None) is not None
@@ -7755,6 +7996,7 @@ class CanonicalModelRunner:
         )
         use_packed_prefix_table_verifier = (
             use_packed_prefix_verifier
+            and use_packed_prefix_table_opt_in
             and bool(getattr(self, "resident_decode_metadata", False))
             and getattr(self, "_hybrid_state_table", None) is not None
             and self._hybrid_state_table.conv_state is not None

@@ -466,6 +466,362 @@ def _build_sampling_params(
     )
 
 
+def _shape_env_value(shapes: list[tuple[int, ...]]) -> str:
+    return ";".join(":".join(str(int(part)) for part in shape) for shape in shapes)
+
+
+def _parse_shape_ints(value: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in value.replace("x", ":").replace(",", ":").split(":") if part.strip())
+
+
+def _manifest_mtp_table_warmup_specs(
+    prompt_rows: list[dict[str, Any]],
+    output_lengths: list[int],
+    args: argparse.Namespace,
+    config: Any,
+) -> dict[str, Any]:
+    """Record table-verifier shapes from an optimistic MTP dry schedule."""
+    from nanovllm_jax.engine.scheduler import Scheduler
+    from nanovllm_jax.engine.sequence import SamplingParams, Sequence
+
+    draft_budget = max(0, int(getattr(args, "num_speculative_tokens", 0) or 0))
+    burst_budget = max(1, int(getattr(args, "mtp_burst_groups", 1) or 1))
+    if draft_budget <= 0:
+        return {"enabled": False, "specs": [], "env": ""}
+
+    scheduler = Scheduler(config)
+    for index, (row, output_len) in enumerate(zip(prompt_rows, output_lengths)):
+        scheduler.add(
+            Sequence(
+                [int(token) for token in row["input_ids"]],
+                SamplingParams(
+                    temperature=float(args.temperature),
+                    top_p=float(args.top_p),
+                    top_k=int(args.sampling_top_k),
+                    max_tokens=int(output_len),
+                    ignore_eos=True,
+                ),
+                seq_id=index,
+            )
+        )
+
+    block_size = int(getattr(config, "block_size", 16) or 16)
+    relax_bonus_boundary = os.environ.get(
+        "NANO_VLLM_JAX_MTP_RELAX_BONUS_BOUNDARY",
+        "0",
+    ) in {"1", "true", "yes", "on", "True"}
+    draft_by_seq_id: dict[int, int] = {}
+    specs: set[tuple[int, int, int, int, int]] = set()
+    events: list[dict[str, Any]] = []
+    max_steps = (
+        sum(int(row["prompt_length"]) + int(length) for row, length in zip(prompt_rows, output_lengths))
+        + 16
+    )
+    steps = 0
+    while not scheduler.is_finished():
+        steps += 1
+        if steps > max_steps:
+            raise RuntimeError("dry MTP warmup-spec scheduler exceeded safety step limit")
+        seqs, batch = scheduler.schedule()
+        if batch.is_prefill:
+            query_lens = [int(length) for length in (batch.query_lens_host or ())[: len(seqs)]]
+            final_flags = batch.prefill_final_flags[: len(seqs)]
+            generated: list[int | list[int]] = [
+                0 if bool(final_flags[row]) else []
+                for row in range(len(seqs))
+            ]
+            scheduler.postprocess(seqs, generated, prefill_chunk_lengths=query_lens)
+            for row, seq in enumerate(seqs):
+                if bool(final_flags[row]) and seq.temperature == 0 and seq.num_completion_tokens + 1 < seq.max_tokens:
+                    draft_by_seq_id[int(seq.seq_id)] = draft_budget
+                else:
+                    draft_by_seq_id.pop(int(seq.seq_id), None)
+            continue
+
+        rows = list(range(len(seqs)))
+        admitted_rows = [
+            row
+            for row, seq in enumerate(seqs)
+            if bool(getattr(seq, "mtp_admitted", False))
+        ]
+        fused_rows = [
+            row
+            for row in admitted_rows
+            if draft_by_seq_id.get(int(seqs[row].seq_id), 0) > 0
+        ]
+        generated = [0 for _ in seqs]
+        if fused_rows == rows and rows:
+            draft_len = min(
+                draft_budget,
+                min(draft_by_seq_id.get(int(seq.seq_id), draft_budget) for seq in seqs),
+            )
+            remaining_tokens = [
+                max(0, int(seq.max_tokens - seq.num_completion_tokens))
+                for seq in seqs
+            ]
+            min_remaining = min(remaining_tokens) if remaining_tokens else 0
+            emit_bonus = True
+            if min_remaining <= 0:
+                scheduler.postprocess(seqs, generated)
+                continue
+            bonus_boundary_no_bonus = (
+                not relax_bonus_boundary
+                and any((seq.num_tokens + draft_len + 1) % block_size == 0 for seq in seqs)
+            )
+            if min_remaining < draft_len + 1 or bonus_boundary_no_bonus:
+                draft_len = min(draft_len, min_remaining)
+                emit_bonus = False
+            if draft_len > 0:
+                burst_emit_tokens = burst_budget * (draft_len + 1)
+                burst_fits_completion_budget = all(
+                    seq.num_completion_tokens + burst_emit_tokens <= seq.max_tokens
+                    for seq in seqs
+                )
+                burst_fits_with_final_bonus_clamp = all(
+                    seq.num_completion_tokens + burst_emit_tokens - 1 <= seq.max_tokens
+                    for seq in seqs
+                )
+                burst_final_bonus_boundary = (
+                    not relax_bonus_boundary
+                    and any((seq.num_tokens + burst_emit_tokens) % block_size == 0 for seq in seqs)
+                )
+                burst_groups = 1
+                if (
+                    emit_bonus
+                    and burst_budget > 1
+                    and (burst_fits_completion_budget or burst_fits_with_final_bonus_clamp)
+                    and not burst_final_bonus_boundary
+                ):
+                    burst_groups = burst_budget
+                physical_rows = int(batch.tokens.shape[0])
+                block_table_width = int(batch.block_tables.shape[1])
+                spec = (
+                    physical_rows,
+                    block_table_width,
+                    int(draft_len),
+                    int(burst_groups),
+                    1 if emit_bonus else 0,
+                )
+                specs.add(spec)
+                emitted_per_row = min(
+                    burst_groups * (draft_len + (1 if emit_bonus else 0)),
+                    min_remaining,
+                )
+                generated = [[0] * emitted_per_row for _ in seqs]
+                events.append(
+                    {
+                        "rows": physical_rows,
+                        "block_table_width": block_table_width,
+                        "draft_len": int(draft_len),
+                        "burst_groups": int(burst_groups),
+                        "emit_bonus": bool(emit_bonus),
+                        "emitted_per_row": int(emitted_per_row),
+                    }
+                )
+        scheduler.postprocess(seqs, generated)
+        for seq, row_generated in zip(seqs, generated):
+            seq_id = int(seq.seq_id)
+            emitted = len(row_generated) if isinstance(row_generated, list) else 1
+            if (
+                seq.status.name != "FINISHED"
+                and bool(getattr(seq, "mtp_admitted", False))
+                and seq.temperature == 0
+                and emitted > 0
+                and seq.num_completion_tokens < seq.max_tokens
+            ):
+                draft_by_seq_id[seq_id] = draft_budget
+            else:
+                draft_by_seq_id.pop(seq_id, None)
+
+    sorted_specs = sorted(specs)
+    return {
+        "enabled": True,
+        "source": "optimistic_mtp_dry_scheduler",
+        "dry_steps": steps,
+        "specs": sorted_specs,
+        "events": events[:64],
+        "event_count": len(events),
+        "env": _shape_env_value(sorted_specs),
+    }
+
+
+def _manifest_warmup_shapes(
+    prompt_rows: list[dict[str, Any]],
+    output_lengths: list[int],
+    args: argparse.Namespace,
+    config: Any,
+) -> dict[str, Any]:
+    from nanovllm_jax.engine.scheduler import Scheduler
+    from nanovllm_jax.engine.sequence import SamplingParams, Sequence
+
+    scheduler = Scheduler(config)
+    for index, (row, output_len) in enumerate(zip(prompt_rows, output_lengths)):
+        sampling = SamplingParams(
+            temperature=float(args.temperature),
+            top_p=float(args.top_p),
+            top_k=int(args.sampling_top_k),
+            max_tokens=int(output_len),
+            ignore_eos=True,
+        )
+        scheduler.add(
+            Sequence(
+                [int(token) for token in row["input_ids"]],
+                sampling,
+                seq_id=index,
+            )
+        )
+
+    prefill_shapes: set[tuple[int, int, int]] = set()
+    prefill_slot_carry_shapes: set[tuple[int, int, int]] = set()
+    prefill_step_shapes: list[tuple[int, int, int]] = []
+    decode_shapes: set[tuple[int, int]] = set()
+    max_steps = sum(int(row["prompt_length"]) + int(length) for row, length in zip(prompt_rows, output_lengths)) + 16
+    steps = 0
+    while not scheduler.is_finished():
+        steps += 1
+        if steps > max_steps:
+            raise RuntimeError("dry warmup-shape scheduler exceeded safety step limit")
+        seqs, batch = scheduler.schedule()
+        if batch.is_prefill:
+            prefill_shape = (
+                int(batch.tokens.shape[1]),
+                int(batch.block_tables.shape[0]),
+                int(batch.block_tables.shape[1]),
+            )
+            prefill_shapes.add(prefill_shape)
+            prefill_step_shapes.append(prefill_shape)
+            slot_carry_mode = os.environ.get(
+                "NANO_VLLM_JAX_MANIFEST_WARMUP_PREFILL_SLOT_CARRY_MODE",
+                "edges",
+            ).strip().lower()
+            if slot_carry_mode == "all" or (
+                slot_carry_mode == "final"
+                and any(bool(flag) for flag in batch.prefill_final_flags[: len(seqs)])
+            ):
+                prefill_slot_carry_shapes.add(prefill_shape)
+            query_lens = [int(length) for length in (batch.query_lens_host or ())[: len(seqs)]]
+            generated = [
+                0 if (batch.prefill_is_final is not None and bool(batch.prefill_is_final[row])) else []
+                for row in range(len(seqs))
+            ]
+            scheduler.postprocess(seqs, generated, prefill_chunk_lengths=query_lens)
+        else:
+            decode_shapes.add(
+                (
+                    int(batch.tokens.shape[0]),
+                    int(batch.block_tables.shape[1]),
+                )
+            )
+            scheduler.postprocess(seqs, [0 for _ in seqs])
+
+    if (
+        str(getattr(args, "speculative_method", "none")).lower() == "mtp"
+        and int(getattr(args, "num_speculative_tokens", 0) or 0) > 0
+    ):
+        if prefill_step_shapes and not prefill_slot_carry_shapes:
+            prefill_slot_carry_shapes.add(prefill_step_shapes[0])
+            prefill_slot_carry_shapes.add(prefill_step_shapes[-1])
+        widths = {int(width) for _, width in decode_shapes}
+        if os.environ.get("NANO_VLLM_JAX_MANIFEST_WARMUP_INCLUDE_CONFIG_WIDTHS", "0") in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "True",
+        }:
+            widths.update(
+                int(width)
+                for width in getattr(config, "decode_block_table_buckets", ()) or ()
+                if int(width) > 0
+            )
+        extra_widths = _parse_shape_ints(
+            os.environ.get("NANO_VLLM_JAX_MANIFEST_WARMUP_EXTRA_DECODE_WIDTHS", "")
+        )
+        widths.update(width for width in extra_widths if width > 0)
+        if not widths:
+            widths.add(int(getattr(config, "max_blocks_per_seq", 1) or 1))
+        expand_decode_rows = os.environ.get(
+            "NANO_VLLM_JAX_MANIFEST_WARMUP_EXPAND_DECODE_ROWS",
+            "1",
+        ) in {"1", "true", "yes", "on", "True"}
+        if expand_decode_rows:
+            max_rows = int(
+                getattr(config, "max_num_seqs", args.max_num_seqs)
+                or args.max_num_seqs
+            )
+            for batch_size in range(1, max_rows + 1):
+                for width in widths:
+                    decode_shapes.add((batch_size, width))
+
+    mtp_table_specs = {"enabled": False, "specs": [], "env": ""}
+    if (
+        str(getattr(args, "speculative_method", "none")).lower() == "mtp"
+        and int(getattr(args, "num_speculative_tokens", 0) or 0) > 0
+        and os.environ.get(
+            "NANO_VLLM_JAX_MANIFEST_WARMUP_MTP_TABLE_SPECS",
+            "1",
+        ) in {"1", "true", "yes", "on", "True"}
+    ):
+        mtp_table_specs = _manifest_mtp_table_warmup_specs(
+            prompt_rows,
+            output_lengths,
+            args,
+            config,
+        )
+        if (
+            mtp_table_specs.get("enabled")
+            and os.environ.get(
+                "NANO_VLLM_JAX_MANIFEST_WARMUP_MTP_TABLE_SAFETY_NO_BONUS",
+                "1",
+            ) in {"1", "true", "yes", "on", "True"}
+        ):
+            draft_budget = max(1, int(getattr(args, "num_speculative_tokens", 1) or 1))
+            spec_set = {
+                tuple(int(part) for part in spec)
+                for spec in mtp_table_specs.get("specs", [])
+            }
+            warm_all_tail_widths = os.environ.get(
+                "NANO_VLLM_JAX_MANIFEST_WARMUP_MTP_TABLE_ALL_TAIL_WIDTHS",
+                "0",
+            ) in {"1", "true", "yes", "on", "True"}
+            safety_tail_widths = (
+                range(1, draft_budget + 1)
+                if warm_all_tail_widths
+                else (draft_budget,)
+            )
+            for batch_size, block_table_width in decode_shapes:
+                for draft_width in safety_tail_widths:
+                    for emit_bonus in (0, 1):
+                        spec_set.add(
+                            (
+                                int(batch_size),
+                                int(block_table_width),
+                                int(draft_width),
+                                1,
+                                int(emit_bonus),
+                            )
+                        )
+            sorted_specs = sorted(spec_set)
+            mtp_table_specs["specs"] = sorted_specs
+            mtp_table_specs["env"] = _shape_env_value(sorted_specs)
+            mtp_table_specs["safety_tail_specs"] = True
+            mtp_table_specs["safety_all_tail_widths"] = warm_all_tail_widths
+
+    return {
+        "enabled": True,
+        "source": "dry_scheduler",
+        "dry_steps": steps,
+        "prefill_shapes": sorted(prefill_shapes),
+        "prefill_slot_carry_shapes": sorted(prefill_slot_carry_shapes),
+        "decode_shapes": sorted(decode_shapes),
+        "decode_widths": sorted({int(width) for _, width in decode_shapes}),
+        "prefill_env": _shape_env_value(sorted(prefill_shapes)),
+        "prefill_slot_carry_env": _shape_env_value(sorted(prefill_slot_carry_shapes)),
+        "decode_env": _shape_env_value(sorted(decode_shapes)),
+        "mtp_table_warmup_specs": mtp_table_specs,
+    }
+
+
 def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     from transformers import AutoTokenizer
 
@@ -590,6 +946,41 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
     if args.warmup:
         warmup_started = time.perf_counter()
         if args.warmup_mode == "generic":
+            manifest_shape_warmup = None
+            use_manifest_shape_warmup = (
+                str(getattr(args, "speculative_method", "none")).lower() == "mtp"
+                and int(getattr(args, "num_speculative_tokens", 0) or 0) > 0
+                and os.environ.get(
+                    "NANO_VLLM_JAX_MANIFEST_WARMUP_SHAPES",
+                    "1" if args.prompt_source in {"manifest", "vllm_random"} else "0",
+                )
+                in {"1", "true", "yes", "on", "True"}
+            )
+            if use_manifest_shape_warmup:
+                manifest_shape_warmup = _manifest_warmup_shapes(
+                    prompt_rows,
+                    output_lengths,
+                    args,
+                    engine.config,
+                )
+                os.environ["NANO_VLLM_JAX_PREFILL_WARMUP_SHAPES"] = str(
+                    manifest_shape_warmup["prefill_env"]
+                )
+                os.environ["NANO_VLLM_JAX_PREFILL_SLOT_CARRY_WARMUP_SHAPES"] = str(
+                    manifest_shape_warmup["prefill_slot_carry_env"]
+                )
+                os.environ["NANO_VLLM_JAX_DECODE_WARMUP_SHAPES"] = str(
+                    manifest_shape_warmup["decode_env"]
+                )
+                mtp_table_specs = manifest_shape_warmup.get(
+                    "mtp_table_warmup_specs",
+                    {},
+                )
+                if mtp_table_specs.get("env"):
+                    os.environ["NANO_VLLM_JAX_MTP_TABLE_WARMUP_SPECS"] = str(
+                        mtp_table_specs["env"]
+                    )
+                os.environ.setdefault("NANO_VLLM_JAX_MTP_WARMUP_MINIMAL", "1")
             include_sampled_routes = not (
                 float(args.temperature) == 0.0
                 and float(args.top_p) == 1.0
@@ -619,6 +1010,8 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
                     _parse_ints(args.startup_warmup_decode_block_table_buckets)
                 ) or None,
             )
+            if manifest_shape_warmup is not None:
+                warmup_summary["manifest_shape_warmup"] = manifest_shape_warmup
         else:
             warmup_params = _build_sampling_params(
                 output_lengths,

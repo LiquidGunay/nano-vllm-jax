@@ -733,6 +733,67 @@ Broader same-shape sweep on 2026-06-23:
 | 128 | 230.10 | 285.46 | 1.241x | exact | 100.0% | 0 |
 | 256 | 264.57 | 333.71 | 1.261x | exact | 99.0% | 0 |
 
+Sixth follow-up on 2026-06-27: the current `packed_prefix` default is the
+row-state verifier, not the resident-table verifier. The row-state route now
+builds true packed-prefill target metadata for the current+draft verifier
+tokens, passes `token_row_ids`, and forces the prefill prefix kernels for both
+attention and GDN. The older resident-table verifier remains available only as
+an explicit diagnostic/tuning route by setting
+`NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE` (for example, `decode_rectangular`). Do
+not claim speed from the table route unless the env is deliberately set and the
+artifact records that mode.
+
+Seventh follow-up on 2026-06-28: the fixed B8 `random_large` target did not
+produce a vLLM-level MTP speedup. Exact resident-table warmup now derives the
+measured verifier routes from the manifest and adds no-bonus tail safety
+routes, which keeps the best K2/B3 artifact cache-stable. That artifact,
+`table_k2_burst3_b8_random_large_r18_safetynobonus.json`, reached `470.15`
+output tok/s with `98.81%` draft acceptance and no measured JIT growth. It is
+still only `0.47x` of the stored base-vLLM denominator and `0.61x` of the
+stored no-MTP JAX denominator on the same manifest. K3/B2 and K3/B4 attempts
+were stopped by the RAM guard during compile/warmup, so the larger-K
+amortization route is outside the current A10G compile envelope.
+
+The same pass added correct 2B and 4B config selection. A 2B B1 128x128 probe
+showed only a small local JAX speedup (`78.79` MTP versus `74.31` no-MTP output
+tok/s). The 4B probe got past weight-shape validation but failed GPU memory
+during LM-head autotuning, so it is not currently a usable speedup lane on this
+machine. MTP packed QKV/gate-up projections are available only with
+`NANO_VLLM_JAX_MTP_PACKED_PROJECTIONS=1`; they are not default because the B8
+probe regressed compile cost and did not produce a measured artifact.
+
+Eighth follow-up on 2026-06-29: lower-memory XLA flags and longer compile
+timeouts were tested before calling the B8 random-large route blocked. The
+local XLA build accepts `--xla_gpu_autotune_level={0,1}`,
+`--xla_gpu_autotune_max_solutions=1`,
+`--xla_gpu_enable_triton_gemm=false`,
+`--xla_gpu_enable_analytical_sol_latency_estimator=false`, and
+`--xla_gpu_enable_latency_hiding_scheduler=false`; it rejects the documented
+`--xla_memory_scheduler=kBrkga` and
+`--xla_latency_hiding_scheduler_rerun=5` flags. With the accepted flag subset,
+the best fixed-B8 random-large artifact is now K2/B4
+`decode_rectangular`:
+`/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_longpass_20260628/table_k2_burst4_b8_random_large_r37_decode_reducedtail_final_jax.json`.
+It measured `560.81 output tok/s`, `98.82%` draft acceptance, and `0` measured
+JIT growth. This is a real improvement over K2/B3 (`470.15 output tok/s`) but
+still below the stored same-manifest JAX no-MTP baseline (`770.12 output
+tok/s`) and base vLLM denominator (`1000.98 output tok/s`).
+
+The same pass tightened manifest table-verifier warmup. It now adds full-draft
+burst-1 bonus and no-bonus tail specs for predicted decode shapes. Warming all
+smaller tail widths is opt-in via
+`NANO_VLLM_JAX_MANIFEST_WARMUP_MTP_TABLE_ALL_TAIL_WIDTHS=1`; the fixed B8
+manifest did not need those extra K1 tail variants, and compiling them raised
+startup warmup from `61` to `79` JIT entries without improving measured
+throughput. The resident-table verifier semantics test now covers
+`prefill_prefix_kernel`, `prefill_gdn_prefix_kernel`, and
+`prefill_attention_kernel`, but B8 random-large warmup for those prefill-style
+target modes still hits the RAM guard before measurement, even with
+`--xla_gpu_autotune_level=0`. K2/B6, K2/B8, and K3/B4
+`decode_rectangular` likewise hit the guard. On this A10G envelope, the largest
+exact verifier that fits cleanly is K2/B4; anything likely to amortize enough
+to beat base decode exceeds the guarded compile-memory budget.
+
 Artifacts live under
 `/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_broad_20260623/`. The sweep
 uses B=2 prompts `64,128`, generic warmup, rectangular packed-prefix target

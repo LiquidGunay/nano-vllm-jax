@@ -545,6 +545,30 @@ class Qwen3_5Config:
             max_position_embeddings=262144,
             tie_word_embeddings=True,
         )
+
+    @classmethod
+    def qwen3_5_4b(cls) -> "Qwen3_5Config":
+        """Qwen3.5-4B text configuration."""
+        return cls(
+            vocab_size=248320,
+            hidden_size=2560,
+            intermediate_size=9216,
+            num_hidden_layers=32,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            head_dim=256,
+            linear_num_key_heads=16,
+            linear_num_value_heads=32,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_size=4,
+            linear_chunk_size=32,
+            use_qk_norm_in_gdn=True,
+            rope_theta=10_000_000,
+            max_position_embeddings=262144,
+            tie_word_embeddings=True,
+            vision_out_hidden_size=2560,
+        )
     
     @classmethod
     def qwen3_5_27b(cls) -> "Qwen3_5Config":

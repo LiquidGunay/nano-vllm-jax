@@ -1,5 +1,6 @@
 """MTP layer implementation for Qwen3.5."""
 
+import os
 import jax
 import jax.numpy as jnp
 from typing import Dict, Optional, Tuple
@@ -8,6 +9,16 @@ from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.backends import InferenceBackend, select_backend
 from nanovllm_jax.kv_cache import AttentionMetadata, KVCacheState
 from nanovllm_jax.layers import rms_norm, apply_rope, causal_mask, get_activation, silu
+
+FULL_ATTN_DECODE_QKV_PACKED_KEY = "qkv_proj_decode"
+MLP_GATE_UP_PACKED_KEY = "gate_up_proj"
+
+
+def _packed_mtp_projections_enabled() -> bool:
+    return os.environ.get(
+        "NANO_VLLM_JAX_MTP_PACKED_PROJECTIONS",
+        "0",
+    ) in {"1", "true", "yes", "on", "True"}
 
 
 @dataclass
@@ -138,20 +149,32 @@ def init_mtp_layer(key: jax.Array, config: Qwen3_5Config) -> Dict[str, jnp.ndarr
     keys = jax.random.split(key, 8)
     attn_out_dim = config.num_attention_heads * config.head_dim
 
-    return {
+    q_proj = jax.random.normal(
+        keys[0],
+        (config.hidden_size, attn_out_dim * 2)
+    ) * (config.hidden_size ** -0.5)
+    k_proj = jax.random.normal(
+        keys[1],
+        (config.hidden_size, config.num_key_value_heads * config.head_dim)
+    ) * (config.hidden_size ** -0.5)
+    v_proj = jax.random.normal(
+        keys[2],
+        (config.hidden_size, config.num_key_value_heads * config.head_dim)
+    ) * (config.hidden_size ** -0.5)
+    gate_proj = jax.random.normal(
+        keys[4],
+        (config.hidden_size, config.intermediate_size),
+    ) * (config.hidden_size ** -0.5)
+    up_proj = jax.random.normal(
+        keys[5],
+        (config.hidden_size, config.intermediate_size),
+    ) * (config.hidden_size ** -0.5)
+
+    layer = {
         # Self-attention
-        "q_proj": jax.random.normal(
-            keys[0], 
-            (config.hidden_size, attn_out_dim * 2)
-        ) * (config.hidden_size ** -0.5),
-        "k_proj": jax.random.normal(
-            keys[1],
-            (config.hidden_size, config.num_key_value_heads * config.head_dim)
-        ) * (config.hidden_size ** -0.5),
-        "v_proj": jax.random.normal(
-            keys[2],
-            (config.hidden_size, config.num_key_value_heads * config.head_dim)
-        ) * (config.hidden_size ** -0.5),
+        "q_proj": q_proj,
+        "k_proj": k_proj,
+        "v_proj": v_proj,
         "o_proj": jax.random.normal(
             keys[3],
             (attn_out_dim, config.hidden_size)
@@ -164,19 +187,20 @@ def init_mtp_layer(key: jax.Array, config: Qwen3_5Config) -> Dict[str, jnp.ndarr
         "post_attn_norm": jnp.ones(config.hidden_size),
 
         # Feed-forward block
-        "gate_proj": jax.random.normal(
-            keys[4],
-            (config.hidden_size, config.intermediate_size),
-        ) * (config.hidden_size ** -0.5),
-        "up_proj": jax.random.normal(
-            keys[5],
-            (config.hidden_size, config.intermediate_size),
-        ) * (config.hidden_size ** -0.5),
+        "gate_proj": gate_proj,
+        "up_proj": up_proj,
         "down_proj": jax.random.normal(
             keys[6],
             (config.intermediate_size, config.hidden_size),
         ) * (config.intermediate_size ** -0.5),
     }
+    if _packed_mtp_projections_enabled():
+        layer[FULL_ATTN_DECODE_QKV_PACKED_KEY] = jnp.concatenate(
+            [q_proj, k_proj, v_proj],
+            axis=1,
+        )
+        layer[MLP_GATE_UP_PACKED_KEY] = jnp.concatenate([gate_proj, up_proj], axis=1)
+    return layer
 
 
 def _mtp_forward_hidden(
@@ -525,16 +549,26 @@ def mtp_layer_forward(
     # Input norm
     x_norm = rms_norm(x, params["input_norm"], config.rms_norm_eps)
     
-    # QKV projection
-    # Qwen3.5: q_proj outputs [query, gate]
-    q_gate = jnp.dot(x_norm, params["q_proj"])
     attn_out_dim = config.num_attention_heads * config.head_dim
+    if (
+        _packed_mtp_projections_enabled()
+        and FULL_ATTN_DECODE_QKV_PACKED_KEY in params
+    ):
+        packed_qkv = jnp.dot(x_norm, params[FULL_ATTN_DECODE_QKV_PACKED_KEY])
+        q_gate_end = attn_out_dim * 2
+        k_end = q_gate_end + config.num_key_value_heads * config.head_dim
+        q_gate, k_raw, v_raw = jnp.split(packed_qkv, [q_gate_end, k_end], axis=-1)
+    else:
+        # Qwen3.5: q_proj outputs [query, gate]
+        q_gate = jnp.dot(x_norm, params["q_proj"])
+        k_raw = jnp.dot(x_norm, params["k_proj"])
+        v_raw = jnp.dot(x_norm, params["v_proj"])
     q_gate_reshaped = q_gate.reshape(batch, seq_len, config.num_attention_heads, 2 * config.head_dim)
     query, gate = jnp.split(q_gate_reshaped, 2, axis=-1)
     gate = gate.reshape(batch, seq_len, -1)
-    
-    k = jnp.dot(x_norm, params["k_proj"]).reshape(batch, seq_len, config.num_key_value_heads, config.head_dim)
-    v = jnp.dot(x_norm, params["v_proj"]).reshape(batch, seq_len, config.num_key_value_heads, config.head_dim)
+
+    k = k_raw.reshape(batch, seq_len, config.num_key_value_heads, config.head_dim)
+    v = v_raw.reshape(batch, seq_len, config.num_key_value_heads, config.head_dim)
     
     # Transpose to [B, H, T, D] first
     query = query.transpose(0, 2, 1, 3)
@@ -602,10 +636,13 @@ def mtp_layer_forward(
     
     # Post-attention norm (applied to residual, before MLP) - matches mlx-lm
     x_norm = rms_norm(x, params["post_attn_norm"], config.rms_norm_eps)
-    
-    # MLP (SwiGLU)
-    gate_proj = jnp.dot(x_norm, params["gate_proj"])
-    up_proj = jnp.dot(x_norm, params["up_proj"])
+
+    if _packed_mtp_projections_enabled() and MLP_GATE_UP_PACKED_KEY in params:
+        gate_up = jnp.dot(x_norm, params[MLP_GATE_UP_PACKED_KEY])
+        gate_proj, up_proj = jnp.split(gate_up, 2, axis=-1)
+    else:
+        gate_proj = jnp.dot(x_norm, params["gate_proj"])
+        up_proj = jnp.dot(x_norm, params["up_proj"])
     activation_fn = get_activation(config.hidden_act)
     # SwiGLU: silu(gate) * up
     mlp_out = jnp.dot(activation_fn(gate_proj) * up_proj, params["down_proj"])
@@ -634,9 +671,18 @@ def mtp_layer_forward_cached(
 
     x_norm = rms_norm(x_cast, params["input_norm"], config.rms_norm_eps)
     attn_out_dim = config.num_attention_heads * config.head_dim
-    q_gate = jnp.dot(x_norm, params["q_proj"])
-    key_raw = jnp.dot(x_norm, params["k_proj"])
-    value_raw = jnp.dot(x_norm, params["v_proj"])
+    if (
+        _packed_mtp_projections_enabled()
+        and FULL_ATTN_DECODE_QKV_PACKED_KEY in params
+    ):
+        packed_qkv = jnp.dot(x_norm, params[FULL_ATTN_DECODE_QKV_PACKED_KEY])
+        q_gate_end = attn_out_dim * 2
+        k_end = q_gate_end + config.num_key_value_heads * config.head_dim
+        q_gate, key_raw, value_raw = jnp.split(packed_qkv, [q_gate_end, k_end], axis=-1)
+    else:
+        q_gate = jnp.dot(x_norm, params["q_proj"])
+        key_raw = jnp.dot(x_norm, params["k_proj"])
+        value_raw = jnp.dot(x_norm, params["v_proj"])
     q_gate = q_gate.reshape(
         batch,
         seq_len,
@@ -707,8 +753,13 @@ def mtp_layer_forward_cached(
     x = x + attn_out
 
     x_norm = rms_norm(x, params["post_attn_norm"], config.rms_norm_eps)
-    gate_proj = jnp.dot(x_norm.astype(dtype), params["gate_proj"])
-    up_proj = jnp.dot(x_norm.astype(dtype), params["up_proj"])
+    x_norm = x_norm.astype(dtype)
+    if _packed_mtp_projections_enabled() and MLP_GATE_UP_PACKED_KEY in params:
+        gate_up = jnp.dot(x_norm, params[MLP_GATE_UP_PACKED_KEY])
+        gate_proj, up_proj = jnp.split(gate_up, 2, axis=-1)
+    else:
+        gate_proj = jnp.dot(x_norm, params["gate_proj"])
+        up_proj = jnp.dot(x_norm, params["up_proj"])
     mlp_out = jnp.dot(get_activation(config.hidden_act)(gate_proj) * up_proj, params["down_proj"])
     x = x + mlp_out
     return x, kv_cache_state

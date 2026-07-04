@@ -1827,10 +1827,12 @@ def test_packed_prefix_uses_explicit_verifier_route(monkeypatch):
         num_speculative_tokens=2,
     )
     runner.mtp_verifier_impl = "packed_prefix"
+    runner.resident_decode_metadata = True
     seqs = [_seq(i, seq_lens[i]) for i in range(2)]
 
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
     monkeypatch.delenv("NANO_VLLM_JAX_MTP_FORCE_GENERIC_K", raising=False)
+    monkeypatch.delenv("NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE", raising=False)
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BATCH_ACCEPT_POLICY", "rowwise")
     monkeypatch.setenv("NANO_VLLM_JAX_MTP_BURST_GROUPS", "1")
 
@@ -2729,6 +2731,10 @@ def test_packed_prefix_verifier_real_executor_accept_reject_and_partial(monkeypa
 
     config = _tiny_mtp_verifier_config()
     config.num_speculative_tokens = 2
+    config.gdn_disable_fallbacks = True
+    config.gdn_prefill_post_conv_impl = "triton_fla_padded"
+    config.gdn_packed_decode_impl = "reference"
+    config.gdn_packed_decode_qkv_dtype = "bf16"
     params = init_params(jax.random.PRNGKey(0), config)
     params.mtp_params = init_mtp_params(jax.random.PRNGKey(1), config)
     executor = ModelExecutor(config, params, backend="pure_jax")
@@ -2822,7 +2828,14 @@ def test_packed_prefix_verifier_real_executor_accept_reject_and_partial(monkeypa
     ]
 
 
-def test_packed_prefix_table_verifier_real_executor_updates_resident_table(monkeypatch):
+@pytest.mark.parametrize(
+    "table_target_mode",
+    [None, "prefill_prefix_kernel", "prefill_gdn_prefix_kernel", "prefill_attention_kernel"],
+)
+def test_packed_prefix_table_verifier_real_executor_updates_resident_table(
+    monkeypatch,
+    table_target_mode,
+):
     import jax
     import numpy as np
 
@@ -2830,7 +2843,10 @@ def test_packed_prefix_table_verifier_real_executor_updates_resident_table(monke
     monkeypatch.delenv("NANO_VLLM_JAX_MTP_DISABLE_BONUS", raising=False)
     monkeypatch.delenv("NANO_VLLM_JAX_GDN_DISABLE_FALLBACKS", raising=False)
     monkeypatch.delenv("NANO_VLLM_JAX_GDN_PACKED_DECODE_IMPL", raising=False)
-    monkeypatch.delenv("NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE", raising=False)
+    if table_target_mode is None:
+        monkeypatch.delenv("NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE", raising=False)
+    else:
+        monkeypatch.setenv("NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE", table_target_mode)
 
     config = _tiny_mtp_verifier_config()
     config.num_speculative_tokens = 2

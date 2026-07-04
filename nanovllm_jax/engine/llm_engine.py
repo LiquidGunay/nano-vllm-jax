@@ -5,7 +5,7 @@ import os
 from time import perf_counter
 from typing import List, Dict, Optional, Union
 from tqdm.auto import tqdm
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.kv_cache import KVCacheSpec, cap_num_kv_cache_blocks
@@ -29,6 +29,19 @@ except ImportError:
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on", "True"}
 _SUMMARY_HOST_TOKEN_SINK_MIN_COMPLETION_TOKENS = 1024
+
+
+def _base_config_for_model(model_path: str) -> Qwen3_5Config:
+    model_name = str(model_path).lower()
+    if "qwen3.5-4b" in model_name:
+        return Qwen3_5Config.qwen3_5_4b()
+    if "qwen3.5-2b" in model_name:
+        return Qwen3_5Config.qwen3_5_2b()
+    if "qwen3.5-27b" in model_name:
+        return Qwen3_5Config.qwen3_5_27b()
+    return Qwen3_5Config.qwen3_5_0_8b()
+
+
 def _config_or_env_flag(config: Qwen3_5Config | None, attr: str, env_name: str, *, default: bool = False) -> bool:
     if config is not None and hasattr(config, attr):
         return bool(getattr(config, attr))
@@ -224,7 +237,9 @@ class LLMEngine:
         weight_dtype = kwargs.pop("weight_dtype", None)
         config_fields = {f.name for f in Qwen3_5Config.__dataclass_fields__.values()}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        self.config = Qwen3_5Config(**config_kwargs)
+        base_config_kwargs = asdict(_base_config_for_model(model_path))
+        base_config_kwargs.update(config_kwargs)
+        self.config = Qwen3_5Config(**base_config_kwargs)
         self.weight_dtype = weight_dtype or self.config.dtype
         kv_spec = KVCacheSpec(
             num_layers=self.config.num_hidden_layers,
