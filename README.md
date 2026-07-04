@@ -24,6 +24,9 @@ policy: dtypes, attention/GDN routes, LM-head route, device token carry, and
 metadata residency. Users should not switch kernels through YAML on the cleaned
 branch.
 
+The offline `LLM.generate(..., use_tqdm=True)` progress bar uses the optional
+`progress` extra. Serving does not require it.
+
 ## API Smoke
 
 ```bash

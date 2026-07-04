@@ -7,13 +7,10 @@ requires-python = ">=3.10"
 dependencies = [
     "jax>=0.4.30",
     "jaxlib>=0.4.30",
-    "flax>=0.8.5",
     "transformers>=4.44.0",
     "safetensors>=0.4.4",
     "numpy>=1.26.4",
-    "tqdm>=4.66.4",
     "sentencepiece>=0.2.0",
-    "optax>=0.2.2",
     "flask>=2.0.0",
     "PyYAML>=6.0.1",
     "xxhash>=3.0.0",
@@ -27,6 +24,9 @@ cuda13 = [
 ]
 hf-parity = [
     "torch>=2.0.0",
+]
+progress = [
+    "tqdm>=4.66.4",
 ]
 flashinfer-ffi = [
     "flashinfer-python; python_version >= '3.11'",

@@ -63,7 +63,7 @@ class ModelConfig:
     max_position_embeddings: int = 262144
 
     @classmethod
-    def from_qwen_config(cls, config: "Qwen3_5Config", model: str = "Qwen/Qwen3.5-0.8B") -> "ModelConfig":
+    def from_runtime_config(cls, config: "RuntimeConfig", model: str = "Qwen/Qwen3.5-0.8B") -> "ModelConfig":
         return cls(
             model=model,
             vocab_size=config.vocab_size,
@@ -240,10 +240,12 @@ def load_engine_config(path: str | Path = "server.yaml") -> ServerSettings:
 
 
 @dataclass(eq=True, frozen=False)
-class Qwen3_5Config:
-    """Configuration for Qwen 3.5 model.
+class RuntimeConfig:
+    """Private merged runtime config for Qwen 3.5 serving.
     
-    Default values match Qwen3.5-0.8B architecture.
+    Default architecture values match Qwen3.5-0.8B.
+    Public workload and capacity config lives in ``EngineConfig``; this object
+    is the internal bridge consumed by model, scheduler, runner, and executor.
     
     Note: This dataclass is made hashable for JAX JIT compilation by:
     1. Using eq=True (default)
@@ -580,7 +582,7 @@ class Qwen3_5Config:
         return dtype_map[self.dtype]
     
     @classmethod
-    def qwen3_5_0_8b(cls) -> "Qwen3_5Config":
+    def qwen3_5_0_8b(cls) -> "RuntimeConfig":
         """Qwen3.5-0.8B configuration."""
         return cls(
             vocab_size=248320,
@@ -603,7 +605,7 @@ class Qwen3_5Config:
         )
     
     @classmethod
-    def qwen3_5_2b(cls) -> "Qwen3_5Config":
+    def qwen3_5_2b(cls) -> "RuntimeConfig":
         """Qwen3.5-2B configuration."""
         return cls(
             vocab_size=248320,
@@ -626,7 +628,7 @@ class Qwen3_5Config:
         )
     
     @classmethod
-    def qwen3_5_27b(cls) -> "Qwen3_5Config":
+    def qwen3_5_27b(cls) -> "RuntimeConfig":
         """Qwen3.5-27B configuration."""
         return cls(
             vocab_size=248320,
@@ -723,6 +725,6 @@ class Qwen3_5Config:
         }
     
     @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> "Qwen3_5Config":
+    def from_dict(cls, config_dict: Dict[str, Any]) -> "RuntimeConfig":
         """Create config from dictionary."""
         return cls(**config_dict)

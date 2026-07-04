@@ -3,15 +3,15 @@ from pathlib import Path
 import pytest
 import yaml
 
-from nanovllm_jax.config import EngineConfig, Qwen3_5Config, WarmupConfig, load_engine_config
+from nanovllm_jax.config import EngineConfig, RuntimeConfig, WarmupConfig, load_engine_config
 from nanovllm_jax.fastpath import FASTPATH, engine_overrides
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_qwen_config_has_no_speculative_surface():
-    config = Qwen3_5Config()
+def test_runtime_config_has_no_speculative_surface():
+    config = RuntimeConfig()
 
     assert not hasattr(config, "speculative_method")
     assert not hasattr(config, "num_speculative_tokens")

@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 torch = pytest.importorskip("torch")
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.layers import rms_norm, apply_rope
 from nanovllm_jax.model import (
     jax_chunk_gated_delta_rule,
@@ -118,7 +118,7 @@ def test_rope(hf_model_and_tokenizer):
     # Ensure HF CUDA path is available and model weights load successfully.
     # Ensure fixture is resolved so CUDA-availability checks run.
     _ = hf_model_and_tokenizer
-    config = Qwen3_5Config.qwen3_5_0_8b()
+    config = RuntimeConfig.qwen3_5_0_8b()
     
     # Create test input
     batch_size, seq_len, num_heads, head_dim = 1, 32, 8, 256
@@ -146,7 +146,7 @@ def test_full_attention(hf_model_and_tokenizer):
     print("\n=== Testing Full Attention ===")
     
     model, _ = hf_model_and_tokenizer
-    config = Qwen3_5Config.qwen3_5_0_8b()
+    config = RuntimeConfig.qwen3_5_0_8b()
     
     # Find a full attention layer (layers 3, 7, 11, 15, 19, 23)
     full_attn_layer_idx = 3
@@ -235,7 +235,7 @@ def test_linear_attention_chunked(hf_model_and_tokenizer):
     print("\n=== Testing Linear Attention (Chunked) ===")
     
     model, _ = hf_model_and_tokenizer
-    config = Qwen3_5Config.qwen3_5_0_8b()
+    config = RuntimeConfig.qwen3_5_0_8b()
     
     # Find a linear attention layer index (0, 1, 2, etc.)
     linear_layer_idx = 0
@@ -280,7 +280,7 @@ def test_linear_attention_recurrent():
     """Test linear attention (recurrent mode for decode) against chunked."""
     print("\n=== Testing Linear Attention (Recurrent) ===")
     
-    config = Qwen3_5Config.qwen3_5_0_8b()
+    config = RuntimeConfig.qwen3_5_0_8b()
     
     # Create test input for single token decode
     batch_size, num_heads, seq_len = 1, config.linear_num_value_heads, 1
@@ -320,7 +320,7 @@ def test_mlp(hf_model_and_tokenizer):
     print("\n=== Testing MLP ===")
     
     model, _ = hf_model_and_tokenizer
-    config = Qwen3_5Config.qwen3_5_0_8b()
+    config = RuntimeConfig.qwen3_5_0_8b()
     
     # Get MLP from any layer
     hf_layer = model.model.layers[0]

@@ -27,7 +27,7 @@ else:
         split_packed_gdn_decode_mixed_qkv,
     )
     from nanovllm_jax.kernels import KernelUnavailable
-    from nanovllm_jax.config import Qwen3_5Config
+    from nanovllm_jax.config import RuntimeConfig
     from nanovllm_jax.cache import HybridLayerState
     from nanovllm_jax.model import (
         gated_deltanet_block,
@@ -58,7 +58,7 @@ def _packed_decode_ops(
     max_batch: int | None = None,
 ) -> "ServingOps":
     return ServingOps(
-        Qwen3_5Config(
+        RuntimeConfig(
             gdn_packed_decode_impl=impl,
             gdn_packed_decode_qkv_dtype=qkv_dtype,
             gdn_disable_fallbacks=disable_fallbacks,
@@ -67,7 +67,7 @@ def _packed_decode_ops(
     )
 
 
-def _tiny_gdn_decode_config(**overrides) -> "Qwen3_5Config":
+def _tiny_gdn_decode_config(**overrides) -> "RuntimeConfig":
     fields = dict(
         vocab_size=16,
         hidden_size=8,
@@ -86,7 +86,7 @@ def _tiny_gdn_decode_config(**overrides) -> "Qwen3_5Config":
         dtype="float32",
     )
     fields.update(overrides)
-    return Qwen3_5Config(**fields)
+    return RuntimeConfig(**fields)
 
 
 def test_gdn_fla_reference_module_is_fallback_compatible():

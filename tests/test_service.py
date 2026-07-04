@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 
+import pytest
+
 from nanovllm_jax.service import EngineService
 from nanovllm_jax.sequence import SamplingParams
 
@@ -46,6 +48,11 @@ class _FakeEngine:
         return " ".join(str(token_id) for token_id in token_ids)
 
 
+class _FailingEngine(_FakeEngine):
+    def step(self):
+        raise RuntimeError("accelerator failed")
+
+
 def test_service_admits_independent_requests_into_same_engine_step():
     engine = _FakeEngine()
     service = EngineService(engine, batch_window_seconds=0.02)
@@ -63,6 +70,56 @@ def test_service_admits_independent_requests_into_same_engine_step():
         assert (0, 1) in engine.step_batches
     finally:
         service.stop()
+
+
+def test_service_engine_failure_fails_active_pending_and_future_requests():
+    engine = _FailingEngine()
+    service = EngineService(engine, batch_window_seconds=0.0)
+    service.start()
+    try:
+        handle = service.submit(
+            [11],
+            SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        )
+
+        with pytest.raises(RuntimeError, match="accelerator failed"):
+            handle.wait(timeout=1.0)
+        with pytest.raises(RuntimeError, match="engine service failed"):
+            service.submit(
+                [22],
+                SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+            )
+    finally:
+        service.stop()
+
+
+def test_service_stop_fails_pending_requests_before_start():
+    engine = _FakeEngine()
+    service = EngineService(engine, batch_window_seconds=0.0)
+    handle = service.submit(
+        [11],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+    )
+
+    service.stop()
+
+    with pytest.raises(RuntimeError, match="stopped"):
+        handle.wait(timeout=0.1)
+
+
+def test_service_rejects_when_queue_is_full():
+    engine = _FakeEngine()
+    service = EngineService(engine, batch_window_seconds=0.0, max_queue_size=1)
+    service.submit(
+        [11],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+    )
+
+    with pytest.raises(RuntimeError, match="queue is full"):
+        service.submit(
+            [22],
+            SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        )
 
 
 def test_service_streams_token_events_before_done():

@@ -122,29 +122,45 @@ class EngineService:
         *,
         engine_lock: threading.Lock | threading.RLock | None = None,
         batch_window_seconds: float = 0.002,
+        max_queue_size: int | None = None,
     ):
         self.engine = engine
         self.engine_lock = engine_lock or threading.RLock()
         self.batch_window_seconds = max(0.0, float(batch_window_seconds))
-        self._incoming: queue.Queue[_PendingRequest | object] = queue.Queue()
+        if max_queue_size is not None and int(max_queue_size) <= 0:
+            raise ValueError("max_queue_size must be positive when provided")
+        self._incoming: queue.Queue[_PendingRequest | object] = queue.Queue(
+            maxsize=0 if max_queue_size is None else int(max_queue_size)
+        )
         self._active: dict[int, _ActiveRequest] = {}
         self._next_request_id = 0
         self._request_id_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._stop = threading.Event()
+        self._failed: BaseException | None = None
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        with self._state_lock:
+            if self._failed is not None:
+                raise RuntimeError("engine service is failed and must be recreated")
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="nanovllm-engine-service", daemon=True)
         self._thread.start()
 
     def stop(self, timeout: float | None = 5.0) -> None:
         self._stop.set()
-        self._incoming.put(_STOP)
+        try:
+            self._incoming.put_nowait(_STOP)
+        except queue.Full:
+            pass
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+        stopped = RuntimeError("engine service stopped before request completed")
+        self._fail_all_active(stopped)
+        self._fail_all_pending(stopped)
 
     def is_idle(self) -> bool:
         return not self._active and self._incoming.empty()
@@ -156,11 +172,19 @@ class EngineService:
         *,
         stream: bool = False,
     ) -> RequestHandle:
+        with self._state_lock:
+            if self._failed is not None:
+                raise RuntimeError("engine service failed; restart the server") from self._failed
+            if self._stop.is_set():
+                raise RuntimeError("engine service is stopping")
         with self._request_id_lock:
             request_id = self._next_request_id
             self._next_request_id += 1
         handle = RequestHandle(request_id, stream=stream)
-        self._incoming.put(_PendingRequest(prompt=prompt, sampling_params=sampling_params, handle=handle))
+        try:
+            self._incoming.put_nowait(_PendingRequest(prompt=prompt, sampling_params=sampling_params, handle=handle))
+        except queue.Full as exc:
+            raise RuntimeError("engine service queue is full") from exc
         return handle
 
     def generate(self, prompt: str | list[int], sampling_params: SamplingParams) -> GenerationResult:
@@ -199,8 +223,8 @@ class EngineService:
                 with self.engine_lock:
                     outputs, _ = self.engine.step()
             except BaseException as exc:
-                self._fail_all_active(exc)
-                continue
+                self._mark_failed(exc)
+                break
 
             self._publish_progress()
             self._publish_finished(outputs)
@@ -295,3 +319,19 @@ class EngineService:
         for active in self._active.values():
             active.handle._fail(exc)
         self._active.clear()
+
+    def _fail_all_pending(self, exc: BaseException) -> None:
+        while True:
+            try:
+                item = self._incoming.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, _PendingRequest):
+                item.handle._fail(exc)
+
+    def _mark_failed(self, exc: BaseException) -> None:
+        with self._state_lock:
+            self._failed = exc
+            self._stop.set()
+        self._fail_all_active(exc)
+        self._fail_all_pending(exc)

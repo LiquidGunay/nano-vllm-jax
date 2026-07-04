@@ -3,10 +3,9 @@
 import atexit
 from time import perf_counter
 from typing import Any, List, Dict, Optional, Union
-from tqdm.auto import tqdm
 from dataclasses import replace
 
-from nanovllm_jax.config import EngineConfig, Qwen3_5Config
+from nanovllm_jax.config import EngineConfig, RuntimeConfig
 from nanovllm_jax.cache import KVCacheSpec, cap_num_kv_cache_blocks
 from nanovllm_jax.model import ModelParams
 from nanovllm_jax.weights import load_weights_from_hf_streaming
@@ -51,12 +50,12 @@ def _engine_config_from_public_kwargs(model_path: str, kwargs: dict[str, Any]) -
     return EngineConfig.from_mapping({"model": model_path, **kwargs})
 
 
-def _qwen_config_from_engine_config(engine_config: EngineConfig) -> tuple[Qwen3_5Config, str]:
+def _runtime_config_from_engine_config(engine_config: EngineConfig) -> tuple[RuntimeConfig, str]:
     engine_kwargs = engine_config.to_engine_kwargs()
     weight_dtype = str(engine_kwargs.pop("weight_dtype", engine_kwargs.get("dtype", "bfloat16")))
-    qwen_fields = set(Qwen3_5Config.__dataclass_fields__)
-    qwen_kwargs = {key: value for key, value in engine_kwargs.items() if key in qwen_fields}
-    return Qwen3_5Config(**qwen_kwargs), weight_dtype
+    runtime_fields = set(RuntimeConfig.__dataclass_fields__)
+    runtime_kwargs = {key: value for key, value in engine_kwargs.items() if key in runtime_fields}
+    return RuntimeConfig(**runtime_kwargs), weight_dtype
 
 
 class LLMEngine:
@@ -76,7 +75,7 @@ class LLMEngine:
         elif engine_config.model != model_path:
             engine_config = replace(engine_config, model=model_path)
 
-        self.config, self.weight_dtype = _qwen_config_from_engine_config(engine_config)
+        self.config, self.weight_dtype = _runtime_config_from_engine_config(engine_config)
         kv_spec = KVCacheSpec(
             num_layers=self.config.num_hidden_layers,
             num_blocks=self.config.num_kvcache_blocks,
@@ -222,7 +221,6 @@ class LLMEngine:
         )
 
         token_ids = self.model_runner.run(seqs, batch=scheduled_batch)
-        mixed_prefill_decode = bool(getattr(scheduled_batch, "mixed_prefill_decode", False))
 
         if scheduled_batch.is_prefill:
             prefix_states_by_seq = None
@@ -250,7 +248,7 @@ class LLMEngine:
         else:
             outputs = [(seq.seq_id, []) for seq in seqs if seq.is_finished]
 
-        if scheduled_batch.is_prefill and not mixed_prefill_decode:
+        if scheduled_batch.is_prefill:
             num_tokens = scheduled_batch.num_prefill_tokens
         else:
             num_tokens = -getattr(self.scheduler, "last_num_generated_tokens", scheduled_batch.num_decode_tokens)
@@ -268,6 +266,13 @@ class LLMEngine:
     ) -> List[Dict[str, any]]:
         seqs = self._prepare_generation_sequences(prompts, sampling_params)
         if use_tqdm:
+            try:
+                from tqdm.auto import tqdm
+            except ImportError as exc:
+                raise ImportError(
+                    "tqdm is required only for progress bars; install the "
+                    "`progress` extra or call generate(..., use_tqdm=False)"
+                ) from exc
             pbar = tqdm(total=len(seqs), desc="Generating", dynamic_ncols=True)
 
         outputs = {}

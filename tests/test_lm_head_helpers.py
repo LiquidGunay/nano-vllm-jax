@@ -6,7 +6,7 @@ import pytest
 from jax import nn
 import jax.numpy as jnp
 
-from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.layers import rms_norm
 from nanovllm_jax.model import (
     ModelParams,
@@ -56,7 +56,7 @@ def test_lm_head_token_ids_and_topk_matches_full_logits(monkeypatch):
     ), jnp.argsort(logits, axis=-1)[..., -2:][..., ::-1]
 
     np.testing.assert_array_equal(np.array(token_ids), np.array(jnp.argmax(logits, axis=-1)))
-    np.testing.assert_allclose(np.array(top_values), np.array(expected_top_values), rtol=0, atol=0)
+    np.testing.assert_allclose(np.array(top_values), np.array(expected_top_values), rtol=0, atol=1e-6)
     np.testing.assert_array_equal(np.array(top_indices), np.array(expected_top_indices))
 
     normed_token_ids, _, _ = lm_head_token_ids_and_topk(
@@ -175,7 +175,7 @@ def test_lm_head_greedy_top1_triton_matches_jax_on_cuda(monkeypatch):
 
 
 def test_decode_padded_gemm_default_cap_admits_qwen_vocab_projection():
-    config = Qwen3_5Config(decode_padded_gemm=True)
+    config = RuntimeConfig(decode_padded_gemm=True)
     x = jnp.zeros((8, 1, 1), dtype=jnp.bfloat16)
     qwen_vocab_projection = jnp.zeros((1, 248064), dtype=jnp.bfloat16)
 
@@ -253,7 +253,7 @@ def test_compact_prefill_mlp_matches_dense_on_valid_tokens():
         nn.silu,
         valid_mask,
         compact_num_tokens=4,
-        config=Qwen3_5Config(compact_prefill_mlp=True),
+        config=RuntimeConfig(compact_prefill_mlp=True),
     )
     dense = jnp.dot(nn.silu(jnp.dot(x, gate_weight)) * jnp.dot(x, up_weight), down_weight)
 

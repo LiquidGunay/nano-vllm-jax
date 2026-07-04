@@ -26,7 +26,7 @@ import pytest
 torch = pytest.importorskip("torch")
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import List, Optional
-from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.weights import load_weights_from_hf
 from nanovllm_jax.model import forward
  
@@ -84,7 +84,7 @@ def load_models(model_name: str = MODEL_NAME):
     
     # Load JAX model with HF weights
     print("  Loading JAX model...")
-    config = Qwen3_5Config.qwen3_5_0_8b()
+    config = RuntimeConfig.qwen3_5_0_8b()
     config.dtype = "bfloat16"
     params = load_weights_from_hf(model_name, config)
     config.dtype = "float32"

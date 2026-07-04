@@ -68,7 +68,9 @@ def _apply_runtime_config() -> None:
     except AttributeError:
         print("[server] this JAX build does not support jax_compilation_cache_dir")
     except Exception as exc:
-        print(f"[server] could not configure the JAX compile cache: {type(exc).__name__}: {exc}")
+        raise RuntimeError(
+            f"could not configure the JAX compile cache: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 # Configure JAX before importing Flask or the engine stack.
@@ -136,7 +138,10 @@ def _settings_from_args(args: argparse.Namespace) -> ServerSettings:
 def _validate_settings(settings: ServerSettings) -> None:
     if settings.max_tokens_default <= 0:
         raise ValueError("--max-tokens-default must be positive")
-    if max(settings.engine.batch_size_buckets) > settings.engine.max_num_seqs:
+    if (
+        settings.engine.batch_size_buckets
+        and max(settings.engine.batch_size_buckets) > settings.engine.max_num_seqs
+    ):
         raise ValueError("--batch-size-buckets cannot exceed --max-num-seqs")
 
 
@@ -389,6 +394,7 @@ def generate():
     except RuntimeError as exc:
         return _json_error(exc, 503)
     except Exception as exc:
+        app.logger.exception("Unhandled /v1/generate error")
         return _json_error(exc, 500)
 
 
@@ -414,6 +420,7 @@ def generate_stream():
                 event.setdefault("request_index", 0)
                 yield f"data: {json.dumps(event, sort_keys=True)}\n\n"
         except Exception as exc:
+            app.logger.exception("Unhandled /v1/generate_stream error")
             yield f"data: {json.dumps({'event': 'error', 'error': str(exc)}, sort_keys=True)}\n\n"
 
     return Response(stream_with_context(events()), mimetype="text/event-stream")
@@ -432,6 +439,7 @@ def completions():
     except RuntimeError as exc:
         return _json_error(exc, 503)
     except Exception as exc:
+        app.logger.exception("Unhandled /v1/completions error")
         return _json_error(exc, 500)
 
 

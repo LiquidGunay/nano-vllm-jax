@@ -34,7 +34,6 @@ def full_attention_block(
     layer_idx: int = 0,
     attention_metadata: Optional[AttentionMetadata] = None,
     backend: Optional[ServingOpsProtocol] = None,
-    return_kv_prewrite: bool = False,
 ):
     """Full attention block with optional KV cache support.
 
@@ -206,9 +205,6 @@ def full_attention_block(
         query = apply_rope(query, positions, config.head_dim, config.rope_theta, config.partial_rotary_factor, layout="BHTD", mrope_section=config.mrope_section)
         k = apply_rope(k, positions, config.head_dim, config.rope_theta, config.partial_rotary_factor, layout="BHTD", mrope_section=config.mrope_section)
 
-    prewrite_k_cache_input = jnp.zeros((batch, seq_len, config.num_key_value_heads, config.head_dim), dtype=dtype)
-    prewrite_v_cache_input = jnp.zeros((batch, seq_len, config.num_key_value_heads, config.head_dim), dtype=dtype)
-
     num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
 
     if kv_cache_state is not None:
@@ -218,8 +214,6 @@ def full_attention_block(
         # Transpose K, V back to [B, T, K, H] for cache storage
         k_cache_input = k.transpose(0, 2, 1, 3)  # [B, T, K, H]
         v_cache_input = v.transpose(0, 2, 1, 3)  # [B, T, K, H]
-        prewrite_k_cache_input = k_cache_input
-        prewrite_v_cache_input = v_cache_input
 
         metadata = attention_metadata
         if metadata is None:
@@ -278,6 +272,4 @@ def full_attention_block(
         force_width1=(not is_prefill) and seq_len > 1 and _force_width1_decode_math(),
     )
 
-    if return_kv_prewrite:
-        return out, kv_cache_state, prewrite_k_cache_input, prewrite_v_cache_input
     return out, kv_cache_state

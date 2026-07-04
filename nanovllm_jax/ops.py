@@ -528,6 +528,11 @@ class ServingOps:
 
     def __init__(self, config=None):
         self.config = config
+        self.full_attention_kv_append_impl = _full_attention_kv_append_impl(config)
+        self.full_attention_decode_impl = _full_attention_decode_impl(config)
+        self.full_attention_prefill_impl = _full_attention_prefill_impl(config)
+        self.gdn_prefill_post_conv_impl = _gdn_prefill_post_conv_impl(config)
+        self.gdn_packed_decode_impl = _gdn_packed_decode_impl(config)
 
     def allocate_kv_cache(
         self,
@@ -559,7 +564,7 @@ class ServingOps:
         spec: KVCacheSpec,
         full_attention_layers: tuple[int, ...],
     ) -> FullAttentionNHDKVCacheStorage | None:
-        if _full_attention_decode_impl(self.config) != "flashinfer_paged":
+        if self.full_attention_decode_impl != "flashinfer_paged":
             return None
         cache_dtype = _full_attention_kv_cache_dtype(spec.dtype, self.config)
         return init_full_attention_nhd_kv_cache(
@@ -649,7 +654,7 @@ class ServingOps:
         cache: KVCacheStorage,
         metadata: AttentionMetadata,
     ) -> KVCacheStorage:
-        if _full_attention_kv_append_impl(self.config) != "reference":
+        if self.full_attention_kv_append_impl != "reference":
             raise AssertionError("KV append policy was validated incorrectly")
         if metadata.token_row_ids is not None:
             actual_tokens = metadata.query_start_loc[-1].astype(jnp.int32)
@@ -682,7 +687,7 @@ class ServingOps:
         is_prefill: bool,
     ) -> jnp.ndarray:
         if is_prefill:
-            prefill_impl = _full_attention_prefill_impl(self.config)
+            prefill_impl = self.full_attention_prefill_impl
             if metadata.token_row_ids is not None:
                 if metadata.positions is None:
                     raise ValueError("metadata.positions is required for packed prefill attention")
@@ -732,7 +737,7 @@ class ServingOps:
             raise ValueError("metadata.positions is required for decode attention")
         if metadata.positions.shape[0] != metadata.block_tables.shape[0]:
             raise ValueError("positions and block_tables batch dimensions must match")
-        if _full_attention_decode_impl(self.config) == "flashinfer_paged" and query.shape[1] == 1:
+        if self.full_attention_decode_impl == "flashinfer_paged" and query.shape[1] == 1:
             if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
                 raise ValueError("FlashInfer decode requires NHD cache storage")
             if cache.k_cache.dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
@@ -778,7 +783,7 @@ class ServingOps:
         num_key_value_groups: int,
         is_prefill: bool,
     ) -> tuple[KVCacheStorage, jnp.ndarray]:
-        if not is_prefill and _full_attention_decode_impl(self.config) == "flashinfer_paged":
+        if not is_prefill and self.full_attention_decode_impl == "flashinfer_paged":
             if metadata.positions is None:
                 raise ValueError("metadata.positions is required for FlashInfer decode attention")
             if cache.k_cache.ndim != 5 or cache.v_cache.ndim != 5:
@@ -864,7 +869,7 @@ class ServingOps:
         initial_state: jnp.ndarray | None,
         use_qk_l2norm_in_kernel: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        impl = _gdn_prefill_post_conv_impl(self.config)
+        impl = self.gdn_prefill_post_conv_impl
         if impl == "off":
             raise RuntimeError("gdn_prefill_post_conv_impl is off; use gated_delta_prefill")
         if impl == "reference":
@@ -1039,7 +1044,7 @@ class ServingOps:
         max_row_tokens: int | None = None,
         return_prefix_state: bool = False,
     ) -> tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        impl = _gdn_prefill_post_conv_impl(self.config)
+        impl = self.gdn_prefill_post_conv_impl
         if impl == "off":
             raise RuntimeError(
                 "gdn_prefill_post_conv_impl is off; use reference packed prefill"
@@ -1258,7 +1263,7 @@ class ServingOps:
         norm_weight: jnp.ndarray | None = None,
         rms_norm_eps: float = 1.0e-6,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        if _gdn_packed_decode_impl(self.config) != "reference":
+        if self.gdn_packed_decode_impl != "reference":
             raise RuntimeError("gdn_packed_decode_impl is off; use gated_delta_decode")
         from nanovllm_jax.kernels.gdn_fla import (
             gdn_packed_decode_reference_from_decay,

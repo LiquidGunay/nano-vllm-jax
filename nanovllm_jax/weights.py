@@ -7,7 +7,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 
-from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.model import ModelParams
 
 
@@ -52,7 +52,7 @@ def _add_mlp_packed_gate_up(layer_params: dict[str, jnp.ndarray]) -> None:
     )
 
 
-def _materialize_tied_lm_head_enabled(config: Qwen3_5Config | None = None) -> bool:
+def _materialize_tied_lm_head_enabled(config: RuntimeConfig | None = None) -> bool:
     """Materialize tied embeddings as a separate [hidden, vocab] LM-head leaf."""
     if config is not None and hasattr(config, "materialize_tied_lm_head"):
         return bool(config.materialize_tied_lm_head)
@@ -141,7 +141,7 @@ def _normalize_hf_key(key: str) -> str:
     return key
 
 
-def _checkpoint_dtypes(config: Qwen3_5Config):
+def _checkpoint_dtypes(config: RuntimeConfig):
     import ml_dtypes
 
     target_dtype = config.get_dtype()
@@ -155,7 +155,7 @@ def _checkpoint_dtypes(config: Qwen3_5Config):
 def _to_jax_weight(
     reader: _SafeTensorReader,
     key: str,
-    config: Qwen3_5Config,
+    config: RuntimeConfig,
     *,
     transpose: bool = False,
     squeeze_axis: int | None = None,
@@ -185,7 +185,7 @@ def _to_jax_weight(
 
 def load_weights_from_hf_streaming(
     model_name: str,
-    config: Qwen3_5Config,
+    config: RuntimeConfig,
     *,
     verbose: bool = False,
     cache_dir: str = None,
@@ -263,7 +263,7 @@ def load_weights_from_hf_streaming(
     )
 
 
-def convert_hf_to_jax(hf_weights: dict, config: Qwen3_5Config, verbose: bool = False) -> ModelParams:
+def convert_hf_to_jax(hf_weights: dict, config: RuntimeConfig, verbose: bool = False) -> ModelParams:
     """Convert HuggingFace weights to JAX format for Qwen 3.5."""
     print("Converting weights...")
     if not verbose:
@@ -419,7 +419,7 @@ def convert_hf_to_jax(hf_weights: dict, config: Qwen3_5Config, verbose: bool = F
 
 def load_weights_from_hf(
     model_name: str,
-    config: Qwen3_5Config,
+    config: RuntimeConfig,
     *,
     verbose: bool = False,
     cache_dir: str = None,

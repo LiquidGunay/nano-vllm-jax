@@ -20,7 +20,7 @@ import jax.numpy as jnp
 
 from nanovllm_jax.ops import ServingOps, ServingOpsProtocol
 from nanovllm_jax.batch import ScheduledBatch
-from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.cache import AttentionMetadata, HybridLayerState, KVCacheState, KVCacheStorage
 from nanovllm_jax.layers import rms_norm
 from nanovllm_jax.model import (
@@ -31,13 +31,13 @@ from nanovllm_jax.model import (
     lm_head_token_ids_and_topk,
 )
 
-def _config_flag(config: Qwen3_5Config | None, attr: str) -> bool:
+def _config_flag(config: RuntimeConfig | None, attr: str) -> bool:
     if config is not None and hasattr(config, attr):
         return bool(getattr(config, attr))
     return False
 
 
-def _needs_static_prefill_token_count(config: Qwen3_5Config | None = None) -> bool:
+def _needs_static_prefill_token_count(config: RuntimeConfig | None = None) -> bool:
     return (
         _config_flag(config, "compact_prefill_in_proj_qkv")
         or _config_flag(config, "compact_prefill_gdn_z")
@@ -49,7 +49,7 @@ def _needs_static_prefill_token_count(config: Qwen3_5Config | None = None) -> bo
 def _compact_prefill_token_count(
     batch: ScheduledBatch,
     *,
-    config: Qwen3_5Config | None = None,
+    config: RuntimeConfig | None = None,
     max_num_batched_tokens: int | None = None,
 ) -> int:
     mode = getattr(config, "compact_prefill_token_count_mode", "exact")
@@ -69,7 +69,7 @@ def _compact_prefill_token_count(
 def _static_prefill_token_count_for_batch(
     batch: ScheduledBatch,
     *,
-    config: Qwen3_5Config | None = None,
+    config: RuntimeConfig | None = None,
     max_num_batched_tokens: int | None = None,
 ) -> int:
     if batch.is_prefill and _needs_static_prefill_token_count(config):
@@ -97,7 +97,7 @@ class ModelExecutor:
 
     def __init__(
         self,
-        config: Qwen3_5Config,
+        config: RuntimeConfig,
         params: ModelParams,
         backend: ServingOpsProtocol | None = None,
     ):

@@ -15,15 +15,16 @@ Invariant:
 import jax
 import jax.numpy as jnp
 import numpy as np
-from typing import List, Tuple, Dict, Optional, Any
+from typing import List, Tuple, Dict, Optional, Any, Literal
 from functools import partial
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from nanovllm_jax.ops import ServingOps, ServingOpsProtocol
 from nanovllm_jax.batch import ScheduledBatch
-from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.model import ModelParams
-from nanovllm_jax.sequence import DeviceTokenRef, Sequence
+from nanovllm_jax.output import DeviceTokenRef
+from nanovllm_jax.sequence import Sequence
 from nanovllm_jax.cache import (
     KVCacheState,
     KVCacheSpec,
@@ -56,13 +57,13 @@ def _block_until_ready_tree(value: object) -> None:
             leaf_ready()
 
 
-def _config_flag(config: Qwen3_5Config | None, attr: str, *, default: bool = False) -> bool:
+def _config_flag(config: RuntimeConfig | None, attr: str, *, default: bool = False) -> bool:
     if config is not None and hasattr(config, attr):
         return bool(getattr(config, attr))
     return bool(default)
 
 
-def _config_int(config: Qwen3_5Config | None, attr: str, *, default: int = 0) -> int:
+def _config_int(config: RuntimeConfig | None, attr: str, *, default: int = 0) -> int:
     if config is not None and hasattr(config, attr):
         return int(getattr(config, attr) or default)
     return int(default)
@@ -84,10 +85,44 @@ from nanovllm_jax.executor import ModelExecutor
 from nanovllm_jax.cache import HybridLayerState, KVCacheStorage
 
 
+@dataclass(frozen=True)
+class RunnerRoute:
+    """Executor route selected for one already-scheduled batch."""
+
+    mode: Literal[
+        "prefill_table",
+        "prefill_slot_carry_table",
+        "prefill_plain",
+        "decode_burst",
+        "decode_resident_dense_slot_carry",
+        "decode_resident_slot_carry",
+        "decode_resident_metadata",
+        "decode_table_slot_carry",
+        "decode_table",
+        "decode_plain",
+        "sampled_decode_resident_dense",
+        "sampled_decode_plain",
+    ]
+    active_rows: tuple[int, ...]
+    decode_steps: int
+    prefill_final_flags: tuple[bool, ...]
+    use_greedy_token_fastpath: bool
+    use_sampled_token_fastpath: bool
+    use_hybrid_table_decode: bool
+    use_hybrid_table_prefill: bool
+    use_sampled_hybrid_table_decode: bool
+    use_prefill_slot_carry_table: bool
+    resident_slot_token_decode: bool
+    resident_slot_token_metadata_decode: bool
+    resident_dense_slot_token_metadata_decode: bool
+    sampled_resident_dense_slot_token_metadata_decode: bool
+    use_resident_slot_decode: bool
+
+
 class ModelRunner:
     """Canonical engine runner built around ModelExecutor.forward_step()."""
 
-    def __init__(self, config: Qwen3_5Config, params: ModelParams, ops: ServingOpsProtocol | None = None):
+    def __init__(self, config: RuntimeConfig, params: ModelParams, ops: ServingOpsProtocol | None = None):
         self.config = config
         self.params = params
         self.backend = ops if ops is not None else ServingOps(config=config)
@@ -810,35 +845,6 @@ class ModelRunner:
                 ),
             )
         )
-        if (
-            carry_enabled
-            and batch.is_prefill
-            and batch.packed_prefill
-            and getattr(batch, "mixed_prefill_decode", False)
-            and getattr(self, "_device_token_carry_by_seq_id", {})
-            and batch.seq_ids_host is not None
-            and batch.query_lens_host is not None
-            and batch.tokens.shape[0] == 1
-        ):
-            tokens = batch.tokens
-            offset = 0
-            applied = False
-            for row, (seq_id, query_len) in enumerate(zip(batch.seq_ids_host, batch.query_lens_host)):
-                query_len = int(query_len)
-                if int(seq_id) >= 0 and query_len == 1:
-                    token_ref = self._device_token_carry_by_seq_id.get(int(seq_id))
-                    if token_ref is not None:
-                        token_array = jnp.asarray(token_ref.tokens, dtype=jnp.int32)
-                        if token_array.ndim == 2 and token_array.shape[1] == 1:
-                            token_value = token_array[int(token_ref.row), 0]
-                        else:
-                            token_value = _int32_device_vector(token_array)[int(token_ref.row)]
-                        tokens = tokens.at[0, offset].set(token_value)
-                        applied = True
-                offset += query_len
-            if applied:
-                return replace(batch, tokens=tokens)
-
         if (
             not carry_enabled
             or batch.is_prefill
@@ -2363,42 +2369,45 @@ class ModelRunner:
             ),
         )
 
-
-    def _run_main_and_sample(
-        self,
-        seqs: List[Sequence],
-        batch: ScheduledBatch,
-    ) -> List[int | List[int]]:
+    @staticmethod
+    def _prefill_final_flags_for_batch(seqs: List[Sequence], batch: ScheduledBatch) -> tuple[bool, ...]:
         if batch.is_prefill:
             prefill_final_flags = list(batch.prefill_final_flags)[: len(seqs)]
             if len(prefill_final_flags) < len(seqs):
                 prefill_final_flags.extend([True] * (len(seqs) - len(prefill_final_flags)))
-        else:
-            prefill_final_flags = [True] * len(seqs)
+            return tuple(bool(flag) for flag in prefill_final_flags)
+        return tuple(True for _ in seqs)
 
+    @staticmethod
+    def _host_query_lens_and_seq_ids(batch: ScheduledBatch, row_count: int) -> tuple[list[int], list[int]]:
+        if batch.query_lens_host is not None:
+            query_lens = [int(x) for x in batch.query_lens_host[:row_count]]
+        else:
+            query_lens = [int(x) for x in batch.query_lens[:row_count].tolist()]
+        if batch.seq_ids_host is not None:
+            seq_ids_host = [int(x) for x in batch.seq_ids_host[:row_count]]
+        else:
+            seq_ids_host = [int(batch.seq_ids[row]) for row in range(row_count)]
+        return query_lens, seq_ids_host
+
+    def _select_route(self, seqs: List[Sequence], batch: ScheduledBatch) -> RunnerRoute:
+        prefill_final_flags = self._prefill_final_flags_for_batch(seqs, batch)
         use_greedy_token_fastpath = self._can_use_greedy_token_fastpath(seqs, batch)
         use_sampled_token_fastpath = (
             not use_greedy_token_fastpath
             and self._can_use_sampled_token_fastpath(seqs, batch)
         )
         decode_burst_steps = self._greedy_decode_burst_steps(seqs, batch) if use_greedy_token_fastpath else 1
-        use_hybrid_table_decode = (
-            use_greedy_token_fastpath
-            and not batch.is_prefill
-            and self._hybrid_state_table.conv_state is not None
+        has_hybrid_table = (
+            self._hybrid_state_table.conv_state is not None
             and self._hybrid_state_table.recurrent_state is not None
         )
-        use_hybrid_table_prefill = (
-            use_greedy_token_fastpath
-            and batch.is_prefill
-            and self._hybrid_state_table.conv_state is not None
-            and self._hybrid_state_table.recurrent_state is not None
-        )
+        use_hybrid_table_decode = use_greedy_token_fastpath and not batch.is_prefill and has_hybrid_table
+        use_hybrid_table_prefill = use_greedy_token_fastpath and batch.is_prefill and has_hybrid_table
         use_sampled_hybrid_table_decode = (
             use_sampled_token_fastpath
             and not batch.is_prefill
-            and self._hybrid_state_table.conv_state is not None
-            and self._hybrid_state_table.recurrent_state is not None
+            and has_hybrid_table
             and bool(getattr(self, "resident_decode_metadata", False))
         )
         use_prefill_slot_carry_table = (
@@ -2430,24 +2439,81 @@ class ModelRunner:
             and hasattr(self, "_resident_rng_counters")
             and self._resident_slot_token_dense_decode_ready(batch, active_rows=active_rows_for_carry)
         )
+        query_lens, seq_ids_host = self._host_query_lens_and_seq_ids(batch, len(seqs))
+        active_rows = tuple(
+            row
+            for row, query_len in enumerate(query_lens)
+            if query_len > 0 and seq_ids_host[row] >= 0
+        )
+        use_resident_slot_decode = (
+            use_hybrid_table_decode
+            and decode_burst_steps <= 1
+            and bool(getattr(self, "resident_decode_metadata", False))
+            and not resident_slot_token_metadata_decode
+        )
+
+        if decode_burst_steps > 1:
+            mode = "decode_burst"
+        elif use_prefill_slot_carry_table:
+            mode = "prefill_slot_carry_table"
+        elif use_hybrid_table_prefill:
+            mode = "prefill_table"
+        elif resident_dense_slot_token_metadata_decode:
+            mode = "decode_resident_dense_slot_carry"
+        elif resident_slot_token_metadata_decode:
+            mode = "decode_resident_slot_carry"
+        elif use_resident_slot_decode:
+            mode = "decode_resident_metadata"
+        elif resident_slot_token_decode:
+            mode = "decode_table_slot_carry"
+        elif use_hybrid_table_decode:
+            mode = "decode_table"
+        elif sampled_resident_dense_slot_token_metadata_decode:
+            mode = "sampled_decode_resident_dense"
+        elif use_sampled_token_fastpath:
+            mode = "sampled_decode_plain"
+        elif use_greedy_token_fastpath:
+            mode = "prefill_plain" if batch.is_prefill else "decode_plain"
+        else:
+            mode = "prefill_plain" if batch.is_prefill else "decode_plain"
+
+        return RunnerRoute(
+            mode=mode,
+            active_rows=active_rows,
+            decode_steps=decode_burst_steps,
+            prefill_final_flags=prefill_final_flags,
+            use_greedy_token_fastpath=use_greedy_token_fastpath,
+            use_sampled_token_fastpath=use_sampled_token_fastpath,
+            use_hybrid_table_decode=use_hybrid_table_decode,
+            use_hybrid_table_prefill=use_hybrid_table_prefill,
+            use_sampled_hybrid_table_decode=use_sampled_hybrid_table_decode,
+            use_prefill_slot_carry_table=use_prefill_slot_carry_table,
+            resident_slot_token_decode=resident_slot_token_decode,
+            resident_slot_token_metadata_decode=resident_slot_token_metadata_decode,
+            resident_dense_slot_token_metadata_decode=resident_dense_slot_token_metadata_decode,
+            sampled_resident_dense_slot_token_metadata_decode=sampled_resident_dense_slot_token_metadata_decode,
+            use_resident_slot_decode=use_resident_slot_decode,
+        )
+
+    def _prepare_batch_for_route(self, route: RunnerRoute, batch: ScheduledBatch) -> ScheduledBatch:
         if not (
-            resident_slot_token_decode
-            or resident_slot_token_metadata_decode
-            or sampled_resident_dense_slot_token_metadata_decode
+            route.resident_slot_token_decode
+            or route.resident_slot_token_metadata_decode
+            or route.sampled_resident_dense_slot_token_metadata_decode
         ):
-            batch = self._maybe_apply_device_token_carry(batch)
+            return self._maybe_apply_device_token_carry(batch)
+        return batch
 
-        if batch.query_lens_host is not None:
-            query_lens = [int(x) for x in batch.query_lens_host[: len(seqs)]]
-        else:
-            query_lens = [int(x) for x in batch.query_lens[: len(seqs)].tolist()]
-        if batch.seq_ids_host is not None:
-            seq_ids_host = [int(x) for x in batch.seq_ids_host[: len(seqs)]]
-        else:
-            seq_ids_host = [int(batch.seq_ids[row]) for row in range(len(seqs))]
-        active_rows = [row for row, query_len in enumerate(query_lens) if query_len > 0 and seq_ids_host[row] >= 0]
-
-        if use_hybrid_table_decode or use_hybrid_table_prefill or sampled_resident_dense_slot_token_metadata_decode:
+    def _hybrid_inputs_for_route(
+        self,
+        route: RunnerRoute,
+        batch: ScheduledBatch,
+    ) -> tuple[jnp.ndarray | None, list[int], HybridLayerState]:
+        if (
+            route.use_hybrid_table_decode
+            or route.use_hybrid_table_prefill
+            or route.sampled_resident_dense_slot_token_metadata_decode
+        ):
             hybrid_slot_ids = self._batch_hybrid_slot_ids(batch)
             hybrid_slot_values = list(batch.hybrid_slot_ids_host or ())
             hybrid_state = self._hybrid_state_table
@@ -2456,15 +2522,89 @@ class ModelRunner:
             hybrid_slot_values = list(batch.hybrid_slot_ids_host or ())
             hybrid_state = self._batch_hybrid_state(batch)
             hybrid_slot_values = list(batch.hybrid_slot_ids_host or hybrid_slot_values)
+        return hybrid_slot_ids, hybrid_slot_values, hybrid_state
 
-        use_resident_slot_decode = (
-            use_hybrid_table_decode
-            and decode_burst_steps <= 1
-            and bool(getattr(self, "resident_decode_metadata", False))
-            and not resident_slot_token_metadata_decode
-        )
-        if use_resident_slot_decode or resident_slot_token_metadata_decode or sampled_resident_dense_slot_token_metadata_decode:
+    def _sync_route_resident_metadata(
+        self,
+        route: RunnerRoute,
+        batch: ScheduledBatch,
+        hybrid_slot_values: list[int],
+    ) -> None:
+        if (
+            route.use_resident_slot_decode
+            or route.resident_slot_token_metadata_decode
+            or route.sampled_resident_dense_slot_token_metadata_decode
+        ):
             self._sync_resident_decode_metadata(batch, hybrid_slot_values, sync_seq_lens=True)
+
+    def _commit_route_output(
+        self,
+        route: RunnerRoute,
+        batch: ScheduledBatch,
+        output: Any,
+        *,
+        hybrid_slot_values: list[int],
+    ) -> None:
+        self.cache_storage = output.cache_storage
+        if (
+            route.use_hybrid_table_decode
+            or route.use_hybrid_table_prefill
+            or route.sampled_resident_dense_slot_token_metadata_decode
+        ):
+            self._hybrid_state_table = output.hybrid_state
+            self._mark_hybrid_slots_written(list(batch.hybrid_slot_ids_host or ()))
+            if (
+                (
+                    route.use_resident_slot_decode
+                    or route.resident_slot_token_metadata_decode
+                    or route.sampled_resident_dense_slot_token_metadata_decode
+                )
+                and output.resident_seq_lens is not None
+            ):
+                self._resident_seq_lens = output.resident_seq_lens
+                self._advance_resident_seq_lens_host(
+                    hybrid_slot_values,
+                    active_rows=list(route.active_rows),
+                    steps=1,
+                )
+        else:
+            self._store_batch_hybrid_state(batch, output.hybrid_state)
+            if route.use_sampled_token_fastpath:
+                self._record_resident_rng_counters(
+                    batch,
+                    output.resident_rng_counters,
+                    active_rows=list(route.active_rows),
+                    prefill_final_flags=list(route.prefill_final_flags),
+                )
+        if batch.is_prefill and bool(getattr(self, "resident_decode_metadata", False)):
+            self._sync_resident_decode_metadata(batch, list(batch.hybrid_slot_ids_host or ()), sync_seq_lens=True)
+
+
+    def _run_main_and_sample(
+        self,
+        seqs: List[Sequence],
+        batch: ScheduledBatch,
+    ) -> List[int | List[int]]:
+        route = self._select_route(seqs, batch)
+        batch = self._prepare_batch_for_route(route, batch)
+        prefill_final_flags = list(route.prefill_final_flags)
+        active_rows = list(route.active_rows)
+        use_greedy_token_fastpath = route.use_greedy_token_fastpath
+        use_sampled_token_fastpath = route.use_sampled_token_fastpath
+        decode_burst_steps = route.decode_steps
+        use_hybrid_table_decode = route.use_hybrid_table_decode
+        use_hybrid_table_prefill = route.use_hybrid_table_prefill
+        use_prefill_slot_carry_table = route.use_prefill_slot_carry_table
+        resident_slot_token_decode = route.resident_slot_token_decode
+        resident_slot_token_metadata_decode = route.resident_slot_token_metadata_decode
+        resident_dense_slot_token_metadata_decode = route.resident_dense_slot_token_metadata_decode
+        sampled_resident_dense_slot_token_metadata_decode = (
+            route.sampled_resident_dense_slot_token_metadata_decode
+        )
+        use_resident_slot_decode = route.use_resident_slot_decode
+
+        hybrid_slot_ids, hybrid_slot_values, hybrid_state = self._hybrid_inputs_for_route(route, batch)
+        self._sync_route_resident_metadata(route, batch, hybrid_slot_values)
 
         prefill_resident_tokens_seeded = False
         if decode_burst_steps > 1:
@@ -2598,27 +2738,7 @@ class ModelRunner:
                 last_logits_only=True,
             )
 
-        self.cache_storage = output.cache_storage
-        if use_hybrid_table_decode or use_hybrid_table_prefill or sampled_resident_dense_slot_token_metadata_decode:
-            self._hybrid_state_table = output.hybrid_state
-            self._mark_hybrid_slots_written(list(batch.hybrid_slot_ids_host or ()))
-            if (
-                (use_resident_slot_decode or resident_slot_token_metadata_decode or sampled_resident_dense_slot_token_metadata_decode)
-                and output.resident_seq_lens is not None
-            ):
-                self._resident_seq_lens = output.resident_seq_lens
-                self._advance_resident_seq_lens_host(hybrid_slot_values, active_rows=active_rows, steps=1)
-        else:
-            self._store_batch_hybrid_state(batch, output.hybrid_state)
-            if use_sampled_token_fastpath:
-                self._record_resident_rng_counters(
-                    batch,
-                    output.resident_rng_counters,
-                    active_rows=active_rows,
-                    prefill_final_flags=prefill_final_flags,
-                )
-        if batch.is_prefill and bool(getattr(self, "resident_decode_metadata", False)):
-            self._sync_resident_decode_metadata(batch, list(batch.hybrid_slot_ids_host or ()), sync_seq_lens=True)
+        self._commit_route_output(route, batch, output, hybrid_slot_values=hybrid_slot_values)
 
         token_ids_all = None
         if decode_burst_steps > 1:

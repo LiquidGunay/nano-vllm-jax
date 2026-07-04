@@ -73,7 +73,7 @@ def format_manifest(fastpath: FastPath = FASTPATH) -> str:
 
 
 def engine_overrides(fastpath: FastPath = FASTPATH) -> dict[str, object]:
-    """Return current ``Qwen3_5Config`` fields for the promoted path.
+    """Return current ``RuntimeConfig`` fields for the promoted path.
 
     Workload and capacity remain in public config; implementation policy is
     centralized here so serving config cannot fork the execution path.

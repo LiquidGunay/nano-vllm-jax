@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import pytest
 
 from nanovllm_jax.ops import ServingOps
-from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.kernels.flashinfer_ffi import kv_append_paged_nhd_reference
 from nanovllm_jax.cache import (
@@ -33,8 +33,8 @@ def _spec() -> KVCacheSpec:
     )
 
 
-def _tiny_full_attention_config() -> Qwen3_5Config:
-    return Qwen3_5Config(
+def _tiny_full_attention_config() -> RuntimeConfig:
+    return RuntimeConfig(
         vocab_size=32,
         hidden_size=16,
         intermediate_size=32,
@@ -65,7 +65,7 @@ def test_nhd_full_attention_cache_disabled_by_default():
 def test_nhd_full_attention_cache_shape_for_flashinfer_decode():
     spec = _spec()
 
-    backend = ServingOps(Qwen3_5Config(full_attention_decode_impl="flashinfer_paged"))
+    backend = ServingOps(RuntimeConfig(full_attention_decode_impl="flashinfer_paged"))
     nhd_cache = backend.allocate_full_attention_nhd_kv_cache(
         spec,
         full_attention_layers=(3, 7, 11, 15, 19, 23),
@@ -94,7 +94,7 @@ def test_nhd_full_attention_cache_uses_main_cache_block_cap():
         max_kv_cache_bytes=2 * 4 * 2 * 1 * 4 * 4 * 2,
     )
 
-    backend = ServingOps(Qwen3_5Config(full_attention_decode_impl="flashinfer_paged"))
+    backend = ServingOps(RuntimeConfig(full_attention_decode_impl="flashinfer_paged"))
     nhd_cache = backend.allocate_full_attention_nhd_kv_cache(
         spec,
         full_attention_layers=(1, 3),

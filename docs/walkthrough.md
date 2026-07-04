@@ -14,6 +14,8 @@ then submits it to `EngineService`.
 `LLMEngine.step()` asks the scheduler for work. For a new prompt, the scheduler
 reserves cache blocks through `BlockManager`, chooses a prefill chunk, and
 returns a `ScheduledBatch`.
+The cleaned scheduler chooses either prefill work or decode work for a step; it
+does not carry a dormant mixed prefill/decode mode.
 
 Packed prefill arrays use fixed bucket shapes:
 
@@ -29,8 +31,9 @@ seq_lens        [rows]
 Only the first `num_prefill_tokens` entries are live. The bucket padding is part
 of the static JAX contract.
 
-`ModelRunner` installs any cached hybrid state, selects the compiled prefill
-bucket, and calls `ModelExecutor`. The executor runs the Qwen layer loop:
+`ModelRunner` installs any cached hybrid state, selects a `RunnerRoute`, prepares
+device-token carry when applicable, and calls `ModelExecutor`. The executor runs
+the Qwen layer loop:
 
 ```text
 embed
@@ -68,8 +71,10 @@ FlashInfer paged route; GDN decode uses the accepted packed BF16 reference
 route; greedy LM-head selection uses the Triton top-1 wrapper.
 
 The engine postprocesses emitted tokens, advances logical sequence length, and
-publishes token events through the request's service handle. Finished requests
-materialize their final token ids and release runner/cache state.
+publishes token events through the request's service handle. Streaming is
+EOS-safe: progress events materialize the visible token prefix on host each
+step. Finished requests materialize their final token ids and release
+runner/cache state.
 
 ## Prefix-Cache Hit
 

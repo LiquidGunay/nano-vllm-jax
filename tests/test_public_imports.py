@@ -26,7 +26,7 @@ def test_top_level_public_imports_are_canonical():
     assert not hasattr(nanovllm_jax, "FastPath")
     assert not hasattr(nanovllm_jax, "LLMEngine")
     assert not hasattr(nanovllm_jax, "ModelConfig")
-    assert not hasattr(nanovllm_jax, "Qwen3_5Config")
+    assert not hasattr(nanovllm_jax, "RuntimeConfig")
     assert not hasattr(nanovllm_jax, "ServerSettings")
     assert not hasattr(nanovllm_jax, "ServingOps")
     assert not hasattr(nanovllm_jax, "select_backend")

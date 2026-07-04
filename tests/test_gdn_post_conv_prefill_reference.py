@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from nanovllm_jax.ops import ServingOps
-from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.kernels.gdn_fla import (
     gdn_fla_prefill_chunk32_fp32_reference,
     gdn_fla_prefill_varlen_reference,
@@ -41,7 +41,7 @@ def _has_jax_triton() -> bool:
     return importlib.util.find_spec("jax_triton") is not None
 
 
-def _small_gdn_config(**overrides) -> Qwen3_5Config:
+def _small_gdn_config(**overrides) -> RuntimeConfig:
     fields = dict(
         vocab_size=32,
         hidden_size=16,
@@ -62,7 +62,7 @@ def _small_gdn_config(**overrides) -> Qwen3_5Config:
         dtype="float32",
     )
     fields.update(overrides)
-    return Qwen3_5Config(**fields)
+    return RuntimeConfig(**fields)
 
 
 def _prefill_ops(
@@ -73,7 +73,7 @@ def _prefill_ops(
     disable_fallbacks: bool = False,
 ) -> ServingOps:
     return ServingOps(
-        Qwen3_5Config(
+        RuntimeConfig(
             gdn_prefill_post_conv_impl=impl,
             gdn_prefill_qkv_dtype=qkv_dtype,
             gdn_prefill_post_conv_output_dtype=output_dtype,

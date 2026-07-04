@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from jax import lax, nn
 
 from nanovllm_jax.cache import HybridLayerState
-from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.layers import causal_conv1d_update, l2norm
 from nanovllm_jax.ops import (
     ServingOps,

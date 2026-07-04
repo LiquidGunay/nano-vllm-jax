@@ -39,6 +39,21 @@ Resolved in the structural cleanup:
   `attention.py`, `gdn.py`, and `lm_head.py` own the corresponding math.
 - Pruned stale operation variants so the runtime keeps one reference path and
   one promoted fast path for each accepted speedup.
+- Hardened `EngineService` lifecycle: engine failures are terminal for the
+  service, queued/active waiters are failed on stop, and bounded queues fail
+  clearly under backpressure.
+- Moved deferred device-token references, prefetch, and materialization policy
+  into `output.py`; `Sequence` now delegates compatibility methods.
+- Removed the dormant mixed prefill/decode scheduler path instead of leaving an
+  uninvoked private scheduling mode on cleaned main.
+- Renamed the private merged execution config to `RuntimeConfig`; the public API
+  remains `LLM`, `EngineConfig`, and `SamplingParams`.
+- Split runner route selection/preparation from resident-state commit through a
+  `RunnerRoute` object.
+- Removed model layer-stage/KV-prewrite diagnostic return payloads from the
+  serving model path.
+- Pruned unused core dependencies (`flax`, `optax`) and made `tqdm` an optional
+  progress-bar extra.
 
 Validation completed under `tests/ram_guard.py`:
 - `python -m compileall -q server.py nanovllm_jax tests`.

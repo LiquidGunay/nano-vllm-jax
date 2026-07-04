@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from nanovllm_jax.ops import ServingOps
-from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.kernels.flashinfer_ffi import (
     kv_append_paged_nhd,
     kv_append_paged_nhd_reference,
@@ -365,7 +365,7 @@ def test_backend_rejects_removed_flashinfer_kv_append_opt_in():
         positions=positions,
     )
     with pytest.raises(ValueError, match="full_attention_kv_append_impl"):
-        ServingOps(Qwen3_5Config(full_attention_kv_append_impl="flashinfer")).write_kv(
+        ServingOps(RuntimeConfig(full_attention_kv_append_impl="flashinfer")).write_kv(
             layer_id=layer_id,
             k=k,
             v=v,

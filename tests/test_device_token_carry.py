@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.batch import ScheduledBatch
 from nanovllm_jax.runner import ModelRunner
@@ -32,8 +32,8 @@ class _AsyncScalar:
 
 
 def test_device_token_carry_comes_from_config():
-    enabled = Qwen3_5Config(device_token_carry=True)
-    disabled = Qwen3_5Config(device_token_carry=False)
+    enabled = RuntimeConfig(device_token_carry=True)
+    disabled = RuntimeConfig(device_token_carry=False)
 
     assert Scheduler(enabled).device_token_carry is True
     assert Scheduler(disabled).device_token_carry is False
@@ -192,7 +192,7 @@ def _prefill_batch(
 
 def test_model_runner_device_token_carry_uses_whole_vector_when_seq_ids_match(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.config = RuntimeConfig(device_token_carry=True)
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -218,7 +218,7 @@ def test_model_runner_device_token_carry_uses_whole_vector_when_seq_ids_match(mo
 
 def test_model_runner_device_token_carry_records_full_static_decode_rows(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.config = RuntimeConfig(device_token_carry=True)
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -248,7 +248,7 @@ def test_model_runner_device_token_carry_records_full_static_decode_rows(monkeyp
 
 def test_model_runner_device_token_carry_updates_resident_last_tokens(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.config = RuntimeConfig(device_token_carry=True)
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -279,7 +279,7 @@ def test_model_runner_device_token_carry_clears_resident_stale_when_tokens_alrea
     monkeypatch,
 ):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.config = RuntimeConfig(device_token_carry=True)
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -308,7 +308,7 @@ def test_model_runner_device_token_carry_marks_resident_stale_when_not_updated(
     monkeypatch,
 ):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.config = RuntimeConfig(device_token_carry=True)
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -332,7 +332,7 @@ def test_model_runner_device_token_carry_marks_resident_stale_when_not_updated(
 
 def test_model_runner_device_token_carry_follows_seq_ids_after_row_order_change(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.config = RuntimeConfig(device_token_carry=True)
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -358,7 +358,7 @@ def test_model_runner_device_token_carry_follows_seq_ids_after_row_order_change(
 
 def test_model_runner_device_token_carry_survives_nonfinal_prefill_chunk(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.config = RuntimeConfig(device_token_carry=True)
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -398,7 +398,7 @@ def test_model_runner_device_token_carry_survives_nonfinal_prefill_chunk(monkeyp
 
 def test_model_runner_release_preserves_carry_for_still_running_rows():
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.config = RuntimeConfig(device_token_carry=True)
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner.hybrid_states = {}
@@ -423,7 +423,7 @@ def test_model_runner_release_preserves_carry_for_still_running_rows():
 def test_scheduler_static_decode_metadata_reuses_fixed_device_arrays(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
-        Qwen3_5Config(
+        RuntimeConfig(
             max_num_seqs=2,
             batch_size_buckets=(2,),
             max_blocks_per_seq=2,
@@ -461,7 +461,7 @@ def test_scheduler_static_decode_metadata_reuses_fixed_device_arrays(monkeypatch
 
 def test_scheduler_decode_block_table_buckets_select_smallest_fit():
     scheduler = Scheduler(
-        Qwen3_5Config(
+        RuntimeConfig(
             max_num_seqs=2,
             batch_size_buckets=(2,),
             max_blocks_per_seq=8,
@@ -482,110 +482,9 @@ def test_scheduler_decode_block_table_buckets_select_smallest_fit():
     np.testing.assert_array_equal(np.asarray(batch.block_tables[1]), np.asarray([1, 3, 0, 0]))
 
 
-def test_scheduler_mixed_prefill_decode_backfills_underfull_decode_batch():
-    scheduler = Scheduler(
-        Qwen3_5Config(
-            max_num_seqs=4,
-            max_num_resident_seqs=6,
-            max_num_batched_tokens=16,
-            prefill_buckets=(16,),
-            prefill_token_buckets=(16,),
-            batch_size_buckets=(4,),
-            max_blocks_per_seq=4,
-            num_kvcache_blocks=16,
-            jax_execution="jit",
-        )
-    )
-    decode_a = Sequence(
-        [1, 2],
-        SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True),
-        seq_id=7,
-    )
-    decode_b = Sequence(
-        [3, 4],
-        SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True),
-        seq_id=8,
-    )
-    for seq, token in ((decode_a, 97), (decode_b, 98)):
-        scheduler.block_manager.allocate(seq, use_prefix_cache=False)
-        seq.num_cached_tokens = seq.num_prompt_tokens
-        seq.append_token(token)
-        seq.status = SequenceStatus.RUNNING
-        scheduler.running.append(seq)
-
-    waiting_a = Sequence(
-        [10, 11, 12],
-        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
-        seq_id=9,
-    )
-    waiting_b = Sequence(
-        [20, 21, 22],
-        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
-        seq_id=10,
-    )
-    scheduler.add(waiting_a)
-    scheduler.add(waiting_b)
-
-    scheduled = scheduler._schedule_mixed_prefill_decode()
-    assert scheduled is not None
-    seqs, batch = scheduled
-
-    assert [seq.seq_id for seq in seqs] == [7, 8, 9, 10]
-    assert batch.is_prefill
-    assert batch.packed_prefill
-    assert batch.mixed_prefill_decode
-    assert batch.query_lens_host == (1, 1, 3, 3)
-    assert batch.seq_lens_host == (3, 3, 3, 3)
-    assert batch.prefill_final_flags[:4] == [True, True, True, True]
-    assert not scheduler.waiting
-    assert len(scheduler.running) == 4
-    np.testing.assert_array_equal(
-        np.asarray(batch.tokens)[0, :8],
-        np.asarray([97, 98, 10, 11, 12, 20, 21, 22]),
-    )
-    np.testing.assert_array_equal(
-        np.asarray(batch.token_row_ids)[0, :8],
-        np.asarray([0, 1, 2, 2, 2, 3, 3, 3]),
-    )
-
-
-def test_model_runner_applies_device_token_carry_to_mixed_packed_decode_rows(monkeypatch):
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.config = Qwen3_5Config(device_token_carry=True)
-    runner.device_token_carry = True
-    runner.static_decode_seq_lens_carry = False
-    runner.device_token_carry = True
-    runner.config = Qwen3_5Config(device_token_carry=True)
-    token_vector = jnp.asarray([70], dtype=jnp.int32)
-    runner._device_token_carry_by_seq_id = {7: DeviceTokenRef(tokens=token_vector, row=0)}
-
-    batch = ScheduledBatch(
-        tokens=jnp.asarray([[0, 11, 12]], dtype=jnp.int32),
-        positions=jnp.asarray([[2, 0, 1]], dtype=jnp.int32),
-        seq_ids=jnp.asarray([7, 8], dtype=jnp.int32),
-        query_start_loc=jnp.asarray([0, 1, 3], dtype=jnp.int32),
-        is_prefill=True,
-        num_prefill_tokens=3,
-        num_decode_tokens=0,
-        block_tables=jnp.zeros((2, 2), dtype=jnp.int32),
-        seq_lens=jnp.asarray([3, 2], dtype=jnp.int32),
-        prefill_is_final=(True, False),
-        seq_ids_host=(7, 8),
-        query_lens_host=(1, 2),
-        seq_lens_host=(3, 2),
-        packed_prefill=True,
-        token_row_ids=jnp.asarray([[0, 1, 1]], dtype=jnp.int32),
-        mixed_prefill_decode=True,
-    )
-
-    carried = runner._maybe_apply_device_token_carry(batch)
-
-    np.testing.assert_array_equal(np.asarray(carried.tokens), np.asarray([[70, 11, 12]]))
-
-
 def test_scheduler_resident_capacity_can_exceed_execution_batch():
     scheduler = Scheduler(
-        Qwen3_5Config(
+        RuntimeConfig(
             max_num_seqs=2,
             max_num_resident_seqs=4,
             max_num_batched_tokens=4,
@@ -638,7 +537,7 @@ def test_scheduler_resident_capacity_can_exceed_execution_batch():
 def test_scheduler_static_decode_metadata_can_reuse_seq_lens_placeholder(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
-        Qwen3_5Config(
+        RuntimeConfig(
             max_num_seqs=2,
             batch_size_buckets=(2,),
             max_blocks_per_seq=2,
@@ -672,7 +571,7 @@ def test_scheduler_static_decode_metadata_can_reuse_seq_lens_placeholder(monkeyp
 def test_scheduler_resident_decode_metadata_uses_device_placeholders(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
-        Qwen3_5Config(
+        RuntimeConfig(
             max_num_seqs=2,
             batch_size_buckets=(2,),
             max_blocks_per_seq=3,
@@ -712,7 +611,7 @@ def test_scheduler_resident_decode_metadata_uses_device_placeholders(monkeypatch
 def test_scheduler_resident_decode_metadata_reuses_placeholders_across_seq_ids(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
-        Qwen3_5Config(
+        RuntimeConfig(
             max_num_seqs=2,
             batch_size_buckets=(2,),
             max_blocks_per_seq=3,
@@ -762,7 +661,7 @@ def test_scheduler_resident_decode_metadata_reuses_placeholders_across_seq_ids(m
 def test_scheduler_static_decode_metadata_allows_greedy_burst(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
-        Qwen3_5Config(
+        RuntimeConfig(
             max_num_seqs=2,
             batch_size_buckets=(2,),
             max_blocks_per_seq=2,
@@ -790,7 +689,7 @@ def test_scheduler_static_decode_metadata_allows_greedy_burst(monkeypatch):
 
 def test_model_runner_static_decode_metadata_requires_token_carry(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = Qwen3_5Config(device_token_carry=True)
+    runner.config = RuntimeConfig(device_token_carry=True)
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -805,7 +704,7 @@ def test_model_runner_static_decode_metadata_requires_token_carry(monkeypatch):
 
 def test_model_runner_static_decode_metadata_applies_carried_seq_lens(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = Qwen3_5Config(
+    runner.config = RuntimeConfig(
         device_token_carry=True,
         static_decode_seq_lens_carry=True,
     )
@@ -838,7 +737,7 @@ def test_model_runner_static_decode_metadata_applies_carried_seq_lens(monkeypatc
 
 def test_model_runner_first_static_decode_can_use_scheduler_seq_lens(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = Qwen3_5Config(
+    runner.config = RuntimeConfig(
         device_token_carry=True,
         static_decode_seq_lens_carry=True,
     )
@@ -871,7 +770,7 @@ def test_model_runner_first_static_decode_can_use_scheduler_seq_lens(monkeypatch
 
 def test_scheduler_postprocess_can_defer_greedy_device_token(monkeypatch):
     scheduler = Scheduler(
-        Qwen3_5Config(
+        RuntimeConfig(
             max_num_seqs=1,
             num_kvcache_blocks=4,
             max_blocks_per_seq=4,
@@ -894,7 +793,7 @@ def test_scheduler_postprocess_can_defer_greedy_device_token(monkeypatch):
 
 def test_scheduler_postprocess_can_defer_sampled_device_token_ref(monkeypatch):
     scheduler = Scheduler(
-        Qwen3_5Config(
+        RuntimeConfig(
             max_num_seqs=1,
             num_kvcache_blocks=4,
             max_blocks_per_seq=4,

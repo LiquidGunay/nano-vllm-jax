@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from nanovllm_jax.config import Qwen3_5Config
+from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.layers import rms_norm
 from nanovllm_jax.ops import gdn_packed_decode_enabled
 
@@ -39,7 +39,7 @@ def _causal_conv1d(
 
 
 def _config_bool(
-    config: Optional[Qwen3_5Config],
+    config: Optional[RuntimeConfig],
     attr: str,
     *,
     default: bool = False,
@@ -50,7 +50,7 @@ def _config_bool(
 
 
 def _config_str(
-    config: Optional[Qwen3_5Config],
+    config: Optional[RuntimeConfig],
     attr: str,
     *,
     default: str,
@@ -61,7 +61,7 @@ def _config_str(
 
 
 def _config_int(
-    config: Optional[Qwen3_5Config],
+    config: Optional[RuntimeConfig],
     attr: str,
     *,
     default: int,
@@ -213,7 +213,7 @@ def _force_width1_decode_math() -> bool:
     return True
 
 
-def _lm_head_decode_activation_dtype(config: Optional[Qwen3_5Config] = None) -> jnp.dtype:
+def _lm_head_decode_activation_dtype(config: Optional[RuntimeConfig] = None) -> jnp.dtype:
     value = _config_str(
         config,
         "lm_head_decode_act_dtype",
@@ -228,25 +228,25 @@ def _lm_head_decode_activation_dtype(config: Optional[Qwen3_5Config] = None) -> 
     )
 
 
-def _decode_padded_gemm_enabled(config: Optional[Qwen3_5Config] = None) -> bool:
+def _decode_padded_gemm_enabled(config: Optional[RuntimeConfig] = None) -> bool:
     return _config_bool(
         config,
         "decode_padded_gemm",
     )
 
 
-def _decode_padded_gemm_gate_up_enabled(config: Optional[Qwen3_5Config] = None) -> bool:
+def _decode_padded_gemm_gate_up_enabled(config: Optional[RuntimeConfig] = None) -> bool:
     return _config_bool(
         config,
         "decode_padded_gemm_gate_up",
     )
 
 
-def _decode_rms_padded_gemm_enabled(config: Optional[Qwen3_5Config] = None) -> bool:
+def _decode_rms_padded_gemm_enabled(config: Optional[RuntimeConfig] = None) -> bool:
     return bool(getattr(config, "decode_rms_padded_gemm", False))
 
 
-def _decode_padded_gemm_rows(config: Optional[Qwen3_5Config] = None) -> int:
+def _decode_padded_gemm_rows(config: Optional[RuntimeConfig] = None) -> int:
     value = _config_int(
         config,
         "decode_padded_gemm_rows",
@@ -263,7 +263,7 @@ def _decode_padded_gemm_rows(config: Optional[Qwen3_5Config] = None) -> int:
     return rows
 
 
-def _decode_padded_gemm_max_out_dim(config: Optional[Qwen3_5Config] = None) -> int:
+def _decode_padded_gemm_max_out_dim(config: Optional[RuntimeConfig] = None) -> int:
     value = _config_int(
         config,
         "decode_padded_gemm_max_out_dim",
@@ -280,7 +280,7 @@ def _decode_padded_gemm_max_out_dim(config: Optional[Qwen3_5Config] = None) -> i
     return out_dim
 
 
-def _lm_head_topk_impl(config: Optional[Qwen3_5Config] = None) -> str:
+def _lm_head_topk_impl(config: Optional[RuntimeConfig] = None) -> str:
     value = _config_str(
         config,
         "lm_head_topk_impl",
@@ -291,7 +291,7 @@ def _lm_head_topk_impl(config: Optional[Qwen3_5Config] = None) -> str:
     raise ValueError(f"lm_head_topk_impl must be jax, got {value!r}")
 
 
-def _lm_head_greedy_top1_impl(config: Optional[Qwen3_5Config] = None) -> str:
+def _lm_head_greedy_top1_impl(config: Optional[RuntimeConfig] = None) -> str:
     value = str(getattr(config, "lm_head_greedy_top1_impl", "jax") or "jax").strip().lower()
     if value in {"", "0", "false", "no", "off", "none", "jax", "reference"}:
         return "jax"
@@ -303,7 +303,7 @@ def _lm_head_greedy_top1_impl(config: Optional[Qwen3_5Config] = None) -> str:
 def _can_use_decode_padded_gemm(
     x: jnp.ndarray,
     weight: jnp.ndarray,
-    config: Optional[Qwen3_5Config] = None,
+    config: Optional[RuntimeConfig] = None,
 ) -> bool:
     rows = _decode_padded_gemm_rows(config)
     return (
@@ -320,7 +320,7 @@ def _can_use_decode_padded_gemm(
 def _decode_padded_gemm_dot(
     x: jnp.ndarray,
     weight: jnp.ndarray,
-    config: Optional[Qwen3_5Config] = None,
+    config: Optional[RuntimeConfig] = None,
 ) -> jnp.ndarray:
     """Run a small-B decode projection through a row-padded GEMM."""
     batch = int(x.shape[0])
@@ -340,7 +340,7 @@ def _can_use_decode_rms_padded_gemm(
     x: jnp.ndarray,
     norm_weight: jnp.ndarray,
     weight: jnp.ndarray,
-    config: Optional[Qwen3_5Config] = None,
+    config: Optional[RuntimeConfig] = None,
 ) -> bool:
     rows = _decode_padded_gemm_rows(config)
     return (
@@ -363,7 +363,7 @@ def _decode_rms_padded_gemm_dot(
     x: jnp.ndarray,
     norm_weight: jnp.ndarray,
     weight: jnp.ndarray,
-    config: Optional[Qwen3_5Config] = None,
+    config: Optional[RuntimeConfig] = None,
 ) -> jnp.ndarray:
     from nanovllm_jax.kernels.decode_reductions import triton_decode_rms_padded_gemm
 
@@ -378,7 +378,7 @@ def _decode_rms_padded_gemm_dot(
 
 def _decode_projection_activation_dtype(
     batch_size: int | None = None,
-    config: Optional[Qwen3_5Config] = None,
+    config: Optional[RuntimeConfig] = None,
 ) -> jnp.dtype:
     value = _config_str(
         config,
@@ -402,7 +402,7 @@ def _use_gdn_decode_packed_in_proj(
     is_prefill: bool,
     batch: int,
     seq_len: int,
-    config: Optional[Qwen3_5Config] = None,
+    config: Optional[RuntimeConfig] = None,
 ) -> bool:
     return (
         not is_prefill
@@ -416,7 +416,7 @@ def _use_gdn_prefill_packed_in_proj(
     params: Dict[str, jnp.ndarray],
     *,
     is_prefill: bool,
-    config: Optional[Qwen3_5Config] = None,
+    config: Optional[RuntimeConfig] = None,
 ) -> bool:
     return (
         is_prefill
@@ -445,7 +445,7 @@ def _use_full_attention_prefill_packed_qkv(
     params: Dict[str, jnp.ndarray],
     *,
     is_prefill: bool,
-    config: Optional[Qwen3_5Config] = None,
+    config: Optional[RuntimeConfig] = None,
 ) -> bool:
     return (
         is_prefill
@@ -459,7 +459,7 @@ def _enable_chunked_gdn_prefill() -> bool:
     return True
 
 
-def _enable_compact_prefill_in_proj_qkv(config: Optional[Qwen3_5Config] = None) -> bool:
+def _enable_compact_prefill_in_proj_qkv(config: Optional[RuntimeConfig] = None) -> bool:
     """Compact true prefill tokens for the GDN QKV input projection."""
     return _config_bool(
         config,
@@ -467,7 +467,7 @@ def _enable_compact_prefill_in_proj_qkv(config: Optional[Qwen3_5Config] = None) 
     )
 
 
-def _enable_compact_prefill_mlp(config: Optional[Qwen3_5Config] = None) -> bool:
+def _enable_compact_prefill_mlp(config: Optional[RuntimeConfig] = None) -> bool:
     """Compact true prefill tokens for tokenwise MLP projections."""
     return _config_bool(
         config,
@@ -475,7 +475,7 @@ def _enable_compact_prefill_mlp(config: Optional[Qwen3_5Config] = None) -> bool:
     )
 
 
-def _enable_compact_prefill_gdn_z(config: Optional[Qwen3_5Config] = None) -> bool:
+def _enable_compact_prefill_gdn_z(config: Optional[RuntimeConfig] = None) -> bool:
     """Compact true prefill tokens for the GDN Z input projection."""
     return _config_bool(
         config,
@@ -483,7 +483,7 @@ def _enable_compact_prefill_gdn_z(config: Optional[Qwen3_5Config] = None) -> boo
     )
 
 
-def _enable_compact_prefill_full_attn_proj(config: Optional[Qwen3_5Config] = None) -> bool:
+def _enable_compact_prefill_full_attn_proj(config: Optional[RuntimeConfig] = None) -> bool:
     """Compact true prefill tokens for full-attention Q/K/V projections."""
     return _config_bool(
         config,
@@ -521,7 +521,7 @@ def _compact_prefill_tokenwise_dot(
     weight: jnp.ndarray,
     valid_token_mask: Optional[jnp.ndarray],
     compact_num_tokens: Optional[int],
-    config: Optional[Qwen3_5Config] = None,
+    config: Optional[RuntimeConfig] = None,
 ) -> jnp.ndarray:
     """Run a tokenwise projection only on true ragged prefill tokens."""
     return _compact_prefill_dot_if_enabled(
@@ -541,7 +541,7 @@ def _compact_prefill_mlp(
     activation_fn,
     valid_token_mask: Optional[jnp.ndarray],
     compact_num_tokens: Optional[int],
-    config: Optional[Qwen3_5Config] = None,
+    config: Optional[RuntimeConfig] = None,
 ) -> jnp.ndarray:
     """Run tokenwise prefill MLP only on true ragged tokens."""
     if (
@@ -571,7 +571,7 @@ def _compact_prefill_mlp_packed(
     activation_fn,
     valid_token_mask: Optional[jnp.ndarray],
     compact_num_tokens: Optional[int],
-    config: Optional[Qwen3_5Config] = None,
+    config: Optional[RuntimeConfig] = None,
 ) -> jnp.ndarray:
     """Run tokenwise prefill MLP only on true ragged tokens with packed gate/up."""
     if (
