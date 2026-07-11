@@ -334,6 +334,26 @@ def test_lm_head_triton_reads_tied_embeddings_without_global_transpose(batch):
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
+def test_lm_head_triton_can_bound_native_vocabulary_without_slicing():
+    pytest.importorskip("jax_triton")
+    if jax.default_backend() != "gpu":
+        pytest.skip("Triton LM-head top1 requires the CUDA backend")
+
+    from nanovllm_jax.kernels.lm_head_triton import lm_head_greedy_top1_triton
+
+    hidden = jax.random.normal(jax.random.PRNGKey(29), (1, 1, 32)).astype(jnp.bfloat16)
+    embedding = jax.random.normal(jax.random.PRNGKey(31), (257, 32)).astype(jnp.bfloat16)
+    limited = lm_head_greedy_top1_triton(
+        hidden,
+        embedding,
+        vocab_major=True,
+        vocab_size_limit=193,
+    )
+    expected = lm_head_greedy_top1_triton(hidden, embedding[:193], vocab_major=True)
+
+    np.testing.assert_array_equal(np.asarray(limited), np.asarray(expected))
+
+
 def test_decode_padded_gemm_default_cap_admits_qwen_vocab_projection():
     config = Qwen3_5Config(decode_padded_gemm=True)
     x = jnp.zeros((8, 1, 1), dtype=jnp.bfloat16)

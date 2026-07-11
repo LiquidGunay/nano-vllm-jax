@@ -28,6 +28,7 @@ def _lm_head_top1_stage1_kernel(
     batch_size: tl.constexpr,
     hidden_dim: tl.constexpr,
     vocab_size: tl.constexpr,
+    weight_vocab_stride: tl.constexpr,
     num_vocab_blocks: tl.constexpr,
     VOCAB_MAJOR: tl.constexpr,
     REDUCE_CAST: tl.constexpr,
@@ -58,7 +59,7 @@ def _lm_head_top1_stage1_kernel(
             b = tl.trans(b)
         else:
             b = tl.load(
-                weight + k[:, None] * vocab_size + vocab_offsets[None, :],
+                weight + k[:, None] * weight_vocab_stride + vocab_offsets[None, :],
                 mask=(k[:, None] < hidden_dim) & (vocab_offsets[None, :] < vocab_size),
                 other=0.0,
             )
@@ -128,6 +129,7 @@ def lm_head_greedy_top1_triton(
     block_m: int | None = None,
     block_n: int = 256,
     block_k: int = 64,
+    vocab_size_limit: int | None = None,
 ) -> jax.Array:
     """Return greedy token ids without materializing logits.
 
@@ -143,7 +145,10 @@ def lm_head_greedy_top1_triton(
     batch = int(hidden_norm.shape[0])
     hidden_dim = int(hidden_norm.shape[-1])
     weight_hidden = int(output_weight.shape[1 if vocab_major else 0])
-    vocab_size = int(output_weight.shape[0 if vocab_major else 1])
+    weight_vocab_size = int(output_weight.shape[0 if vocab_major else 1])
+    vocab_size = weight_vocab_size
+    if vocab_size_limit is not None and int(vocab_size_limit) > 0:
+        vocab_size = min(vocab_size, int(vocab_size_limit))
     if batch <= 0 or hidden_dim <= 0 or vocab_size <= 0:
         raise ValueError("Triton LM-head top1 requires non-empty dimensions")
     if hidden_dim != weight_hidden:
@@ -176,6 +181,7 @@ def lm_head_greedy_top1_triton(
         batch_size=batch,
         hidden_dim=hidden_dim,
         vocab_size=vocab_size,
+        weight_vocab_stride=weight_vocab_size,
         num_vocab_blocks=num_vocab_blocks,
         VOCAB_MAJOR=bool(vocab_major),
         REDUCE_CAST=reduce_cast,

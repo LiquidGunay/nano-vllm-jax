@@ -57,11 +57,12 @@ DEFAULT_WORKER_NICE = int(os.environ.get("NANO_VLLM_JAX_RANDOM_WORKER_NICE", "10
 DEFAULT_MAX_SYSTEM_RAM_PERCENT = float(
     os.environ.get("NANO_VLLM_JAX_RANDOM_MAX_SYSTEM_RAM_PERCENT", "70")
 )
-_STARTUP_WARMUP_ENGINE_KEYS = (
+_DIRECT_CONFIG_ENGINE_KEYS = (
     "startup_warmup_prefill_token_buckets",
     "startup_warmup_batch_size_buckets",
     "startup_warmup_decode_block_table_buckets",
     "startup_warmup_include_sampled_routes",
+    "mtp_draft_vocab_size",
 )
 
 
@@ -383,7 +384,7 @@ def _load_jax_config(path: str) -> dict[str, Any]:
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     engine_overrides = engine_overrides_from_config(raw)
     engine_section = raw.get("engine", {}) or {}
-    for key in _STARTUP_WARMUP_ENGINE_KEYS:
+    for key in _DIRECT_CONFIG_ENGINE_KEYS:
         if key in engine_section and engine_section[key] not in (None, ""):
             engine_overrides[key] = engine_section[key]
     return {

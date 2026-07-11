@@ -1,0 +1,62 @@
+# Live B=8 regression lane for the promoted non-MTP server path.
+#
+# Edit this file, then run:
+#   .venv/bin/python benchmarks/benchmark_random_request_sidecar.py \
+#     --experiment-config configs/diagnostics/b8_live.yaml
+
+benchmark:
+  model: "Qwen/Qwen3.5-0.8B"
+  backend: "gpu"
+  dtype: "bfloat16"
+  weight_dtype: "bfloat16"
+  jax_execution: "jit"
+  jax_config: "configs/server/gpu_optimal.yaml"
+  skip_vllm: true
+  skip_jax: false
+  reference_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260608/random_large_flashinfer_lm_triton_bn256_r1_jax.json"
+  vllm_reference_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/random_hillclimb_20260608/random_large_flashinfer_lm_triton_bn256_r1.json"
+  run_label: "b8_random_large_general_regression_repeat"
+  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/b8_live/b8_random_large_general_regression_repeat.json"
+
+  seed: 1234
+  dataset_name: "random"
+  min_input_tokens: 512
+  max_input_tokens: 1024
+  min_output_tokens: 128
+  max_output_tokens: 256
+  min_request_count: 8
+  max_request_count: 8
+  temperature: 0.0
+  top_p: 1.0
+  sampling_top_k: -1
+
+  jax_warmup: true
+  jax_warmup_mode: "generic"
+  jax_fail_on_jit_cache_growth: true
+  jax_profile: false
+  jax_max_kv_cache_mb: 2048
+  jax_num_kvcache_blocks: 2048
+  max_num_seqs: 8
+  max_num_resident_seqs: 8
+  max_num_batched_tokens: 1024
+  jax_prefix_cache: true
+  prefill_buckets: "512,1024"
+  prefill_token_buckets: "512,1024"
+  prefill_layout: "packed"
+  batch_size_buckets: "1,2,3,4,5,6,7,8"
+  max_blocks_per_seq: 128
+  decode_block_table_buckets: "128"
+  resident_decode_metadata: true
+  jax_startup_warmup_prefill_token_buckets: "512,1024"
+  jax_startup_warmup_batch_size_buckets: "1,2,3,4,5,6,7,8"
+  jax_startup_warmup_decode_block_table_buckets: "128"
+  jax_startup_warmup_include_sampled_routes: false
+
+  jax_speculative_method: "none"
+  jax_num_speculative_tokens: 0
+  command_timeout_seconds: 900
+  max_system_ram_percent: 70
+  worker_cpu_cores: 4
+  worker_cpu_core_offset: 0
+  worker_nice: 10
+  resource_poll_seconds: 0.25

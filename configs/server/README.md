@@ -18,3 +18,7 @@ Use these YAML files with `python server.py --config <path>`.
 Benchmark JSON files under `benchmarks/configs/` are benchmark contracts, not
 server setup recipes. Full result/profile artifacts should stay under
 `/mountpoint/.exp/diagnostics` or `/mountpoint/.exp/profiles`, not in git.
+
+Latency and throughput compile different static shape buckets. Keep B=1 MTP
+experiments in `configs/diagnostics/mtp_live.yaml` and validate shared changes
+with `configs/diagnostics/b8_live.yaml` before promoting them here.

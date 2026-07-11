@@ -616,8 +616,11 @@ def _use_gdn_decode_packed_in_proj(
     seq_len: int,
     config: Optional[Qwen3_5Config] = None,
 ) -> bool:
-    # Split projections remain best for a single B=1 token. Grouped decode
-    # must use the persistent packed leaf or XLA repacks the weights at runtime.
+    width1_packed = _config_or_env_bool(
+        config,
+        "gdn_width1_packed_input_projection",
+        "NANO_VLLM_JAX_GDN_WIDTH1_PACKED_PROJECTIONS",
+    )
     return (
         not is_prefill
         and _GDN_DECODE_IN_PROJ_PACKED_KEY in params
@@ -626,6 +629,7 @@ def _use_gdn_decode_packed_in_proj(
             batch > 1
             or seq_len > 1
             or gdn_packed_decode_tail_fused_enabled(config)
+            or width1_packed
         )
     )
 

@@ -249,6 +249,12 @@ def _mtp_greedy_top1_token_ids(
     vocab_major: bool = False,
 ) -> jnp.ndarray:
     impl = str(getattr(config, "mtp_lm_head_greedy_top1_impl", "jax") or "jax").strip().lower()
+    configured_vocab = os.environ.get("NANO_VLLM_JAX_MTP_DRAFT_VOCAB_SIZE")
+    if configured_vocab is None:
+        configured_vocab = getattr(config, "mtp_draft_vocab_size", 0)
+    vocab_size = int(output_weight.shape[0 if vocab_major else 1])
+    draft_vocab_size = int(configured_vocab or 0)
+    limit_vocab = 0 < draft_vocab_size < vocab_size
     if impl in {"triton", "triton_tensorcore", "triton_top1"}:
         from nanovllm_jax.kernels.lm_head_triton import lm_head_greedy_top1_triton
 
@@ -259,6 +265,7 @@ def _mtp_greedy_top1_token_ids(
                 x_normed.astype(output_weight.dtype),
                 output_weight,
                 vocab_major=vocab_major,
+                vocab_size_limit=draft_vocab_size if limit_vocab else None,
             ).astype(jnp.int32)
         batch, seq_len, hidden_dim = x_normed.shape
         flat_hidden = x_normed.reshape((batch * seq_len, 1, hidden_dim))
@@ -266,6 +273,7 @@ def _mtp_greedy_top1_token_ids(
             flat_hidden.astype(output_weight.dtype),
             output_weight,
             vocab_major=vocab_major,
+            vocab_size_limit=draft_vocab_size if limit_vocab else None,
         ).astype(jnp.int32)
         return flat_token_ids.reshape((batch, seq_len))
     if impl in {"cutlass", "cutlass_top1", "cutlass_fused_gemm", "fused_gemm"}:
@@ -274,6 +282,12 @@ def _mtp_greedy_top1_token_ids(
         )
     if impl not in {"jax", "", "none"}:
         raise ValueError(f"unsupported MTP greedy top1 implementation: {impl!r}")
+    if limit_vocab:
+        output_weight = (
+            output_weight[:draft_vocab_size]
+            if vocab_major
+            else output_weight[:, :draft_vocab_size]
+        )
     logits = jnp.dot(x_normed, output_weight.T if vocab_major else output_weight)
     return jnp.argmax(logits, axis=-1).astype(jnp.int32)
 

@@ -14273,3 +14273,38 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     accept/commit state in persistent backend buffers. XLA already emitted
     command buffers for the current JIT; the tested command-buffer flags did
     not reproduce vLLM's whole-runner CUDA-graph boundary.
+
+#### Entry 332 - Typed B=1 Latency Profile And B=8 Regression Gate
+
+- date: 2026-07-11
+- implementation:
+  - ordinary B=1 decode can opt into its persistent packed GDN input projection
+    through `gdn_width1_packed_input_projection`; B>1 behavior is unchanged;
+  - `mtp_draft_vocab_size` bounds the proposal head without slicing/copying the
+    persistent weight. Target verification remains full-vocabulary;
+  - both switches flow through typed server/benchmark configuration, with
+    environment variables retained only as compatibility overrides;
+  - added `configs/diagnostics/b8_live.yaml` as the fixed seed-1234 general-path
+    regression lane. `gpu_optimal.yaml` remains the promoted non-MTP profile.
+- 4B B=1 results, 64 prompt + 64 greedy output tokens:
+  - strengthened no-MTP base repeats: `52.16` and `52.25 output tok/s`, exact;
+  - strict full-vocabulary K=2: `64.44`, exact, `39/48` accepted;
+  - strict 131072-token proposal vocabulary: `68.62--69.26`, exact, the same
+    `39/48` acceptance, zero fallback and zero measured JIT growth;
+  - the final typed run peaked at `62.7%` host RAM and is `1.326x` the stronger
+    JAX base and `1.420x` fresh base vLLM (`48.79`).
+- parity diagnostics:
+  - forcing width-1 GDN projections, attention+MLP projections, or all four
+    projection families did not remove the exercised packed-verifier token-2
+    drift; the defect is in broad token/state math rather than weight packing;
+  - the 4B one-layer drift graph failed safely on a `1.39 GiB` GPU allocation
+    after reaching `67.3%` host RAM. Do not retry it on 4B; use 0.8B/2B for
+    layerwise localization.
+- B=8 gate:
+  - exact historical random-large manifest SHA
+    `6662c7b48aa32ffea70019afacfd861a4b0a5ce9dd18f0dc589fd4e02705395f`;
+  - current-code repeats: `785.87` and `756.41 output tok/s`; detached
+    pre-change checkpoint `76bc901`: `727.38`; all had zero measured JIT growth
+    and peaked at `68.3--68.9%` host RAM;
+  - the older `818.91` anchor did not reproduce under the current runtime.
+    Treat the new A/B as evidence of no B=8 regression, not a speedup claim.

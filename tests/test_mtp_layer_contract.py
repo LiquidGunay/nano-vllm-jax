@@ -155,10 +155,17 @@ def test_mtp_forward_last_uses_final_sequence_position():
 def test_mtp_triton_top1_casts_hidden_to_weight_dtype(monkeypatch):
     seen = {}
 
-    def fake_top1(hidden_norm, output_weight, *, vocab_major=False):
+    def fake_top1(
+        hidden_norm,
+        output_weight,
+        *,
+        vocab_major=False,
+        vocab_size_limit=None,
+    ):
         seen["hidden_dtype"] = hidden_norm.dtype
         seen["weight_dtype"] = output_weight.dtype
         seen["vocab_major"] = vocab_major
+        seen["vocab_size_limit"] = vocab_size_limit
         return jnp.zeros((hidden_norm.shape[0], hidden_norm.shape[1]), dtype=jnp.int32)
 
     monkeypatch.setitem(
@@ -177,4 +184,40 @@ def test_mtp_triton_top1_casts_hidden_to_weight_dtype(monkeypatch):
         "hidden_dtype": jnp.dtype(jnp.bfloat16),
         "weight_dtype": jnp.dtype(jnp.bfloat16),
         "vocab_major": False,
+        "vocab_size_limit": None,
     }
+
+
+def test_mtp_draft_vocab_limit_slices_only_the_vocab_axis(monkeypatch):
+    seen = []
+
+    def fake_top1(
+        hidden_norm,
+        output_weight,
+        *,
+        vocab_major=False,
+        vocab_size_limit=None,
+    ):
+        seen.append((output_weight.shape, vocab_major, vocab_size_limit))
+        return jnp.zeros(hidden_norm.shape[:2], dtype=jnp.int32)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "nanovllm_jax.kernels.lm_head_triton",
+        types.SimpleNamespace(lm_head_greedy_top1_triton=fake_top1),
+    )
+    config = types.SimpleNamespace(
+        mtp_lm_head_greedy_top1_impl="triton",
+        mtp_draft_vocab_size=7,
+    )
+    hidden = jnp.ones((1, 1, 8), dtype=jnp.bfloat16)
+
+    _mtp_greedy_top1_token_ids(hidden, jnp.ones((8, 16)), config)
+    _mtp_greedy_top1_token_ids(
+        hidden,
+        jnp.ones((16, 8)),
+        config,
+        vocab_major=True,
+    )
+
+    assert seen == [((8, 16), False, 7), ((16, 8), True, 7)]

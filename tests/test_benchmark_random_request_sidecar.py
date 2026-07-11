@@ -362,6 +362,7 @@ runtime:
     lm_head_topk_impl: flashinfer
     lm_head_greedy_top1_impl: cutlass
     decode_rms_padded_gemm: true
+    gdn_width1_packed_input_projection: true
 kernels:
   full_attention:
     kv_cache_dtype: bf16
@@ -373,6 +374,7 @@ kernels:
       impl: triton_fla_conv_raw_gates
       qkv_dtype: bf16
 engine:
+  mtp_draft_vocab_size: 131072
   startup_warmup_prefill_token_buckets: "64,128"
   startup_warmup_batch_size_buckets: "1,2"
   startup_warmup_decode_block_table_buckets: "128"
@@ -404,6 +406,8 @@ engine:
     assert command[command.index("--lm-head-topk-impl") + 1] == "flashinfer"
     assert command[command.index("--lm-head-greedy-top1-impl") + 1] == "cutlass"
     assert "--decode-rms-padded-gemm" in command
+    assert "--gdn-width1-packed-input-projection" in command
+    assert command[command.index("--mtp-draft-vocab-size") + 1] == "131072"
     assert command[command.index("--full-attention-kv-cache-dtype") + 1] == "bf16"
     assert command[command.index("--full-attention-decode-impl") + 1] == "triton_paged"
     assert command[command.index("--full-attention-prefill-impl") + 1] == "triton_packed"

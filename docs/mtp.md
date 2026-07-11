@@ -30,9 +30,10 @@ recursive drafts, target-model verification, and the 70% system-RAM watchdog.
 | route | exact | completed output tok/s | host token-event tok/s | vs vLLM base | vs JAX base | acceptance | peak RAM |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | vLLM 0.24.0, no MTP | yes | 48.79 | n/a | 1.000x | 1.237x | n/a | 63.4% |
-| JAX, no MTP, native tied head | yes | 39.43 | 74.89 | 0.808x | 1.000x | n/a | 61.2% |
-| JAX strict packed K=2, current | yes | 63.47 | 64.37 | 1.301x | 1.610x | 81.25% | 63.6% |
-| vLLM 0.24.0, MTP K=2 | yes | 88.05 | n/a | 1.805x | 2.233x | 83.33% | 63.5% |
+| JAX, no MTP, B=1 packed GDN input | yes | 52.25 | 53.16 | 1.071x | 1.000x | n/a | 60.9% |
+| JAX strict packed K=2, full draft vocab | yes | 64.44 | 65.26 | 1.321x | 1.233x | 81.25% | 63.5% |
+| JAX strict packed K=2, 131k draft vocab | yes | 69.26 | 70.23 | 1.420x | 1.326x | 81.25% | 62.7% |
+| vLLM 0.24.0, MTP K=2 | yes | 88.05 | n/a | 1.805x | 1.685x | 83.33% | 63.5% |
 
 Completed output throughput is the speed metric. It includes the final device
 drain and token materialization. The host token-event clock is diagnostic only:
@@ -40,12 +41,33 @@ resident token carry can enqueue dependent GPU work and emit host events before
 that work completes. It is neither a model-side clock nor cross-runtime
 comparable. The benchmark artifact now labels this scope explicitly.
 
-Four post-ABI JAX MTP runs span `63.47--65.40` completed output tok/s. All match
-the current no-MTP JAX row for all 64 tokens. Each proposes 48 drafts, accepts
-39, records six rejected blocks and 18 bonus tokens, has zero verifier/seed
-fallbacks, and adds no JIT keys during measurement. Against the corrected JAX
-base this is a `1.610--1.658x` MTP speedup; against fresh base vLLM it is
-`1.301--1.340x`.
+The current typed-config run matches the strengthened no-MTP JAX row for all 64
+tokens. It proposes 48 drafts, accepts 39, records six rejected blocks and 18
+bonus tokens, has zero verifier/seed fallbacks, and adds no JIT keys during
+measurement. `mtp_draft_vocab_size=131072` limits only proposal generation;
+the target verifier still evaluates the complete vocabulary. Consequently the
+committed output is exact with zero output-distribution KL. The bound preserves
+the same `39/48` acceptance on this row and improves strict MTP from `64.44` to
+`69.26 tok/s`.
+
+### Workload profiles
+
+XLA produces different executables for static batch and sequence buckets. The
+engine therefore treats latency and throughput as explicit profiles rather
+than assuming one compilation policy is universally optimal:
+
+- `configs/server/gpu_optimal.yaml` remains the general non-MTP/B=8 path;
+- `configs/diagnostics/mtp_live.yaml` owns the B=1 MTP latency experiment;
+- `configs/diagnostics/b8_live.yaml` is the same-manifest B=8 regression gate.
+
+`gdn_width1_packed_input_projection` is deliberately opt-in. It lets ordinary
+B=1 decode consume the persistent packed GDN input leaf and raises the 4B base
+from `39.43` to `52.25 tok/s`; B>1 already used that leaf, so its executable
+branch is unchanged. On the exact seed-1234 random-large B=8 lane, current-code
+repeats reached `756.41` and `785.87 tok/s`, while the pre-change checkpoint
+reached `727.38 tok/s` under an identical command. Run variance prevents a B=8
+speedup claim, but there is no observed B=8 regression. Shared changes are not
+promoted to the default without this gate.
 
 ### Base JAX timing correction
 

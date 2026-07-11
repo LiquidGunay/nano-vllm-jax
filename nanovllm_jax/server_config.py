@@ -103,6 +103,7 @@ _ENGINE_ENV_MAP: dict[str, tuple[str, type]] = {
     "mtp_token_source": ("NANO_VLLM_JAX_MTP_TOKEN_SOURCE", str),
     "mtp_position_offset": ("NANO_VLLM_JAX_MTP_POSITION_OFFSET", int),
     "mtp_lm_head_greedy_top1_impl": ("NANO_VLLM_JAX_MTP_LM_HEAD_GREEDY_TOP1_IMPL", str),
+    "mtp_draft_vocab_size": ("NANO_VLLM_JAX_MTP_DRAFT_VOCAB_SIZE", int),
     "num_speculative_tokens": ("NANO_VLLM_JAX_NUM_SPECULATIVE_TOKENS", int),
     "mtp_burst_groups": ("NANO_VLLM_JAX_MTP_BURST_GROUPS", int),
     "mtp_max_active_rows": ("NANO_VLLM_JAX_MTP_MAX_ACTIVE_ROWS", int),
@@ -140,6 +141,10 @@ _ENGINE_ENV_MAP: dict[str, tuple[str, type]] = {
     "decode_rms_padded_gemm": ("NANO_VLLM_JAX_DECODE_RMS_PADDED_GEMM", bool),
     "decode_padded_gemm_rows": ("NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS", int),
     "decode_padded_gemm_max_out_dim": ("NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM", int),
+    "gdn_width1_packed_input_projection": (
+        "NANO_VLLM_JAX_GDN_WIDTH1_PACKED_PROJECTIONS",
+        bool,
+    ),
     "full_attention_kv_cache_dtype": ("NANO_VLLM_JAX_FULL_ATTN_KV_CACHE_DTYPE", str),
     "full_attention_kv_append_impl": ("NANO_VLLM_JAX_FULL_ATTN_KV_APPEND_IMPL", str),
     "full_attention_decode_impl": ("NANO_VLLM_JAX_FULL_ATTN_DECODE_IMPL", str),
@@ -320,6 +325,7 @@ def _runtime_fastpaths_to_engine(runtime_section: dict) -> dict[str, Any]:
         "decode_rms_padded_gemm": "decode_rms_padded_gemm",
         "decode_padded_gemm_rows": "decode_padded_gemm_rows",
         "decode_padded_gemm_max_out_dim": "decode_padded_gemm_max_out_dim",
+        "gdn_width1_packed_input_projection": "gdn_width1_packed_input_projection",
     }
     return {
         engine_key: fastpaths[fastpath_key]
@@ -420,6 +426,9 @@ def _runtime_section_to_env(runtime_section: dict) -> dict[str, str]:
         "decode_padded_gemm_gate_up": "NANO_VLLM_JAX_DECODE_PADDED_GEMM_GATE_UP",
         "decode_padded_gemm_rows": "NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS",
         "decode_padded_gemm_max_out_dim": "NANO_VLLM_JAX_DECODE_PADDED_GEMM_MAX_OUT_DIM",
+        "gdn_width1_packed_input_projection": (
+            "NANO_VLLM_JAX_GDN_WIDTH1_PACKED_PROJECTIONS"
+        ),
         "pallas_decode_rmsnorm": "NANO_VLLM_JAX_PALLAS_DECODE_RMSNORM",
         "triton_decode_rmsnorm": "NANO_VLLM_JAX_TRITON_DECODE_RMSNORM",
         "pallas_gdn_qk_prenorm": "NANO_VLLM_JAX_PALLAS_GDN_QK_PRENORM",
@@ -677,6 +686,7 @@ def load_server_config(path: str | Path | None = None) -> ServerConfig:
         "mtp_token_source": "generated",
         "mtp_position_offset": 0,
         "mtp_lm_head_greedy_top1_impl": "jax",
+        "mtp_draft_vocab_size": 0,
         "mtp_prefill_seed": True,
         "mtp_unverified_draft_append": False,
         "mtp_unverified_fused_append": False,
@@ -708,6 +718,7 @@ def load_server_config(path: str | Path | None = None) -> ServerConfig:
         "decode_rms_padded_gemm": False,
         "decode_padded_gemm_rows": 8,
         "decode_padded_gemm_max_out_dim": 300000,
+        "gdn_width1_packed_input_projection": False,
         "full_attention_kv_cache_dtype": "default",
         "full_attention_kv_append_impl": "reference",
         "full_attention_decode_impl": "reference",

@@ -16,9 +16,9 @@ benchmark:
   jax_execution: "jit"
   skip_vllm: true
   skip_jax: false
-  reference_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_live/qwen35_4b_no_mtp_native_head_b1_64x64_jax.json"
-  run_label: "qwen35_4b_strict_k2_native_head_b1_64x64"
-  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_live/qwen35_4b_strict_k2_native_head_b1_64x64.json"
+  reference_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_live/qwen35_4b_no_mtp_width1_packed_gdn_b1_64x64_jax.json"
+  run_label: "qwen35_4b_strict_k2_typed_latency_config_b1_64x64"
+  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_live/qwen35_4b_strict_k2_typed_latency_config_b1_64x64.json"
   seed: 20260710
   dataset_name: "random"
   min_input_tokens: 64
@@ -128,6 +128,7 @@ engine:
   mtp_chain_hidden_source: "final_normed"
   mtp_chain_mode: "recursive"
   mtp_lm_head_greedy_top1_impl: "triton"
+  mtp_draft_vocab_size: 131072
   num_speculative_tokens: 2
   mtp_burst_groups: 1
   mtp_max_active_rows: 1
@@ -161,8 +162,10 @@ runtime:
     decode_proj_act_dtype: "bf16"
     decode_padded_gemm: true
     decode_padded_gemm_gate_up: true
+    decode_rms_padded_gemm: false
     decode_padded_gemm_rows: 8
     decode_padded_gemm_max_out_dim: 300000
+    gdn_width1_packed_input_projection: true
 
 kernels:
   backend: "pure_jax"

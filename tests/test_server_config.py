@@ -276,6 +276,7 @@ def test_runtime_fastpaths_project_to_engine_config(tmp_path, monkeypatch):
         "NANO_VLLM_JAX_COMPACT_PREFILL_MLP",
         "NANO_VLLM_JAX_LM_HEAD_DECODE_ACT_DTYPE",
         "NANO_VLLM_JAX_DECODE_PADDED_GEMM_ROWS",
+        "NANO_VLLM_JAX_GDN_WIDTH1_PACKED_PROJECTIONS",
     ):
         monkeypatch.delenv(key, raising=False)
     config = tmp_path / "server_config.yaml"
@@ -296,6 +297,7 @@ runtime:
     lm_head_greedy_top1_impl: cutlass
     decode_rms_padded_gemm: true
     decode_padded_gemm_rows: 8
+    gdn_width1_packed_input_projection: true
 """.strip()
     )
 
@@ -313,6 +315,7 @@ runtime:
     assert loaded.engine["lm_head_decode_act_dtype"] == "bf16"
     assert loaded.engine["lm_head_greedy_top1_impl"] == "cutlass"
     assert loaded.engine["decode_rms_padded_gemm"] is True
+    assert loaded.engine["gdn_width1_packed_input_projection"] is True
     assert loaded.engine["decode_padded_gemm_rows"] == 8
 
 
@@ -431,6 +434,7 @@ def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy
                     "lm_head_greedy_top1_impl": "cutlass",
                     "decode_padded_gemm": True,
                     "decode_rms_padded_gemm": True,
+                    "gdn_width1_packed_input_projection": True,
                 },
             },
             "kernels": {
@@ -460,6 +464,7 @@ def test_engine_overrides_from_config_merges_runtime_fastpaths_and_kernel_policy
     assert overrides["lm_head_greedy_top1_impl"] == "cutlass"
     assert overrides["decode_padded_gemm"] is True
     assert overrides["decode_rms_padded_gemm"] is True
+    assert overrides["gdn_width1_packed_input_projection"] is True
     assert overrides["full_attention_kv_cache_dtype"] == "bf16"
     assert overrides["full_attention_kv_append_impl"] == "reference"
     assert overrides["full_attention_decode_impl"] == "triton_paged"

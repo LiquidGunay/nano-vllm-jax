@@ -79,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mtp-token-source", choices=["generated", "current"], default="generated")
     parser.add_argument("--mtp-position-offset", type=int, default=0)
     parser.add_argument("--mtp-lm-head-greedy-top1-impl", default="jax")
+    parser.add_argument("--mtp-draft-vocab-size", type=int, default=0)
     parser.add_argument("--num-speculative-tokens", type=int, choices=list(range(0, 9)), default=0)
     parser.add_argument("--mtp-burst-groups", type=int, default=1)
     parser.add_argument("--mtp-max-active-rows", type=int, default=0)
@@ -133,6 +134,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decode-rms-padded-gemm", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--decode-padded-gemm-rows", type=int, default=8)
     parser.add_argument("--decode-padded-gemm-max-out-dim", type=int, default=300000)
+    parser.add_argument(
+        "--gdn-width1-packed-input-projection",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--full-attention-kv-cache-dtype", default="default")
     parser.add_argument("--full-attention-kv-append-impl", default="reference")
     parser.add_argument("--full-attention-decode-impl", default="reference")
@@ -944,6 +950,7 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "mtp_token_source": args.mtp_token_source,
         "mtp_position_offset": args.mtp_position_offset,
         "mtp_lm_head_greedy_top1_impl": args.mtp_lm_head_greedy_top1_impl,
+        "mtp_draft_vocab_size": args.mtp_draft_vocab_size,
         "num_speculative_tokens": args.num_speculative_tokens,
         "mtp_burst_groups": args.mtp_burst_groups,
         "mtp_max_active_rows": args.mtp_max_active_rows,
@@ -979,6 +986,9 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "decode_rms_padded_gemm": args.decode_rms_padded_gemm,
         "decode_padded_gemm_rows": args.decode_padded_gemm_rows,
         "decode_padded_gemm_max_out_dim": args.decode_padded_gemm_max_out_dim,
+        "gdn_width1_packed_input_projection": (
+            args.gdn_width1_packed_input_projection
+        ),
         "full_attention_kv_cache_dtype": args.full_attention_kv_cache_dtype,
         "full_attention_kv_append_impl": args.full_attention_kv_append_impl,
         "full_attention_decode_impl": args.full_attention_decode_impl,

@@ -72,6 +72,7 @@ class Qwen3_5Config:
     mtp_token_source: str = "generated"
     mtp_position_offset: int = 0
     mtp_lm_head_greedy_top1_impl: str = "jax"
+    mtp_draft_vocab_size: int = 0
     num_speculative_tokens: int = 0
     mtp_burst_groups: int = 1
     mtp_max_active_rows: int = 0
@@ -126,6 +127,7 @@ class Qwen3_5Config:
     decode_rms_padded_gemm: bool = False
     decode_padded_gemm_rows: int = 8
     decode_padded_gemm_max_out_dim: int = 300000
+    gdn_width1_packed_input_projection: bool = False
 
     # Kernel policy carried by config. Low-level diagnostic CUDA switches stay
     # env-only; accepted serving kernels should flow through these fields.
@@ -235,6 +237,10 @@ class Qwen3_5Config:
         if mtp_batch_accept_policy not in {"rowwise", "all_or_none"}:
             raise ValueError("mtp_batch_accept_policy must be 'rowwise' or 'all_or_none'")
         object.__setattr__(self, "num_speculative_tokens", num_speculative_tokens)
+        mtp_draft_vocab_size = int(self.mtp_draft_vocab_size or 0)
+        if not 0 <= mtp_draft_vocab_size <= self.vocab_size:
+            raise ValueError("mtp_draft_vocab_size must be between 0 and vocab_size")
+        object.__setattr__(self, "mtp_draft_vocab_size", mtp_draft_vocab_size)
         object.__setattr__(self, "speculative_method", speculative_method)
         object.__setattr__(self, "draft_sample_method", draft_sample_method)
         object.__setattr__(self, "mtp_verifier_impl", mtp_verifier_impl)
@@ -437,6 +443,7 @@ class Qwen3_5Config:
             self.mtp_token_source,
             self.mtp_position_offset,
             self.mtp_lm_head_greedy_top1_impl,
+            self.mtp_draft_vocab_size,
             self.num_speculative_tokens,
             self.mtp_burst_groups,
             self.mtp_max_active_rows,
@@ -474,6 +481,7 @@ class Qwen3_5Config:
             self.decode_rms_padded_gemm,
             self.decode_padded_gemm_rows,
             self.decode_padded_gemm_max_out_dim,
+            self.gdn_width1_packed_input_projection,
             self.full_attention_kv_cache_dtype,
             self.full_attention_kv_append_impl,
             self.full_attention_decode_impl,
@@ -635,6 +643,7 @@ class Qwen3_5Config:
             "mtp_token_source": self.mtp_token_source,
             "mtp_position_offset": self.mtp_position_offset,
             "mtp_lm_head_greedy_top1_impl": self.mtp_lm_head_greedy_top1_impl,
+            "mtp_draft_vocab_size": self.mtp_draft_vocab_size,
             "num_speculative_tokens": self.num_speculative_tokens,
             "mtp_burst_groups": self.mtp_burst_groups,
             "mtp_max_active_rows": self.mtp_max_active_rows,
@@ -681,6 +690,9 @@ class Qwen3_5Config:
             "decode_rms_padded_gemm": self.decode_rms_padded_gemm,
             "decode_padded_gemm_rows": self.decode_padded_gemm_rows,
             "decode_padded_gemm_max_out_dim": self.decode_padded_gemm_max_out_dim,
+            "gdn_width1_packed_input_projection": (
+                self.gdn_width1_packed_input_projection
+            ),
             "full_attention_kv_cache_dtype": self.full_attention_kv_cache_dtype,
             "full_attention_kv_append_impl": self.full_attention_kv_append_impl,
             "full_attention_decode_impl": self.full_attention_decode_impl,

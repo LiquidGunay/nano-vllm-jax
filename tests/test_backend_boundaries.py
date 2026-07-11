@@ -121,7 +121,8 @@ def _tiny_linear_attention_config() -> Qwen3_5Config:
     )
 
 
-def test_grouped_decode_uses_prepacked_projection_weights():
+def test_grouped_decode_uses_prepacked_projection_weights(monkeypatch):
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_WIDTH1_PACKED_PROJECTIONS", raising=False)
     full_params = {"qkv_proj_decode": object()}
     assert not _use_full_attention_decode_packed_qkv(
         full_params, is_prefill=False, batch=1, seq_len=1
@@ -133,6 +134,15 @@ def test_grouped_decode_uses_prepacked_projection_weights():
     linear_params = {"in_proj_qkv_abz": object()}
     config = Qwen3_5Config(gdn_packed_decode_impl="reference")
     assert not _use_gdn_decode_packed_in_proj(
+        linear_params, is_prefill=False, batch=1, seq_len=1, config=config
+    )
+    config.gdn_width1_packed_input_projection = True
+    assert _use_gdn_decode_packed_in_proj(
+        linear_params, is_prefill=False, batch=1, seq_len=1, config=config
+    )
+    config.gdn_width1_packed_input_projection = False
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_WIDTH1_PACKED_PROJECTIONS", "1")
+    assert _use_gdn_decode_packed_in_proj(
         linear_params, is_prefill=False, batch=1, seq_len=1, config=config
     )
     assert _use_gdn_decode_packed_in_proj(
