@@ -138,9 +138,9 @@ same B=1 64-to-64 row:
 | vLLM, no MTP | 48.79 | yes | n/a |
 | vLLM, MTP K=1 | 75.73 | yes | 31/31 |
 | vLLM, MTP K=2 | 88.05 | yes | 40/48 |
-| JAX, MTP K=2 | 63.47--65.40 | yes | 39/48 |
+| JAX, MTP K=2 | 69.26 | yes | 39/48 |
 
-vLLM K=2 is about `1.35--1.39x` JAX MTP despite nearly identical
+vLLM K=2 is about `1.27x` JAX MTP despite nearly identical
 acceptance (`83.3%` versus `81.25%`). This isolates the remaining 4B gap to
 execution cost, not draft quality. vLLM captures a K=2 graph at physical size
 three (`K+1`) and keeps proposer preparation, target verification, rejection
@@ -192,13 +192,30 @@ persistent draft cache.
 The distribution diagnostic now uses the true width-1 scan as its reference;
 the older full-attention-only replay was not a complete sequential oracle. On
 0.8B, ten sampled verifier positions have mean/max forward KL
-`0.02999/0.10958` nats and mean/max JS `0.00719/0.02626`, with `8/10` local
-top-1 matches. The first visible token flip has only a `0.102` reference logit
-margin, forward KL `0.0845`, and JS `0.0197`. That is modest approximate-quality
-drift, but broad accepted-prefix state still does not reproduce the sequential
-greedy stream. A true dual-path 2B KL compile reached the 70% RAM guard and was
-stopped; vLLM's first 2B token disagreement is independently a `0.125`
-log-prob near tie.
+`0.02971/0.11307` nats and mean/max JS `0.00711/0.02705`, with `8/10` local
+top-1 matches. The two top-1 flips have reference margins `0.093` and `0.156`,
+so they are near ties rather than gross distribution failures. That is modest
+approximate-quality drift, but broad accepted-prefix state still does not
+reproduce the sequential greedy stream. A true dual-path 2B KL compile reached
+the 70% RAM guard and was stopped; vLLM's first 2B token disagreement is
+independently a `0.125` log-prob near tie.
+
+Layerwise 0.8B probes localized the first mismatch more narrowly. Reusing the
+same persistent packed input leaf removes projection packing differences, and
+a shared width-1 conv/recurrent cell makes every emitted GDN prefix state match
+the sequential cell. Small residual hidden-state differences remain after the
+GDN tail and dense block, however, and still flip token 6. Forcing width-1
+projection families or FP32 projection activations did not repair the complete
+row. This is a BF16 broad-shape numerical-parity issue, not stale MTP cache or
+bad checkpoint weights.
+
+A fused conv-plus-recurrence prefix kernel was also tested and removed. It
+matched three repeated width-1 GDN cells in focused CUDA coverage, but reached
+`67.32 tok/s` on exact 4B K=2 versus `68.85` for the existing verifier control.
+On 0.8B it improved the divergent diagnostic from `116.93` to `125.31 tok/s`,
+still below the `150.56` no-MTP run. Launch coarsening at that boundary is
+therefore insufficient; the remaining profitable boundary must also reduce
+model or vocabulary work.
 
 Neither smaller JAX route supports a speed claim yet because both broad
 verifiers change the greedy row. Their completed rates are approximately flat

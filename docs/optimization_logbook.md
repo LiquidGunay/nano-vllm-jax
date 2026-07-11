@@ -14308,3 +14308,41 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     and peaked at `68.3--68.9%` host RAM;
   - the older `818.91` anchor did not reproduce under the current runtime.
     Treat the new A/B as evidence of no B=8 regression, not a speedup claim.
+
+#### Entry 333 - Smaller-Model Parity Localization And Rejected GDN Coarsening
+
+- date: 2026-07-11
+- 0.8B parity localization:
+  - persistent packed GDN projection inputs match width-1 decode when the same
+    packed parameter leaf and width-1 projection order are used;
+  - a shared width-1 conv/recurrent cell makes convolution and recurrent prefix
+    states match the sequential cell, but residual hidden-state drift remains
+    after the GDN tail/dense block and the complete row still first differs at
+    token 6;
+  - forcing width-1 GDN, attention, and MLP projections did not repair the row;
+    FP32 projection activations increased rather than reduced the drift.
+- distribution evidence:
+  - ten true broad-vs-width-1 positions have forward-KL mean/max
+    `0.02971/0.11307` nats and JS mean/max `0.00711/0.02705`;
+  - local top-1 agrees at `8/10` positions. The two flips have sequential
+    top-1 margins `0.093` and `0.156`, consistent with BF16 near-tie shape
+    sensitivity rather than corrupted weights or cache state.
+- guarded integrated diagnostics:
+  - shared width-1 GDN cell, no MTP: `150.56` completed and `197.46` token-event
+    tok/s; the earlier base was `123.53/201.66`, so the completed-rate change is
+    final-drain variance rather than a model-side speedup;
+  - shared cell strict K=2: `116.93 tok/s`, `38/48` accepted, still divergent;
+  - one-call conv-plus-recurrence prefix kernel: `125.31 tok/s` on divergent
+    0.8B; exact 4B broad projections reached `67.32 tok/s` versus `68.85` for
+    the existing exact verifier control. Both had zero measured JIT growth;
+  - the 4B all-width-1 diagnostic fell to `47.04 tok/s`, showing why parity
+    knobs must remain outside the promoted broad-projection profile.
+- decision:
+  - remove the neutral 300-line prefix kernel and retain the existing compact
+    verifier implementation;
+  - do not describe the smaller-model drift as bad draft quality. It is broad
+    BF16 target-state parity, while the 4B performance gap remains fragmented
+    target/MTP execution and three full-vocabulary scans per K=2 group;
+  - `gpu_optimal.yaml` remains the general B=8 profile. B=1 MTP specialization
+    stays explicit in `mtp_live.yaml` and continues to use the B=8 regression
+    gate before any shared change is promoted.
