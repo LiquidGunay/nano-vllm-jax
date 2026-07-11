@@ -920,3 +920,20 @@ host accept/reject logic. A credible next attempt needs a whole fixed-shape
 target backend (for example, backend-owned graph replay plus selected-state
 commit) or a larger-K verifier that fits below the RAM guard. Another isolated
 LM-head or GDN microkernel is not enough.
+
+A follow-up tested that backend boundary directly. A compact GDN ABI recorded
+per-token decay/key/delta factors and reconstructed only the selected prefix in
+one Triton epilogue, avoiding materialized recurrent-state snapshots. The
+epilogue matched the old prefix states in focused CUDA tests and preserved the
+resident-table contract, but it reached only `79.99` token-events/s versus a
+same-config `80.76` B2 control, then fell to `195.07` versus `216.46` at B4.
+Small reconstruction-order differences also changed later draft acceptance.
+The implementation was removed: selected-state commit must be fused into the
+target recurrence itself, not added as a second full-state pass.
+
+Near-tied draft-head reductions did not provide an alternate route. Scoring
+only half the hidden dimensions reduced B2 acceptance to `26.3%`. Restricting
+the exact tied projection to the first 128K vocabulary entries improved B4
+throughput (`233.68` versus `216.46`) but regressed the actual B8 target to
+`571.12` token-events/s versus the exact-head median `585.49`, despite `92.3%`
+acceptance. Both diagnostic implementations were removed.
