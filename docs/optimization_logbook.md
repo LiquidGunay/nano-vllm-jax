@@ -14136,8 +14136,9 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
 - interpretation:
   - this establishes the first exact, repeated B=1 speedup over current base
     vLLM on this A10G;
-  - MTP remains slightly below this repo's own no-MTP model-side rate, so it is
-    still an experimental path rather than the promoted default.
+  - the token-event comparison recorded here was later found not to be a
+    model-side clock because deferred device work can finish during final
+    materialization; Entry 331 supersedes that interpretation.
 
 #### Entry 329 - vLLM MTP and Dense-Family B=1 Matrix
 
@@ -14197,8 +14198,9 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - every run is exact for 64 tokens, accepts `39/48` drafts, emits 18 bonuses,
     has zero verifier fallbacks and zero measured JIT growth;
   - the final run peaks at `63.2%` host RAM. The result is `1.338--1.354x`
-    base vLLM (`48.31`) and `1.056--1.070x` local no-MTP model-side throughput
-    (`62.03`).
+    base vLLM (`48.31`). The local `62.03` token-event denominator is an
+    asynchronous host event rate, not completed model throughput; Entry 331
+    provides the corrected comparison.
 - smaller-model parity:
   - 0.8B persistent scan accepts `38/48` and exactly matches vLLM's complete
     greedy row; the stateless `k_decode` acceptance result is not a draft oracle;
@@ -14216,3 +14218,58 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - smaller-model draft quality is not fundamentally broken, but broad
     accepted-prefix state parity must be solved before those routes can make
     exact speed claims.
+
+#### Entry 331 - Correct End-to-End Denominator and Native Tied Head
+
+- date: 2026-07-11
+- benchmark audit:
+  - every 4B run uses the same prompt-manifest hash
+    `e8e7c8cd427f468f2dadd53228bbe5c1f2ae5d31b84ce8dffebb5c558c093f3d`;
+  - a fresh current-commit JAX no-MTP repeat reproduced `32.34` completed
+    output tok/s, `62.04` host token-event tok/s, and a `0.947 s` final device
+    drain;
+  - fresh vLLM 0.24 controls reach `48.79 tok/s` without MTP and `88.05 tok/s`
+    with K=2 MTP; the latter is exact and accepts `40/48` drafts;
+  - host token-event timing is not a model-side clock. Resident token carry can
+    enqueue dependent GPU work and emit events before the final device
+    synchronization. Cross-runtime and speedup claims now use completed output
+    throughput only, and new benchmark artifacts label the event scope.
+- base-path profile and implementation:
+  - the 16-token no-MTP profile spends `92.80 ms / 16` launches transposing the
+    full tied `[248320, 2560]` embedding, `92.03 ms / 360` launches in GDN
+    conv-state concatenation, and `40.00 ms / 16` launches in LM-head top-1;
+  - greedy Triton top-1 now consumes the tied embedding in native vocab-major
+    layout and transposes only register tiles. It does not materialize another
+    parameter leaf or increase the memory envelope;
+  - focused CUDA coverage passes `4/4`. The fresh B=1 64-to-64 run is exact,
+    adds no JIT keys, peaks at `61.2%` host RAM, and improves JAX no-MTP from
+    `32.34` to `39.43 completed output tok/s` (`+21.9%`).
+- corrected strict MTP comparison:
+  - the final strict packed-prefix run is exact against the improved JAX base,
+    reaches `63.47 tok/s`, accepts `39/48` drafts, has zero verifier/seed
+    fallbacks and zero measured JIT growth, and peaks at `63.6%` host RAM;
+  - the four post-resident-ABI results span `63.47--65.40 tok/s`, or
+    `1.610--1.658x` the improved JAX base and `1.301--1.340x` fresh base vLLM;
+  - fresh vLLM MTP remains `1.35--1.39x` faster than JAX MTP at essentially the
+    same acceptance, so the remaining MTP gap is execution cost.
+- family scaling:
+  - vLLM K=2 speedups on the same B=1 row are `1.320x` for 0.8B
+    (`198.14 -> 261.63`), `1.071x` for 2B (`104.41 -> 111.81`), and `1.805x`
+    for 4B (`48.79 -> 88.05`);
+  - 2B accepts only about `42.9%` of drafts, so low acceptance limits both
+    runtimes. 0.8B accepts about `83.3%`, but fixed proposer/verifier and
+    248,320-way vocabulary work is large relative to its cheap target body;
+  - 4B has 32 layers at width 2560 versus 24 layers at widths 1024/2048 for
+    0.8B/2B, while all three share the vocabulary size. The grouped target pass
+    therefore amortizes fixed speculative work best on 4B.
+- next work:
+  - do not retry the rejected tail-fused GDN switch merely because the base
+    profile exposes conv-state concatenation. Replace a coarser width-1 GDN
+    state/projection boundary and gate it on integrated throughput;
+  - reduce the three full-vocabulary scans per K=2 group, preferably with a
+    faster native-layout projection/top-1 kernel or a quality-gated approximate
+    draft head; target verification must remain exact;
+  - coarsen repeated MLP/GDN projection GEMMs and keep speculative metadata and
+    accept/commit state in persistent backend buffers. XLA already emitted
+    command buffers for the current JIT; the tested command-buffer flags did
+    not reproduce vLLM's whole-runner CUDA-graph boundary.

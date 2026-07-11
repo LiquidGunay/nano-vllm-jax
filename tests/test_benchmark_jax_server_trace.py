@@ -47,6 +47,7 @@ def test_timing_metrics_reports_final_materialization_gap():
     assert metrics["post_last_token_drain_seconds"] == pytest.approx(0.05)
     assert metrics["tokens_per_second"] == 12.0
     assert metrics["token_event_tokens_per_second"] == 15.0
+    assert "exclude deferred device completion" in metrics["token_event_scope"]
 
 
 def test_timing_metrics_from_trace_uses_summary_without_events():
@@ -71,6 +72,7 @@ def test_timing_metrics_from_trace_uses_summary_without_events():
     assert metrics["post_last_token_drain_seconds"] == pytest.approx(0.05)
     assert metrics["tokens_per_second"] == 12.0
     assert metrics["token_event_tokens_per_second"] == 15.0
+    assert "exclude deferred device completion" in metrics["token_event_scope"]
     assert metrics["itl_source"] == "jax_server_step_summary"
 
 

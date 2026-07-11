@@ -27,31 +27,51 @@ The benchmark contract is Qwen3.5-4B BF16 on an A10G, one 64-token prompt, 64
 greedy output tokens, K=2, burst 1, persistent MTP KV, prefill cache seeding,
 recursive drafts, target-model verification, and the 70% system-RAM watchdog.
 
-| route | exact | output tok/s | token-event tok/s | vs vLLM | acceptance | peak RAM |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| vLLM 0.24.0, no MTP | yes | 48.31 | n/a | 1.000x | n/a | 65.4% |
-| JAX, no MTP | yes | 32.34 | 62.03 | 0.669x | n/a | 60.8% |
-| strict packed K=2, ABI run 1 | yes | 65.36 | 66.26 | 1.353x | 81.25% | 62.4% |
-| strict packed K=2, ABI run 2 | yes | 65.40 | 66.35 | 1.354x | 81.25% | 62.5% |
-| strict packed K=2, final validation | yes | 64.63 | 65.51 | 1.338x | 81.25% | 63.2% |
+| route | exact | completed output tok/s | host token-event tok/s | vs vLLM base | vs JAX base | acceptance | peak RAM |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| vLLM 0.24.0, no MTP | yes | 48.79 | n/a | 1.000x | 1.237x | n/a | 63.4% |
+| JAX, no MTP, native tied head | yes | 39.43 | 74.89 | 0.808x | 1.000x | n/a | 61.2% |
+| JAX strict packed K=2, current | yes | 63.47 | 64.37 | 1.301x | 1.610x | 81.25% | 63.6% |
+| vLLM 0.24.0, MTP K=2 | yes | 88.05 | n/a | 1.805x | 2.233x | 83.33% | 63.5% |
 
-The three post-ABI MTP runs average 65.13 output tok/s, or `1.348x` vLLM. All
-match the fresh no-MTP JAX row for all 64 tokens. Each proposes 48 drafts, accepts 39,
-records six rejected blocks and 18 bonus tokens, has zero verifier/seed
-fallbacks, and adds no JIT keys during measurement.
+Completed output throughput is the speed metric. It includes the final device
+drain and token materialization. The host token-event clock is diagnostic only:
+resident token carry can enqueue dependent GPU work and emit host events before
+that work completes. It is neither a model-side clock nor cross-runtime
+comparable. The benchmark artifact now labels this scope explicitly.
 
-The no-MTP JAX output number includes a 0.947 s final token-materialization
-drain, so token-event throughput is the fair comparison of local model work.
-On that basis strict MTP is `1.056--1.070x` the same JAX width-1 path. This is
-the first result here that beats both base vLLM end to end and the local JAX
-decode path on model-side token-event time.
+Four post-ABI JAX MTP runs span `63.47--65.40` completed output tok/s. All match
+the current no-MTP JAX row for all 64 tokens. Each proposes 48 drafts, accepts
+39, records six rejected blocks and 18 bonus tokens, has zero verifier/seed
+fallbacks, and adds no JIT keys during measurement. Against the corrected JAX
+base this is a `1.610--1.658x` MTP speedup; against fresh base vLLM it is
+`1.301--1.340x`.
+
+### Base JAX timing correction
+
+The earlier `62.03 token-event tok/s` no-MTP result was incorrectly described
+as model-side throughput. Its completed rate was only `32.34 tok/s`: 64
+resident token references were emitted while GPU work was still pending, then
+the required final drain took `0.947 s`. A fresh repeat reproduced both values,
+so this was a metric-interpretation error, not benchmark noise.
+
+A short no-MTP profile also exposed a real base-path problem. With the 4B tied
+head left unmaterialized to save memory, ordinary decode built a full embedding
+transpose every token (`92.80 ms / 16` profiled tokens). Greedy Triton top-1 now
+reads the native `[vocab, hidden]` embedding and transposes only register tiles.
+The change adds no parameter copy, stays exact, and raises completed no-MTP
+throughput from `32.34` to `39.43 tok/s` (`+21.9%`). The remaining profile is
+dominated by GDN conv-state concatenation (`92.03 ms / 360` launches) and
+fragmented projection GEMMs; the previously tested tail-fused GDN custom-call
+route regressed integrated throughput and is not enabled.
 
 ### Grouped projection ABI
 
 The speed fix changes which persistent parameter leaves a grouped decode is
 allowed to consume:
 
-- width-1 B=1 decode keeps its existing individual projection path;
+- width-1 B=1 decode keeps its existing individual projection path, while its
+  tied top-1 head reads the native embedding layout;
 - a grouped target decode (`sequence width > 1`) consumes the prepacked GDN
   `in_proj_qkv_abz` and attention `qkv_proj_decode` leaves directly;
 - the MTP layer uses its opt-in persistent `qkv_proj_decode` and
@@ -93,18 +113,36 @@ same B=1 64-to-64 row:
 
 | route | output tok/s | exact | accepted drafts |
 | --- | ---: | --- | ---: |
-| vLLM, no MTP | 48.31 | yes | n/a |
+| vLLM, no MTP | 48.79 | yes | n/a |
 | vLLM, MTP K=1 | 75.73 | yes | 31/31 |
-| vLLM, MTP K=2 | 88.42 | yes | 40/48 |
-| JAX, MTP K=2 | 64.63--65.40 | yes | 39/48 |
+| vLLM, MTP K=2 | 88.05 | yes | 40/48 |
+| JAX, MTP K=2 | 63.47--65.40 | yes | 39/48 |
 
-vLLM K=2 is about `1.36x` the mean JAX MTP result despite nearly identical
+vLLM K=2 is about `1.35--1.39x` JAX MTP despite nearly identical
 acceptance (`83.3%` versus `81.25%`). This isolates the remaining 4B gap to
 execution cost, not draft quality. vLLM captures a K=2 graph at physical size
 three (`K+1`) and keeps proposer preparation, target verification, rejection
 sampling, and cache metadata in that model-runner boundary. The JAX profile
 still pays three separate full-vocabulary scans plus fragmented target/MTP
 GEMM families per group.
+
+The family-level vLLM controls show why model size alone is not the whole
+story:
+
+| model | vLLM base tok/s | vLLM MTP K=2 tok/s | speedup | draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| 0.8B | 198.14 | 261.63 | 1.320x | 83.3% |
+| 2B | 104.41 | 111.81 | 1.071x | 42.9% |
+| 4B | 48.79 | 88.05 | 1.805x | 83.3% |
+
+The 2B MTP row first differs from its own vLLM base at token 48; that specific
+branch was not KL-traced, so it is not labeled exact here. The benchmark still
+shows that low acceptance leaves little speedup even in vLLM. The 0.8B row has
+high acceptance but a smaller gain than 4B because the
+fixed proposer, verifier, and 248,320-way top-1 work is large relative to its
+cheap target decode. The 4B body has 32 layers at width 2560; 0.8B and 2B have
+24 layers at widths 1024 and 2048. All three retain the same vocabulary size,
+so fixed vocabulary work is easiest to amortize on 4B.
 
 The packed-leaf ABI can be selected for every dense checkpoint, but the broad
 verifier is not parity-clean on the smaller models for this row:
@@ -140,18 +178,18 @@ greedy stream. A true dual-path 2B KL compile reached the 70% RAM guard and was
 stopped; vLLM's first 2B token disagreement is independently a `0.125`
 log-prob near tie.
 
-Even under an approximate-quality tolerance, neither smaller model is a useful
-speed lane. Their MTP model-side rates are only `0.547x` (2B) and `0.607x`
-(0.8B) their no-MTP controls. The 2B end-to-end number appears `1.02x` faster
-only because MTP avoids the control's final host token drain; it is not cheaper
-verification.
+Neither smaller JAX route supports a speed claim yet because both broad
+verifiers change the greedy row. Their completed rates are approximately flat
+against JAX no-MTP (`1.020x` for 2B and `0.968x` for 0.8B), even before applying
+that correctness gate. The 2B acceptance problem is model/prompt dependent and
+also appears in vLLM; the separate broad-state drift is a JAX parity issue.
 
 Qwen3.5-4B now fits: the dense prefill final-row projection no longer
 materializes a full `[prompt, vocab]` tensor, and these guarded JAX runs remain
 below 64% host RAM outside profiler overhead. The older 0.8B B=8 result remains
 a separate negative lane; this B=1 result does not overturn it. Keep MTP
-experimental until it also beats the same JAX non-MTP model-side rate and is
-validated on broader prompts.
+experimental until the packed state path is parity-clean across prompts and
+model sizes and the speedup survives broader serving workloads.
 
 ## Current MTP Direction (2026-06-22)
 
@@ -167,7 +205,7 @@ state on host with sequential decode, or reports host-side repair/materializatio
 as progress is a correctness diagnostic only.
 
 Do not describe the current MTP path as production-ready. It beats base vLLM
-and the same JAX non-MTP model-side rate on the narrow 4B B=1 result above, but
+and the same JAX non-MTP completed rate on the narrow 4B B=1 result above, but
 it still needs broader prompt validation and smaller-model state parity. Treat
 historical K=1 TPU results as non-normative for current GPU work.
 

@@ -6,6 +6,7 @@ import pytest
 from jax import nn
 import jax.numpy as jnp
 
+import nanovllm_jax.model as model_module
 from nanovllm_jax.config import Qwen3_5Config
 from nanovllm_jax.layers import rms_norm
 from nanovllm_jax.model import (
@@ -229,6 +230,40 @@ def test_lm_head_greedy_top1_impl_rejects_unimplemented_cutlass_backend(monkeypa
     assert token_ids.shape == (1, 1)
     assert top_values.shape == (1, 1, 2)
     assert top_indices.shape == (1, 1, 2)
+
+
+def test_lm_head_greedy_top1_keeps_tied_embedding_vocab_major(monkeypatch):
+    hidden = jnp.ones((1, 1, 4), dtype=jnp.float32)
+    embed_tokens = jnp.ones((7, 4), dtype=jnp.bfloat16)
+    params = ModelParams(
+        embed_tokens=embed_tokens,
+        layers=[],
+        norm_weight=jnp.ones((4,), dtype=jnp.float32),
+        lm_head=None,
+    )
+    config = SimpleNamespace(
+        rms_norm_eps=1e-6,
+        lm_head_decode_act_dtype="bf16",
+        lm_head_greedy_top1_impl="triton",
+    )
+    call = {}
+
+    def fake_top1(hidden_norm, output_weight, _config, *, vocab_major=False):
+        call["weight"] = output_weight
+        call["vocab_major"] = vocab_major
+        return jnp.zeros(hidden_norm.shape[:2], dtype=jnp.int32)
+
+    monkeypatch.setattr(model_module, "_lm_head_greedy_top1_token_ids", fake_top1)
+    token_ids, _, _ = lm_head_token_ids_and_topk(
+        hidden,
+        params,
+        config,
+        is_prefill=False,
+    )
+
+    assert call["weight"] is embed_tokens
+    assert call["vocab_major"] is True
+    np.testing.assert_array_equal(np.asarray(token_ids), np.zeros((1, 1), dtype=np.int32))
 
 
 def test_lm_head_greedy_top1_triton_matches_jax_on_cuda(monkeypatch):

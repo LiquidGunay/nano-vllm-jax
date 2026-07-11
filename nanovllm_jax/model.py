@@ -829,6 +829,7 @@ def _lm_head_normed_hidden_and_weight(
     *,
     hidden_is_normed: bool = False,
     is_prefill: bool = True,
+    keep_tied_vocab_major: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     if hidden_is_normed:
         hidden_norm = hidden
@@ -849,7 +850,9 @@ def _lm_head_normed_hidden_and_weight(
     hidden_norm = hidden_norm.astype(
         _lm_head_decode_activation_dtype(config) if not is_prefill else jnp.float32
     )
-    output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
+    output_weight = params.lm_head
+    if output_weight is None:
+        output_weight = params.embed_tokens if keep_tied_vocab_major else params.embed_tokens.T
     return hidden_norm, output_weight
 
 
@@ -945,16 +948,23 @@ def lm_head_token_ids_and_topk(
         and hidden.ndim == 3
         and _lm_head_greedy_top1_impl(config) != "jax"
     ):
+        vocab_major = params.lm_head is None
         hidden_norm, output_weight = _lm_head_normed_hidden_and_weight(
             hidden,
             params,
             config,
             hidden_is_normed=hidden_is_normed,
             is_prefill=False,
+            keep_tied_vocab_major=vocab_major,
         )
         batch, width, hidden_dim = hidden_norm.shape
         flat_hidden = hidden_norm.reshape(batch * width, 1, hidden_dim)
-        token_ids = _lm_head_greedy_top1_token_ids(flat_hidden, output_weight, config)
+        token_ids = _lm_head_greedy_top1_token_ids(
+            flat_hidden,
+            output_weight,
+            config,
+            vocab_major=vocab_major,
+        )
         return token_ids.reshape(batch, width), None, None
 
     logits = _lm_head_logits(

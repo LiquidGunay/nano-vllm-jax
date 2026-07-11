@@ -294,6 +294,7 @@ def _timing_metrics(events: list[dict[str, Any]], elapsed: float, total_tokens: 
             if last_token_elapsed is not None
             else None
         ),
+        "token_event_scope": "host events; may exclude deferred device completion",
         "ttft_ms_mean": float(sum(ttfts) / len(ttfts)) if ttfts else None,
         "ttft_ms_p50": _percentile(ttfts, 50),
         "ttft_ms_p95": _percentile(ttfts, 95),
@@ -326,6 +327,7 @@ def _timing_metrics_from_trace(trace: dict[str, Any], elapsed: float, total_toke
             if last_token_elapsed is not None
             else None
         ),
+        "token_event_scope": "host events; may exclude deferred device completion",
         "ttft_ms_mean": summary.get("ttft_ms_mean"),
         "ttft_ms_p50": summary.get("ttft_ms_p50"),
         "ttft_ms_p95": summary.get("ttft_ms_p95"),
