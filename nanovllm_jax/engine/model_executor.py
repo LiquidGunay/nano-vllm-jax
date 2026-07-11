@@ -1002,7 +1002,9 @@ class ModelExecutor:
                     params,
                     self.config,
                     hidden_is_normed=False,
-                    is_prefill=True,
+                    # The sequence has been reduced to one hidden row. Use the
+                    # decode top-1 backend instead of materializing prefill logits.
+                    is_prefill=False,
                     top_k=0,
                 )
                 scatter_slot_ids = jnp.where(
@@ -2605,7 +2607,8 @@ class ModelExecutor:
                     params,
                     self.config,
                     hidden_is_normed=False,
-                    is_prefill=True,
+                    # Only one hidden row per request remains after the gather.
+                    is_prefill=False,
                     top_k=0,
                 )
                 token_ids = token_ids[:, 0].astype(jnp.int32)

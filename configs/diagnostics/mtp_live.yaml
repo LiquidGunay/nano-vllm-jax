@@ -9,24 +9,24 @@
 # the JAX subprocess.  Keep the RAM watchdog enabled.
 
 benchmark:
-  model: "Qwen/Qwen3.5-0.8B"
+  model: "Qwen/Qwen3.5-4B"
   backend: "gpu"
   dtype: "bfloat16"
   weight_dtype: "bfloat16"
   jax_execution: "jit"
   skip_vllm: true
   skip_jax: false
-  reference_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_fresh_20260710/guarded_control_unmaterialized_r2_b8_128x64_jax.json"
-  run_label: "live_target_vocab_major_k2_burst2_08b_b8_128x64_r2"
-  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_backend_20260711/live_target_vocab_major_k2_burst2_08b_b8_128x64_r2.json"
+  reference_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_assessment_20260711/qwen35_4b_no_mtp_b1_64x64_jax.json"
+  run_label: "qwen35_4b_strict_mtp_k2_b1_64x64_repro"
+  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_assessment_20260711/qwen35_4b_strict_mtp_k2_b1_64x64_repro.json"
   seed: 20260710
   dataset_name: "random"
-  min_input_tokens: 128
-  max_input_tokens: 128
+  min_input_tokens: 64
+  max_input_tokens: 64
   min_output_tokens: 64
   max_output_tokens: 64
-  min_request_count: 8
-  max_request_count: 8
+  min_request_count: 1
+  max_request_count: 1
   temperature: 0.0
   top_p: 1.0
   sampling_top_k: -1
@@ -35,23 +35,23 @@ benchmark:
   jax_warmup_mode: "generic"
   jax_fail_on_jit_cache_growth: true
   jax_profile: false
-  jax_max_kv_cache_mb: 1024
-  jax_num_kvcache_blocks: 256
-  max_num_seqs: 8
-  max_num_resident_seqs: 8
-  max_num_batched_tokens: 1024
+  jax_max_kv_cache_mb: 128
+  jax_num_kvcache_blocks: 32
+  max_num_seqs: 1
+  max_num_resident_seqs: 1
+  max_num_batched_tokens: 64
   jax_prefix_cache: true
-  prefill_buckets: "128,256,512,1024"
-  prefill_token_buckets: "128,256,512,1024"
+  prefill_buckets: "64"
+  prefill_token_buckets: "64"
   prefill_layout: "packed"
-  batch_size_buckets: "1,2,4,8"
-  max_blocks_per_seq: 128
-  decode_block_table_buckets: "128"
+  batch_size_buckets: "1"
+  max_blocks_per_seq: 8
+  decode_block_table_buckets: "8"
   resident_decode_metadata: true
   jax_materialize_tied_lm_head: false
-  jax_startup_warmup_prefill_token_buckets: "1024"
-  jax_startup_warmup_batch_size_buckets: "8"
-  jax_startup_warmup_decode_block_table_buckets: "128"
+  jax_startup_warmup_prefill_token_buckets: "64"
+  jax_startup_warmup_batch_size_buckets: "1"
+  jax_startup_warmup_decode_block_table_buckets: "8"
   jax_startup_warmup_include_sampled_routes: false
 
   # Change these together with the matching engine fields below.
@@ -69,17 +69,17 @@ benchmark:
   jax_mtp_position_offset: 0
   jax_mtp_lm_head_greedy_top1_impl: "triton"
   jax_num_speculative_tokens: 2
-  jax_mtp_burst_groups: 2
-  jax_mtp_max_active_rows: 8
+  jax_mtp_burst_groups: 1
+  jax_mtp_max_active_rows: 1
   jax_mtp_prefill_seed: true
 
-  vllm_execution: "async"
+  vllm_execution: "offline"
   vllm_max_model_len: 512
   vllm_gpu_memory_utilization: 0.72
   vllm_tensor_parallel_size: 1
-  vllm_max_num_seqs: 8
-  vllm_max_num_batched_tokens: 1024
-  vllm_cudagraph_capture_sizes: "8"
+  vllm_max_num_seqs: 1
+  vllm_max_num_batched_tokens: 64
+  vllm_cudagraph_capture_sizes: "1"
   vllm_language_model_only: true
   vllm_skip_mm_profiling: true
   vllm_enable_v1_multiprocessing: false
@@ -93,27 +93,27 @@ benchmark:
   resource_poll_seconds: 0.25
 
 engine:
-  model: "Qwen/Qwen3.5-0.8B"
+  model: "Qwen/Qwen3.5-4B"
   backend: "gpu"
   dtype: "bfloat16"
   weight_dtype: "bfloat16"
   jax_execution: "jit"
-  prefill_buckets: "128,256,512,1024"
-  prefill_token_buckets: "128,256,512,1024"
+  prefill_buckets: "64"
+  prefill_token_buckets: "64"
   prefill_layout: "packed"
-  batch_size_buckets: "1,2,4,8"
-  startup_warmup_prefill_token_buckets: "1024"
-  startup_warmup_batch_size_buckets: "8"
-  startup_warmup_decode_block_table_buckets: "128"
+  batch_size_buckets: "1"
+  startup_warmup_prefill_token_buckets: "64"
+  startup_warmup_batch_size_buckets: "1"
+  startup_warmup_decode_block_table_buckets: "8"
   startup_warmup_include_sampled_routes: false
-  decode_block_table_buckets: "128"
-  max_prefill: 1024
-  max_kv_cache_mb: 1024
-  num_kvcache_blocks: 256
-  max_num_seqs: 8
-  max_num_resident_seqs: 8
-  max_num_batched_tokens: 1024
-  max_blocks_per_seq: 128
+  decode_block_table_buckets: "8"
+  max_prefill: 64
+  max_kv_cache_mb: 128
+  num_kvcache_blocks: 32
+  max_num_seqs: 1
+  max_num_resident_seqs: 1
+  max_num_batched_tokens: 64
+  max_blocks_per_seq: 8
   prefix_cache: true
   speculative_method: "mtp"
   draft_sample_method: "greedy"
@@ -125,8 +125,8 @@ engine:
   mtp_chain_mode: "recursive"
   mtp_lm_head_greedy_top1_impl: "triton"
   num_speculative_tokens: 2
-  mtp_burst_groups: 2
-  mtp_max_active_rows: 8
+  mtp_burst_groups: 1
+  mtp_max_active_rows: 1
   mtp_prefill_seed: true
   skip_compile: false
 
@@ -136,7 +136,7 @@ runtime:
   xla:
     preallocate: false
     gpu_allocator: "cuda_malloc_async"
-    flags: "--xla_gpu_autotune_level=4 --xla_gpu_enable_triton_gemm=false"
+    flags: "--xla_gpu_autotune_level=1 --xla_gpu_enable_triton_gemm=false"
   fastpaths:
     greedy_token: true
     sampled_token: true

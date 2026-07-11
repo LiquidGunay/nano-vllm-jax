@@ -937,3 +937,69 @@ the exact tied projection to the first 128K vocabulary entries improved B4
 throughput (`233.68` versus `216.46`) but regressed the actual B8 target to
 `571.12` token-events/s versus the exact-head median `585.49`, despite `92.3%`
 acceptance. Both diagnostic implementations were removed.
+
+## 2026-07-11 verifier and 4B assessment
+
+The earlier statement that Qwen3.5-4B does not fit is superseded. The model
+weights and ordinary decode already fit; the failure was a `2.38 GiB` allocation
+while scoring the final prefill row through the generic dense-logit path. That
+allocation is the size of a float32 `248320 x 2560` vocabulary matrix. Both
+resident prefill paths now send their already-gathered final hidden row through
+the decode top-1 backend. This avoids dense prefill logits and keeps the tied
+embedding in native `[vocab, hidden]` layout.
+
+With a 64-token prompt, B=1, a 128 MiB KV cap, and the 70% host-RAM watchdog,
+Qwen3.5-4B now warms and runs strict K=2 packed-prefix MTP. It uses about
+`16.9 GiB` of the A10G and peaks below 65% system RAM. The 64-token strict run
+matches the fresh no-MTP token sequence exactly and has no measured JIT growth
+or verifier fallback.
+
+The useful comparison is:
+
+| model/envelope | no MTP | measured MTP route | free perfect-draft ceiling |
+|---|---:|---:|---:|
+| 0.8B, B=8, 128+64 | 972.82 | 585.49 broad diagnostic (0.602x) | 679.81 (0.699x) |
+| 4B, B=1, 64+64 | 62.00 | 48.78 exact K=2 (0.787x) | 63.12 (1.018x) |
+
+Values are token-event tokens/s. The free-draft route is a diagnostic that
+forces full acceptance while retaining the packed target forward and selected
+state commit; it was removed after measurement and is not a correctness path.
+The 0.8B broad route also remains diagnostic-only because only one of eight
+full rows matches no-MTP; its numbers are useful here only as a cost ceiling.
+For 4B it isolates a real verifier ceiling: replacing its MTP-seed TTFT with
+the no-MTP TTFT gives about `74.5 token/s`, or `1.20x` steady-state baseline.
+For 0.8B the same optimistic seed replacement is only about `823 token/s`, so
+even free perfect drafts cannot beat the B=8 baseline.
+
+Actual 4B K=2 accepts `39/48` proposed drafts (`81.25%`) and emits 18 bonuses.
+Its decode window is about 11% slower than baseline. The target-only decode
+window is about 17% shorter than baseline; recursive drafting plus the extra
+verifier groups caused by rejection consume that saving. Always-on K=1 is
+exact and accepts `30/33` drafts (`90.9%`), but reaches only `38.42 token/s`.
+The large shared-vocabulary projection and one full-width MTP decoder layer per
+recursive draft are not cheap enough at this scale.
+
+This makes the blocker model-dependent:
+
+- At 0.8B/B=8, verification is the primary blocker. The target body is too
+  small to amortize materializing and selecting GDN prefix states.
+- At 4B/B=1, verification is cheap enough. Draft generation, rejected groups,
+  and the MTP prefill seed are the primary blockers.
+- A genuinely free, 99%-accurate external drafter should therefore speed up
+  the current 4B verifier by roughly the perfect-draft ceiling, but it would not
+  rescue the tested 0.8B/B=8 lane.
+
+The framework comparison explains the remaining gap. vLLM flattens current and
+draft tokens into its normal target input buffers and uses a fused GPU Mamba
+postprocess to retain the accepted state. SGLang's GDN path goes further: it
+tracks the last accepted speculative step and lets the recurrent kernels update
+lazily, avoiding full SSM/conv-state copies; its Qwen3.5 verifier also has a
+dedicated fused GDN target-verify kernel. TensorRT Edge-LLM exports separate
+compiled target and draft engines and reuses its EAGLE tree-verification
+runtime. Our packed target pass still exposes every prefix's recurrent state as
+a large JAX value before selecting one prefix, and our recursive draft path
+scans the shared 248K vocabulary once per draft token.
+
+A fresh vLLM 0.21 baseline attempt on this host was stopped by the watchdog at
+70.3% system RAM immediately after warmup, even for 0.8B/B=1 with one CUDA
+graph size. No live vLLM MTP speed claim is made from this 15 GiB host.
