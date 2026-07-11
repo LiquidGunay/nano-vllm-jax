@@ -29,6 +29,7 @@ def _lm_head_top1_stage1_kernel(
     hidden_dim: tl.constexpr,
     vocab_size: tl.constexpr,
     num_vocab_blocks: tl.constexpr,
+    VOCAB_MAJOR: tl.constexpr,
     REDUCE_CAST: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -48,11 +49,19 @@ def _lm_head_top1_stage1_kernel(
             mask=(row_offsets[:, None] < batch_size) & (k[None, :] < hidden_dim),
             other=0.0,
         )
-        b = tl.load(
-            weight + k[:, None] * vocab_size + vocab_offsets[None, :],
-            mask=(k[:, None] < hidden_dim) & (vocab_offsets[None, :] < vocab_size),
-            other=0.0,
-        )
+        if VOCAB_MAJOR:
+            b = tl.load(
+                weight + vocab_offsets[:, None] * hidden_dim + k[None, :],
+                mask=(vocab_offsets[:, None] < vocab_size) & (k[None, :] < hidden_dim),
+                other=0.0,
+            )
+            b = tl.trans(b)
+        else:
+            b = tl.load(
+                weight + k[:, None] * vocab_size + vocab_offsets[None, :],
+                mask=(k[:, None] < hidden_dim) & (vocab_offsets[None, :] < vocab_size),
+                other=0.0,
+            )
         acc += tl.dot(a, b, out_dtype=tl.float32)
 
     if REDUCE_CAST == 1:
@@ -115,14 +124,16 @@ def lm_head_greedy_top1_triton(
     hidden_norm: jax.Array,
     output_weight: jax.Array,
     *,
-    block_m: int = 8,
+    vocab_major: bool = False,
+    block_m: int | None = None,
     block_n: int = 256,
     block_k: int = 64,
 ) -> jax.Array:
-    """Return greedy token ids for `[B, 1, H] x [H, V]`.
+    """Return greedy token ids without materializing logits.
 
-    The implementation computes full-precision tile accumulators and never
-    materializes `[B, V]` logits.  It returns `[B, 1]` int32 token ids.
+    Tied embeddings can stay in their native `[V, H]` layout by setting
+    ``vocab_major``. The kernel transposes one weight tile in registers instead
+    of materializing a full `[H, V]` copy.
     """
 
     if hidden_norm.ndim != 3 or int(hidden_norm.shape[1]) != 1:
@@ -131,8 +142,8 @@ def lm_head_greedy_top1_triton(
         raise ValueError("Triton LM-head top1 requires output weight shape [H, V]")
     batch = int(hidden_norm.shape[0])
     hidden_dim = int(hidden_norm.shape[-1])
-    weight_hidden = int(output_weight.shape[0])
-    vocab_size = int(output_weight.shape[1])
+    weight_hidden = int(output_weight.shape[1 if vocab_major else 0])
+    vocab_size = int(output_weight.shape[0 if vocab_major else 1])
     if batch <= 0 or hidden_dim <= 0 or vocab_size <= 0:
         raise ValueError("Triton LM-head top1 requires non-empty dimensions")
     if hidden_dim != weight_hidden:
@@ -142,6 +153,8 @@ def lm_head_greedy_top1_triton(
     if output_weight.dtype not in (jnp.float16, jnp.bfloat16, jnp.float32):
         raise ValueError(f"unsupported weight dtype for Triton LM-head top1: {output_weight.dtype}")
 
+    if block_m is None:
+        block_m = 16 if batch > 8 else 8
     x = jnp.reshape(hidden_norm, (batch, hidden_dim))
     reduce_cast = 0
     if hidden_norm.dtype == jnp.bfloat16 and output_weight.dtype == jnp.bfloat16:
@@ -164,6 +177,7 @@ def lm_head_greedy_top1_triton(
         hidden_dim=hidden_dim,
         vocab_size=vocab_size,
         num_vocab_blocks=num_vocab_blocks,
+        VOCAB_MAJOR=bool(vocab_major),
         REDUCE_CAST=reduce_cast,
         BLOCK_M=int(block_m),
         BLOCK_N=int(block_n),

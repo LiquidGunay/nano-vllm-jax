@@ -878,3 +878,45 @@ Artifacts live under
 uses B=2 prompts `64,128`, generic warmup, rectangular packed-prefix target
 verification, K=3, `mtp_burst_groups=4`, and reference checking against the
 matching no-MTP artifact for each output length.
+
+## 2026-07-11 backend checkpoint
+
+The target LM head now reads tied embeddings in native `[vocab, hidden]`
+layout. Its Triton tile transposes in registers, so strict packed verification
+does not build a model-sized `[hidden, vocab]` copy. Generic warmup also covers
+the burst-1 rejection tail, and MTP-gated rows retain the resident physical
+batch bucket.
+
+The guarded B8/K2/burst-2 repeats reached `578.41`, `585.49`, and `596.82`
+token-events/s (median `585.49`). The previous strict path reached `567.52`, so
+this backend change is a reproducible local improvement, but it remains well
+below same-envelope no-MTP JAX (`972.82`) and the stored vLLM denominator
+(`1000.98`). All three repeats had zero measured JIT growth, zero verifier
+fallbacks, and 90.2--92.0% draft acceptance. Peak system RAM was 66.2--69.0%
+under the 70% watchdog.
+
+This is not a valid MTP speedup claim. Only one of eight full greedy rows
+matches the no-MTP reference because `decode_rectangular` still changes broad
+target numerics. A focused distribution diagnostic found small local drift
+(mean KL about `0.046`, maximum `0.115`, 27/27 local top-1 matches), but exact
+parity remains the promotion requirement.
+
+Rejected backend variants from the same pass:
+
+- Coarse draft candidate search preserved target verification but fell to
+  `421.51` token-events/s at B8.
+- An int8 tied draft head preserved B2 acceptance and regressed `81.36` to
+  `78.11` token-events/s.
+- Compact GDN factors plus a selected-prefix reconstruction epilogue improved
+  B2 (`81.36` to `97.34`) but regressed B8 (`596.82` to `560.48`).
+- Suppressing the unused final GDN state reached only `557.10` at B8; FP16
+  prefix snapshots already failed the B2 gate (`79.30`).
+- Widening the same backend to K3 lost the B2 gate (`77.87` versus `81.36`
+  token-events/s for K2), so it was not promoted to the RAM-heavy B8 lane.
+
+Those implementations were removed. On this A10G, cheap verification is still
+blocked by the full target-model pass and GDN accepted-prefix state ABI, not by
+host accept/reject logic. A credible next attempt needs a whole fixed-shape
+target backend (for example, backend-owned graph replay plus selected-state
+commit) or a larger-K verifier that fits below the RAM guard. Another isolated
+LM-head or GDN microkernel is not enough.

@@ -17,8 +17,8 @@ benchmark:
   skip_vllm: true
   skip_jax: false
   reference_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_fresh_20260710/guarded_control_unmaterialized_r2_b8_128x64_jax.json"
-  run_label: "live_strict_packed_k2_burst2_lean_warmup_08b_b8_128x64"
-  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_fresh_20260710/live_strict_packed_k2_burst2_lean_warmup_08b_b8_128x64_jax.json"
+  run_label: "live_target_vocab_major_k2_burst2_08b_b8_128x64_r2"
+  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_backend_20260711/live_target_vocab_major_k2_burst2_08b_b8_128x64_r2.json"
   seed: 20260710
   dataset_name: "random"
   min_input_tokens: 128
@@ -191,7 +191,6 @@ env:
   NANO_VLLM_JAX_FLASHINFER_PAGE_TABLE_IMPL: "dense"
   NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE: "decode_rectangular"
   NANO_VLLM_JAX_MANIFEST_WARMUP_EXPAND_DECODE_ROWS: "0"
-  # K=4's second no-bonus executable exceeds this host's 70% RAM ceiling.
-  # Keep the short final tail explicitly scheduler-gated for this diagnostic.
+  # Keep short tails scheduler-gated instead of compiling another large shape.
   NANO_VLLM_JAX_MTP_FIXED_K_NO_BONUS_TAIL: "0"
   NANO_VLLM_JAX_MANIFEST_WARMUP_MTP_TABLE_SAFETY_NO_BONUS: "0"

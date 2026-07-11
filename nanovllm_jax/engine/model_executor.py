@@ -9918,8 +9918,9 @@ class ModelExecutor:
                         and _force_width1_decode_norms()
                     ),
                 ).astype(jnp.float32)
+                vocab_major = params.lm_head is None
                 output_weight = (
-                    params.lm_head if params.lm_head is not None else params.embed_tokens.T
+                    params.lm_head if params.lm_head is not None else params.embed_tokens
                 )
                 token_ids = _lm_head_greedy_top1_token_ids(
                     hidden_norm.astype(output_weight.dtype).reshape(
@@ -9929,6 +9930,7 @@ class ModelExecutor:
                     ),
                     output_weight,
                     self.config,
+                    vocab_major=vocab_major,
                 ).reshape(row_count, verify_width).astype(jnp.int32)
                 target_tokens = token_ids[:, :draft_len]
                 bonus_token = token_ids[:, draft_len]
@@ -10327,8 +10329,9 @@ class ModelExecutor:
                     jnp.zeros_like(current_recurrent_state),
                 )
 
+                vocab_major = params.lm_head is None
                 output_weight = (
-                    params.lm_head if params.lm_head is not None else params.embed_tokens.T
+                    params.lm_head if params.lm_head is not None else params.embed_tokens
                 )
                 del next_mtp_position_arg
 
@@ -10675,6 +10678,7 @@ class ModelExecutor:
                         ),
                         output_weight,
                         self.config,
+                        vocab_major=vocab_major,
                     ).reshape(row_count, verify_width).astype(jnp.int32)
                     target_tokens = token_ids[:, :draft_len]
                     bonus_token = (
@@ -10683,9 +10687,10 @@ class ModelExecutor:
                         else jnp.zeros((row_count,), dtype=token_ids.dtype)
                     )
                     if logit_debug_enabled:
+                        logits_weight = output_weight.T if vocab_major else output_weight
                         test_logits_full = jnp.dot(
                             hidden_norm,
-                            output_weight,
+                            logits_weight,
                         ).astype(jnp.float32)
                         verifier_logits = test_logits_full[:, :draft_len, :]
                         verifier_top_values, verifier_top_ids = jax.lax.top_k(
@@ -10705,7 +10710,7 @@ class ModelExecutor:
                         ).astype(jnp.float32)
                         reference_logits = jnp.dot(
                             reference_hidden_norm,
-                            output_weight,
+                            logits_weight,
                         ).astype(jnp.float32)
                         reference_top_values, reference_top_ids = jax.lax.top_k(
                             reference_logits,

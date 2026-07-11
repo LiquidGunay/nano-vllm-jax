@@ -650,6 +650,9 @@ def _manifest_mtp_table_warmup_specs(
                     1 if emit_bonus else 0,
                 )
                 specs.add(spec)
+                if burst_groups > 1:
+                    # Real rejections can leave a one-group tail.
+                    specs.add((*spec[:3], 1, spec[4]))
                 emitted_per_row = min(
                     burst_groups * (draft_len + (1 if emit_bonus else 0)),
                     min_remaining,

@@ -1402,6 +1402,30 @@ def test_mtp_gated_decode_can_use_static_metadata_hot_path():
     assert batch.uses_static_decode_metadata
 
 
+def test_mtp_gated_tail_keeps_the_resident_physical_bucket():
+    config = _tiny_full_attention_config()
+    config.max_num_seqs = 8
+    config.batch_size_buckets = (1, 2, 4, 8)
+    config.max_blocks_per_seq = 2
+    config.num_speculative_tokens = 2
+    config.speculative_method = "mtp"
+    config.mtp_max_active_rows = 8
+    scheduler = Scheduler(config)
+    seq = Sequence(
+        [1, 2, 3],
+        SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True),
+        seq_id=22,
+    )
+    seq.block_table = [0]
+    seq.num_cached_tokens = seq.num_prompt_tokens
+    seq.mtp_admitted = False
+
+    batch = scheduler.build_scheduled_batch([seq], is_prefill=False)
+
+    assert batch.speculative_method == "none"
+    assert batch.tokens.shape == (8, 1)
+
+
 def test_mtp_packed_prefix_decode_can_use_resident_static_metadata():
     config = _tiny_full_attention_config()
     config.block_size = 8

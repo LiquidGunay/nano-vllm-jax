@@ -155,9 +155,10 @@ def test_mtp_forward_last_uses_final_sequence_position():
 def test_mtp_triton_top1_casts_hidden_to_weight_dtype(monkeypatch):
     seen = {}
 
-    def fake_top1(hidden_norm, output_weight):
+    def fake_top1(hidden_norm, output_weight, *, vocab_major=False):
         seen["hidden_dtype"] = hidden_norm.dtype
         seen["weight_dtype"] = output_weight.dtype
+        seen["vocab_major"] = vocab_major
         return jnp.zeros((hidden_norm.shape[0], hidden_norm.shape[1]), dtype=jnp.int32)
 
     monkeypatch.setitem(
@@ -175,4 +176,5 @@ def test_mtp_triton_top1_casts_hidden_to_weight_dtype(monkeypatch):
     assert seen == {
         "hidden_dtype": jnp.dtype(jnp.bfloat16),
         "weight_dtype": jnp.dtype(jnp.bfloat16),
+        "vocab_major": False,
     }

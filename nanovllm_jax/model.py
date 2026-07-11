@@ -892,20 +892,22 @@ def _lm_head_greedy_top1_token_ids(
     hidden_norm: jnp.ndarray,
     output_weight: jnp.ndarray,
     config,
+    *,
+    vocab_major: bool = False,
 ) -> jnp.ndarray:
     impl = _lm_head_greedy_top1_impl(config)
     if impl == "jax":
-        logits = _lm_head_logits_from_normed(
-            hidden_norm,
-            output_weight,
-            config,
-            is_prefill=False,
-        )
+        weight = output_weight.T if vocab_major else output_weight
+        logits = _lm_head_logits_from_normed(hidden_norm, weight, config, is_prefill=False)
         return jnp.argmax(logits, axis=-1).astype(jnp.int32)
     if impl == "triton":
         from nanovllm_jax.kernels.lm_head_triton import lm_head_greedy_top1_triton
 
-        return lm_head_greedy_top1_triton(hidden_norm, output_weight)
+        return lm_head_greedy_top1_triton(
+            hidden_norm,
+            output_weight,
+            vocab_major=vocab_major,
+        )
     if impl == "cutlass":
         raise NotImplementedError(
             "lm_head_greedy_top1_impl='cutlass' requires a true fused "

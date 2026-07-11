@@ -245,6 +245,8 @@ def _mtp_greedy_top1_token_ids(
     x_normed: jnp.ndarray,
     output_weight: jnp.ndarray,
     config: Qwen3_5Config,
+    *,
+    vocab_major: bool = False,
 ) -> jnp.ndarray:
     impl = str(getattr(config, "mtp_lm_head_greedy_top1_impl", "jax") or "jax").strip().lower()
     if impl in {"triton", "triton_tensorcore", "triton_top1"}:
@@ -256,12 +258,14 @@ def _mtp_greedy_top1_token_ids(
             return lm_head_greedy_top1_triton(
                 x_normed.astype(output_weight.dtype),
                 output_weight,
+                vocab_major=vocab_major,
             ).astype(jnp.int32)
         batch, seq_len, hidden_dim = x_normed.shape
         flat_hidden = x_normed.reshape((batch * seq_len, 1, hidden_dim))
         flat_token_ids = lm_head_greedy_top1_triton(
             flat_hidden.astype(output_weight.dtype),
             output_weight,
+            vocab_major=vocab_major,
         ).astype(jnp.int32)
         return flat_token_ids.reshape((batch, seq_len))
     if impl in {"cutlass", "cutlass_top1", "cutlass_fused_gemm", "fused_gemm"}:
@@ -270,7 +274,7 @@ def _mtp_greedy_top1_token_ids(
         )
     if impl not in {"jax", "", "none"}:
         raise ValueError(f"unsupported MTP greedy top1 implementation: {impl!r}")
-    logits = jnp.dot(x_normed, output_weight)
+    logits = jnp.dot(x_normed, output_weight.T if vocab_major else output_weight)
     return jnp.argmax(logits, axis=-1).astype(jnp.int32)
 
 
@@ -343,9 +347,15 @@ def mtp_forward_token_ids(
         config=config,
         positions=positions,
     )
-    output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
+    vocab_major = params.lm_head is None
+    output_weight = params.lm_head if params.lm_head is not None else embed_tokens
     x_normed = x_normed.astype(_mtp_decode_activation_dtype(config))
-    token_ids = _mtp_greedy_top1_token_ids(x_normed, output_weight, config)
+    token_ids = _mtp_greedy_top1_token_ids(
+        x_normed,
+        output_weight,
+        config,
+        vocab_major=vocab_major,
+    )
     return token_ids, x_normed if return_normed_hidden else x
 
 
@@ -419,11 +429,13 @@ def mtp_forward_token_ids_cached(
         backend=backend,
         is_prefill=is_prefill,
     )
-    output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
+    vocab_major = params.lm_head is None
+    output_weight = params.lm_head if params.lm_head is not None else embed_tokens
     token_ids = _mtp_greedy_top1_token_ids(
         x_normed.astype(_mtp_decode_activation_dtype(config)),
         output_weight,
         config,
+        vocab_major=vocab_major,
     )
     return token_ids, x_normed if return_normed_hidden else x, kv_cache_state
 
@@ -468,11 +480,13 @@ def mtp_forward_selected_token_ids_cached(
         gather_idx = selected_indices.reshape(batch, 1, 1)
         gather_idx = jnp.broadcast_to(gather_idx, (batch, 1, hidden_dim))
         selected_normed = jnp.take_along_axis(x_normed, gather_idx, axis=1)
-    output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
+    vocab_major = params.lm_head is None
+    output_weight = params.lm_head if params.lm_head is not None else embed_tokens
     token_ids = _mtp_greedy_top1_token_ids(
         selected_normed.astype(_mtp_decode_activation_dtype(config)),
         output_weight,
         config,
+        vocab_major=vocab_major,
     )
     return token_ids, x_normed if return_normed_hidden else x, kv_cache_state
 
@@ -520,9 +534,15 @@ def mtp_forward_last_token_ids(
         config=config,
         positions=positions,
     )
-    output_weight = params.lm_head if params.lm_head is not None else embed_tokens.T
+    vocab_major = params.lm_head is None
+    output_weight = params.lm_head if params.lm_head is not None else embed_tokens
     last_normed = x_normed[:, -1:, :].astype(_mtp_decode_activation_dtype(config))
-    token_ids = _mtp_greedy_top1_token_ids(last_normed, output_weight, config)
+    token_ids = _mtp_greedy_top1_token_ids(
+        last_normed,
+        output_weight,
+        config,
+        vocab_major=vocab_major,
+    )
     chain_hidden = x_normed if return_normed_hidden else x
     return token_ids, chain_hidden[:, -1:, :]
 

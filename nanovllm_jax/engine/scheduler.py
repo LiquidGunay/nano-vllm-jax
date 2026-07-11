@@ -811,7 +811,6 @@ class Scheduler:
                 not is_prefill
                 and self.speculative_method == "mtp"
                 and self.num_speculative_tokens > 0
-                and any(bool(getattr(seq, "mtp_admitted", False)) for seq in seqs)
             ):
                 batch_size_bucket = self._select_mtp_static_batch_size_bucket(len(seqs))
             else:
