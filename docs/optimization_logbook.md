@@ -14103,3 +14103,38 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     B4 does not compile within the guarded host-memory envelope, while the
     largest fitting decode-rectangular verifier is still slower than base
     decode on the 0.8B model.
+
+#### Entry 328 - B=1 Grouped Projection ABI Removes Runtime Weight Packing
+
+- date: 2026-07-11
+- target:
+  - Qwen3.5-4B BF16, B=1, 64 prompt tokens, 64 greedy output tokens;
+  - strict K=2 packed-prefix verification with recursive drafts, persistent
+    MTP KV, prefill seeding, no repair, and no verifier fallback;
+  - beat a fresh same-shape vLLM baseline under a RAM watchdog.
+- implementation:
+  - grouped decode now reads the persistent packed GDN and full-attention
+    projection leaves directly, while ordinary B=1 width-1 decode is unchanged;
+  - enabled the existing opt-in packed QKV and gate/up leaves for the MTP layer;
+  - added a sidecar-owned `vllm_use_flashinfer_sampler` switch so vLLM's native
+    greedy sampler can be selected reproducibly when the host NVCC cannot build
+    FlashInfer 0.6.12's sampling extension.
+- results:
+  - vLLM 0.24.0 no-MTP: `48.31 output tok/s`, exact, `65.4%` peak host RAM;
+  - fresh JAX no-MTP: `62.03 token-event tok/s`; final materialization lowers
+    end-to-end output throughput to `32.34 tok/s`;
+  - strict MTP repeats: `59.70` and `57.54 output tok/s`, both exact and
+    fallback-free, or `1.236x` and `1.191x` vLLM;
+  - acceptance is identical in both runs: `39/48` drafts (`81.25%`), six
+    rejected blocks, and 18 bonus tokens;
+  - measured JIT growth is zero and non-profile peak host RAM is `62.9%`.
+- profile evidence:
+  - runtime `wrapped_concatenate` work drops from `135.02 ms / 548` launches
+    to effectively zero (`2` trace events);
+  - the remaining largest MTP-specific family is the full-vocabulary top-1
+    scan: `138.52 ms / 54` launches.
+- interpretation:
+  - this establishes the first exact, repeated B=1 speedup over current base
+    vLLM on this A10G;
+  - MTP remains slightly below this repo's own no-MTP model-side rate, so it is
+    still an experimental path rather than the promoted default.

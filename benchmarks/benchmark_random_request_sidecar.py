@@ -226,6 +226,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--vllm-use-flashinfer-sampler",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use FlashInfer sampling in vLLM; disable for the native greedy path.",
+    )
     parser.add_argument("--vllm-top-k", type=int, default=5)
     parser.add_argument("--vllm-mode", default="baseline", choices=["baseline", "mtp"])
     parser.add_argument("--vllm-speculative-method", default="mtp")
@@ -1138,6 +1144,9 @@ def _run() -> None:
         config_engine_overrides=jax_config["engine_overrides"],
     )
     vllm_command = _build_vllm_command(args, manifest_jsonl=manifest_path, output_json=vllm_output_json)
+    vllm_env = {
+        "VLLM_USE_FLASHINFER_SAMPLER": "1" if args.vllm_use_flashinfer_sampler else "0"
+    }
     effective_jax_kernel_policy = _effective_jax_kernel_policy(
         args,
         jax_config["engine_overrides"],
@@ -1193,6 +1202,7 @@ def _run() -> None:
                 "worker_nice": args.worker_nice,
                 "resource_poll_seconds": args.resource_poll_seconds,
             },
+            "env_overrides": vllm_env,
         }
     elif args.skip_vllm:
         vllm_run = {
@@ -1208,6 +1218,7 @@ def _run() -> None:
                 "worker_nice": args.worker_nice,
                 "resource_poll_seconds": args.resource_poll_seconds,
             },
+            "env_overrides": vllm_env,
         }
         vllm_artifact = {}
     else:
@@ -1216,6 +1227,7 @@ def _run() -> None:
             artifact_path=vllm_output_json,
             dry_run=args.dry_run,
             timeout_seconds=args.command_timeout_seconds,
+            env_overrides=vllm_env,
             max_system_ram_percent=args.max_system_ram_percent,
             worker_cpu_cores=args.worker_cpu_cores,
             worker_cpu_core_offset=args.worker_cpu_core_offset,

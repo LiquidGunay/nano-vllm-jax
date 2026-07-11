@@ -44,6 +44,7 @@ def test_parse_args_defaults_set_random_ranges():
     assert args.vllm_reference_json == ""
     assert sidecar._effective_vllm_dtype(args) == "bfloat16"
     assert args.vllm_num_speculative_tokens == 0
+    assert args.vllm_use_flashinfer_sampler is True
     assert args.skip_jax is False
     assert args.skip_vllm is False
     assert args.max_system_ram_percent == 70.0
@@ -81,6 +82,7 @@ benchmark:
   min_request_count: 1
   max_request_count: 1
   skip_vllm: true
+  vllm_use_flashinfer_sampler: false
   max_system_ram_percent: 70
 runtime:
   platform: cuda
@@ -103,6 +105,7 @@ runtime:
     assert args.max_input_tokens == 96
     assert args.min_request_count == args.max_request_count == 1
     assert args.skip_vllm is True
+    assert args.vllm_use_flashinfer_sampler is False
     assert args.max_system_ram_percent == 70
     assert args.jax_config == str(config_path)
 

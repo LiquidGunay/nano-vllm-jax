@@ -616,11 +616,17 @@ def _use_gdn_decode_packed_in_proj(
     seq_len: int,
     config: Optional[Qwen3_5Config] = None,
 ) -> bool:
+    # Split projections remain best for a single B=1 token. Grouped decode
+    # must use the persistent packed leaf or XLA repacks the weights at runtime.
     return (
         not is_prefill
         and _GDN_DECODE_IN_PROJ_PACKED_KEY in params
         and (seq_len == 1 or gdn_packed_decode_enabled(config))
-        and (batch > 1 or gdn_packed_decode_tail_fused_enabled(config))
+        and (
+            batch > 1
+            or seq_len > 1
+            or gdn_packed_decode_tail_fused_enabled(config)
+        )
     )
 
 
@@ -645,11 +651,11 @@ def _use_full_attention_decode_packed_qkv(
     batch: int,
     seq_len: int,
 ) -> bool:
+    # As above, avoid runtime weight packing for a grouped verifier.
     return (
         not is_prefill
-        and batch > 1
-        and seq_len == 1
         and _FULL_ATTN_DECODE_QKV_PACKED_KEY in params
+        and (batch > 1 or seq_len > 1)
     )
 
 

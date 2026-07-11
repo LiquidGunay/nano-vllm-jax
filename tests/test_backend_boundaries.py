@@ -41,6 +41,7 @@ from nanovllm_jax.layers import causal_conv1d_update, rms_norm
 from nanovllm_jax.model import (
     _can_use_decode_padded_gemm,
     _decode_padded_gemm_dot,
+    _use_gdn_decode_packed_in_proj,
     _use_full_attention_decode_packed_qkv,
     _packed_causal_conv1d_prefill,
     forward,
@@ -117,6 +118,25 @@ def _tiny_linear_attention_config() -> Qwen3_5Config:
         linear_attn_layers=(0,),
         max_kv_cache_bytes=4 * 2 * 2 * 1 * 8 * 4 * 2,
         prefill_layout="dense",
+    )
+
+
+def test_grouped_decode_uses_prepacked_projection_weights():
+    full_params = {"qkv_proj_decode": object()}
+    assert not _use_full_attention_decode_packed_qkv(
+        full_params, is_prefill=False, batch=1, seq_len=1
+    )
+    assert _use_full_attention_decode_packed_qkv(
+        full_params, is_prefill=False, batch=1, seq_len=3
+    )
+
+    linear_params = {"in_proj_qkv_abz": object()}
+    config = Qwen3_5Config(gdn_packed_decode_impl="reference")
+    assert not _use_gdn_decode_packed_in_proj(
+        linear_params, is_prefill=False, batch=1, seq_len=1, config=config
+    )
+    assert _use_gdn_decode_packed_in_proj(
+        linear_params, is_prefill=False, batch=1, seq_len=3, config=config
     )
 
 

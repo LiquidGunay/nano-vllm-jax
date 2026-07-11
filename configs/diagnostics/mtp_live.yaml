@@ -16,9 +16,9 @@ benchmark:
   jax_execution: "jit"
   skip_vllm: true
   skip_jax: false
-  reference_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_assessment_20260711/qwen35_4b_no_mtp_b1_64x64_jax.json"
-  run_label: "qwen35_4b_strict_mtp_k2_b1_64x64_repro"
-  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_assessment_20260711/qwen35_4b_strict_mtp_k2_b1_64x64_repro.json"
+  reference_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_backend_b1_20260711/qwen35_4b_no_mtp_current_b1_64x64_jax.json"
+  run_label: "qwen35_4b_strict_k2_packed_weights_b1_64x64"
+  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_backend_b1_20260711/qwen35_4b_strict_k2_packed_weights_b1_64x64.json"
   seed: 20260710
   dataset_name: "random"
   min_input_tokens: 64
@@ -83,9 +83,10 @@ benchmark:
   vllm_language_model_only: true
   vllm_skip_mm_profiling: true
   vllm_enable_v1_multiprocessing: false
+  vllm_use_flashinfer_sampler: false
   vllm_mode: "baseline"
 
-  command_timeout_seconds: 600
+  command_timeout_seconds: 900
   max_system_ram_percent: 70
   worker_cpu_cores: 4
   worker_cpu_core_offset: 0
@@ -179,6 +180,8 @@ kernels:
       qkv_dtype: "bf16"
 
 env:
+  # Grouped B=1 decode consumes persistent packed projection leaves directly.
+  NANO_VLLM_JAX_MTP_PACKED_PROJECTIONS: "1"
   # Broad verifier projections; norms remain width-1 for numerical stability.
   NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH: "0"
   NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_NORMS: "1"

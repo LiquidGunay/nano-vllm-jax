@@ -4,9 +4,9 @@ MTP is experimental in this repository. This page records the current GPU servin
 
 ## Current GPU Result (2026-07-11)
 
-A fresh code-led pass implemented the strict packed-prefix target verifier on
-the resident serving path. The measured boundary now keeps the following work
-inside compiled device code:
+A Qwen3.5-4B, B=1 pass now has a repeatable exact MTP speedup over base vLLM.
+The strict packed-prefix boundary keeps the following work in compiled device
+code:
 
 - persistent MTP KV state seeded during prefill;
 - recursive K-token draft generation;
@@ -23,64 +23,59 @@ The disposable experiment control surface is
 .venv/bin/python benchmarks/benchmark_random_request_sidecar.py --experiment-config configs/diagnostics/mtp_live.yaml
 ```
 
-The current A10G BF16 result is not a speedup. These runs use eight requests,
-128 prompt tokens, 64 output tokens, the accepted non-MTP serving geometry,
-and the 70% system-RAM watchdog:
+The benchmark contract is Qwen3.5-4B BF16 on an A10G, one 64-token prompt, 64
+greedy output tokens, K=2, burst 1, persistent MTP KV, prefill cache seeding,
+recursive drafts, target-model verification, and the 70% system-RAM watchdog.
+The vLLM process alone is allowed a 78% watchdog because its checkpoint loader
+briefly needs more host memory.
 
-| route | output tok/s | token-event tok/s | draft acceptance | peak RAM | measured JIT growth |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| non-MTP JAX control | 653.67 | 972.82 | n/a | 62.3% | 0 |
-| strict packed K=2, burst 1 | 479.44 | 486.51 | 94.10% | 69.1% | 0 |
-| strict packed K=2, burst 2 | 551.71 | 567.52 | 92.05% | 69.5% | 0 |
-| strict packed K=2, materialized tied head | 468.65 | 477.06 | 92.33% | 68.6% | 0 |
-| strict packed K=4, one executable | 279.79 | 283.20 | 80.08% | 69.6% | 0 |
+| route | exact | output tok/s | token-event tok/s | vs vLLM | acceptance | peak RAM |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| vLLM 0.24.0, no MTP | yes | 48.31 | n/a | 1.000x | n/a | 65.4% |
+| JAX, no MTP | yes | 32.34 | 62.03 | 0.669x | n/a | 60.8% |
+| strict packed K=2, run 1 | yes | 59.70 | 60.44 | 1.236x | 81.25% | 62.9% |
+| strict packed K=2, run 2 | yes | 57.54 | 58.18 | 1.191x | 81.25% | 62.9% |
 
-Token-event throughput is the fair model-side comparison because the
-unmaterialized control pays a 25 ms final token drain after its last token.
-The best strict K=2 result is therefore `0.583x` the same non-MTP JAX path.
-It proposed 352 drafts, accepted 324, emitted 161 bonus tokens, recorded no
-sequential-verifier fallback, and had zero measured-phase compilation.
+The two MTP runs average 58.62 output tok/s, or `1.213x` vLLM. Both match the
+fresh no-MTP JAX row for all 64 tokens. Each proposes 48 drafts, accepts 39,
+records six rejected blocks and 18 bonus tokens, has zero verifier/seed
+fallbacks, and adds no JIT keys during measurement.
 
-The broad packed math is intentionally an approximate BF16 route. A focused
-same-state comparison over 27 target positions measured mean forward KL
-`0.04599` nats (maximum `0.11507`) and mean JS divergence `0.01097` nats
-(maximum `0.02765`); target top-1 matched the sequential-width reference at
-all 27 sampled positions. That local result is encouraging but is not an
-end-to-end quality proof: small recurrent-state differences accumulate, and
-only one of eight 64-token greedy rows exactly matched the non-MTP output.
-Treat the throughput above as an approximate-quality diagnostic, not an exact
-correctness or serving speed claim.
+The no-MTP JAX output number includes a 0.947 s final token-materialization
+drain, so token-event throughput is the fair comparison of local model work.
+On that basis strict MTP is still `0.938--0.974x` the same JAX width-1 path.
+The result therefore proves the requested speedup over vLLM, but does not yet
+prove that speculative execution is faster than this repo's own decode kernels.
 
-The restriction is structural on this host/model envelope:
+### Grouped projection ABI
 
-- K=2 already emits almost the maximum useful tokens per verifier group, so
-  acceptance tuning cannot recover the missing `1.71x` throughput.
-- The burst-1 and burst-2 timings imply an optimistic host-amortization ceiling
-  of only about 681 token-event tok/s if their difference is modeled entirely
-  as fixed per-call overhead. A wider burst therefore cannot reach the 972.82
-  tok/s control even before accounting for tail loss or extra compilation RAM.
-- The packed target pass plus recursive MTP-head work remains more expensive
-  than ordinary width-1 decode. A focused profile places a steady packed K=2
-  target group around 19--20 ms, with roughly another 5 ms for draft work.
-- Qwen3.5-2B is a worse lane here: a B=1 64-to-32 probe measured 37.04
-  token-event tok/s versus 199.89 non-MTP, with only 26.3% draft acceptance
-  and 69.3% peak RAM.
-- Qwen3.5-4B cannot be loaded safely under this machine's RAM contract. Its
-  local checkpoint is 9.32 GB before runtime copies, while the host has about
-  15 GiB total and already uses roughly 6--7 GiB before model loading.
+The speed fix changes which persistent parameter leaves a grouped decode is
+allowed to consume:
 
-Two fresh optimized vLLM attempts for the exact B=8 envelope were stopped by
-the watchdog at 70.2--70.3% RAM, including an in-process offline attempt that
-reused the compiled graph cache. No RAM limit was weakened and no unrelated
-server process was killed. The older 1000.98 tok/s vLLM artifact is a
-different full-random envelope and is context only, not an exact denominator.
-This does not affect the negative conclusion: verified K=2 is already much
-slower than the same JAX implementation without MTP.
+- width-1 B=1 decode keeps its existing individual projection path;
+- a grouped target decode (`sequence width > 1`) consumes the prepacked GDN
+  `in_proj_qkv_abz` and attention `qkv_proj_decode` leaves directly;
+- the MTP layer uses its opt-in persistent `qkv_proj_decode` and
+  `gate_up_proj` leaves.
 
-Further GPU work needs a backend-owned target boundary that materially lowers
-the packed GDN/projection cost; more host orchestration, acceptance-margin
-tuning, sequential repair, or wider K on the current kernels cannot establish
-a speedup. Do not promote this path to the clean branch yet.
+Previously the B=1 predicates rejected those leaves. XLA horizontally fused
+the individual projections anyway, but first rebuilt the packed matrices on
+every speculative group. The before/after GPU profiles show
+`wrapped_concatenate` falling from 135.02 ms over 548 launches to effectively
+zero over two launches. Target verification, accept/reject, and committed
+state selection are unchanged.
+
+The remaining dominant speculative cost is now visible rather than hidden by
+copies: 54 full-vocabulary top-1 scans take 138.52 ms in the profiled run. K=2
+needs one target scan plus two causally dependent MTP scans per group, so those
+draft scans cannot simply be batched without changing the draft algorithm.
+
+Qwen3.5-4B now fits: the dense prefill final-row projection no longer
+materializes a full `[prompt, vocab]` tensor, and these guarded JAX runs remain
+below 64% host RAM outside profiler overhead. The older 0.8B B=8 result remains
+a separate negative lane; this B=1 result does not overturn it. Keep MTP
+experimental until it also beats the same JAX non-MTP model-side rate and is
+validated on broader prompts.
 
 ## Current MTP Direction (2026-06-22)
 
@@ -95,9 +90,10 @@ Any route that emits draft tokens without target verification, repairs accepted-
 state on host with sequential decode, or reports host-side repair/materialization
 as progress is a correctness diagnostic only.
 
-Do not describe the current MTP path as production-ready. The current strict
-GPU packed-prefix route has not beaten the same non-MTP serving path. Treat
-historical K=1 TPU results as non-normative for current GPU work.
+Do not describe the current MTP path as production-ready. It beats base vLLM
+on the narrow B=1 result above, but remains below the same JAX non-MTP
+model-side rate and needs broader prompt validation. Treat historical K=1 TPU
+results as non-normative for current GPU work.
 
 ## Current Plan (2026-06-22)
 
