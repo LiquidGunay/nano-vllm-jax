@@ -49,6 +49,80 @@ _configure_triton_runtime()
 
 
 @triton.jit
+def _compact_paged_kv_indices_kernel(
+    block_tables,
+    kv_indptr,
+    kv_indices,
+    capacity: tl.constexpr,
+    batch: tl.constexpr,
+    max_pages: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    in_capacity = offsets < capacity
+    total_pages = tl.load(kv_indptr + batch).to(tl.int32)
+    row = tl.zeros((BLOCK,), dtype=tl.int32)
+    for row_idx in range(batch):
+        row_end = tl.load(kv_indptr + row_idx + 1).to(tl.int32)
+        row = tl.where(offsets >= row_end, row_idx + 1, row)
+    valid = in_capacity & (offsets < total_pages) & (row < batch)
+    safe_row = tl.minimum(row, batch - 1)
+    row_start = tl.load(kv_indptr + safe_row).to(tl.int32)
+    page_offset = offsets - row_start
+    value = tl.load(
+        block_tables + safe_row * max_pages + page_offset,
+        mask=valid & (page_offset >= 0) & (page_offset < max_pages),
+        other=0,
+    ).to(tl.int32)
+    tl.store(kv_indices + offsets, value, mask=in_capacity)
+
+
+def compact_block_tables_to_kv_indptr_triton(
+    block_tables: jax.Array,
+    seq_lens: jax.Array,
+    page_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Compact live dense page prefixes with one small Triton custom call."""
+
+    if block_tables.ndim != 2:
+        raise ValueError("block_tables must have shape [batch, max_pages_per_sequence]")
+    if seq_lens.shape != (block_tables.shape[0],):
+        raise ValueError("seq_lens must have shape [batch]")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+    batch, max_pages = map(int, block_tables.shape)
+    page_counts = jnp.where(
+        seq_lens > 0,
+        (seq_lens.astype(jnp.int32) + int(page_size) - 1) // int(page_size),
+        0,
+    )
+    page_counts = jnp.clip(page_counts, 0, max_pages).astype(jnp.int32)
+    kv_indptr = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=jnp.int32),
+            jnp.cumsum(page_counts, dtype=jnp.int32),
+        ]
+    )
+    capacity = batch * max_pages
+    block = min(1024, max(32, int(jt.next_power_of_2(min(capacity, 1024)))))
+    kv_indices = jt.triton_call(
+        block_tables.astype(jnp.int32),
+        kv_indptr,
+        kernel=_compact_paged_kv_indices_kernel,
+        out_shape=jax.ShapeDtypeStruct((capacity,), jnp.int32),
+        grid=(jt.cdiv(capacity, block),),
+        name="compact_paged_kv_indices",
+        capacity=capacity,
+        batch=batch,
+        max_pages=max_pages,
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
+    return kv_indices, kv_indptr
+
+
+@triton.jit
 def _packed_paged_prefill_attention_kernel(
     query,
     k_cache,

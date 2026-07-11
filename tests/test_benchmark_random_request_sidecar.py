@@ -35,6 +35,7 @@ def test_parse_args_defaults_set_random_ranges():
     assert args.decode_block_table_buckets == "128,256,320"
     assert args.max_blocks_per_seq * 16 >= args.max_input_tokens + args.max_output_tokens
     assert args.resident_decode_metadata is False
+    assert args.jax_materialize_tied_lm_head is None
     assert args.full_attention_kv_cache_dtype == "default"
     assert args.full_attention_kv_append_impl == "reference"
     assert args.full_attention_decode_impl == "reference"
@@ -43,6 +44,8 @@ def test_parse_args_defaults_set_random_ranges():
     assert args.vllm_reference_json == ""
     assert sidecar._effective_vllm_dtype(args) == "bfloat16"
     assert args.vllm_num_speculative_tokens == 0
+    assert args.skip_jax is False
+    assert args.skip_vllm is False
     assert args.max_system_ram_percent == 70.0
     assert args.worker_cpu_cores >= 1
     assert args.worker_nice == 10
@@ -60,6 +63,61 @@ def test_parse_args_rejects_invalid_ranges():
 
     with pytest.raises(SystemExit):
         sidecar.parse_args(["--worker-cpu-cores", "-1"])
+
+    with pytest.raises(SystemExit):
+        sidecar.parse_args(["--skip-jax", "--skip-vllm"])
+
+
+def test_experiment_config_sets_sidecar_defaults_and_cli_wins(tmp_path):
+    config_path = tmp_path / "mtp_live.yaml"
+    config_path.write_text(
+        """
+benchmark:
+  model: Qwen/Qwen3.5-2B
+  dtype: bfloat16
+  weight_dtype: bfloat16
+  min_input_tokens: 64
+  max_input_tokens: 64
+  min_request_count: 1
+  max_request_count: 1
+  skip_vllm: true
+  max_system_ram_percent: 70
+runtime:
+  platform: cuda
+""".strip()
+    )
+
+    args = sidecar.parse_args(
+        [
+            "--experiment-config",
+            str(config_path),
+            "--max-input-tokens",
+            "96",
+        ]
+    )
+
+    assert args.model == "Qwen/Qwen3.5-2B"
+    assert args.dtype == "bfloat16"
+    assert args.weight_dtype == "bfloat16"
+    assert args.min_input_tokens == 64
+    assert args.max_input_tokens == 96
+    assert args.min_request_count == args.max_request_count == 1
+    assert args.skip_vllm is True
+    assert args.max_system_ram_percent == 70
+    assert args.jax_config == str(config_path)
+
+
+def test_experiment_config_rejects_unknown_benchmark_key(tmp_path):
+    config_path = tmp_path / "bad_live.yaml"
+    config_path.write_text(
+        """
+benchmark:
+  typo_request_count: 1
+""".strip()
+    )
+
+    with pytest.raises(SystemExit):
+        sidecar.parse_args(["--experiment-config", str(config_path)])
 
 
 def test_deterministic_request_rows_have_same_contents():
@@ -333,6 +391,88 @@ engine:
     assert policy["gdn_disable_fallbacks"] is True
 
 
+def test_vllm_command_projects_bounded_text_only_envelope():
+    args = sidecar.parse_args(
+        [
+            "--output-json",
+            "/tmp/sidecar.json",
+            "--vllm-max-num-seqs",
+            "2",
+            "--vllm-max-num-batched-tokens",
+            "256",
+            "--vllm-cudagraph-capture-sizes",
+            "1,2",
+            "--vllm-language-model-only",
+            "--vllm-skip-mm-profiling",
+            "--no-vllm-enable-v1-multiprocessing",
+        ]
+    )
+
+    command = sidecar._build_vllm_command(
+        args,
+        manifest_jsonl=sidecar.Path("/tmp/prompts.jsonl"),
+        output_json=sidecar.Path("/tmp/vllm.json"),
+    )
+
+    assert command[command.index("--max-num-seqs") + 1] == "2"
+    assert command[command.index("--max-num-batched-tokens") + 1] == "256"
+    assert command[command.index("--cudagraph-capture-sizes") + 1] == "1,2"
+    assert "--language-model-only" in command
+    assert "--skip-mm-profiling" in command
+    assert "--no-enable-v1-multiprocessing" in command
+
+
+def test_jax_command_allows_narrow_diagnostic_startup_warmup():
+    args = sidecar.parse_args(
+        [
+            "--output-json",
+            "/tmp/sidecar.json",
+            "--jax-startup-warmup-prefill-token-buckets",
+            "128",
+            "--jax-startup-warmup-batch-size-buckets",
+            "2",
+            "--jax-startup-warmup-decode-block-table-buckets",
+            "16",
+            "--no-jax-startup-warmup-include-sampled-routes",
+        ]
+    )
+    command = sidecar._build_jax_command(
+        args,
+        manifest_jsonl=sidecar.Path("/tmp/prompts.jsonl"),
+        output_json=sidecar.Path("/tmp/jax.json"),
+        config_engine_overrides={
+            "startup_warmup_prefill_token_buckets": "64,128",
+            "startup_warmup_batch_size_buckets": "1,4",
+            "startup_warmup_decode_block_table_buckets": "128,320",
+            "startup_warmup_include_sampled_routes": True,
+        },
+    )
+
+    assert command[command.index("--startup-warmup-prefill-token-buckets") + 1] == "128"
+    assert command[command.index("--startup-warmup-batch-size-buckets") + 1] == "2"
+    assert command[command.index("--startup-warmup-decode-block-table-buckets") + 1] == "16"
+    assert "--no-startup-warmup-include-sampled-routes" in command
+
+
+def test_jax_command_can_override_configured_tied_lm_head_materialization():
+    args = sidecar.parse_args(
+        [
+            "--output-json",
+            "/tmp/sidecar.json",
+            "--no-jax-materialize-tied-lm-head",
+        ]
+    )
+    command = sidecar._build_jax_command(
+        args,
+        manifest_jsonl=sidecar.Path("/tmp/prompts.jsonl"),
+        output_json=sidecar.Path("/tmp/jax.json"),
+        config_engine_overrides={"materialize_tied_lm_head": True},
+    )
+
+    assert "--no-materialize-tied-lm-head" in command
+    assert "--materialize-tied-lm-head" not in command
+
+
 def test_run_command_kills_process_when_ram_guard_trips(monkeypatch):
     monkeypatch.setattr(sidecar, "_system_ram_percent", lambda: 71.0)
 
@@ -352,3 +492,34 @@ def test_run_command_kills_process_when_ram_guard_trips(monkeypatch):
     assert result["status"] == "killed_resource_limit"
     assert result["resource_limit_reason"]["kind"] == "system_ram_percent"
     assert result["resource_limit_reason"]["observed_percent"] == 71.0
+
+
+def test_run_command_cleans_process_group_on_interrupt(monkeypatch):
+    terminated = []
+    original_terminate = sidecar._terminate_process_group
+
+    def record_terminate(process):
+        terminated.append(process.pid)
+        original_terminate(process)
+
+    def interrupt_sleep(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sidecar, "_terminate_process_group", record_terminate)
+    monkeypatch.setattr(sidecar.time, "sleep", interrupt_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        sidecar._run_command(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+            ],
+            timeout_seconds=10,
+            max_system_ram_percent=70.0,
+            worker_cpu_cores=0,
+            worker_nice=0,
+            resource_poll_seconds=0.05,
+        )
+
+    assert terminated

@@ -10,11 +10,36 @@ import jax.numpy as jnp
 import numpy as np
 
 from nanovllm_jax.kernels.paged_attention import (
+    compact_block_tables_to_kv_indptr,
     dense_block_tables_to_kv_indptr,
     kv_last_page_len_from_seq_lens,
     paged_decode_attention_gqa_nhd_reference,
 )
 from nanovllm_jax.kv_cache import paged_attention_decode
+
+
+def test_compact_block_tables_to_kv_indptr_drops_bucket_padding():
+    block_tables = jnp.array(
+        [
+            [3, 1, 6, 0, 0],
+            [5, 2, 7, 4, 0],
+            [0, 0, 0, 0, 0],
+        ],
+        dtype=jnp.int32,
+    )
+    seq_lens = jnp.array([7, 13, 0], dtype=jnp.int32)
+
+    kv_indices, kv_indptr = jax.jit(
+        lambda tables, lens: compact_block_tables_to_kv_indptr(
+            tables,
+            lens,
+            4,
+        )
+    )(block_tables, seq_lens)
+
+    np.testing.assert_array_equal(np.asarray(kv_indptr), [0, 2, 6, 6])
+    np.testing.assert_array_equal(np.asarray(kv_indices)[:6], [3, 1, 5, 2, 7, 4])
+    assert kv_indices.shape == (15,)
 
 
 def test_paged_decode_attention_gqa_nhd_reference_matches_current_decode_path():

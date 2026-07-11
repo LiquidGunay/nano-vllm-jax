@@ -97,6 +97,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--manifest-jsonl", default="")
     parser.add_argument("--prompt-manifest-output-jsonl", default="")
+    parser.add_argument(
+        "--experiment-config",
+        default="",
+        help=(
+            "Optional YAML file whose benchmark section supplies sidecar arguments. "
+            "When the same file also contains engine/runtime/kernels sections, it is "
+            "used as --jax-config unless benchmark.jax_config overrides it."
+        ),
+    )
     parser.add_argument("--jax-python", default=DEFAULT_JAX_PYTHON)
     parser.add_argument(
         "--jax-config",
@@ -136,6 +145,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fail the JAX run if new executor JIT keys are created during measured generation.",
     )
+    parser.add_argument("--jax-startup-warmup-prefill-token-buckets", default="")
+    parser.add_argument("--jax-startup-warmup-batch-size-buckets", default="")
+    parser.add_argument("--jax-startup-warmup-decode-block-table-buckets", default="")
+    parser.add_argument(
+        "--jax-startup-warmup-include-sampled-routes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--jax-profile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--jax-trace-profile-dir", default="")
     parser.add_argument("--jax-max-kv-cache-mb", type=int, default=8192)
@@ -156,6 +173,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-blocks-per-seq", type=int, default=320)
     parser.add_argument("--decode-block-table-buckets", default="128,256,320")
     parser.add_argument("--resident-decode-metadata", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--jax-materialize-tied-lm-head",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the JAX config's tied LM-head materialization policy.",
+    )
     parser.add_argument("--full-attention-kv-cache-dtype", default="default")
     parser.add_argument("--full-attention-kv-append-impl", default="reference")
     parser.add_argument("--full-attention-decode-impl", default="reference")
@@ -185,12 +208,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vllm-max-model-len", type=int, default=8192)
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.72)
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=0)
+    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=0)
+    parser.add_argument("--vllm-cudagraph-capture-sizes", default="")
+    parser.add_argument(
+        "--vllm-language-model-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--vllm-skip-mm-profiling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--vllm-enable-v1-multiprocessing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--vllm-top-k", type=int, default=5)
     parser.add_argument("--vllm-mode", default="baseline", choices=["baseline", "mtp"])
     parser.add_argument("--vllm-speculative-method", default="mtp")
     parser.add_argument("--vllm-num-speculative-tokens", type=int, choices=[0, 1], default=0)
 
     parser.add_argument("--dry-run", action="store_true", help="Generate manifest and commands without launching benchmarks.")
+    parser.add_argument("--skip-jax", action="store_true", help="Generate suite and run vLLM only.")
     parser.add_argument("--skip-vllm", action="store_true", help="Generate suite and run JAX only.")
     parser.add_argument(
         "--command-timeout-seconds",
@@ -231,10 +273,63 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _experiment_config_defaults(
+    path: str,
+    *,
+    parser: argparse.ArgumentParser,
+) -> dict[str, Any]:
+    if not path:
+        return {}
+
+    import yaml
+
+    config_path = Path(path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    benchmark = raw.get("benchmark", {}) or {}
+    if not isinstance(benchmark, dict):
+        parser.error("experiment config 'benchmark' section must be a mapping")
+
+    known_dests = {
+        action.dest
+        for action in parser._actions
+        if action.dest not in {argparse.SUPPRESS, "help"}
+    }
+    defaults: dict[str, Any] = {}
+    unknown: list[str] = []
+    for raw_key, value in benchmark.items():
+        dest = str(raw_key).replace("-", "_")
+        if dest not in known_dests:
+            unknown.append(str(raw_key))
+            continue
+        defaults[dest] = value
+    if unknown:
+        parser.error(
+            "unknown benchmark key(s) in experiment config: "
+            + ", ".join(sorted(unknown))
+        )
+
+    if "jax_config" not in defaults and any(
+        section in raw for section in ("engine", "runtime", "kernels", "env")
+    ):
+        defaults["jax_config"] = str(config_path)
+    return defaults
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--experiment-config", default="")
+    config_args, _ = config_parser.parse_known_args(raw_argv)
+
     parser = build_arg_parser()
-    raw_argv = sys.argv[1:] if argv is None else argv
-    args = parser.parse_args(argv)
+    if config_args.experiment_config:
+        parser.set_defaults(
+            **_experiment_config_defaults(
+                config_args.experiment_config,
+                parser=parser,
+            )
+        )
+    args = parser.parse_args(raw_argv)
     args.decode_block_table_buckets_explicit = any(
         value == "--decode-block-table-buckets"
         or value.startswith("--decode-block-table-buckets=")
@@ -257,6 +352,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--worker-nice must be between -20 and 19")
     if args.resource_poll_seconds <= 0:
         parser.error("--resource-poll-seconds must be > 0")
+    if args.skip_jax and args.skip_vllm:
+        parser.error("--skip-jax and --skip-vllm cannot both be enabled")
     return args
 
 
@@ -653,33 +750,39 @@ def _run_command(
             start_new_session=True,
             preexec_fn=_limit_child_process if (selected_cores or worker_nice) else None,
         )
-        while process.poll() is None:
-            elapsed = time.perf_counter() - started
-            if timeout_seconds > 0 and elapsed > timeout_seconds:
-                limit_reason = {
-                    "kind": "timeout",
-                    "elapsed_seconds": elapsed,
-                    "limit_seconds": int(timeout_seconds),
-                }
-                _terminate_process_group(process)
-                break
-            ram_percent = _system_ram_percent()
-            if ram_percent is not None:
-                peak_system_ram_percent = max(peak_system_ram_percent or 0.0, ram_percent)
-                if max_system_ram_percent > 0 and ram_percent >= max_system_ram_percent:
+        try:
+            while process.poll() is None:
+                elapsed = time.perf_counter() - started
+                if timeout_seconds > 0 and elapsed > timeout_seconds:
                     limit_reason = {
-                        "kind": "system_ram_percent",
-                        "observed_percent": ram_percent,
-                        "limit_percent": float(max_system_ram_percent),
+                        "kind": "timeout",
+                        "elapsed_seconds": elapsed,
+                        "limit_seconds": int(timeout_seconds),
                     }
                     _terminate_process_group(process)
                     break
-            rss_bytes = _process_tree_rss_bytes(process.pid)
-            if rss_bytes is not None:
-                peak_process_tree_rss_bytes = max(peak_process_tree_rss_bytes or 0, rss_bytes)
-            _apply_affinity_to_tree(process.pid, selected_cores)
-            time.sleep(float(resource_poll_seconds))
-        returncode = process.wait()
+                ram_percent = _system_ram_percent()
+                if ram_percent is not None:
+                    peak_system_ram_percent = max(peak_system_ram_percent or 0.0, ram_percent)
+                    if max_system_ram_percent > 0 and ram_percent >= max_system_ram_percent:
+                        limit_reason = {
+                            "kind": "system_ram_percent",
+                            "observed_percent": ram_percent,
+                            "limit_percent": float(max_system_ram_percent),
+                        }
+                        _terminate_process_group(process)
+                        break
+                rss_bytes = _process_tree_rss_bytes(process.pid)
+                if rss_bytes is not None:
+                    peak_process_tree_rss_bytes = max(peak_process_tree_rss_bytes or 0, rss_bytes)
+                _apply_affinity_to_tree(process.pid, selected_cores)
+                time.sleep(float(resource_poll_seconds))
+            returncode = process.wait()
+        except BaseException:
+            if process.poll() is None:
+                _terminate_process_group(process)
+                process.wait()
+            raise
         output_file.flush()
         output_file.seek(0, os.SEEK_END)
         output_size = output_file.tell()
@@ -884,6 +987,24 @@ def _build_jax_command(
         "output_json": str(output_json),
     }
     command_args.update(config_engine_overrides or {})
+    if args.jax_materialize_tied_lm_head is not None:
+        command_args["materialize_tied_lm_head"] = args.jax_materialize_tied_lm_head
+    if args.jax_startup_warmup_prefill_token_buckets:
+        command_args["startup_warmup_prefill_token_buckets"] = (
+            args.jax_startup_warmup_prefill_token_buckets
+        )
+    if args.jax_startup_warmup_batch_size_buckets:
+        command_args["startup_warmup_batch_size_buckets"] = (
+            args.jax_startup_warmup_batch_size_buckets
+        )
+    if args.jax_startup_warmup_decode_block_table_buckets:
+        command_args["startup_warmup_decode_block_table_buckets"] = (
+            args.jax_startup_warmup_decode_block_table_buckets
+        )
+    if args.jax_startup_warmup_include_sampled_routes is not None:
+        command_args["startup_warmup_include_sampled_routes"] = (
+            args.jax_startup_warmup_include_sampled_routes
+        )
     if args.decode_block_table_buckets:
         command_args["decode_block_table_buckets"] = args.decode_block_table_buckets
         if bool(getattr(args, "decode_block_table_buckets_explicit", False)):
@@ -943,6 +1064,12 @@ def _build_vllm_command(args: argparse.Namespace, manifest_jsonl: Path, output_j
         "execution": args.vllm_execution,
         "max_model_len": args.vllm_max_model_len,
         "gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+        "max_num_seqs": args.vllm_max_num_seqs,
+        "max_num_batched_tokens": args.vllm_max_num_batched_tokens,
+        "cudagraph_capture_sizes": args.vllm_cudagraph_capture_sizes,
+        "language_model_only": args.vllm_language_model_only,
+        "skip_mm_profiling": args.vllm_skip_mm_profiling,
+        "enable_v1_multiprocessing": args.vllm_enable_v1_multiprocessing,
         "trust_remote_code": True,
         "prompt_source": "manifest",
         "prompt_manifest_jsonl": str(manifest_jsonl),
@@ -989,6 +1116,13 @@ def _run() -> None:
     manifest_path = _build_manifest_path(args.output_json, args.manifest_jsonl or args.prompt_manifest_output_jsonl)
     manifest_sha = write_prompt_manifest(rows, manifest_path)
     jax_config = _load_jax_config(args.jax_config)
+    if args.jax_materialize_tied_lm_head is not None:
+        jax_config["engine_overrides"]["materialize_tied_lm_head"] = (
+            args.jax_materialize_tied_lm_head
+        )
+        jax_config["env"]["NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD"] = (
+            "1" if args.jax_materialize_tied_lm_head else "0"
+        )
 
     jax_output_json = _build_artifact_path(args.output_json, "jax")
     if args.output_json_jax:
@@ -1010,18 +1144,35 @@ def _run() -> None:
     )
     vllm_reference_info: dict[str, Any] | None = None
 
-    jax_run, jax_artifact = _run_benchmark(
-        jax_command,
-        artifact_path=jax_output_json,
-        dry_run=args.dry_run,
-        timeout_seconds=args.command_timeout_seconds,
-        env_overrides=jax_config["env"],
-        max_system_ram_percent=args.max_system_ram_percent,
-        worker_cpu_cores=args.worker_cpu_cores,
-        worker_cpu_core_offset=args.worker_cpu_core_offset,
-        worker_nice=args.worker_nice,
-        resource_poll_seconds=args.resource_poll_seconds,
-    )
+    if args.skip_jax:
+        jax_run = {
+            "status": "skipped",
+            "returncode": None,
+            "command": jax_command,
+            "elapsed_seconds": 0.0,
+            "output_tail": "",
+            "resource_limits": {
+                "max_system_ram_percent": args.max_system_ram_percent,
+                "worker_cpu_cores": args.worker_cpu_cores,
+                "worker_cpu_core_offset": args.worker_cpu_core_offset,
+                "worker_nice": args.worker_nice,
+                "resource_poll_seconds": args.resource_poll_seconds,
+            },
+        }
+        jax_artifact = {}
+    else:
+        jax_run, jax_artifact = _run_benchmark(
+            jax_command,
+            artifact_path=jax_output_json,
+            dry_run=args.dry_run,
+            timeout_seconds=args.command_timeout_seconds,
+            env_overrides=jax_config["env"],
+            max_system_ram_percent=args.max_system_ram_percent,
+            worker_cpu_cores=args.worker_cpu_cores,
+            worker_cpu_core_offset=args.worker_cpu_core_offset,
+            worker_nice=args.worker_nice,
+            resource_poll_seconds=args.resource_poll_seconds,
+        )
 
     if args.vllm_reference_json:
         vllm_artifact, vllm_reference_info = _load_vllm_reference_artifact(
@@ -1147,6 +1298,7 @@ def _run() -> None:
                     jax_config["engine_overrides"].get("startup_warmup_include_sampled_routes")
                 ),
                 "resident_decode_metadata": args.resident_decode_metadata,
+                "materialize_tied_lm_head": args.jax_materialize_tied_lm_head,
                 "full_attention_kv_cache_dtype": args.full_attention_kv_cache_dtype,
                 "full_attention_kv_append_impl": args.full_attention_kv_append_impl,
                 "full_attention_decode_impl": args.full_attention_decode_impl,
@@ -1188,6 +1340,12 @@ def _run() -> None:
                 "max_model_len": args.vllm_max_model_len,
                 "gpu_memory_utilization": args.vllm_gpu_memory_utilization,
                 "tensor_parallel_size": args.vllm_tensor_parallel_size,
+                "max_num_seqs": args.vllm_max_num_seqs,
+                "max_num_batched_tokens": args.vllm_max_num_batched_tokens,
+                "cudagraph_capture_sizes": args.vllm_cudagraph_capture_sizes,
+                "language_model_only": args.vllm_language_model_only,
+                "skip_mm_profiling": args.vllm_skip_mm_profiling,
+                "enable_v1_multiprocessing": args.vllm_enable_v1_multiprocessing,
                 "top_k": args.vllm_top_k,
                 "sampling": {
                     "temperature": args.temperature,
@@ -1249,7 +1407,7 @@ def _run() -> None:
         raise RuntimeError(f"JAX benchmark failed: {jax_run}")
     if args.dry_run:
         return
-    if jax_run.get("status") != "ok":
+    if not args.skip_jax and jax_run.get("status") != "ok":
         raise RuntimeError(f"JAX benchmark failed: {jax_run}")
     if (
         not args.skip_vllm

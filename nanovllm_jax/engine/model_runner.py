@@ -1356,8 +1356,27 @@ class CanonicalModelRunner:
             or tuple(getattr(self.config, "prefill_buckets", ()))
             or (max_prefill_len,)
         )
-        batch_buckets = tuple(int(bucket) for bucket in (batch_size_buckets or ())) or (
+        requested_batch_buckets = tuple(
+            int(bucket) for bucket in (batch_size_buckets or ())
+        ) or (
             tuple(getattr(self.config, "batch_size_buckets", ())) or (max_batch,)
+        )
+        max_serving_batch = max(
+            1,
+            int(getattr(self.config, "max_num_seqs", max_batch) or max_batch),
+        )
+        # Startup configs can be reused with a narrower benchmark/server
+        # envelope. Never construct a warmup batch larger than the runner can
+        # schedule or than its resident host tables can address. Clamping also
+        # preserves coverage of the largest reachable batch instead of simply
+        # dropping an oversized configured bucket.
+        batch_buckets = tuple(
+            sorted(
+                {
+                    min(max(1, int(bucket)), max_serving_batch)
+                    for bucket in requested_batch_buckets
+                }
+            )
         )
         decode_block_table_buckets = tuple(
             int(bucket) for bucket in (decode_block_table_buckets or ())
@@ -1373,6 +1392,13 @@ class CanonicalModelRunner:
         }
         summary["prefill_buckets"] = list(prefill_buckets)
         summary["batch_size_buckets"] = list(batch_buckets)
+        if batch_buckets != tuple(
+            sorted(set(int(bucket) for bucket in requested_batch_buckets))
+        ):
+            summary["requested_batch_size_buckets"] = list(
+                requested_batch_buckets
+            )
+            summary["batch_size_buckets_clamped_to"] = max_serving_batch
         summary["decode_block_table_buckets"] = [int(width) for width in decode_block_table_buckets]
         row_prefill_buckets = tuple(getattr(self.config, "prefill_buckets", ()) or ())
 
@@ -1707,8 +1733,9 @@ class CanonicalModelRunner:
                         return_mtp_draft=prefill_seed_for_batch,
                     )
                     self._hybrid_state_table = output.hybrid_state
-                    if output.mtp_cache_storage is not None:
-                        self.mtp_cache_storage = output.mtp_cache_storage
+                    output_mtp_cache = getattr(output, "mtp_cache_storage", None)
+                    if output_mtp_cache is not None:
+                        self.mtp_cache_storage = output_mtp_cache
                     route = (
                         "forward_prefill_token_ids_table_jit:prefill-mtp-hidden-seed"
                         if prefill_seed_for_batch
@@ -2412,9 +2439,15 @@ class CanonicalModelRunner:
                             mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                             burst_groups=warm_burst_groups,
                             emit_bonus=emit_bonus,
+                            resident_block_tables=self._resident_block_tables,
                             resident_seq_lens=self._resident_seq_lens,
+                            resident_last_tokens=self._resident_last_tokens,
                         )
                         self._hybrid_state_table = table_output.hybrid_state
+                        if table_output.resident_seq_lens is not None:
+                            self._resident_seq_lens = table_output.resident_seq_lens
+                        if table_output.resident_last_tokens is not None:
+                            self._resident_last_tokens = table_output.resident_last_tokens
                         if table_output.mtp_cache_storage is not None:
                             self.mtp_cache_storage = table_output.mtp_cache_storage
                             _record_decode_warmup(
@@ -3233,7 +3266,11 @@ class CanonicalModelRunner:
             self._mtp1_seeded_chain.clear()
         if hasattr(self, "_clear_device_token_carry"):
             self._clear_device_token_carry()
-        if hasattr(self, "cache_storage"):
+        if (
+            hasattr(self, "cache_storage")
+            and hasattr(self.cache_storage, "k_cache")
+            and hasattr(self.cache_storage, "v_cache")
+        ):
             self.cache_storage = KVCacheStorage(
                 k_cache=jnp.zeros_like(self.cache_storage.k_cache),
                 v_cache=jnp.zeros_like(self.cache_storage.v_cache),
@@ -3714,29 +3751,28 @@ class CanonicalModelRunner:
         update_resident_tokens: bool = True,
     ) -> None:
         """Record final emitted MTP tokens for the next resident decode step."""
-        if (
-            not outputs
-            or not bool(
-                getattr(
-                    self,
+        if not outputs:
+            return
+        if not bool(
+            getattr(
+                self,
+                "device_token_carry",
+                _config_or_env_flag(
+                    getattr(self, "config", None),
                     "device_token_carry",
-                    _config_or_env_flag(
-                        getattr(self, "config", None),
-                        "device_token_carry",
-                        "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
-                    ),
-                )
+                    "NANO_VLLM_JAX_DEVICE_TOKEN_CARRY",
+                ),
             )
-            or batch.seq_ids_host is None
-        ):
+        ) or batch.seq_ids_host is None:
             self._clear_device_token_carry()
             return
 
         active_rows: list[int] = []
         token_values: list[object] = []
+        carry_seq_ids_to_remove: set[int] = set()
         for row in sorted(outputs):
             row = int(row)
-            if row < 0 or row >= len(seqs) or not seqs[row].ignore_eos:
+            if row < 0 or row >= len(seqs) or row >= len(batch.seq_ids_host):
                 continue
             emitted = outputs[row]
             if isinstance(emitted, list):
@@ -3747,12 +3783,38 @@ class CanonicalModelRunner:
             else:
                 emitted_count = 1
                 token = emitted
-            if seqs[row].num_completion_tokens + emitted_count >= seqs[row].max_tokens:
+            seq_id = int(batch.seq_ids_host[row])
+            if seq_id < 0:
+                continue
+            if (
+                not seqs[row].ignore_eos
+                or seqs[row].num_completion_tokens + emitted_count
+                >= seqs[row].max_tokens
+            ):
+                carry_seq_ids_to_remove.add(seq_id)
                 continue
             active_rows.append(row)
             token_values.append(token)
+
+        if carry_seq_ids_to_remove:
+            retained_carry = {
+                int(seq_id): token_ref
+                for seq_id, token_ref in getattr(
+                    self,
+                    "_device_token_carry_by_seq_id",
+                    {},
+                ).items()
+                if int(seq_id) not in carry_seq_ids_to_remove
+            }
+            if retained_carry:
+                self._device_token_carry_seq_ids = None
+                self._device_token_carry_tokens = None
+                self._device_token_carry_by_seq_id = retained_carry
+                self._device_seq_lens_carry_seq_ids = None
+                self._device_seq_lens_carry = None
+            else:
+                self._clear_device_token_carry()
         if not active_rows:
-            self._clear_device_token_carry()
             return
 
         if all(isinstance(token, DeviceTokenRef) for token in token_values):
@@ -3781,6 +3843,14 @@ class CanonicalModelRunner:
                         self._device_token_carry_by_seq_id = carry_by_seq_id
                         self._device_seq_lens_carry_seq_ids = None
                         self._device_seq_lens_carry = None
+                        stale_seq_ids = getattr(
+                            self,
+                            "_resident_last_tokens_stale_seq_ids",
+                            None,
+                        )
+                        if stale_seq_ids is not None:
+                            for seq_id in new_carry_by_seq_id:
+                                stale_seq_ids.discard(int(seq_id))
                         return
                 token_matrix = jnp.asarray(first_tokens, dtype=jnp.int32)
                 batch_size = int(batch.tokens.shape[0])
@@ -4248,6 +4318,95 @@ class CanonicalModelRunner:
             block_tables_host=block_tables_host,
             hybrid_slot_ids_host=hybrid_slot_ids_host,
             uses_static_decode_metadata=False,
+        )
+
+    def _run_static_resident_target_rows(
+        self,
+        seqs: List[Sequence],
+        batch: ScheduledBatch,
+        rows: List[int],
+    ) -> List[int | List[int]]:
+        """Run ordinary target decode for selected rows on the resident path."""
+
+        batch_size = int(batch.tokens.shape[0])
+        row_set = {int(row) for row in rows}
+        if len(row_set) != len(rows) or any(
+            row < 0 or row >= batch_size or row >= len(seqs)
+            for row in row_set
+        ):
+            raise ValueError(
+                f"invalid resident target rows {rows} for batch/sequence sizes "
+                f"{batch_size}/{len(seqs)}"
+            )
+        if (
+            batch.seq_ids_host is None
+            or batch.seq_lens_host is None
+            or batch.query_lens_host is None
+        ):
+            raise ValueError("resident target rows require host decode metadata")
+
+        hybrid_slots = getattr(self, "_hybrid_slots", {})
+        source_slots = tuple(
+            int(
+                hybrid_slots.get(
+                    int(seq_id),
+                    (
+                        batch.hybrid_slot_ids_host[row]
+                        if batch.hybrid_slot_ids_host is not None
+                        else -1
+                    ),
+                )
+            )
+            for row, seq_id in enumerate(batch.seq_ids_host)
+        )
+        missing_slots = [
+            row
+            for row in row_set
+            if int(batch.seq_ids_host[row]) < 0 or int(source_slots[row]) < 0
+        ]
+        if missing_slots:
+            raise RuntimeError(
+                "resident target rows are missing live sequence/slot ids: "
+                f"{missing_slots}"
+            )
+        masked_batch = replace(
+            batch,
+            num_decode_tokens=len(row_set),
+            seq_ids_host=tuple(
+                int(batch.seq_ids_host[row]) if row in row_set else -1
+                for row in range(batch_size)
+            ),
+            query_lens_host=tuple(
+                1 if row in row_set else 0
+                for row in range(batch_size)
+            ),
+            seq_lens_host=tuple(
+                int(batch.seq_lens_host[row]) if row in row_set else 0
+                for row in range(batch_size)
+            ),
+            hybrid_slot_ids_host=tuple(
+                int(source_slots[row]) if row in row_set else -1
+                for row in range(batch_size)
+            ),
+            uses_static_decode_metadata=True,
+        )
+        return self._run_main_and_sample(
+            seqs,
+            masked_batch,
+            seed_mtp1=False,
+        )
+
+    def _can_run_static_resident_target_rows(self, batch: ScheduledBatch) -> bool:
+        return bool(
+            not batch.is_prefill
+            and self._strict_k_mtp_verifier_enabled()
+            and str(getattr(self, "mtp_verifier_impl", "") or "").lower()
+            in {"packed_prefix", "packed_prefill", "prefill_packed"}
+            and bool(getattr(self, "resident_decode_metadata", False))
+            and bool(getattr(batch, "uses_static_decode_metadata", False))
+            and batch.seq_ids_host is not None
+            and batch.query_lens_host is not None
+            and batch.seq_lens_host is not None
         )
 
     def _pad_decode_batch_to_rows(self, batch: ScheduledBatch, target_rows: int) -> ScheduledBatch:
@@ -5770,8 +5929,9 @@ class CanonicalModelRunner:
             )
         _prefill_seed_mark("executor_dispatch")
         self.cache_storage = output.cache_storage
-        if output.mtp_cache_storage is not None:
-            self.mtp_cache_storage = output.mtp_cache_storage
+        output_mtp_cache = getattr(output, "mtp_cache_storage", None)
+        if output_mtp_cache is not None:
+            self.mtp_cache_storage = output_mtp_cache
         if use_hybrid_table_decode or use_hybrid_table_prefill or sampled_resident_dense_slot_token_metadata_decode:
             self._hybrid_state_table = output.hybrid_state
             self._mark_hybrid_slots_written(list(batch.hybrid_slot_ids_host or ()))
@@ -6841,6 +7001,10 @@ class CanonicalModelRunner:
                 for local_row, row in enumerate(original_active_rows)
             }
             _mark("compact_batch")
+        static_seed_rows = self._mtp_static_batch_size(len(active_rows))
+        if static_seed_rows > int(batch.tokens.shape[0]):
+            batch = self._pad_decode_batch_to_rows(batch, static_seed_rows)
+            _mark("pad_static_batch")
         batch = self._maybe_apply_device_token_carry(batch)
         _mark("apply_device_token_carry")
         hybrid_state = self._batch_hybrid_state(batch)
@@ -7424,6 +7588,19 @@ class CanonicalModelRunner:
         if not rows:
             return {}
         strict_k_verifier = self._strict_k_mtp_verifier_enabled()
+        configured_verifier_impl = str(
+            getattr(self, "mtp_verifier_impl", "two_decode") or "two_decode"
+        ).lower()
+        use_static_resident_packed_inputs = (
+            strict_k_verifier
+            and configured_verifier_impl
+            in {"packed_prefix", "packed_prefill", "prefill_packed"}
+            and bool(getattr(self, "resident_decode_metadata", False))
+            and bool(getattr(batch, "uses_static_decode_metadata", False))
+            and hasattr(self, "_resident_block_tables")
+            and hasattr(self, "_resident_seq_lens")
+            and hasattr(self, "_resident_last_tokens")
+        )
 
         def _none_or_strict_error(reason: str) -> None:
             if strict_k_verifier:
@@ -7467,10 +7644,11 @@ class CanonicalModelRunner:
             return start
 
         t_profile = time.perf_counter()
-        batch = self._maybe_apply_device_token_carry(batch)
-        t_profile = _mark("apply_device_token_carry", t_profile)
-        batch = self._materialize_static_decode_metadata_batch(batch)
-        t_profile = _mark("materialize_static_decode_metadata", t_profile)
+        if not use_static_resident_packed_inputs:
+            batch = self._maybe_apply_device_token_carry(batch)
+            t_profile = _mark("apply_device_token_carry", t_profile)
+            batch = self._materialize_static_decode_metadata_batch(batch)
+            t_profile = _mark("materialize_static_decode_metadata", t_profile)
         mtp_max_active_rows = int(
             getattr(
                 self,
@@ -7556,6 +7734,12 @@ class CanonicalModelRunner:
         if draft_len < 1:
             return {}
         emit_bonus = True
+        fixed_width_packed_verifier = bool(
+            strict_k_verifier
+            and str(getattr(self, "mtp_verifier_impl", "") or "").lower()
+            in {"packed_prefix", "packed_prefill", "prefill_packed"}
+            and os.environ.get("NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE", "").strip()
+        )
         if strict_k_verifier and draft_len > 1:
             remaining_tokens = [
                 max(0, int(seq.max_tokens - seq.num_completion_tokens))
@@ -7567,13 +7751,21 @@ class CanonicalModelRunner:
             bonus_boundary_no_bonus = any(
                 (seq.num_tokens + draft_len + 1) % self.block_size == 0
                 for seq in mtp_seqs
-            )
+            ) and not fixed_width_packed_verifier
             if min_remaining_tokens < draft_len + 1 or bonus_boundary_no_bonus:
-                draft_len = min(draft_len, min_remaining_tokens)
+                if not fixed_width_packed_verifier:
+                    draft_len = min(draft_len, min_remaining_tokens)
                 emit_bonus = False
             if draft_len < 1:
                 return {}
-            if any(remaining < draft_len + (1 if emit_bonus else 0) for remaining in remaining_tokens):
+            if any(
+                remaining < draft_len + (1 if emit_bonus else 0)
+                for remaining in remaining_tokens
+            ) and not (
+                fixed_width_packed_verifier
+                and not emit_bonus
+                and all(remaining > 0 for remaining in remaining_tokens)
+            ):
                 return _none_or_strict_error(
                     "MTP verifier would exceed remaining max-token budget"
                 )
@@ -7667,6 +7859,12 @@ class CanonicalModelRunner:
             decode_batch = self._compact_decode_batch(batch, rows)
         elif rows == list(range(physical_batch_size)):
             decode_batch = batch
+        elif use_static_resident_packed_inputs:
+            # The packed table verifier gathers token/paging/state inputs by
+            # resident slot. Keep the physical static batch and mask only the
+            # slot IDs below; rebuilding a masked JAX batch here creates a
+            # shape-polymorphic host boundary as acceptance desynchronizes.
+            decode_batch = batch
         else:
             decode_batch = self._masked_decode_batch(batch, rows)
         t_profile = _mark("decode_batch_setup", t_profile)
@@ -7722,7 +7920,12 @@ class CanonicalModelRunner:
             if verifier_draft_token_chains_device is None:
                 dense_tokens = None
                 dense_refs = draft_len > 0
-                for idx, chain in enumerate(draft_token_chains_for_batch):
+                # Inactive physical rows are masked by hybrid slot ID inside
+                # the resident verifier. Validate only active rows so a tail
+                # can keep reusing the dense [physical_batch, K] draft tensor
+                # instead of rebuilding it with out-of-JIT scatters.
+                for idx in verifier_index_for_local:
+                    chain = draft_token_chains_for_batch[idx]
                     for pos, token in enumerate(chain[:draft_len]):
                         if not isinstance(token, DeviceTokenRef):
                             dense_refs = False
@@ -7738,10 +7941,14 @@ class CanonicalModelRunner:
                     if not dense_refs:
                         break
                 if dense_refs and dense_tokens is not None:
-                    dense_values = jnp.asarray(dense_tokens, dtype=jnp.int32).reshape(
-                        -1,
+                    dense_values = jnp.asarray(dense_tokens, dtype=jnp.int32)
+                    if tuple(dense_values.shape) == (
+                        verifier_physical_batch_size,
                         draft_len,
-                    )
+                    ):
+                        verifier_draft_token_chains_device = dense_values
+                        return verifier_draft_token_chains_device
+                    dense_values = dense_values.reshape(-1, draft_len)
                     if int(dense_values.shape[0]) >= verifier_physical_batch_size:
                         verifier_draft_token_chains_device = dense_values[
                             :verifier_physical_batch_size,
@@ -8022,6 +8229,32 @@ class CanonicalModelRunner:
             or use_packed_prefix_table_verifier
         ):
             hybrid_slot_ids = self._batch_hybrid_slot_ids(decode_batch)
+            if use_static_resident_packed_inputs and partial_physical_batch:
+                active_row_set = set(int(row) for row in rows)
+                masked_slot_values = tuple(
+                    int(slot) if row in active_row_set else -1
+                    for row, slot in enumerate(decode_batch.hybrid_slot_ids_host or ())
+                )
+                decode_batch.hybrid_slot_ids_host = masked_slot_values
+                if hasattr(self, "_resident_update_slots_device"):
+                    hybrid_slot_ids = self._resident_update_slots_device(
+                        masked_slot_values
+                    )
+                else:
+                    hybrid_slot_ids = jnp.asarray(masked_slot_values, dtype=jnp.int32)
+            if (
+                use_packed_prefix_table_verifier
+                and hasattr(self, "_sync_resident_decode_metadata")
+                and decode_batch.hybrid_slot_ids_host is not None
+                and hasattr(self, "_resident_block_tables")
+                and hasattr(self, "_resident_seq_lens")
+                and hasattr(self, "_resident_last_tokens")
+            ):
+                self._sync_resident_decode_metadata(
+                    decode_batch,
+                    list(decode_batch.hybrid_slot_ids_host),
+                    sync_seq_lens=False,
+                )
             _ready(hybrid_slot_ids)
             t_profile = _mark("batch_hybrid_slot_ids", t_profile)
         else:
@@ -8276,6 +8509,17 @@ class CanonicalModelRunner:
                     "packed-prefix table verifier does not support layerwise "
                     "drift debug; run a diagnostic verifier route explicitly"
                 )
+            resident_packed_kwargs = {}
+            if (
+                hasattr(self, "_resident_block_tables")
+                and hasattr(self, "_resident_seq_lens")
+                and hasattr(self, "_resident_last_tokens")
+            ):
+                resident_packed_kwargs = {
+                    "resident_block_tables": self._resident_block_tables,
+                    "resident_seq_lens": self._resident_seq_lens,
+                    "resident_last_tokens": self._resident_last_tokens,
+                }
             output = self.executor.mtp_k_packed_prefix_table_greedy_step_jit(
                 decode_batch,
                 cache_storage=self.cache_storage,
@@ -8283,13 +8527,17 @@ class CanonicalModelRunner:
                 hybrid_state_table=self._hybrid_state_table,
                 hybrid_slot_ids=hybrid_slot_ids,
                 draft_tokens=_verifier_draft_token_chains_device(),
-                next_mtp_position=_next_mtp_positions_device(),
+                next_mtp_position=(
+                    decode_batch.seq_lens
+                    if resident_packed_kwargs
+                    else _next_mtp_positions_device()
+                ),
                 mtp_hidden_final_normed=getattr(self, "mtp_hidden_source", "final_normed") == "final_normed",
                 mtp_chain_return_normed=getattr(self, "mtp_chain_hidden_source", "raw") == "final_normed",
                 mtp_chain_mode=getattr(self, "mtp_chain_mode", "recursive"),
                 burst_groups=packed_prefix_burst_groups,
                 emit_bonus=emit_bonus,
-                resident_seq_lens=self._resident_seq_lens,
+                **resident_packed_kwargs,
             )
             _ready(output)
             t_profile = _mark("executor_mtp_k_packed_prefix_table", t_profile)
@@ -8602,9 +8850,17 @@ class CanonicalModelRunner:
             self.cache_storage = output.cache_storage
             if output.mtp_cache_storage is not None:
                 self.mtp_cache_storage = output.mtp_cache_storage
-            committed_batch = self._with_committed_seq_lens(
-                decode_batch,
-                output.committed_seq_lens,
+            resident_tables_committed = (
+                bool(getattr(output, "hybrid_state_is_table", False))
+                and getattr(output, "resident_seq_lens", None) is not None
+            )
+            committed_batch = (
+                replace(decode_batch, seq_lens=output.committed_seq_lens)
+                if resident_tables_committed
+                else self._with_committed_seq_lens(
+                    decode_batch,
+                    output.committed_seq_lens,
+                )
             )
             if k_parity_output is not None:
                 (
@@ -8818,7 +9074,9 @@ class CanonicalModelRunner:
                 ]
                 layer_rows = []
                 first_idx = None
-                for layer_idx, layer_type in enumerate(self.config.layer_types):
+                for layer_idx, layer_type in enumerate(
+                    self.config.layer_types[: len(hidden_vals)]
+                ):
                     score = max(
                         hidden_vals[layer_idx],
                         k_vals[layer_idx],
@@ -8872,6 +9130,11 @@ class CanonicalModelRunner:
                 self._resident_seq_lens = output.resident_seq_lens
             else:
                 self._record_resident_committed_seq_lens(committed_batch)
+            resident_last_tokens_committed = (
+                getattr(output, "resident_last_tokens", None) is not None
+            )
+            if resident_last_tokens_committed:
+                self._resident_last_tokens = output.resident_last_tokens
             if getattr(output, "hybrid_state_is_table", False):
                 self._hybrid_state_table = output.hybrid_state
                 self._mark_hybrid_slots_written(list(decode_batch.hybrid_slot_ids_host or ()))
@@ -8883,10 +9146,8 @@ class CanonicalModelRunner:
             t_profile = _mark("record_resident_burst_kv_snapshot", t_profile)
 
             emitted_width = resident_burst_groups * (draft_len + 1)
-            emitted_tokens = output.emitted_tokens.astype(jnp.int32).reshape(
-                (verifier_physical_batch_size, emitted_width)
-            )
-            next_draft_tokens = output.next_draft_token.astype(jnp.int32)
+            emitted_tokens = output.emitted_tokens
+            next_draft_tokens = output.next_draft_token
 
             compact_burst_output = (
                 draft_len == 1
@@ -8948,6 +9209,7 @@ class CanonicalModelRunner:
             future_draft_top_ids_dbg = None
             future_draft_top_values_dbg = None
             if getattr(output, "debug_payload", None) is not None:
+                debug_payload_host = jax.device_get(output.debug_payload)
                 (
                     draft_top_ids_dbg,
                     draft_top_values_dbg,
@@ -8955,7 +9217,12 @@ class CanonicalModelRunner:
                     verifier_top_values_dbg,
                     draft_tokens_dbg,
                     target_tokens_dbg,
-                ) = jax.device_get(output.debug_payload)
+                ) = debug_payload_host[:6]
+                distribution_debug_host = (
+                    debug_payload_host[6:]
+                    if len(debug_payload_host) > 6
+                    else None
+                )
                 future_draft_top_ids_dbg = draft_top_ids_dbg
                 future_draft_top_values_dbg = draft_top_values_dbg
                 seed_debug_by_seq, debug_events = self._mtp1_debug_state()
@@ -8997,6 +9264,10 @@ class CanonicalModelRunner:
                                     "seq_id": seq_id,
                                     "row": int(row),
                                     "verifier_row": int(verifier_idx),
+                                    "seq_tokens": int(seqs[row].num_tokens),
+                                    "completion_tokens": int(
+                                        seqs[row].num_completion_tokens
+                                    ),
                                     "burst_group": int(group_idx),
                                     "draft_position": int(draft_pos),
                                     "draft_token": draft_token_dbg,
@@ -9023,6 +9294,105 @@ class CanonicalModelRunner:
                                     },
                                 }
                             )
+                        if distribution_debug_host is not None:
+                            (
+                                reference_top_ids_dbg,
+                                reference_top_values_dbg,
+                                reference_kl_dbg,
+                                test_kl_dbg,
+                                js_divergence_dbg,
+                                reference_margin_dbg,
+                                test_margin_dbg,
+                                top1_equal_dbg,
+                            ) = distribution_debug_host
+                            verify_width_dbg = int(reference_kl_dbg.shape[2])
+                            for verify_pos in range(verify_width_dbg):
+                                test_top_ids = []
+                                test_top_values = []
+                                if verify_pos < draft_len:
+                                    test_top_ids = [
+                                        int(value)
+                                        for value in verifier_top_ids_dbg[
+                                            verifier_idx, group_idx, verify_pos
+                                        ].tolist()
+                                    ]
+                                    test_top_values = [
+                                        float(value)
+                                        for value in verifier_top_values_dbg[
+                                            verifier_idx, group_idx, verify_pos
+                                        ].tolist()
+                                    ]
+                                debug_events.append(
+                                    {
+                                        "kind": "mtp_target_distribution_debug",
+                                        "seq_id": seq_id,
+                                        "row": int(row),
+                                        "verifier_row": int(verifier_idx),
+                                        "seq_tokens": int(seqs[row].num_tokens),
+                                        "completion_tokens": int(
+                                            seqs[row].num_completion_tokens
+                                        ),
+                                        "burst_group": int(group_idx),
+                                        "verify_position": int(verify_pos),
+                                        "token_role": (
+                                            "draft"
+                                            if verify_pos < draft_len
+                                            else "bonus"
+                                        ),
+                                        "reference_kl_nats": float(
+                                            reference_kl_dbg[
+                                                verifier_idx, group_idx, verify_pos
+                                            ]
+                                        ),
+                                        "test_kl_nats": float(
+                                            test_kl_dbg[
+                                                verifier_idx, group_idx, verify_pos
+                                            ]
+                                        ),
+                                        "js_divergence_nats": float(
+                                            js_divergence_dbg[
+                                                verifier_idx, group_idx, verify_pos
+                                            ]
+                                        ),
+                                        "reference_top1_margin": float(
+                                            reference_margin_dbg[
+                                                verifier_idx, group_idx, verify_pos
+                                            ]
+                                        ),
+                                        "test_top1_margin": float(
+                                            test_margin_dbg[
+                                                verifier_idx, group_idx, verify_pos
+                                            ]
+                                        ),
+                                        "top1_equal": bool(
+                                            top1_equal_dbg[
+                                                verifier_idx, group_idx, verify_pos
+                                            ]
+                                        ),
+                                        "reference_top": {
+                                            "ids": [
+                                                int(value)
+                                                for value in reference_top_ids_dbg[
+                                                    verifier_idx,
+                                                    group_idx,
+                                                    verify_pos,
+                                                ].tolist()
+                                            ],
+                                            "values": [
+                                                float(value)
+                                                for value in reference_top_values_dbg[
+                                                    verifier_idx,
+                                                    group_idx,
+                                                    verify_pos,
+                                                ].tolist()
+                                            ],
+                                        },
+                                        "test_top": {
+                                            "ids": test_top_ids,
+                                            "values": test_top_values,
+                                        },
+                                    }
+                                )
 
             outputs: dict[int, List[int] | int] = {}
             stats = self._speculative_stats()
@@ -9218,13 +9588,33 @@ class CanonicalModelRunner:
                     for local_row, row in enumerate(rows)
                     if row in outputs
                 }
-                self._record_mtp_output_token_carry(
-                    committed_batch,
-                    compact_seqs,
-                    compact_outputs,
-                )
+                if resident_last_tokens_committed:
+                    self._record_mtp_output_token_carry(
+                        committed_batch,
+                        compact_seqs,
+                        compact_outputs,
+                        update_resident_tokens=False,
+                    )
+                else:
+                    self._record_mtp_output_token_carry(
+                        committed_batch,
+                        compact_seqs,
+                        compact_outputs,
+                    )
             else:
-                self._record_mtp_output_token_carry(committed_batch, seqs, outputs)
+                if resident_last_tokens_committed:
+                    self._record_mtp_output_token_carry(
+                        committed_batch,
+                        seqs,
+                        outputs,
+                        update_resident_tokens=False,
+                    )
+                else:
+                    self._record_mtp_output_token_carry(
+                        committed_batch,
+                        seqs,
+                        outputs,
+                    )
             self._mtp_carry_recorded_this_call = True
             t_profile = _mark("resident_burst_commit", t_profile)
             return outputs
@@ -9475,7 +9865,9 @@ class CanonicalModelRunner:
             stage_names = ["entry", "in_norm", "attn", "attn_resid", "ffn_norm", "mlp", "out"]
             layer_rows = []
             first_idx = None
-            for layer_idx, layer_type in enumerate(self.config.layer_types):
+            for layer_idx, layer_type in enumerate(
+                self.config.layer_types[: len(hidden_vals)]
+            ):
                 score = max(
                     hidden_vals[layer_idx],
                     k_vals[layer_idx],
@@ -10093,6 +10485,21 @@ class CanonicalModelRunner:
             ) in {"1", "true", "yes", "on", "True"}
             verifier_impl = str(getattr(self, "mtp_verifier_impl", "two_decode") or "two_decode")
             strict_k_verifier = self._strict_k_mtp_verifier_enabled()
+            fixed_width_packed_verifier = (
+                strict_k_verifier
+                and verifier_impl in {"packed_prefix", "packed_prefill", "prefill_packed"}
+                and bool(
+                    os.environ.get(
+                        "NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE",
+                        "",
+                    ).strip()
+                )
+            )
+            fixed_k_no_bonus_tail = os.environ.get(
+                "NANO_VLLM_JAX_MTP_FIXED_K_NO_BONUS_TAIL",
+                "1",
+            ) in {"1", "true", "yes", "on", "True"}
+            fixed_width_tail_gated_rows: set[int] = set()
             row_draft_lens: Dict[int, int] = {}
             for row, seq in enumerate(seqs):
                 query_len = (
@@ -10109,8 +10516,21 @@ class CanonicalModelRunner:
                 # written to KV until the next decode step, so requiring block
                 # capacity for it here creates avoidable boundary fallbacks.
                 remaining_tokens = max(0, int(seq.max_tokens - seq.num_completion_tokens))
+                fixed_width_capped_tail = (
+                    fixed_width_packed_verifier
+                    and fixed_k_no_bonus_tail
+                    and draft_len > 1
+                    and 0 < remaining_tokens < draft_len + 1
+                )
+                fixed_width_disabled_tail = (
+                    fixed_width_packed_verifier
+                    and not fixed_k_no_bonus_tail
+                    and draft_len > 1
+                    and 0 < remaining_tokens < draft_len + 1
+                )
                 tail_no_bonus = (
                     strict_k_verifier
+                    and not fixed_width_packed_verifier
                     and draft_len > 1
                     and remaining_tokens > 0
                     and (
@@ -10127,8 +10547,21 @@ class CanonicalModelRunner:
                     min(draft_len, remaining_tokens) if tail_no_bonus else draft_len,
                 )
                 required_blocks = (seq.num_tokens + verifier_width + self.block_size - 1) // self.block_size
+                if (
+                    fixed_width_disabled_tail
+                    or (
+                        fixed_width_capped_tail
+                        and len(seq.block_table) < required_blocks
+                    )
+                ):
+                    # The request can finish with ordinary target steps.  Gate
+                    # it when fixed-K verification would write beyond the
+                    # scheduler-owned final block, or when a RAM-constrained
+                    # diagnostic explicitly omits the no-bonus executable.
+                    fixed_width_tail_gated_rows.add(row)
                 unsafe_bonus_boundary = (
                     not relax_bonus_boundary
+                    and not fixed_width_packed_verifier
                     and not tail_no_bonus
                     and (seq.num_tokens + verifier_width + 1) % self.block_size == 0
                 )
@@ -10140,6 +10573,7 @@ class CanonicalModelRunner:
                     and (
                         seq.num_completion_tokens + draft_len + 1 <= seq.max_tokens
                         or tail_no_bonus
+                        or fixed_width_capped_tail
                     )
                     and query_len == 1
                     and len(seq.block_table) >= required_blocks
@@ -10196,13 +10630,21 @@ class CanonicalModelRunner:
                         reason = "other"
                     not_fused_reasons[reason] = not_fused_reasons.get(reason, 0) + 1
 
+            if fixed_width_tail_gated_rows:
+                self._clear_mtp1_drafts_for_rows(
+                    seqs,
+                    sorted(fixed_width_tail_gated_rows),
+                )
+
             strict_k_draft_rows = [
                 row
                 for row in admitted_mtp_rows
                 if row_draft_lens.get(row, 0) > 1
+                and row not in fixed_width_tail_gated_rows
                 and max(0, seqs[row].max_tokens - seqs[row].num_completion_tokens) > 0
                 and not (
                     not relax_bonus_boundary
+                    and not fixed_width_packed_verifier
                     and max(0, seqs[row].max_tokens - seqs[row].num_completion_tokens)
                     >= row_draft_lens[row] + 1
                     and (
@@ -10224,6 +10666,8 @@ class CanonicalModelRunner:
                     if row < 0 or row >= len(seqs):
                         continue
                     if row_draft_lens.get(row, 0) > 0:
+                        continue
+                    if row in fixed_width_tail_gated_rows:
                         continue
                     seq = seqs[row]
                     query_len = (
@@ -10551,12 +10995,32 @@ class CanonicalModelRunner:
                                     unresolved_rows = next_unresolved
                         if unresolved_rows:
                             stats["fallback_gated_no_spec_steps"] += 1
-                            fallback_batch = self._masked_decode_batch(batch, unresolved_rows)
-                            fallback_outputs = self._run_main_and_sample(
-                                seqs,
-                                fallback_batch,
-                                seed_mtp1=False,
+                            resident_compact_fallback = (
+                                self._can_run_static_resident_target_rows(batch)
                             )
+                            fallback_started = time.perf_counter()
+                            fallback_outputs = (
+                                self._run_static_resident_target_rows(
+                                    seqs,
+                                    batch,
+                                    unresolved_rows,
+                                )
+                                if resident_compact_fallback
+                                else self._run_main_and_sample(
+                                    seqs,
+                                    self._masked_decode_batch(batch, unresolved_rows),
+                                    seed_mtp1=False,
+                                )
+                            )
+                            if profile_mtp:
+                                _block_until_ready_tree(fallback_outputs)
+                                print(
+                                    "[MTP_RUN] gated_target_decode="
+                                    f"{(time.perf_counter() - fallback_started) * 1000:.3f}ms "
+                                    f"rows={unresolved_rows} "
+                                    f"resident_compact={resident_compact_fallback}",
+                                    flush=True,
+                                )
                             for row in unresolved_rows:
                                 outputs[row] = fallback_outputs[row]
                     if not getattr(self, "_mtp_carry_recorded_this_call", False):
@@ -10677,6 +11141,31 @@ class CanonicalModelRunner:
                     return fused_seed_outputs
             elif self.mtp1_enabled and not batch.is_prefill:
                 stats["fallback_gated_no_spec_steps"] += 1
+            resident_target_rows = [
+                row
+                for row in self._active_decode_rows_host(batch)
+                if row < len(seqs)
+            ]
+            if (
+                not main_seed_mtp1
+                and resident_target_rows
+                and self._can_run_static_resident_target_rows(batch)
+            ):
+                fallback_started = time.perf_counter()
+                outputs = self._run_static_resident_target_rows(
+                    seqs,
+                    batch,
+                    resident_target_rows,
+                )
+                if profile_mtp:
+                    _block_until_ready_tree(outputs)
+                    print(
+                        "[MTP_RUN] gated_target_decode="
+                        f"{(time.perf_counter() - fallback_started) * 1000:.3f}ms "
+                        f"rows={resident_target_rows} resident_compact=True",
+                        flush=True,
+                    )
+                return outputs
             return self._run_main_and_sample(
                 seqs,
                 batch,
@@ -10685,6 +11174,20 @@ class CanonicalModelRunner:
 
         if self.mtp1_enabled and not batch.is_prefill and not admitted_mtp_rows:
             self._speculative_stats()["fallback_gated_no_spec_steps"] += 1
+            resident_target_rows = [
+                row
+                for row in self._active_decode_rows_host(batch)
+                if row < len(seqs)
+            ]
+            if (
+                resident_target_rows
+                and self._can_run_static_resident_target_rows(batch)
+            ):
+                return self._run_static_resident_target_rows(
+                    seqs,
+                    batch,
+                    resident_target_rows,
+                )
         return self._run_main_and_sample(
             seqs,
             batch,

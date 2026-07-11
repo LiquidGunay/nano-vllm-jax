@@ -25,6 +25,9 @@ _BATCH_DECODE_TARGET_PREFIX = "nanovllm_jax_flashinfer_batch_decode_jax_plan"
 _BATCH_DECODE_FUSED_APPEND_TARGET_PREFIX = (
     "nanovllm_jax_flashinfer_batch_decode_fused_append_jax_plan"
 )
+_BATCH_DECODE_DENSE_DIRECT_TARGET_PREFIX = (
+    "nanovllm_jax_flashinfer_batch_decode_dense_direct_jax_plan"
+)
 _NHD_LAYOUT = 0
 _SUPPORTED_KV_APPEND_DTYPES = (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
 _SUPPORTED_BATCH_DECODE_DTYPES = (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
@@ -33,6 +36,7 @@ _APPEND_PAGED_KV_CACHE_REGISTERED = False
 _RADIX_TOPK_REGISTERED = False
 _BATCH_DECODE_TARGETS: dict[tuple[str, int], str] = {}
 _BATCH_DECODE_FUSED_APPEND_TARGETS: dict[tuple[str, int], str] = {}
+_BATCH_DECODE_DENSE_DIRECT_TARGETS: dict[tuple[str, int], str] = {}
 _BATCH_DECODE_MODULES: dict[tuple[str, int], Any] = {}
 _BATCH_DECODE_PLANS: dict[
     tuple[str, int, int, int, int, int, int],
@@ -298,6 +302,43 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
 
 using namespace flashinfer;
 
+__global__ void CompactDensePageTableForDirectDecode(
+    const int32_t* block_tables,
+    const int32_t* seq_lens,
+    int32_t* kv_indices,
+    int32_t* kv_indptr,
+    int32_t* kv_last_page_len,
+    int32_t batch_size,
+    int32_t max_pages,
+    int32_t page_size,
+    int64_t block_table_row_stride) {{
+  if (blockIdx.x != 0) return;
+  if (threadIdx.x == 0) {{
+    int32_t running = 0;
+    kv_indptr[0] = 0;
+    for (int32_t row = 0; row < batch_size; ++row) {{
+      const int32_t seq_len = max(seq_lens[row], 0);
+      const int32_t page_count = min((seq_len + page_size - 1) / page_size, max_pages);
+      running += page_count;
+      kv_indptr[row + 1] = running;
+      kv_last_page_len[row] =
+          seq_len > 0 ? ((seq_len - 1) % page_size) + 1 : 0;
+    }}
+  }}
+  __syncthreads();
+
+  const int32_t capacity = batch_size * max_pages;
+  for (int32_t flat = threadIdx.x; flat < capacity; flat += blockDim.x) {{
+    const int32_t row = flat / max_pages;
+    const int32_t page_offset = flat - row * max_pages;
+    const int32_t page_count = kv_indptr[row + 1] - kv_indptr[row];
+    if (page_offset < page_count) {{
+      kv_indices[kv_indptr[row] + page_offset] =
+          block_tables[row * block_table_row_stride + page_offset];
+    }}
+  }}
+}}
+
 void BatchDecodeWithPagedKVCacheFusedAppendJaxPlan(
     TensorView float_workspace_buffer,
     TensorView int_workspace_buffer,
@@ -455,6 +496,150 @@ void BatchDecodeWithPagedKVCacheFusedAppendJaxPlan(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_jax_plan_fused_append,
                               BatchDecodeWithPagedKVCacheFusedAppendJaxPlan);
+
+void BatchDecodeWithDensePagedKVCacheDirectJaxPlan(
+    TensorView float_workspace_buffer,
+    TensorView int_workspace_buffer,
+    TensorView q,
+    TensorView paged_k_cache,
+    TensorView paged_v_cache,
+    TensorView block_tables,
+    TensorView seq_lens,
+    {plan_args},
+    TensorView o,
+    TensorView lse,
+    int64_t kv_indices_offset,
+    int64_t kv_indptr_offset,
+    int64_t kv_last_page_len_offset,
+    int64_t kv_layout_code,
+    int64_t window_left,
+    bool enable_pdl ADDITIONAL_FUNC_PARAMS) {{
+  CHECK_INPUT_TYPE(block_tables, dl_int32);
+  CHECK_INPUT_TYPE(seq_lens, dl_int32);
+  CHECK_DIM(3, q);
+  CHECK_DIM(4, paged_k_cache);
+  CHECK_DIM(4, paged_v_cache);
+  CHECK_DIM(2, block_tables);
+  CHECK_DIM(1, seq_lens);
+
+  std::vector<int64_t> plan_vec = {{{plan_values}}};
+  DecodePlanInfo plan_info;
+  plan_info.FromVector(plan_vec);
+  TVM_FFI_ICHECK(!plan_info.split_kv)
+      << "dense direct decode requires a non-split plan";
+
+  QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
+  int64_t batch_size = q.size(0);
+  int64_t num_qo_heads = q.size(1);
+  int64_t max_pages = block_tables.size(1);
+  TVM_FFI_ICHECK_EQ(block_tables.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(seq_lens.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(paged_v_cache.size(0), paged_k_cache.size(0));
+  TVM_FFI_ICHECK_EQ(paged_v_cache.size(1), paged_k_cache.size(1));
+  TVM_FFI_ICHECK_EQ(paged_v_cache.size(2), paged_k_cache.size(2));
+  TVM_FFI_ICHECK_EQ(paged_v_cache.size(3), paged_k_cache.size(3));
+
+  int64_t num_kv_heads, page_size;
+  if (kv_layout == QKVLayout::kHND) {{
+    num_kv_heads = paged_k_cache.size(1);
+    page_size = paged_k_cache.size(2);
+  }} else {{
+    page_size = paged_k_cache.size(1);
+    num_kv_heads = paged_k_cache.size(2);
+  }}
+  uint32_t head_dim_qk = q.size(2);
+  uint32_t head_dim_vo = paged_v_cache.size(3);
+  TVM_FFI_ICHECK_EQ(head_dim_qk, head_dim_vo);
+  TVM_FFI_ICHECK_EQ(lse.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(lse.size(1), num_qo_heads);
+
+  auto k_strides = paged_k_cache.strides();
+  auto v_strides = paged_v_cache.strides();
+  TVM_FFI_ICHECK_EQ(k_strides.size(), 4);
+  TVM_FFI_ICHECK_EQ(v_strides.size(), 4);
+  for (int i = 0; i < 4; ++i) {{
+    TVM_FFI_ICHECK_EQ(k_strides[i], v_strides[i]);
+  }}
+  auto block_table_strides = block_tables.strides();
+
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
+  const cudaStream_t stream = get_stream(q.device());
+  void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
+  void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
+  int32_t* kv_indices =
+      GetPtrFromBaseOffset<int32_t>(int_buffer, kv_indices_offset);
+  int32_t* kv_indptr =
+      GetPtrFromBaseOffset<int32_t>(int_buffer, kv_indptr_offset);
+  int32_t* kv_last_page_len =
+      GetPtrFromBaseOffset<int32_t>(int_buffer, kv_last_page_len_offset);
+
+  CompactDensePageTableForDirectDecode<<<1, 256, 0, stream>>>(
+      static_cast<int32_t*>(block_tables.data_ptr()),
+      static_cast<int32_t*>(seq_lens.data_ptr()),
+      kv_indices,
+      kv_indptr,
+      kv_last_page_len,
+      batch_size,
+      max_pages,
+      page_size,
+      block_table_strides[0]);
+  cudaError_t compact_status = cudaGetLastError();
+  TVM_FFI_ICHECK(compact_status == cudaSuccess)
+      << "dense page-table compaction failed with error "
+      << cudaGetErrorString(compact_status);
+
+  paged_kv_t<DTypeKV, IdType> paged_kv(
+      num_kv_heads,
+      page_size,
+      head_dim_qk,
+      batch_size,
+      kv_layout,
+      static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
+      static_cast<DTypeKV*>(paged_v_cache.data_ptr()),
+      k_strides.data(),
+      kv_indices,
+      kv_indptr,
+      kv_last_page_len);
+  auto q_strides = q.strides();
+
+  DISPATCH_context(
+      DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+      USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {{
+        Params params;
+        params.q = static_cast<DTypeQ*>(q.data_ptr());
+        params.paged_kv = paged_kv;
+        params.o = static_cast<DTypeO*>(o.data_ptr());
+        params.lse = static_cast<float*>(lse.data_ptr());
+        params.padded_batch_size = plan_info.padded_batch_size;
+        params.num_qo_heads = num_qo_heads;
+        params.q_stride_n = q_strides[0];
+        params.q_stride_h = q_strides[1];
+        params.window_left = window_left;
+        params.request_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.request_indices_offset);
+        params.kv_tile_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.kv_tile_indices_offset);
+        params.o_indptr =
+            GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.o_indptr_offset);
+        params.kv_chunk_size_ptr =
+            GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.kv_chunk_size_ptr_offset);
+        params.block_valid_mask = nullptr;
+        params.partition_kv = false;
+        ADDITIONAL_PARAMS_SETTER
+
+        cudaError_t status =
+            flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM_QK, POS_ENCODING_MODE,
+                                                              AttentionVariant>(
+                params, nullptr, nullptr, enable_pdl, stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "BatchDecodeWithPagedKVCache failed with error "
+            << cudaGetErrorString(status);
+        return true;
+      }});
+}}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_jax_plan_dense_direct,
+                              BatchDecodeWithDensePagedKVCacheDirectJaxPlan);
 """
     write_if_different(path, source)
 
@@ -513,6 +698,9 @@ def _register_batch_decode(dtype: jnp.dtype, head_dim: int) -> str:
         fused_target = (
             f"{_BATCH_DECODE_FUSED_APPEND_TARGET_PREFIX}_{dtype_key}_hd{int(head_dim)}"
         )
+        dense_direct_target = (
+            f"{_BATCH_DECODE_DENSE_DIRECT_TARGET_PREFIX}_{dtype_key}_hd{int(head_dim)}"
+        )
         register_ffi_target(
             target,
             module.run_jax_plan,
@@ -555,9 +743,34 @@ def _register_batch_decode(dtype: jnp.dtype, head_dim: int) -> str:
             platform="gpu",
             allow_cuda_graph=True,
         )
+        register_ffi_target(
+            dense_direct_target,
+            module.run_jax_plan_dense_direct,
+            arg_spec=[
+                "args",
+                *[
+                    f"attrs.plan_{idx}"
+                    for idx in range(_FLASHINFER_BATCH_DECODE_PLAN_FIELDS)
+                ],
+                "rets",
+                "attrs.kv_indices_offset",
+                "attrs.kv_indptr_offset",
+                "attrs.kv_last_page_len_offset",
+                "attrs.kv_layout_code",
+                "attrs.window_left",
+                "attrs.enable_pdl",
+                "attrs.logits_soft_cap",
+                "attrs.sm_scale",
+                "attrs.rope_rcp_scale",
+                "attrs.rope_rcp_theta",
+            ],
+            platform="gpu",
+            allow_cuda_graph=True,
+        )
         _BATCH_DECODE_MODULES[key] = module
         _BATCH_DECODE_TARGETS[key] = target
         _BATCH_DECODE_FUSED_APPEND_TARGETS[key] = fused_target
+        _BATCH_DECODE_DENSE_DIRECT_TARGETS[key] = dense_direct_target
         return target
 
 
@@ -988,6 +1201,132 @@ def _batch_decode_plan_info(
     return result
 
 
+def _batch_decode_direct_plan_info(
+    *,
+    batch: int,
+    page_size: int,
+    max_pages_per_sequence: int,
+) -> tuple[tuple[int, ...], Any, int]:
+    """Build a page-count-independent, non-split FlashInfer decode plan.
+
+    FlashInfer's normal decode planner specializes its scheduler tables to the
+    page counts in the host ``indptr`` used during planning.  That contract is
+    unsuitable for the packed MTP verifier: its compact CSR ``indptr`` changes
+    as the accepted prefix advances while the compiled JAX program must retain
+    one static executable.
+
+    The non-split FlashInfer kernel does not need a page-count-specialized
+    schedule.  It launches one work item per query and reads that query's live
+    length from the runtime ``indptr``/``last_page_len`` pair.  Constructing the
+    four tiny scheduler arrays directly therefore gives the rectangular target
+    verifier a static, device-owned plan without re-planning or host decisions.
+    """
+
+    if batch <= 0:
+        raise ValueError("batch must be positive")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+    if max_pages_per_sequence <= 0:
+        raise ValueError("max_pages_per_sequence must be positive")
+
+    import numpy as np
+
+    def _aligned_offset(offset: int, alignment: int) -> int:
+        return ((offset + alignment - 1) // alignment) * alignment
+
+    offset = 0
+    request_indices_offset = _aligned_offset(offset, 16)
+    offset = request_indices_offset + batch * np.dtype(np.int32).itemsize
+    kv_tile_indices_offset = _aligned_offset(offset, 16)
+    offset = kv_tile_indices_offset + batch * np.dtype(np.int32).itemsize
+    o_indptr_offset = _aligned_offset(offset, 16)
+    offset = o_indptr_offset + (batch + 1) * np.dtype(np.int32).itemsize
+    kv_chunk_size_ptr_offset = _aligned_offset(offset, 1)
+    offset = kv_chunk_size_ptr_offset + np.dtype(np.int32).itemsize
+
+    int_workspace = np.zeros((offset,), dtype=np.uint8)
+    np.frombuffer(
+        int_workspace,
+        dtype=np.int32,
+        count=batch,
+        offset=request_indices_offset,
+    )[:] = np.arange(batch, dtype=np.int32)
+    np.frombuffer(
+        int_workspace,
+        dtype=np.int32,
+        count=batch,
+        offset=kv_tile_indices_offset,
+    )[:] = 0
+    np.frombuffer(
+        int_workspace,
+        dtype=np.int32,
+        count=batch + 1,
+        offset=o_indptr_offset,
+    )[:] = np.arange(batch + 1, dtype=np.int32)
+    np.frombuffer(
+        int_workspace,
+        dtype=np.int32,
+        count=1,
+        offset=kv_chunk_size_ptr_offset,
+    )[0] = int(page_size) * int(max_pages_per_sequence)
+
+    plan_info = (
+        int(batch),  # padded_batch_size
+        0,  # v_offset; unused without split-KV
+        0,  # s_offset; unused without split-KV
+        int(request_indices_offset),
+        int(kv_tile_indices_offset),
+        int(o_indptr_offset),
+        0,  # block_valid_mask_offset; CUDA-graph padding is disabled
+        int(kv_chunk_size_ptr_offset),
+        0,  # enable_cuda_graph
+        0,  # split_kv
+    )
+    return plan_info, int_workspace, 1
+
+
+def _batch_decode_dense_direct_plan_info(
+    *,
+    batch: int,
+    page_size: int,
+    max_pages_per_sequence: int,
+) -> tuple[tuple[int, ...], Any, int, tuple[int, int, int]]:
+    """Extend the direct plan workspace with compact runtime page metadata."""
+
+    plan_info, direct_workspace, float_workspace_bytes = (
+        _batch_decode_direct_plan_info(
+            batch=batch,
+            page_size=page_size,
+            max_pages_per_sequence=max_pages_per_sequence,
+        )
+    )
+    import numpy as np
+
+    def _aligned_offset(offset: int, alignment: int) -> int:
+        return ((offset + alignment - 1) // alignment) * alignment
+
+    offset = len(direct_workspace)
+    kv_indices_offset = _aligned_offset(offset, 16)
+    offset = kv_indices_offset + batch * max_pages_per_sequence * np.dtype(np.int32).itemsize
+    kv_indptr_offset = _aligned_offset(offset, 16)
+    offset = kv_indptr_offset + (batch + 1) * np.dtype(np.int32).itemsize
+    kv_last_page_len_offset = _aligned_offset(offset, 16)
+    offset = kv_last_page_len_offset + batch * np.dtype(np.int32).itemsize
+
+    int_workspace = np.zeros((offset,), dtype=np.uint8)
+    int_workspace[: len(direct_workspace)] = direct_workspace
+    return (
+        plan_info,
+        int_workspace,
+        float_workspace_bytes,
+        (
+            int(kv_indices_offset),
+            int(kv_indptr_offset),
+            int(kv_last_page_len_offset),
+        ),
+    )
+
+
 def paged_decode_attention_gqa_nhd(
     query: jnp.ndarray,
     k_cache_layer: jnp.ndarray,
@@ -997,6 +1336,7 @@ def paged_decode_attention_gqa_nhd(
     kv_last_page_len: jnp.ndarray,
     *,
     scale: float,
+    direct_plan: bool = False,
 ) -> jnp.ndarray:
     """Run FlashInfer batch decode attention on an NHD paged KV cache.
 
@@ -1046,15 +1386,30 @@ def paged_decode_attention_gqa_nhd(
     _require_flashinfer_modules()
     target = _register_batch_decode(query.dtype, int(head_dim))
     max_pages_per_sequence = max(1, int(kv_indices.shape[0]) // int(batch))
-    plan_info, planned_int_workspace, planned_float_workspace_nbytes = _batch_decode_plan_info(
-        dtype=query.dtype,
-        batch=int(batch),
-        num_qo_heads=int(num_qo_heads),
-        num_kv_heads=int(num_kv_heads),
-        head_dim=int(head_dim),
-        page_size=int(page_size),
-        max_pages_per_sequence=max_pages_per_sequence,
-    )
+    if direct_plan:
+        (
+            plan_info,
+            planned_int_workspace,
+            planned_float_workspace_nbytes,
+        ) = _batch_decode_direct_plan_info(
+            batch=int(batch),
+            page_size=int(page_size),
+            max_pages_per_sequence=max_pages_per_sequence,
+        )
+    else:
+        (
+            plan_info,
+            planned_int_workspace,
+            planned_float_workspace_nbytes,
+        ) = _batch_decode_plan_info(
+            dtype=query.dtype,
+            batch=int(batch),
+            num_qo_heads=int(num_qo_heads),
+            num_kv_heads=int(num_kv_heads),
+            head_dim=int(head_dim),
+            page_size=int(page_size),
+            max_pages_per_sequence=max_pages_per_sequence,
+        )
     float_workspace = jnp.zeros((planned_float_workspace_nbytes,), dtype=jnp.uint8)
     int_workspace = jnp.asarray(planned_int_workspace, dtype=jnp.uint8)
     call = jax.ffi.ffi_call(
@@ -1075,6 +1430,103 @@ def paged_decode_attention_gqa_nhd(
         kv_indices,
         kv_last_page_len,
         **{f"plan_{idx}": value for idx, value in enumerate(plan_info)},
+        kv_layout_code=_NHD_LAYOUT,
+        window_left=-1,
+        enable_pdl=False,
+        logits_soft_cap=0.0,
+        sm_scale=_static_scale(scale, int(head_dim)),
+        rope_rcp_scale=1.0,
+        rope_rcp_theta=1.0e4,
+    )
+    return out.astype(jnp.float32)
+
+
+def paged_decode_attention_gqa_nhd_dense_direct(
+    query: jnp.ndarray,
+    k_cache_layer: jnp.ndarray,
+    v_cache_layer: jnp.ndarray,
+    block_tables: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    *,
+    scale: float,
+) -> jnp.ndarray:
+    """Run non-split FlashInfer decode from dense tables with device compaction.
+
+    The compact CSR metadata is scratch state internal to the custom call.  XLA
+    therefore sees one fixed attention boundary even though every request's
+    live page count changes during decoding.
+    """
+
+    query = _as_jax_array("query", query)
+    k_cache_layer = _as_jax_array("k_cache_layer", k_cache_layer)
+    v_cache_layer = _as_jax_array("v_cache_layer", v_cache_layer)
+    block_tables = _as_jax_array("block_tables", block_tables).astype(jnp.int32)
+    seq_lens = _as_jax_array("seq_lens", seq_lens).astype(jnp.int32)
+
+    if query.ndim != 3:
+        raise ValueError("query must have shape [batch, num_heads, head_dim]")
+    if k_cache_layer.ndim != 4 or v_cache_layer.shape != k_cache_layer.shape:
+        raise ValueError(
+            "k_cache_layer/v_cache_layer must have NHD shape "
+            "[num_pages, page_size, num_kv_heads, head_dim]"
+        )
+    if query.dtype != k_cache_layer.dtype or v_cache_layer.dtype != k_cache_layer.dtype:
+        raise ValueError("query and KV cache dtypes must match for FlashInfer decode")
+    if query.dtype not in _SUPPORTED_BATCH_DECODE_DTYPES:
+        raise ValueError(
+            "FlashInfer batch decode supports only FP16/BF16 through this JAX FFI route; "
+            f"got {query.dtype}"
+        )
+    batch, num_qo_heads, head_dim = query.shape
+    _num_pages, page_size, num_kv_heads, cache_head_dim = k_cache_layer.shape
+    if cache_head_dim != head_dim:
+        raise ValueError("query/cache head_dim mismatch")
+    if block_tables.ndim != 2 or block_tables.shape[0] != batch:
+        raise ValueError("block_tables must have shape [batch, max_pages_per_sequence]")
+    if seq_lens.shape != (batch,):
+        raise ValueError("seq_lens must have shape [batch]")
+    if block_tables.shape[1] < 1:
+        raise ValueError("block_tables must contain at least one page column")
+    if num_qo_heads % num_kv_heads != 0:
+        raise ValueError("num_qo_heads must be divisible by num_kv_heads")
+
+    _require_flashinfer_modules()
+    _register_batch_decode(query.dtype, int(head_dim))
+    dtype_key = _dtype_key(query.dtype)
+    target = _BATCH_DECODE_DENSE_DIRECT_TARGETS[(dtype_key, int(head_dim))]
+    (
+        plan_info,
+        planned_int_workspace,
+        planned_float_workspace_nbytes,
+        metadata_offsets,
+    ) = _batch_decode_dense_direct_plan_info(
+        batch=int(batch),
+        page_size=int(page_size),
+        max_pages_per_sequence=int(block_tables.shape[1]),
+    )
+    kv_indices_offset, kv_indptr_offset, kv_last_page_len_offset = metadata_offsets
+    float_workspace = jnp.zeros((planned_float_workspace_nbytes,), dtype=jnp.uint8)
+    int_workspace = jnp.asarray(planned_int_workspace, dtype=jnp.uint8)
+    call = jax.ffi.ffi_call(
+        target,
+        (
+            jax.ShapeDtypeStruct(query.shape, query.dtype),
+            jax.ShapeDtypeStruct((batch, num_qo_heads), jnp.float32),
+        ),
+        has_side_effect=True,
+    )
+    out, _lse = call(
+        float_workspace,
+        int_workspace,
+        query,
+        k_cache_layer,
+        v_cache_layer,
+        block_tables,
+        seq_lens,
+        **{f"plan_{idx}": value for idx, value in enumerate(plan_info)},
+        kv_indices_offset=kv_indices_offset,
+        kv_indptr_offset=kv_indptr_offset,
+        kv_last_page_len_offset=kv_last_page_len_offset,
         kv_layout_code=_NHD_LAYOUT,
         window_left=-1,
         enable_pdl=False,

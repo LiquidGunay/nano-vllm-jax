@@ -60,6 +60,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
+    parser.add_argument("--max-num-seqs", type=int, default=0)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=0)
+    parser.add_argument(
+        "--cudagraph-capture-sizes",
+        default="",
+        help="Optional comma-separated CUDA-graph batch sizes for the measured envelope.",
+    )
+    parser.add_argument(
+        "--language-model-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load only the text model for text-only Qwen3.5 benchmarks.",
+    )
+    parser.add_argument(
+        "--skip-mm-profiling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip multimodal encoder-cache profiling for text-only benchmarks.",
+    )
+    parser.add_argument(
+        "--enable-v1-multiprocessing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Control VLLM_ENABLE_V1_MULTIPROCESSING. Disabling it keeps the "
+            "async engine in one process and reduces host-RAM pressure."
+        ),
+    )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true", default=True)
     parser.add_argument("--no-trust-remote-code", dest="trust_remote_code", action="store_false")
@@ -111,6 +139,25 @@ def parse_args() -> argparse.Namespace:
 
 def _parse_ints(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part.strip()]
+
+
+def _bounded_engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """Return optional vLLM capacity knobs for the measured text envelope."""
+    values: dict[str, Any] = {}
+    if int(args.max_num_seqs) > 0:
+        values["max_num_seqs"] = int(args.max_num_seqs)
+    if int(args.max_num_batched_tokens) > 0:
+        values["max_num_batched_tokens"] = int(args.max_num_batched_tokens)
+    capture_sizes = _parse_ints(args.cudagraph_capture_sizes)
+    if capture_sizes:
+        capture_sizes = sorted(set(max(1, int(size)) for size in capture_sizes))
+        values["cudagraph_capture_sizes"] = capture_sizes
+        values["max_cudagraph_capture_size"] = max(capture_sizes)
+    if bool(args.language_model_only):
+        values["language_model_only"] = True
+    if bool(args.skip_mm_profiling):
+        values["skip_mm_profiling"] = True
+    return values
 
 
 def _sha256_file(path: Path) -> str:
@@ -556,6 +603,7 @@ def run_vllm(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         "enforce_eager": bool(args.enforce_eager),
         "disable_log_stats": not bool(args.vllm_log_stats),
     }
+    llm_kwargs.update(_bounded_engine_kwargs(args))
     if speculative_config is not None:
         llm_kwargs["speculative_config"] = speculative_config
 
@@ -702,6 +750,7 @@ async def run_vllm_async(args: argparse.Namespace, recorder: RunRecorder) -> dic
         enforce_eager=bool(args.enforce_eager),
         speculative_config=speculative_config,
         disable_log_stats=not bool(args.vllm_log_stats),
+        **_bounded_engine_kwargs(args),
     )
     load_t0 = time.perf_counter()
     engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -953,6 +1002,9 @@ def compare_reference(summary: dict, reference_json: str) -> dict:
 
 def main() -> None:
     args = parse_args()
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = (
+        "1" if args.enable_v1_multiprocessing else "0"
+    )
     recorder = RunRecorder.create(
         script=Path(__file__).name,
         args=vars(args),

@@ -385,8 +385,9 @@ class Scheduler:
                 available = prefill_token_budget - num_batched_tokens
                 if available <= 0:
                     if from_waiting:
-                        seq.status = SequenceStatus.RUNNING
-                        self.running.append(seq)
+                        self.block_manager.deallocate(seq)
+                        seq.status = SequenceStatus.WAITING
+                        self.waiting.appendleft(seq)
                     else:
                         scheduled_running.append(seq)
                     break
@@ -405,8 +406,9 @@ class Scheduler:
                     and prospective_padded_tokens > self.max_num_batched_tokens
                 ):
                     if from_waiting:
-                        seq.status = SequenceStatus.RUNNING
-                        self.running.append(seq)
+                        self.block_manager.deallocate(seq)
+                        seq.status = SequenceStatus.WAITING
+                        self.waiting.appendleft(seq)
                     else:
                         self.running.appendleft(seq)
                     break
@@ -1106,15 +1108,22 @@ class Scheduler:
         padded_tokens: List[List[int]],
         query_lens_host: tuple[int, ...],
     ) -> bool:
+        has_admitted_mtp = (
+            self.num_speculative_tokens != 0
+            and any(bool(getattr(seq, "mtp_admitted", False)) for seq in seqs)
+        )
+        resident_packed_mtp = (
+            has_admitted_mtp
+            and self.resident_decode_metadata
+            and self.mtp_verifier_impl
+            in {"packed_prefix", "packed_prefill", "prefill_packed"}
+        )
         if (
             is_prefill
             or not self.static_decode_metadata
             or self.jax_execution not in {"decode-jit", "jit"}
             or not self.device_token_carry
-            or (
-                self.num_speculative_tokens != 0
-                and any(bool(getattr(seq, "mtp_admitted", False)) for seq in seqs)
-            )
+            or (has_admitted_mtp and not resident_packed_mtp)
             or query_len_bucket != 1
             or not seqs
         ):

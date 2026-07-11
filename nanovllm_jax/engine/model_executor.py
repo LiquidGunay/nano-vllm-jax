@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +18,8 @@ from nanovllm_jax.kv_cache import AttentionMetadata, HybridLayerState, KVCacheSt
 from nanovllm_jax.layers import rms_norm
 from nanovllm_jax.model import (
     ModelParams,
+    _decode_width1_rms_norm,
+    _force_width1_decode_norms,
     _lm_head_greedy_top1_token_ids,
     forward_step as model_forward_step,
     gdn_decode_recurrent_input_max_abs,
@@ -120,6 +122,7 @@ class MTP1GreedyOutput:
     mtp_cache_storage: Optional[KVCacheStorage] = None
     committed_seq_lens: object | None = None
     resident_seq_lens: object | None = None
+    resident_last_tokens: object | None = None
     host_payload: object | None = None
     emitted_tokens: object | None = None
     emitted_counts: object | None = None
@@ -7052,17 +7055,29 @@ class ModelExecutor:
         if verify_mode not in {"decode", "prefill"}:
             raise ValueError("verify_mode must be 'decode' or 'prefill'")
         self._validate_batch_contract(batch)
+        requested_debug_layers = int(
+            os.environ.get("NANO_VLLM_JAX_MTP_LAYERWISE_DRIFT_MAX_LAYERS", "0")
+            or "0"
+        )
+        debug_layer_count = (
+            len(self.config.layer_types)
+            if requested_debug_layers <= 0
+            else min(requested_debug_layers, len(self.config.layer_types))
+        )
+        if debug_layer_count < 1:
+            raise ValueError("layerwise drift debug requires at least one layer")
 
         key = (
             "mtp-k-rollout-layerwise-drift-debug",
             verify_mode,
             draft_len,
+            debug_layer_count,
             tuple(batch.tokens.shape),
             tuple(batch.positions.shape),
             tuple(batch.block_tables.shape),
         )
         if key not in self._jit_cache:
-            layer_types = tuple(self.config.layer_types)
+            layer_types = tuple(self.config.layer_types[:debug_layer_count])
 
             def _layer_hidden_max_abs(fused_layers, seq_layers, row_mask):
                 diff = jnp.abs(
@@ -7120,6 +7135,10 @@ class ModelExecutor:
                 recurrent_state,
                 draft_tokens_arg,
             ):
+                params = replace(
+                    params,
+                    layers=params.layers[:debug_layer_count],
+                )
                 row_count = int(tokens.shape[0])
                 row_query_lens = jnp.diff(query_start_loc).astype(jnp.int32)
                 row_active = (row_query_lens > 0) & (seq_ids >= 0)
@@ -9889,10 +9908,15 @@ class ModelExecutor:
                     ),
                 )
 
-                hidden_norm = rms_norm(
+                hidden_norm = _decode_width1_rms_norm(
                     hidden,
                     params.norm_weight,
                     self.config.rms_norm_eps,
+                    force_width1=(
+                        hidden.ndim == 3
+                        and hidden.shape[1] > 1
+                        and _force_width1_decode_norms()
+                    ),
                 ).astype(jnp.float32)
                 output_weight = (
                     params.lm_head if params.lm_head is not None else params.embed_tokens.T
@@ -10103,7 +10127,9 @@ class ModelExecutor:
         mtp_chain_mode: str = "recursive",
         burst_groups: int = 1,
         emit_bonus: bool = True,
+        resident_block_tables: jnp.ndarray | None = None,
         resident_seq_lens: jnp.ndarray | None = None,
+        resident_last_tokens: jnp.ndarray | None = None,
     ) -> MTP1GreedyOutput:
         """Packed K-token verifier with resident-table hybrid state commit.
 
@@ -10127,6 +10153,19 @@ class ModelExecutor:
         draft_len = int(draft_tokens.shape[1])
         if draft_len < 1:
             raise ValueError("draft_tokens must contain at least one draft token")
+        resident_inputs = (
+            resident_block_tables,
+            resident_seq_lens,
+            resident_last_tokens,
+        )
+        if any(value is not None for value in resident_inputs) and not all(
+            value is not None for value in resident_inputs
+        ):
+            raise ValueError(
+                "resident block tables, sequence lengths, and last tokens must "
+                "be supplied together"
+            )
+        use_resident_inputs = all(value is not None for value in resident_inputs)
         self._log_step(
             "mtp_k_packed_prefix_table_greedy_step_jit",
             batch,
@@ -10146,7 +10185,11 @@ class ModelExecutor:
             )
         emit_bonus = bool(emit_bonus)
         verify_width = draft_len + 1 if emit_bonus else draft_len
-        logit_debug_enabled = os.environ.get(
+        target_distribution_debug_enabled = os.environ.get(
+            "NANO_VLLM_JAX_MTP_TARGET_DISTRIBUTION_DEBUG",
+            "0",
+        ) in {"1", "true", "yes", "on", "True"}
+        logit_debug_enabled = target_distribution_debug_enabled or os.environ.get(
             "NANO_VLLM_JAX_MTP_K_LOGIT_DEBUG",
             "0",
         ) in {"1", "true", "yes", "on", "True"}
@@ -10191,6 +10234,11 @@ class ModelExecutor:
                 "'prefill_attention_matmul_kernel', "
                 "'prefill_gdn_prefix_kernel', or 'scan'"
             )
+        if target_distribution_debug_enabled and target_verify_mode != "decode_rectangular":
+            raise ValueError(
+                "NANO_VLLM_JAX_MTP_TARGET_DISTRIBUTION_DEBUG currently requires "
+                "NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE=decode_rectangular"
+            )
 
         key = (
             "mtp-k-packed-prefix-table-greedy",
@@ -10204,12 +10252,15 @@ class ModelExecutor:
             tuple(batch.block_tables.shape),
             tuple(hybrid_state_table.conv_state.shape),
             tuple(hybrid_state_table.recurrent_state.shape),
+            tuple(resident_block_tables.shape) if resident_block_tables is not None else None,
             tuple(resident_seq_lens.shape) if resident_seq_lens is not None else None,
+            tuple(resident_last_tokens.shape) if resident_last_tokens is not None else None,
             tuple(mtp_cache_storage.k_cache.shape),
             tuple(mtp_cache_storage.v_cache.shape),
             bool(mtp_hidden_final_normed),
             bool(mtp_chain_return_normed),
             bool(logit_debug_enabled),
+            bool(target_distribution_debug_enabled),
             bool(emit_bonus),
         )
         if key not in self._jit_cache:
@@ -10224,6 +10275,19 @@ class ModelExecutor:
                     (value.shape[0], 1) + value.shape[2:],
                 )
                 return jnp.take_along_axis(value, gather_idx, axis=1)[:, 0, ...]
+
+            def _gather_layer_first_prefix(
+                value: jnp.ndarray,
+                prefix_len: jnp.ndarray,
+            ) -> jnp.ndarray:
+                batch_indices = jnp.arange(prefix_len.shape[0], dtype=jnp.int32)
+                selected = jax.vmap(
+                    lambda layer: layer[
+                        batch_indices,
+                        prefix_len.astype(jnp.int32),
+                    ]
+                )(value)
+                return jnp.swapaxes(selected, 0, 1)
 
             def compiled(
                 params_leaves,
@@ -10240,7 +10304,9 @@ class ModelExecutor:
                 conv_state_table,
                 recurrent_state_table,
                 slot_ids,
+                resident_block_tables_arg,
                 resident_seq_lens_arg,
+                resident_last_tokens_arg,
                 draft_tokens_arg,
                 next_mtp_position_arg,
             ):
@@ -10266,9 +10332,33 @@ class ModelExecutor:
                 )
                 del next_mtp_position_arg
 
-                current_tokens = tokens
-                current_positions = positions
-                current_seq_lens = seq_lens
+                if use_resident_inputs:
+                    current_tokens = resident_last_tokens_arg[safe_slot_ids, None]
+                    current_seq_lens = resident_seq_lens_arg[safe_slot_ids]
+                    block_tables = resident_block_tables_arg[safe_slot_ids]
+                    current_tokens = jnp.where(
+                        row_active[:, None],
+                        current_tokens,
+                        jnp.zeros_like(current_tokens),
+                    )
+                    current_seq_lens = jnp.where(
+                        row_active,
+                        current_seq_lens,
+                        jnp.zeros_like(current_seq_lens),
+                    )
+                    block_tables = jnp.where(
+                        row_active[:, None],
+                        block_tables,
+                        jnp.zeros_like(block_tables),
+                    )
+                    current_positions = jnp.maximum(
+                        current_seq_lens - jnp.asarray(1, dtype=jnp.int32),
+                        jnp.asarray(0, dtype=jnp.int32),
+                    )[:, None]
+                else:
+                    current_tokens = tokens
+                    current_positions = positions
+                    current_seq_lens = seq_lens
                 current_drafts = draft_tokens_arg
                 current_k_cache = k_cache
                 current_v_cache = v_cache
@@ -10285,8 +10375,17 @@ class ModelExecutor:
                 debug_verifier_top_ids_groups = []
                 debug_verifier_top_values_groups = []
                 debug_draft_token_groups = []
+                debug_reference_top_ids_groups = []
+                debug_reference_top_values_groups = []
+                debug_reference_kl_groups = []
+                debug_test_kl_groups = []
+                debug_js_groups = []
+                debug_reference_margin_groups = []
+                debug_test_margin_groups = []
+                debug_top1_equal_groups = []
 
                 for _group_idx in range(burst_groups):
+                    reference_hidden = None
                     verifier_input_drafts = (
                         current_drafts
                         if emit_bonus
@@ -10351,6 +10450,7 @@ class ModelExecutor:
                             return_hidden_with_logits=False,
                             return_prefix_hybrid=True,
                             hybrid_state_layerwise=True,
+                            prefix_hybrid_layer_first=True,
                             backend=self.backend,
                         )
                     elif target_verify_mode in {
@@ -10422,6 +10522,7 @@ class ModelExecutor:
                             return_hidden_with_logits=False,
                             return_prefix_hybrid=True,
                             hybrid_state_layerwise=True,
+                            prefix_hybrid_layer_first=True,
                             backend=self.backend,
                             prefill_prefix_kernel_scope=prefill_scope,
                         )
@@ -10507,10 +10608,64 @@ class ModelExecutor:
                             conv_state=jnp.stack(conv_state_parts, axis=1),
                             recurrent_state=jnp.stack(recurrent_state_parts, axis=1),
                         )
-                    hidden_norm = rms_norm(
+                    if target_distribution_debug_enabled:
+                        prior_rectangular_impl = os.environ.get(
+                            "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL"
+                        )
+                        os.environ[
+                            "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL"
+                        ] = "token_loop"
+                        try:
+                            reference_kv_state = KVCacheState(
+                                k_cache=current_k_cache,
+                                v_cache=current_v_cache,
+                                block_table=block_tables,
+                                kv_lens=verify_seq_lens,
+                                slot_mapping=verify_metadata.slot_mapping,
+                            )
+                            (
+                                reference_hidden,
+                                _reference_updated_kv_state,
+                                _reference_updated_hybrid_state,
+                                _reference_prefix_hybrid_state,
+                            ) = model_forward_step(
+                                verify_batch.tokens,
+                                params,
+                                self.config,
+                                positions=verify_batch.positions,
+                                kv_cache_state=reference_kv_state,
+                                attention_metadata=verify_metadata,
+                                hybrid_state=HybridLayerState(
+                                    current_conv_state,
+                                    current_recurrent_state,
+                                ),
+                                is_prefill=False,
+                                return_hidden=True,
+                                return_hidden_with_logits=False,
+                                return_prefix_hybrid=True,
+                                hybrid_state_layerwise=True,
+                                prefix_hybrid_layer_first=True,
+                                backend=self.backend,
+                            )
+                        finally:
+                            if prior_rectangular_impl is None:
+                                os.environ.pop(
+                                    "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL",
+                                    None,
+                                )
+                            else:
+                                os.environ[
+                                    "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL"
+                                ] = prior_rectangular_impl
+                    hidden_norm = _decode_width1_rms_norm(
                         hidden,
                         params.norm_weight,
                         self.config.rms_norm_eps,
+                        force_width1=(
+                            hidden.ndim == 3
+                            and hidden.shape[1] > 1
+                            and _force_width1_decode_norms()
+                        ),
                     ).astype(jnp.float32)
                     token_ids = _lm_head_greedy_top1_token_ids(
                         hidden_norm.astype(output_weight.dtype).reshape(
@@ -10528,13 +10683,84 @@ class ModelExecutor:
                         else jnp.zeros((row_count,), dtype=token_ids.dtype)
                     )
                     if logit_debug_enabled:
-                        verifier_logits = jnp.dot(
-                            hidden_norm[:, :draft_len, :],
+                        test_logits_full = jnp.dot(
+                            hidden_norm,
                             output_weight,
                         ).astype(jnp.float32)
+                        verifier_logits = test_logits_full[:, :draft_len, :]
                         verifier_top_values, verifier_top_ids = jax.lax.top_k(
                             verifier_logits,
                             5,
+                        )
+                    if target_distribution_debug_enabled:
+                        reference_hidden_norm = _decode_width1_rms_norm(
+                            reference_hidden,
+                            params.norm_weight,
+                            self.config.rms_norm_eps,
+                            force_width1=(
+                                reference_hidden.ndim == 3
+                                and reference_hidden.shape[1] > 1
+                                and _force_width1_decode_norms()
+                            ),
+                        ).astype(jnp.float32)
+                        reference_logits = jnp.dot(
+                            reference_hidden_norm,
+                            output_weight,
+                        ).astype(jnp.float32)
+                        reference_top_values, reference_top_ids = jax.lax.top_k(
+                            reference_logits,
+                            5,
+                        )
+                        test_top_values_full, test_top_ids_full = jax.lax.top_k(
+                            test_logits_full,
+                            5,
+                        )
+                        reference_log_probs = jax.nn.log_softmax(
+                            reference_logits,
+                            axis=-1,
+                        )
+                        test_log_probs = jax.nn.log_softmax(
+                            test_logits_full,
+                            axis=-1,
+                        )
+                        reference_probs = jnp.exp(reference_log_probs)
+                        test_probs = jnp.exp(test_log_probs)
+                        reference_kl = jnp.sum(
+                            reference_probs * (reference_log_probs - test_log_probs),
+                            axis=-1,
+                        )
+                        test_kl = jnp.sum(
+                            test_probs * (test_log_probs - reference_log_probs),
+                            axis=-1,
+                        )
+                        mixture_log_probs = jnp.logaddexp(
+                            reference_log_probs,
+                            test_log_probs,
+                        ) - jnp.log(jnp.asarray(2.0, dtype=jnp.float32))
+                        js_divergence = 0.5 * (
+                            jnp.sum(
+                                reference_probs
+                                * (reference_log_probs - mixture_log_probs),
+                                axis=-1,
+                            )
+                            + jnp.sum(
+                                test_probs * (test_log_probs - mixture_log_probs),
+                                axis=-1,
+                            )
+                        )
+                        reference_kl = jnp.maximum(reference_kl, 0.0)
+                        test_kl = jnp.maximum(test_kl, 0.0)
+                        js_divergence = jnp.maximum(js_divergence, 0.0)
+                        reference_margin = (
+                            reference_top_values[..., 0]
+                            - reference_top_values[..., 1]
+                        )
+                        test_margin = (
+                            test_top_values_full[..., 0]
+                            - test_top_values_full[..., 1]
+                        )
+                        top1_equal = (
+                            reference_top_ids[..., 0] == test_top_ids_full[..., 0]
                         )
                     raw_accepted = (target_tokens == current_drafts) & row_active[:, None]
                     accepted = jnp.cumprod(
@@ -10568,14 +10794,24 @@ class ModelExecutor:
                         if mtp_hidden_final_normed
                         else _gather_prefix(hidden, selected_hidden_index)[:, None, :]
                     )
-                    selected_conv = _gather_prefix(
-                        prefix_hybrid_state.conv_state,
-                        state_prefix_len,
-                    )
-                    selected_recurrent = _gather_prefix(
-                        prefix_hybrid_state.recurrent_state,
-                        state_prefix_len,
-                    )
+                    if target_verify_mode == "scan":
+                        selected_conv = _gather_prefix(
+                            prefix_hybrid_state.conv_state,
+                            state_prefix_len,
+                        )
+                        selected_recurrent = _gather_prefix(
+                            prefix_hybrid_state.recurrent_state,
+                            state_prefix_len,
+                        )
+                    else:
+                        selected_conv = _gather_layer_first_prefix(
+                            prefix_hybrid_state.conv_state,
+                            state_prefix_len,
+                        )
+                        selected_recurrent = _gather_layer_first_prefix(
+                            prefix_hybrid_state.recurrent_state,
+                            state_prefix_len,
+                        )
                     selected_k_cache = updated_kv_state.k_cache
                     selected_v_cache = updated_kv_state.v_cache
 
@@ -10737,6 +10973,25 @@ class ModelExecutor:
                             verifier_top_values.astype(jnp.float32)
                         )
                         debug_draft_token_groups.append(current_drafts.astype(jnp.int32))
+                        if target_distribution_debug_enabled:
+                            debug_reference_top_ids_groups.append(
+                                reference_top_ids.astype(jnp.int32)
+                            )
+                            debug_reference_top_values_groups.append(
+                                reference_top_values.astype(jnp.float32)
+                            )
+                            debug_reference_kl_groups.append(
+                                reference_kl.astype(jnp.float32)
+                            )
+                            debug_test_kl_groups.append(test_kl.astype(jnp.float32))
+                            debug_js_groups.append(js_divergence.astype(jnp.float32))
+                            debug_reference_margin_groups.append(
+                                reference_margin.astype(jnp.float32)
+                            )
+                            debug_test_margin_groups.append(
+                                test_margin.astype(jnp.float32)
+                            )
+                            debug_top1_equal_groups.append(top1_equal)
 
                     current_tokens = selected_next_token[:, None]
                     current_positions = current_positions + emitted_count[:, None]
@@ -10785,15 +11040,42 @@ class ModelExecutor:
                         committed_seq_lens.astype(jnp.int32),
                         mode="drop",
                     )
+                updated_resident_last_tokens = resident_last_tokens_arg
+                if resident_last_tokens is not None:
+                    token_scatter_slot_ids = jnp.where(
+                        row_active,
+                        slot_ids,
+                        jnp.full_like(slot_ids, resident_last_tokens_arg.shape[0]),
+                    )
+                    updated_resident_last_tokens = resident_last_tokens_arg.at[
+                        token_scatter_slot_ids
+                    ].set(
+                        current_tokens[:, 0].astype(jnp.int32),
+                        mode="drop",
+                    )
                 if logit_debug_enabled:
-                    debug_payload = (
+                    debug_payload_parts = [
                         jnp.stack(debug_draft_top_ids_groups, axis=1),
                         jnp.stack(debug_draft_top_values_groups, axis=1),
                         jnp.stack(debug_verifier_top_ids_groups, axis=1),
                         jnp.stack(debug_verifier_top_values_groups, axis=1),
                         jnp.stack(debug_draft_token_groups, axis=1),
                         target_tokens,
-                    )
+                    ]
+                    if target_distribution_debug_enabled:
+                        debug_payload_parts.extend(
+                            [
+                                jnp.stack(debug_reference_top_ids_groups, axis=1),
+                                jnp.stack(debug_reference_top_values_groups, axis=1),
+                                jnp.stack(debug_reference_kl_groups, axis=1),
+                                jnp.stack(debug_test_kl_groups, axis=1),
+                                jnp.stack(debug_js_groups, axis=1),
+                                jnp.stack(debug_reference_margin_groups, axis=1),
+                                jnp.stack(debug_test_margin_groups, axis=1),
+                                jnp.stack(debug_top1_equal_groups, axis=1),
+                            ]
+                        )
+                    debug_payload = tuple(debug_payload_parts)
                 else:
                     debug_payload = None
                 return (
@@ -10812,6 +11094,7 @@ class ModelExecutor:
                     updated_recurrent_table,
                     committed_seq_lens,
                     updated_resident_seq_lens,
+                    updated_resident_last_tokens,
                     debug_payload,
                 )
 
@@ -10833,6 +11116,7 @@ class ModelExecutor:
             recurrent_state,
             committed_seq_lens,
             resident_seq_lens_out,
+            resident_last_tokens_out,
             debug_payload,
         ) = self._profile_jit_call(
             key,
@@ -10852,8 +11136,14 @@ class ModelExecutor:
                 hybrid_state_table.conv_state,
                 hybrid_state_table.recurrent_state,
                 hybrid_slot_ids,
+                jnp.asarray(resident_block_tables, dtype=jnp.int32)
+                if resident_block_tables is not None
+                else jnp.zeros((1, 1), dtype=jnp.int32),
                 jnp.asarray(resident_seq_lens, dtype=jnp.int32)
                 if resident_seq_lens is not None
+                else jnp.zeros((1,), dtype=jnp.int32),
+                jnp.asarray(resident_last_tokens, dtype=jnp.int32)
+                if resident_last_tokens is not None
                 else jnp.zeros((1,), dtype=jnp.int32),
                 jnp.asarray(draft_tokens, dtype=jnp.int32),
                 jnp.asarray(next_mtp_position, dtype=jnp.int32),
@@ -10870,6 +11160,9 @@ class ModelExecutor:
             mtp_cache_storage=KVCacheStorage(mtp_k_cache, mtp_v_cache),
             committed_seq_lens=committed_seq_lens,
             resident_seq_lens=resident_seq_lens_out if resident_seq_lens is not None else None,
+            resident_last_tokens=(
+                resident_last_tokens_out if resident_last_tokens is not None else None
+            ),
             emitted_tokens=emitted_tokens,
             emitted_counts=emitted_counts,
             accepted_counts=accepted_counts,

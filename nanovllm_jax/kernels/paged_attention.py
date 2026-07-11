@@ -54,6 +54,62 @@ def dense_block_tables_to_kv_indptr(
     return kv_indices, kv_indptr
 
 
+def compact_block_tables_to_kv_indptr(
+    block_tables: Any,
+    seq_lens: Any,
+    page_size: int,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Pack only logically live page ids while retaining static capacity.
+
+    Decode block tables are bucket-padded with physical page ``0``. Passing
+    their rectangular width directly to FlashInfer makes those padded entries
+    part of the logical KV sequence because FlashInfer derives each request's
+    page count from ``kv_indptr``. This helper builds dynamic CSR offsets from
+    ``seq_lens`` and packs each row's valid page prefix into a statically sized
+    indices buffer; trailing capacity is ignored by ``kv_indptr[-1]``.
+    """
+
+    block_tables = _as_jax_array("block_tables", block_tables)
+    seq_lens = _as_jax_array("seq_lens", seq_lens).astype(jnp.int32)
+    if block_tables.ndim != 2:
+        raise ValueError("block_tables must have shape [batch, max_pages_per_sequence]")
+    if seq_lens.shape != (block_tables.shape[0],):
+        raise ValueError("seq_lens must have shape [batch]")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+
+    batch, max_pages = block_tables.shape
+    page_size_array = jnp.asarray(page_size, dtype=jnp.int32)
+    page_counts = jnp.where(
+        seq_lens > 0,
+        (seq_lens + page_size_array - 1) // page_size_array,
+        0,
+    )
+    page_counts = jnp.clip(page_counts, 0, max_pages).astype(jnp.int32)
+    kv_indptr = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=jnp.int32),
+            jnp.cumsum(page_counts, dtype=jnp.int32),
+        ]
+    )
+
+    capacity = batch * max_pages
+    page_offsets = jnp.arange(max_pages, dtype=jnp.int32)[None, :]
+    destinations = kv_indptr[:-1, None] + page_offsets
+    valid = page_offsets < page_counts[:, None]
+    destinations = jnp.where(
+        valid,
+        destinations,
+        jnp.asarray(capacity, dtype=jnp.int32),
+    ).reshape(-1)
+    values = block_tables.astype(jnp.int32).reshape(-1)
+    kv_indices = jnp.zeros((capacity,), dtype=jnp.int32).at[destinations].set(
+        values,
+        mode="drop",
+    )
+    return kv_indices, kv_indptr
+
+
 def _validate_paged_decode_inputs(
     q: jnp.ndarray,
     k_cache: jnp.ndarray,

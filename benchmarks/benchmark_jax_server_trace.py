@@ -474,6 +474,41 @@ def _parse_shape_ints(value: str) -> tuple[int, ...]:
     return tuple(int(part) for part in value.replace("x", ":").replace(",", ":").split(":") if part.strip())
 
 
+def _mtp_static_warmup_row_count(
+    rows: int,
+    args: argparse.Namespace,
+    config: Any,
+) -> int:
+    """Mirror the runner's fixed-row MTP verifier bucket selection."""
+
+    rows = int(rows)
+    max_active_rows = max(
+        0,
+        int(
+            getattr(
+                config,
+                "mtp_max_active_rows",
+                getattr(args, "mtp_max_active_rows", 0),
+            )
+            or 0
+        ),
+    )
+    if max_active_rows <= 0 or rows > max_active_rows:
+        return rows
+    batch_buckets = tuple(
+        sorted(int(bucket) for bucket in (getattr(config, "batch_size_buckets", ()) or ()))
+    )
+    if not batch_buckets:
+        return max_active_rows
+    for bucket in batch_buckets:
+        if max_active_rows <= bucket:
+            return bucket
+    raise ValueError(
+        "fixed-row MTP warmup target "
+        f"{max_active_rows} exceeds configured batch buckets {batch_buckets}"
+    )
+
+
 def _manifest_mtp_table_warmup_specs(
     prompt_rows: list[dict[str, Any]],
     output_lengths: list[int],
@@ -488,6 +523,9 @@ def _manifest_mtp_table_warmup_specs(
     burst_budget = max(1, int(getattr(args, "mtp_burst_groups", 1) or 1))
     if draft_budget <= 0:
         return {"enabled": False, "specs": [], "env": ""}
+    fixed_width_packed_verifier = str(
+        getattr(args, "mtp_verifier_impl", "none") or "none"
+    ).lower() in {"packed_prefix", "packed_prefill", "prefill_packed"}
 
     scheduler = Scheduler(config)
     for index, (row, output_len) in enumerate(zip(prompt_rows, output_lengths)):
@@ -568,7 +606,11 @@ def _manifest_mtp_table_warmup_specs(
                 not relax_bonus_boundary
                 and any((seq.num_tokens + draft_len + 1) % block_size == 0 for seq in seqs)
             )
-            if min_remaining < draft_len + 1 or bonus_boundary_no_bonus:
+            if fixed_width_packed_verifier and (
+                min_remaining < draft_len + 1 or bonus_boundary_no_bonus
+            ):
+                draft_len = 0
+            elif min_remaining < draft_len + 1 or bonus_boundary_no_bonus:
                 draft_len = min(draft_len, min_remaining)
                 emit_bonus = False
             if draft_len > 0:
@@ -593,7 +635,12 @@ def _manifest_mtp_table_warmup_specs(
                     and not burst_final_bonus_boundary
                 ):
                     burst_groups = burst_budget
-                physical_rows = int(batch.tokens.shape[0])
+                scheduled_physical_rows = int(batch.tokens.shape[0])
+                physical_rows = _mtp_static_warmup_row_count(
+                    scheduled_physical_rows,
+                    args,
+                    config,
+                )
                 block_table_width = int(batch.block_tables.shape[1])
                 spec = (
                     physical_rows,
@@ -611,6 +658,7 @@ def _manifest_mtp_table_warmup_specs(
                 events.append(
                     {
                         "rows": physical_rows,
+                        "scheduled_rows": scheduled_physical_rows,
                         "block_table_width": block_table_width,
                         "draft_len": int(draft_len),
                         "burst_groups": int(burst_groups),
@@ -641,6 +689,7 @@ def _manifest_mtp_table_warmup_specs(
         "specs": sorted_specs,
         "events": events[:64],
         "event_count": len(events),
+        "fixed_width_packed_verifier": fixed_width_packed_verifier,
         "env": _shape_env_value(sorted_specs),
     }
 
@@ -789,9 +838,27 @@ def _manifest_warmup_shapes(
                 if warm_all_tail_widths
                 else (draft_budget,)
             )
-            for batch_size, block_table_width in decode_shapes:
+            fixed_width_packed_verifier = str(
+                getattr(args, "mtp_verifier_impl", "none") or "none"
+            ).lower() in {"packed_prefix", "packed_prefill", "prefill_packed"}
+            if fixed_width_packed_verifier:
+                safety_tail_widths = (draft_budget,)
+            # The fixed-K packed verifier keeps K constant at short request
+            # tails and block boundaries, but suppresses the bonus and caps
+            # emitted tokens per row.  Warm that exact no-bonus executable;
+            # the optimistic dry schedule already contributes the normal
+            # bonus-bearing route.
+            safety_bonus_modes = (0,) if fixed_width_packed_verifier else (0, 1)
+            mtp_decode_shapes = {
+                (
+                    _mtp_static_warmup_row_count(batch_size, args, config),
+                    int(block_table_width),
+                )
+                for batch_size, block_table_width in decode_shapes
+            }
+            for batch_size, block_table_width in mtp_decode_shapes:
                 for draft_width in safety_tail_widths:
-                    for emit_bonus in (0, 1):
+                    for emit_bonus in safety_bonus_modes:
                         spec_set.add(
                             (
                                 int(batch_size),
@@ -806,6 +873,9 @@ def _manifest_warmup_shapes(
             mtp_table_specs["env"] = _shape_env_value(sorted_specs)
             mtp_table_specs["safety_tail_specs"] = True
             mtp_table_specs["safety_all_tail_widths"] = warm_all_tail_widths
+            mtp_table_specs["fixed_width_packed_verifier"] = (
+                fixed_width_packed_verifier
+            )
 
     return {
         "enabled": True,
@@ -948,11 +1018,10 @@ def run_benchmark(args: argparse.Namespace, recorder: RunRecorder) -> dict:
         if args.warmup_mode == "generic":
             manifest_shape_warmup = None
             use_manifest_shape_warmup = (
-                str(getattr(args, "speculative_method", "none")).lower() == "mtp"
-                and int(getattr(args, "num_speculative_tokens", 0) or 0) > 0
+                args.prompt_source in {"manifest", "vllm_random"}
                 and os.environ.get(
                     "NANO_VLLM_JAX_MANIFEST_WARMUP_SHAPES",
-                    "1" if args.prompt_source in {"manifest", "vllm_random"} else "0",
+                    "1",
                 )
                 in {"1", "true", "yes", "on", "True"}
             )

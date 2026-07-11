@@ -1,7 +1,9 @@
-# Experimental exact true-K MTP config.
+# Experimental target-verified true-K MTP config.
 #
-# This is not a speed-claim path. It keeps target-model verification enabled
-# and exists so MTP work is isolated from the promoted non-MTP server config.
+# This is not yet a promoted speed-claim path. It keeps target-model
+# verification enabled and exists so MTP work is isolated from the promoted
+# non-MTP server config. Broad full-attention verification is quality-gated by
+# the explicit KL/margin diagnostic before benchmark results are considered.
 
 server:
   host: "127.0.0.1"
@@ -94,5 +96,22 @@ kernels:
       qkv_dtype: "bf16"
 
 env:
+  # Canonical width-1 projection controls. Individual projection families can
+  # be widened only after the target-verification contract stays exact.
+  NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH: "1"
+  NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_NORMS: "1"
+  NANO_VLLM_JAX_FORCE_WIDTH1_GDN_INPUT_PROJECTIONS: "1"
+  NANO_VLLM_JAX_FORCE_WIDTH1_GDN_OUTPUT_PROJECTIONS: "1"
+  NANO_VLLM_JAX_FORCE_WIDTH1_FULL_ATTN_PROJECTIONS: "1"
+  NANO_VLLM_JAX_FORCE_WIDTH1_MLP_PROJECTIONS: "1"
+  # The packed GDN prefix-state kernel is parity-clean at the active K=2/K=3
+  # widths and avoids replaying the recurrent cell token by token.
+  NANO_VLLM_JAX_GDN_DECODE_PREFIX_STATE_IMPL: "kernel"
+  # Append verifier K/V once, then compact live dense pages and run non-split
+  # FlashInfer attention inside one device-owned custom-call boundary.
+  NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL: "kernel"
+  NANO_VLLM_JAX_FLASHINFER_PAGE_TABLE_IMPL: "dense"
   NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE: "decode_rectangular"
-  NANO_VLLM_JAX_MANIFEST_WARMUP_EXPAND_DECODE_ROWS: "0"
+  # MTP acceptance can desynchronise otherwise identical requests, so a
+  # measured tail can reach any physical decode row count.
+  NANO_VLLM_JAX_MANIFEST_WARMUP_EXPAND_DECODE_ROWS: "1"

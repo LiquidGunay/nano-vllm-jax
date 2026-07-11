@@ -170,6 +170,101 @@ def _full_attention_decode_impl(config=None) -> str:
     )
 
 
+def _flashinfer_page_table_impl() -> str:
+    value = os.environ.get(
+        "NANO_VLLM_JAX_FLASHINFER_PAGE_TABLE_IMPL",
+        "dense",
+    ).strip().lower()
+    if value in {"dense", "legacy", "padded"}:
+        return "dense"
+    if value in {"jax", "compact", "compact_jax"}:
+        return "compact_jax"
+    if value in {"triton", "compact_triton"}:
+        return "compact_triton"
+    raise ValueError(
+        "NANO_VLLM_JAX_FLASHINFER_PAGE_TABLE_IMPL must be "
+        "'dense', 'compact_jax', or 'compact_triton'"
+    )
+
+
+def _full_attention_rectangular_decode_impl() -> str:
+    value = os.environ.get(
+        "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL",
+        "kernel",
+    ).strip().lower()
+    if value in {"kernel", "rectangular", "packed", "flashinfer"}:
+        return "kernel"
+    if value in {"triton", "triton_paged", "paged_triton"}:
+        return "triton"
+    if value in {"scan", "loop", "tokenwise", "token_loop", "replay"}:
+        return "token_loop"
+    raise ValueError(
+        "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL must be "
+        "'kernel', 'triton', or 'token_loop'"
+    )
+
+
+def _flashinfer_block_tables_to_kv_indptr(
+    block_tables: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    block_size: int,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    impl = _flashinfer_page_table_impl()
+    if impl == "dense":
+        from nanovllm_jax.kernels.paged_attention import (
+            dense_block_tables_to_kv_indptr,
+        )
+
+        return dense_block_tables_to_kv_indptr(block_tables)
+    if impl == "compact_triton":
+        from nanovllm_jax.kernels.full_attention_triton import (
+            compact_block_tables_to_kv_indptr_triton,
+        )
+
+        return compact_block_tables_to_kv_indptr_triton(
+            block_tables,
+            seq_lens,
+            block_size,
+        )
+    from nanovllm_jax.kernels.paged_attention import (
+        compact_block_tables_to_kv_indptr,
+    )
+
+    return compact_block_tables_to_kv_indptr(
+        block_tables,
+        seq_lens,
+        block_size,
+    )
+
+
+def _flashinfer_paged_metadata(
+    metadata: AttentionMetadata,
+    block_size: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    if (
+        getattr(metadata, "paged_kv_indices", None) is not None
+        and getattr(metadata, "paged_kv_indptr", None) is not None
+        and getattr(metadata, "paged_kv_last_page_len", None) is not None
+    ):
+        return (
+            getattr(metadata, "paged_kv_indices"),
+            getattr(metadata, "paged_kv_indptr"),
+            getattr(metadata, "paged_kv_last_page_len"),
+        )
+    from nanovllm_jax.kernels.paged_attention import kv_last_page_len_from_seq_lens
+
+    indices, indptr = _flashinfer_block_tables_to_kv_indptr(
+        metadata.block_tables,
+        metadata.seq_lens,
+        block_size,
+    )
+    return (
+        indices,
+        indptr,
+        kv_last_page_len_from_seq_lens(metadata.seq_lens, block_size),
+    )
+
+
 def _full_attention_prefill_impl(config=None) -> str:
     value = str(
         getattr(config, "full_attention_prefill_impl", "reference")
@@ -964,6 +1059,57 @@ class PureJAXBackend:
             num_prefill_tokens = batch * query_len if is_prefill else 0
         if num_decode_tokens is None:
             num_decode_tokens = 0 if is_prefill else batch
+        paged_kv_indices = None
+        paged_kv_indptr = None
+        paged_kv_last_page_len = None
+        decode_query_kv_indices = None
+        decode_query_kv_indptr = None
+        decode_query_kv_last_page_len = None
+        decode_query_seq_lens = None
+        if (
+            not is_prefill
+            and _full_attention_decode_impl(self.config) == "flashinfer_paged"
+            and _flashinfer_page_table_impl() != "dense"
+        ):
+            from nanovllm_jax.kernels.paged_attention import (
+                kv_last_page_len_from_seq_lens,
+            )
+
+            paged_kv_indices, paged_kv_indptr = _flashinfer_block_tables_to_kv_indptr(
+                block_tables,
+                seq_lens,
+                block_size,
+            )
+            paged_kv_last_page_len = kv_last_page_len_from_seq_lens(
+                seq_lens,
+                block_size,
+            )
+            if query_len > 1:
+                expanded_block_tables = jnp.repeat(
+                    block_tables.astype(jnp.int32),
+                    query_len,
+                    axis=0,
+                )
+                width_offsets = jnp.arange(query_len, dtype=seq_lens.dtype)
+                decode_query_seq_lens = (
+                    seq_lens[:, None]
+                    - (
+                        jnp.asarray(query_len - 1, dtype=seq_lens.dtype)
+                        - width_offsets[None, :]
+                    )
+                ).reshape(-1)
+                (
+                    decode_query_kv_indices,
+                    decode_query_kv_indptr,
+                ) = _flashinfer_block_tables_to_kv_indptr(
+                    expanded_block_tables,
+                    decode_query_seq_lens,
+                    block_size,
+                )
+                decode_query_kv_last_page_len = kv_last_page_len_from_seq_lens(
+                    decode_query_seq_lens,
+                    block_size,
+                )
         return AttentionMetadata(
             slot_mapping=slot_mapping,
             block_tables=block_tables,
@@ -975,6 +1121,13 @@ class PureJAXBackend:
             max_kv_len=block_tables.shape[1] * block_size if not is_prefill else None,
             token_row_ids=token_row_ids,
             max_query_len=max_query_len if max_query_len is not None else query_len,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            decode_query_kv_indices=decode_query_kv_indices,
+            decode_query_kv_indptr=decode_query_kv_indptr,
+            decode_query_kv_last_page_len=decode_query_kv_last_page_len,
+            decode_query_seq_lens=decode_query_seq_lens,
         )
 
     def write_kv(
@@ -1144,13 +1297,9 @@ class PureJAXBackend:
             from nanovllm_jax.kernels.cuda_fp32_ffi import (
                 paged_decode_attention_gqa_nhd_fp32,
             )
-            from nanovllm_jax.kernels.paged_attention import (
-                dense_block_tables_to_kv_indptr,
-                kv_last_page_len_from_seq_lens,
-            )
-
-            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
-                metadata.block_tables,
+            kv_indices, kv_indptr, kv_last_page_len = _flashinfer_paged_metadata(
+                metadata,
+                block_size,
             )
             out = paged_decode_attention_gqa_nhd_fp32(
                 query[:, 0],
@@ -1158,7 +1307,7 @@ class PureJAXBackend:
                 cache.v_cache[layer_id],
                 kv_indptr,
                 kv_indices,
-                kv_last_page_len_from_seq_lens(metadata.seq_lens, block_size),
+                kv_last_page_len,
                 metadata.seq_lens.astype(jnp.int32),
                 scale,
             )
@@ -1212,13 +1361,9 @@ class PureJAXBackend:
             from nanovllm_jax.kernels.flashinfer_ffi import (
                 paged_decode_attention_gqa_nhd,
             )
-            from nanovllm_jax.kernels.paged_attention import (
-                dense_block_tables_to_kv_indptr,
-                kv_last_page_len_from_seq_lens,
-            )
-
-            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
-                metadata.block_tables,
+            kv_indices, kv_indptr, kv_last_page_len = _flashinfer_paged_metadata(
+                metadata,
+                block_size,
             )
             query_for_kernel = query[:, 0].astype(cache.k_cache.dtype)
             out = paged_decode_attention_gqa_nhd(
@@ -1227,7 +1372,7 @@ class PureJAXBackend:
                 cache.v_cache[layer_id],
                 kv_indptr,
                 kv_indices,
-                kv_last_page_len_from_seq_lens(metadata.seq_lens, block_size),
+                kv_last_page_len,
                 scale=scale,
             )
             return out.reshape(
@@ -1286,7 +1431,6 @@ class PureJAXBackend:
 
             width = int(query.shape[1])
             batch = int(query.shape[0])
-            max_pages_per_seq = int(metadata.block_tables.shape[1])
             expanded_batch = batch * width
             append_key = k.reshape(
                 expanded_batch,
@@ -1304,10 +1448,13 @@ class PureJAXBackend:
                 axis=0,
             )
             append_positions = metadata.positions.reshape(-1).astype(jnp.int32)
-            base_kv_indices = metadata.block_tables.reshape(-1).astype(jnp.int32)
-            base_kv_indptr = (
-                jnp.arange(batch + 1, dtype=jnp.int32)
-                * jnp.asarray(max_pages_per_seq, dtype=jnp.int32)
+            (
+                base_kv_indices,
+                base_kv_indptr,
+                base_kv_last_page_len,
+            ) = _flashinfer_paged_metadata(
+                metadata,
+                block_size,
             )
             k_cache_layer, v_cache_layer = kv_append_paged_nhd(
                 append_key,
@@ -1318,36 +1465,111 @@ class PureJAXBackend:
                 cache.v_cache[layer_id],
                 base_kv_indices,
                 base_kv_indptr,
-                kv_last_page_len_from_seq_lens(metadata.seq_lens, block_size),
+                base_kv_last_page_len,
             )
             expanded_query = query.reshape(
                 expanded_batch,
                 query.shape[2],
                 query.shape[3],
             ).astype(cache.k_cache.dtype)
-            expanded_block_tables = jnp.repeat(
-                metadata.block_tables.astype(jnp.int32),
-                width,
-                axis=0,
+            seq_lens_per_query = getattr(metadata, "decode_query_seq_lens", None)
+            expanded_block_tables = None
+            if seq_lens_per_query is None:
+                width_offsets = jnp.arange(width, dtype=metadata.seq_lens.dtype)
+                seq_lens_per_query = (
+                    metadata.seq_lens[:, None]
+                    - (
+                        jnp.asarray(width - 1, dtype=metadata.seq_lens.dtype)
+                        - width_offsets[None, :]
+                    )
+                ).reshape(-1)
+            if _full_attention_rectangular_decode_impl() == "triton":
+                from nanovllm_jax.kernels.full_attention_triton import (
+                    paged_decode_attention_triton,
+                )
+
+                expanded_block_tables = jnp.repeat(
+                    metadata.block_tables.astype(jnp.int32),
+                    width,
+                    axis=0,
+                )
+                out = paged_decode_attention_triton(
+                    query=expanded_query[:, None, :, :],
+                    k_cache_layer=k_cache_layer,
+                    v_cache_layer=v_cache_layer,
+                    block_table=expanded_block_tables,
+                    seq_lens=seq_lens_per_query,
+                    block_size=block_size,
+                    scale=scale,
+                    num_key_value_groups=num_key_value_groups,
+                )
+                k_cache = cache.k_cache.at[layer_id].set(k_cache_layer)
+                v_cache = cache.v_cache.at[layer_id].set(v_cache_layer)
+                return (
+                    KVCacheStorage(k_cache, v_cache),
+                    out.reshape(batch, width, query.shape[2] * query.shape[3]),
+                )
+            if _full_attention_rectangular_decode_impl() == "kernel":
+                from nanovllm_jax.kernels.flashinfer_ffi import (
+                    paged_decode_attention_gqa_nhd_dense_direct,
+                )
+
+                expanded_block_tables = jnp.repeat(
+                    metadata.block_tables.astype(jnp.int32),
+                    width,
+                    axis=0,
+                )
+                out = paged_decode_attention_gqa_nhd_dense_direct(
+                    expanded_query,
+                    k_cache_layer,
+                    v_cache_layer,
+                    expanded_block_tables,
+                    seq_lens_per_query,
+                    scale=scale,
+                )
+                k_cache = cache.k_cache.at[layer_id].set(k_cache_layer)
+                v_cache = cache.v_cache.at[layer_id].set(v_cache_layer)
+                return (
+                    KVCacheStorage(k_cache, v_cache),
+                    out.reshape(batch, width, query.shape[2] * query.shape[3]),
+                )
+            kv_indices = getattr(metadata, "decode_query_kv_indices", None)
+            kv_indptr = getattr(metadata, "decode_query_kv_indptr", None)
+            query_last_page_len = getattr(
+                metadata,
+                "decode_query_kv_last_page_len",
+                None,
             )
-            kv_indices = expanded_block_tables.reshape(-1)
-            kv_indptr = (
-                jnp.arange(expanded_batch + 1, dtype=jnp.int32)
-                * jnp.asarray(max_pages_per_seq, dtype=jnp.int32)
-            )
-            width_offsets = jnp.arange(width, dtype=metadata.seq_lens.dtype)
-            seq_lens_per_query = (
-                metadata.seq_lens[:, None]
-                - (jnp.asarray(width - 1, dtype=metadata.seq_lens.dtype) - width_offsets[None, :])
-            ).reshape(-1)
+            if (
+                seq_lens_per_query is None
+                or kv_indices is None
+                or kv_indptr is None
+                or query_last_page_len is None
+            ):
+                if expanded_block_tables is None:
+                    expanded_block_tables = jnp.repeat(
+                        metadata.block_tables.astype(jnp.int32),
+                        width,
+                        axis=0,
+                    )
+                kv_indices, kv_indptr = _flashinfer_block_tables_to_kv_indptr(
+                    expanded_block_tables,
+                    seq_lens_per_query,
+                    block_size,
+                )
+                query_last_page_len = kv_last_page_len_from_seq_lens(
+                    seq_lens_per_query,
+                    block_size,
+                )
             out = paged_decode_attention_gqa_nhd(
                 expanded_query,
                 k_cache_layer,
                 v_cache_layer,
                 kv_indptr,
                 kv_indices,
-                kv_last_page_len_from_seq_lens(seq_lens_per_query, block_size),
+                query_last_page_len,
                 scale=scale,
+                direct_plan=_flashinfer_page_table_impl() != "dense",
             )
             k_cache = cache.k_cache.at[layer_id].set(k_cache_layer)
             v_cache = cache.v_cache.at[layer_id].set(v_cache_layer)
@@ -1383,13 +1605,9 @@ class PureJAXBackend:
             from nanovllm_jax.kernels.flashinfer_ffi import (
                 paged_decode_attention_with_kv_append_gqa_nhd,
             )
-            from nanovllm_jax.kernels.paged_attention import (
-                dense_block_tables_to_kv_indptr,
-                kv_last_page_len_from_seq_lens,
-            )
-
-            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
-                metadata.block_tables,
+            kv_indices, kv_indptr, kv_last_page_len = _flashinfer_paged_metadata(
+                metadata,
+                block_size,
             )
             out, k_cache, v_cache = paged_decode_attention_with_kv_append_gqa_nhd(
                 query[:, 0].astype(cache.k_cache.dtype),
@@ -1399,7 +1617,7 @@ class PureJAXBackend:
                 cache.v_cache,
                 kv_indptr,
                 kv_indices,
-                kv_last_page_len_from_seq_lens(metadata.seq_lens, block_size),
+                kv_last_page_len,
                 metadata.positions.reshape(query.shape[0]).astype(jnp.int32),
                 layer_id=layer_id,
                 scale=scale,

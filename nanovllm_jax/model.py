@@ -264,6 +264,91 @@ def _force_width1_decode_math() -> bool:
     }
 
 
+def _force_width1_decode_norms() -> bool:
+    """Keep decode reductions canonical while allowing grouped projections.
+
+    The broad packed verifier can profit from wider GEMMs without also
+    accepting shape-dependent RMSNorm drift.  The dedicated override falls
+    back to the historical all-or-nothing policy for compatibility.
+    """
+
+    value = os.environ.get("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_NORMS")
+    if value is None:
+        return _force_width1_decode_math()
+    return value in {"1", "true", "yes", "on", "True"}
+
+
+def _force_width1_decode_component(env_name: str) -> bool:
+    value = os.environ.get(env_name)
+    if value is None:
+        return _force_width1_decode_math()
+    return value in {"1", "true", "yes", "on", "True"}
+
+
+def _force_width1_gdn_input_projections() -> bool:
+    return _force_width1_decode_component(
+        "NANO_VLLM_JAX_FORCE_WIDTH1_GDN_INPUT_PROJECTIONS"
+    )
+
+
+def _force_width1_gdn_output_projections() -> bool:
+    return _force_width1_decode_component(
+        "NANO_VLLM_JAX_FORCE_WIDTH1_GDN_OUTPUT_PROJECTIONS"
+    )
+
+
+def _force_width1_full_attention_projections() -> bool:
+    return _force_width1_decode_component(
+        "NANO_VLLM_JAX_FORCE_WIDTH1_FULL_ATTN_PROJECTIONS"
+    )
+
+
+def _force_width1_mlp_projections() -> bool:
+    return _force_width1_decode_component(
+        "NANO_VLLM_JAX_FORCE_WIDTH1_MLP_PROJECTIONS"
+    )
+
+
+def _gdn_decode_prefix_state_impl() -> str:
+    value = os.environ.get(
+        "NANO_VLLM_JAX_GDN_DECODE_PREFIX_STATE_IMPL",
+        "kernel",
+    ).strip().lower()
+    if value in {"scan", "loop", "tokenwise", "token_loop"}:
+        return "token_loop"
+    if value in {"kernel", "packed", "packed_kernel"}:
+        return "kernel"
+    raise ValueError(
+        "NANO_VLLM_JAX_GDN_DECODE_PREFIX_STATE_IMPL must be "
+        "'kernel' or 'token_loop'"
+    )
+
+
+def _full_attention_rectangular_decode_impl() -> str:
+    """Select the width>1 FlashInfer decode-attention implementation.
+
+    ``kernel`` is the intended packed-verifier path. ``token_loop`` keeps the
+    outer target-model call compiled, but reuses the canonical width-1 append
+    and attention primitive for each verifier position. The latter is a
+    correctness diagnostic, not a cheap-verification speed path.
+    """
+
+    value = os.environ.get(
+        "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL",
+        "kernel",
+    ).strip().lower()
+    if value in {"kernel", "rectangular", "packed", "flashinfer"}:
+        return "kernel"
+    if value in {"triton", "triton_paged", "paged_triton"}:
+        return "triton"
+    if value in {"scan", "loop", "tokenwise", "token_loop", "replay"}:
+        return "token_loop"
+    raise ValueError(
+        "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL must be "
+        "'kernel', 'triton', or 'token_loop'"
+    )
+
+
 def _full_attention_decode_uses_flashinfer(config: Optional[Qwen3_5Config]) -> bool:
     value = str(getattr(config, "full_attention_decode_impl", "reference") or "reference").strip().lower()
     return value in {
@@ -743,15 +828,15 @@ def _lm_head_normed_hidden_and_weight(
         hidden_norm = hidden
     else:
         if not is_prefill:
-            from nanovllm_jax.kernels.decode_reductions import (
-                decode_rms_norm,
-                lowered_decode_rms_norm_enabled,
-            )
-
-            hidden_norm = (
-                decode_rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
-                if lowered_decode_rms_norm_enabled()
-                else rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
+            hidden_norm = _decode_width1_rms_norm(
+                hidden,
+                params.norm_weight,
+                config.rms_norm_eps,
+                force_width1=(
+                    hidden.ndim == 3
+                    and hidden.shape[1] > 1
+                    and _force_width1_decode_norms()
+                ),
             )
         else:
             hidden_norm = rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
@@ -1502,7 +1587,7 @@ def gated_deltanet_block(
     force_width1_dot = (
         (not is_prefill or decode_like_prefill)
         and seq_len > 1
-        and _force_width1_decode_math()
+        and _force_width1_gdn_input_projections()
     )
     use_packed_decode_in_proj = _use_gdn_decode_packed_in_proj(
         params,
@@ -1727,6 +1812,10 @@ def gated_deltanet_block(
                 and not return_first_prefix_state
                 and not tail_fused_requested
                 and gdn_prefill_post_conv_enabled(config)
+            )
+            use_prefix_recurrent_decode = (
+                use_prefix_recurrent_decode
+                and _gdn_decode_prefix_state_impl() == "kernel"
             )
             output_parts = []
             conv_flat_parts = []
@@ -2744,7 +2833,7 @@ def gated_deltanet_block(
                 force_width1=(
                     decode_like_prefill
                     and seq_len > 1
-                    and _force_width1_decode_math()
+                    and _force_width1_gdn_output_projections()
                 ),
             )
             if hybrid_state is not None:
@@ -3002,7 +3091,7 @@ def gated_deltanet_block(
         force_width1=(
             (not is_prefill or decode_like_prefill)
             and seq_len > 1
-            and _force_width1_decode_math()
+            and _force_width1_gdn_output_projections()
         ),
     )
     
@@ -3038,7 +3127,7 @@ def gdn_decode_recurrent_input_max_abs(
 
     def build_inputs(x):
         batch, seq_len, _ = x.shape
-        force_width1_norm = seq_len > 1 and _force_width1_decode_math()
+        force_width1_norm = seq_len > 1 and _force_width1_decode_norms()
         x = _decode_width1_rms_norm(
             x,
             params["input_norm"],
@@ -3051,7 +3140,7 @@ def gdn_decode_recurrent_input_max_abs(
         value_dim = config.linear_num_value_heads * config.linear_value_head_dim
         v_heads_per_k = config.linear_num_value_heads // config.linear_num_key_heads
         conv_dim = key_dim * 2 + value_dim
-        force_width1_dot = seq_len > 1 and _force_width1_decode_math()
+        force_width1_dot = seq_len > 1 and _force_width1_gdn_input_projections()
         use_packed_decode_in_proj = _use_gdn_decode_packed_in_proj(
             params,
             is_prefill=False,
@@ -3261,7 +3350,7 @@ def full_attention_block(
         if (
             (not is_prefill or decode_like_prefill)
             and seq_len > 1
-            and _force_width1_decode_math()
+            and _force_width1_full_attention_projections()
         ):
             return _tokenwise_decode_dot(inp, weight, force_width1=True)
         if is_prefill and not decode_like_prefill:
@@ -3371,7 +3460,7 @@ def full_attention_block(
         # Apply RMSNorm BEFORE transpose (on head dimension, in [B, T, H, D] layout)
         force_width1_norm = (
             (not is_prefill or decode_like_prefill)
-            and _force_width1_decode_math()
+            and _force_width1_decode_norms()
         )
         query = _decode_width1_rms_norm(
             query,
@@ -3427,6 +3516,7 @@ def full_attention_block(
         flashinfer_rectangular_multitoken_decode = (
             (not is_prefill)
             and seq_len > 1
+            and _full_attention_rectangular_decode_impl() in {"kernel", "triton"}
             and _full_attention_decode_uses_flashinfer(config)
             and kv_cache_state.storage.k_cache.ndim == 5
             and kv_cache_state.storage.v_cache.ndim == 5
@@ -3555,13 +3645,16 @@ def full_attention_block(
         # For decode: out is [batch, 1, hidden_dim]
         # Both are already in the correct format
         
-        # Update KV cache state (preserve linear attention states)
-            kv_cache_state = replace(
-                kv_cache_state,
-                k_cache=cache_storage.k_cache,
-                v_cache=cache_storage.v_cache,
-                slot_mapping=metadata_for_state.slot_mapping,
-            )
+        # Update KV cache state (preserve linear attention states). This must
+        # run for both the rectangular kernel and token-loop replay branches;
+        # otherwise replay computes correct local attention outputs but drops
+        # every speculative KV write before the model returns.
+        kv_cache_state = replace(
+            kv_cache_state,
+            k_cache=cache_storage.k_cache,
+            v_cache=cache_storage.v_cache,
+            slot_mapping=metadata_for_state.slot_mapping,
+        )
     else:
         # No cache - standard attention (for prefill without caching)
         k = jnp.repeat(k, num_key_value_groups, axis=1)
@@ -3582,7 +3675,7 @@ def full_attention_block(
         force_width1=(
             (not is_prefill or decode_like_prefill)
             and seq_len > 1
-            and _force_width1_decode_math()
+            and _force_width1_full_attention_projections()
         ),
     )
     
@@ -3643,7 +3736,7 @@ def transformer_block(
     force_width1_norm = (
         (not is_prefill or decode_like_prefill)
         and x.ndim == 3
-        and _force_width1_decode_math()
+        and _force_width1_decode_norms()
     )
     x = _decode_width1_rms_norm(
         x,
@@ -3794,6 +3887,12 @@ def transformer_block(
 
     # MLP path
     residual = x
+    force_width1_dot = (
+        (not is_prefill or decode_like_prefill)
+        and x.ndim == 3
+        and x.shape[1] > 1
+        and _force_width1_mlp_projections()
+    )
     fused_mlp_gate_up = None
     if (
         (not is_prefill or decode_like_prefill)
@@ -3805,7 +3904,7 @@ def transformer_block(
             params["ffn_norm"],
             params[_MLP_GATE_UP_PACKED_KEY],
             config,
-            force_width1=force_width1_norm,
+            force_width1=force_width1_dot,
         )
         if fused_mlp_gate_up is not None:
             ffn_norm_out = x
@@ -3819,12 +3918,6 @@ def transformer_block(
         ffn_norm_out = x
 
     # MLP computation (stays in bfloat16)
-    force_width1_dot = (
-        (not is_prefill or decode_like_prefill)
-        and x.ndim == 3
-        and x.shape[1] > 1
-        and _force_width1_decode_math()
-    )
     activation_fn = get_activation(config.hidden_act)
     if is_prefill and not decode_like_prefill:
         if _MLP_GATE_UP_PACKED_KEY in params:
@@ -3938,6 +4031,7 @@ def forward_step(
     return_kv_prewrite: bool = False,
     return_layer_stages: bool = False,
     hybrid_state_layerwise: bool = False,
+    prefix_hybrid_layer_first: bool = False,
     force_prefill_prefix_kernel: bool = False,
     prefill_prefix_kernel_scope: str = "none",
 ):
@@ -4195,9 +4289,13 @@ def forward_step(
             recurrent_state=jnp.stack(hybrid_recurrent_layers, axis=1),
         )
         if return_prefix_hybrid:
+            prefix_layer_axis = 0 if prefix_hybrid_layer_first else 2
             prefix_hybrid_state = HybridLayerState(
-                conv_state=jnp.stack(prefix_conv_layers, axis=2),
-                recurrent_state=jnp.stack(prefix_recurrent_layers, axis=2),
+                conv_state=jnp.stack(prefix_conv_layers, axis=prefix_layer_axis),
+                recurrent_state=jnp.stack(
+                    prefix_recurrent_layers,
+                    axis=prefix_layer_axis,
+                ),
             )
         elif return_first_prefix_hybrid:
             prefix_hybrid_state = HybridLayerState(
@@ -4240,7 +4338,16 @@ def forward_step(
             return hidden_pre, kv_cache_state, hybrid_state, prefix_hybrid_state
         return hidden_pre, kv_cache_state, hybrid_state
 
-    x = rms_norm(x, params.norm_weight, config.rms_norm_eps)
+    x = _decode_width1_rms_norm(
+        x,
+        params.norm_weight,
+        config.rms_norm_eps,
+        force_width1=(
+            not is_prefill
+            and seq_len > 1
+            and _force_width1_decode_norms()
+        ),
+    )
     x = x.astype(jnp.float32)
     if last_logits_only:
         if logit_positions is None:

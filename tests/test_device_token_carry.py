@@ -437,6 +437,45 @@ def test_model_runner_release_preserves_carry_for_still_running_rows():
     assert runner._device_token_carry_by_seq_id[8].row == 1
 
 
+def test_mtp_finishing_rows_do_not_clear_untouched_device_carry(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
+    runner = ModelRunner.__new__(ModelRunner)
+    token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
+    runner._device_token_carry_seq_ids = (7, 8)
+    runner._device_token_carry_tokens = token_vector
+    runner._device_token_carry_by_seq_id = {
+        7: DeviceTokenRef(tokens=token_vector, row=0),
+        8: DeviceTokenRef(tokens=token_vector, row=1),
+    }
+    runner._device_seq_lens_carry_seq_ids = (7, 8)
+    runner._device_seq_lens_carry = jnp.asarray([4, 5], dtype=jnp.int32)
+    finished = Sequence(
+        [1],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        seq_id=7,
+    )
+    untouched = Sequence(
+        [2],
+        SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True),
+        seq_id=8,
+    )
+    batch = _decode_batch((7, 8), [0, 0], seq_lens=[4, 5])
+
+    runner._record_mtp_output_token_carry(
+        batch,
+        [finished, untouched],
+        {0: [70]},
+        update_resident_tokens=False,
+    )
+
+    assert runner._device_token_carry_seq_ids is None
+    assert runner._device_token_carry_tokens is None
+    assert set(runner._device_token_carry_by_seq_id) == {8}
+    assert runner._device_token_carry_by_seq_id[8].row == 1
+    assert runner._device_seq_lens_carry_seq_ids is None
+    assert runner._device_seq_lens_carry is None
+
+
 def test_scheduler_static_decode_metadata_reuses_fixed_device_arrays(monkeypatch):
     monkeypatch.setenv("NANO_VLLM_JAX_DEVICE_TOKEN_CARRY", "1")
     monkeypatch.setenv("NANO_VLLM_JAX_STATIC_DECODE_METADATA", "1")

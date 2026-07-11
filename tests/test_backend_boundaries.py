@@ -391,9 +391,9 @@ def test_configured_triton_decode_attention_matches_reference_non_contiguous_blo
         num_blocks=6,
         block_size=block_size,
         num_kv_heads=1,
-        head_dim=16,
+        head_dim=128,
         dtype=jnp.float32,
-        max_kv_cache_bytes=4096,
+        max_kv_cache_bytes=32768,
     )
     cache = backend.allocate_kv_cache(spec, max_seqs=3, max_blocks_per_seq=3)
     block_tables = jnp.array([[2, 0, 4], [3, 1, 5], [0, 0, 0]], dtype=jnp.int32)
@@ -401,12 +401,12 @@ def test_configured_triton_decode_attention_matches_reference_non_contiguous_blo
     key = jax.random.PRNGKey(220)
     dense_k = jax.random.normal(
         key,
-        (3, 6, 1, 16),
+        (3, 6, 1, 128),
         dtype=jnp.float32,
     ).astype(jnp.bfloat16)
     dense_v = jax.random.normal(
         jax.random.fold_in(key, 1),
-        (3, 6, 1, 16),
+        (3, 6, 1, 128),
         dtype=jnp.float32,
     ).astype(jnp.bfloat16)
 
@@ -422,7 +422,7 @@ def test_configured_triton_decode_attention_matches_reference_non_contiguous_blo
 
     query = jax.random.normal(
         jax.random.fold_in(key, 2),
-        (3, 1, 2, 16),
+        (3, 1, 2, 128),
         dtype=jnp.float32,
     )
     metadata = backend.build_attention_metadata(
@@ -438,7 +438,7 @@ def test_configured_triton_decode_attention_matches_reference_non_contiguous_blo
         cache=cache,
         metadata=metadata,
         block_size=block_size,
-        scale=1.0 / np.sqrt(16),
+        scale=1.0 / np.sqrt(128),
         num_key_value_groups=2,
         is_prefill=False,
     )
@@ -451,9 +451,9 @@ def test_configured_triton_decode_attention_matches_reference_non_contiguous_blo
         kv_indices,
         kv_last_page_len_from_seq_lens(seq_lens, block_size),
         seq_lens,
-        1.0 / np.sqrt(16),
+        1.0 / np.sqrt(128),
         max_pages_per_sequence=block_tables.shape[1],
-    ).reshape(3, 1, 2 * 16)
+    ).reshape(3, 1, 2 * 128)
 
     np.testing.assert_allclose(
         np.asarray(actual[:2], dtype=np.float32),
@@ -461,6 +461,214 @@ def test_configured_triton_decode_attention_matches_reference_non_contiguous_blo
         rtol=3e-2,
         atol=3e-2,
     )
+
+
+def test_flashinfer_decode_metadata_compacts_live_pages_once(monkeypatch):
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_FLASHINFER_PAGE_TABLE_IMPL",
+        "compact_jax",
+    )
+    config = Qwen3_5Config(
+        full_attention_decode_impl="flashinfer_paged",
+        full_attention_kv_cache_dtype="bf16",
+    )
+    backend = PureJAXBackend(config=config)
+    metadata = backend.build_attention_metadata(
+        positions=jnp.array([[16, 17], [29, 30]], dtype=jnp.int32),
+        block_tables=jnp.array(
+            [[2, 0, 7, 6], [3, 1, 5, 4]],
+            dtype=jnp.int32,
+        ),
+        seq_lens=jnp.array([18, 31], dtype=jnp.int32),
+        block_size=16,
+        is_prefill=False,
+        max_query_len=2,
+    )
+
+    np.testing.assert_array_equal(np.asarray(metadata.paged_kv_indptr), [0, 2, 4])
+    np.testing.assert_array_equal(np.asarray(metadata.paged_kv_indices)[:4], [2, 0, 3, 1])
+    np.testing.assert_array_equal(
+        np.asarray(metadata.decode_query_seq_lens),
+        [17, 18, 30, 31],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(metadata.decode_query_kv_indptr),
+        [0, 2, 4, 6, 8],
+    )
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+def test_triton_flashinfer_page_compaction_matches_jax():
+    from nanovllm_jax.kernels.full_attention_triton import (
+        compact_block_tables_to_kv_indptr_triton,
+    )
+    from nanovllm_jax.kernels.paged_attention import (
+        compact_block_tables_to_kv_indptr,
+    )
+
+    block_tables = jnp.array(
+        [[2, 0, 7, 6], [3, 1, 5, 4], [6, 7, 0, 0]],
+        dtype=jnp.int32,
+    )
+    seq_lens = jnp.array([17, 30, 5], dtype=jnp.int32)
+    actual_indices, actual_indptr = jax.jit(
+        lambda tables, lens: compact_block_tables_to_kv_indptr_triton(
+            tables,
+            lens,
+            16,
+        )
+    )(block_tables, seq_lens)
+    expected_indices, expected_indptr = compact_block_tables_to_kv_indptr(
+        block_tables,
+        seq_lens,
+        16,
+    )
+
+    np.testing.assert_array_equal(np.asarray(actual_indptr), np.asarray(expected_indptr))
+    np.testing.assert_array_equal(np.asarray(actual_indices), np.asarray(expected_indices))
+
+
+@pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
+@pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
+@pytest.mark.skipif(
+    not (
+        importlib.util.find_spec("flashinfer")
+        and importlib.util.find_spec("jax_tvm_ffi")
+    ),
+    reason="FlashInfer/JAX FFI optional dependencies are required",
+)
+@pytest.mark.parametrize(
+    ("rectangular_impl", "page_table_impl"),
+    (("triton", "dense"), ("kernel", "dense")),
+)
+def test_rectangular_decode_attention_matches_causal_reference(
+    monkeypatch,
+    rectangular_impl,
+    page_table_impl,
+):
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL",
+        rectangular_impl,
+    )
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_FLASHINFER_PAGE_TABLE_IMPL",
+        page_table_impl,
+    )
+    config = Qwen3_5Config(
+        full_attention_decode_impl="flashinfer_paged",
+        full_attention_kv_cache_dtype="bf16",
+    )
+    backend = PureJAXBackend(config=config)
+    block_size = 2
+    spec = KVCacheSpec(
+        num_layers=1,
+        num_blocks=8,
+        block_size=block_size,
+        num_kv_heads=1,
+        head_dim=128,
+        dtype=jnp.bfloat16,
+        max_kv_cache_bytes=131072,
+    )
+    cache = backend.allocate_kv_cache(spec, max_seqs=2, max_blocks_per_seq=4)
+    block_tables = jnp.array(
+        [[2, 0, 6, 7], [3, 1, 5, 4]],
+        dtype=jnp.int32,
+    )
+    positions = jnp.array([[2, 3], [4, 5]], dtype=jnp.int32)
+    final_seq_lens = jnp.array([4, 6], dtype=jnp.int32)
+    key = jax.random.PRNGKey(901)
+    query = jax.random.normal(
+        key,
+        (2, 2, 2, 128),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    new_k = jax.random.normal(
+        jax.random.fold_in(key, 1),
+        (2, 2, 1, 128),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    new_v = jax.random.normal(
+        jax.random.fold_in(key, 2),
+        (2, 2, 1, 128),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+
+    k_cache = cache.k_cache
+    v_cache = cache.v_cache
+    prefix_lens = [2, 4]
+    for row, prefix_len in enumerate(prefix_lens):
+        for pos in range(prefix_len):
+            page = int(block_tables[row, pos // block_size])
+            slot = pos % block_size
+            value = jnp.full((1, 128), row * 20 + pos + 1, dtype=jnp.bfloat16)
+            k_cache = k_cache.at[0, page, slot].set(value)
+            v_cache = v_cache.at[0, page, slot].set(value * 0.5)
+    cache = type(cache)(k_cache, v_cache)
+    metadata = backend.build_attention_metadata(
+        positions=positions,
+        block_tables=block_tables,
+        seq_lens=final_seq_lens,
+        block_size=block_size,
+        is_prefill=False,
+        max_query_len=2,
+    )
+
+    def run(q, k, v, kc, vc):
+        storage, out = backend.write_kv_and_attention(
+            layer_id=0,
+            query=q,
+            k=k,
+            v=v,
+            cache=type(cache)(kc, vc),
+            metadata=metadata,
+            block_size=block_size,
+            scale=1.0 / np.sqrt(128),
+            num_key_value_groups=2,
+            is_prefill=False,
+        )
+        return storage.k_cache, storage.v_cache, out
+
+    actual_k, actual_v, actual = jax.jit(run)(
+        query,
+        new_k,
+        new_v,
+        cache.k_cache,
+        cache.v_cache,
+    )
+
+    expected_k = cache.k_cache
+    expected_v = cache.v_cache
+    for row in range(2):
+        for offset in range(2):
+            pos = int(positions[row, offset])
+            page = int(block_tables[row, pos // block_size])
+            slot = pos % block_size
+            expected_k = expected_k.at[0, page, slot].set(new_k[row, offset])
+            expected_v = expected_v.at[0, page, slot].set(new_v[row, offset])
+    expanded_tables = jnp.repeat(block_tables, 2, axis=0)
+    expanded_lens = jnp.array([3, 4, 5, 6], dtype=jnp.int32)
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(expanded_tables)
+    expected = paged_decode_attention_gqa_nhd_reference(
+        query.reshape(4, 2, 128),
+        expected_k[0],
+        expected_v[0],
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len_from_seq_lens(expanded_lens, block_size),
+        expanded_lens,
+        1.0 / np.sqrt(128),
+        max_pages_per_sequence=expanded_tables.shape[1],
+    ).reshape(2, 2, 2 * 128)
+
+    np.testing.assert_allclose(
+        np.asarray(actual, dtype=np.float32),
+        np.asarray(expected, dtype=np.float32),
+        rtol=3e-2,
+        atol=3e-2,
+    )
+    np.testing.assert_array_equal(np.asarray(actual_k), np.asarray(expected_k))
+    np.testing.assert_array_equal(np.asarray(actual_v), np.asarray(expected_v))
 
 
 def test_configured_packed_prefill_attention_impl_controls_triton_route(monkeypatch):
@@ -1192,6 +1400,41 @@ def test_mtp_gated_decode_can_use_static_metadata_hot_path():
 
     assert batch.speculative_method == "none"
     assert batch.uses_static_decode_metadata
+
+
+def test_mtp_packed_prefix_decode_can_use_resident_static_metadata():
+    config = _tiny_full_attention_config()
+    config.block_size = 8
+    config.max_num_seqs = 2
+    config.batch_size_buckets = (2,)
+    config.max_blocks_per_seq = 2
+    config.num_speculative_tokens = 2
+    config.speculative_method = "mtp"
+    config.mtp_verifier_impl = "packed_prefix"
+    config.jax_execution = "jit"
+    config.device_token_carry = True
+    config.static_decode_metadata = True
+    config.resident_decode_metadata = True
+    scheduler = Scheduler(config)
+    seqs = [
+        Sequence([1, 2, 0], SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True), seq_id=30),
+        Sequence([4, 5, 0], SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True), seq_id=31),
+    ]
+    carried_tokens = jnp.array([3, 6], dtype=jnp.int32)
+    for row, seq in enumerate(seqs):
+        seq.status = SequenceStatus.RUNNING
+        seq.block_table = [row]
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        seq.last_token = 0
+        seq.last_token_device = DeviceTokenRef(carried_tokens, row)
+        seq.mtp_admitted = True
+
+    batch = scheduler.build_scheduled_batch(seqs, is_prefill=False)
+
+    assert batch.speculative_method == "mtp"
+    assert batch.uses_static_decode_metadata
+    np.testing.assert_array_equal(np.asarray(batch.block_tables), np.zeros((2, 2), dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(batch.seq_lens), np.zeros((2,), dtype=np.int32))
 
 
 def test_scheduler_rejects_requests_exceeding_static_capacity():
@@ -2897,6 +3140,59 @@ def test_model_runner_warmup_uses_greedy_token_fastpath_without_mtp(monkeypatch)
     ]
     assert summary["prefill_runs"][0]["route"] == "forward_step_token_ids_jit:prefill"
     assert summary["decode_runs"][0]["route"] == "forward_step_token_ids_jit:decode"
+
+
+def test_model_runner_warmup_clamps_batch_buckets_to_server_capacity(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_GREEDY_TOKEN_FASTPATH", "1")
+    config = _tiny_full_attention_config()
+    config.jax_execution = "jit"
+    config.prefill_buckets = (4,)
+    config.batch_size_buckets = (1, 2)
+    config.max_num_seqs = 2
+    config.max_blocks_per_seq = 2
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = config
+    runner.block_size = config.block_size
+    runner.max_blocks_per_seq = 2
+    runner.execution = "jit"
+    runner.cache_storage = object()
+    runner._warmup_compiled = False
+    runner.mtp1_enabled = False
+    runner._hybrid_state_table = None
+
+    class Ready:
+        def block_until_ready(self):
+            return self
+
+    class FakeExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def forward_step_token_ids_jit(self, batch, **kwargs):
+            self.calls.append((tuple(batch.tokens.shape), batch.is_prefill))
+            return type(
+                "Output",
+                (),
+                {
+                    "activations": Ready(),
+                    "cache_storage": kwargs["cache_storage"],
+                },
+            )()
+
+    runner.executor = FakeExecutor()
+    runner._sample_fn = lambda logits, temperatures: Ready()
+    runner._reset_runtime_state_after_warmup = lambda: None
+
+    summary = runner.warmup_compilation(
+        max_prefill_len=4,
+        max_batch=2,
+        batch_size_buckets=(1, 4),
+    )
+
+    assert summary["requested_batch_size_buckets"] == [1, 4]
+    assert summary["batch_size_buckets"] == [1, 2]
+    assert summary["batch_size_buckets_clamped_to"] == 2
+    assert all(shape[0] <= 2 for shape, _is_prefill in runner.executor.calls)
 
 
 def test_model_runner_warmup_compiles_table_prefill_when_available(monkeypatch):

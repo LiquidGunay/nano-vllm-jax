@@ -62,6 +62,13 @@ class AttentionMetadata:
     max_kv_len: Optional[int] = None
     token_row_ids: Optional[jnp.ndarray] = None
     max_query_len: Optional[int] = None
+    paged_kv_indices: Optional[jnp.ndarray] = None
+    paged_kv_indptr: Optional[jnp.ndarray] = None
+    paged_kv_last_page_len: Optional[jnp.ndarray] = None
+    decode_query_kv_indices: Optional[jnp.ndarray] = None
+    decode_query_kv_indptr: Optional[jnp.ndarray] = None
+    decode_query_kv_last_page_len: Optional[jnp.ndarray] = None
+    decode_query_seq_lens: Optional[jnp.ndarray] = None
 
 
 @dataclass

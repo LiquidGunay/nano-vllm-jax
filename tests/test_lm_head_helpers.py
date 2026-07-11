@@ -13,10 +13,85 @@ from nanovllm_jax.model import (
     _can_use_decode_padded_gemm,
     _compact_prefill_dot_if_enabled,
     _compact_prefill_mlp,
+    _force_width1_decode_norms,
+    _force_width1_gdn_input_projections,
+    _full_attention_rectangular_decode_impl,
+    _gdn_decode_prefix_state_impl,
     _lm_head_greedy_top1_impl,
     lm_head_sample_token_ids,
     lm_head_token_ids_and_topk,
 )
+
+
+def test_decode_norm_width_policy_can_be_split_from_projection_math(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH", "0")
+    monkeypatch.delenv("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_NORMS", raising=False)
+    assert not _force_width1_decode_norms()
+
+    monkeypatch.setenv("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_NORMS", "1")
+    assert _force_width1_decode_norms()
+
+    monkeypatch.setenv("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_NORMS", "0")
+    assert not _force_width1_decode_norms()
+
+
+def test_decode_component_width_policy_overrides_global_default(monkeypatch):
+    monkeypatch.setenv("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH", "0")
+    monkeypatch.delenv(
+        "NANO_VLLM_JAX_FORCE_WIDTH1_GDN_INPUT_PROJECTIONS",
+        raising=False,
+    )
+    assert not _force_width1_gdn_input_projections()
+
+    monkeypatch.setenv("NANO_VLLM_JAX_FORCE_WIDTH1_GDN_INPUT_PROJECTIONS", "1")
+    assert _force_width1_gdn_input_projections()
+
+    monkeypatch.setenv("NANO_VLLM_JAX_FORCE_WIDTH1_DECODE_MATH", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_FORCE_WIDTH1_GDN_INPUT_PROJECTIONS", "0")
+    assert not _force_width1_gdn_input_projections()
+
+
+def test_gdn_decode_prefix_state_impl_is_explicit(monkeypatch):
+    monkeypatch.delenv("NANO_VLLM_JAX_GDN_DECODE_PREFIX_STATE_IMPL", raising=False)
+    assert _gdn_decode_prefix_state_impl() == "kernel"
+
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_DECODE_PREFIX_STATE_IMPL", "scan")
+    assert _gdn_decode_prefix_state_impl() == "token_loop"
+
+    monkeypatch.setenv("NANO_VLLM_JAX_GDN_DECODE_PREFIX_STATE_IMPL", "invalid")
+    with pytest.raises(ValueError, match="must be 'kernel' or 'token_loop'"):
+        _gdn_decode_prefix_state_impl()
+
+
+def test_full_attention_rectangular_decode_impl_is_explicit(monkeypatch):
+    monkeypatch.delenv(
+        "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL",
+        raising=False,
+    )
+    assert _full_attention_rectangular_decode_impl() == "kernel"
+
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL",
+        "replay",
+    )
+    assert _full_attention_rectangular_decode_impl() == "token_loop"
+
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL",
+        "triton",
+    )
+    assert _full_attention_rectangular_decode_impl() == "triton"
+
+    monkeypatch.setenv(
+        "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL",
+        "invalid",
+    )
+    with pytest.raises(
+        ValueError,
+        match="must be 'kernel', 'triton', or 'token_loop'",
+    ):
+        _full_attention_rectangular_decode_impl()
 
 
 def test_lm_head_token_ids_and_topk_matches_full_logits(monkeypatch):

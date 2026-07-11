@@ -1,10 +1,36 @@
+from types import SimpleNamespace
+
 import pytest
 
 from benchmarks.benchmark_jax_server_trace import (
+    _mtp_static_warmup_row_count,
     _performance_with_token_scopes,
     _timing_metrics,
     _timing_metrics_from_trace,
 )
+
+
+def test_mtp_static_warmup_rows_match_fixed_verifier_bucket():
+    args = SimpleNamespace(mtp_max_active_rows=0)
+    config = SimpleNamespace(
+        mtp_max_active_rows=2,
+        batch_size_buckets=(1, 2),
+    )
+
+    assert _mtp_static_warmup_row_count(1, args, config) == 2
+    assert _mtp_static_warmup_row_count(2, args, config) == 2
+    assert _mtp_static_warmup_row_count(3, args, config) == 3
+
+
+def test_mtp_static_warmup_rows_reject_unreachable_bucket():
+    args = SimpleNamespace(mtp_max_active_rows=0)
+    config = SimpleNamespace(
+        mtp_max_active_rows=4,
+        batch_size_buckets=(1, 2),
+    )
+
+    with pytest.raises(ValueError, match="exceeds configured batch buckets"):
+        _mtp_static_warmup_row_count(1, args, config)
 
 
 def test_timing_metrics_reports_final_materialization_gap():

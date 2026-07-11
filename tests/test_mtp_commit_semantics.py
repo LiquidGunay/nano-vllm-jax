@@ -52,6 +52,45 @@ def _seq(seq_id, num_tokens, *, max_tokens=64, eos=None, ignore_eos=False):
     return seq
 
 
+def test_resident_target_rows_mask_host_metadata_and_reuse_device_buffers():
+    runner = object.__new__(ModelRunner)
+    runner._hybrid_slots = {0: 5, 1: 6, 2: 7}
+    batch = _batch([17, 18, 19])
+    batch.uses_static_decode_metadata = True
+    # Simulate the packed verifier having masked a non-verifier row on an
+    # aliased batch object.  The sequence-to-slot map remains authoritative.
+    batch.hybrid_slot_ids_host = (5, -1, 7)
+    captured = {}
+
+    def fake_main(seqs, masked_batch, *, seed_mtp1):
+        captured["seqs"] = seqs
+        captured["batch"] = masked_batch
+        captured["seed_mtp1"] = seed_mtp1
+        return [[], 41, 42]
+
+    runner._run_main_and_sample = fake_main
+    seqs = [object(), object(), object()]
+
+    outputs = runner._run_static_resident_target_rows(seqs, batch, [1, 2])
+    masked = captured["batch"]
+
+    assert outputs == [[], 41, 42]
+    assert captured["seqs"] is seqs
+    assert captured["seed_mtp1"] is False
+    assert masked.tokens is batch.tokens
+    assert masked.positions is batch.positions
+    assert masked.seq_ids is batch.seq_ids
+    assert masked.query_start_loc is batch.query_start_loc
+    assert masked.block_tables is batch.block_tables
+    assert masked.seq_lens is batch.seq_lens
+    assert masked.uses_static_decode_metadata
+    assert masked.num_decode_tokens == 2
+    assert masked.seq_ids_host == (-1, 1, 2)
+    assert masked.query_lens_host == (0, 1, 1)
+    assert masked.seq_lens_host == (0, 18, 19)
+    assert masked.hybrid_slot_ids_host == (-1, 6, 7)
+
+
 class _FakeExecutor:
     def __init__(
         self,
@@ -834,6 +873,16 @@ class _FakeRunner:
     def _materialize_static_decode_metadata_batch(self, batch):
         return batch
 
+    @staticmethod
+    def _active_decode_rows_host(batch):
+        return ModelRunner._active_decode_rows_host(batch)
+
+    def _can_run_static_resident_target_rows(self, batch):
+        return ModelRunner._can_run_static_resident_target_rows(self, batch)
+
+    def _run_static_resident_target_rows(self, seqs, batch, rows):
+        return ModelRunner._run_static_resident_target_rows(self, seqs, batch, rows)
+
     def _mtp_static_batch_size(self, size):
         target = int(getattr(self.config, "mtp_max_active_rows", 0) or 0)
         if target > 0 and int(size) <= target:
@@ -1245,6 +1294,84 @@ def test_strict_k_run_bootstraps_missing_draft_with_fused_seed(monkeypatch):
     assert _resolve_output_tokens(runner._mtp1_drafts[0]) == [301, 302]
     assert runner.stats.get("mtp_bootstrap_main_seed_steps", 0) == 1
     assert runner.stats.get("fallback_seeded_main_steps", 0) == 0
+
+
+def test_strict_k_fused_seed_uses_static_mtp_row_bucket(monkeypatch):
+    executor = _FakeExecutor(
+        accepted=[[True, True]],
+        target=[100],
+        bonus=[201],
+        next_draft=[[301, 302]],
+        state_marker=[930],
+        committed_seq_lens=[8],
+        kv_slots=[[1000, 1001, 1002]],
+    )
+    runner = _FakeRunner(
+        executor,
+        {},
+        block_size=16,
+        num_speculative_tokens=2,
+    )
+    runner.mtp_verifier_impl = "packed_prefix"
+    runner.config.mtp_max_active_rows = 2
+    runner.mtp_max_active_rows = 2
+    seqs = [_seq(0, 5, max_tokens=64, ignore_eos=True)]
+
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    outputs = ModelRunner.run(runner, seqs, batch=_batch([5]))
+
+    assert _resolve_output_tokens(outputs[0]) == [100]
+    assert executor.calls[-1]["method"] == "forward_step_token_ids_mtp_draft_chain"
+    assert executor.calls[-1]["batch_size"] == 2
+    assert executor.calls[-1]["seq_ids"] == [0, -1]
+    assert executor.calls[-1]["query_lens"] == [1, 0]
+    assert _resolve_output_tokens(runner._mtp1_drafts[0]) == [301, 302]
+
+
+def test_strict_packed_prefix_gates_fixed_k_tail_without_stale_draft(monkeypatch):
+    executor = _FakeExecutor(
+        accepted=[[True, True, True]],
+        target=[[10, 11, 12]],
+        bonus=[20],
+        next_draft=[[30, 31, 32]],
+        state_marker=[930],
+        committed_seq_lens=[64],
+        kv_slots=[[1000, 1001, 1002, 1003]],
+    )
+    runner = _FakeRunner(
+        executor,
+        {0: [10, 11, 12]},
+        block_size=16,
+        num_speculative_tokens=3,
+    )
+    runner.mtp_verifier_impl = "packed_prefix"
+    runner.resident_decode_metadata = True
+    runner.stats.update(
+        {
+            "fallback_gated_no_spec_steps": 0,
+            "fallback_partial_rows": 0,
+            "fallback_seeded_main_steps": 0,
+            "fallback_steps": 0,
+        }
+    )
+    seqs = [_seq(0, 63, max_tokens=64, ignore_eos=True)]
+    fallback_calls = []
+
+    def fallback_main(seqs_arg, batch_arg, seed_mtp1):
+        fallback_calls.append((list(seqs_arg), batch_arg, bool(seed_mtp1)))
+        return [999]
+
+    runner._run_main_and_sample = fallback_main
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_FUSED_VERIFY", "1")
+    monkeypatch.setenv("NANO_VLLM_JAX_MTP_TABLE_TARGET_MODE", "decode_rectangular")
+
+    outputs = ModelRunner.run(runner, seqs, batch=_batch([63]))
+
+    assert outputs == [999]
+    assert fallback_calls and fallback_calls[-1][2] is False
+    assert runner._mtp1_drafts == {}
+    assert not executor.calls
+    assert runner.stats["fallback_gated_no_spec_steps"] == 1
 
 
 def test_k1_commit_b1_accepted_invariants_and_parity(monkeypatch):
@@ -2889,7 +3016,16 @@ def test_packed_prefix_table_verifier_real_executor_updates_resident_table(
         / 100.0,
     )
     slot_ids = jnp.array([1, 2], dtype=jnp.int32)
+    resident_block_tables = jnp.array(
+        [
+            [0, 0, 0, 0],
+            [0, 1, 2, 3],
+            [4, 5, 6, 7],
+        ],
+        dtype=jnp.int32,
+    )
     resident_seq_lens = jnp.array([99, 1, 1], dtype=jnp.int32)
+    resident_last_tokens = jnp.array([99, 3, 4], dtype=jnp.int32)
 
     def table_run(drafts):
         return executor.mtp_k_packed_prefix_table_greedy_step_jit(
@@ -2903,7 +3039,9 @@ def test_packed_prefix_table_verifier_real_executor_updates_resident_table(
             mtp_hidden_final_normed=True,
             mtp_chain_return_normed=False,
             mtp_chain_mode="recursive",
+            resident_block_tables=resident_block_tables,
             resident_seq_lens=resident_seq_lens,
+            resident_last_tokens=resident_last_tokens,
         )
 
     first_probe = table_run([[-1, -1], [-1, -1]])
@@ -2926,6 +3064,19 @@ def test_packed_prefix_table_verifier_real_executor_updates_resident_table(
         np.testing.assert_array_equal(
             np.asarray(table_output.resident_seq_lens),
             np.asarray(resident_seq_lens.at[slot_ids].set(jnp.asarray(expected_seq_lens))),
+        )
+        emitted = np.asarray(table_output.emitted_tokens)
+        emitted_counts = np.asarray(table_output.emitted_counts)[:, 0]
+        expected_last_tokens = np.asarray(resident_last_tokens).copy()
+        for row, slot in enumerate(np.asarray(slot_ids)):
+            expected_last_tokens[int(slot)] = emitted[
+                row,
+                0,
+                int(emitted_counts[row]) - 1,
+            ]
+        np.testing.assert_array_equal(
+            np.asarray(table_output.resident_last_tokens),
+            expected_last_tokens,
         )
         np.testing.assert_allclose(
             np.asarray(table_output.hybrid_state.conv_state[0]),
