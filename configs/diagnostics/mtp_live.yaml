@@ -17,8 +17,8 @@ benchmark:
   skip_vllm: true
   skip_jax: false
   reference_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_backend_b1_20260711/qwen35_4b_no_mtp_current_b1_64x64_jax.json"
-  run_label: "qwen35_4b_strict_k2_packed_weights_b1_64x64"
-  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_backend_b1_20260711/qwen35_4b_strict_k2_packed_weights_b1_64x64.json"
+  run_label: "qwen35_4b_strict_k2_live_b1_64x64"
+  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_live/qwen35_4b_strict_k2_live_b1_64x64.json"
   seed: 20260710
   dataset_name: "random"
   min_input_tokens: 64
@@ -79,15 +79,15 @@ benchmark:
   vllm_tensor_parallel_size: 1
   vllm_max_num_seqs: 1
   vllm_max_num_batched_tokens: 64
-  vllm_cudagraph_capture_sizes: "1"
+  vllm_cudagraph_capture_sizes: "3"
   vllm_language_model_only: true
   vllm_skip_mm_profiling: true
   vllm_enable_v1_multiprocessing: false
   vllm_use_flashinfer_sampler: false
-  vllm_log_stats: false
-  vllm_mode: "baseline"
+  vllm_log_stats: true
+  vllm_mode: "mtp"
   vllm_speculative_method: "mtp"
-  vllm_num_speculative_tokens: 0
+  vllm_num_speculative_tokens: 2
 
   command_timeout_seconds: 900
   max_system_ram_percent: 70

@@ -6158,17 +6158,34 @@ class CanonicalModelRunner:
                     and seq.num_completion_tokens + 1 < seq.max_tokens
                     and not getattr(self, "_mtp_adaptive_gated", lambda: False)()
                 ):
-                    draft_row = prefill_mtp_draft_tokens[row]
-                    if getattr(prefill_mtp_draft_tokens, "ndim", 0) == 1:
-                        draft_value = int(draft_row.item())
-                        draft_count = 1
+                    draft_width = (
+                        1
+                        if getattr(prefill_mtp_draft_tokens, "ndim", 0) == 1
+                        else int(prefill_mtp_draft_tokens.shape[1])
+                    )
+                    if self._device_token_carry_enabled():
+                        draft_chain = [
+                            DeviceTokenRef(
+                                tokens=prefill_mtp_draft_tokens,
+                                row=row * draft_width + position,
+                            )
+                            for position in range(draft_width)
+                        ]
+                        draft_value = (
+                            draft_chain if len(draft_chain) > 1 else draft_chain[0]
+                        )
                     else:
-                        draft_chain = [int(token) for token in draft_row.tolist()]
-                        draft_value = draft_chain if len(draft_chain) > 1 else draft_chain[0]
-                        draft_count = len(draft_chain)
+                        draft_row = prefill_mtp_draft_tokens[row]
+                        draft_chain = [
+                            int(token)
+                            for token in jnp.asarray(draft_row).reshape(-1).tolist()
+                        ]
+                        draft_value = (
+                            draft_chain if len(draft_chain) > 1 else draft_chain[0]
+                        )
                     self._mtp1_drafts[seq.seq_id] = draft_value
                     self._mtp1_seeded_chain[seq.seq_id] = 0
-                    self._speculative_stats()["drafts_proposed"] += draft_count
+                    self._speculative_stats()["drafts_proposed"] += draft_width
                 else:
                     self._mtp1_drafts.pop(seq.seq_id, None)
                     self._mtp1_seeded_chain.pop(seq.seq_id, None)
@@ -7636,6 +7653,12 @@ class CanonicalModelRunner:
                 return
             _block_until_ready_tree(value)
 
+        def _profile_token_value(value: object) -> int:
+            if isinstance(value, DeviceTokenRef):
+                flat = jnp.asarray(value.tokens, dtype=jnp.int32).reshape(-1)
+                return int(jax.device_get(flat[int(value.row)]))
+            return int(value)
+
         def _mark(label: str, start: float) -> float:
             if profile_mtp:
                 now = time.perf_counter()
@@ -7694,12 +7717,15 @@ class CanonicalModelRunner:
                 "NANO_VLLM_JAX_MTP_LAYERWISE_DRIFT_DEBUG",
             )
         )
+        query_lens_host = batch.query_lens_host
+        if query_lens_host is None:
+            query_lens_host = tuple(int(value) for value in batch.query_lens.tolist())
         use_fused_step = (
             not use_debug
             and not force_scalar_mtp
             and getattr(self, "execution", "eager") in {"decode-jit", "jit"}
             and hasattr(self.executor, "mtp1_commit_select_greedy_step_jit")
-            and all(int(batch.query_lens[row]) == 1 for row in rows)
+            and all(int(query_lens_host[row]) == 1 for row in rows)
         )
         if not use_fused_step:
             if int(batch.tokens.shape[0]) != 1 or rows != [0]:
@@ -9495,6 +9521,14 @@ class CanonicalModelRunner:
                             "emitted_count": int(emitted_total),
                             "accepted_count": int(accepted_total),
                             "bonus_count": int(bonus_total),
+                            "draft_chain": [
+                                _profile_token_value(token)
+                                for token in draft_token_chains[local_row]
+                            ],
+                            "emitted": [
+                                _profile_token_value(token)
+                                for token in row_outputs
+                            ],
                             "emitted_ref_rows": [
                                 int(token.row)
                                 for token in row_outputs

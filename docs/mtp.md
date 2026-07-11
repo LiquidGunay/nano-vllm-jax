@@ -26,26 +26,25 @@ The disposable experiment control surface is
 The benchmark contract is Qwen3.5-4B BF16 on an A10G, one 64-token prompt, 64
 greedy output tokens, K=2, burst 1, persistent MTP KV, prefill cache seeding,
 recursive drafts, target-model verification, and the 70% system-RAM watchdog.
-The vLLM process alone is allowed a 78% watchdog because its checkpoint loader
-briefly needs more host memory.
 
 | route | exact | output tok/s | token-event tok/s | vs vLLM | acceptance | peak RAM |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | vLLM 0.24.0, no MTP | yes | 48.31 | n/a | 1.000x | n/a | 65.4% |
 | JAX, no MTP | yes | 32.34 | 62.03 | 0.669x | n/a | 60.8% |
-| strict packed K=2, run 1 | yes | 59.70 | 60.44 | 1.236x | 81.25% | 62.9% |
-| strict packed K=2, run 2 | yes | 57.54 | 58.18 | 1.191x | 81.25% | 62.9% |
+| strict packed K=2, ABI run 1 | yes | 65.36 | 66.26 | 1.353x | 81.25% | 62.4% |
+| strict packed K=2, ABI run 2 | yes | 65.40 | 66.35 | 1.354x | 81.25% | 62.5% |
+| strict packed K=2, final validation | yes | 64.63 | 65.51 | 1.338x | 81.25% | 63.2% |
 
-The two MTP runs average 58.62 output tok/s, or `1.213x` vLLM. Both match the
-fresh no-MTP JAX row for all 64 tokens. Each proposes 48 drafts, accepts 39,
+The three post-ABI MTP runs average 65.13 output tok/s, or `1.348x` vLLM. All
+match the fresh no-MTP JAX row for all 64 tokens. Each proposes 48 drafts, accepts 39,
 records six rejected blocks and 18 bonus tokens, has zero verifier/seed
 fallbacks, and adds no JIT keys during measurement.
 
 The no-MTP JAX output number includes a 0.947 s final token-materialization
 drain, so token-event throughput is the fair comparison of local model work.
-On that basis strict MTP is still `0.938--0.974x` the same JAX width-1 path.
-The result therefore proves the requested speedup over vLLM, but does not yet
-prove that speculative execution is faster than this repo's own decode kernels.
+On that basis strict MTP is `1.056--1.070x` the same JAX width-1 path. This is
+the first result here that beats both base vLLM end to end and the local JAX
+decode path on model-side token-event time.
 
 ### Grouped projection ABI
 
@@ -65,6 +64,21 @@ every speculative group. The before/after GPU profiles show
 zero over two launches. Target verification, accept/reject, and committed
 state selection are unchanged.
 
+The follow-up ABI removes three host/device boundaries from each verifier
+group:
+
+- prefill-produced draft chains stay as dense device token references;
+- scheduler-owned host query lengths replace per-group `diff`/scalar reads;
+- the physical decode-token count is a static JIT specialization, not a
+  device scalar argument.
+
+The steady verifier group falls from four PJRT calls to one, and the short
+profile drops from 75 to 35 PJRT calls. Explicit command-buffer experiments did
+not help: XLA already emits command buffers for this graph, `+WHILE` was
+neutral, and forcing graph size 1 increased capture/update work. The useful
+analogue to CUDA graph replay was therefore a stable one-call JIT ABI, not an
+extra capture flag.
+
 The remaining dominant speculative cost is now visible rather than hidden by
 copies: 54 full-vocabulary top-1 scans take 138.52 ms in the profiled run. K=2
 needs one target scan plus two causally dependent MTP scans per group, so those
@@ -82,9 +96,9 @@ same B=1 64-to-64 row:
 | vLLM, no MTP | 48.31 | yes | n/a |
 | vLLM, MTP K=1 | 75.73 | yes | 31/31 |
 | vLLM, MTP K=2 | 88.42 | yes | 40/48 |
-| JAX, MTP K=2 | 57.54--59.70 | yes | 39/48 |
+| JAX, MTP K=2 | 64.63--65.40 | yes | 39/48 |
 
-vLLM K=2 is about `1.51x` the mean JAX MTP result despite nearly identical
+vLLM K=2 is about `1.36x` the mean JAX MTP result despite nearly identical
 acceptance (`83.3%` versus `81.25%`). This isolates the remaining 4B gap to
 execution cost, not draft quality. vLLM captures a K=2 graph at physical size
 three (`K+1`) and keeps proposer preparation, target verification, rejection
@@ -102,14 +116,29 @@ verifier is not parity-clean on the smaller models for this row:
 | 0.8B no MTP | 123.53 | 201.66 | n/a | none |
 | 0.8B packed K=2 | 119.56 | 122.37 | 79.2% | token 6 |
 
-The 2B width-1-projection diagnostic still diverges at token 11 and slows to
-52.23 output tok/s, so projection GEMM shape is not the full parity issue.
-Same-state distribution probes show modest local drift: 2B mean/max forward KL
-is `0.01951/0.08056` nats with all 10 sampled top-1 tokens equal; 0.8B is
-`0.00923/0.04864` nats with 9/10 top-1 equal. On 0.8B the single mismatch has
-only a `0.151` reference top-1 logit margin. These are reasonable approximate
-quality diagnostics, but small GDN/prefix-state differences accumulate across
-accepted groups and change the greedy stream.
+Persistent-cache diagnostics separate draft quality from verifier numerics.
+On 0.8B, the exact scanned target oracle accepts `38/48` drafts (`79.2%`) and
+its complete 64-token row exactly matches both vLLM baseline and vLLM MTP.
+The earlier low-acceptance `k_decode` probe regenerated stateless drafts and is
+not a valid proposer-quality oracle. On 2B, the exact scan accepts `4/22` over
+the first 16 tokens, while vLLM accepts `30/70` over the full row. Token traces
+show why: JAX and vLLM produce the same first four draft chains, including a
+full accept and a partial accept. The following draft differs only when JAX
+uses sequential width-1 target hidden states; JAX's broad target pass produces
+vLLM's exact next draft. The smaller-model acceptance gap is therefore driven
+by verifier-shape hidden-state numerics, not bad initial MTP weights or a lost
+persistent draft cache.
+
+The distribution diagnostic now uses the true width-1 scan as its reference;
+the older full-attention-only replay was not a complete sequential oracle. On
+0.8B, ten sampled verifier positions have mean/max forward KL
+`0.02999/0.10958` nats and mean/max JS `0.00719/0.02626`, with `8/10` local
+top-1 matches. The first visible token flip has only a `0.102` reference logit
+margin, forward KL `0.0845`, and JS `0.0197`. That is modest approximate-quality
+drift, but broad accepted-prefix state still does not reproduce the sequential
+greedy stream. A true dual-path 2B KL compile reached the 70% RAM guard and was
+stopped; vLLM's first 2B token disagreement is independently a `0.125`
+log-prob near tie.
 
 Even under an approximate-quality tolerance, neither smaller model is a useful
 speed lane. Their MTP model-side rates are only `0.547x` (2B) and `0.607x`
@@ -138,9 +167,9 @@ state on host with sequential decode, or reports host-side repair/materializatio
 as progress is a correctness diagnostic only.
 
 Do not describe the current MTP path as production-ready. It beats base vLLM
-on the narrow B=1 result above, but remains below the same JAX non-MTP
-model-side rate and needs broader prompt validation. Treat historical K=1 TPU
-results as non-normative for current GPU work.
+and the same JAX non-MTP model-side rate on the narrow 4B B=1 result above, but
+it still needs broader prompt validation and smaller-model state parity. Treat
+historical K=1 TPU results as non-normative for current GPU work.
 
 ## Current Plan (2026-06-22)
 

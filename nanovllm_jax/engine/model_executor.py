@@ -10267,8 +10267,10 @@ class ModelExecutor:
             bool(logit_debug_enabled),
             bool(target_distribution_debug_enabled),
             bool(emit_bonus),
+            int(batch.num_decode_tokens),
         )
         if key not in self._jit_cache:
+            static_num_decode_tokens = int(batch.num_decode_tokens)
 
             def _gather_prefix(value: jnp.ndarray, prefix_len: jnp.ndarray) -> jnp.ndarray:
                 gather_idx = prefix_len.astype(jnp.int32)
@@ -10299,7 +10301,6 @@ class ModelExecutor:
                 tokens,
                 positions,
                 seq_ids,
-                num_decode_tokens,
                 block_tables,
                 seq_lens,
                 k_cache,
@@ -10389,6 +10390,98 @@ class ModelExecutor:
                 debug_reference_margin_groups = []
                 debug_test_margin_groups = []
                 debug_top1_equal_groups = []
+
+                def scan_target(
+                    token_rows,
+                    position_rows,
+                    row_seq_lens,
+                    row_block_tables,
+                    start_k_cache,
+                    start_v_cache,
+                    start_conv_state,
+                    start_recurrent_state,
+                ):
+                    query_start_loc = jnp.arange(row_count + 1, dtype=jnp.int32)
+                    step_k_cache = start_k_cache
+                    step_v_cache = start_v_cache
+                    step_conv_state = start_conv_state
+                    step_recurrent_state = start_recurrent_state
+                    hidden_parts = []
+                    conv_state_parts = []
+                    recurrent_state_parts = []
+                    slot_mapping_parts = []
+                    for offset in range(verify_width):
+                        step_seq_lens = row_seq_lens + jnp.asarray(
+                            offset,
+                            dtype=row_seq_lens.dtype,
+                        )
+                        step_batch = ScheduledBatch(
+                            tokens=token_rows[:, offset : offset + 1],
+                            positions=position_rows[:, offset : offset + 1],
+                            seq_ids=seq_ids,
+                            query_start_loc=query_start_loc,
+                            is_prefill=False,
+                            num_prefill_tokens=0,
+                            num_decode_tokens=static_num_decode_tokens,
+                            block_tables=row_block_tables,
+                            seq_lens=step_seq_lens,
+                        )
+                        step_metadata = self.backend.build_attention_metadata(
+                            positions=step_batch.positions,
+                            block_tables=row_block_tables,
+                            seq_lens=step_seq_lens,
+                            block_size=self.config.block_size,
+                            is_prefill=False,
+                            query_start_loc=query_start_loc,
+                            num_prefill_tokens=0,
+                            num_decode_tokens=static_num_decode_tokens,
+                        )
+                        step_kv_state = KVCacheState(
+                            k_cache=step_k_cache,
+                            v_cache=step_v_cache,
+                            block_table=row_block_tables,
+                            kv_lens=step_seq_lens,
+                            slot_mapping=step_metadata.slot_mapping,
+                        )
+                        hidden_t, step_kv_state, step_hybrid_state = model_forward_step(
+                            step_batch.tokens,
+                            params,
+                            self.config,
+                            positions=step_batch.positions,
+                            kv_cache_state=step_kv_state,
+                            attention_metadata=step_metadata,
+                            hybrid_state=HybridLayerState(
+                                step_conv_state,
+                                step_recurrent_state,
+                            ),
+                            is_prefill=False,
+                            return_hidden=True,
+                            return_hidden_with_logits=False,
+                            backend=self.backend,
+                        )
+                        step_k_cache = step_kv_state.k_cache
+                        step_v_cache = step_kv_state.v_cache
+                        step_conv_state = step_hybrid_state.conv_state
+                        step_recurrent_state = step_hybrid_state.recurrent_state
+                        hidden_parts.append(hidden_t[:, 0, :])
+                        conv_state_parts.append(step_conv_state)
+                        recurrent_state_parts.append(step_recurrent_state)
+                        slot_mapping_parts.append(step_metadata.slot_mapping.reshape(row_count))
+                    return (
+                        jnp.stack(hidden_parts, axis=1),
+                        KVCacheState(
+                            k_cache=step_k_cache,
+                            v_cache=step_v_cache,
+                            block_table=row_block_tables,
+                            kv_lens=row_seq_lens + verify_width - 1,
+                            slot_mapping=jnp.stack(slot_mapping_parts, axis=1).reshape(-1),
+                        ),
+                        HybridLayerState(step_conv_state, step_recurrent_state),
+                        HybridLayerState(
+                            conv_state=jnp.stack(conv_state_parts, axis=1),
+                            recurrent_state=jnp.stack(recurrent_state_parts, axis=1),
+                        ),
+                    )
 
                 for _group_idx in range(burst_groups):
                     reference_hidden = None
@@ -10534,135 +10627,32 @@ class ModelExecutor:
                         )
                         hidden = hidden.reshape((row_count, verify_width, hidden.shape[-1]))
                     else:
-                        step_query_start_loc = jnp.arange(row_count + 1, dtype=jnp.int32)
-                        step_k_cache = current_k_cache
-                        step_v_cache = current_v_cache
-                        step_conv_state = current_conv_state
-                        step_recurrent_state = current_recurrent_state
-                        hidden_parts = []
-                        conv_state_parts = []
-                        recurrent_state_parts = []
-                        slot_mapping_parts = []
-                        for offset in range(verify_width):
-                            step_seq_lens = current_seq_lens + jnp.asarray(
-                                offset,
-                                dtype=current_seq_lens.dtype,
-                            )
-                            step_batch = ScheduledBatch(
-                                tokens=verify_tokens_rows[:, offset : offset + 1],
-                                positions=verify_positions_rows[:, offset : offset + 1],
-                                seq_ids=seq_ids,
-                                query_start_loc=step_query_start_loc,
-                                is_prefill=False,
-                                num_prefill_tokens=0,
-                                num_decode_tokens=num_decode_tokens,
-                                block_tables=block_tables,
-                                seq_lens=step_seq_lens,
-                            )
-                            step_metadata = self.backend.build_attention_metadata(
-                                positions=step_batch.positions,
-                                block_tables=step_batch.block_tables,
-                                seq_lens=step_batch.seq_lens,
-                                block_size=self.config.block_size,
-                                is_prefill=False,
-                                query_start_loc=step_batch.query_start_loc,
-                                num_prefill_tokens=0,
-                                num_decode_tokens=step_batch.num_decode_tokens,
-                            )
-                            step_kv_state = KVCacheState(
-                                k_cache=step_k_cache,
-                                v_cache=step_v_cache,
-                                block_table=block_tables,
-                                kv_lens=step_seq_lens,
-                                slot_mapping=step_metadata.slot_mapping,
-                            )
-                            hidden_t, step_updated_kv_state, step_updated_hybrid_state = model_forward_step(
-                                step_batch.tokens,
-                                params,
-                                self.config,
-                                positions=step_batch.positions,
-                                kv_cache_state=step_kv_state,
-                                attention_metadata=step_metadata,
-                                hybrid_state=HybridLayerState(
-                                    step_conv_state,
-                                    step_recurrent_state,
-                                ),
-                                is_prefill=False,
-                                return_hidden=True,
-                                return_hidden_with_logits=False,
-                                backend=self.backend,
-                            )
-                            step_k_cache = step_updated_kv_state.k_cache
-                            step_v_cache = step_updated_kv_state.v_cache
-                            step_conv_state = step_updated_hybrid_state.conv_state
-                            step_recurrent_state = step_updated_hybrid_state.recurrent_state
-                            hidden_parts.append(hidden_t[:, 0, :])
-                            conv_state_parts.append(step_conv_state)
-                            recurrent_state_parts.append(step_recurrent_state)
-                            slot_mapping_parts.append(
-                                step_metadata.slot_mapping.reshape(row_count)
-                            )
-                        hidden = jnp.stack(hidden_parts, axis=1)
-                        updated_kv_state = KVCacheState(
-                            k_cache=step_k_cache,
-                            v_cache=step_v_cache,
-                            block_table=block_tables,
-                            kv_lens=verify_seq_lens,
-                            slot_mapping=jnp.stack(slot_mapping_parts, axis=1).reshape(-1),
-                        )
-                        prefix_hybrid_state = HybridLayerState(
-                            conv_state=jnp.stack(conv_state_parts, axis=1),
-                            recurrent_state=jnp.stack(recurrent_state_parts, axis=1),
+                        (
+                            hidden,
+                            updated_kv_state,
+                            _updated_hybrid_state,
+                            prefix_hybrid_state,
+                        ) = scan_target(
+                            verify_tokens_rows,
+                            verify_positions_rows,
+                            current_seq_lens,
+                            block_tables,
+                            current_k_cache,
+                            current_v_cache,
+                            current_conv_state,
+                            current_recurrent_state,
                         )
                     if target_distribution_debug_enabled:
-                        prior_rectangular_impl = os.environ.get(
-                            "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL"
+                        reference_hidden, _, _, _ = scan_target(
+                            verify_tokens_rows,
+                            verify_positions_rows,
+                            current_seq_lens,
+                            block_tables,
+                            current_k_cache,
+                            current_v_cache,
+                            current_conv_state,
+                            current_recurrent_state,
                         )
-                        os.environ[
-                            "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL"
-                        ] = "token_loop"
-                        try:
-                            reference_kv_state = KVCacheState(
-                                k_cache=current_k_cache,
-                                v_cache=current_v_cache,
-                                block_table=block_tables,
-                                kv_lens=verify_seq_lens,
-                                slot_mapping=verify_metadata.slot_mapping,
-                            )
-                            (
-                                reference_hidden,
-                                _reference_updated_kv_state,
-                                _reference_updated_hybrid_state,
-                                _reference_prefix_hybrid_state,
-                            ) = model_forward_step(
-                                verify_batch.tokens,
-                                params,
-                                self.config,
-                                positions=verify_batch.positions,
-                                kv_cache_state=reference_kv_state,
-                                attention_metadata=verify_metadata,
-                                hybrid_state=HybridLayerState(
-                                    current_conv_state,
-                                    current_recurrent_state,
-                                ),
-                                is_prefill=False,
-                                return_hidden=True,
-                                return_hidden_with_logits=False,
-                                return_prefix_hybrid=True,
-                                hybrid_state_layerwise=True,
-                                prefix_hybrid_layer_first=True,
-                                backend=self.backend,
-                            )
-                        finally:
-                            if prior_rectangular_impl is None:
-                                os.environ.pop(
-                                    "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL",
-                                    None,
-                                )
-                            else:
-                                os.environ[
-                                    "NANO_VLLM_JAX_FULL_ATTN_RECTANGULAR_DECODE_IMPL"
-                                ] = prior_rectangular_impl
                     hidden_norm = _decode_width1_rms_norm(
                         hidden,
                         params.norm_weight,
@@ -11106,7 +11096,7 @@ class ModelExecutor:
                     debug_payload,
                 )
 
-            self._jit_cache[key] = jax.jit(compiled, donate_argnums=(7, 8, 9, 10))
+            self._jit_cache[key] = jax.jit(compiled, donate_argnums=(6, 7, 8, 9))
 
         (
             emitted_tokens,
@@ -11134,7 +11124,6 @@ class ModelExecutor:
                 batch.tokens,
                 batch.positions,
                 batch.seq_ids,
-                jnp.asarray(batch.num_decode_tokens, dtype=jnp.int32),
                 batch.block_tables,
                 batch.seq_lens,
                 cache_storage.k_cache,

@@ -14175,3 +14175,44 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     committed hybrid state is not yet exact across sizes;
   - 4B is the only useful current B=1 lane. Smaller target decode is too cheap
     to amortize this JAX MTP boundary even if the observed KL is acceptable.
+
+#### Entry 330 - Resident MTP Input ABI and True Parity Oracle
+
+- date: 2026-07-11
+- implementation:
+  - prefill draft chains remain dense device token references instead of
+    round-tripping through Python;
+  - verifier admission reads scheduler-owned host query lengths;
+  - physical decode-token count is a static packed-verifier JIT specialization;
+  - broad-vs-scan distribution debug now reuses the exact width-1 target scan,
+    replacing the incomplete full-attention-only reference.
+- graph evidence:
+  - steady packed verification falls from four PJRT calls to one; the short
+    profile falls from 75 to 35 PJRT calls;
+  - XLA already creates command buffers. `+WHILE` was neutral, while graph size
+    1 increased command-buffer execute/update work and regressed the profile.
+- strict 4B B1 results:
+  - two ABI repeats reach `65.36/66.26` and `65.40/66.35` output/token-event
+    tok/s; final live-config validation reaches `64.63/65.51`;
+  - every run is exact for 64 tokens, accepts `39/48` drafts, emits 18 bonuses,
+    has zero verifier fallbacks and zero measured JIT growth;
+  - the final run peaks at `63.2%` host RAM. The result is `1.338--1.354x`
+    base vLLM (`48.31`) and `1.056--1.070x` local no-MTP model-side throughput
+    (`62.03`).
+- smaller-model parity:
+  - 0.8B persistent scan accepts `38/48` and exactly matches vLLM's complete
+    greedy row; the stateless `k_decode` acceptance result is not a draft oracle;
+  - 2B JAX and vLLM draft chains match through the first partial accept. The
+    next draft matches vLLM under broad target verification but changes under
+    the exact sequential target scan, isolating target-hidden numerics;
+  - true 0.8B broad-vs-scan KL mean/max is `0.02999/0.10958` nats, JS mean/max
+    `0.00719/0.02626`, with narrow `0.102--0.122` reference margins at the two
+    top-1 flips;
+  - the corresponding 2B dual-path compile was stopped cleanly at the 70% RAM
+    guard. vLLM's first 2B branch has only a `0.125` log-prob margin.
+- conclusion:
+  - cheap verified MTP is demonstrated for 4B B1; the remaining gap to vLLM
+    MTP (`88.42 tok/s`) is fragmented target/draft execution, not acceptance;
+  - smaller-model draft quality is not fundamentally broken, but broad
+    accepted-prefix state parity must be solved before those routes can make
+    exact speed claims.
