@@ -84,7 +84,10 @@ benchmark:
   vllm_skip_mm_profiling: true
   vllm_enable_v1_multiprocessing: false
   vllm_use_flashinfer_sampler: false
+  vllm_log_stats: false
   vllm_mode: "baseline"
+  vllm_speculative_method: "mtp"
+  vllm_num_speculative_tokens: 0
 
   command_timeout_seconds: 900
   max_system_ram_percent: 70

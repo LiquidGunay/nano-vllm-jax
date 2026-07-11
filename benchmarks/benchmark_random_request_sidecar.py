@@ -232,10 +232,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Use FlashInfer sampling in vLLM; disable for the native greedy path.",
     )
+    parser.add_argument(
+        "--vllm-log-stats",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Emit vLLM speculative-decoding counters for the measured run.",
+    )
     parser.add_argument("--vllm-top-k", type=int, default=5)
     parser.add_argument("--vllm-mode", default="baseline", choices=["baseline", "mtp"])
     parser.add_argument("--vllm-speculative-method", default="mtp")
-    parser.add_argument("--vllm-num-speculative-tokens", type=int, choices=[0, 1], default=0)
+    parser.add_argument(
+        "--vllm-num-speculative-tokens",
+        type=int,
+        choices=list(range(0, 9)),
+        default=0,
+    )
 
     parser.add_argument("--dry-run", action="store_true", help="Generate manifest and commands without launching benchmarks.")
     parser.add_argument("--skip-jax", action="store_true", help="Generate suite and run vLLM only.")
@@ -1092,6 +1103,8 @@ def _build_vllm_command(args: argparse.Namespace, manifest_jsonl: Path, output_j
     }
     if args.reference_json:
         command_args["reference_json"] = args.reference_json
+    if args.vllm_log_stats:
+        command_args["vllm_log_stats"] = True
     if args.vllm_mode == "mtp":
         command_args["speculative_method"] = args.vllm_speculative_method
         command_args["num_speculative_tokens"] = args.vllm_num_speculative_tokens

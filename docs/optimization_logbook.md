@@ -14138,3 +14138,40 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
     vLLM on this A10G;
   - MTP remains slightly below this repo's own no-MTP model-side rate, so it is
     still an experimental path rather than the promoted default.
+
+#### Entry 329 - vLLM MTP and Dense-Family B=1 Matrix
+
+- date: 2026-07-11
+- vLLM 0.24, Qwen3.5-4B, 64-to-64, B=1:
+  - base: `48.31 output tok/s`, exact;
+  - MTP K=1: `75.73 output tok/s`, exact, measured drafts `31/31` accepted;
+  - MTP K=2: `88.42 output tok/s`, exact, measured drafts `40/48` accepted;
+  - K=2 requires CUDA-graph capture size `3` (`K+1`); capture size `1` fails
+    explicitly before measurement;
+  - successful MTP runs peak at `66.7--66.8%` host RAM under the 78% watchdog.
+- comparison:
+  - JAX K=2 accepts `39/48`, essentially matching vLLM's draft quality;
+  - vLLM K=2 is about `1.51x` the mean JAX K=2 output throughput, so the
+    remaining 4B gap is execution-bound rather than acceptance-bound.
+- smaller JAX checkpoints, same B=1 row:
+  - 2B no-MTP: `62.63` output / `119.24` token-event tok/s;
+  - 2B broad packed K=2: `63.91` / `65.19`, acceptance `40.0%`, first greedy
+    difference at token 10;
+  - 0.8B no-MTP: `123.53` / `201.66`;
+  - 0.8B broad packed K=2: `119.56` / `122.37`, acceptance `79.2%`, first
+    difference at token 6.
+- drift probes:
+  - 2B same-state forward KL mean/max `0.01951/0.08056` nats, JS mean/max
+    `0.00479/0.02038`, with `10/10` local top-1 matches; a width-1 projection
+    retry remained non-exact and slower;
+  - 0.8B forward KL mean/max `0.00923/0.04864`, JS mean/max
+    `0.00223/0.01162`, with `9/10` top-1 matches. The mismatch has a `0.151`
+    reference top-1 margin;
+  - one 2B KL compile was stopped at `70.2%` by the RAM guard. Autotune level
+    zero plus a 64 MiB KV envelope completed at `69.7%`; this was diagnostic
+    only and is not the live speed configuration.
+- conclusion:
+  - the packed projection ABI is family-compatible, but the broad verifier's
+    committed hybrid state is not yet exact across sizes;
+  - 4B is the only useful current B=1 lane. Smaller target decode is too cheap
+    to amortize this JAX MTP boundary even if the observed KL is acceptable.

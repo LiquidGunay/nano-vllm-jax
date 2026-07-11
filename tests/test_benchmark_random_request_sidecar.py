@@ -45,6 +45,7 @@ def test_parse_args_defaults_set_random_ranges():
     assert sidecar._effective_vllm_dtype(args) == "bfloat16"
     assert args.vllm_num_speculative_tokens == 0
     assert args.vllm_use_flashinfer_sampler is True
+    assert args.vllm_log_stats is False
     assert args.skip_jax is False
     assert args.skip_vllm is False
     assert args.max_system_ram_percent == 70.0
@@ -83,6 +84,7 @@ benchmark:
   max_request_count: 1
   skip_vllm: true
   vllm_use_flashinfer_sampler: false
+  vllm_log_stats: true
   max_system_ram_percent: 70
 runtime:
   platform: cuda
@@ -106,6 +108,7 @@ runtime:
     assert args.min_request_count == args.max_request_count == 1
     assert args.skip_vllm is True
     assert args.vllm_use_flashinfer_sampler is False
+    assert args.vllm_log_stats is True
     assert args.max_system_ram_percent == 70
     assert args.jax_config == str(config_path)
 
@@ -194,6 +197,29 @@ def test_baseline_vllm_command_omits_speculative_args():
     assert command[command.index("--dtype") + 1] == "bfloat16"
     assert "--speculative-method" not in command
     assert "--num-speculative-tokens" not in command
+    assert "--vllm-log-stats" not in command
+
+
+def test_vllm_mtp_command_supports_recursive_k_and_stats():
+    args = sidecar.parse_args(
+        [
+            "--output-json",
+            "/tmp/sidecar.json",
+            "--vllm-mode",
+            "mtp",
+            "--vllm-num-speculative-tokens",
+            "2",
+            "--vllm-log-stats",
+        ]
+    )
+    command = sidecar._build_vllm_command(
+        args,
+        manifest_jsonl=sidecar.Path("/tmp/prompts.jsonl"),
+        output_json=sidecar.Path("/tmp/vllm.json"),
+    )
+
+    assert command[command.index("--num-speculative-tokens") + 1] == "2"
+    assert "--vllm-log-stats" in command
 
 
 def test_vllm_dtype_override_is_used():

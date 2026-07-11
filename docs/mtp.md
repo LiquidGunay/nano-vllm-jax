@@ -70,6 +70,53 @@ copies: 54 full-vocabulary top-1 scans take 138.52 ms in the profiled run. K=2
 needs one target scan plus two causally dependent MTP scans per group, so those
 draft scans cannot simply be batched without changing the draft algorithm.
 
+### vLLM MTP and dense-family scaling
+
+vLLM 0.24 supports reusing Qwen3.5's single MTP layer recursively for K>1.
+Its [Qwen3.5 recipe](https://github.com/vllm-project/recipes/blob/main/Qwen/Qwen3.5.md)
+recommends MTP-1 for low-concurrency latency and also documents K=2. On the
+same B=1 64-to-64 row:
+
+| route | output tok/s | exact | accepted drafts |
+| --- | ---: | --- | ---: |
+| vLLM, no MTP | 48.31 | yes | n/a |
+| vLLM, MTP K=1 | 75.73 | yes | 31/31 |
+| vLLM, MTP K=2 | 88.42 | yes | 40/48 |
+| JAX, MTP K=2 | 57.54--59.70 | yes | 39/48 |
+
+vLLM K=2 is about `1.51x` the mean JAX MTP result despite nearly identical
+acceptance (`83.3%` versus `81.25%`). This isolates the remaining 4B gap to
+execution cost, not draft quality. vLLM captures a K=2 graph at physical size
+three (`K+1`) and keeps proposer preparation, target verification, rejection
+sampling, and cache metadata in that model-runner boundary. The JAX profile
+still pays three separate full-vocabulary scans plus fragmented target/MTP
+GEMM families per group.
+
+The packed-leaf ABI can be selected for every dense checkpoint, but the broad
+verifier is not parity-clean on the smaller models for this row:
+
+| model/route | output tok/s | token-event tok/s | acceptance | first difference |
+| --- | ---: | ---: | ---: | ---: |
+| 2B no MTP | 62.63 | 119.24 | n/a | none |
+| 2B packed K=2 | 63.91 | 65.19 | 40.0% | token 10 |
+| 0.8B no MTP | 123.53 | 201.66 | n/a | none |
+| 0.8B packed K=2 | 119.56 | 122.37 | 79.2% | token 6 |
+
+The 2B width-1-projection diagnostic still diverges at token 11 and slows to
+52.23 output tok/s, so projection GEMM shape is not the full parity issue.
+Same-state distribution probes show modest local drift: 2B mean/max forward KL
+is `0.01951/0.08056` nats with all 10 sampled top-1 tokens equal; 0.8B is
+`0.00923/0.04864` nats with 9/10 top-1 equal. On 0.8B the single mismatch has
+only a `0.151` reference top-1 logit margin. These are reasonable approximate
+quality diagnostics, but small GDN/prefix-state differences accumulate across
+accepted groups and change the greedy stream.
+
+Even under an approximate-quality tolerance, neither smaller model is a useful
+speed lane. Their MTP model-side rates are only `0.547x` (2B) and `0.607x`
+(0.8B) their no-MTP controls. The 2B end-to-end number appears `1.02x` faster
+only because MTP avoids the control's final host token drain; it is not cheaper
+verification.
+
 Qwen3.5-4B now fits: the dense prefill final-row projection no longer
 materializes a full `[prompt, vocab]` tensor, and these guarded JAX runs remain
 below 64% host RAM outside profiler overhead. The older 0.8B B=8 result remains
