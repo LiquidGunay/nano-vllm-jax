@@ -198,7 +198,12 @@ MTP is then one implementation of `Drafter`:
 
 ### Preparation: fresh external baseline
 
-Status: [ ] not started
+Status: [x] complete with a guarded baseline limitation
+
+Unmodified `main` could not complete either the 0.8B B=8 or 4B B=1 lane
+inside the 70% system-RAM guard because it retained the materialized tied head.
+That failure is the baseline result; the cleanup branch completed both lanes
+without measured-phase JIT growth. Raw artifacts remain outside the repository.
 
 Before changing `main`, capture a fresh external baseline for the exact
 manifests used by the cleanup gates. This is not a public claim and no result
@@ -215,7 +220,9 @@ bounded CPU cores, positive nice level, and mountpoint-owned caches/artifacts.
 
 ### PR 1: correct capacity, configuration, and base model ABI
 
-Status: [ ] not started
+Status: [ ] draft PR [#7](https://github.com/LiquidGunay/nano-vllm-jax/pull/7), awaiting review
+
+Branch: `agent/base-correctness-abi` at `064d1a0`
 
 Purpose: make the ordinary target model truthful and safe before moving state
 between components.
@@ -224,7 +231,9 @@ Scope:
 
 - Remove recompute preemption and add worst-case block reservation.
 - Make sequence ids and block size engine-local.
-- Introduce frozen model/capacity/compile/kernel/runtime specs.
+- Introduce frozen checkpoint and workload configs. Keep the private flat
+  `RuntimeConfig` as a compatibility bridge until PR 2 extracts the complete
+  capacity/compile/kernel aggregate and step ABI.
 - Reject unknown YAML keys and invalid or uncovered buckets.
 - Resolve and validate architecture from the checkpoint.
 - Support only real-weight-validated Qwen3.5 dense sizes.
@@ -437,6 +446,6 @@ Do not transplant:
   branch at the revisions above.
 - [x] Define the target base and speculative ABIs.
 - [x] Define PR boundaries and merge gates.
-- [ ] Confirm the proposed supported model set and headline workload.
-- [ ] Capture the fresh external baseline.
-- [ ] Open PR 1.
+- [x] Confirm the proposed supported model set and headline workload.
+- [x] Capture the fresh external baseline (guarded mainline failure recorded).
+- [x] Open PR 1 as draft PR #7.
