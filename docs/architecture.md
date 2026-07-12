@@ -30,11 +30,12 @@ worker advances the engine and publishes token events or final results.
 - prompt chunk selection,
 - decode row selection,
 - inactive-row padding,
-- block allocation and preemption,
+- whole-request block reservation,
 - prefix-cache lookup and publication.
 
 `BlockManager` owns physical cache page ids, reference counts, and prefix-cache
-metadata.
+metadata. Admission reserves enough pages for `prompt + max_tokens`; active
+requests are not evicted or recomputed under pressure.
 
 `ScheduledBatch` is the Python-to-JAX contract. It documents the fixed-shape
 arrays that the runner and executor consume.
@@ -50,6 +51,10 @@ arrays that the runner and executor consume.
 - compile-bucket lookup.
 
 `ModelExecutor` owns JIT cache keys and calls into `model.forward_step`.
+
+Checkpoint `config.json` owns model dimensions and layer types. The loader
+accepts the validated Qwen3.5 0.8B, 2B, and 4B text configurations, validates
+every loaded tensor shape, and retains vocabulary weights as `[V, H]`.
 
 `model.py` owns parameter structure, the Qwen3.5 layer loop, and the exported
 forward entrypoints. The math is split by role:

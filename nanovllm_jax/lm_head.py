@@ -45,23 +45,24 @@ def _lm_head_normed_hidden_and_weight(
     hidden_norm = hidden_norm.astype(
         _lm_head_decode_activation_dtype(config) if not is_prefill else jnp.float32
     )
-    output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
-    return hidden_norm, output_weight
+    vocab_weight = params.lm_head if params.lm_head is not None else params.embed_tokens
+    return hidden_norm, vocab_weight
 
 
 def _lm_head_logits_from_normed(
     hidden_norm: jnp.ndarray,
-    output_weight: jnp.ndarray,
+    vocab_weight: jnp.ndarray,
     config,
     *,
     is_prefill: bool = True,
 ):
-    if _can_use_decode_padded_gemm(hidden_norm, output_weight, config):
-        logits = _decode_padded_gemm_dot(hidden_norm, output_weight, config)
+    projection_weight = vocab_weight.T
+    if _can_use_decode_padded_gemm(hidden_norm, projection_weight, config):
+        logits = _decode_padded_gemm_dot(hidden_norm, projection_weight, config)
     else:
         logits = _tokenwise_decode_dot(
             hidden_norm,
-            output_weight,
+            projection_weight,
             force_width1=(not is_prefill) and hidden_norm.ndim == 3 and hidden_norm.shape[1] > 1 and _force_width1_decode_math(),
         )
     return logits
@@ -75,7 +76,7 @@ def _lm_head_logits(
     hidden_is_normed: bool = False,
     is_prefill: bool = True,
 ):
-    hidden_norm, output_weight = _lm_head_normed_hidden_and_weight(
+    hidden_norm, vocab_weight = _lm_head_normed_hidden_and_weight(
         hidden,
         params,
         config,
@@ -84,7 +85,7 @@ def _lm_head_logits(
     )
     return _lm_head_logits_from_normed(
         hidden_norm,
-        output_weight,
+        vocab_weight,
         config,
         is_prefill=is_prefill,
     )
@@ -92,14 +93,14 @@ def _lm_head_logits(
 
 def _lm_head_greedy_top1_token_ids(
     hidden_norm: jnp.ndarray,
-    output_weight: jnp.ndarray,
+    vocab_weight: jnp.ndarray,
     config,
 ) -> jnp.ndarray:
     impl = _lm_head_greedy_top1_impl(config)
     if impl == "jax":
         logits = _lm_head_logits_from_normed(
             hidden_norm,
-            output_weight,
+            vocab_weight,
             config,
             is_prefill=False,
         )
@@ -107,7 +108,7 @@ def _lm_head_greedy_top1_token_ids(
     if impl == "triton":
         from nanovllm_jax.kernels.lm_head_triton import lm_head_greedy_top1_triton
 
-        return lm_head_greedy_top1_triton(hidden_norm, output_weight)
+        return lm_head_greedy_top1_triton(hidden_norm, vocab_weight)
     raise AssertionError(f"unexpected LM-head greedy top1 impl: {impl!r}")
 
 
@@ -133,7 +134,7 @@ def lm_head_token_ids_and_topk(
         and hidden.ndim == 3
         and _lm_head_greedy_top1_impl(config) != "jax"
     ):
-        hidden_norm, output_weight = _lm_head_normed_hidden_and_weight(
+        hidden_norm, vocab_weight = _lm_head_normed_hidden_and_weight(
             hidden,
             params,
             config,
@@ -142,7 +143,7 @@ def lm_head_token_ids_and_topk(
         )
         batch, width, hidden_dim = hidden_norm.shape
         flat_hidden = hidden_norm.reshape(batch * width, 1, hidden_dim)
-        token_ids = _lm_head_greedy_top1_token_ids(flat_hidden, output_weight, config)
+        token_ids = _lm_head_greedy_top1_token_ids(flat_hidden, vocab_weight, config)
         return token_ids.reshape(batch, width), None, None
 
     logits = _lm_head_logits(

@@ -1,7 +1,7 @@
 """Dynamic Python scheduler for continuous batching.
 
 Owns:
-    Waiting/running queues, prefix-cache scheduling decisions, preemption, and
+    Waiting/running queues, prefix-cache decisions, and capacity reservations.
     logical postprocessing after each engine step.
 Receives:
     Admitted ``Sequence`` objects and static serving capacity config.
@@ -53,7 +53,7 @@ class Scheduler:
     - Waiting queue (sequences waiting to start)
     - Running queue (sequences being generated)
     - Block allocation via BlockManager
-    - Preemption (swapping out sequences)
+    - Whole-request KV capacity reservation
     """
 
     def __init__(self, config: RuntimeConfig):
@@ -114,8 +114,6 @@ class Scheduler:
             config.num_kvcache_blocks, 
             config.block_size
         )
-        # Override sequence block size
-        Sequence.block_size = config.block_size
         
         self.waiting: Deque[Sequence] = deque()
         self.running: Deque[Sequence] = deque()
@@ -130,6 +128,7 @@ class Scheduler:
     def _can_allocate_waiting(self, seq: Sequence) -> bool:
         return self.block_manager.can_allocate(
             seq,
+            total_blocks=self._required_blocks(seq),
             use_prefix_cache=self.enable_prefix_cache_execution,
             cacheable_hashes=self._prefix_cacheable_hashes(),
         )
@@ -137,9 +136,14 @@ class Scheduler:
     def _allocate_waiting(self, seq: Sequence) -> None:
         self.block_manager.allocate(
             seq,
+            total_blocks=self._required_blocks(seq),
             use_prefix_cache=self.enable_prefix_cache_execution,
             cacheable_hashes=self._prefix_cacheable_hashes(),
         )
+
+    def _required_blocks(self, seq: Sequence) -> int:
+        total_tokens = seq.num_prompt_tokens + seq.max_tokens
+        return (total_tokens + self.block_size - 1) // self.block_size
 
     def record_computed_prefix_states(
         self,
@@ -191,6 +195,14 @@ class Scheduler:
 
     def add(self, seq: Sequence):
         """Add a sequence to the waiting queue."""
+        if seq.block_size != self.block_size:
+            raise ValueError("sequence and scheduler use different block sizes")
+        required_blocks = self._required_blocks(seq)
+        if required_blocks > len(self.block_manager.blocks):
+            raise ValueError(
+                f"request needs {required_blocks} blocks but the engine has "
+                f"{len(self.block_manager.blocks)}"
+            )
         if self.max_blocks_per_seq is not None:
             max_tokens_per_seq = self.max_blocks_per_seq * seq.block_size
             requested_tokens = seq.num_tokens + seq.max_tokens
@@ -328,24 +340,17 @@ class Scheduler:
                 self.running.append(seq)
                 continue
             
-            # Ensure we can append the scheduled decode token or greedy burst.
+            # Complete capacity was reserved before prefill, so decode must
+            # never need eviction or recomputation.
             remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
             lookahead_tokens = 1
             if self.greedy_decode_burst_steps > 1 and seq.temperature == 0 and seq.ignore_eos:
                 lookahead_tokens = min(self.greedy_decode_burst_steps, remaining_tokens)
-            while not self.block_manager.can_append_slots(seq, lookahead_tokens):
-                if self.running:
-                    # Preempt a running sequence
-                    self.preempt(self.running.pop())
-                else:
-                    # Must preempt current sequence
-                    self.preempt(seq)
-                    break
-            else:
-                # Can append - schedule for decode
-                num_seqs += 1
-                self.block_manager.may_append_slots(seq, lookahead_tokens)
-                scheduled_seqs.append(seq)
+            if not self.block_manager.can_append_slots(seq, lookahead_tokens):
+                raise AssertionError("reserved request ran out of KV blocks")
+            num_seqs += 1
+            self.block_manager.may_append_slots(seq, lookahead_tokens)
+            scheduled_seqs.append(seq)
         
         if not scheduled_seqs:
             raise RuntimeError(self._capacity_exhausted_message())
@@ -778,28 +783,6 @@ class Scheduler:
         if buckets:
             return self._select_bucket(size, buckets, "prefill token")
         return size
-
-
-    @staticmethod
-
-
-
-
-
-
-
-    @staticmethod
-
-
-
-    @staticmethod
-
-    def preempt(self, seq: Sequence):
-        """Preempt a sequence (move back to waiting)."""
-        seq.status = SequenceStatus.WAITING
-        self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
-
     def _capacity_exhausted_message(self) -> str:
         stats = self.block_manager.stats()
 
@@ -812,7 +795,7 @@ class Scheduler:
                 "max_tokens": int(seq.max_tokens),
                 "cached_tokens": int(seq.num_cached_tokens),
                 "blocks": int(len(seq.block_table)),
-                "required_blocks": int((len(seq) + self.block_size - 1) // self.block_size),
+                "required_blocks": self._required_blocks(seq),
             }
 
         running = [seq_snapshot(seq) for seq in list(self.running)[:8]]

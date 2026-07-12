@@ -40,7 +40,6 @@ def test_device_token_carry_comes_from_config():
 
 
 def test_sequence_materializes_deferred_device_tokens():
-    Sequence.block_size = 16
     seq = Sequence([11, 22], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
 
     seq.append_token_device(jnp.asarray(33, dtype=jnp.int32))
@@ -87,7 +86,6 @@ def test_sequence_materializes_deferred_device_token_refs_for_multiple_sequences
 
 
 def test_sequence_materializes_device_token_snapshot_without_clearing_newer_tokens():
-    Sequence.block_size = 16
     seq = Sequence([11], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True))
 
     seq.append_token_device(jnp.asarray(33, dtype=jnp.int32))

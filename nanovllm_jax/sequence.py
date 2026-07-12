@@ -13,7 +13,6 @@ Invariant:
 
 from copy import copy
 from enum import Enum, auto
-from itertools import count
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -44,20 +43,18 @@ class SamplingParams:
 
 class Sequence:
     """Represents a sequence being generated."""
-    
-    block_size: int = 16  # Will be overridden by config
-    counter = count()
 
     def __init__(
         self, 
         token_ids: List[int], 
         sampling_params: Optional[SamplingParams] = None,
-        seq_id: Optional[int] = None,
+        seq_id: int = 0,
+        block_size: int = 16,
     ):
-        if seq_id is None:
-            self.seq_id = next(Sequence.counter)
-        else:
-            self.seq_id = seq_id
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
+        self.seq_id = int(seq_id)
+        self.block_size = int(block_size)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]

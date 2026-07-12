@@ -5,6 +5,7 @@ serving capacity are configurable, implementation policy is not.
 """
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -24,7 +25,15 @@ def _int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
         raise ValueError(f"{field_name} must contain integers") from exc
     if any(item <= 0 for item in parsed):
         raise ValueError(f"{field_name} must contain positive integers")
+    if parsed != tuple(sorted(set(parsed))):
+        raise ValueError(f"{field_name} must be sorted and unique")
     return parsed
+
+
+def _strict_keys(raw: Mapping[str, Any], allowed: set[str], name: str) -> None:
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(f"unknown {name} keys: {', '.join(unknown)}")
 
 
 def _bool_value(value: Any, field_name: str) -> bool:
@@ -60,7 +69,95 @@ class ModelConfig:
     linear_conv_kernel_size: int = 4
     linear_chunk_size: int = 32
     rope_theta: float = 10_000_000
+    partial_rotary_factor: float = 0.25
+    mrope_section: tuple[int, ...] = (11, 11, 10)
     max_position_embeddings: int = 262144
+    layer_types: tuple[str, ...] = tuple(
+        "linear_attention" if index % 4 != 3 else "full_attention"
+        for index in range(24)
+    )
+    hidden_act: str = "silu"
+    rms_norm_eps: float = 1e-6
+    attention_dropout: float = 0.0
+    attention_bias: bool = False
+    tie_word_embeddings: bool = True
+    eos_token_id: int = 248044
+
+    def __post_init__(self) -> None:
+        fingerprint = (
+            self.hidden_size,
+            self.intermediate_size,
+            self.num_hidden_layers,
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.linear_num_key_heads,
+            self.linear_num_value_heads,
+        )
+        supported = {
+            (1024, 3584, 24, 8, 2, 16, 16),
+            (2048, 6144, 24, 8, 2, 16, 16),
+            (2560, 9216, 32, 16, 4, 16, 32),
+        }
+        if fingerprint not in supported:
+            raise ValueError(
+                "unsupported Qwen3.5 dense text shape "
+                f"hidden_size={self.hidden_size}, num_hidden_layers={self.num_hidden_layers}; "
+                "validated sizes are 0.8B, 2B, and 4B"
+            )
+        if len(self.layer_types) != self.num_hidden_layers:
+            raise ValueError("layer_types must contain one entry per hidden layer")
+        if set(self.layer_types) - {"linear_attention", "full_attention"}:
+            raise ValueError("layer_types contains an unsupported layer kind")
+        if self.num_attention_heads % self.num_key_value_heads:
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
+        if self.linear_num_value_heads % self.linear_num_key_heads:
+            raise ValueError("linear_num_value_heads must be divisible by linear_num_key_heads")
+        if not self.tie_word_embeddings:
+            raise ValueError("validated Qwen3.5 0.8B, 2B, and 4B checkpoints use tied embeddings")
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint: str | Path, *, model: str) -> "ModelConfig":
+        config_path = Path(checkpoint) / "config.json"
+        try:
+            raw = json.loads(config_path.read_text())
+        except FileNotFoundError as exc:
+            raise ValueError(f"checkpoint has no config.json: {checkpoint}") from exc
+        if raw.get("model_type") != "qwen3_5":
+            raise ValueError(f"unsupported model_type={raw.get('model_type')!r}; expected 'qwen3_5'")
+        text = raw.get("text_config")
+        if not isinstance(text, Mapping) or text.get("model_type") != "qwen3_5_text":
+            raise ValueError("checkpoint does not contain a Qwen3.5 text_config")
+        if text.get("mlp_only_layers", []) not in ([], None):
+            raise ValueError("mlp-only layers are not supported")
+        rope = text.get("rope_parameters") or {}
+        if rope.get("rope_type", "default") != "default":
+            raise ValueError("only default Qwen3.5 RoPE is supported")
+        return cls(
+            model=model,
+            vocab_size=int(text["vocab_size"]),
+            hidden_size=int(text["hidden_size"]),
+            intermediate_size=int(text["intermediate_size"]),
+            num_hidden_layers=int(text["num_hidden_layers"]),
+            num_attention_heads=int(text["num_attention_heads"]),
+            num_key_value_heads=int(text["num_key_value_heads"]),
+            head_dim=int(text["head_dim"]),
+            linear_num_key_heads=int(text["linear_num_key_heads"]),
+            linear_num_value_heads=int(text["linear_num_value_heads"]),
+            linear_key_head_dim=int(text["linear_key_head_dim"]),
+            linear_value_head_dim=int(text["linear_value_head_dim"]),
+            linear_conv_kernel_size=int(text["linear_conv_kernel_dim"]),
+            rope_theta=float(rope["rope_theta"]),
+            partial_rotary_factor=float(rope["partial_rotary_factor"]),
+            mrope_section=tuple(int(value) for value in rope["mrope_section"]),
+            max_position_embeddings=int(text["max_position_embeddings"]),
+            layer_types=tuple(str(value) for value in text["layer_types"]),
+            hidden_act=str(text["hidden_act"]),
+            rms_norm_eps=float(text["rms_norm_eps"]),
+            attention_dropout=float(text["attention_dropout"]),
+            attention_bias=bool(text["attention_bias"]),
+            tie_word_embeddings=bool(text["tie_word_embeddings"]),
+            eos_token_id=int(text["eos_token_id"]),
+        )
 
     @classmethod
     def from_runtime_config(cls, config: "RuntimeConfig", model: str = "Qwen/Qwen3.5-0.8B") -> "ModelConfig":
@@ -80,7 +177,16 @@ class ModelConfig:
             linear_conv_kernel_size=config.linear_conv_kernel_size,
             linear_chunk_size=config.linear_chunk_size,
             rope_theta=config.rope_theta,
+            partial_rotary_factor=config.partial_rotary_factor,
+            mrope_section=tuple(config.mrope_section),
             max_position_embeddings=config.max_position_embeddings,
+            layer_types=tuple(config.layer_types),
+            hidden_act=config.hidden_act,
+            rms_norm_eps=config.rms_norm_eps,
+            attention_dropout=config.attention_dropout,
+            attention_bias=config.attention_bias,
+            tie_word_embeddings=config.tie_word_embeddings,
+            eos_token_id=int(config.eos or 248044),
         )
 
 
@@ -94,9 +200,26 @@ class WarmupConfig:
     include_sampled_routes: bool = True
     enabled: bool = True
 
+    def __post_init__(self) -> None:
+        for name in ("prefill_token_buckets", "batch_size_buckets", "decode_block_buckets"):
+            value = getattr(self, name)
+            if value != tuple(sorted(set(value))) or any(item <= 0 for item in value):
+                raise ValueError(f"warmup.{name} must be sorted, unique, and positive")
+
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "WarmupConfig":
         raw = raw or {}
+        _strict_keys(
+            raw,
+            {
+                "prefill_token_buckets",
+                "batch_size_buckets",
+                "decode_block_buckets",
+                "include_sampled_routes",
+                "enabled",
+            },
+            "warmup",
+        )
         return cls(
             prefill_token_buckets=_int_tuple(
                 raw.get("prefill_token_buckets", cls.prefill_token_buckets),
@@ -134,6 +257,8 @@ class EngineConfig:
     prefix_cache: bool = True
 
     def __post_init__(self):
+        if self.max_prefill <= 0:
+            raise ValueError("max_prefill must be positive")
         if self.max_num_seqs <= 0:
             raise ValueError("max_num_seqs must be positive")
         if self.max_num_resident_seqs < self.max_num_seqs:
@@ -146,17 +271,47 @@ class EngineConfig:
             raise ValueError("kv_cache_bytes must be positive")
         if self.num_kvcache_blocks <= 0:
             raise ValueError("num_kvcache_blocks must be positive")
+        for name in ("prefill_token_buckets", "batch_size_buckets", "decode_block_buckets"):
+            value = getattr(self, name)
+            if not value or value != tuple(sorted(set(value))) or any(item <= 0 for item in value):
+                raise ValueError(f"{name} must be sorted, unique, and positive")
+        if max(self.prefill_token_buckets) < self.max_prefill:
+            raise ValueError("prefill_token_buckets must cover max_prefill")
+        if max(self.prefill_token_buckets) < self.max_num_batched_tokens:
+            raise ValueError("prefill_token_buckets must cover max_num_batched_tokens")
+        if max(self.batch_size_buckets) < self.max_num_seqs:
+            raise ValueError("batch_size_buckets must cover max_num_seqs")
+        if max(self.decode_block_buckets) < self.max_blocks_per_seq:
+            raise ValueError("decode_block_buckets must cover max_blocks_per_seq")
+        if not set(self.warmup.prefill_token_buckets).issubset(self.prefill_token_buckets):
+            raise ValueError("warmup prefill buckets must be configured engine buckets")
+        if not set(self.warmup.batch_size_buckets).issubset(self.batch_size_buckets):
+            raise ValueError("warmup batch buckets must be configured engine buckets")
+        if not set(self.warmup.decode_block_buckets).issubset(self.decode_block_buckets):
+            raise ValueError("warmup decode buckets must be configured engine buckets")
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "EngineConfig":
         raw = raw or {}
-        kv_cache_bytes = raw.get("kv_cache_bytes")
-        if kv_cache_bytes is None and raw.get("kv_cache_mb") is not None:
-            kv_cache_bytes = int(raw["kv_cache_mb"]) * 1024 * 1024
-        if kv_cache_bytes is None and raw.get("max_kv_cache_mb") is not None:
-            kv_cache_bytes = int(raw["max_kv_cache_mb"]) * 1024 * 1024
-        if kv_cache_bytes is None:
-            kv_cache_bytes = cls.kv_cache_bytes
+        _strict_keys(
+            raw,
+            {
+                "model",
+                "max_prefill",
+                "max_num_seqs",
+                "max_num_resident_seqs",
+                "max_num_batched_tokens",
+                "max_blocks_per_seq",
+                "kv_cache_bytes",
+                "num_kvcache_blocks",
+                "prefill_token_buckets",
+                "batch_size_buckets",
+                "decode_block_buckets",
+                "warmup",
+                "prefix_cache",
+            },
+            "engine",
+        )
         return cls(
             model=str(raw.get("model", cls.model)),
             max_prefill=int(raw.get("max_prefill", cls.max_prefill)),
@@ -166,8 +321,8 @@ class EngineConfig:
             ),
             max_num_batched_tokens=int(raw.get("max_num_batched_tokens", cls.max_num_batched_tokens)),
             max_blocks_per_seq=int(raw.get("max_blocks_per_seq", cls.max_blocks_per_seq)),
-            kv_cache_bytes=int(kv_cache_bytes),
-            num_kvcache_blocks=int(raw.get("num_kvcache_blocks", raw.get("num_kv_cache_blocks", cls.num_kvcache_blocks))),
+            kv_cache_bytes=int(raw.get("kv_cache_bytes", cls.kv_cache_bytes)),
+            num_kvcache_blocks=int(raw.get("num_kvcache_blocks", cls.num_kvcache_blocks)),
             prefill_token_buckets=_int_tuple(
                 raw.get("prefill_token_buckets", cls.prefill_token_buckets),
                 "prefill_token_buckets",
@@ -177,7 +332,7 @@ class EngineConfig:
                 "batch_size_buckets",
             ),
             decode_block_buckets=_int_tuple(
-                raw.get("decode_block_buckets", raw.get("decode_block_table_buckets", cls.decode_block_buckets)),
+                raw.get("decode_block_buckets", cls.decode_block_buckets),
                 "decode_block_buckets",
             ),
             warmup=WarmupConfig.from_mapping(raw.get("warmup")),
@@ -219,7 +374,9 @@ class ServerSettings:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "ServerSettings":
         raw = raw or {}
+        _strict_keys(raw, {"server", "engine"}, "top-level")
         server = raw.get("server", {}) or {}
+        _strict_keys(server, {"host", "port", "max_tokens_default"}, "server")
         return cls(
             host=str(server.get("host", cls.host)),
             port=int(server.get("port", cls.port)),
@@ -321,7 +478,6 @@ class RuntimeConfig:
 
     # Internal implementation policy projected from nanovllm_jax.fastpath.
     # These fields stay here because the model and executor read one config.
-    materialize_tied_lm_head: bool = False
     compact_prefill_in_proj_qkv: bool = False
     compact_prefill_gdn_z: bool = False
     compact_prefill_full_attn_proj: bool = False
@@ -336,6 +492,7 @@ class RuntimeConfig:
     decode_rms_padded_gemm: bool = False
     decode_padded_gemm_rows: int = 8
     decode_padded_gemm_max_out_dim: int = 300000
+    gdn_width1_packed_input_projection: bool = False
 
     # Kernel policy projected from nanovllm_jax.fastpath, not user config.
     full_attention_kv_cache_dtype: str = "default"
@@ -350,13 +507,6 @@ class RuntimeConfig:
     gdn_packed_decode_qkv_dtype: str = "fp32"
     gdn_packed_decode_pre_normalize_qk: bool = False
     gdn_packed_decode_max_batch: Optional[int] = None
-    
-    # Vision config (for multimodal)
-    vision_depth: int = 12
-    vision_hidden_size: int = 768
-    vision_num_heads: int = 12
-    vision_patch_size: int = 16
-    vision_out_hidden_size: int = 1024
     
     def __post_init__(self):
         """Initialize layer_types if not provided."""
@@ -540,7 +690,6 @@ class RuntimeConfig:
             self.static_decode_seq_lens_carry,
             self.resident_decode_metadata,
             self.greedy_decode_burst_steps,
-            self.materialize_tied_lm_head,
             self.compact_prefill_in_proj_qkv,
             self.compact_prefill_gdn_z,
             self.compact_prefill_full_attn_proj,
@@ -555,6 +704,7 @@ class RuntimeConfig:
             self.decode_rms_padded_gemm,
             self.decode_padded_gemm_rows,
             self.decode_padded_gemm_max_out_dim,
+            self.gdn_width1_packed_input_projection,
             self.full_attention_kv_cache_dtype,
             self.full_attention_kv_append_impl,
             self.full_attention_decode_impl,
@@ -583,72 +733,54 @@ class RuntimeConfig:
     
     @classmethod
     def qwen3_5_0_8b(cls) -> "RuntimeConfig":
-        """Qwen3.5-0.8B configuration."""
-        return cls(
-            vocab_size=248320,
-            hidden_size=1024,
-            intermediate_size=3584,
-            num_hidden_layers=24,
-            num_attention_heads=8,
-            num_key_value_heads=2,
-            head_dim=256,
-            linear_num_key_heads=16,
-            linear_num_value_heads=16,
-            linear_key_head_dim=128,
-            linear_value_head_dim=128,
-            linear_conv_kernel_size=4,
-            linear_chunk_size=32,
-            use_qk_norm_in_gdn=True,
-            rope_theta=10_000_000,
-            max_position_embeddings=262144,
-            tie_word_embeddings=True,
-        )
-    
+        """Small deterministic config used by focused model tests."""
+        return cls.from_model_config(ModelConfig())
+
     @classmethod
-    def qwen3_5_2b(cls) -> "RuntimeConfig":
-        """Qwen3.5-2B configuration."""
-        return cls(
-            vocab_size=248320,
-            hidden_size=2048,
-            intermediate_size=6144,
-            num_hidden_layers=24,
-            num_attention_heads=8,
-            num_key_value_heads=2,
-            head_dim=256,
-            linear_num_key_heads=16,
-            linear_num_value_heads=16,
-            linear_key_head_dim=128,
-            linear_value_head_dim=128,
-            linear_conv_kernel_size=4,
-            linear_chunk_size=32,
-            use_qk_norm_in_gdn=True,
-            rope_theta=10_000_000,
-            max_position_embeddings=262144,
-            tie_word_embeddings=True,
-        )
-    
-    @classmethod
-    def qwen3_5_27b(cls) -> "RuntimeConfig":
-        """Qwen3.5-27B configuration."""
-        return cls(
-            vocab_size=248320,
-            hidden_size=4608,
-            intermediate_size=12032,
-            num_hidden_layers=64,
-            num_attention_heads=32,
-            num_key_value_heads=8,
-            head_dim=256,
-            linear_num_key_heads=32,
-            linear_num_value_heads=64,
-            linear_key_head_dim=128,
-            linear_value_head_dim=128,
-            linear_conv_kernel_size=4,
-            linear_chunk_size=32,
-            use_qk_norm_in_gdn=True,
-            rope_theta=1_000_000,
-            max_position_embeddings=262144,
-            tie_word_embeddings=False,
-        )
+    def from_model_config(
+        cls,
+        model: ModelConfig,
+        **runtime: Any,
+    ) -> "RuntimeConfig":
+        """Combine checkpoint architecture with serving/runtime policy."""
+        architecture = {
+            "vocab_size": model.vocab_size,
+            "hidden_size": model.hidden_size,
+            "intermediate_size": model.intermediate_size,
+            "num_hidden_layers": model.num_hidden_layers,
+            "num_attention_heads": model.num_attention_heads,
+            "num_key_value_heads": model.num_key_value_heads,
+            "head_dim": model.head_dim,
+            "linear_num_key_heads": model.linear_num_key_heads,
+            "linear_num_value_heads": model.linear_num_value_heads,
+            "linear_key_head_dim": model.linear_key_head_dim,
+            "linear_value_head_dim": model.linear_value_head_dim,
+            "linear_conv_kernel_size": model.linear_conv_kernel_size,
+            "linear_chunk_size": model.linear_chunk_size,
+            "rope_theta": model.rope_theta,
+            "partial_rotary_factor": model.partial_rotary_factor,
+            "mrope_section": model.mrope_section,
+            "max_position_embeddings": model.max_position_embeddings,
+            "layer_types": model.layer_types,
+            "linear_attn_layers": tuple(
+                index
+                for index, layer_type in enumerate(model.layer_types)
+                if layer_type == "linear_attention"
+            ),
+            "hidden_act": model.hidden_act,
+            "rms_norm_eps": model.rms_norm_eps,
+            "attention_dropout": model.attention_dropout,
+            "attention_bias": model.attention_bias,
+            "tie_word_embeddings": model.tie_word_embeddings,
+            "eos": model.eos_token_id,
+        }
+        overlap = set(architecture) & set(runtime)
+        if overlap:
+            raise ValueError(
+                "runtime policy cannot override checkpoint architecture: "
+                + ", ".join(sorted(overlap))
+            )
+        return cls(**architecture, **runtime)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
@@ -695,7 +827,6 @@ class RuntimeConfig:
             "static_decode_seq_lens_carry": self.static_decode_seq_lens_carry,
             "resident_decode_metadata": self.resident_decode_metadata,
             "greedy_decode_burst_steps": self.greedy_decode_burst_steps,
-            "materialize_tied_lm_head": self.materialize_tied_lm_head,
             "compact_prefill_in_proj_qkv": self.compact_prefill_in_proj_qkv,
             "compact_prefill_gdn_z": self.compact_prefill_gdn_z,
             "compact_prefill_full_attn_proj": self.compact_prefill_full_attn_proj,
@@ -710,6 +841,7 @@ class RuntimeConfig:
             "decode_rms_padded_gemm": self.decode_rms_padded_gemm,
             "decode_padded_gemm_rows": self.decode_padded_gemm_rows,
             "decode_padded_gemm_max_out_dim": self.decode_padded_gemm_max_out_dim,
+            "gdn_width1_packed_input_projection": self.gdn_width1_packed_input_projection,
             "full_attention_kv_cache_dtype": self.full_attention_kv_cache_dtype,
             "full_attention_kv_append_impl": self.full_attention_kv_append_impl,
             "full_attention_decode_impl": self.full_attention_decode_impl,

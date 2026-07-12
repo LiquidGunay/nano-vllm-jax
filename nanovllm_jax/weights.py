@@ -1,7 +1,5 @@
 """Load pretrained Hugging Face weights into the serving parameter tree."""
 
-import time
-import json
 from pathlib import Path
 
 import jax.numpy as jnp
@@ -43,29 +41,24 @@ def _add_full_attention_decode_packed_qkv(layer_params: dict[str, jnp.ndarray]) 
 
 def _add_mlp_packed_gate_up(layer_params: dict[str, jnp.ndarray]) -> None:
     """Add a packed SwiGLU gate/up projection weight."""
-    layer_params[MLP_GATE_UP_PACKED_KEY] = jnp.concatenate(
-        [
-            layer_params["gate_proj"],
-            layer_params["up_proj"],
-        ],
-        axis=1,
-    )
+    gate = layer_params.pop("gate_proj")
+    up = layer_params.pop("up_proj")
+    layer_params[MLP_GATE_UP_PACKED_KEY] = jnp.concatenate([gate, up], axis=1)
 
 
-def _materialize_tied_lm_head_enabled(config: RuntimeConfig | None = None) -> bool:
-    """Materialize tied embeddings as a separate [hidden, vocab] LM-head leaf."""
-    if config is not None and hasattr(config, "materialize_tied_lm_head"):
-        return bool(config.materialize_tied_lm_head)
-    return False
+def resolve_checkpoint(model: str | Path, cache_dir: str | None = None) -> Path:
+    """Resolve a local checkpoint directory or one immutable Hub snapshot."""
+    local = Path(model).expanduser()
+    if local.exists():
+        if not local.is_dir():
+            raise ValueError(f"checkpoint path is not a directory: {local}")
+        return local.resolve()
 
-
-def download_hf_weights(model_name: str, cache_dir: str = None):
-    """Download or reuse a Hugging Face snapshot."""
     from huggingface_hub import snapshot_download
 
-    print(f"Resolving {model_name} from Hugging Face cache...")
+    print(f"Resolving {model} from Hugging Face cache...")
     path = snapshot_download(
-        repo_id=model_name,
+        repo_id=str(model),
         cache_dir=cache_dir,
         allow_patterns=[
             "*.json",
@@ -79,25 +72,6 @@ def download_hf_weights(model_name: str, cache_dir: str = None):
     )
     print(f"Using snapshot: {path}")
     return Path(path)
-
-def load_safetensors(model_path: Path):
-    """Load weights from safetensors files."""
-    try:
-        from safetensors import safe_open
-    except ImportError as exc:
-        raise ImportError(
-            "safetensors is required to load model weights. Install the package "
-            "with `pip install -e .` or `pip install safetensors`."
-        ) from exc
-
-    weights = {}
-    for st_file in model_path.glob("*.safetensors"):
-        print(f"  Loading {st_file.name}...")
-        with safe_open(st_file, framework="np") as f:
-            for key in f.keys():
-                weights[key] = f.get_tensor(key)
-
-    return weights
 
 
 class _SafeTensorReader:
@@ -120,6 +94,8 @@ class _SafeTensorReader:
                     normalized = _normalize_hf_key(key)
                     self._key_to_file[normalized] = (st_file, key)
                     self._key_to_file[key] = (st_file, key)
+        if not self._key_to_file:
+            raise ValueError(f"checkpoint contains no safetensors weights: {model_path}")
 
     def get(self, key: str):
         try:
@@ -183,8 +159,75 @@ def _to_jax_weight(
     return arr
 
 
+def _expect_shape(name: str, value: jnp.ndarray, expected: tuple[int, ...]) -> None:
+    actual = tuple(int(size) for size in value.shape)
+    if actual != expected:
+        raise ValueError(f"{name} has shape {actual}, expected {expected}")
+
+
+def _validate_params(params: ModelParams, config: RuntimeConfig) -> None:
+    hidden = config.hidden_size
+    intermediate = config.intermediate_size
+    key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+    value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+    mixed_dim = 2 * key_dim + value_dim
+    query_dim = config.num_attention_heads * config.head_dim
+    kv_dim = config.num_key_value_heads * config.head_dim
+
+    _expect_shape("embed_tokens", params.embed_tokens, (config.vocab_size, hidden))
+    _expect_shape("norm_weight", params.norm_weight, (hidden,))
+    if params.lm_head is not None:
+        _expect_shape("lm_head", params.lm_head, (config.vocab_size, hidden))
+    if len(params.layers) != config.num_hidden_layers:
+        raise ValueError("checkpoint layer count does not match model config")
+
+    for index, (layer_type, layer) in enumerate(zip(config.layer_types, params.layers)):
+        prefix = f"layers.{index}"
+        common = {
+            "input_norm": (hidden,),
+            "ffn_norm": (hidden,),
+            "down_proj": (intermediate, hidden),
+            MLP_GATE_UP_PACKED_KEY: (hidden, 2 * intermediate),
+        }
+        expected = dict(common)
+        if layer_type == "full_attention":
+            expected.update(
+                {
+                    "q_proj": (hidden, 2 * query_dim),
+                    "k_proj": (hidden, kv_dim),
+                    "v_proj": (hidden, kv_dim),
+                    "o_proj": (query_dim, hidden),
+                    "q_norm": (config.head_dim,),
+                    "k_norm": (config.head_dim,),
+                    FULL_ATTN_DECODE_QKV_PACKED_KEY: (hidden, 2 * query_dim + 2 * kv_dim),
+                }
+            )
+        else:
+            expected.update(
+                {
+                    "in_proj_qkv": (hidden, mixed_dim),
+                    "in_proj_a": (hidden, config.linear_num_value_heads),
+                    "in_proj_b": (hidden, config.linear_num_value_heads),
+                    "in_proj_z": (hidden, value_dim),
+                    "conv1d_weight": (mixed_dim, config.linear_conv_kernel_size),
+                    "dt_bias": (config.linear_num_value_heads,),
+                    "A": (config.linear_num_value_heads,),
+                    "norm_weight": (config.linear_value_head_dim,),
+                    "out_proj": (value_dim, hidden),
+                    GDN_DECODE_IN_PROJ_PACKED_KEY: (
+                        hidden,
+                        mixed_dim + 2 * config.linear_num_value_heads + value_dim,
+                    ),
+                }
+            )
+        for name, shape in expected.items():
+            if name not in layer:
+                raise ValueError(f"{prefix} is missing {name}")
+            _expect_shape(f"{prefix}.{name}", layer[name], shape)
+
+
 def load_weights_from_hf_streaming(
-    model_name: str,
+    model: str | Path,
     config: RuntimeConfig,
     *,
     verbose: bool = False,
@@ -194,8 +237,8 @@ def load_weights_from_hf_streaming(
     if config is None:
         raise ValueError("config is required - cannot be None")
 
-    print(f"Loading weights for {model_name}...")
-    hf_path = download_hf_weights(model_name, cache_dir=cache_dir)
+    hf_path = resolve_checkpoint(model, cache_dir=cache_dir)
+    print(f"Loading weights from {hf_path}...")
     reader = _SafeTensorReader(hf_path)
 
     print("Converting weights...")
@@ -215,7 +258,6 @@ def load_weights_from_hf_streaming(
             layer_params["q_norm"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.q_norm.weight", config)
             layer_params["k_norm"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.k_norm.weight", config)
             layer_params["input_norm"] = _to_jax_weight(reader, f"{layer_prefix}input_layernorm.weight", config)
-            layer_params["post_attn_norm"] = _to_jax_weight(reader, f"{layer_prefix}post_attention_layernorm.weight", config)
             layer_params["gate_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.gate_proj.weight", config, transpose=True)
             layer_params["up_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.up_proj.weight", config, transpose=True)
             layer_params["down_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.down_proj.weight", config, transpose=True)
@@ -245,213 +287,20 @@ def load_weights_from_hf_streaming(
         if verbose:
             print(f"  converted layer {i}: {layer_type}")
 
-    norm_weight = _to_jax_weight(reader, "norm.weight", config) if reader.has("norm.weight") else jnp.ones(config.hidden_size)
+    norm_weight = _to_jax_weight(reader, "norm.weight", config)
     if reader.has("lm_head.weight"):
-        lm_head = _to_jax_weight(reader, "lm_head.weight", config, transpose=True)
-    elif config.tie_word_embeddings and _materialize_tied_lm_head_enabled(config):
-        print("Materializing tied LM head as a separate [hidden, vocab] weight...")
-        lm_head = _to_jax_weight(reader, "embed_tokens.weight", config, transpose=True)
-    else:
+        lm_head = _to_jax_weight(reader, "lm_head.weight", config)
+    elif config.tie_word_embeddings:
         lm_head = None
+    else:
+        raise ValueError("untied checkpoint is missing lm_head.weight")
 
     print(f"✓ Loaded weights: {len(layers)} layers")
-    return ModelParams(
+    params = ModelParams(
         embed_tokens=embed_tokens,
         layers=layers,
         norm_weight=norm_weight,
         lm_head=lm_head,
     )
-
-
-def convert_hf_to_jax(hf_weights: dict, config: RuntimeConfig, verbose: bool = False) -> ModelParams:
-    """Convert HuggingFace weights to JAX format for Qwen 3.5."""
-    print("Converting weights...")
-    if not verbose:
-        import warnings
-        warnings.filterwarnings('ignore')
-
-    import ml_dtypes
-
-    # Get target dtype from config
-    target_dtype = config.get_dtype()
-    if target_dtype == jnp.bfloat16:
-        # Use ml_dtypes for bfloat16 support
-        np_dtype = ml_dtypes.bfloat16
-        jax_dtype = jnp.bfloat16
-    elif target_dtype == jnp.float16:
-        np_dtype = np.float16
-        jax_dtype = jnp.float16
-    else:
-        np_dtype = np.float32
-        jax_dtype = jnp.float32
-
-    # Extract text model weights (prefix "model.language_model." or "model.")
-    text_weights = {}
-
-    for key, value in hf_weights.items():
-        value_np = np.asarray(value)
-
-        # Convert to target dtype
-        if value_np.dtype != np_dtype:
-            # Convert via float32 intermediate for bfloat16
-            if np_dtype == ml_dtypes.bfloat16:
-                value_np = value_np.astype(np.float32).astype(np_dtype)
-            else:
-                value_np = value_np.astype(np_dtype)
-
-        value_jax = jnp.array(value_np, dtype=jax_dtype)
-
-        if key.startswith("model.language_model."):
-            new_key = key[21:]  # Remove "model.language_model." prefix
-            text_weights[new_key] = value_jax
-        elif key.startswith("model."):
-            new_key = key[6:]  # Remove "model." prefix
-            text_weights[new_key] = value_jax
-
-    # Embeddings
-    embed_tokens = text_weights.get("embed_tokens.weight")
-    if embed_tokens is None:
-        raise ValueError("embed_tokens.weight not found")
-
-    # Convert layers
-    layers = []
-    for i in range(config.num_hidden_layers):
-        layer_prefix = f"layers.{i}."
-        layer_params = {}
-
-        layer_type = config.layer_types[i]
-
-        if layer_type == "full_attention":
-            # Full attention layer
-            layer_params["q_proj"] = text_weights[f"{layer_prefix}self_attn.q_proj.weight"].T
-            layer_params["k_proj"] = text_weights[f"{layer_prefix}self_attn.k_proj.weight"].T
-            layer_params["v_proj"] = text_weights[f"{layer_prefix}self_attn.v_proj.weight"].T
-            layer_params["o_proj"] = text_weights[f"{layer_prefix}self_attn.o_proj.weight"].T
-
-            # Norms (no shift needed - HF checkpoint is already sanitized)
-            layer_params["q_norm"] = text_weights[f"{layer_prefix}self_attn.q_norm.weight"]
-            layer_params["k_norm"] = text_weights[f"{layer_prefix}self_attn.k_norm.weight"]
-            layer_params["input_norm"] = text_weights[f"{layer_prefix}input_layernorm.weight"]
-            layer_params["post_attn_norm"] = text_weights[f"{layer_prefix}post_attention_layernorm.weight"]
-
-            # MLP (SwiGLU)
-            layer_params["gate_proj"] = text_weights[f"{layer_prefix}mlp.gate_proj.weight"].T
-            layer_params["up_proj"] = text_weights[f"{layer_prefix}mlp.up_proj.weight"].T
-            layer_params["down_proj"] = text_weights[f"{layer_prefix}mlp.down_proj.weight"].T
-            layer_params["ffn_norm"] = text_weights[f"{layer_prefix}post_attention_layernorm.weight"]
-            _add_full_attention_decode_packed_qkv(layer_params)
-            _add_mlp_packed_gate_up(layer_params)
-
-        else:
-            # Gated DeltaNet layer
-            linear_prefix = f"{layer_prefix}linear_attn."
-
-            # in_proj_qkv: [6144, 1024] -> split into q, k, v after loading
-            layer_params["in_proj_qkv"] = text_weights[f"{linear_prefix}in_proj_qkv.weight"].T  # [1024, 6144]
-
-            # in_proj_a: [16, 1024] -> [1024, 16]
-            layer_params["in_proj_a"] = text_weights[f"{linear_prefix}in_proj_a.weight"].T
-
-            # in_proj_b: [16, 1024] -> [1024, 16]
-            layer_params["in_proj_b"] = text_weights[f"{linear_prefix}in_proj_b.weight"].T
-
-            # in_proj_z: [2048, 1024] -> [1024, 2048]
-            layer_params["in_proj_z"] = text_weights[f"{linear_prefix}in_proj_z.weight"].T
-
-            # conv1d: [6144, 1, 4] -> need to squeeze and transpose to [6144, 4]
-            conv_weight = text_weights[f"{linear_prefix}conv1d.weight"]
-            if conv_weight.ndim == 3:
-                conv_weight = jnp.squeeze(conv_weight, axis=1)  # [6144, 4]
-            layer_params["conv1d_weight"] = conv_weight
-
-            # dt_bias: [16]
-            layer_params["dt_bias"] = text_weights[f"{linear_prefix}dt_bias"]
-
-            # A_log: [16] -> exp to get A. HF computes A_log.float().exp()
-            # at runtime, so the derived A stays FP32 even for BF16 weights.
-            layer_params["A"] = jnp.exp(text_weights[f"{linear_prefix}A_log"].astype(jnp.float32))
-
-            # norm: [128] - RMSNorm over head groups (no shift needed)
-            layer_params["norm_weight"] = text_weights[f"{linear_prefix}norm.weight"]
-
-            # out_proj: [1024, 2048] -> [2048, 1024]
-            layer_params["out_proj"] = text_weights[f"{linear_prefix}out_proj.weight"].T
-
-            # Layer norms - use correct names for transformer_block (no shift needed)
-            layer_params["input_norm"] = text_weights[f"{layer_prefix}input_layernorm.weight"]
-            layer_params["ffn_norm"] = text_weights[f"{layer_prefix}post_attention_layernorm.weight"]
-
-            # MLP (SwiGLU)
-            layer_params["gate_proj"] = text_weights[f"{layer_prefix}mlp.gate_proj.weight"].T
-            layer_params["up_proj"] = text_weights[f"{layer_prefix}mlp.up_proj.weight"].T
-            layer_params["down_proj"] = text_weights[f"{layer_prefix}mlp.down_proj.weight"].T
-            _add_gdn_decode_packed_in_proj(layer_params)
-            _add_mlp_packed_gate_up(layer_params)
-
-        layers.append(layer_params)
-
-    # Final norm (no shift needed)
-    norm_weight = text_weights.get("norm.weight", jnp.ones(config.hidden_size))
-
-    # LM head (check if tied)
-    lm_head = None
-    if "lm_head.weight" in text_weights:
-        lm_head = text_weights["lm_head.weight"].T
-    # Also check without language_model prefix
-    elif "lm_head.weight" in hf_weights:
-        lm_head_val = hf_weights["lm_head.weight"]
-        if hasattr(lm_head_val, 'cpu'):
-            lm_head_val = lm_head_val.cpu().float().numpy()
-        lm_head = jnp.array(lm_head_val).T
-    # Tie weights if no separate LM head
-    elif config.tie_word_embeddings:
-        # Keep tied weights implicit by default. Materializing embed_tokens.T costs
-        # about 485 MiB for Qwen3.5-0.8B, but can be profiled as an opt-in layout.
-        lm_head = jnp.array(embed_tokens.T, copy=True) if _materialize_tied_lm_head_enabled(config) else None
-
-    return ModelParams(
-        embed_tokens=embed_tokens,
-        layers=layers,
-        norm_weight=norm_weight,
-        lm_head=lm_head,
-    )
-
-
-def load_weights_from_hf(
-    model_name: str,
-    config: RuntimeConfig,
-    *,
-    verbose: bool = False,
-    cache_dir: str = None,
-) -> ModelParams:
-    """Load weights from HuggingFace for Qwen3.5 model.
-
-    Args:
-        model_name: HuggingFace model identifier (e.g., "Qwen/Qwen3.5-0.8B")
-        config: Model configuration (REQUIRED)
-        verbose: Whether to print detailed weight info
-        cache_dir: Optional Hugging Face cache directory
-
-    Returns:
-        ModelParams with loaded serving weights
-
-    Raises:
-        ValueError: If model not found in cache or weights invalid
-        RuntimeError: If weight conversion fails
-    """
-    if config is None:
-        raise ValueError("config is required - cannot be None")
-
-    print(f"Loading weights for {model_name}...")
-
-    # Download from HF
-    hf_path = download_hf_weights(model_name, cache_dir=cache_dir)
-
-    # Load safetensors
-    hf_weights = load_safetensors(hf_path)
-
-    # Convert to JAX format
-    jax_params = convert_hf_to_jax(hf_weights, config, verbose=verbose)
-
-    print(f"✓ Loaded weights: {len(jax_params.layers)} layers")
-    return jax_params
+    _validate_params(params, config)
+    return params

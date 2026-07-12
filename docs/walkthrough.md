@@ -11,9 +11,11 @@ then submits it to `EngineService`.
 `EngineService` owns online admission. It drains queued arrivals, calls
 `LLMEngine.add_request()`, and lets the engine worker call `engine.step()`.
 
-`LLMEngine.step()` asks the scheduler for work. For a new prompt, the scheduler
-reserves cache blocks through `BlockManager`, chooses a prefill chunk, and
-returns a `ScheduledBatch`.
+`LLMEngine.step()` asks the scheduler for work. Before a new prompt starts, the
+scheduler reserves enough cache blocks for its prompt and maximum completion.
+If that reservation cannot be made, the request waits while active requests
+continue; it is never admitted and later evicted with partial state. The
+scheduler then chooses a prefill chunk and returns a `ScheduledBatch`.
 The cleaned scheduler chooses either prefill work or decode work for a step; it
 does not carry a dormant mixed prefill/decode mode.
 
@@ -42,7 +44,7 @@ for each layer:
   full attention -> attention.py, Triton packed prefill
   or GDN          -> gdn.py, Triton/FLA padded prefill
   MLP
-LM head          -> lm_head.py, Triton greedy top-1 when greedy
+LM head          -> lm_head.py, native `[V, H]` Triton top-1 when greedy
 ```
 
 After the step, the scheduler records computed prefix blocks and matching GDN

@@ -163,12 +163,14 @@ class BlockManager:
         self,
         seq: Sequence,
         *,
+        total_blocks: int | None = None,
         use_prefix_cache: bool = True,
         cacheable_hashes: Set[int] | None = None,
     ) -> bool:
-        """Check if we can allocate blocks for sequence."""
+        """Check whether a request's complete lifetime can be reserved."""
         return len(self.free_block_ids) >= self._num_required_blocks(
             seq,
+            total_blocks=total_blocks,
             use_prefix_cache=use_prefix_cache,
             cacheable_hashes=cacheable_hashes,
         )
@@ -177,6 +179,7 @@ class BlockManager:
         self,
         seq: Sequence,
         *,
+        total_blocks: int | None = None,
         use_prefix_cache: bool = True,
         cacheable_hashes: Set[int] | None = None,
     ) -> int:
@@ -185,13 +188,17 @@ class BlockManager:
         Full-block prefix-cache hits that are already in use do not consume a
         free block; cache misses and request-local partial blocks do.
         """
+        logical_blocks = self._num_blocks(seq)
+        total_blocks = logical_blocks if total_blocks is None else int(total_blocks)
+        if total_blocks < logical_blocks:
+            raise ValueError("total_blocks cannot be smaller than the prompt")
         if not use_prefix_cache:
-            return self._num_blocks(seq)
+            return total_blocks
         cached_tokens, _ = self.cached_prefix_info(seq, cacheable_hashes=cacheable_hashes)
         cached_blocks = cached_tokens // self.block_size
         h = -1
         required = 0
-        for block_idx in range(self._num_blocks(seq)):
+        for block_idx in range(total_blocks):
             token_ids = self._block_tokens(seq, block_idx)
             block_id = -1
             if len(token_ids) == self.block_size:
@@ -207,10 +214,11 @@ class BlockManager:
         self,
         seq: Sequence,
         *,
+        total_blocks: int | None = None,
         use_prefix_cache: bool = True,
         cacheable_hashes: Set[int] | None = None,
     ):
-        """Allocate blocks for a sequence.
+        """Reserve every block a sequence can need before it starts.
         
         Implements prefix caching:
         - Computes hash for each full block
@@ -218,7 +226,19 @@ class BlockManager:
         - Allocates new blocks for cache misses
         """
         assert not seq.block_table
-        seq.block_size = self.block_size
+        if seq.block_size != self.block_size:
+            raise ValueError("sequence and block manager use different block sizes")
+        logical_blocks = self._num_blocks(seq)
+        total_blocks = logical_blocks if total_blocks is None else int(total_blocks)
+        if total_blocks < logical_blocks:
+            raise ValueError("total_blocks cannot be smaller than the prompt")
+        if not self.can_allocate(
+            seq,
+            total_blocks=total_blocks,
+            use_prefix_cache=use_prefix_cache,
+            cacheable_hashes=cacheable_hashes,
+        ):
+            raise RuntimeError("insufficient free blocks for complete request reservation")
         seq.num_cached_tokens = 0
         seq.cached_prefix_hash = None
         seq.cached_prefix_hybrid_seeded = False
@@ -231,7 +251,7 @@ class BlockManager:
         cached_blocks = cached_tokens // self.block_size
         h = -1
         
-        for i in range(self._num_blocks(seq)):
+        for i in range(total_blocks):
             token_ids = self._block_tokens(seq, i)
             block_id = -1
 

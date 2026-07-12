@@ -223,6 +223,30 @@ class ModelRunner:
         self._sample_fn = jax.jit(self._sample_logits)
         self._warmup_compiled = False
 
+    def memory_bytes(self) -> dict[str, int]:
+        """Return the persistent non-parameter device allocation breakdown."""
+
+        def nbytes(value: object) -> int:
+            return sum(
+                int(leaf.size) * int(leaf.dtype.itemsize)
+                for leaf in jax.tree_util.tree_leaves(value)
+                if hasattr(leaf, "size") and hasattr(leaf, "dtype")
+            )
+
+        return {
+            "target_kv": nbytes(self.cache_storage),
+            "full_attention_kv": nbytes(self.full_attention_nhd_cache),
+            "hybrid_state": nbytes((self._empty_hybrid_state, self._hybrid_state_table)),
+            "resident_metadata": nbytes(
+                (
+                    self._resident_block_tables,
+                    self._resident_seq_lens,
+                    self._resident_last_tokens,
+                    self._resident_rng_counters,
+                )
+            ),
+        }
+
 
     def warmup_compilation(
         self,

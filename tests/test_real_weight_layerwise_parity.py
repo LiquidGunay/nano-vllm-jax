@@ -18,7 +18,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.layers import rms_norm
-from nanovllm_jax.weights import load_weights_from_hf
+from nanovllm_jax.weights import load_weights_from_hf_streaming
 from nanovllm_jax.model import _stable_rmsnorm_fp32
 
 
@@ -208,7 +208,7 @@ def real_weight_artifacts() -> RealWeightArtifacts:
 
     load_config = RuntimeConfig.qwen3_5_0_8b()
     load_config.dtype = "bfloat16"
-    params = load_weights_from_hf(MODEL_NAME, load_config)
+    params = load_weights_from_hf_streaming(MODEL_NAME, load_config)
 
     runtime_config = RuntimeConfig.qwen3_5_0_8b()
     runtime_config.dtype = "float32"

@@ -5,9 +5,11 @@ checkpoints. The cleaned mainline is intentionally narrow: it executes and
 explains one accepted serving path instead of exposing the full experimental
 search space as runtime configuration.
 
-The promoted target is `Qwen/Qwen3.5-0.8B` with BF16 weights and compute,
-packed prefill, paged decode, prefix caching, device token carry, resident
-decode metadata, and queue-driven continuous batching.
+The default target is `Qwen/Qwen3.5-0.8B`; the validated dense text sizes are
+0.8B, 2B, and 4B. Architecture is read from each checkpoint and checked before
+weights are loaded. The promoted path uses BF16 weights and compute, packed
+prefill, paged decode, prefix caching, device token carry, resident decode
+metadata, and queue-driven continuous batching.
 
 ## Start The Server
 
@@ -18,6 +20,11 @@ python server.py
 
 [server.yaml](server.yaml) controls model id, serving capacity, bucket sizes,
 KV budget, warmup buckets, and prefix-cache enablement.
+
+Requests reserve their worst-case KV capacity before prefill. A request that
+can never fit is rejected, and an active request is never evicted with partial
+KV/GDN state. Tied vocabulary weights remain in checkpoint-native `[V, H]`
+layout instead of allocating a second transposed copy.
 
 [nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py) owns implementation
 policy: dtypes, attention/GDN routes, LM-head route, device token carry, and

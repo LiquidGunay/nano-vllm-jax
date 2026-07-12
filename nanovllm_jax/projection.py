@@ -404,11 +404,12 @@ def _use_gdn_decode_packed_in_proj(
     seq_len: int,
     config: Optional[RuntimeConfig] = None,
 ) -> bool:
+    width_one = bool(getattr(config, "gdn_width1_packed_input_projection", False))
     return (
         not is_prefill
         and _GDN_DECODE_IN_PROJ_PACKED_KEY in params
         and (seq_len == 1 or gdn_packed_decode_enabled(config))
-        and batch > 1
+        and (batch > 1 or width_one)
     )
 
 

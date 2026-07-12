@@ -46,7 +46,6 @@ class FastPath:
     static_decode_seq_lens_carry: bool = False
     resident_decode_metadata: bool = True
 
-    materialize_tied_lm_head: bool = True
     compact_prefill_in_proj_qkv: bool = True
     compact_prefill_gdn_z: bool = True
     compact_prefill_full_attn_proj: bool = True
@@ -58,6 +57,7 @@ class FastPath:
     decode_padded_gemm_gate_up: bool = True
     decode_padded_gemm_rows: int = 8
     decode_padded_gemm_max_out_dim: int = 300000
+    gdn_width1_packed_input_projection: bool = True
 
 
 FASTPATH = FastPath()
@@ -90,7 +90,6 @@ def engine_overrides(fastpath: FastPath = FASTPATH) -> dict[str, object]:
         "static_decode_metadata": fastpath.static_decode_metadata,
         "static_decode_seq_lens_carry": fastpath.static_decode_seq_lens_carry,
         "resident_decode_metadata": fastpath.resident_decode_metadata,
-        "materialize_tied_lm_head": fastpath.materialize_tied_lm_head,
         "compact_prefill_in_proj_qkv": fastpath.compact_prefill_in_proj_qkv,
         "compact_prefill_gdn_z": fastpath.compact_prefill_gdn_z,
         "compact_prefill_full_attn_proj": fastpath.compact_prefill_full_attn_proj,
@@ -104,6 +103,7 @@ def engine_overrides(fastpath: FastPath = FASTPATH) -> dict[str, object]:
         "decode_padded_gemm_gate_up": fastpath.decode_padded_gemm_gate_up,
         "decode_padded_gemm_rows": fastpath.decode_padded_gemm_rows,
         "decode_padded_gemm_max_out_dim": fastpath.decode_padded_gemm_max_out_dim,
+        "gdn_width1_packed_input_projection": fastpath.gdn_width1_packed_input_projection,
         "full_attention_kv_cache_dtype": fastpath.kv_cache_dtype,
         "full_attention_kv_append_impl": fastpath.full_attention_kv_append,
         "full_attention_decode_impl": fastpath.full_attention_decode,
