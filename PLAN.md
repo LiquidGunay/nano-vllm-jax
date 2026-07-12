@@ -103,9 +103,12 @@ preemption:
 
 1. Compute worst-case blocks from `prompt_tokens + max_tokens`.
 2. Reject a request that can never fit the configured engine.
-3. Admit a waiting request only when its complete reservation can be held.
-4. Never evict a request after generation begins.
-5. Release the reservation on finish, cancellation, or error.
+3. Admit a waiting request only when its complete capacity-credit reservation
+   can be held; allocate physical pages only as tokens need them.
+4. Use bounded first-fit admission so a blocked large waiter does not stall a
+   smaller request that fits.
+5. Never evict a request after generation begins.
+6. Release physical pages and unused credits on finish, cancellation, or error.
 
 Recompute preemption can return later only with an explicit replay/reset ABI
 and its own correctness PR.
@@ -220,9 +223,9 @@ bounded CPU cores, positive nice level, and mountpoint-owned caches/artifacts.
 
 ### PR 1: correct capacity, configuration, and base model ABI
 
-Status: [ ] draft PR [#7](https://github.com/LiquidGunay/nano-vllm-jax/pull/7), awaiting review
+Status: [ ] draft PR [#7](https://github.com/LiquidGunay/nano-vllm-jax/pull/7), review fixes pushed; awaiting re-review
 
-Branch: `agent/base-correctness-abi` at `064d1a0`
+Branch: `agent/base-correctness-abi` at `74093fb`
 
 Purpose: make the ordinary target model truthful and safe before moving state
 between components.
@@ -449,3 +452,6 @@ Do not transplant:
 - [x] Confirm the proposed supported model set and headline workload.
 - [x] Capture the fresh external baseline (guarded mainline failure recorded).
 - [x] Open PR 1 as draft PR #7.
+- [x] Address PR 1 review: dual-EOS termination, complete architecture gate,
+  capacity credits, first-fit admission, derived shorthand warmup, metadata-first
+  Hub resolution, live-page FlashInfer metadata, and CPU CI. CI run 1 passed.
