@@ -12,10 +12,13 @@ then submits it to `EngineService`.
 `LLMEngine.add_request()`, and lets the engine worker call `engine.step()`.
 
 `LLMEngine.step()` asks the scheduler for work. Before a new prompt starts, the
-scheduler reserves enough cache blocks for its prompt and maximum completion.
-If that reservation cannot be made, the request waits while active requests
-continue; it is never admitted and later evicted with partial state. The
-scheduler then chooses a prefill chunk and returns a `ScheduledBatch`.
+scheduler reserves enough capacity credits for its prompt and maximum
+completion. It allocates physical pages only for the prompt and later block
+boundaries, so unwritten future tokens do not evict reusable prefixes. If the
+capacity reservation cannot be made, the request waits while active requests
+continue; a bounded first-fit scan still admits smaller requests behind it. An
+admitted request is never later evicted with partial state. The scheduler then
+chooses a prefill chunk and returns a `ScheduledBatch`.
 The cleaned scheduler chooses either prefill work or decode work for a step; it
 does not carry a dormant mixed prefill/decode mode.
 
@@ -75,8 +78,8 @@ route; greedy LM-head selection uses the Triton top-1 wrapper.
 The engine postprocesses emitted tokens, advances logical sequence length, and
 publishes token events through the request's service handle. Streaming is
 EOS-safe: progress events materialize the visible token prefix on host each
-step. Finished requests materialize their final token ids and release
-runner/cache state.
+step, and either the checkpoint EOS or tokenizer EOS ends generation. Finished
+requests materialize their final token ids and release runner/cache state.
 
 ## Prefix-Cache Hit
 

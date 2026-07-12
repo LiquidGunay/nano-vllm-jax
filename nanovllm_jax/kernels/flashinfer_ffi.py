@@ -839,11 +839,14 @@ def kv_append_paged_nhd_from_metadata(
     append_value = v[row_idx, col_idx]
     batch_indices = row_idx.astype(jnp.int32)
     positions = metadata.positions[row_idx, col_idx].astype(jnp.int32)
-    max_pages_per_sequence = metadata.block_tables.shape[1]
-    kv_indices = metadata.block_tables.reshape(-1).astype(jnp.int32)
-    kv_indptr = (
-        jnp.arange(batch + 1, dtype=jnp.int32)
-        * jnp.asarray(max_pages_per_sequence, dtype=jnp.int32)
+    from nanovllm_jax.kernels.paged_attention import (
+        dense_block_tables_to_kv_indptr,
+    )
+
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
+        metadata.block_tables,
+        metadata.seq_lens,
+        page_size,
     )
     kv_last_page_len = _kv_last_page_len(metadata.seq_lens, page_size)
     return kv_append_paged_nhd(

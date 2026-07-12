@@ -39,17 +39,47 @@ def kv_last_page_len_from_seq_lens(
 
 def dense_block_tables_to_kv_indptr(
     block_tables: Any,
+    seq_lens: Any,
+    page_size: int,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Convert dense `[batch, max_pages]` block tables to flattened page metadata."""
+    """Pack live page prefixes into FlashInfer's CSR page-table ABI.
+
+    The returned indices keep the static dense buffer size for JIT stability,
+    but ``kv_indptr`` exposes only the pages required by each sequence length.
+    FlashInfer ignores the unused tail of ``kv_indices``.
+    """
 
     block_tables = _as_jax_array("block_tables", block_tables)
     if block_tables.ndim != 2:
         raise ValueError("block_tables must have shape [batch, max_pages_per_sequence]")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
     batch, max_pages_per_sequence = block_tables.shape
-    kv_indices = block_tables.reshape(-1).astype(jnp.int32)
-    kv_indptr = (
-        jnp.arange(batch + 1, dtype=jnp.int32)
-        * jnp.asarray(max_pages_per_sequence, dtype=jnp.int32)
+    seq_lens = _as_jax_array("seq_lens", seq_lens).astype(jnp.int32)
+    if seq_lens.shape != (batch,):
+        raise ValueError("seq_lens must have shape [batch]")
+
+    page_counts = jnp.minimum(
+        (jnp.maximum(seq_lens, 0) + page_size - 1) // page_size,
+        max_pages_per_sequence,
+    )
+    # Keep one empty placeholder page for padded rows. FlashInfer derives a
+    # zero logical length from kv_last_page_len=0, while a non-empty segment
+    # avoids backend assumptions about strictly increasing indptr values.
+    physical_counts = jnp.where(seq_lens > 0, page_counts, 1)
+    live = jnp.arange(max_pages_per_sequence)[None, :] < physical_counts[:, None]
+    flat_tables = block_tables.reshape(-1).astype(jnp.int32)
+    live_offsets = jnp.nonzero(
+        live.reshape(-1),
+        size=batch * max_pages_per_sequence,
+        fill_value=0,
+    )[0]
+    kv_indices = flat_tables[live_offsets]
+    kv_indptr = jnp.concatenate(
+        (
+            jnp.zeros((1,), dtype=jnp.int32),
+            jnp.cumsum(physical_counts, dtype=jnp.int32),
+        )
     )
     return kv_indices, kv_indptr
 

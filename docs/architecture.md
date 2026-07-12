@@ -30,12 +30,17 @@ worker advances the engine and publishes token events or final results.
 - prompt chunk selection,
 - decode row selection,
 - inactive-row padding,
-- whole-request block reservation,
+- whole-request capacity reservation,
+- bounded first-fit waiting admission,
 - prefix-cache lookup and publication.
 
-`BlockManager` owns physical cache page ids, reference counts, and prefix-cache
-metadata. Admission reserves enough pages for `prompt + max_tokens`; active
-requests are not evicted or recomputed under pressure.
+`BlockManager` owns physical cache page ids, reference counts, prefix-cache
+metadata, and future-capacity credits. Admission reserves enough capacity for
+`prompt + max_tokens`, but allocates pages only for the current prompt and as
+decode crosses block boundaries. Thus future capacity cannot be stolen, yet an
+unwritten completion does not evict a cached prefix or widen its block table.
+Admission scans the bounded waiting queue for the first request that fits, so a
+large blocked request does not stall smaller requests behind it.
 
 `ScheduledBatch` is the Python-to-JAX contract. It documents the fixed-shape
 arrays that the runner and executor consume.
@@ -50,11 +55,19 @@ arrays that the runner and executor consume.
 - device token carry,
 - compile-bucket lookup.
 
+FlashInfer receives a fixed-size page-index buffer for JIT stability, but its
+CSR indptr exposes only each row's live page prefix. Static block-table padding
+is never treated as attention context.
+
 `ModelExecutor` owns JIT cache keys and calls into `model.forward_step`.
 
 Checkpoint `config.json` owns model dimensions and layer types. The loader
 accepts the validated Qwen3.5 0.8B, 2B, and 4B text configurations, validates
-every loaded tensor shape, and retains vocabulary weights as `[V, H]`.
+their complete math and tensor-layout architecture before downloading weight
+shards, validates every loaded tensor shape, and retains vocabulary weights as
+`[V, H]`. Generation terminates on the union of checkpoint and tokenizer EOS
+ids because the official chat tokenizer and text config designate different
+special tokens.
 
 `model.py` owns parameter structure, the Qwen3.5 layer loop, and the exported
 forward entrypoints. The math is split by role:

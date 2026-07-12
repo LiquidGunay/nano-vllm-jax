@@ -64,7 +64,10 @@ class Scheduler:
         if self.max_num_resident_seqs < self.max_num_seqs:
             raise ValueError("max_num_resident_seqs must be >= max_num_seqs")
         self.max_num_batched_tokens = getattr(config, 'max_num_batched_tokens', 2048)
-        self.eos = getattr(config, 'eos', None)
+        self.eos_token_ids = frozenset(
+            int(token_id)
+            for token_id in getattr(config, "eos_token_ids", ())
+        )
         self.block_size = config.block_size
         self.enable_prefix_cache_execution = bool(getattr(config, "prefix_cache", True))
         self.prefix_cache_requires_hybrid_state = bool(getattr(config, "linear_attn_layers", ()))
@@ -125,16 +128,16 @@ class Scheduler:
             return None
         return set(self.prefix_cache_hybrid_states)
 
-    def _can_allocate_waiting(self, seq: Sequence) -> bool:
-        return self.block_manager.can_allocate(
+    def _can_reserve_waiting(self, seq: Sequence) -> bool:
+        return self.block_manager.can_reserve(
             seq,
             total_blocks=self._required_blocks(seq),
             use_prefix_cache=self.enable_prefix_cache_execution,
             cacheable_hashes=self._prefix_cacheable_hashes(),
         )
 
-    def _allocate_waiting(self, seq: Sequence) -> None:
-        self.block_manager.allocate(
+    def _reserve_waiting(self, seq: Sequence) -> None:
+        self.block_manager.reserve(
             seq,
             total_blocks=self._required_blocks(seq),
             use_prefix_cache=self.enable_prefix_cache_execution,
@@ -144,6 +147,16 @@ class Scheduler:
     def _required_blocks(self, seq: Sequence) -> int:
         total_tokens = seq.num_prompt_tokens + seq.max_tokens
         return (total_tokens + self.block_size - 1) // self.block_size
+
+    def _admit_first_fitting_waiter(self) -> Sequence | None:
+        """Return the first request that fits without stalling later waiters."""
+        for _ in range(len(self.waiting)):
+            candidate = self.waiting.popleft()
+            if self._can_reserve_waiting(candidate):
+                self._reserve_waiting(candidate)
+                return candidate
+            self.waiting.append(candidate)
+        return None
 
     def record_computed_prefix_states(
         self,
@@ -239,23 +252,17 @@ class Scheduler:
         )
         # Phase 1: Prefill - schedule new/waiting sequences and unfinished
         # prompt tails from already-allocated running sequences.
-        waiting_blocked_by_kv = False
         while num_seqs < self.max_num_seqs:
             seq = None
             from_waiting = False
             if (
                 self.waiting
-                and not waiting_blocked_by_kv
                 and not defer_waiting_prefill_for_decode
                 and len(self.running) + len(scheduled_running) < self.max_num_resident_seqs
             ):
-                candidate = self.waiting[0]
-                if self._can_allocate_waiting(candidate):
-                    seq = self.waiting.popleft()
+                seq = self._admit_first_fitting_waiter()
+                if seq is not None:
                     from_waiting = True
-                    self._allocate_waiting(seq)
-                else:
-                    waiting_blocked_by_kv = True
 
             if seq is None:
                 next_seq = None
@@ -340,8 +347,8 @@ class Scheduler:
                 self.running.append(seq)
                 continue
             
-            # Complete capacity was reserved before prefill, so decode must
-            # never need eviction or recomputation.
+            # Complete capacity credits were reserved before prefill, so decode
+            # can allocate physical pages without eviction or recomputation.
             remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
             lookahead_tokens = 1
             if self.greedy_decode_burst_steps > 1 and seq.temperature == 0 and seq.ignore_eos:
@@ -851,7 +858,7 @@ class Scheduler:
                 else:
                     token_id = int(token_id)
                     seq.append_token(token_id)
-                    is_eos = (token_id == self.eos)
+                    is_eos = token_id in self.eos_token_ids
                 self.last_num_generated_tokens += 1
 
                 if idx < len(generated_tokens) - 1:

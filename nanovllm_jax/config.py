@@ -50,6 +50,60 @@ def _bool_value(value: Any, field_name: str) -> bool:
     raise ValueError(f"{field_name} must be a boolean")
 
 
+def _layer_pattern(count: int) -> tuple[str, ...]:
+    return tuple(
+        "linear_attention" if index % 4 != 3 else "full_attention"
+        for index in range(count)
+    )
+
+
+_COMMON_ARCHITECTURE = {
+    "vocab_size": 248320,
+    "head_dim": 256,
+    "linear_num_key_heads": 16,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_size": 4,
+    "rope_theta": 10_000_000.0,
+    "partial_rotary_factor": 0.25,
+    "mrope_section": (11, 11, 10),
+    "mrope_interleaved": True,
+    "max_position_embeddings": 262144,
+    "full_attention_interval": 4,
+    "hidden_act": "silu",
+    "rms_norm_eps": 1e-6,
+    "attention_dropout": 0.0,
+    "attention_bias": False,
+    "attn_output_gate": True,
+    "mamba_ssm_dtype": "float32",
+    "tie_word_embeddings": True,
+}
+
+_SUPPORTED_ARCHITECTURES = {
+    (1024, 24): {
+        "size": "0.8B",
+        "intermediate_size": 3584,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "linear_num_value_heads": 16,
+    },
+    (2048, 24): {
+        "size": "2B",
+        "intermediate_size": 6144,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "linear_num_value_heads": 16,
+    },
+    (2560, 32): {
+        "size": "4B",
+        "intermediate_size": 9216,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "linear_num_value_heads": 32,
+    },
+}
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     """Architectural values read from the checkpoint config."""
@@ -72,48 +126,42 @@ class ModelConfig:
     partial_rotary_factor: float = 0.25
     mrope_section: tuple[int, ...] = (11, 11, 10)
     max_position_embeddings: int = 262144
-    layer_types: tuple[str, ...] = tuple(
-        "linear_attention" if index % 4 != 3 else "full_attention"
-        for index in range(24)
-    )
+    layer_types: tuple[str, ...] = _layer_pattern(24)
+    full_attention_interval: int = 4
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-6
     attention_dropout: float = 0.0
     attention_bias: bool = False
+    attn_output_gate: bool = True
+    mrope_interleaved: bool = True
+    mamba_ssm_dtype: str = "float32"
     tie_word_embeddings: bool = True
-    eos_token_id: int = 248044
+    eos_token_id: int | None = 248044
 
     def __post_init__(self) -> None:
-        fingerprint = (
-            self.hidden_size,
-            self.intermediate_size,
-            self.num_hidden_layers,
-            self.num_attention_heads,
-            self.num_key_value_heads,
-            self.linear_num_key_heads,
-            self.linear_num_value_heads,
-        )
-        supported = {
-            (1024, 3584, 24, 8, 2, 16, 16),
-            (2048, 6144, 24, 8, 2, 16, 16),
-            (2560, 9216, 32, 16, 4, 16, 32),
-        }
-        if fingerprint not in supported:
+        key = (self.hidden_size, self.num_hidden_layers)
+        variant = _SUPPORTED_ARCHITECTURES.get(key)
+        if variant is None:
             raise ValueError(
                 "unsupported Qwen3.5 dense text shape "
                 f"hidden_size={self.hidden_size}, num_hidden_layers={self.num_hidden_layers}; "
                 "validated sizes are 0.8B, 2B, and 4B"
             )
-        if len(self.layer_types) != self.num_hidden_layers:
-            raise ValueError("layer_types must contain one entry per hidden layer")
-        if set(self.layer_types) - {"linear_attention", "full_attention"}:
-            raise ValueError("layer_types contains an unsupported layer kind")
-        if self.num_attention_heads % self.num_key_value_heads:
-            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
-        if self.linear_num_value_heads % self.linear_num_key_heads:
-            raise ValueError("linear_num_value_heads must be divisible by linear_num_key_heads")
-        if not self.tie_word_embeddings:
-            raise ValueError("validated Qwen3.5 0.8B, 2B, and 4B checkpoints use tied embeddings")
+        size = str(variant["size"])
+        expected = {
+            **_COMMON_ARCHITECTURE,
+            **{name: value for name, value in variant.items() if name != "size"},
+            "hidden_size": key[0],
+            "num_hidden_layers": key[1],
+            "layer_types": _layer_pattern(key[1]),
+        }
+        for name, expected_value in expected.items():
+            actual = getattr(self, name)
+            if actual != expected_value:
+                raise ValueError(
+                    f"unsupported Qwen3.5-{size} architecture: "
+                    f"{name}={actual!r}, expected {expected_value!r}"
+                )
 
     @classmethod
     def from_checkpoint(cls, checkpoint: str | Path, *, model: str) -> "ModelConfig":
@@ -149,44 +197,22 @@ class ModelConfig:
             rope_theta=float(rope["rope_theta"]),
             partial_rotary_factor=float(rope["partial_rotary_factor"]),
             mrope_section=tuple(int(value) for value in rope["mrope_section"]),
+            mrope_interleaved=bool(rope["mrope_interleaved"]),
             max_position_embeddings=int(text["max_position_embeddings"]),
             layer_types=tuple(str(value) for value in text["layer_types"]),
+            full_attention_interval=int(text["full_attention_interval"]),
             hidden_act=str(text["hidden_act"]),
             rms_norm_eps=float(text["rms_norm_eps"]),
             attention_dropout=float(text["attention_dropout"]),
             attention_bias=bool(text["attention_bias"]),
+            attn_output_gate=bool(text["attn_output_gate"]),
+            mamba_ssm_dtype=str(text["mamba_ssm_dtype"]),
             tie_word_embeddings=bool(text["tie_word_embeddings"]),
-            eos_token_id=int(text["eos_token_id"]),
-        )
-
-    @classmethod
-    def from_runtime_config(cls, config: "RuntimeConfig", model: str = "Qwen/Qwen3.5-0.8B") -> "ModelConfig":
-        return cls(
-            model=model,
-            vocab_size=config.vocab_size,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            num_hidden_layers=config.num_hidden_layers,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
-            linear_num_key_heads=config.linear_num_key_heads,
-            linear_num_value_heads=config.linear_num_value_heads,
-            linear_key_head_dim=config.linear_key_head_dim,
-            linear_value_head_dim=config.linear_value_head_dim,
-            linear_conv_kernel_size=config.linear_conv_kernel_size,
-            linear_chunk_size=config.linear_chunk_size,
-            rope_theta=config.rope_theta,
-            partial_rotary_factor=config.partial_rotary_factor,
-            mrope_section=tuple(config.mrope_section),
-            max_position_embeddings=config.max_position_embeddings,
-            layer_types=tuple(config.layer_types),
-            hidden_act=config.hidden_act,
-            rms_norm_eps=config.rms_norm_eps,
-            attention_dropout=config.attention_dropout,
-            attention_bias=config.attention_bias,
-            tie_word_embeddings=config.tie_word_embeddings,
-            eos_token_id=int(config.eos or 248044),
+            eos_token_id=(
+                int(text["eos_token_id"])
+                if text.get("eos_token_id") is not None
+                else None
+            ),
         )
 
 
@@ -236,6 +262,22 @@ class WarmupConfig:
             include_sampled_routes=_bool_value(raw.get("include_sampled_routes", True), "warmup.include_sampled_routes"),
             enabled=_bool_value(raw.get("enabled", True), "warmup.enabled"),
         )
+
+
+def _derived_warmup(
+    prefill: tuple[int, ...],
+    batches: tuple[int, ...],
+    decode: tuple[int, ...],
+) -> WarmupConfig:
+    def subset(configured: tuple[int, ...], preferred: tuple[int, ...]) -> tuple[int, ...]:
+        selected = tuple(value for value in preferred if value in configured)
+        return selected or configured[:1]
+
+    return WarmupConfig(
+        prefill_token_buckets=subset(prefill, WarmupConfig.prefill_token_buckets),
+        batch_size_buckets=subset(batches, WarmupConfig.batch_size_buckets),
+        decode_block_buckets=subset(decode, WarmupConfig.decode_block_buckets),
+    )
 
 
 @dataclass(frozen=True)
@@ -312,6 +354,25 @@ class EngineConfig:
             },
             "engine",
         )
+        prefill_buckets = _int_tuple(
+            raw.get("prefill_token_buckets", cls.prefill_token_buckets),
+            "prefill_token_buckets",
+        )
+        batch_buckets = _int_tuple(
+            raw.get("batch_size_buckets", cls.batch_size_buckets),
+            "batch_size_buckets",
+        )
+        decode_buckets = _int_tuple(
+            raw.get("decode_block_buckets", cls.decode_block_buckets),
+            "decode_block_buckets",
+        )
+        warmup = _derived_warmup(prefill_buckets, batch_buckets, decode_buckets)
+        if "warmup" in raw:
+            warmup_raw = dict(raw.get("warmup") or {})
+            warmup_raw.setdefault("prefill_token_buckets", warmup.prefill_token_buckets)
+            warmup_raw.setdefault("batch_size_buckets", warmup.batch_size_buckets)
+            warmup_raw.setdefault("decode_block_buckets", warmup.decode_block_buckets)
+            warmup = WarmupConfig.from_mapping(warmup_raw)
         return cls(
             model=str(raw.get("model", cls.model)),
             max_prefill=int(raw.get("max_prefill", cls.max_prefill)),
@@ -323,19 +384,10 @@ class EngineConfig:
             max_blocks_per_seq=int(raw.get("max_blocks_per_seq", cls.max_blocks_per_seq)),
             kv_cache_bytes=int(raw.get("kv_cache_bytes", cls.kv_cache_bytes)),
             num_kvcache_blocks=int(raw.get("num_kvcache_blocks", cls.num_kvcache_blocks)),
-            prefill_token_buckets=_int_tuple(
-                raw.get("prefill_token_buckets", cls.prefill_token_buckets),
-                "prefill_token_buckets",
-            ),
-            batch_size_buckets=_int_tuple(
-                raw.get("batch_size_buckets", cls.batch_size_buckets),
-                "batch_size_buckets",
-            ),
-            decode_block_buckets=_int_tuple(
-                raw.get("decode_block_buckets", cls.decode_block_buckets),
-                "decode_block_buckets",
-            ),
-            warmup=WarmupConfig.from_mapping(raw.get("warmup")),
+            prefill_token_buckets=prefill_buckets,
+            batch_size_buckets=batch_buckets,
+            decode_block_buckets=decode_buckets,
+            warmup=warmup,
             prefix_cache=_bool_value(raw.get("prefix_cache", True), "prefix_cache"),
         )
 
@@ -459,7 +511,7 @@ class RuntimeConfig:
     max_num_seqs: int = 16
     max_num_resident_seqs: Optional[int] = None
     max_num_batched_tokens: int = 2048
-    eos: Optional[int] = None
+    eos_token_ids: tuple[int, ...] = field(default_factory=tuple)
     prefill_buckets: tuple = field(default_factory=tuple)
     prefill_token_buckets: tuple = field(default_factory=tuple)
     prefill_layout: str = "packed"
@@ -520,6 +572,11 @@ class RuntimeConfig:
         if max_num_resident_seqs < max_num_seqs:
             raise ValueError("max_num_resident_seqs must be >= max_num_seqs")
         object.__setattr__(self, "max_num_resident_seqs", max_num_resident_seqs)
+        object.__setattr__(
+            self,
+            "eos_token_ids",
+            tuple(sorted({int(token_id) for token_id in self.eos_token_ids})),
+        )
 
         for field_name in (
             "prefill_buckets",
@@ -772,7 +829,11 @@ class RuntimeConfig:
             "attention_dropout": model.attention_dropout,
             "attention_bias": model.attention_bias,
             "tie_word_embeddings": model.tie_word_embeddings,
-            "eos": model.eos_token_id,
+            "eos_token_ids": (
+                (model.eos_token_id,)
+                if model.eos_token_id is not None
+                else ()
+            ),
         }
         overlap = set(architecture) & set(runtime)
         if overlap:
@@ -813,6 +874,7 @@ class RuntimeConfig:
             "max_num_seqs": self.max_num_seqs,
             "max_num_resident_seqs": self.max_num_resident_seqs,
             "max_num_batched_tokens": self.max_num_batched_tokens,
+            "eos_token_ids": self.eos_token_ids,
             "prefill_buckets": self.prefill_buckets,
             "prefill_token_buckets": self.prefill_token_buckets,
             "prefill_layout": self.prefill_layout,

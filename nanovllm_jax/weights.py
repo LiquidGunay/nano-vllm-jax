@@ -46,32 +46,80 @@ def _add_mlp_packed_gate_up(layer_params: dict[str, jnp.ndarray]) -> None:
     layer_params[MLP_GATE_UP_PACKED_KEY] = jnp.concatenate([gate, up], axis=1)
 
 
-def resolve_checkpoint(model: str | Path, cache_dir: str | None = None) -> Path:
-    """Resolve a local checkpoint directory or one immutable Hub snapshot."""
-    local = Path(model).expanduser()
-    if local.exists():
-        if not local.is_dir():
-            raise ValueError(f"checkpoint path is not a directory: {local}")
-        return local.resolve()
+_METADATA_PATTERNS = (
+    "*.json",
+    "*.model",
+    "tokenizer.*",
+    "vocab.*",
+    "merges.txt",
+)
 
+
+def _local_checkpoint(model: str | Path) -> Path | None:
+    local = Path(model).expanduser()
+    if not local.exists():
+        return None
+    if not local.is_dir():
+        raise ValueError(f"checkpoint path is not a directory: {local}")
+    return local.resolve()
+
+
+def _download_snapshot(
+    model: str | Path,
+    *,
+    cache_dir: str | None,
+    allow_patterns: tuple[str, ...],
+    revision: str | None = None,
+) -> Path:
     from huggingface_hub import snapshot_download
 
-    print(f"Resolving {model} from Hugging Face cache...")
     path = snapshot_download(
         repo_id=str(model),
+        revision=revision,
         cache_dir=cache_dir,
-        allow_patterns=[
-            "*.json",
+        allow_patterns=allow_patterns,
+    )
+    return Path(path)
+
+
+def resolve_checkpoint_metadata(model: str | Path, cache_dir: str | None = None) -> Path:
+    """Resolve config/tokenizer files without downloading weight shards."""
+    local = _local_checkpoint(model)
+    if local is not None:
+        return local
+    print(f"Resolving {model} metadata from Hugging Face cache...")
+    path = _download_snapshot(
+        model,
+        cache_dir=cache_dir,
+        allow_patterns=_METADATA_PATTERNS,
+    )
+    print(f"Using metadata snapshot: {path}")
+    return path
+
+
+def resolve_checkpoint(
+    model: str | Path,
+    cache_dir: str | None = None,
+    *,
+    revision: str | None = None,
+) -> Path:
+    """Resolve a local checkpoint or download one validated Hub revision."""
+    local = _local_checkpoint(model)
+    if local is not None:
+        return local
+
+    print(f"Resolving {model} weights from Hugging Face cache...")
+    path = _download_snapshot(
+        model,
+        revision=revision,
+        cache_dir=cache_dir,
+        allow_patterns=(
+            *_METADATA_PATTERNS,
             "*.safetensors",
-            "*.model",
-            "tokenizer.*",
-            "vocab.*",
-            "merges.txt",
-            "generation_config.json",
-        ],
+        ),
     )
     print(f"Using snapshot: {path}")
-    return Path(path)
+    return path
 
 
 class _SafeTensorReader:

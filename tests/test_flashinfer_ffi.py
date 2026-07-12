@@ -164,7 +164,7 @@ def test_paged_decode_attention_flashinfer_matches_reference():
     num_pages = batch * max_pages_per_sequence
     scale = 1.0 / np.sqrt(head_dim)
     block_tables = jnp.array([[2, 0], [3, 1]], dtype=jnp.int32)
-    seq_lens = jnp.array([17, 30], dtype=jnp.int32)
+    seq_lens = jnp.array([5, 30], dtype=jnp.int32)
     query = jax.random.normal(
         key,
         (batch, num_heads, head_dim),
@@ -180,7 +180,11 @@ def test_paged_decode_attention_flashinfer_matches_reference():
         (num_pages, page_size, num_kv_heads, head_dim),
         dtype=jnp.float32,
     ).astype(jnp.bfloat16)
-    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(block_tables)
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
+        block_tables,
+        seq_lens,
+        page_size,
+    )
     kv_last_page_len = kv_last_page_len_from_seq_lens(seq_lens, page_size)
 
     actual = jax.jit(
@@ -234,7 +238,7 @@ def test_paged_decode_fused_append_flashinfer_matches_reference():
     layer_id = 1
     scale = 1.0 / np.sqrt(head_dim)
     block_tables = jnp.array([[2, 0], [3, 1]], dtype=jnp.int32)
-    seq_lens = jnp.array([17, 30], dtype=jnp.int32)
+    seq_lens = jnp.array([5, 30], dtype=jnp.int32)
     positions = seq_lens - 1
     query = jax.random.normal(
         key,
@@ -261,7 +265,11 @@ def test_paged_decode_fused_append_flashinfer_matches_reference():
         (2, num_pages, page_size, num_kv_heads, head_dim),
         dtype=jnp.float32,
     ).astype(jnp.bfloat16)
-    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(block_tables)
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
+        block_tables,
+        seq_lens,
+        page_size,
+    )
     kv_last_page_len = kv_last_page_len_from_seq_lens(seq_lens, page_size)
 
     actual, actual_k, actual_v = jax.jit(

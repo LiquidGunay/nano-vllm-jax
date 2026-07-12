@@ -21,10 +21,11 @@ python server.py
 [server.yaml](server.yaml) controls model id, serving capacity, bucket sizes,
 KV budget, warmup buckets, and prefix-cache enablement.
 
-Requests reserve their worst-case KV capacity before prefill. A request that
-can never fit is rejected, and an active request is never evicted with partial
-KV/GDN state. Tied vocabulary weights remain in checkpoint-native `[V, H]`
-layout instead of allocating a second transposed copy.
+Requests reserve worst-case KV capacity credits before prefill, while physical
+pages are allocated only as tokens need them. This keeps active requests safe
+without evicting cached prefixes for unwritten future tokens. A request that
+can never fit is rejected. Tied vocabulary weights remain in checkpoint-native
+`[V, H]` layout instead of allocating a second transposed copy.
 
 [nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py) owns implementation
 policy: dtypes, attention/GDN routes, LM-head route, device token carry, and
@@ -94,10 +95,17 @@ Generated results, profiles, and benchmark artifacts are not part of the
 cleaned branch. Keep ad hoc diagnostics under `/mountpoint/.exp/diagnostics` or
 another external scratch path.
 
-CPU-safe control-plane checks:
+CPU-safe control-plane checks (also run in GitHub Actions):
 
 ```bash
-PYTHONPATH=$PWD python tests/ram_guard.py -- pytest -q tests/test_fastpath_config.py tests/test_service.py tests/test_server_config.py tests/test_public_imports.py
+JAX_PLATFORMS=cpu pytest -q \
+  tests/test_engine_initialization.py \
+  tests/test_fastpath_config.py \
+  tests/test_paged_attention_abi.py \
+  tests/test_public_imports.py \
+  tests/test_scheduler_capacity.py \
+  tests/test_server_config.py \
+  tests/test_service.py
 ```
 
 For GPU correctness, verify CUDA visibility first and run JAX with

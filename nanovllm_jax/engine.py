@@ -1,6 +1,7 @@
 """Request lifecycle engine for Qwen 3.5 JAX serving."""
 
 import atexit
+from pathlib import Path
 from time import perf_counter
 from typing import Any, List, Dict, Optional, Union
 from dataclasses import replace
@@ -10,7 +11,11 @@ import jax
 from nanovllm_jax.config import EngineConfig, ModelConfig, RuntimeConfig
 from nanovllm_jax.cache import KVCacheSpec, cap_num_kv_cache_blocks
 from nanovllm_jax.model import ModelParams
-from nanovllm_jax.weights import load_weights_from_hf_streaming, resolve_checkpoint
+from nanovllm_jax.weights import (
+    load_weights_from_hf_streaming,
+    resolve_checkpoint,
+    resolve_checkpoint_metadata,
+)
 from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.sequence import Sequence, SamplingParams
@@ -85,10 +90,15 @@ class LLMEngine:
             engine_config = replace(engine_config, model=model_path)
 
         self.model_id = model_path
-        self.checkpoint_path = resolve_checkpoint(model_path)
+        metadata_path = resolve_checkpoint_metadata(model_path)
         self.model_config = ModelConfig.from_checkpoint(
-            self.checkpoint_path,
+            metadata_path,
             model=model_path,
+        )
+        self.checkpoint_path = (
+            metadata_path
+            if Path(model_path).expanduser().exists()
+            else resolve_checkpoint(model_path, revision=metadata_path.name)
         )
         self.config, self.weight_dtype = _runtime_config_from_engine_config(
             engine_config,
@@ -115,8 +125,18 @@ class LLMEngine:
             raise ImportError("transformers is required; install it with the package dependencies")
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path, trust_remote_code=True)
-        if self.config.eos is None:
-            self.config.eos = self.tokenizer.eos_token_id
+        self.config.eos_token_ids = tuple(
+            sorted(
+                {
+                    int(token_id)
+                    for token_id in (
+                        *self.config.eos_token_ids,
+                        self.tokenizer.eos_token_id,
+                    )
+                    if token_id is not None
+                }
+            )
+        )
 
         print(f"Loading pretrained weights from {self.checkpoint_path}...")
         load_config = replace(self.config, dtype=self.weight_dtype)
