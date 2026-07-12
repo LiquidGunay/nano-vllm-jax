@@ -267,13 +267,14 @@ class Qwen3_5Config:
             "triton",
             "triton_tensorcore",
             "triton_top1",
+            "triton_int8",
             "cutlass",
             "cutlass_top1",
             "cutlass_fused_gemm",
             "fused_gemm",
         }:
             raise ValueError(
-                "mtp_lm_head_greedy_top1_impl must be jax, triton, or cutlass"
+                "mtp_lm_head_greedy_top1_impl must be jax, triton, triton_int8, or cutlass"
             )
         object.__setattr__(self, "mtp_hidden_source", mtp_hidden_source)
         object.__setattr__(self, "mtp_chain_hidden_source", mtp_chain_hidden_source)

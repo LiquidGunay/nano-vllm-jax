@@ -65,6 +65,32 @@ def _mtp_packed_projections_enabled() -> bool:
     return _env_flag("NANO_VLLM_JAX_MTP_PACKED_PROJECTIONS")
 
 
+def _mtp_int8_top1_enabled(config: Qwen3_5Config) -> bool:
+    impl = str(config.mtp_lm_head_greedy_top1_impl or "jax").strip().lower()
+    return impl == "triton_int8"
+
+
+@jax.jit
+def _quantize_vocab_rows_int8(weight: jax.Array) -> tuple[jax.Array, jax.Array]:
+    weight_f32 = weight.astype(jnp.float32)
+    absmax = jnp.max(jnp.abs(weight_f32), axis=1)
+    scale = jnp.where(absmax > 0, absmax / 127.0, 1.0)
+    quantized = jnp.clip(jnp.rint(weight_f32 / scale[:, None]), -127, 127)
+    return quantized.astype(jnp.int8), scale.astype(jnp.float32)
+
+
+def _maybe_quantize_mtp_lm_head(
+    weight_vocab_major: jax.Array,
+    config: Qwen3_5Config,
+) -> tuple[jax.Array | None, jax.Array | None]:
+    if not _mtp_int8_top1_enabled(config):
+        return None, None
+    print("Quantizing the full MTP proposal head to per-row INT8...")
+    quantized, scale = _quantize_vocab_rows_int8(weight_vocab_major)
+    jax.block_until_ready((quantized, scale))
+    return quantized, scale
+
+
 def _materialize_tied_lm_head_enabled(config: Qwen3_5Config | None = None) -> bool:
     """Materialize tied embeddings as a separate [hidden, vocab] LM-head leaf."""
     env_value = os.environ.get("NANO_VLLM_JAX_MATERIALIZE_TIED_LM_HEAD")
@@ -308,13 +334,24 @@ def _load_mtp_weights_from_reader(
             _add_mlp_packed_gate_up(layer)
         layers.append(layer)
 
+    native_lm_head = lm_head.T if lm_head is not None else embed_tokens
+    quantized_weight, quantized_scale = _maybe_quantize_mtp_lm_head(
+        native_lm_head,
+        config,
+    )
     return MTPParams(
         eh_proj=_to_jax_weight(reader, "mtp.fc.weight", config, transpose=True),
         layers=layers,
         pre_fc_norm_hidden=_to_jax_weight(reader, "mtp.pre_fc_norm_hidden.weight", config),
         pre_fc_norm_embedding=_to_jax_weight(reader, "mtp.pre_fc_norm_embedding.weight", config),
         final_norm=_to_jax_weight(reader, "mtp.norm.weight", config),
-        lm_head=lm_head if lm_head is not None else embed_tokens.T,
+        lm_head=(
+            lm_head
+            if lm_head is not None
+            else (None if quantized_weight is not None else embed_tokens.T)
+        ),
+        proposal_weight_int8=quantized_weight,
+        proposal_weight_scale=quantized_scale,
     )
 
 
@@ -516,6 +553,14 @@ def load_weights_from_hf(
         mtp_params = load_mtp_weights_from_hf(hf_weights, config, verbose=verbose)
         # Share LM head from main model (tied embeddings)
         mtp_params.lm_head = jax_params.lm_head
+        native_lm_head = (
+            jax_params.lm_head.T
+            if jax_params.lm_head is not None
+            else jax_params.embed_tokens
+        )
+        mtp_params.proposal_weight_int8, mtp_params.proposal_weight_scale = (
+            _maybe_quantize_mtp_lm_head(native_lm_head, config)
+        )
         jax_params.mtp_params = mtp_params  # Attach MTP params to main params
         print(f"✓ Loaded MTP head: {config.mtp_num_hidden_layers} layer(s)")
     

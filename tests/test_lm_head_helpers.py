@@ -354,6 +354,32 @@ def test_lm_head_triton_can_bound_native_vocabulary_without_slicing():
     np.testing.assert_array_equal(np.asarray(limited), np.asarray(expected))
 
 
+def test_lm_head_int8_triton_matches_quantized_reference():
+    pytest.importorskip("jax_triton")
+    if jax.default_backend() != "gpu":
+        pytest.skip("Triton LM-head top1 requires the CUDA backend")
+
+    from nanovllm_jax.kernels.lm_head_triton import (
+        lm_head_greedy_top1_int8_triton,
+    )
+
+    hidden = jax.random.normal(jax.random.PRNGKey(37), (2, 1, 64)).astype(jnp.bfloat16)
+    weight = jax.random.normal(jax.random.PRNGKey(41), (513, 64)).astype(jnp.float32)
+    weight_absmax = jnp.max(jnp.abs(weight), axis=1)
+    weight_scale = jnp.where(weight_absmax > 0, weight_absmax / 127.0, 1.0)
+    weight_q = jnp.clip(jnp.rint(weight / weight_scale[:, None]), -127, 127).astype(jnp.int8)
+
+    hidden_f32 = hidden[:, 0].astype(jnp.float32)
+    hidden_absmax = jnp.max(jnp.abs(hidden_f32), axis=1, keepdims=True)
+    hidden_scale = jnp.maximum(hidden_absmax / 127.0, jnp.finfo(jnp.float32).tiny)
+    hidden_q = jnp.clip(jnp.rint(hidden_f32 / hidden_scale), -127, 127).astype(jnp.int8)
+    logits = jnp.dot(hidden_q.astype(jnp.int32), weight_q.T.astype(jnp.int32))
+    expected = jnp.argmax(logits.astype(jnp.float32) * weight_scale, axis=-1)[:, None]
+    actual = lm_head_greedy_top1_int8_triton(hidden, weight_q, weight_scale)
+
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
 def test_decode_padded_gemm_default_cap_admits_qwen_vocab_projection():
     config = Qwen3_5Config(decode_padded_gemm=True)
     x = jnp.zeros((8, 1, 1), dtype=jnp.bfloat16)

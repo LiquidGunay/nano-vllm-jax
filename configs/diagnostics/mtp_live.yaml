@@ -17,8 +17,8 @@ benchmark:
   skip_vllm: true
   skip_jax: false
   reference_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_live/qwen35_4b_no_mtp_width1_packed_gdn_b1_64x64_jax.json"
-  run_label: "qwen35_4b_strict_k2_typed_latency_config_b1_64x64"
-  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_live/qwen35_4b_strict_k2_typed_latency_config_b1_64x64.json"
+  run_label: "qwen35_4b_mtp_int8_full_vocab_b1_64x64"
+  output_json: "/mountpoint/.exp/diagnostics/nano-vllm-jax/mtp_live/qwen35_4b_mtp_int8_full_vocab_b1_64x64.json"
   seed: 20260710
   dataset_name: "random"
   min_input_tokens: 64
@@ -67,7 +67,8 @@ benchmark:
   jax_mtp_chain_mode: "recursive"
   jax_mtp_token_source: "generated"
   jax_mtp_position_offset: 0
-  jax_mtp_lm_head_greedy_top1_impl: "triton"
+  # Quantize only the full-vocabulary proposal head; target verification stays BF16.
+  jax_mtp_lm_head_greedy_top1_impl: "triton_int8"
   jax_num_speculative_tokens: 2
   jax_mtp_burst_groups: 1
   jax_mtp_max_active_rows: 1
@@ -127,8 +128,9 @@ engine:
   mtp_hidden_source: "final_normed"
   mtp_chain_hidden_source: "final_normed"
   mtp_chain_mode: "recursive"
-  mtp_lm_head_greedy_top1_impl: "triton"
-  mtp_draft_vocab_size: 131072
+  mtp_lm_head_greedy_top1_impl: "triton_int8"
+  # Zero means proposals still search the complete vocabulary.
+  mtp_draft_vocab_size: 0
   num_speculative_tokens: 2
   mtp_burst_groups: 1
   mtp_max_active_rows: 1

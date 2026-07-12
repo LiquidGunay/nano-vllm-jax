@@ -5319,11 +5319,22 @@ class CanonicalModelRunner:
             params.pre_fc_norm_embedding,
             params.final_norm,
             params.lm_head,
+            params.proposal_weight_int8,
+            params.proposal_weight_scale,
         )
 
     @staticmethod
     def _mtp1_params_from_tree(tree) -> MTPParams:
-        eh_proj, layers, pre_fc_norm_hidden, pre_fc_norm_embedding, final_norm, lm_head = tree
+        (
+            eh_proj,
+            layers,
+            pre_fc_norm_hidden,
+            pre_fc_norm_embedding,
+            final_norm,
+            lm_head,
+            proposal_weight_int8,
+            proposal_weight_scale,
+        ) = tree
         return MTPParams(
             eh_proj=eh_proj,
             layers=list(layers),
@@ -5331,6 +5342,8 @@ class CanonicalModelRunner:
             pre_fc_norm_embedding=pre_fc_norm_embedding,
             final_norm=final_norm,
             lm_head=lm_head,
+            proposal_weight_int8=proposal_weight_int8,
+            proposal_weight_scale=proposal_weight_scale,
         )
 
     def _mtp1_logits(self, hidden_state: jnp.ndarray, token_ids: jnp.ndarray, positions: jnp.ndarray) -> jnp.ndarray:

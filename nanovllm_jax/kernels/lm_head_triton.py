@@ -86,6 +86,58 @@ def _lm_head_top1_stage1_kernel(
 
 
 @triton.jit
+def _lm_head_top1_int8_stage1_kernel(
+    hidden,
+    weight,
+    weight_scale,
+    partial_values,
+    partial_indices,
+    batch_size: tl.constexpr,
+    hidden_dim: tl.constexpr,
+    vocab_size: tl.constexpr,
+    num_vocab_blocks: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    vocab = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offsets_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    for k_start in range(0, hidden_dim, BLOCK_K):
+        k = k_start + offsets_k
+        a = tl.load(
+            hidden + rows[:, None] * hidden_dim + k[None, :],
+            mask=(rows[:, None] < batch_size) & (k[None, :] < hidden_dim),
+            other=0,
+        )
+        b = tl.load(
+            weight + vocab[:, None] * hidden_dim + k[None, :],
+            mask=(vocab[:, None] < vocab_size) & (k[None, :] < hidden_dim),
+            other=0,
+        )
+        acc += tl.dot(a, tl.trans(b), out_dtype=tl.int32)
+
+    scale = tl.load(weight_scale + vocab, mask=vocab < vocab_size, other=0.0)
+    logits = acc.to(tl.float32) * scale[None, :]
+    logits = tl.where(vocab[None, :] < vocab_size, logits, -float("inf"))
+    block_max = tl.max(logits, axis=1)
+    vocab_ids = tl.broadcast_to(vocab[None, :], (BLOCK_M, BLOCK_N))
+    block_arg = tl.min(
+        tl.where(logits == block_max[:, None], vocab_ids, vocab_size),
+        axis=1,
+    )
+
+    valid_rows = rows < batch_size
+    out_offsets = rows * num_vocab_blocks + pid_n
+    tl.store(partial_values + out_offsets, block_max, mask=valid_rows)
+    tl.store(partial_indices + out_offsets, block_arg, mask=valid_rows)
+
+
+@triton.jit
 def _lm_head_top1_stage2_kernel(
     partial_values,
     partial_indices,
@@ -206,4 +258,74 @@ def lm_head_greedy_top1_triton(
     return token_ids[:, None]
 
 
-__all__ = ["lm_head_greedy_top1_triton"]
+def lm_head_greedy_top1_int8_triton(
+    hidden_norm: jax.Array,
+    quantized_weight: jax.Array,
+    weight_scale: jax.Array,
+    *,
+    vocab_size_limit: int | None = None,
+) -> jax.Array:
+    """Approximate full-vocabulary proposal top-1 with INT8 row weights."""
+
+    if hidden_norm.ndim != 3 or int(hidden_norm.shape[1]) != 1:
+        raise ValueError("INT8 LM-head top1 requires hidden shape [B, 1, H]")
+    if quantized_weight.ndim != 2 or quantized_weight.dtype != jnp.int8:
+        raise ValueError("quantized_weight must have shape [V, H] and dtype int8")
+    if weight_scale.shape != quantized_weight.shape[:1]:
+        raise ValueError("weight_scale must have shape [V]")
+
+    batch = int(hidden_norm.shape[0])
+    hidden_dim = int(hidden_norm.shape[-1])
+    vocab_size = int(quantized_weight.shape[0])
+    if hidden_dim != int(quantized_weight.shape[1]):
+        raise ValueError("hidden dimension must match quantized weight columns")
+    if vocab_size_limit is not None and int(vocab_size_limit) > 0:
+        vocab_size = min(vocab_size, int(vocab_size_limit))
+
+    hidden = hidden_norm.reshape(batch, hidden_dim).astype(jnp.float32)
+    absmax = jnp.max(jnp.abs(hidden), axis=1, keepdims=True)
+    hidden_scale = jnp.maximum(absmax / 127.0, jnp.finfo(jnp.float32).tiny)
+    hidden_q = jnp.clip(jnp.rint(hidden / hidden_scale), -127, 127).astype(jnp.int8)
+
+    block_m = 16 if batch > 8 else 8
+    block_n = 256
+    block_k = 64
+    num_vocab_blocks = int(jt.cdiv(vocab_size, block_n))
+    partial_shape = (batch, num_vocab_blocks)
+    partial_values, partial_indices = jt.triton_call(
+        hidden_q,
+        quantized_weight,
+        weight_scale.astype(jnp.float32),
+        kernel=_lm_head_top1_int8_stage1_kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct(partial_shape, jnp.float32),
+            jax.ShapeDtypeStruct(partial_shape, jnp.int32),
+        ),
+        grid=(jt.cdiv(batch, block_m), num_vocab_blocks),
+        name="lm_head_top1_int8_stage1",
+        batch_size=batch,
+        hidden_dim=hidden_dim,
+        vocab_size=vocab_size,
+        num_vocab_blocks=num_vocab_blocks,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=4,
+        num_stages=3,
+    )
+    token_ids = jt.triton_call(
+        partial_values,
+        partial_indices,
+        kernel=_lm_head_top1_stage2_kernel,
+        out_shape=jax.ShapeDtypeStruct((batch,), jnp.int32),
+        grid=(batch,),
+        name="lm_head_top1_int8_stage2",
+        num_vocab_blocks=num_vocab_blocks,
+        BLOCK_B=_next_power_of_2_bounded(num_vocab_blocks),
+        num_warps=8 if num_vocab_blocks >= 1024 else 4,
+        num_stages=3,
+    )
+    return token_ids[:, None]
+
+
+__all__ = ["lm_head_greedy_top1_int8_triton", "lm_head_greedy_top1_triton"]

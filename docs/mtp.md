@@ -32,7 +32,8 @@ recursive drafts, target-model verification, and the 70% system-RAM watchdog.
 | vLLM 0.24.0, no MTP | yes | 48.79 | n/a | 1.000x | 1.237x | n/a | 63.4% |
 | JAX, no MTP, B=1 packed GDN input | yes | 52.25 | 53.16 | 1.071x | 1.000x | n/a | 60.9% |
 | JAX strict packed K=2, full draft vocab | yes | 64.44 | 65.26 | 1.321x | 1.233x | 81.25% | 63.5% |
-| JAX strict packed K=2, 131k draft vocab | yes | 69.26 | 70.23 | 1.420x | 1.326x | 81.25% | 62.7% |
+| JAX strict packed K=2, full-vocab INT8 proposals | yes | 66.40--68.30 | 67.38--69.26 | 1.361--1.400x | 1.271--1.307x | 81.25% | 63.4--63.5% |
+| JAX strict packed K=2, 131k token-ID prefix | yes | 69.26 | 70.23 | 1.420x | 1.326x | 81.25% | 62.7% |
 | vLLM 0.24.0, MTP K=2 | yes | 88.05 | n/a | 1.805x | 1.685x | 83.33% | 63.5% |
 
 Completed output throughput is the speed metric. It includes the final device
@@ -41,14 +42,18 @@ resident token carry can enqueue dependent GPU work and emit host events before
 that work completes. It is neither a model-side clock nor cross-runtime
 comparable. The benchmark artifact now labels this scope explicitly.
 
-The current typed-config run matches the strengthened no-MTP JAX row for all 64
-tokens. It proposes 48 drafts, accepts 39, records six rejected blocks and 18
-bonus tokens, has zero verifier/seed fallbacks, and adds no JIT keys during
-measurement. `mtp_draft_vocab_size=131072` limits only proposal generation;
-the target verifier still evaluates the complete vocabulary. Consequently the
-committed output is exact with zero output-distribution KL. The bound preserves
-the same `39/48` acceptance on this row and improves strict MTP from `64.44` to
-`69.26 tok/s`.
+All strict rows match the strengthened no-MTP JAX row for all 64 tokens, have
+zero verifier/seed fallback, and add no JIT keys during measurement. The 131k
+row limits only proposal generation, so target verification still keeps output
+exact. It is not a general serving policy, however: token IDs are not a
+universal quality ordering, and its acceptance/speed can change by language,
+domain, prompt, or checkpoint. Keep fixed token-ID prefixes diagnostic-only.
+
+The live profile instead uses `triton_int8` with `mtp_draft_vocab_size=0`.
+Every vocabulary row remains eligible; only the proposal projection is
+quantized. The BF16 target model and full-vocabulary verifier are unchanged.
+Two single-row repeats reach `66.40` and `68.30 tok/s`, preserve the BF16-full
+`39/48` acceptance, and remain exact.
 
 ### Workload profiles
 
@@ -125,6 +130,37 @@ The remaining dominant speculative cost is now visible rather than hidden by
 copies: 54 full-vocabulary top-1 scans take 138.52 ms in the profiled run. K=2
 needs one target scan plus two causally dependent MTP scans per group, so those
 draft scans cannot simply be batched without changing the draft algorithm.
+
+### Proposal projection fusion
+
+The proposal projection and greedy top-1 were already fused before the latest
+pass. The Triton stage computes tensor-core vocabulary tiles and writes only one
+candidate per tile; a tiny second stage chooses the winning token. A 4B profile
+attributes about `62.0 ms / 25` calls to the projection stage, while the final
+reduction is too small to appear among meaningful GPU events. Removing that
+reduction is therefore not a useful fusion target.
+
+The direct alternatives confirm this:
+
+- XLA dense proposal projection plus argmax: exact, `64.25 tok/s`;
+- a logical B=1 row tile: exact, `68.23 tok/s`; tensor-core padding removes the
+  apparent seven-row saving;
+- eight-warp projection tiles: exact, `65.81 tok/s`.
+
+All were below the `69.26 tok/s` tuned-prefix result, and the kernel-tuning
+changes were removed. A fixed-prefix sweep reached `74.09` at 65k, `76.06` at
+32k, and `77.05 tok/s` at 16k with unchanged acceptance on this one row. Those
+numbers are a bandwidth upper bound, not evidence that vocabulary-prefix
+pruning generalizes.
+
+The general experiment keeps all 248,320 candidates and stores the
+proposal-only tied head as per-row INT8 weights plus scales. The current hidden
+vector is dynamically quantized, INT8 tensor cores perform projection-plus-top1,
+and the selected proposal is verified by the unchanged BF16 target model. On a
+four-request B=1 manifest, BF16-full reaches `69.09 tok/s` with `75/94` accepted
+drafts; INT8 reaches `72.15 tok/s` with `76/94`. The manifest hashes match, all
+128 emitted tokens match, GPU memory remains at the same measured
+`16.9 GiB` envelope, and measured JIT growth is zero.
 
 ### vLLM MTP and dense-family scaling
 

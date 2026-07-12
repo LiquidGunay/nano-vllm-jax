@@ -32,6 +32,8 @@ class MTPParams:
         pre_fc_norm_embedding: Pre-norm for embedding [hidden_size]
         final_norm: Final norm after MTP layers [hidden_size]
         lm_head: Output projection to vocab [hidden_size, vocab_size] (shared with main model)
+        proposal_weight_int8: Proposal-only INT8 weight [vocab_size, hidden_size]
+        proposal_weight_scale: Per-vocabulary-row scale for the INT8 weight
     """
     eh_proj: jnp.ndarray
     layers: list
@@ -39,6 +41,8 @@ class MTPParams:
     pre_fc_norm_embedding: jnp.ndarray
     final_norm: Optional[jnp.ndarray] = None
     lm_head: Optional[jnp.ndarray] = None
+    proposal_weight_int8: Optional[jnp.ndarray] = None
+    proposal_weight_scale: Optional[jnp.ndarray] = None
     
     def __call__(
         self,
@@ -247,6 +251,8 @@ def _mtp_greedy_top1_token_ids(
     config: Qwen3_5Config,
     *,
     vocab_major: bool = False,
+    quantized_weight: jnp.ndarray | None = None,
+    quantized_scale: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     impl = str(getattr(config, "mtp_lm_head_greedy_top1_impl", "jax") or "jax").strip().lower()
     configured_vocab = os.environ.get("NANO_VLLM_JAX_MTP_DRAFT_VOCAB_SIZE")
@@ -255,6 +261,24 @@ def _mtp_greedy_top1_token_ids(
     vocab_size = int(output_weight.shape[0 if vocab_major else 1])
     draft_vocab_size = int(configured_vocab or 0)
     limit_vocab = 0 < draft_vocab_size < vocab_size
+    if impl == "triton_int8":
+        if quantized_weight is None or quantized_scale is None:
+            raise ValueError("INT8 MTP top1 requires persistent quantized proposal weights")
+        from nanovllm_jax.kernels.lm_head_triton import (
+            lm_head_greedy_top1_int8_triton,
+        )
+
+        if x_normed.ndim != 3:
+            raise ValueError("INT8 MTP greedy top1 expects hidden shape [B, T, H]")
+        batch, seq_len, hidden_dim = x_normed.shape
+        flat_hidden = x_normed.reshape((batch * seq_len, 1, hidden_dim))
+        flat_token_ids = lm_head_greedy_top1_int8_triton(
+            flat_hidden,
+            quantized_weight,
+            quantized_scale,
+            vocab_size_limit=draft_vocab_size if limit_vocab else None,
+        )
+        return flat_token_ids.reshape((batch, seq_len)).astype(jnp.int32)
     if impl in {"triton", "triton_tensorcore", "triton_top1"}:
         from nanovllm_jax.kernels.lm_head_triton import lm_head_greedy_top1_triton
 
@@ -369,6 +393,8 @@ def mtp_forward_token_ids(
         output_weight,
         config,
         vocab_major=vocab_major,
+        quantized_weight=params.proposal_weight_int8,
+        quantized_scale=params.proposal_weight_scale,
     )
     return token_ids, x_normed if return_normed_hidden else x
 
@@ -450,6 +476,8 @@ def mtp_forward_token_ids_cached(
         output_weight,
         config,
         vocab_major=vocab_major,
+        quantized_weight=params.proposal_weight_int8,
+        quantized_scale=params.proposal_weight_scale,
     )
     return token_ids, x_normed if return_normed_hidden else x, kv_cache_state
 
@@ -501,6 +529,8 @@ def mtp_forward_selected_token_ids_cached(
         output_weight,
         config,
         vocab_major=vocab_major,
+        quantized_weight=params.proposal_weight_int8,
+        quantized_scale=params.proposal_weight_scale,
     )
     return token_ids, x_normed if return_normed_hidden else x, kv_cache_state
 
@@ -556,6 +586,8 @@ def mtp_forward_last_token_ids(
         output_weight,
         config,
         vocab_major=vocab_major,
+        quantized_weight=params.proposal_weight_int8,
+        quantized_scale=params.proposal_weight_scale,
     )
     chain_hidden = x_normed if return_normed_hidden else x
     return token_ids, chain_hidden[:, -1:, :]
@@ -808,6 +840,8 @@ def _mtp_params_flatten(params):
         params.pre_fc_norm_embedding,
         params.final_norm,
         params.lm_head,
+        params.proposal_weight_int8,
+        params.proposal_weight_scale,
     )
     aux_data = None
     return children, aux_data
@@ -822,6 +856,8 @@ def _mtp_params_unflatten(aux_data, children):
         pre_fc_norm_embedding=children[3],
         final_norm=children[4],
         lm_head=children[5],
+        proposal_weight_int8=children[6],
+        proposal_weight_scale=children[7],
     )
 
 

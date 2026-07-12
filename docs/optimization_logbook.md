@@ -14346,3 +14346,43 @@ NANO_VLLM_JAX_CACHE_ROOT=/mountpoint/.exp JAX_PLATFORMS=cuda \
   - `gpu_optimal.yaml` remains the general B=8 profile. B=1 MTP specialization
     stays explicit in `mtp_live.yaml` and continues to use the B=8 regression
     gate before any shared change is promoted.
+
+#### Entry 334 - Full-Vocabulary INT8 Proposal Fusion
+
+- date: 2026-07-12
+- fusion audit:
+  - the active Triton MTP proposal head already fuses projection with top-1 and
+    does not materialize logits;
+  - its tensor-core projection stage costs about `62.0 ms / 25` calls in the
+    available 4B profile, while the final candidate reduction is negligible;
+  - XLA full logits (`64.25 tok/s`), a B=1 logical row tile (`68.23`), and
+    eight-warp tiles (`65.81`) are exact but miss the `69.26` prior best. The
+    temporary tile changes were removed.
+- token-prefix diagnostic:
+  - 65k, 32k, and 16k proposal prefixes reach `74.09`, `76.06`, and
+    `77.05 tok/s` with unchanged acceptance on the single 4B row;
+  - these are bandwidth upper bounds only. Token-ID prefixes have no general
+    quality guarantee, so the live profile was restored to full vocabulary.
+- implementation:
+  - added explicit `mtp_lm_head_greedy_top1_impl=triton_int8`;
+  - quantize every native `[vocab, hidden]` proposal row once with a per-row
+    scale, dynamically quantize each hidden vector, and run INT8
+    projection-plus-top1 without materializing logits;
+  - target parameters, target logits, verification, and committed state remain
+    BF16 and full-vocabulary. The INT8 leaf replaces the tied BF16 proposal
+    transpose, so measured engine GPU memory remains about `16.9 GiB`.
+- exact 4B B=1 results:
+  - single 64-to-64 BF16-full control: `64.31 tok/s`, `39/48` accepted;
+  - INT8-full repeats: `66.40` and `68.30 tok/s`, both exact with the same
+    `39/48` acceptance, zero fallback, and zero measured JIT growth;
+  - same-manifest four-request 64-to-32 control: BF16 `69.09 tok/s`, `75/94`
+    accepted; INT8 `72.15 tok/s`, `76/94` accepted;
+  - manifest SHA is
+    `ae8ff96d9a1a803374fd2fa5f941a3a520dfd94ca08d2065f013f0f1b418c95b`,
+    and all four rows / 128 emitted tokens match exactly.
+- decision:
+  - keep INT8 full-vocabulary proposals as the general B=1 diagnostic route;
+  - keep fixed token-ID prefixes diagnostic-only and do not promote either
+    proposal approximation into `gpu_optimal.yaml`;
+  - no B=8 runtime branch changes: the new weight and kernel exist only when
+    MTP is loaded and `triton_int8` is explicitly selected.

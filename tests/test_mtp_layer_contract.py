@@ -188,6 +188,46 @@ def test_mtp_triton_top1_casts_hidden_to_weight_dtype(monkeypatch):
     }
 
 
+def test_mtp_int8_top1_uses_persistent_full_vocab_weight(monkeypatch):
+    seen = {}
+
+    def fake_top1(hidden_norm, quantized_weight, weight_scale, *, vocab_size_limit=None):
+        seen["hidden_shape"] = hidden_norm.shape
+        seen["weight_shape"] = quantized_weight.shape
+        seen["scale_shape"] = weight_scale.shape
+        seen["vocab_size_limit"] = vocab_size_limit
+        return jnp.zeros((hidden_norm.shape[0], 1), dtype=jnp.int32)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "nanovllm_jax.kernels.lm_head_triton",
+        types.SimpleNamespace(lm_head_greedy_top1_int8_triton=fake_top1),
+    )
+    config = types.SimpleNamespace(
+        mtp_lm_head_greedy_top1_impl="triton_int8",
+        mtp_draft_vocab_size=0,
+    )
+    hidden = jnp.ones((2, 1, 8), dtype=jnp.bfloat16)
+    quantized_weight = jnp.ones((16, 8), dtype=jnp.int8)
+    weight_scale = jnp.ones((16,), dtype=jnp.float32)
+
+    token_ids = _mtp_greedy_top1_token_ids(
+        hidden,
+        jnp.ones((8, 16), dtype=jnp.bfloat16),
+        config,
+        quantized_weight=quantized_weight,
+        quantized_scale=weight_scale,
+    )
+
+    assert token_ids.shape == (2, 1)
+    assert seen == {
+        "hidden_shape": (2, 1, 8),
+        "weight_shape": (16, 8),
+        "scale_shape": (16,),
+        "vocab_size_limit": None,
+    }
+
+
 def test_mtp_draft_vocab_limit_slices_only_the_vocab_axis(monkeypatch):
     seen = []
 
