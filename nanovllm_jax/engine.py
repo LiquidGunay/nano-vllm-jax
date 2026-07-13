@@ -157,12 +157,12 @@ class LLMEngine:
 
         self.scheduler = Scheduler(self.config)
         self.model_runner = ModelRunner(self.config, self.params)
-        self.startup_memory_bytes = {
+        self.startup_device_budget_bytes = {
             "parameters": _tree_nbytes(self.params),
             **self.model_runner.memory_bytes(),
         }
-        memory_mib = sum(self.startup_memory_bytes.values()) / (1024 * 1024)
-        print(f"Startup device arrays: {memory_mib:.1f} MiB")
+        memory_mib = sum(self.startup_device_budget_bytes.values()) / (1024 * 1024)
+        print(f"Startup device budget: {memory_mib:.1f} MiB")
         self._next_seq_id = 0
         atexit.register(self.exit)
 
@@ -177,6 +177,10 @@ class LLMEngine:
         decode_block_table_buckets: tuple[int, ...] | None = None,
     ) -> dict[str, object]:
         """Compile configured serving buckets without using live request data."""
+        if not self.scheduler.is_pristine():
+            raise RuntimeError(
+                "warmup_compilation must run before requests or prefix-cache state"
+            )
         if max_prefill_len is None:
             max_prefill_len = max(
                 tuple(getattr(self.config, "prefill_token_buckets", ()) or ())
@@ -333,6 +337,11 @@ class LLMEngine:
             finished=tuple(finished),
         )
 
+    def _release_invalidated_prefix_states(self) -> None:
+        handles = self.scheduler.take_released_prefix_state_handles()
+        if handles:
+            self.model_runner.release_prefix_hybrid_states(handles)
+
     def step(self) -> StepResult:
         seqs, schedule_plan = self.scheduler.schedule()
         prefill_chunk_lengths = (
@@ -341,26 +350,26 @@ class LLMEngine:
             else None
         )
 
+        self._release_invalidated_prefix_states()
         self.model_runner.install_cached_prefix_hybrid_states(
             seqs,
-            getattr(self.scheduler, "prefix_cache_hybrid_states", None),
+            self.scheduler.cached_prefix_entries(seqs),
         )
 
         device_batch = self.model_runner.materialize(schedule_plan)
         run_result = self.model_runner.execute(seqs, device_batch)
 
         if schedule_plan.is_prefill:
-            prefix_states_by_seq = None
-            if (
-                getattr(self.scheduler, "enable_prefix_cache_execution", False)
-                and getattr(self.scheduler, "prefix_cache_requires_hybrid_state", False)
-            ):
-                prefix_states_by_seq = self.model_runner.hybrid_states_for_sequences(seqs)
-            self.scheduler.record_computed_prefix_states(
+            pending = self.scheduler.record_computed_prefixes(
                 seqs,
                 prefill_chunk_lengths or [],
-                prefix_states_by_seq,
             )
+            self._release_invalidated_prefix_states()
+            if pending:
+                handles = self.model_runner.cache_prefix_hybrid_states(
+                    pending,
+                )
+                self.scheduler.publish_prefix_states(pending, handles)
         step_result = self.commit(seqs, schedule_plan, run_result)
         finished_seq_ids = [request.seq_id for request in step_result.finished]
         if finished_seq_ids:

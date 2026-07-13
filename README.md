@@ -86,21 +86,31 @@ and GDN hybrid state advance by the same committed prefix.
 
 ## Reading Path
 
-1. [nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py) - promoted operation policy.
-2. [server.yaml](server.yaml) and [nanovllm_jax/config.py](nanovllm_jax/config.py) - capacity and buckets.
-3. [nanovllm_jax/service.py](nanovllm_jax/service.py) - online request queue.
-4. [nanovllm_jax/engine.py](nanovllm_jax/engine.py),
+Core engine:
+
+1. [nanovllm_jax/engine.py](nanovllm_jax/engine.py),
    [nanovllm_jax/step.py](nanovllm_jax/step.py), and
-   [nanovllm_jax/output.py](nanovllm_jax/output.py) - execution results,
-   logical commit, and explicit output materialization.
-5. [nanovllm_jax/scheduler.py](nanovllm_jax/scheduler.py) and [nanovllm_jax/block_manager.py](nanovllm_jax/block_manager.py) - work selection and cache pages.
-6. [nanovllm_jax/batch.py](nanovllm_jax/batch.py) and
+   [nanovllm_jax/output.py](nanovllm_jax/output.py) - request lifecycle and commit.
+2. [nanovllm_jax/scheduler.py](nanovllm_jax/scheduler.py) - prefill and decode selection.
+3. [nanovllm_jax/block_manager.py](nanovllm_jax/block_manager.py) - paged capacity and prefix reuse.
+4. [nanovllm_jax/batch.py](nanovllm_jax/batch.py) and
    [nanovllm_jax/device_batch.py](nanovllm_jax/device_batch.py) - host planning
    and runner-owned device materialization.
-7. [nanovllm_jax/runner.py](nanovllm_jax/runner.py) and [nanovllm_jax/executor.py](nanovllm_jax/executor.py) - persistent device state and compiled calls.
-8. [nanovllm_jax/model.py](nanovllm_jax/model.py) - parameter structure, layer loop, and forward entrypoints.
-9. [nanovllm_jax/projection.py](nanovllm_jax/projection.py), [nanovllm_jax/attention.py](nanovllm_jax/attention.py), [nanovllm_jax/gdn.py](nanovllm_jax/gdn.py), and [nanovllm_jax/lm_head.py](nanovllm_jax/lm_head.py) - the model math split by role.
-10. [nanovllm_jax/cache.py](nanovllm_jax/cache.py) and [nanovllm_jax/kernels](nanovllm_jax/kernels) - cache layout and low-level routes.
+5. [nanovllm_jax/runner.py](nanovllm_jax/runner.py) and
+   [nanovllm_jax/executor.py](nanovllm_jax/executor.py) - device state and the selected compiled call.
+6. [nanovllm_jax/model.py](nanovllm_jax/model.py) - one model transition.
+
+Advanced serving:
+
+- [nanovllm_jax/service.py](nanovllm_jax/service.py), [server.yaml](server.yaml),
+  and [nanovllm_jax/config.py](nanovllm_jax/config.py) - online queues and capacity.
+- [nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py) - promoted operation policy.
+- [nanovllm_jax/projection.py](nanovllm_jax/projection.py),
+  [nanovllm_jax/attention.py](nanovllm_jax/attention.py),
+  [nanovllm_jax/gdn.py](nanovllm_jax/gdn.py), and
+  [nanovllm_jax/lm_head.py](nanovllm_jax/lm_head.py) - model operations.
+- [nanovllm_jax/cache.py](nanovllm_jax/cache.py) and
+  [nanovllm_jax/kernels](nanovllm_jax/kernels) - cache layout and low-level routes.
 
 ## Development
 
@@ -108,17 +118,22 @@ Generated results, profiles, and benchmark artifacts are not part of the
 cleaned branch. Keep ad hoc diagnostics under `/mountpoint/.exp/diagnostics` or
 another external scratch path.
 
-CPU-safe control-plane checks (also run in GitHub Actions):
+[docs/style.md](docs/style.md) defines the repository's lightweight complexity
+budget and review checks.
+
+CPU-safe control-plane checks:
 
 ```bash
 JAX_PLATFORMS=cpu pytest -q \
   tests/test_engine_initialization.py \
   tests/test_fastpath_config.py \
   tests/test_paged_attention_abi.py \
+  tests/test_prefix_cache.py \
   tests/test_public_imports.py \
   tests/test_scheduler_capacity.py \
   tests/test_server_config.py \
-  tests/test_service.py
+  tests/test_service.py \
+  tests/test_step_results.py
 ```
 
 For GPU correctness, verify CUDA visibility first and run JAX with

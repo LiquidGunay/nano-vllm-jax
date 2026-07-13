@@ -97,6 +97,8 @@ the engine worker to cancel the request and release its cache state.
 
 When a later prompt shares complete prompt blocks with an earlier request, the
 scheduler hashes full prompt blocks and asks `BlockManager` for reusable pages.
+It always leaves at least one prompt token to execute because prefix entries do
+not store the logits following a completely cached prompt.
 
 A hit is valid only when both pieces of state match:
 
@@ -105,7 +107,7 @@ full-attention KV blocks for the prefix
 GDN conv/recurrent hybrid state at the same prefix boundary
 ```
 
-The scheduler skips the cached prefix, schedules only the remaining suffix, and
-seeds the runner with the cached hybrid state before prefill. The same invariant
-still applies: the request's logical cached-token count, KV block table, and GDN
-state all describe the same prefix length.
+The scheduler skips the cached prefix, passes its opaque state handle to the
+runner, and schedules only the remaining suffix. The runner checks the entry,
+snapshot, and request token counts before installing the state. Reusing a KV
+block invalidates the complete entry and releases the snapshot.

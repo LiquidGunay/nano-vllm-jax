@@ -63,6 +63,13 @@ unwritten completion does not evict a cached prefix or widen its block table.
 Admission scans the bounded waiting queue for the first request that fits, so a
 large blocked request does not stall smaller requests behind it.
 
+Each reusable prefix is one `PrefixCacheEntry`: its chained hash, exact token
+count, physical block chain, and an optional opaque GDN-state handle. The
+runner owns the referenced device arrays. Reusing any block removes every
+dependent entry and returns its handle to the runner; the state-handle budget
+is capped by resident request capacity and included in the startup device
+budget.
+
 The scheduler returns a host-only `SchedulePlan`: immutable request rows plus
 the selected bucket shape. It neither imports JAX nor allocates device arrays.
 
@@ -74,9 +81,14 @@ the selected bucket shape. It neither imports JAX nor allocates device arrays.
 - reusable shape-stable device metadata,
 - full-attention KV cache arrays,
 - GDN hybrid-state slots,
+- bounded cached-prefix GDN snapshots,
 - resident decode metadata,
 - device token carry,
 - compile-bucket lookup.
+
+Compilation warmup is a startup-only transition. The engine rejects it after a
+request has been admitted or any prefix metadata has been published, so runner
+state cannot be reset beneath surviving host handles.
 
 FlashInfer receives a fixed-size page-index buffer for JIT stability, but its
 CSR indptr exposes only each row's live page prefix. Static block-table padding
