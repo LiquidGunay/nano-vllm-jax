@@ -6,7 +6,7 @@ Owns:
 Receives:
     Logical sequence state from the scheduler.
 Returns:
-    Reserved cache blocks and prefix-cache reuse decisions.
+    Physical cache blocks, capacity reservations, and prefix-cache decisions.
 Invariant:
     A published prefix block hash refers to materialized KV for a complete
     logical block.
@@ -57,6 +57,8 @@ class BlockManager:
         self.hash_to_block_id: Dict[int, int] = dict()
         self.free_block_ids: Deque[int] = deque(range(num_blocks))
         self.used_block_ids: Set[int] = set()
+        self._reserved_by_sequence: Dict[int, int] = {}
+        self.num_reserved_blocks = 0
 
     @classmethod
     def compute_hash(cls, token_ids: List[int], prefix: int = -1) -> int:
@@ -101,7 +103,13 @@ class BlockManager:
         end = (block_idx + 1) * self.block_size
         return seq.token_ids[start:end]
 
-    def _record_completed_block_hash(self, seq: Sequence, block_idx: int, *, publish: bool | None = None) -> int | None:
+    def _record_completed_block_hash(
+        self,
+        seq: Sequence,
+        block_idx: int,
+        *,
+        publish: bool | None = None,
+    ) -> int | None:
         if block_idx < 0 or block_idx >= len(seq.block_table):
             return None
         if seq.block_has_unmaterialized_device_tokens(block_idx):
@@ -159,16 +167,19 @@ class BlockManager:
                 best_hash = h
         return best_blocks * self.block_size, best_hash
 
-    def can_allocate(
+    def can_reserve(
         self,
         seq: Sequence,
         *,
+        total_blocks: int | None = None,
         use_prefix_cache: bool = True,
         cacheable_hashes: Set[int] | None = None,
     ) -> bool:
-        """Check if we can allocate blocks for sequence."""
-        return len(self.free_block_ids) >= self._num_required_blocks(
+        """Check whether a request's unallocated lifetime can be reserved."""
+        available = len(self.free_block_ids) - self.num_reserved_blocks
+        return available >= self._num_required_blocks(
             seq,
+            total_blocks=total_blocks,
             use_prefix_cache=use_prefix_cache,
             cacheable_hashes=cacheable_hashes,
         )
@@ -177,6 +188,7 @@ class BlockManager:
         self,
         seq: Sequence,
         *,
+        total_blocks: int | None = None,
         use_prefix_cache: bool = True,
         cacheable_hashes: Set[int] | None = None,
     ) -> int:
@@ -185,13 +197,17 @@ class BlockManager:
         Full-block prefix-cache hits that are already in use do not consume a
         free block; cache misses and request-local partial blocks do.
         """
+        logical_blocks = self._num_blocks(seq)
+        total_blocks = logical_blocks if total_blocks is None else int(total_blocks)
+        if total_blocks < logical_blocks:
+            raise ValueError("total_blocks cannot be smaller than the prompt")
         if not use_prefix_cache:
-            return self._num_blocks(seq)
+            return total_blocks
         cached_tokens, _ = self.cached_prefix_info(seq, cacheable_hashes=cacheable_hashes)
         cached_blocks = cached_tokens // self.block_size
         h = -1
         required = 0
-        for block_idx in range(self._num_blocks(seq)):
+        for block_idx in range(total_blocks):
             token_ids = self._block_tokens(seq, block_idx)
             block_id = -1
             if len(token_ids) == self.block_size:
@@ -203,22 +219,70 @@ class BlockManager:
             required += 1
         return required
 
+    def reserve(
+        self,
+        seq: Sequence,
+        *,
+        total_blocks: int | None = None,
+        use_prefix_cache: bool = True,
+        cacheable_hashes: Set[int] | None = None,
+    ):
+        """Reserve lifetime capacity, then allocate only prompt blocks."""
+        if seq.block_table:
+            raise ValueError("sequence already has allocated blocks")
+        if seq.block_size != self.block_size:
+            raise ValueError("sequence and block manager use different block sizes")
+        key = id(seq)
+        if key in self._reserved_by_sequence:
+            raise ValueError("sequence already has a capacity reservation")
+        required = self._num_required_blocks(
+            seq,
+            total_blocks=total_blocks,
+            use_prefix_cache=use_prefix_cache,
+            cacheable_hashes=cacheable_hashes,
+        )
+        if required > len(self.free_block_ids) - self.num_reserved_blocks:
+            raise RuntimeError("insufficient free blocks for complete request reservation")
+        self._reserved_by_sequence[key] = required
+        self.num_reserved_blocks += required
+        self.allocate(
+            seq,
+            use_prefix_cache=use_prefix_cache,
+            cacheable_hashes=cacheable_hashes,
+        )
+
+    def _consume_reservation(self, seq: Sequence) -> None:
+        key = id(seq)
+        remaining = self._reserved_by_sequence.get(key, 0)
+        if remaining <= 0:
+            raise AssertionError("physical allocation exceeded reserved capacity")
+        self._reserved_by_sequence[key] = remaining - 1
+        self.num_reserved_blocks -= 1
+
+    def _release_reservation(self, seq: Sequence) -> None:
+        remaining = self._reserved_by_sequence.pop(id(seq), 0)
+        self.num_reserved_blocks -= remaining
+
+    def _allocate_reserved_block(self, seq: Sequence) -> int:
+        if not self.free_block_ids:
+            raise AssertionError("reserved capacity has no physical free block")
+        block_id = self.free_block_ids[0]
+        self._allocate_block(block_id)
+        self._consume_reservation(seq)
+        return block_id
+
     def allocate(
         self,
         seq: Sequence,
         *,
         use_prefix_cache: bool = True,
         cacheable_hashes: Set[int] | None = None,
-    ):
-        """Allocate blocks for a sequence.
-        
-        Implements prefix caching:
-        - Computes hash for each full block
-        - Reuses existing blocks if hash matches
-        - Allocates new blocks for cache misses
-        """
+    ) -> None:
+        """Allocate prompt pages, reusing a complete cached prefix when possible."""
         assert not seq.block_table
-        seq.block_size = self.block_size
+        if seq.block_size != self.block_size:
+            raise ValueError("sequence and block manager use different block sizes")
+        logical_blocks = self._num_blocks(seq)
         seq.num_cached_tokens = 0
         seq.cached_prefix_hash = None
         seq.cached_prefix_hybrid_seeded = False
@@ -230,8 +294,8 @@ class BlockManager:
         )
         cached_blocks = cached_tokens // self.block_size
         h = -1
-        
-        for i in range(self._num_blocks(seq)):
+
+        for i in range(logical_blocks):
             token_ids = self._block_tokens(seq, i)
             block_id = -1
 
@@ -243,19 +307,17 @@ class BlockManager:
                         raise AssertionError("cached prefix disappeared during allocation")
 
             if block_id == -1:
-                # Allocate new block
-                block_id = self.free_block_ids[0]
-                block = self._allocate_block(block_id)
+                block_id = self._allocate_reserved_block(seq)
+                block = self.blocks[block_id]
             else:
-                # Cache hit - reuse existing block
                 seq.num_cached_tokens += self.block_size
                 if block_id in self.used_block_ids:
-                    # Block already in use - increment ref count
                     block = self.blocks[block_id]
                     block.ref_count += 1
                 else:
                     block = self._reuse_cached_block(block_id)
-            
+                    self._consume_reservation(seq)
+
             # Only full blocks are content-addressed. Newly allocated blocks are
             # not published to the prefix-cache map until execution has actually
             # materialized their KV rows.
@@ -266,13 +328,14 @@ class BlockManager:
         seq.cached_prefix_hash = cached_hash if seq.num_cached_tokens > 0 else None
 
     def deallocate(self, seq: Sequence):
-        """Free blocks for a sequence."""
+        """Free physical pages and unused lifetime capacity."""
+        self._release_reservation(seq)
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        
+
         seq.num_cached_tokens = 0
         seq.cached_prefix_hash = None
         seq.cached_prefix_hybrid_seeded = False
@@ -292,7 +355,8 @@ class BlockManager:
         """
         target_tokens = len(seq) + max(0, int(num_slots) - 1)
         required_blocks = (target_tokens + self.block_size - 1) // self.block_size
-        return len(self.free_block_ids) >= max(0, required_blocks - len(seq.block_table))
+        new_blocks = max(0, required_blocks - len(seq.block_table))
+        return self._reserved_by_sequence.get(id(seq), 0) >= new_blocks
 
     def stats(self) -> dict[str, int]:
         """Return allocation counters for scheduler diagnostics."""
@@ -300,6 +364,8 @@ class BlockManager:
             "total_blocks": len(self.blocks),
             "free_blocks": len(self.free_block_ids),
             "used_blocks": len(self.used_block_ids),
+            "reserved_blocks": self.num_reserved_blocks,
+            "available_blocks": len(self.free_block_ids) - self.num_reserved_blocks,
         }
 
     def snapshot(self, seqs: List[Sequence] | None = None) -> BlockTables:
@@ -335,10 +401,8 @@ class BlockManager:
             last_block = self.blocks[block_table[-1]]
             if last_block.hash == -1 and not seq.block_has_unmaterialized_device_tokens(last_block_idx):
                 raise AssertionError("completed block hash was not recorded")
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)
-            
+            block_table.append(self._allocate_reserved_block(seq))
+
         if len(seq) % self.block_size == 0:
             # Completed a block - update its hash
             block_idx = len(seq) // self.block_size - 1
@@ -347,9 +411,7 @@ class BlockManager:
         target_tokens = len(seq) + max(0, int(num_slots) - 1)
         required_blocks = (target_tokens + self.block_size - 1) // self.block_size
         while len(block_table) < required_blocks:
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)
+            block_table.append(self._allocate_reserved_block(seq))
 
     def commit_processed_token(self, seq: Sequence):
         """Record metadata for an already-processed appended token.

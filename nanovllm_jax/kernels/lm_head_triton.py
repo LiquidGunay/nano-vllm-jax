@@ -49,10 +49,11 @@ def _lm_head_top1_stage1_kernel(
             other=0.0,
         )
         b = tl.load(
-            weight + k[:, None] * vocab_size + vocab_offsets[None, :],
-            mask=(k[:, None] < hidden_dim) & (vocab_offsets[None, :] < vocab_size),
+            weight + vocab_offsets[:, None] * hidden_dim + k[None, :],
+            mask=(vocab_offsets[:, None] < vocab_size) & (k[None, :] < hidden_dim),
             other=0.0,
         )
+        b = tl.trans(b)
         acc += tl.dot(a, b, out_dtype=tl.float32)
 
     if REDUCE_CAST == 1:
@@ -119,24 +120,25 @@ def lm_head_greedy_top1_triton(
     block_n: int = 256,
     block_k: int = 64,
 ) -> jax.Array:
-    """Return greedy token ids for `[B, 1, H] x [H, V]`.
+    """Return greedy token ids from hidden rows and native `[V, H]` weights.
 
     The implementation computes full-precision tile accumulators and never
-    materializes `[B, V]` logits.  It returns `[B, 1]` int32 token ids.
+    materializes `[B, V]` logits. It transposes each vocabulary tile in
+    registers and returns `[B, 1]` int32 token ids.
     """
 
     if hidden_norm.ndim != 3 or int(hidden_norm.shape[1]) != 1:
         raise ValueError("Triton LM-head top1 requires hidden shape [B, 1, H]")
     if output_weight.ndim != 2:
-        raise ValueError("Triton LM-head top1 requires output weight shape [H, V]")
+        raise ValueError("Triton LM-head top1 requires output weight shape [V, H]")
     batch = int(hidden_norm.shape[0])
     hidden_dim = int(hidden_norm.shape[-1])
-    weight_hidden = int(output_weight.shape[0])
-    vocab_size = int(output_weight.shape[1])
+    vocab_size = int(output_weight.shape[0])
+    weight_hidden = int(output_weight.shape[1])
     if batch <= 0 or hidden_dim <= 0 or vocab_size <= 0:
         raise ValueError("Triton LM-head top1 requires non-empty dimensions")
     if hidden_dim != weight_hidden:
-        raise ValueError("hidden dimension must match output weight rows")
+        raise ValueError("hidden dimension must match output weight columns")
     if hidden_norm.dtype not in (jnp.float16, jnp.bfloat16, jnp.float32):
         raise ValueError(f"unsupported hidden dtype for Triton LM-head top1: {hidden_norm.dtype}")
     if output_weight.dtype not in (jnp.float16, jnp.bfloat16, jnp.float32):

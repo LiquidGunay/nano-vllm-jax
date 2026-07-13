@@ -1,14 +1,21 @@
 """Request lifecycle engine for Qwen 3.5 JAX serving."""
 
 import atexit
+from pathlib import Path
 from time import perf_counter
 from typing import Any, List, Dict, Optional, Union
 from dataclasses import replace
 
-from nanovllm_jax.config import EngineConfig, RuntimeConfig
+import jax
+
+from nanovllm_jax.config import EngineConfig, ModelConfig, RuntimeConfig
 from nanovllm_jax.cache import KVCacheSpec, cap_num_kv_cache_blocks
 from nanovllm_jax.model import ModelParams
-from nanovllm_jax.weights import load_weights_from_hf_streaming
+from nanovllm_jax.weights import (
+    load_weights_from_hf_streaming,
+    resolve_checkpoint,
+    resolve_checkpoint_metadata,
+)
 from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.sequence import Sequence, SamplingParams
@@ -27,14 +34,10 @@ _PUBLIC_ENGINE_KWARGS = {
     "max_num_batched_tokens",
     "max_blocks_per_seq",
     "kv_cache_bytes",
-    "kv_cache_mb",
-    "max_kv_cache_mb",
     "num_kvcache_blocks",
-    "num_kv_cache_blocks",
     "prefill_token_buckets",
     "batch_size_buckets",
     "decode_block_buckets",
-    "decode_block_table_buckets",
     "prefix_cache",
 }
 
@@ -50,12 +53,23 @@ def _engine_config_from_public_kwargs(model_path: str, kwargs: dict[str, Any]) -
     return EngineConfig.from_mapping({"model": model_path, **kwargs})
 
 
-def _runtime_config_from_engine_config(engine_config: EngineConfig) -> tuple[RuntimeConfig, str]:
+def _runtime_config_from_engine_config(
+    engine_config: EngineConfig,
+    model_config: ModelConfig,
+) -> tuple[RuntimeConfig, str]:
     engine_kwargs = engine_config.to_engine_kwargs()
     weight_dtype = str(engine_kwargs.pop("weight_dtype", engine_kwargs.get("dtype", "bfloat16")))
     runtime_fields = set(RuntimeConfig.__dataclass_fields__)
     runtime_kwargs = {key: value for key, value in engine_kwargs.items() if key in runtime_fields}
-    return RuntimeConfig(**runtime_kwargs), weight_dtype
+    return RuntimeConfig.from_model_config(model_config, **runtime_kwargs), weight_dtype
+
+
+def _tree_nbytes(value: object) -> int:
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree_util.tree_leaves(value)
+        if hasattr(leaf, "size") and hasattr(leaf, "dtype")
+    )
 
 
 class LLMEngine:
@@ -75,7 +89,21 @@ class LLMEngine:
         elif engine_config.model != model_path:
             engine_config = replace(engine_config, model=model_path)
 
-        self.config, self.weight_dtype = _runtime_config_from_engine_config(engine_config)
+        self.model_id = model_path
+        metadata_path = resolve_checkpoint_metadata(model_path)
+        self.model_config = ModelConfig.from_checkpoint(
+            metadata_path,
+            model=model_path,
+        )
+        self.checkpoint_path = (
+            metadata_path
+            if Path(model_path).expanduser().exists()
+            else resolve_checkpoint(model_path, revision=metadata_path.name)
+        )
+        self.config, self.weight_dtype = _runtime_config_from_engine_config(
+            engine_config,
+            self.model_config,
+        )
         kv_spec = KVCacheSpec(
             num_layers=self.config.num_hidden_layers,
             num_blocks=self.config.num_kvcache_blocks,
@@ -96,20 +124,37 @@ class LLMEngine:
         if not HAS_TRANSFORMERS:
             raise ImportError("transformers is required; install it with the package dependencies")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        if self.config.eos is None:
-            self.config.eos = self.tokenizer.eos_token_id
+        self.tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path, trust_remote_code=True)
+        self.config.eos_token_ids = tuple(
+            sorted(
+                {
+                    int(token_id)
+                    for token_id in (
+                        *self.config.eos_token_ids,
+                        self.tokenizer.eos_token_id,
+                    )
+                    if token_id is not None
+                }
+            )
+        )
 
-        print(f"Loading pretrained weights from {model_path}...")
+        print(f"Loading pretrained weights from {self.checkpoint_path}...")
         load_config = replace(self.config, dtype=self.weight_dtype)
         self.params = load_weights_from_hf_streaming(
-            model_path,
+            self.checkpoint_path,
             load_config,
         )
         print("✓ Using pretrained weights")
 
         self.scheduler = Scheduler(self.config)
         self.model_runner = ModelRunner(self.config, self.params)
+        self.startup_memory_bytes = {
+            "parameters": _tree_nbytes(self.params),
+            **self.model_runner.memory_bytes(),
+        }
+        memory_mib = sum(self.startup_memory_bytes.values()) / (1024 * 1024)
+        print(f"Startup device arrays: {memory_mib:.1f} MiB")
+        self._next_seq_id = 0
         atexit.register(self.exit)
 
     def warmup_compilation(
@@ -166,8 +211,13 @@ class LLMEngine:
         if sampling_params.temperature < 0:
             raise ValueError("temperature must be non-negative")
 
-        # Create sequence
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(
+            prompt,
+            sampling_params,
+            seq_id=self._next_seq_id,
+            block_size=self.config.block_size,
+        )
+        self._next_seq_id += 1
         self.scheduler.add(seq)
         return seq
 

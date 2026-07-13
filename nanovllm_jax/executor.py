@@ -273,8 +273,8 @@ class ModelExecutor:
             gathered_hidden = hidden[0, gather_idx, :][:, None, :]
             if return_hidden_with_logits or not return_hidden:
                 normed = rms_norm(gathered_hidden, self.params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
-                output_weight = self.params.lm_head if self.params.lm_head is not None else self.params.embed_tokens.T
-                logits = jnp.dot(normed, output_weight)
+                vocab_weight = self.params.lm_head if self.params.lm_head is not None else self.params.embed_tokens
+                logits = jnp.dot(normed, vocab_weight.T)
                 activations = (gathered_hidden, logits) if return_hidden_with_logits else logits
             else:
                 activations = gathered_hidden
@@ -417,8 +417,8 @@ class ModelExecutor:
                     gathered_hidden = hidden[0, gather_idx, :][:, None, :]
                     if return_hidden_with_logits or not return_hidden:
                         normed = rms_norm(gathered_hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
-                        output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
-                        logits = jnp.dot(normed, output_weight)
+                        vocab_weight = params.lm_head if params.lm_head is not None else params.embed_tokens
+                        logits = jnp.dot(normed, vocab_weight.T)
                         activations = (gathered_hidden, logits) if return_hidden_with_logits else logits
                     else:
                         activations = gathered_hidden

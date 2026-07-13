@@ -120,7 +120,10 @@ def init_params(key: jax.Array, config: RuntimeConfig) -> ModelParams:
     embed_tokens = jax.random.normal(keys[0], (config.vocab_size, config.hidden_size)) * (config.hidden_size ** -0.5)
     layers = [init_transformer_block(keys[i + 1], config, i) for i in range(config.num_hidden_layers)]
     norm_weight = jnp.ones(config.hidden_size)
-    lm_head = None if config.tie_word_embeddings else jax.random.normal(keys[-2], (config.hidden_size, config.vocab_size)) * (config.hidden_size ** -0.5)
+    lm_head = None if config.tie_word_embeddings else jax.random.normal(
+        keys[-2],
+        (config.vocab_size, config.hidden_size),
+    ) * (config.hidden_size ** -0.5)
     return ModelParams(embed_tokens=embed_tokens, layers=layers, norm_weight=norm_weight, lm_head=lm_head)
 
 
@@ -146,9 +149,6 @@ def init_transformer_block(key: jax.Array, config: RuntimeConfig, layer_idx: int
             "q_norm": jnp.ones((config.num_attention_heads, config.head_dim)),
             "k_norm": jnp.ones((config.num_key_value_heads, config.head_dim)),
             "input_norm": jnp.ones(config.hidden_size),
-            "post_attn_norm": jnp.ones(config.hidden_size),
-            "gate_proj": gate_proj,
-            "up_proj": up_proj,
             _MLP_GATE_UP_PACKED_KEY: jnp.concatenate([gate_proj, up_proj], axis=1),
             "down_proj": jax.random.normal(keys[7], (config.intermediate_size, config.hidden_size)) * (config.hidden_size ** -0.5),
             "ffn_norm": jnp.ones(config.hidden_size),
@@ -178,8 +178,6 @@ def init_transformer_block(key: jax.Array, config: RuntimeConfig, layer_idx: int
             "A": jnp.exp(jnp.full(config.linear_num_value_heads, 0.0)),
             "norm_weight": jnp.ones(config.linear_value_head_dim),
             "out_proj": jax.random.normal(keys[6], (value_dim, config.hidden_size)) * (config.hidden_size ** -0.5),
-            "gate_proj": gate_proj,
-            "up_proj": up_proj,
             _MLP_GATE_UP_PACKED_KEY: jnp.concatenate([gate_proj, up_proj], axis=1),
             "down_proj": jax.random.normal(keys[7], (config.intermediate_size, config.hidden_size)) * (config.hidden_size ** -0.5),
             "ffn_norm": jnp.ones(config.hidden_size),
@@ -586,10 +584,10 @@ def forward_step(
             gather_idx = gather_idx[:, None, None]
             gather_idx = jnp.broadcast_to(gather_idx, (batch, 1, x.shape[-1]))
             x = jnp.take_along_axis(x, gather_idx, axis=1)
-    output_weight = params.lm_head if params.lm_head is not None else params.embed_tokens.T
+    vocab_weight = params.lm_head if params.lm_head is not None else params.embed_tokens
     logits = _tokenwise_decode_dot(
         x,
-        output_weight,
+        vocab_weight.T,
         force_width1=(not is_prefill) and seq_len > 1 and _force_width1_decode_math(),
     )
     if return_hidden:

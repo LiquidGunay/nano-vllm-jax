@@ -27,7 +27,7 @@ torch = pytest.importorskip("torch")
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import List, Optional
 from nanovllm_jax.config import RuntimeConfig
-from nanovllm_jax.weights import load_weights_from_hf
+from nanovllm_jax.weights import load_weights_from_hf_streaming
 from nanovllm_jax.model import forward
  
 jax.config.update("jax_default_matmul_precision", "highest")
@@ -86,7 +86,7 @@ def load_models(model_name: str = MODEL_NAME):
     print("  Loading JAX model...")
     config = RuntimeConfig.qwen3_5_0_8b()
     config.dtype = "bfloat16"
-    params = load_weights_from_hf(model_name, config)
+    params = load_weights_from_hf_streaming(model_name, config)
     config.dtype = "float32"
     
     print("  ✓ Models loaded")
@@ -200,11 +200,16 @@ def test_generation_parity(
     print("TESTING GENERATION PARITY")
     print("=" * 80)
 
-    for i, prompt in enumerate(prompts):
+    encoded_prompts = [
+        tokenizer(prompt, return_tensors="pt").to(hf_device)
+        for prompt in prompts
+    ]
+    fixed_length = max(int(inputs["input_ids"].shape[1]) for inputs in encoded_prompts) + max_new_tokens
+
+    for i, (prompt, inputs) in enumerate(zip(prompts, encoded_prompts)):
         print(f"\n[Prompt {i+1}/{len(prompts)}] \"{prompt[:50]}...\"" if len(prompt) > 50 else f"\n[Prompt {i+1}/{len(prompts)}] \"{prompt}\"")
         
         # HF generation
-        inputs = tokenizer(prompt, return_tensors="pt").to(hf_device)
         with torch.no_grad():
             hf_output_ids = hf_model.generate(
                 inputs["input_ids"],
@@ -214,34 +219,25 @@ def test_generation_parity(
             )
         hf_generated = tokenizer.decode(hf_output_ids[0], skip_special_tokens=True)
         
-        # JAX generation (simplified greedy decoding)
-        input_ids = inputs["input_ids"].cpu().numpy()
-        generated_ids = list(input_ids[0])
-        
-        # Prefill (no KV cache for simplicity)
-        input_ids_jax = jnp.array([generated_ids])
-        logits, _ = forward(
-            input_ids_jax,
-            params,
-            config,
-            kv_cache_state=None,  # No cache for simple test
-            is_prefill=True,
-        )
-        
-        # Decode tokens
+        # Keep one JAX shape for every decode step. Future padding is causally
+        # invisible at the current position, so this is identical to growing
+        # the sequence while avoiding a compile per length.
+        generated_ids = list(inputs["input_ids"][0].cpu().numpy())
+        padded_ids = generated_ids + [tokenizer.eos_token_id] * (fixed_length - len(generated_ids))
         for _ in range(max_new_tokens):
-            next_token = int(jnp.argmax(logits[0, -1, :]))
-            generated_ids.append(next_token)
-            
-            # Decode step (forward full sequence each time - no cache)
-            input_ids_jax = jnp.array([generated_ids])
+            current_position = len(generated_ids) - 1
             logits, _ = forward(
-                input_ids_jax,
+                jnp.array([padded_ids]),
                 params,
                 config,
                 kv_cache_state=None,
-                is_prefill=True,  # Treat as prefill since no cache
+                is_prefill=True,
+                last_logits_only=True,
+                logit_positions=jnp.array([current_position], dtype=jnp.int32),
             )
+            next_token = int(jnp.argmax(logits[0, 0, :]))
+            generated_ids.append(next_token)
+            padded_ids[current_position + 1] = next_token
         
         jax_generated = tokenizer.decode(generated_ids, skip_special_tokens=True)
         

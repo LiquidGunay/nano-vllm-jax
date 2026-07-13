@@ -48,7 +48,13 @@ def test_paged_decode_attention_gqa_nhd_reference_matches_current_decode_path():
         .reshape(batch, num_q_heads, head_dim)
         / 50.0
     )
-    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(block_tables)
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
+        block_tables,
+        seq_lens,
+        page_size,
+    )
+    np.testing.assert_array_equal(np.asarray(kv_indptr), [0, 2, 5])
+    np.testing.assert_array_equal(np.asarray(kv_indices[:5]), [3, 1, 0, 5, 2])
     kv_last_page_len = kv_last_page_len_from_seq_lens(seq_lens, page_size)
     scale = 1.0 / np.sqrt(head_dim)
 
@@ -131,7 +137,11 @@ def test_paged_decode_attention_gqa_nhd_reference_model_head_shape_fp32():
         batch * num_q_heads * head_dim,
         dtype=jnp.float32,
     ).reshape(batch, num_q_heads, head_dim)
-    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(block_tables)
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
+        block_tables,
+        seq_lens,
+        page_size,
+    )
     kv_last_page_len = kv_last_page_len_from_seq_lens(seq_lens, page_size)
     scale = 1.0 / np.sqrt(head_dim)
 

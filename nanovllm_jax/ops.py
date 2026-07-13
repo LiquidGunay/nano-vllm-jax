@@ -745,7 +745,11 @@ class ServingOps:
             from nanovllm_jax.kernels.flashinfer_ffi import paged_decode_attention_gqa_nhd
             from nanovllm_jax.kernels.paged_attention import dense_block_tables_to_kv_indptr, kv_last_page_len_from_seq_lens
 
-            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(metadata.block_tables)
+            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
+                metadata.block_tables,
+                metadata.seq_lens,
+                block_size,
+            )
             out = paged_decode_attention_gqa_nhd(
                 query[:, 0].astype(cache.k_cache.dtype),
                 cache.k_cache[layer_id],
@@ -793,7 +797,11 @@ class ServingOps:
             from nanovllm_jax.kernels.flashinfer_ffi import paged_decode_attention_with_kv_append_gqa_nhd
             from nanovllm_jax.kernels.paged_attention import dense_block_tables_to_kv_indptr, kv_last_page_len_from_seq_lens
 
-            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(metadata.block_tables)
+            kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
+                metadata.block_tables,
+                metadata.seq_lens,
+                block_size,
+            )
             k_cache, v_cache, outputs = cache.k_cache, cache.v_cache, []
             width = int(query.shape[1])
             for token_idx in range(width):
