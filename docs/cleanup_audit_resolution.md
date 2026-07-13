@@ -40,8 +40,8 @@ Resolved in the structural cleanup:
 - Pruned stale operation variants so the runtime keeps one reference path and
   one promoted fast path for each accepted speedup.
 - Hardened `EngineService` lifecycle: engine failures are terminal for the
-  service, queued/active waiters are failed on stop, and bounded queues fail
-  clearly under backpressure.
+  service, queued plus active work is bounded, disconnected streams cancel,
+  health follows the worker, and shutdown verifies that the worker stopped.
 - Made `OutputBuffer` the owner of generated host tokens and deferred device
   references; `Sequence` now contains only logical/cache request state.
 - Added typed `RunResult` and `StepResult` boundaries and one
@@ -61,12 +61,11 @@ Resolved in the structural cleanup:
 Validation completed under `tests/ram_guard.py`:
 - `python -m compileall -q server.py nanovllm_jax tests`.
 - `python -m ruff check server.py nanovllm_jax tests`.
-- `pytest --collect-only -q`: 167 tests collected after removing obsolete
-  runtime variants.
-- `pytest -q tests/test_fastpath_config.py tests/test_public_imports.py
-  tests/test_service.py tests/test_server_config.py
-  tests/test_causal_conv1d_update.py tests/test_decode_reductions.py
-  tests/test_paged_attention_abi.py tests/test_nhd_kv_cache.py`: 34 passed.
+- `pytest --collect-only -q`: 205 tests collected.
+- `pytest -q tests/test_engine_initialization.py tests/test_fastpath_config.py
+  tests/test_public_imports.py tests/test_scheduler_capacity.py
+  tests/test_server_config.py tests/test_service.py tests/test_step_results.py`:
+  57 passed.
 - `pytest -q tests/test_device_token_carry.py tests/test_kv_cache.py
   tests/test_flashinfer_ffi.py tests/test_lm_head_helpers.py`: 55 passed.
 - `pytest -q tests/test_gdn_packed_decode_reference.py

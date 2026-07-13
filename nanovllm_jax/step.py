@@ -10,6 +10,7 @@ from nanovllm_jax.batch import Phase
 class FinishReason(str, Enum):
     EOS = "eos"
     LENGTH = "length"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True)

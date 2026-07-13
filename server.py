@@ -388,7 +388,15 @@ def _json_error(exc: Exception, status: int):
 @app.route("/health", methods=["GET"])
 def health():
     loaded = engine is not None
-    return jsonify({"status": "healthy" if loaded else "loading", "model_loaded": loaded})
+    worker = service.health() if service is not None else {"state": "stopped"}
+    healthy = loaded and worker["state"] == "running"
+    return jsonify(
+        {
+            "status": "healthy" if healthy else worker["state"] if loaded else "loading",
+            "model_loaded": loaded,
+            "worker": worker,
+        }
+    ), 200 if healthy else 503
 
 
 @app.route("/v1/generate", methods=["POST"])
@@ -420,6 +428,7 @@ def generate_stream():
         return _json_error(ValueError("streaming accepts one prompt per request"), 400)
 
     def events():
+        handle = None
         if service is None:
             yield f"data: {json.dumps({'event': 'error', 'error': 'model is not loaded'})}\n\n"
             return
@@ -431,6 +440,9 @@ def generate_stream():
         except Exception as exc:
             app.logger.exception("Unhandled /v1/generate_stream error")
             yield f"data: {json.dumps({'event': 'error', 'error': str(exc)}, sort_keys=True)}\n\n"
+        finally:
+            if handle is not None and not handle.done:
+                handle.cancel()
 
     return Response(stream_with_context(events()), mimetype="text/event-stream")
 
@@ -505,7 +517,11 @@ def main() -> None:
     validate_runtime_dependencies()
     load_engine(settings)
     print(f"server_ready=http://{settings.host}:{settings.port}")
-    app.run(host=settings.host, port=settings.port, threaded=True)
+    try:
+        app.run(host=settings.host, port=settings.port, threaded=True)
+    finally:
+        if service is not None:
+            service.stop()
 
 
 if __name__ == "__main__":

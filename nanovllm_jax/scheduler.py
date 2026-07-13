@@ -547,7 +547,8 @@ class Scheduler:
         )
 
     def release(self, seq: Sequence) -> None:
-        """Release queue and block resources after the engine finishes a request."""
+        """Release queue and block resources after a terminal transition."""
         self.block_manager.deallocate(seq)
-        if seq in self.running:
-            self.running.remove(seq)
+        for requests in (self.waiting, self.running):
+            if seq in requests:
+                requests.remove(seq)

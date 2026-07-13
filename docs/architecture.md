@@ -12,7 +12,10 @@ EngineService -> LLMEngine -> Scheduler -> ModelRunner -> ModelExecutor -> model
 and submits work to `EngineService`.
 
 `EngineService` owns cross-request admission. Handler threads enqueue work; one
-worker advances the engine and publishes token events or final results.
+worker advances the engine and publishes output or cancellation transitions.
+The total queued-plus-active request count is bounded. Streaming uses a
+one-slot wake channel plus an output watermark, so slow clients coalesce work
+instead of retaining one Python dictionary per token.
 
 `LLMEngine` owns request lifecycle:
 
@@ -21,6 +24,11 @@ worker advances the engine and publishes token events or final results.
 - call the runner,
 - commit each `RunResult` exactly once,
 - release runner/cache state.
+
+Cancellation is also an engine transition: `cancel_request()` removes a
+waiting or running sequence and releases its scheduler, KV, and runner state.
+Health is derived from the worker thread rather than model allocation alone,
+and shutdown succeeds only after that worker has actually stopped.
 
 The control boundary is explicit:
 

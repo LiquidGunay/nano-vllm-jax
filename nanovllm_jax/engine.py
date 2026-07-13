@@ -370,6 +370,15 @@ class LLMEngine:
     def is_finished(self) -> bool:
         return self.scheduler.is_finished()
 
+    def cancel_request(self, seq: Sequence) -> bool:
+        """Commit cancellation and release all state owned by one request."""
+        if seq.is_finished:
+            return False
+        self.scheduler.release(seq)
+        self.model_runner.release([seq.seq_id])
+        seq.status = SequenceStatus.FINISHED
+        return True
+
     def generate(
         self,
         prompts: List[Union[str, List[int]]],

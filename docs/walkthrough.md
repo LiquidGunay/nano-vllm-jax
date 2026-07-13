@@ -88,6 +88,11 @@ non-streaming output stays on device until the request finishes. Either the
 checkpoint EOS or tokenizer EOS ends generation, and the finish reason is
 carried to the service response.
 
+The HTTP stream reads those tokens through a one-slot notification channel.
+If the client is slow, the channel retains only the latest output watermark and
+the next `tokens` event carries the whole unseen range. Closing the stream asks
+the engine worker to cancel the request and release its cache state.
+
 ## Prefix-Cache Hit
 
 When a later prompt shares complete prompt blocks with an earlier request, the

@@ -51,6 +51,10 @@ curl http://127.0.0.1:6791/v1/generate_stream \
   -d '{"prompt":"Reply with one short sentence.","max_tokens":32,"temperature":0}'
 ```
 
+Streaming emits coalesced `tokens` events with `completion_start`, `token_ids`,
+and an append-only `text` delta. The final `done` event carries the canonical
+text, token ids, and finish reason.
+
 HTTP handlers submit work to `EngineService`. A single worker admits queued
 requests, calls `LLMEngine.step()`, and publishes per-request results so
 independent clients can batch together.
