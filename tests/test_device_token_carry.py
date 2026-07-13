@@ -7,11 +7,25 @@ import numpy as np
 import pytest
 
 from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.device_batch import BatchMaterializer, DeviceBatch
 from nanovllm_jax.engine import LLMEngine
-from nanovllm_jax.batch import ScheduledBatch
 from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.sequence import DeviceTokenRef, SamplingParams, Sequence, SequenceStatus
+
+
+def _batch_materializer(
+    *,
+    resident: bool = False,
+    seq_lens_carry: bool = False,
+) -> BatchMaterializer:
+    return BatchMaterializer(
+        execution="jit",
+        device_token_carry=True,
+        static_decode_metadata=True,
+        resident_decode_metadata=resident,
+        static_decode_seq_lens_carry=seq_lens_carry,
+    )
 
 
 class _AsyncScalar:
@@ -138,14 +152,14 @@ def _decode_batch(
     tokens: list[int],
     *,
     seq_lens: list[int] | None = None,
-) -> ScheduledBatch:
+) -> DeviceBatch:
     query_lens = [1 if seq_id >= 0 else 0 for seq_id in seq_ids]
     if seq_lens is None:
         seq_lens = query_lens
     query_start_loc = [0]
     for query_len in query_lens:
         query_start_loc.append(query_start_loc[-1] + query_len)
-    return ScheduledBatch(
+    return DeviceBatch(
         tokens=jnp.asarray(tokens, dtype=jnp.int32)[:, None],
         positions=jnp.zeros((len(seq_ids), 1), dtype=jnp.int32),
         seq_ids=jnp.asarray(seq_ids, dtype=jnp.int32),
@@ -166,12 +180,12 @@ def _prefill_batch(
     tokens: list[int],
     *,
     final_flags: tuple[bool, ...],
-) -> ScheduledBatch:
+) -> DeviceBatch:
     query_lens = [1 if seq_id >= 0 else 0 for seq_id in seq_ids]
     query_start_loc = [0]
     for query_len in query_lens:
         query_start_loc.append(query_start_loc[-1] + query_len)
-    return ScheduledBatch(
+    return DeviceBatch(
         tokens=jnp.asarray(tokens, dtype=jnp.int32)[:, None],
         positions=jnp.zeros((len(seq_ids), 1), dtype=jnp.int32),
         seq_ids=jnp.asarray(seq_ids, dtype=jnp.int32),
@@ -418,7 +432,7 @@ def test_model_runner_release_preserves_carry_for_still_running_rows():
     assert runner._device_token_carry_by_seq_id[8].row == 1
 
 
-def test_scheduler_static_decode_metadata_reuses_fixed_device_arrays(monkeypatch):
+def test_materializer_reuses_fixed_decode_arrays(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
         RuntimeConfig(
@@ -431,6 +445,7 @@ def test_scheduler_static_decode_metadata_reuses_fixed_device_arrays(monkeypatch
             static_decode_metadata=True,
         )
     )
+    materializer = _batch_materializer()
     seq_a = Sequence([1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7)
     seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
     seq_a.block_table = [0]
@@ -440,10 +455,14 @@ def test_scheduler_static_decode_metadata_reuses_fixed_device_arrays(monkeypatch
     seq_a.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
     seq_b.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
 
-    first = scheduler.build_scheduled_batch([seq_a, seq_b], is_prefill=False)
+    first = materializer.materialize(
+        scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
+    )
     seq_a.append_token_device(DeviceTokenRef(tokens=token_vector, row=0))
     seq_b.append_token_device(DeviceTokenRef(tokens=token_vector, row=1))
-    second = scheduler.build_scheduled_batch([seq_a, seq_b], is_prefill=False)
+    second = materializer.materialize(
+        scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
+    )
 
     assert first.uses_static_decode_metadata
     assert second.uses_static_decode_metadata
@@ -457,7 +476,7 @@ def test_scheduler_static_decode_metadata_reuses_fixed_device_arrays(monkeypatch
     assert second.seq_lens_host == (3, 3)
 
 
-def test_scheduler_decode_block_table_buckets_select_smallest_fit():
+def test_schedule_plan_selects_smallest_decode_block_bucket():
     scheduler = Scheduler(
         RuntimeConfig(
             max_num_seqs=2,
@@ -468,12 +487,15 @@ def test_scheduler_decode_block_table_buckets_select_smallest_fit():
             jax_execution="jit",
         )
     )
+    materializer = _batch_materializer()
     seq_a = Sequence([1, 2, 3], SamplingParams(temperature=0.0, max_tokens=2), seq_id=7)
     seq_b = Sequence([4, 5, 6], SamplingParams(temperature=0.0, max_tokens=2), seq_id=8)
     seq_a.block_table = [0, 2, 4]
     seq_b.block_table = [1, 3]
 
-    batch = scheduler.build_scheduled_batch([seq_a, seq_b], is_prefill=False)
+    batch = materializer.materialize(
+        scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
+    )
 
     assert batch.block_tables.shape == (2, 4)
     np.testing.assert_array_equal(np.asarray(batch.block_tables[0]), np.asarray([0, 2, 4, 0]))
@@ -505,13 +527,13 @@ def test_scheduler_resident_capacity_can_exceed_execution_batch():
 
     first_prefill_seqs, first_prefill = scheduler.schedule()
     assert [seq.seq_id for seq in first_prefill_seqs] == [0, 1]
-    assert first_prefill.seq_ids_host == (0, 1)
+    assert tuple(row.seq_id for row in first_prefill.rows) == (0, 1)
     for seq in first_prefill_seqs:
         seq.num_cached_tokens = seq.num_prompt_tokens
 
     first_decode_seqs, first_decode = scheduler.schedule()
     assert [seq.seq_id for seq in first_decode_seqs] == [0, 1]
-    assert first_decode.tokens.shape[0] == 2
+    assert first_decode.bucket.batch_size == 2
     assert len(scheduler.waiting) == 2
 
     scheduler.postprocess(first_decode_seqs, [101, 102])
@@ -519,7 +541,7 @@ def test_scheduler_resident_capacity_can_exceed_execution_batch():
 
     second_prefill_seqs, second_prefill = scheduler.schedule()
     assert [seq.seq_id for seq in second_prefill_seqs] == [2, 3]
-    assert second_prefill.seq_ids_host == (2, 3)
+    assert tuple(row.seq_id for row in second_prefill.rows) == (2, 3)
     for seq in second_prefill_seqs:
         seq.num_cached_tokens = seq.num_prompt_tokens
 
@@ -528,11 +550,11 @@ def test_scheduler_resident_capacity_can_exceed_execution_batch():
 
     decode_seqs, decode_batch = scheduler.schedule()
     assert len(decode_seqs) == 2
-    assert decode_batch.tokens.shape[0] == 2
+    assert decode_batch.bucket.batch_size == 2
     assert len(scheduler.running) == 2
 
 
-def test_scheduler_static_decode_metadata_can_reuse_seq_lens_placeholder(monkeypatch):
+def test_materializer_can_reuse_seq_lens_placeholder(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
         RuntimeConfig(
@@ -546,6 +568,7 @@ def test_scheduler_static_decode_metadata_can_reuse_seq_lens_placeholder(monkeyp
             static_decode_seq_lens_carry=True,
         )
     )
+    materializer = _batch_materializer(seq_lens_carry=True)
     seq_a = Sequence([1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7)
     seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
     seq_a.block_table = [0]
@@ -555,10 +578,14 @@ def test_scheduler_static_decode_metadata_can_reuse_seq_lens_placeholder(monkeyp
     seq_a.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
     seq_b.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
 
-    first = scheduler.build_scheduled_batch([seq_a, seq_b], is_prefill=False)
+    first = materializer.materialize(
+        scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
+    )
     seq_a.append_token_device(DeviceTokenRef(tokens=token_vector, row=0))
     seq_b.append_token_device(DeviceTokenRef(tokens=token_vector, row=1))
-    second = scheduler.build_scheduled_batch([seq_a, seq_b], is_prefill=False)
+    second = materializer.materialize(
+        scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
+    )
 
     assert first.uses_static_decode_metadata
     assert second.uses_static_decode_metadata
@@ -566,7 +593,7 @@ def test_scheduler_static_decode_metadata_can_reuse_seq_lens_placeholder(monkeyp
     assert second.seq_lens_host == (3, 3)
 
 
-def test_scheduler_resident_decode_metadata_uses_device_placeholders(monkeypatch):
+def test_materializer_uses_resident_metadata_placeholders(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
         RuntimeConfig(
@@ -580,6 +607,7 @@ def test_scheduler_resident_decode_metadata_uses_device_placeholders(monkeypatch
             resident_decode_metadata=True,
         )
     )
+    materializer = _batch_materializer(resident=True)
     seq_a = Sequence([1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7)
     seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
     seq_a.block_table = [1]
@@ -589,11 +617,15 @@ def test_scheduler_resident_decode_metadata_uses_device_placeholders(monkeypatch
     seq_a.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
     seq_b.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
 
-    first = scheduler.build_scheduled_batch([seq_a, seq_b], is_prefill=False)
+    first = materializer.materialize(
+        scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
+    )
     seq_a.append_token_device(DeviceTokenRef(tokens=token_vector, row=0))
     seq_b.append_token_device(DeviceTokenRef(tokens=token_vector, row=1))
     seq_a.block_table = [1, 4]
-    second = scheduler.build_scheduled_batch([seq_a, seq_b], is_prefill=False)
+    second = materializer.materialize(
+        scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
+    )
 
     assert first.uses_static_decode_metadata
     assert second.uses_static_decode_metadata
@@ -606,7 +638,7 @@ def test_scheduler_resident_decode_metadata_uses_device_placeholders(monkeypatch
     assert second.seq_lens_host == (3, 3)
 
 
-def test_scheduler_resident_decode_metadata_reuses_placeholders_across_seq_ids(monkeypatch):
+def test_materializer_reuses_resident_placeholders_across_seq_ids(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
         RuntimeConfig(
@@ -620,6 +652,7 @@ def test_scheduler_resident_decode_metadata_reuses_placeholders_across_seq_ids(m
             resident_decode_metadata=True,
         )
     )
+    materializer = _batch_materializer(resident=True)
     seq_a = Sequence([1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7)
     seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
     seq_a.block_table = [1]
@@ -629,7 +662,9 @@ def test_scheduler_resident_decode_metadata_reuses_placeholders_across_seq_ids(m
     seq_a.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
     seq_b.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
 
-    first = scheduler.build_scheduled_batch([seq_a, seq_b], is_prefill=False)
+    first = materializer.materialize(
+        scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
+    )
 
     seq_c = Sequence([5, 6], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=17)
     seq_d = Sequence([7, 8], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=18)
@@ -640,7 +675,9 @@ def test_scheduler_resident_decode_metadata_reuses_placeholders_across_seq_ids(m
     seq_c.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
     seq_d.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
 
-    second = scheduler.build_scheduled_batch([seq_c, seq_d], is_prefill=False)
+    second = materializer.materialize(
+        scheduler.build_schedule_plan([seq_c, seq_d], is_prefill=False)
+    )
 
     assert first.uses_static_decode_metadata
     assert second.uses_static_decode_metadata
@@ -656,7 +693,7 @@ def test_scheduler_resident_decode_metadata_reuses_placeholders_across_seq_ids(m
     np.testing.assert_array_equal(np.asarray(second.block_tables), np.zeros((2, 3), dtype=np.int32))
 
 
-def test_scheduler_static_decode_metadata_allows_greedy_burst(monkeypatch):
+def test_materializer_preserves_greedy_burst_width(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
         RuntimeConfig(
@@ -670,6 +707,7 @@ def test_scheduler_static_decode_metadata_allows_greedy_burst(monkeypatch):
             greedy_decode_burst_steps=2,
         )
     )
+    materializer = _batch_materializer()
     seq_a = Sequence([1, 2], SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True), seq_id=7)
     seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True), seq_id=8)
     seq_a.block_table = [0]
@@ -679,7 +717,13 @@ def test_scheduler_static_decode_metadata_allows_greedy_burst(monkeypatch):
     seq_a.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
     seq_b.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
 
-    batch = scheduler.build_scheduled_batch([seq_a, seq_b], is_prefill=False, decode_step_count=2)
+    batch = materializer.materialize(
+        scheduler.build_schedule_plan(
+            [seq_a, seq_b],
+            is_prefill=False,
+            decode_step_count=2,
+        )
+    )
 
     assert batch.uses_static_decode_metadata
     assert batch.decode_step_count_host == 2

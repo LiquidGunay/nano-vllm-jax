@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+import subprocess
+import sys
 
 import pytest
 
@@ -7,6 +9,24 @@ from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.sequence import SamplingParams, Sequence
+
+
+def test_scheduler_and_sequence_import_without_jax():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "import nanovllm_jax.scheduler, nanovllm_jax.sequence; "
+                "assert 'jax' not in sys.modules"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def _scheduler(*, block_size: int = 2, num_blocks: int = 3) -> Scheduler:

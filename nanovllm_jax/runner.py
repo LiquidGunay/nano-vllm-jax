@@ -4,7 +4,7 @@ Owns:
     KV cache arrays, GDN hybrid-state slots, resident decode metadata, device
     token carry, and compile-bucket lookup.
 Receives:
-    Completed ``ScheduledBatch`` objects from the scheduler.
+    Host-only ``SchedulePlan`` objects from the scheduler.
 Returns:
     Generated token ids or device token references for scheduled sequences.
 Invariant:
@@ -20,8 +20,9 @@ from functools import partial
 from dataclasses import dataclass, replace
 
 from nanovllm_jax.ops import ServingOps, ServingOpsProtocol
-from nanovllm_jax.batch import ScheduledBatch
+from nanovllm_jax.batch import SchedulePlan
 from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.device_batch import BatchMaterializer, DeviceBatch
 from nanovllm_jax.model import ModelParams
 from nanovllm_jax.output import DeviceTokenRef
 from nanovllm_jax.sequence import Sequence
@@ -174,6 +175,13 @@ class ModelRunner:
         self.static_decode_seq_lens_carry = _config_flag(
             config,
             "static_decode_seq_lens_carry",
+        )
+        self.batch_materializer = BatchMaterializer(
+            execution=self.execution,
+            device_token_carry=self.device_token_carry,
+            static_decode_metadata=self.static_decode_metadata,
+            resident_decode_metadata=self.resident_decode_metadata,
+            static_decode_seq_lens_carry=self.static_decode_seq_lens_carry,
         )
 
         self.cache_storage = self.backend.allocate_kv_cache(
@@ -697,7 +705,7 @@ class ModelRunner:
         query_len: int,
         is_prefill: bool,
         max_blocks_per_seq: int | None = None,
-    ) -> ScheduledBatch:
+    ) -> DeviceBatch:
         block_tables = []
         num_blocks = max(1, int(getattr(self.config, "num_kvcache_blocks", 1) or 1))
         block_table_width = int(max_blocks_per_seq or self.max_blocks_per_seq)
@@ -721,7 +729,7 @@ class ModelRunner:
                 query_start_loc.append(query_start_loc[-1] + qlen)
                 packed_positions.extend(range(qlen))
                 token_row_ids.extend([row] * qlen)
-            return ScheduledBatch(
+            return DeviceBatch(
                 tokens=jnp.zeros((1, token_bucket), dtype=jnp.int32),
                 positions=jnp.array([packed_positions], dtype=jnp.int32),
                 seq_ids=jnp.arange(batch_size, dtype=jnp.int32),
@@ -744,7 +752,7 @@ class ModelRunner:
         for qlen in query_lens:
             query_start_loc.append(query_start_loc[-1] + qlen)
         positions = [list(range(query_len)) for _ in range(batch_size)]
-        return ScheduledBatch(
+        return DeviceBatch(
             tokens=jnp.zeros((batch_size, query_len), dtype=jnp.int32),
             positions=jnp.array(positions, dtype=jnp.int32),
             seq_ids=jnp.arange(batch_size, dtype=jnp.int32),
@@ -847,7 +855,7 @@ class ModelRunner:
         self._device_seq_lens_carry = None
 
     @staticmethod
-    def _active_decode_rows_host(batch: ScheduledBatch) -> List[int]:
+    def _active_decode_rows_host(batch: DeviceBatch) -> List[int]:
         if batch.seq_ids_host is None or batch.query_lens_host is None:
             return []
         return [
@@ -856,7 +864,7 @@ class ModelRunner:
             if int(seq_id) >= 0 and int(query_len) > 0
         ]
 
-    def _maybe_apply_device_token_carry(self, batch: ScheduledBatch) -> ScheduledBatch:
+    def _maybe_apply_device_token_carry(self, batch: DeviceBatch) -> DeviceBatch:
         static_decode_metadata = bool(getattr(batch, "uses_static_decode_metadata", False))
         active_rows = self._active_decode_rows_host(batch)
         carry_enabled = bool(
@@ -972,7 +980,7 @@ class ModelRunner:
 
     def _resident_slot_token_decode_ready(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         active_rows: list[int],
     ) -> bool:
@@ -999,7 +1007,7 @@ class ModelRunner:
 
     def _resident_slot_token_dense_decode_ready(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         active_rows: list[int],
     ) -> bool:
@@ -1024,7 +1032,7 @@ class ModelRunner:
 
     def _record_resident_last_tokens(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         token_ids: jnp.ndarray,
         *,
         eligible_rows: list[int],
@@ -1065,7 +1073,7 @@ class ModelRunner:
 
     def _record_device_token_carry(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         token_ids: jnp.ndarray,
         *,
         active_rows: list[int],
@@ -1176,8 +1184,8 @@ class ModelRunner:
 
     def _materialize_static_decode_metadata_batch(
         self,
-        batch: ScheduledBatch,
-    ) -> ScheduledBatch:
+        batch: DeviceBatch,
+    ) -> DeviceBatch:
         """Build a concrete decode batch from static/resident scheduler metadata.
 
         Static resident decode batches intentionally carry placeholder token
@@ -1267,94 +1275,6 @@ class ModelRunner:
             else:
                 materialized[int(row)] = resolve_token(value)
         return materialized
-
-    def _build_scheduled_batch(self, seqs: List[Sequence], is_prefill: bool) -> ScheduledBatch:
-        query_tokens: List[List[int]] = []
-        query_positions: List[List[int]] = []
-        block_tables: List[List[int]] = []
-        seq_lens: List[int] = []
-        query_lens: List[int] = []
-
-        actual_max_blocks = max(1, max(len(seq.block_table) for seq in seqs))
-        max_blocks = actual_max_blocks
-        if self.max_blocks_per_seq is not None:
-            if actual_max_blocks > self.max_blocks_per_seq:
-                raise ValueError(
-                    f"scheduled block table needs {actual_max_blocks} blocks but bucket has {self.max_blocks_per_seq}"
-                )
-            max_blocks = self.max_blocks_per_seq
-        if not is_prefill:
-            decode_block_table_buckets = tuple(getattr(self.config, "decode_block_table_buckets", ()) or ())
-            if decode_block_table_buckets:
-                max_blocks = self._select_bucket(actual_max_blocks, decode_block_table_buckets, "decode block table")
-                if self.max_blocks_per_seq is not None and max_blocks > self.max_blocks_per_seq:
-                    raise ValueError(
-                        f"decode block table bucket {max_blocks} exceeds max_blocks_per_seq {self.max_blocks_per_seq}"
-                    )
-        for seq in seqs:
-            if is_prefill:
-                start = seq.num_cached_tokens
-                tokens = seq.token_ids[start:]
-                positions = list(range(start, seq.num_tokens))
-            else:
-                tokens = [seq.last_token]
-                positions = [seq.num_tokens - 1]
-            if not tokens:
-                raise ValueError(f"Scheduled sequence {seq.seq_id} has no executable tokens")
-            query_tokens.append(tokens)
-            query_positions.append(positions)
-            block_tables.append(seq.block_table + [0] * (max_blocks - len(seq.block_table)))
-            seq_lens.append(seq.num_tokens)
-            query_lens.append(len(tokens))
-
-        max_query_len = max(query_lens)
-        query_len_bucket = max_query_len
-        prefill_buckets = tuple(getattr(self.config, "prefill_buckets", ()))
-        if is_prefill and prefill_buckets:
-            query_len_bucket = self._select_bucket(max_query_len, prefill_buckets, "prefill")
-
-        batch_size_bucket = len(seqs)
-        batch_size_buckets = tuple(getattr(self.config, "batch_size_buckets", ()))
-        if batch_size_buckets:
-            batch_size_bucket = self._select_bucket(len(seqs), batch_size_buckets, "batch")
-
-        padded_tokens = [tokens + [0] * (query_len_bucket - len(tokens)) for tokens in query_tokens]
-        padded_positions = [positions + [0] * (query_len_bucket - len(positions)) for positions in query_positions]
-        query_start_loc = [0]
-        for qlen in query_lens:
-            query_start_loc.append(query_start_loc[-1] + qlen)
-        for _ in range(batch_size_bucket - len(seqs)):
-            padded_tokens.append([0] * query_len_bucket)
-            padded_positions.append([0] * query_len_bucket)
-            block_tables.append([0] * max_blocks)
-            seq_lens.append(0)
-            query_lens.append(0)
-            query_start_loc.append(query_start_loc[-1])
-
-        seq_ids_host = tuple([seq.seq_id for seq in seqs] + [-1] * (batch_size_bucket - len(seqs)))
-        query_lens_host = tuple(query_lens)
-        return ScheduledBatch(
-            tokens=jnp.array(padded_tokens, dtype=jnp.int32),
-            positions=jnp.array(padded_positions, dtype=jnp.int32),
-            seq_ids=jnp.array(seq_ids_host, dtype=jnp.int32),
-            query_start_loc=jnp.array(query_start_loc, dtype=jnp.int32),
-            is_prefill=is_prefill,
-            num_prefill_tokens=sum(query_lens) if is_prefill else 0,
-            num_decode_tokens=0 if is_prefill else sum(query_lens),
-            block_tables=jnp.array(block_tables, dtype=jnp.int32),
-            seq_lens=jnp.array(seq_lens, dtype=jnp.int32),
-            seq_ids_host=seq_ids_host,
-            query_lens_host=query_lens_host,
-            seq_lens_host=tuple(seq_lens),
-        )
-
-    @staticmethod
-    def _select_bucket(size: int, buckets: tuple[int, ...], name: str) -> int:
-        for bucket in sorted(buckets):
-            if size <= bucket:
-                return bucket
-        raise ValueError(f"{name} size {size} exceeds configured buckets {buckets}")
-
 
     def _zero_hybrid_slot(self, slot: int):
         self._zero_hybrid_slots([slot])
@@ -1508,12 +1428,12 @@ class ModelRunner:
             self._set_hybrid_state(int(seq.seq_id), state)
             seq.cached_prefix_hybrid_seeded = True
 
-    def _slice_batch(self, batch: ScheduledBatch, idx: int) -> ScheduledBatch:
+    def _slice_batch(self, batch: DeviceBatch, idx: int) -> DeviceBatch:
         query_len = int(batch.query_lens[idx])
         block_tables_host = None
         if batch.block_tables_host is not None:
             block_tables_host = (tuple(batch.block_tables_host[idx]),)
-        return ScheduledBatch(
+        return DeviceBatch(
             tokens=batch.tokens[idx : idx + 1, :query_len],
             positions=batch.positions[idx : idx + 1, :query_len],
             seq_ids=batch.seq_ids[idx : idx + 1],
@@ -1528,13 +1448,13 @@ class ModelRunner:
 
     def _masked_decode_batch(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         rows: List[int],
         *,
         token_values: List[int] | None = None,
         position_values: List[int] | None = None,
         seq_len_values: List[int] | None = None,
-    ) -> ScheduledBatch:
+    ) -> DeviceBatch:
         if not rows:
             raise ValueError("rows must not be empty")
         if batch.is_prefill:
@@ -1588,7 +1508,7 @@ class ModelRunner:
                 int(batch.seq_lens_host[row]) if row in row_set else 0
                 for row in range(batch_size)
             )
-        return ScheduledBatch(
+        return DeviceBatch(
             tokens=tokens,
             positions=positions,
             seq_ids=jnp.where(active, batch.seq_ids, jnp.full_like(batch.seq_ids, -1)),
@@ -1610,7 +1530,7 @@ class ModelRunner:
             uses_static_decode_metadata=False,
         )
 
-    def _pad_decode_batch_to_rows(self, batch: ScheduledBatch, target_rows: int) -> ScheduledBatch:
+    def _pad_decode_batch_to_rows(self, batch: DeviceBatch, target_rows: int) -> DeviceBatch:
         """Pad a decode batch with inactive rows to stabilize compiled shapes."""
 
         if batch.is_prefill:
@@ -1684,9 +1604,9 @@ class ModelRunner:
 
     def _with_committed_seq_lens(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         committed_seq_lens: jnp.ndarray | None,
-    ) -> ScheduledBatch:
+    ) -> DeviceBatch:
         if committed_seq_lens is None:
             return batch
         active = (batch.seq_ids >= 0) & (batch.query_lens > 0)
@@ -1714,13 +1634,13 @@ class ModelRunner:
 
     def _compact_decode_batch(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         rows: List[int],
         *,
         token_values: List[int] | None = None,
         position_values: List[int] | None = None,
         seq_len_values: List[int] | None = None,
-    ) -> ScheduledBatch:
+    ) -> DeviceBatch:
         if not rows:
             raise ValueError("rows must not be empty")
         if batch.is_prefill:
@@ -1758,7 +1678,7 @@ class ModelRunner:
             hybrid_slot_ids_host = tuple(int(batch.hybrid_slot_ids_host[row]) for row in rows)
 
         compact_size = len(rows)
-        return ScheduledBatch(
+        return DeviceBatch(
             tokens=tokens,
             positions=positions,
             seq_ids=batch.seq_ids[row_ids],
@@ -1775,7 +1695,7 @@ class ModelRunner:
             hybrid_slot_ids_host=hybrid_slot_ids_host,
         )
 
-    def _batch_hybrid_state(self, batch: ScheduledBatch) -> HybridLayerState:
+    def _batch_hybrid_state(self, batch: DeviceBatch) -> HybridLayerState:
         seq_ids = (
             list(batch.seq_ids_host)
             if batch.seq_ids_host is not None
@@ -1841,7 +1761,7 @@ class ModelRunner:
             )
         return HybridLayerState(conv_state=conv_state, recurrent_state=recurrent_state)
 
-    def _store_batch_hybrid_state(self, batch: ScheduledBatch, state: HybridLayerState | None):
+    def _store_batch_hybrid_state(self, batch: DeviceBatch, state: HybridLayerState | None):
         if state is None:
             return
         valid_rows: List[int] = []
@@ -1892,7 +1812,7 @@ class ModelRunner:
         )
         self._mark_hybrid_slots_written(slot_values)
 
-    def _batch_hybrid_slot_ids(self, batch: ScheduledBatch) -> jnp.ndarray:
+    def _batch_hybrid_slot_ids(self, batch: DeviceBatch) -> jnp.ndarray:
         """Assign hybrid slots for a batch without gathering the state table."""
 
         seq_ids = (
@@ -1918,7 +1838,7 @@ class ModelRunner:
             cache[slot_key] = cached
         return cached
 
-    def _prefill_final_flags_device(self, batch: ScheduledBatch) -> jnp.ndarray:
+    def _prefill_final_flags_device(self, batch: DeviceBatch) -> jnp.ndarray:
         rows = max(0, int(batch.query_start_loc.shape[0]) - 1)
         flags = [bool(flag) for flag in list(batch.prefill_final_flags)[:rows]]
         if len(flags) < rows:
@@ -2049,7 +1969,7 @@ class ModelRunner:
 
     def _sync_resident_decode_metadata(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         slot_values: List[int] | Tuple[int, ...],
         *,
         sync_seq_lens: bool,
@@ -2159,7 +2079,7 @@ class ModelRunner:
             if slot >= 0 and row in active:
                 self._resident_seq_lens_host[slot] += int(steps)
 
-    def _record_resident_committed_seq_lens(self, batch: ScheduledBatch) -> None:
+    def _record_resident_committed_seq_lens(self, batch: DeviceBatch) -> None:
         """Mirror committed per-row decode lengths into resident metadata."""
         if (
             not bool(getattr(self, "resident_decode_metadata", False))
@@ -2194,7 +2114,7 @@ class ModelRunner:
 
     def _record_resident_committed_seq_lens_host(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         row_to_committed_len: dict[int, int],
     ) -> None:
         """Mirror committed per-row decode lengths into the resident host cache."""
@@ -2225,13 +2145,13 @@ class ModelRunner:
                 continue
             self._resident_seq_lens_host[slot] = int(committed_len)
 
-    def _step_fn(self, batch: ScheduledBatch):
+    def _step_fn(self, batch: DeviceBatch):
         execution = getattr(self, "execution", "eager")
         if execution == "jit" or (execution == "decode-jit" and not batch.is_prefill):
             return self.executor.forward_step_jit
         return self.executor.forward_step
 
-    def _can_use_greedy_token_fastpath(self, seqs: List[Sequence], batch: ScheduledBatch) -> bool:
+    def _can_use_greedy_token_fastpath(self, seqs: List[Sequence], batch: DeviceBatch) -> bool:
         if not bool(
             getattr(
                 self,
@@ -2254,7 +2174,7 @@ class ModelRunner:
                 return False
         return True
 
-    def _can_use_sampled_token_fastpath(self, seqs: List[Sequence], batch: ScheduledBatch) -> bool:
+    def _can_use_sampled_token_fastpath(self, seqs: List[Sequence], batch: DeviceBatch) -> bool:
         if not bool(
             getattr(
                 self,
@@ -2281,7 +2201,7 @@ class ModelRunner:
                 has_sampling = True
         return has_sampling
 
-    def _sample_temperatures_device(self, seqs: List[Sequence], batch: ScheduledBatch) -> jnp.ndarray:
+    def _sample_temperatures_device(self, seqs: List[Sequence], batch: DeviceBatch) -> jnp.ndarray:
         row_count = len(seqs) if batch.is_prefill and batch.packed_prefill else int(batch.tokens.shape[0])
         values = [0.0 for _ in range(row_count)]
         active_limit = min(len(seqs), row_count)
@@ -2293,7 +2213,7 @@ class ModelRunner:
 
     def _sample_rng_slots_and_counters_device(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         self._flush_resident_rng_counter_resets()
         row_count = (
@@ -2329,7 +2249,7 @@ class ModelRunner:
 
     def _record_resident_rng_counters(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         updated_counters: jnp.ndarray | None,
         *,
         active_rows: list[int],
@@ -2359,7 +2279,7 @@ class ModelRunner:
             jnp.asarray(slots, dtype=jnp.int32)
         ].set(updated_counters[jnp.asarray(rows, dtype=jnp.int32)].astype(jnp.int32))
 
-    def _greedy_decode_burst_steps(self, seqs: List[Sequence], batch: ScheduledBatch) -> int:
+    def _greedy_decode_burst_steps(self, seqs: List[Sequence], batch: DeviceBatch) -> int:
         if batch.is_prefill:
             return 1
         configured_steps = max(
@@ -2394,7 +2314,7 @@ class ModelRunner:
         )
 
     @staticmethod
-    def _prefill_final_flags_for_batch(seqs: List[Sequence], batch: ScheduledBatch) -> tuple[bool, ...]:
+    def _prefill_final_flags_for_batch(seqs: List[Sequence], batch: DeviceBatch) -> tuple[bool, ...]:
         if batch.is_prefill:
             prefill_final_flags = list(batch.prefill_final_flags)[: len(seqs)]
             if len(prefill_final_flags) < len(seqs):
@@ -2403,7 +2323,7 @@ class ModelRunner:
         return tuple(True for _ in seqs)
 
     @staticmethod
-    def _host_query_lens_and_seq_ids(batch: ScheduledBatch, row_count: int) -> tuple[list[int], list[int]]:
+    def _host_query_lens_and_seq_ids(batch: DeviceBatch, row_count: int) -> tuple[list[int], list[int]]:
         if batch.query_lens_host is not None:
             query_lens = [int(x) for x in batch.query_lens_host[:row_count]]
         else:
@@ -2414,7 +2334,7 @@ class ModelRunner:
             seq_ids_host = [int(batch.seq_ids[row]) for row in range(row_count)]
         return query_lens, seq_ids_host
 
-    def _select_route(self, seqs: List[Sequence], batch: ScheduledBatch) -> RunnerRoute:
+    def _select_route(self, seqs: List[Sequence], batch: DeviceBatch) -> RunnerRoute:
         prefill_final_flags = self._prefill_final_flags_for_batch(seqs, batch)
         use_greedy_token_fastpath = self._can_use_greedy_token_fastpath(seqs, batch)
         use_sampled_token_fastpath = (
@@ -2519,7 +2439,7 @@ class ModelRunner:
             use_resident_slot_decode=use_resident_slot_decode,
         )
 
-    def _prepare_batch_for_route(self, route: RunnerRoute, batch: ScheduledBatch) -> ScheduledBatch:
+    def _prepare_batch_for_route(self, route: RunnerRoute, batch: DeviceBatch) -> DeviceBatch:
         if not (
             route.resident_slot_token_decode
             or route.resident_slot_token_metadata_decode
@@ -2531,7 +2451,7 @@ class ModelRunner:
     def _hybrid_inputs_for_route(
         self,
         route: RunnerRoute,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
     ) -> tuple[jnp.ndarray | None, list[int], HybridLayerState]:
         if (
             route.use_hybrid_table_decode
@@ -2551,7 +2471,7 @@ class ModelRunner:
     def _sync_route_resident_metadata(
         self,
         route: RunnerRoute,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         hybrid_slot_values: list[int],
     ) -> None:
         if (
@@ -2564,7 +2484,7 @@ class ModelRunner:
     def _commit_route_output(
         self,
         route: RunnerRoute,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         output: Any,
         *,
         hybrid_slot_values: list[int],
@@ -2607,7 +2527,7 @@ class ModelRunner:
     def _run_main_and_sample(
         self,
         seqs: List[Sequence],
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
     ) -> List[int | List[int]]:
         route = self._select_route(seqs, batch)
         batch = self._prepare_batch_for_route(route, batch)
@@ -2870,18 +2790,16 @@ class ModelRunner:
         return outputs
 
 
-    def run(
+    def materialize(self, plan: SchedulePlan) -> DeviceBatch:
+        """Turn a host schedule into fixed-shape accelerator inputs."""
+        return self.batch_materializer.materialize(plan)
+
+    def execute(
         self,
         seqs: List[Sequence],
-        is_prefill: bool | None = None,
-        *,
-        batch: ScheduledBatch | None = None,
+        batch: DeviceBatch,
     ) -> List[int | List[int]]:
-        """Run one engine step through the promoted executor path."""
-        if batch is None:
-            if is_prefill is None:
-                raise ValueError("Either is_prefill or batch must be provided")
-            batch = self._build_scheduled_batch(seqs, is_prefill=is_prefill)
+        """Execute one materialized engine step."""
         return self._run_main_and_sample(seqs, batch)
 
     @partial(jax.jit, static_argnums=(0,))

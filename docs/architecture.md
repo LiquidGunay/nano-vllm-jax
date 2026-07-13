@@ -29,7 +29,6 @@ worker advances the engine and publishes token events or final results.
 - waiting and running queues,
 - prompt chunk selection,
 - decode row selection,
-- inactive-row padding,
 - whole-request capacity reservation,
 - bounded first-fit waiting admission,
 - prefix-cache lookup and publication.
@@ -42,13 +41,15 @@ unwritten completion does not evict a cached prefix or widen its block table.
 Admission scans the bounded waiting queue for the first request that fits, so a
 large blocked request does not stall smaller requests behind it.
 
-`ScheduledBatch` is the Python-to-JAX contract. It documents the fixed-shape
-arrays that the runner and executor consume.
+The scheduler returns a host-only `SchedulePlan`: immutable request rows plus
+the selected bucket shape. It neither imports JAX nor allocates device arrays.
 
 ## Execution
 
 `ModelRunner` owns session state around compiled execution:
 
+- plan padding and `DeviceBatch` materialization,
+- reusable shape-stable device metadata,
 - full-attention KV cache arrays,
 - GDN hybrid-state slots,
 - resident decode metadata,

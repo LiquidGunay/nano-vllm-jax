@@ -1,7 +1,7 @@
 import pytest
 
 from nanovllm_jax import EngineConfig, LLM, SamplingParams
-from nanovllm_jax.batch import ScheduledBatch
+from nanovllm_jax.batch import SchedulePlan
 from nanovllm_jax.block_manager import BlockManager
 from nanovllm_jax.executor import ModelExecutor
 import nanovllm_jax.engine as engine_module
@@ -44,7 +44,7 @@ def test_internal_imports_use_top_level_modules():
     assert BlockManager.__module__ == "nanovllm_jax.block_manager"
     assert ModelExecutor.__module__ == "nanovllm_jax.executor"
     assert ModelRunner.__module__ == "nanovllm_jax.runner"
-    assert ScheduledBatch.__module__ == "nanovllm_jax.batch"
+    assert SchedulePlan.__module__ == "nanovllm_jax.batch"
     assert Scheduler.__module__ == "nanovllm_jax.scheduler"
     assert Sequence.__module__ == "nanovllm_jax.sequence"
     assert SequenceStatus.__module__ == "nanovllm_jax.sequence"

@@ -1,90 +1,82 @@
-"""Scheduler-to-JAX batch contract.
-
-Owns:
-    The fixed-shape arrays handed from Python scheduling to compiled JAX code.
-Receives:
-    Padded or packed token metadata from the batch builder.
-Returns:
-    Shape-stable fields consumed by runner and executor.
-Invariant:
-    Host metadata and device arrays describe the same active rows and padding.
-
-Packed prefill:
-    tokens          [1, token_bucket]
-    positions       [1, token_bucket]
-    token_row_ids   [1, token_bucket]
-    query_start_loc [rows + 1]
-
-Decode:
-    tokens          [batch_bucket, 1]
-    positions       [batch_bucket, 1]
-    block_tables    [batch_bucket, block_bucket]
-    seq_lens        [batch_bucket]
-"""
+"""Host-only scheduling contract."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-import jax.numpy as jnp
-import numpy as np
+from typing import Literal
 
 
-@dataclass
-class ScheduledBatch:
-    """A flat scheduled batch for one engine step.
+Phase = Literal["prefill", "decode"]
 
-    `tokens` and `positions` are padded to rectangular arrays, while
-    `query_start_loc` preserves the true ragged query lengths.
 
-    Dense prefill/decode uses `tokens.shape[0]` rows.  Packed prefill keeps
-    query tokens in a single row (`tokens.shape == [1, token_bucket]`) and uses
-    `token_row_ids` plus the paged row metadata (`block_tables`, `seq_lens`,
-    `query_start_loc`) to map each token back to its request.
-    """
+@dataclass(frozen=True)
+class ScheduledRow:
+    """Logical work for one request in an engine step."""
 
-    tokens: jnp.ndarray
-    positions: jnp.ndarray
-    seq_ids: jnp.ndarray
-    query_start_loc: jnp.ndarray
-    is_prefill: bool
-    num_prefill_tokens: int
-    num_decode_tokens: int
-    block_tables: jnp.ndarray
-    seq_lens: jnp.ndarray
-    prefill_is_final: list[bool] | tuple[bool, ...] | None = None
-    seq_ids_host: tuple[int, ...] | None = None
-    query_lens_host: tuple[int, ...] | None = None
-    seq_lens_host: tuple[int, ...] | None = None
-    block_tables_host: tuple[tuple[int, ...], ...] | None = None
-    hybrid_slot_ids_host: tuple[int, ...] | None = None
-    decode_step_count_host: int = 1
-    uses_static_decode_metadata: bool = False
+    seq_id: int
+    token_ids: tuple[int, ...]
+    positions: tuple[int, ...]
+    block_table: tuple[int, ...]
+    seq_len: int
+    prefill_is_final: bool = True
+    carries_device_token: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.token_ids:
+            raise ValueError("scheduled row must contain at least one token")
+        if len(self.token_ids) != len(self.positions):
+            raise ValueError("scheduled row token and position counts must match")
+
+    @property
+    def query_len(self) -> int:
+        return len(self.token_ids)
+
+
+@dataclass(frozen=True)
+class BucketShape:
+    """Static accelerator shape selected by the scheduler."""
+
+    batch_size: int
+    query_tokens: int
+    block_table_width: int
     packed_prefill: bool = False
-    token_row_ids: jnp.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if min(self.batch_size, self.query_tokens, self.block_table_width) <= 0:
+            raise ValueError("bucket dimensions must be positive")
+
+
+@dataclass(frozen=True)
+class SchedulePlan:
+    """Immutable host description of one scheduled step."""
+
+    phase: Phase
+    rows: tuple[ScheduledRow, ...]
+    bucket: BucketShape
+    decode_steps: int = 1
+
+    def __post_init__(self) -> None:
+        if self.phase not in {"prefill", "decode"}:
+            raise ValueError(f"unsupported phase: {self.phase}")
+        if not self.rows:
+            raise ValueError("schedule plan must contain at least one row")
+        if len(self.rows) > self.bucket.batch_size:
+            raise ValueError("scheduled rows exceed the batch bucket")
+        if self.decode_steps <= 0:
+            raise ValueError("decode_steps must be positive")
+        if self.phase == "decode" and any(row.query_len != 1 for row in self.rows):
+            raise ValueError("decode rows must contain exactly one token")
 
     @property
-    def batch_size(self) -> int:
-        if self.packed_prefill:
-            return int(self.block_tables.shape[0])
-        return int(self.tokens.shape[0])
+    def is_prefill(self) -> bool:
+        return self.phase == "prefill"
 
     @property
-    def query_lens(self) -> jnp.ndarray:
-        return jnp.diff(self.query_start_loc).astype(jnp.int32)
+    def num_scheduled_tokens(self) -> int:
+        return sum(row.query_len for row in self.rows)
 
     @property
-    def active_decode_rows(self) -> jnp.ndarray:
-        return (self.seq_ids >= 0) & (self.query_lens > 0)
-
-    @property
-    def prefill_final_flags(self) -> list[bool]:
-        if self.prefill_is_final is None:
-            return [True] * self.batch_size
-        if isinstance(self.prefill_is_final, np.ndarray):
-            return [bool(x) for x in np.array(self.prefill_is_final, dtype=bool).tolist()]
-        if isinstance(self.prefill_is_final, tuple):
-            return list(self.prefill_is_final)
-        if isinstance(self.prefill_is_final, jnp.ndarray):
-            return [bool(x) for x in list(np.array(self.prefill_is_final, dtype=bool).tolist())]
-        return list(self.prefill_is_final)
+    def prefill_chunk_lengths(self) -> tuple[int, ...]:
+        if not self.is_prefill:
+            return ()
+        return tuple(row.query_len for row in self.rows)
