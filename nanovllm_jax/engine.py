@@ -10,6 +10,7 @@ import jax
 
 from nanovllm_jax.config import EngineConfig, ModelConfig, RuntimeConfig
 from nanovllm_jax.cache import KVCacheSpec, cap_num_kv_cache_blocks
+from nanovllm_jax.batch import SchedulePlan
 from nanovllm_jax.model import ModelParams
 from nanovllm_jax.weights import (
     load_weights_from_hf_streaming,
@@ -18,7 +19,15 @@ from nanovllm_jax.weights import (
 )
 from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.scheduler import Scheduler
-from nanovllm_jax.sequence import Sequence, SamplingParams
+from nanovllm_jax.output import OutputBuffer, is_device_token
+from nanovllm_jax.sequence import Sequence, SequenceStatus, SamplingParams
+from nanovllm_jax.step import (
+    FinishedRequest,
+    FinishReason,
+    RunResult,
+    StepResult,
+    TokenEvent,
+)
 
 try:
     from transformers import AutoTokenizer
@@ -256,7 +265,75 @@ class LLMEngine:
 
         return [self.add_request(prompt, sp) for prompt, sp in zip(request_inputs, sampling_params)]
 
-    def step(self, *, materialize_finished_outputs: bool = True) -> tuple[List[tuple], int]:
+    def commit(
+        self,
+        seqs: List[Sequence],
+        schedule_plan: SchedulePlan,
+        run_result: RunResult,
+    ) -> StepResult:
+        """Commit one runner result to logical request state."""
+        if len(run_result.rows) != len(seqs):
+            raise ValueError("run result rows must align with scheduled sequences")
+
+        prefill_chunk_lengths = (
+            schedule_plan.prefill_chunk_lengths
+            if schedule_plan.is_prefill
+            else (0,) * len(seqs)
+        )
+        if len(prefill_chunk_lengths) != len(seqs):
+            raise ValueError("prefill chunk lengths must align with scheduled sequences")
+
+        emitted: list[TokenEvent] = []
+        finished: list[FinishedRequest] = []
+        for seq, tokens, prefill_chunk_len in zip(
+            seqs,
+            run_result.rows,
+            prefill_chunk_lengths,
+        ):
+            if prefill_chunk_len:
+                seq.num_cached_tokens = min(
+                    seq.num_prompt_tokens,
+                    seq.num_cached_tokens + int(prefill_chunk_len),
+                )
+
+            for index, token in enumerate(tokens):
+                deferred = (
+                    self.scheduler.device_token_carry
+                    and seq.ignore_eos
+                    and is_device_token(token)
+                )
+                if deferred:
+                    completion_index = seq.output.append_device(token)
+                    is_eos = False
+                    event_token = token
+                else:
+                    event_token = int(token)
+                    completion_index = seq.output.append(event_token)
+                    is_eos = event_token in self.scheduler.eos_token_ids
+                emitted.append(TokenEvent(seq.seq_id, completion_index, event_token))
+
+                if index < len(tokens) - 1:
+                    self.scheduler.block_manager.commit_processed_token(seq)
+
+                reason = None
+                if not seq.ignore_eos and is_eos:
+                    reason = FinishReason.EOS
+                elif seq.num_completion_tokens >= seq.max_tokens:
+                    reason = FinishReason.LENGTH
+                if reason is not None:
+                    seq.status = SequenceStatus.FINISHED
+                    self.scheduler.release(seq)
+                    finished.append(FinishedRequest(seq.seq_id, reason))
+                    break
+
+        return StepResult(
+            phase="prefill" if schedule_plan.is_prefill else "decode",
+            scheduled_tokens=int(schedule_plan.num_scheduled_tokens),
+            emitted_tokens=tuple(emitted),
+            finished=tuple(finished),
+        )
+
+    def step(self) -> StepResult:
         seqs, schedule_plan = self.scheduler.schedule()
         prefill_chunk_lengths = (
             list(schedule_plan.prefill_chunk_lengths)
@@ -270,7 +347,7 @@ class LLMEngine:
         )
 
         device_batch = self.model_runner.materialize(schedule_plan)
-        token_ids = self.model_runner.execute(seqs, device_batch)
+        run_result = self.model_runner.execute(seqs, device_batch)
 
         if schedule_plan.is_prefill:
             prefix_states_by_seq = None
@@ -284,41 +361,32 @@ class LLMEngine:
                 prefill_chunk_lengths or [],
                 prefix_states_by_seq,
             )
-        finished_flags = self.scheduler.postprocess(seqs, token_ids, prefill_chunk_lengths=prefill_chunk_lengths)
-        finished_seq_ids = [seq.seq_id for seq, is_finished in zip(seqs, finished_flags) if is_finished]
+        step_result = self.commit(seqs, schedule_plan, run_result)
+        finished_seq_ids = [request.seq_id for request in step_result.finished]
         if finished_seq_ids:
             self.model_runner.release(finished_seq_ids)
-
-        if materialize_finished_outputs:
-            outputs = [
-                (seq.seq_id, seq.completion_token_ids)
-                for seq in seqs
-                if seq.is_finished
-            ]
-        else:
-            outputs = [(seq.seq_id, []) for seq in seqs if seq.is_finished]
-
-        if schedule_plan.is_prefill:
-            num_tokens = schedule_plan.num_scheduled_tokens
-        else:
-            num_tokens = -getattr(
-                self.scheduler,
-                "last_num_generated_tokens",
-                schedule_plan.num_scheduled_tokens,
-            )
-
-        return outputs, num_tokens
+        return step_result
 
     def is_finished(self) -> bool:
         return self.scheduler.is_finished()
+
+    def cancel_request(self, seq: Sequence) -> bool:
+        """Commit cancellation and release all state owned by one request."""
+        if seq.is_finished:
+            return False
+        self.scheduler.release(seq)
+        self.model_runner.release([seq.seq_id])
+        seq.status = SequenceStatus.FINISHED
+        return True
 
     def generate(
         self,
         prompts: List[Union[str, List[int]]],
         sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
         use_tqdm: bool = True,
-    ) -> List[Dict[str, any]]:
+    ) -> List[Dict[str, Any]]:
         seqs = self._prepare_generation_sequences(prompts, sampling_params)
+        seqs_by_id = {seq.seq_id: seq for seq in seqs}
         if use_tqdm:
             try:
                 from tqdm.auto import tqdm
@@ -330,32 +398,43 @@ class LLMEngine:
             pbar = tqdm(total=len(seqs), desc="Generating", dynamic_ncols=True)
 
         outputs = {}
+        finish_reasons = {}
         prefill_throughput = decode_throughput = 0.0
 
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
+            step_result = self.step()
 
             if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
+                if step_result.phase == "prefill":
+                    prefill_throughput = step_result.scheduled_tokens / (perf_counter() - t)
                 else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
+                    decode_throughput = step_result.num_emitted_tokens / (perf_counter() - t)
 
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)} tok/s",
                     "Decode": f"{int(decode_throughput)} tok/s",
                 })
 
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            finished_seqs = [
+                seqs_by_id[request.seq_id]
+                for request in step_result.finished
+            ]
+            token_rows = OutputBuffer.materialize_many(seq.output for seq in finished_seqs)
+            for request, seq, token_ids in zip(step_result.finished, finished_seqs, token_rows):
+                outputs[seq.seq_id] = token_ids
+                finish_reasons[seq.seq_id] = request.reason.value
                 if use_tqdm:
                     pbar.update(1)
 
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+        ordered_ids = sorted(outputs)
         results = [
-            {"text": self._detokenize(token_ids), "token_ids": token_ids}
-            for token_ids in outputs
+            {
+                "text": self._detokenize(outputs[seq_id]),
+                "token_ids": outputs[seq_id],
+                "finish_reason": finish_reasons[seq_id],
+            }
+            for seq_id in ordered_ids
         ]
 
         if use_tqdm:
@@ -372,47 +451,49 @@ class LLMEngine:
     ):
         seqs = self._prepare_generation_sequences(prompts, sampling_params)
         seq_to_request = {seq.seq_id: index for index, seq in enumerate(seqs)}
-        seen_completion_lengths = {seq.seq_id: 0 for seq in seqs}
-        emitted_finish = set()
+        seqs_by_id = {seq.seq_id: seq for seq in seqs}
         stream_start = perf_counter()
 
         while not self.is_finished():
             step_start = perf_counter()
-            _, num_tokens = self.step()
+            step_result = self.step()
             step_end = perf_counter()
-            for seq in seqs:
-                request_index = seq_to_request[seq.seq_id]
-                completion = seq.completion_token_ids
-                previous_length = seen_completion_lengths[seq.seq_id]
-                if len(completion) > previous_length:
-                    for offset, token_id in enumerate(completion[previous_length:]):
-                        completion_index = previous_length + offset
-                        token_event = {
-                            "event": "token",
-                            "seq_id": seq.seq_id,
-                            "request_index": request_index,
-                            "completion_index": completion_index,
-                            "token_id": int(token_id),
-                            "elapsed_seconds": step_end - stream_start,
-                            "step_seconds": step_end - step_start,
-                            "step_start_seconds": step_start - stream_start,
-                            "step_end_seconds": step_end - stream_start,
-                            "scheduler_step_tokens": int(abs(num_tokens)),
-                            "scheduler_step_is_decode": bool(num_tokens < 0),
-                        }
-                        if include_text:
-                            token_event["text"] = self._detokenize([int(token_id)])
-                        yield token_event
-                    seen_completion_lengths[seq.seq_id] = len(completion)
-                if seq.is_finished and seq.seq_id not in emitted_finish:
-                    emitted_finish.add(seq.seq_id)
-                    yield {
-                        "event": "finished",
-                        "seq_id": seq.seq_id,
-                        "request_index": request_index,
-                        "elapsed_seconds": step_end - stream_start,
-                        "completion_tokens": len(seq.completion_token_ids),
-                    }
+            event_buffers = {
+                event.seq_id: seqs_by_id[event.seq_id].output
+                for event in step_result.emitted_tokens
+            }
+            OutputBuffer.snapshot_many(event_buffers.values()).prefetch().materialize()
+            for event in step_result.emitted_tokens:
+                seq = seqs_by_id[event.seq_id]
+                token_id = seq.output.token_id(event.completion_index)
+                token_event = {
+                    "event": "token",
+                    "seq_id": event.seq_id,
+                    "request_index": seq_to_request[event.seq_id],
+                    "completion_index": event.completion_index,
+                    "token_id": token_id,
+                    "elapsed_seconds": step_end - stream_start,
+                    "step_seconds": step_end - step_start,
+                    "step_start_seconds": step_start - stream_start,
+                    "step_end_seconds": step_end - stream_start,
+                    "scheduler_step_tokens": step_result.scheduled_tokens,
+                    "scheduler_step_is_decode": step_result.is_decode,
+                }
+                if include_text:
+                    token_event["text"] = self._detokenize([token_id])
+                yield token_event
+            for request in step_result.finished:
+                seq = seqs_by_id[request.seq_id]
+                yield {
+                    "event": "finished",
+                    "seq_id": request.seq_id,
+                    "request_index": seq_to_request[request.seq_id],
+                    "finish_reason": request.reason.value,
+                    "elapsed_seconds": step_end - stream_start,
+                    "completion_tokens": seq.num_completion_tokens,
+                }
+
+        OutputBuffer.snapshot_many(seq.output for seq in seqs).prefetch().materialize()
 
         yield {
             "event": "done",
@@ -420,8 +501,8 @@ class LLMEngine:
             "results": [
                 {
                     "request_index": index,
-                    "text": self._detokenize(seq.completion_token_ids) if include_text else "",
-                    "token_ids": [int(token) for token in seq.completion_token_ids],
+                    "text": self._detokenize(seq.output.token_ids()) if include_text else "",
+                    "token_ids": seq.output.token_ids(),
                 }
                 for index, seq in enumerate(seqs)
             ],

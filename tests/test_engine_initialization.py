@@ -8,6 +8,7 @@ import nanovllm_jax.weights as weights_module
 from nanovllm_jax.config import EngineConfig, ModelConfig, WarmupConfig
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.sequence import SamplingParams
+from nanovllm_jax.step import FinishReason, RunResult
 
 
 def _small_engine_config(model: str) -> EngineConfig:
@@ -67,16 +68,16 @@ def test_engine_stops_on_tokenizer_eos_when_checkpoint_eos_differs(tmp_path, mon
         [1],
         SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=False),
     )
-    seqs, _ = engine.scheduler.schedule()
-    finished = engine.scheduler.postprocess(
+    seqs, plan = engine.scheduler.schedule()
+    result = engine.commit(
         seqs,
-        [248046],
-        prefill_chunk_lengths=[1],
+        plan,
+        RunResult.from_rows([248046]),
     )
 
-    assert finished == [True]
+    assert result.finished[0].reason is FinishReason.EOS
     assert seq.is_finished
-    assert seq.completion_token_ids == [248046]
+    assert seq.output.token_ids() == [248046]
 
 
 def test_unsupported_hub_architecture_fails_before_weight_resolution(tmp_path, monkeypatch):

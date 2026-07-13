@@ -51,6 +51,10 @@ curl http://127.0.0.1:6791/v1/generate_stream \
   -d '{"prompt":"Reply with one short sentence.","max_tokens":32,"temperature":0}'
 ```
 
+Streaming emits coalesced `tokens` events with `completion_start`, `token_ids`,
+and an append-only `text` delta. The final `done` event carries the canonical
+text, token ids, and finish reason.
+
 HTTP handlers submit work to `EngineService`. A single worker admits queued
 requests, calls `LLMEngine.step()`, and publishes per-request results so
 independent clients can batch together.
@@ -68,6 +72,9 @@ server.py
   -> ModelExecutor
   -> Qwen3.5 model
   -> attention / GDN / LM-head kernels
+  -> RunResult
+  -> LLMEngine.commit()
+  -> StepResult
 ```
 
 The central invariant is:
@@ -82,7 +89,10 @@ and GDN hybrid state advance by the same committed prefix.
 1. [nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py) - promoted operation policy.
 2. [server.yaml](server.yaml) and [nanovllm_jax/config.py](nanovllm_jax/config.py) - capacity and buckets.
 3. [nanovllm_jax/service.py](nanovllm_jax/service.py) - online request queue.
-4. [nanovllm_jax/engine.py](nanovllm_jax/engine.py) - request lifecycle and step loop.
+4. [nanovllm_jax/engine.py](nanovllm_jax/engine.py),
+   [nanovllm_jax/step.py](nanovllm_jax/step.py), and
+   [nanovllm_jax/output.py](nanovllm_jax/output.py) - execution results,
+   logical commit, and explicit output materialization.
 5. [nanovllm_jax/scheduler.py](nanovllm_jax/scheduler.py) and [nanovllm_jax/block_manager.py](nanovllm_jax/block_manager.py) - work selection and cache pages.
 6. [nanovllm_jax/batch.py](nanovllm_jax/batch.py) and
    [nanovllm_jax/device_batch.py](nanovllm_jax/device_batch.py) - host planning

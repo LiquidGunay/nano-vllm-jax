@@ -25,6 +25,7 @@ from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.device_batch import BatchMaterializer, DeviceBatch
 from nanovllm_jax.model import ModelParams
 from nanovllm_jax.output import DeviceTokenRef
+from nanovllm_jax.step import RunResult
 from nanovllm_jax.sequence import Sequence
 from nanovllm_jax.cache import (
     KVCacheState,
@@ -2528,7 +2529,7 @@ class ModelRunner:
         self,
         seqs: List[Sequence],
         batch: DeviceBatch,
-    ) -> List[int | List[int]]:
+    ) -> List[Any | List[Any]]:
         route = self._select_route(seqs, batch)
         batch = self._prepare_batch_for_route(route, batch)
         prefill_final_flags = list(route.prefill_final_flags)
@@ -2798,9 +2799,9 @@ class ModelRunner:
         self,
         seqs: List[Sequence],
         batch: DeviceBatch,
-    ) -> List[int | List[int]]:
+    ) -> RunResult:
         """Execute one materialized engine step."""
-        return self._run_main_and_sample(seqs, batch)
+        return RunResult.from_rows(self._run_main_and_sample(seqs, batch))
 
     @partial(jax.jit, static_argnums=(0,))
     def _sample_logits(

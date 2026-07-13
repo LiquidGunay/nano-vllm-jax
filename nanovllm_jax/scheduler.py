@@ -2,7 +2,6 @@
 
 Owns:
     Waiting/running queues, prefix-cache decisions, and capacity reservations.
-    logical postprocessing after each engine step.
 Receives:
     Admitted ``Sequence`` objects and static serving capacity config.
 Returns:
@@ -16,7 +15,7 @@ from typing import Deque, List, Tuple
 
 from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.batch import BucketShape, ScheduledRow, SchedulePlan
-from nanovllm_jax.output import DeviceTokenRef
+from nanovllm_jax.output import is_device_token
 from nanovllm_jax.sequence import Sequence, SequenceStatus, SamplingParams
 from nanovllm_jax.block_manager import BlockManager
 
@@ -30,10 +29,6 @@ def _config_int(config: RuntimeConfig | None, attr: str, *, default: int = 0) ->
     if config is not None and hasattr(config, attr):
         return int(getattr(config, attr) or default)
     return int(default)
-
-
-def _is_device_token(value) -> bool:
-    return isinstance(value, DeviceTokenRef) or (hasattr(value, "dtype") and hasattr(value, "shape"))
 
 
 class Scheduler:
@@ -458,7 +453,7 @@ class Scheduler:
                         not is_prefill
                         and seq.temperature == 0
                         and seq.ignore_eos
-                        and _is_device_token(getattr(seq, "last_token_device", None))
+                        and is_device_token(getattr(seq, "last_token_device", None))
                     ),
                 )
             )
@@ -551,70 +546,9 @@ class Scheduler:
             f"max_blocks_per_seq={self.max_blocks_per_seq} running={running} waiting={waiting}"
         )
 
-    def postprocess(
-        self, 
-        seqs: List[Sequence], 
-        token_ids: List[int | List[int]],
-        prefill_chunk_lengths: List[int] | None = None,
-    ) -> List[bool]:
-        """Post-process after generation step.
-        
-        Args:
-            seqs: Sequences that were scheduled
-            token_ids: Generated token IDs
-            
-        Returns:
-            List of is_finished flags for each sequence
-        """
-        finished_flags = []
-        self.last_num_generated_tokens = 0
-
-        if prefill_chunk_lengths is None:
-            prefill_chunk_lengths = [0] * len(seqs)
-        if len(prefill_chunk_lengths) != len(seqs):
-            raise ValueError("prefill_chunk_lengths must align with scheduled sequences")
-        use_device_carry = self.device_token_carry
-        
-        for seq, generated, prefill_chunk_len in zip(seqs, token_ids, prefill_chunk_lengths):
-            is_prefill_chunk = prefill_chunk_len > 0
-            if prefill_chunk_len > 0:
-                seq.num_cached_tokens = min(seq.num_prompt_tokens, seq.num_cached_tokens + prefill_chunk_len)
-
-            generated_tokens = generated if isinstance(generated, list) else [generated]
-            finished = False
-
-            for idx, token_id in enumerate(generated_tokens):
-                device_token = (
-                    use_device_carry
-                    and _is_device_token(token_id)
-                    and seq.ignore_eos
-                )
-                if device_token:
-                    seq.append_token_device(token_id)
-                    is_eos = False
-                else:
-                    token_id = int(token_id)
-                    seq.append_token(token_id)
-                    is_eos = token_id in self.eos_token_ids
-                self.last_num_generated_tokens += 1
-
-                if idx < len(generated_tokens) - 1:
-                    self.block_manager.commit_processed_token(seq)
-
-                # Check termination conditions. The final prefill chunk can
-                # emit the first completion token, so it must participate in
-                # max-token/EOS termination. Use >= to avoid leaking requests
-                # if a path emits more than one token in a step.
-                is_max_tokens = (seq.num_completion_tokens >= seq.max_tokens)
-
-                if (not seq.ignore_eos and is_eos) or is_max_tokens:
-                    seq.status = SequenceStatus.FINISHED
-                    self.block_manager.deallocate(seq)
-                    if seq in self.running:
-                        self.running.remove(seq)
-                    finished = True
-                    break
-
-            finished_flags.append(finished)
-        
-        return finished_flags
+    def release(self, seq: Sequence) -> None:
+        """Release queue and block resources after a terminal transition."""
+        self.block_manager.deallocate(seq)
+        for requests in (self.waiting, self.running):
+            if seq in requests:
+                requests.remove(seq)

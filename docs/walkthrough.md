@@ -54,9 +54,11 @@ for each layer:
 LM head          -> lm_head.py, native `[V, H]` Triton top-1 when greedy
 ```
 
-After the step, the scheduler records computed prefix blocks and matching GDN
-hybrid state. The invariant is that logical tokens, full-attention KV blocks,
-and GDN hybrid state all advance by the same committed prefix.
+After execution, the scheduler records computed prefix blocks and matching GDN
+hybrid state. The runner returns a `RunResult`; `LLMEngine.commit()` then
+advances logical state once and returns a `StepResult`. The invariant is that
+logical tokens, full-attention KV blocks, and GDN hybrid state all advance by
+the same committed prefix.
 
 ## One Decode Step
 
@@ -79,11 +81,17 @@ device instead of synchronizing through Python. Full-attention decode calls the
 FlashInfer paged route; GDN decode uses the accepted packed BF16 reference
 route; greedy LM-head selection uses the Triton top-1 wrapper.
 
-The engine postprocesses emitted tokens, advances logical sequence length, and
-publishes token events through the request's service handle. Streaming is
-EOS-safe: progress events materialize the visible token prefix on host each
-step, and either the checkpoint EOS or tokenizer EOS ends generation. Finished
-requests materialize their final token ids and release runner/cache state.
+The engine commits emitted tokens into each request's `OutputBuffer` and
+publishes the resulting `TokenEvent` and `FinishedRequest` values through a
+`StepResult`. Streaming explicitly materializes only event-bearing buffers;
+non-streaming output stays on device until the request finishes. Either the
+checkpoint EOS or tokenizer EOS ends generation, and the finish reason is
+carried to the service response.
+
+The HTTP stream reads those tokens through a one-slot notification channel.
+If the client is slow, the channel retains only the latest output watermark and
+the next `tokens` event carries the whole unseen range. Closing the stream asks
+the engine worker to cancel the request and release its cache state.
 
 ## Prefix-Cache Hit
 
