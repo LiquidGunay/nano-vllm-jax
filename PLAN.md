@@ -16,7 +16,7 @@ one PR at a time, then build the next PR from the newly merged `main`.
 
 ## Source Revisions
 
-- Clean mainline: `origin/main@0f6fbbc`
+- Clean mainline: `origin/main@ecab818` (through merged PR #12)
 - Experimental evidence: `experimental/mtp-prefill-verifier-speed@da91504`
 - Cleanup review: `/mountpoint/.exp/cleanup_and_diagnosis.md`
 
@@ -86,7 +86,7 @@ The scheduler should describe work; it should not create or cache JAX arrays.
 Scheduler.plan()
     -> SchedulePlan          host-only logical work
 Runner.materialize()
-    -> DeviceBatch           JAX arrays and resident-slot ids
+    -> DeviceBatch           JAX arrays plus one immutable HostBatch
 Runner.execute()
     -> RunResult             device outputs and state transition
 Engine.commit()
@@ -103,7 +103,8 @@ Service
 | `KernelPlan` | internal policy | One promoted implementation per route |
 | `RuntimeSpec` | engine | Frozen aggregate of the four specs above |
 | `SchedulePlan` | scheduler | Host rows, phase, lengths, block ids, bucket |
-| `DeviceBatch` | runner | Device arrays only; no host mirrors |
+| `HostBatch` | runner | Immutable Python facts retained at materialization |
+| `DeviceBatch` | runner | Device arrays plus one `HostBatch`; no parallel host mirrors |
 | `ExecutionPlan` | route registry | Route kind and static execution signature |
 | `RunResult` | runner | Device token buffer, counts, and committed state |
 | `StepResult` | engine | Explicit logical token and finish events |
@@ -289,9 +290,8 @@ Merge gates:
 
 ### PR 2: explicit step, cache, route, and output ownership
 
-Status: [ ] split in progress; PRs 2a-2c are merged, PR 2d is open for review
-as PR [#12](https://github.com/LiquidGunay/nano-vllm-jax/pull/12), and PR 2e
-remains planned from issue #10
+Status: [ ] split in progress; PRs 2a-2d are merged and PR 2e is open for
+review as draft PR [#13](https://github.com/LiquidGunay/nano-vllm-jax/pull/13)
 
 PR 2a branch: `agent/step-ownership-abi` at `5cee688`; merged as PR
 [#8](https://github.com/LiquidGunay/nano-vllm-jax/pull/8) at main commit
@@ -350,8 +350,9 @@ PR 2c keeps the prefix-cache follow-up narrow:
 - Add the style guide and put the core engine before advanced serving policy in
   the README reading path.
 
-PR 2d branch: `agent/route-registry` at `8deb3e4`; open as draft PR
-[#12](https://github.com/LiquidGunay/nano-vllm-jax/pull/12)
+PR 2d branch: `agent/route-registry` at `8deb3e4`; merged as PR
+[#12](https://github.com/LiquidGunay/nano-vllm-jax/pull/12) at main commit
+`ecab818`
 
 PR 2d is the route-ownership compression pass:
 
@@ -366,6 +367,9 @@ PR 2d is the route-ownership compression pass:
 - Add a host-only executable trace of schedule, materialize, execute, and
   commit.
 
+PR 2e branch: `agent/runtime-policy-ownership` at `0ab4293`; open as draft PR
+[#13](https://github.com/LiquidGunay/nano-vllm-jax/pull/13)
+
 PR 2e completes the remaining configuration and model-policy compression:
 
 - Split the flat `RuntimeConfig` into narrow model, capacity, compile, and
@@ -376,6 +380,15 @@ PR 2e completes the remaining configuration and model-policy compression:
   reference implementation and parity tests.
 - Split runner/executor files only where an extracted module owns a complete
   state transition.
+
+The implementation removes the flat runtime compatibility shape, replaces
+eight parallel host mirrors with one `HostBatch`, and leaves runner/executor
+unsplit because no complete transition could be extracted without adding
+forwarding-only modules. Production code is net 654 lines smaller. Guarded
+real-model controls are exact with no measured JIT growth: Qwen3.5-4B B=1
+measured `51.68` versus merged-main `51.63` decode tok/s, and the 0.8B B=8
+result stayed within the merged-main run range. The obsolete GitHub Actions
+workflow is removed in accordance with the explicit no-CI decision.
 
 Purpose: implement the host/device ABI that speculation will extend later.
 
@@ -620,6 +633,12 @@ Do not transplant:
   and open draft PR #12. At current head `8deb3e4`, `runner.py` is 310 lines
   smaller while the production source is nearly line-neutral; the added lines
   are principally focused route and warmup regressions.
-- [ ] Review and merge PR #12, then complete PR 2e's config/model-policy
-  compression before the reproducibility artifact or speculative routes add
-  new execution choices.
+- [x] Address PR #12 follow-up review, merge it at main commit `ecab818`, and
+  keep CI explicitly outside the plan.
+- [x] Open runtime/model-policy compression draft PR #13 at `0ab4293`.
+  `RuntimeSpec` now composes model, capacity, compile, and kernel owners;
+  `HostBatch` replaces parallel host mirrors; GDN serving decisions live in
+  `ServingOps`; and production code is net 654 lines smaller. Guarded 4B B=1
+  and 0.8B B=8 controls are exact with zero measured JIT growth.
+- [ ] Review and merge PR #13, completing PR 2 before starting the
+  reproducibility artifact.
