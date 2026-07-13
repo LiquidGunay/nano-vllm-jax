@@ -31,6 +31,8 @@ from nanovllm_jax.routes import (
     RouteCapability,
     RouteRequest,
     TokenMode,
+    WarmupScenario,
+    decode_warmup_scenarios,
     select_route,
     validate_executor,
 )
@@ -266,11 +268,12 @@ class ModelRunner:
         batch_size: int,
         *,
         temperature: float,
+        ignore_eos: bool = True,
     ) -> list[Sequence]:
         params = SamplingParams(
             temperature=temperature,
             max_tokens=max(2, _config_int(self.config, "greedy_decode_burst_steps", default=1) + 1),
-            ignore_eos=True,
+            ignore_eos=ignore_eos,
         )
         return [
             Sequence([0], params, seq_id=row, block_size=self.block_size)
@@ -292,6 +295,36 @@ class ModelRunner:
             int(seq_id): DeviceTokenRef(tokens=tokens, row=row)
             for row, seq_id in enumerate(batch.seq_ids_host)
         }
+
+    def _warmup_decode_inputs(
+        self,
+        batch_size: int,
+        block_table_width: int,
+        scenario: WarmupScenario,
+    ) -> tuple[list[Sequence], DeviceBatch]:
+        active_rows = batch_size if scenario.full_bucket else 1
+        batch = self._dummy_batch(
+            batch_size=active_rows,
+            query_len=1,
+            is_prefill=False,
+            max_blocks_per_seq=block_table_width,
+        )
+        batch = self._pad_decode_batch_to_rows(batch, batch_size)
+        batch = replace(
+            batch,
+            decode_step_count_host=scenario.decode_steps,
+            uses_static_decode_metadata=scenario.static_token_carry,
+        )
+        self._clear_device_token_carry()
+        if scenario.static_token_carry:
+            self._prime_warmup_decode_batch(batch)
+        temperature = 1.0 if scenario.tokens is TokenMode.SAMPLED else 0.0
+        seqs = self._warmup_sequences(
+            active_rows,
+            temperature=temperature,
+            ignore_eos=scenario.ignore_eos,
+        )
+        return seqs, batch
 
     def _warm_route(
         self,
@@ -428,19 +461,24 @@ class ModelRunner:
 
         for batch_size in batch_buckets:
             for block_table_width in decode_block_table_buckets:
-                batch = self._dummy_batch(
-                    batch_size=batch_size,
-                    query_len=1,
-                    is_prefill=False,
-                    max_blocks_per_seq=int(block_table_width),
+                scenarios = decode_warmup_scenarios(
+                    static_token_carry=bool(
+                        self.greedy_token_fastpath
+                        and self.device_token_carry
+                        and self.static_decode_metadata
+                    ),
+                    sparse_bucket=batch_size > 1,
+                    include_sampled=warm_sampled,
+                    burst_steps=(
+                        greedy_decode_burst_steps if self.greedy_token_fastpath else 1
+                    ),
                 )
-                batch = replace(
-                    batch,
-                    uses_static_decode_metadata=bool(self.static_decode_metadata),
-                )
-                self._prime_warmup_decode_batch(batch)
 
-                def record_decode(route: ExecutionPlan) -> None:
+                def record_decode(
+                    route: ExecutionPlan,
+                    batch: DeviceBatch,
+                    scenario: WarmupScenario,
+                ) -> None:
                     self._sample_fn(
                         jnp.zeros((batch_size, self.config.vocab_size), dtype=jnp.float32),
                         jnp.zeros((batch_size,), dtype=jnp.float32),
@@ -453,37 +491,27 @@ class ModelRunner:
                             "block_tables_shape": list(batch.block_tables.shape),
                             "num_decode_tokens": int(batch.num_decode_tokens),
                             "route": route.kind.value,
+                            "scenario": scenario.name,
                             "decode_steps": int(route.decode_steps),
                         }
                     )
 
-                if self.greedy_token_fastpath and greedy_decode_burst_steps > 1:
-                    for burst_steps in range(2, greedy_decode_burst_steps + 1):
-                        burst_batch = replace(batch, decode_step_count_host=burst_steps)
-                        route = self._warm_route(
-                            self._warmup_sequences(batch_size, temperature=0.0),
-                            burst_batch,
-                        )
-                        record_decode(route)
-
-                route = self._warm_route(
-                    self._warmup_sequences(batch_size, temperature=0.0),
-                    batch,
-                )
-                record_decode(route)
-                if warm_sampled:
-                    sampled_batch = replace(batch, uses_static_decode_metadata=False)
-                    sampled_route = self._warm_route(
-                        self._warmup_sequences(batch_size, temperature=1.0),
-                        sampled_batch,
+                for scenario in scenarios:
+                    seqs, batch = self._warmup_decode_inputs(
+                        batch_size,
+                        int(block_table_width),
+                        scenario,
                     )
-                    record_decode(sampled_route)
+                    route = self._warm_route(seqs, batch)
+                    record_decode(route, batch, scenario)
+                    if scenario.tokens is not TokenMode.SAMPLED:
+                        continue
                     summary["sampled_token_fastpath_runs"].append(
                         {
                             "kind": "decode",
                             "batch_size": int(batch_size),
                             "block_tables_shape": list(batch.block_tables.shape),
-                            "route": sampled_route.kind.value,
+                            "route": route.kind.value,
                         }
                     )
         if bool(getattr(self, "resident_decode_metadata", False)):

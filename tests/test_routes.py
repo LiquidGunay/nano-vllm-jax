@@ -1,4 +1,6 @@
-from dataclasses import fields
+from dataclasses import fields, replace
+
+import pytest
 
 from nanovllm_jax.routes import (
     ExecutionPlan,
@@ -6,8 +8,10 @@ from nanovllm_jax.routes import (
     RouteCapability,
     RouteKind,
     RouteRequest,
+    decode_warmup_scenarios,
     select_route,
     validate_executor,
+    validate_registry,
 )
 
 
@@ -54,3 +58,41 @@ def test_executor_validation_uses_the_registry():
         assert "forward_step_token_ids_jit" in str(exc)
     else:
         raise AssertionError("missing route methods must fail validation")
+
+
+def test_registry_rejects_duplicate_route_kinds():
+    with pytest.raises(RuntimeError, match="duplicate RouteKind"):
+        validate_registry(ROUTE_SPECS + (ROUTE_SPECS[0],))
+
+
+def test_registry_rejects_ambiguous_capabilities():
+    dense = next(
+        spec for spec in ROUTE_SPECS if spec.kind is RouteKind.DECODE_RESIDENT_DENSE
+    )
+    ambiguous = tuple(
+        replace(spec, requires=dense.requires)
+        if spec.kind is RouteKind.DECODE_RESIDENT
+        else spec
+        for spec in ROUTE_SPECS
+    )
+
+    with pytest.raises(RuntimeError, match="ambiguous decode/greedy routes"):
+        validate_registry(ambiguous)
+
+
+def test_decode_warmup_scenarios_cover_public_route_shapes():
+    scenarios = decode_warmup_scenarios(
+        static_token_carry=True,
+        sparse_bucket=True,
+        include_sampled=True,
+        burst_steps=3,
+    )
+
+    assert [scenario.name for scenario in scenarios] == [
+        "dense_carry",
+        "sparse_carry",
+        "ordinary_greedy",
+        "sampled",
+        "burst_2",
+        "burst_3",
+    ]

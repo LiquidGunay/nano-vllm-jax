@@ -92,6 +92,10 @@ its `RouteSpec` supplies the executor method and state requirements used by
 dispatch, validation, warmup, and reporting. The plan carries no parallel route
 booleans.
 
+Startup warmup enumerates the public dense-carry, sparse-carry, ordinary
+no-carry, sampled, and configured burst scenarios for each decode bucket. Each
+scenario goes through normal route selection and execution.
+
 Compilation warmup is a startup-only transition. The engine rejects it after a
 request has been admitted or any prefix metadata has been published, so runner
 state cannot be reset beneath surviving host handles.

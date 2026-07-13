@@ -67,7 +67,7 @@ and should not exist.
 
 A route is one typed choice, not a mode plus a parallel boolean matrix.
 `routes.py` owns the shared route specification used by selection, preparation,
-execution, warmup, dependency validation, and route labels. New execution work
+execution, warmup, executor validation, and route labels. New execution work
 must extend or consolidate that registry instead of adding a route-specific
 boolean.
 

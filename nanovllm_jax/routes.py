@@ -69,6 +69,16 @@ class RouteSpec:
         return RouteCapability.PREFILL_TOKEN_SEED in self.requires
 
 
+@dataclass(frozen=True)
+class WarmupScenario:
+    name: str
+    tokens: TokenMode
+    full_bucket: bool
+    static_token_carry: bool
+    ignore_eos: bool
+    decode_steps: int = 1
+
+
 def _caps(*values: RouteCapability) -> frozenset[RouteCapability]:
     return frozenset(values)
 
@@ -173,14 +183,101 @@ ROUTE_SPECS = (
     ),
 )
 
-_ROUTES = {spec.kind: spec for spec in ROUTE_SPECS}
-
-
 @dataclass(frozen=True)
 class RouteRequest:
     phase: BatchPhase
     tokens: TokenMode
     capabilities: frozenset[RouteCapability]
+
+
+def decode_warmup_scenarios(
+    *,
+    static_token_carry: bool,
+    sparse_bucket: bool,
+    include_sampled: bool,
+    burst_steps: int,
+) -> tuple[WarmupScenario, ...]:
+    """Return the public decode situations that need compiled coverage."""
+
+    scenarios = []
+    if static_token_carry:
+        scenarios.append(
+            WarmupScenario("dense_carry", TokenMode.GREEDY, True, True, True)
+        )
+        if sparse_bucket:
+            scenarios.append(
+                WarmupScenario("sparse_carry", TokenMode.GREEDY, False, True, True)
+            )
+    scenarios.append(
+        WarmupScenario("ordinary_greedy", TokenMode.GREEDY, False, False, False)
+    )
+    if include_sampled:
+        scenarios.append(
+            WarmupScenario("sampled", TokenMode.SAMPLED, False, False, False)
+        )
+    scenarios.extend(
+        WarmupScenario(
+            f"burst_{steps}",
+            TokenMode.BURST,
+            False,
+            static_token_carry,
+            True,
+            steps,
+        )
+        for steps in range(2, max(1, int(burst_steps)) + 1)
+    )
+    return tuple(scenarios)
+
+
+def _maximal_routes(
+    specs: tuple[RouteSpec, ...],
+    request: RouteRequest,
+) -> tuple[RouteSpec, ...]:
+    candidates = tuple(
+        spec
+        for spec in specs
+        if spec.phase is request.phase
+        and spec.tokens is request.tokens
+        and spec.requires <= request.capabilities
+    )
+    return tuple(
+        spec
+        for spec in candidates
+        if not any(spec.requires < other.requires for other in candidates)
+    )
+
+
+def validate_registry(specs: tuple[RouteSpec, ...]) -> None:
+    """Reject incomplete, duplicate, or capability-ambiguous route tables."""
+
+    kinds = tuple(spec.kind for spec in specs)
+    if len(set(kinds)) != len(kinds):
+        raise RuntimeError("duplicate RouteKind in route registry")
+    missing = set(RouteKind) - set(kinds)
+    if missing:
+        names = ", ".join(sorted(kind.value for kind in missing))
+        raise RuntimeError(f"route registry is missing: {names}")
+
+    capabilities = tuple(RouteCapability)
+    for phase in BatchPhase:
+        for tokens in TokenMode:
+            for mask in range(1 << len(capabilities)):
+                available = frozenset(
+                    capability
+                    for index, capability in enumerate(capabilities)
+                    if mask & (1 << index)
+                )
+                request = RouteRequest(phase, tokens, available)
+                matches = _maximal_routes(specs, request)
+                if len(matches) > 1:
+                    names = ", ".join(sorted(spec.kind.value for spec in matches))
+                    raise RuntimeError(
+                        f"ambiguous {phase.value}/{tokens.value} routes: {names}"
+                    )
+
+
+validate_registry(ROUTE_SPECS)
+_ROUTES = {spec.kind: spec for spec in ROUTE_SPECS}
 
 
 @dataclass(frozen=True)
@@ -198,19 +295,17 @@ class ExecutionPlan:
 def select_route(request: RouteRequest) -> RouteKind:
     """Choose the most capable route whose requirements are satisfied."""
 
-    candidates = (
-        spec
-        for spec in ROUTE_SPECS
-        if spec.phase is request.phase
-        and spec.tokens is request.tokens
-        and spec.requires <= request.capabilities
-    )
-    try:
-        return max(candidates, key=lambda spec: len(spec.requires)).kind
-    except ValueError as exc:
+    matches = _maximal_routes(ROUTE_SPECS, request)
+    if not matches:
         raise RuntimeError(
             f"no {request.phase.value}/{request.tokens.value} execution route"
-        ) from exc
+        )
+    if len(matches) > 1:
+        names = ", ".join(sorted(spec.kind.value for spec in matches))
+        raise RuntimeError(
+            f"ambiguous {request.phase.value}/{request.tokens.value} routes: {names}"
+        )
+    return matches[0].kind
 
 
 def validate_executor(executor: object) -> None:
