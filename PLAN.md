@@ -16,8 +16,8 @@ one PR at a time, then build the next PR from the newly merged `main`.
 
 ## Source Revisions
 
-- Clean mainline: `origin/main@534f039`
-- Experimental evidence: `experimental/mtp-prefill-verifier-speed@7ced216`
+- Clean mainline: `origin/main@850cd3e`
+- Experimental evidence: `experimental/mtp-prefill-verifier-speed@da91504`
 - Cleanup review: `/mountpoint/.exp/cleanup_and_diagnosis.md`
 
 The clean mainline is the implementation base. The experimental branch is a
@@ -47,6 +47,33 @@ surface, and diagnostics will not be merged or cherry-picked wholesale.
 - The only production verifier is strict target-model packed-prefix
   verification. Sequential repair, unverified append, and forced acceptance
   remain test or diagnostic tools and cannot support a speed claim.
+
+## Repository Style Contract
+
+Issue [#10](https://github.com/LiquidGunay/nano-vllm-jax/issues/10) identified
+the main remaining risk: optimizations accumulating as flags, optional fields,
+and history-encoded route names until documentation has to explain accidental
+complexity. `docs/style.md` is the review contract once its PR merges.
+
+The governing rule is conceptual compression, not a line-count target:
+
+- Keep one ordinary serving path and one typed representation of each choice.
+- Put state and transitions at their documented owner; do not add compatibility
+  guards for partially initialized internal objects.
+- Prefer concept-level names and narrow specs over boolean matrices and a flat
+  configuration message bus.
+- Keep serving policy outside model math and keep host/device mirrors behind one
+  explicit materialization boundary.
+- Extract a file only when it owns a coherent transition; facade-only modules
+  make the reading path worse.
+- Every optimized operation keeps visible reference semantics and a focused
+  parity check.
+
+The first reading path stays centered on `engine.py`, `scheduler.py`,
+`block_manager.py`, batch materialization, `runner.py`, and `model.py`. Service,
+warmup, implementation policy, and specialized kernels are the advanced path.
+Each PR review records which concept it adds, which older concept it removes or
+consolidates, and why the ordinary path remains easy to trace.
 
 ## Target Base ABI
 
@@ -124,10 +151,11 @@ class PrefixCacheEntry:
     hybrid_state_handle: int | None
 ```
 
-An entry is published only when target KV and GDN state represent the same
-complete prefix. Reusing any physical block in the entry atomically removes
-the entry, releases its runner-owned state handle, and updates statistics.
-The cache has an explicit entry/state budget and a churn test.
+KV metadata may be published before a GDN snapshot is attached, but a hybrid
+prefix is reusable only when both represent the same complete boundary.
+Reusing any physical block in the entry atomically removes the entry, releases
+its runner-owned state handle, and updates statistics. The cache has an
+explicit entry/state budget and a churn test.
 
 ### Model and weight ABI
 
@@ -258,8 +286,9 @@ Merge gates:
 
 ### PR 2: explicit step, cache, route, and output ownership
 
-Status: [ ] split in progress; PR 2a is merged and PR 2b is draft PR
-[#9](https://github.com/LiquidGunay/nano-vllm-jax/pull/9)
+Status: [ ] split in progress; PRs 2a and 2b are merged, PR 2c is draft PR
+[#11](https://github.com/LiquidGunay/nano-vllm-jax/pull/11), and PR 2d is
+planned from issue #10
 
 PR 2a branch: `agent/step-ownership-abi` at `5cee688`; merged as PR
 [#8](https://github.com/LiquidGunay/nano-vllm-jax/pull/8) at main commit
@@ -277,7 +306,9 @@ PR 2a establishes the review boundary recommended by the cleanup audit:
   tokens with no measured JIT growth: 0.8B B=8 measured `434.41` versus
   `434.21` decode tok/s; 4B B=1 measured `49.92` versus `49.89`.
 
-PR 2b branch: `agent/step-commit-output` at `a30f8eb`
+PR 2b branch: `agent/step-commit-output`; merged as PR
+[#9](https://github.com/LiquidGunay/nano-vllm-jax/pull/9) at main commit
+`850cd3e`
 
 PR 2b completes the execute/commit/output half of the ABI:
 
@@ -294,12 +325,40 @@ PR 2b completes the execute/commit/output half of the ABI:
 - EOS/length/cancelled finish reasons and the configured model id reach server
   output.
 
-Prefix-handle lifecycle remains one focused follow-up. Route-registry and GDN
-policy cleanup will be combined into the following structural PR.
+PR 2c branch: `agent/prefix-cache-lifecycle` at `e3c7f67`
+
+PR 2c keeps the prefix-cache follow-up narrow:
+
+- Replace split KV/hash and GDN-state dictionaries with one bounded
+  `PrefixCacheEntry` lifecycle.
+- Keep device snapshots runner-owned behind opaque handles.
+- Invalidate complete entries on physical block reuse and evict state by an
+  explicit LRU budget.
+- Leave at least one prompt token executable because entries do not cache the
+  following logits.
+- Prove cache-hit parity on a tiny CUDA model and a real Qwen3.5 checkpoint;
+  add churn and capacity tests.
+- Add the style guide and put the core engine before advanced serving policy in
+  the README reading path.
+
+PR 2d is the structural compression pass required before new optimization:
+
+- Replace the runner boolean matrix with one `RouteKind`/`RouteSpec` registry
+  shared by selection, preparation, dispatch, warmup, validation, and metrics.
+- Split the flat `RuntimeConfig` into narrow model, capacity, compile, and
+  kernel specs without compatibility adapters in the ordinary path.
+- Group host batch metadata at the materialization boundary instead of growing
+  optional parallel `DeviceBatch` fields.
+- Move GDN serving-policy selection out of model math, retaining an explicit
+  reference implementation and parity tests.
+- Split runner/executor files only where an extracted module owns a complete
+  state transition.
+- Add a CPU-safe executable trace of schedule, materialize, execute, and
+  commit.
 
 Purpose: implement the host/device ABI that speculation will extend later.
 
-Scope:
+Completed and remaining scope across PR 2a-2d:
 
 - Add `ScheduledRow`, `SchedulePlan`, `DeviceBatch`, `ExecutionPlan`,
   `RunResult`, `StepResult`, and `TokenEvent`.
@@ -329,12 +388,13 @@ Merge gates:
 - Fresh primary and B=8 report-only comparisons remain within measured run
   variance; any material regression blocks merge.
 
-If review size requires it, this PR may be split after the type extraction,
-but both halves must leave `main` fully working and use the same final ABI.
+The work is deliberately split at coherent ownership boundaries. Every part
+must leave `main` fully working and reduce or consolidate concepts; a structural
+change does not earn scope merely because it appears in issue #10.
 
 ### PR 3: reproducible artifact and one benchmark claim
 
-Status: [ ] blocked by PR 2
+Status: [ ] blocked by PR 2d
 
 Purpose: make the repository able to support and reproduce one honest claim.
 
@@ -508,3 +568,14 @@ Do not transplant:
   cancellation, worker-aware health, and verified shutdown. The expanded
   control suite passes 57 tests, 205 tests collect, and a fresh guarded 0.8B
   CUDA smoke remains correct.
+- [x] Address both PR #9 review rounds, pass CI, and merge it at main commit
+  `850cd3e`.
+- [x] Review issue #10 and turn its critique into an explicit conceptual-
+  compression contract and a core-versus-advanced reading path.
+- [x] Open prefix-lifecycle draft PR #11 from
+  `agent/prefix-cache-lifecycle`: bounded KV/GDN entries, runner-owned
+  snapshots, issue #10 style guide, and guarded tiny/real-model cache-hit
+  parity. The 0.8B smoke matched exact tokens with zero measured JIT growth;
+  the guarded control suite passed 69 tests and 214 tests collect.
+- [ ] Complete PR 2d's route/config/model-policy compression before the
+  reproducibility artifact or speculative routes add new execution choices.
