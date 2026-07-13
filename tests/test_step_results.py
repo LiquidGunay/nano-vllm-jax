@@ -6,8 +6,9 @@ from nanovllm_jax.step import FinishReason, RunResult
 
 
 class _Runner:
-    def __init__(self, rows):
+    def __init__(self, rows, trace=None):
         self.rows = iter(rows)
+        self.trace = trace
         self.released = []
         self.installed_prefix_handles = []
         self.released_prefix_handles = []
@@ -15,10 +16,7 @@ class _Runner:
 
     def install_cached_prefix_hybrid_states(self, seqs, states):
         self.installed_prefix_handles.append(
-            {
-                seq_id: entry.hybrid_state_handle
-                for seq_id, entry in states.items()
-            }
+            {seq_id: entry.hybrid_state_handle for seq_id, entry in states.items()}
         )
 
     def cache_prefix_hybrid_states(self, entries_by_seq):
@@ -34,13 +32,45 @@ class _Runner:
         self.released_prefix_handles.extend(handles)
 
     def materialize(self, plan):
+        if self.trace is not None:
+            self.trace.append("materialize")
         return plan
 
     def execute(self, seqs, batch):
+        if self.trace is not None:
+            self.trace.append("execute")
         return RunResult.from_rows(next(self.rows))
 
     def release(self, seq_ids):
         self.released.extend(seq_ids)
+
+
+class _TracingScheduler(Scheduler):
+    def __init__(self, config, trace):
+        super().__init__(config)
+        self.trace = trace
+
+    def schedule(self):
+        self.trace.append("schedule")
+        return super().schedule()
+
+
+class _Engine(LLMEngine):
+    """Valid host-only engine fixture with an explicit runner boundary."""
+
+    def __init__(self, config, runner, trace=None):
+        self.config = config
+        self.scheduler = (
+            _TracingScheduler(config, trace) if trace is not None else Scheduler(config)
+        )
+        self.model_runner = runner
+        self._next_seq_id = 0
+        self.trace = trace
+
+    def commit(self, seqs, schedule_plan, run_result):
+        if self.trace is not None:
+            self.trace.append("commit")
+        return super().commit(seqs, schedule_plan, run_result)
 
 
 def test_step_executes_then_commits_one_typed_transition():
@@ -59,9 +89,8 @@ def test_step_executes_then_commits_one_typed_transition():
         prefix_cache=False,
         device_token_carry=False,
     )
-    engine = object.__new__(LLMEngine)
-    engine.scheduler = Scheduler(config)
-    engine.model_runner = _Runner([[101], [102]])
+    trace = []
+    engine = _Engine(config, _Runner([[101], [102]], trace), trace)
     seq = Sequence(
         [1, 2],
         SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True),
@@ -70,7 +99,10 @@ def test_step_executes_then_commits_one_typed_transition():
     engine.scheduler.add(seq)
 
     prefill = engine.step()
+    assert trace == ["schedule", "materialize", "execute", "commit"]
+    trace.clear()
     decode = engine.step()
+    assert trace == ["schedule", "materialize", "execute", "commit"]
 
     assert prefill.phase == "prefill"
     assert prefill.scheduled_tokens == 2
@@ -95,9 +127,7 @@ def test_cancel_request_releases_scheduler_and_runner_state():
         max_blocks_per_seq=2,
         prefix_cache=False,
     )
-    engine = object.__new__(LLMEngine)
-    engine.scheduler = Scheduler(config)
-    engine.model_runner = _Runner([])
+    engine = _Engine(config, _Runner([]))
     seq = Sequence(
         [1, 2],
         SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True),
@@ -128,9 +158,7 @@ def test_step_reuses_runner_owned_prefix_state_by_handle():
         prefix_cache=True,
         linear_attn_layers=(0,),
     )
-    engine = object.__new__(LLMEngine)
-    engine.scheduler = Scheduler(config)
-    engine.model_runner = _Runner([[101], [102]])
+    engine = _Engine(config, _Runner([[101], [102]]))
     first = Sequence(
         [1, 2],
         SamplingParams(max_tokens=1),
