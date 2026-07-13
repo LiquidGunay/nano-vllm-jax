@@ -57,7 +57,10 @@ arrays that the runner and executor consume.
 
 FlashInfer receives a fixed-size page-index buffer for JIT stability, but its
 CSR indptr exposes only each row's live page prefix. Static block-table padding
-is never treated as attention context.
+is never treated as attention context. Decode uses a reusable non-split plan,
+because FlashInfer split-KV scheduler tables depend on the exact plan-time page
+counts. The fused append kernel skips rows whose logical length is zero, so a
+padded row cannot write through its placeholder page.
 
 `ModelExecutor` owns JIT cache keys and calls into `model.forward_step`.
 

@@ -14,6 +14,7 @@ import pytest
 from nanovllm_jax.ops import ServingOps
 from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.kernels.flashinfer_ffi import (
+    _batch_decode_plan_info,
     kv_append_paged_nhd,
     kv_append_paged_nhd_reference,
     paged_decode_attention_gqa_nhd,
@@ -160,10 +161,12 @@ def test_paged_decode_attention_flashinfer_matches_reference():
     num_kv_heads = 2
     head_dim = 128
     page_size = 16
-    max_pages_per_sequence = 2
+    max_pages_per_sequence = 128
     num_pages = batch * max_pages_per_sequence
     scale = 1.0 / np.sqrt(head_dim)
-    block_tables = jnp.array([[2, 0], [3, 1]], dtype=jnp.int32)
+    block_tables = jnp.arange(num_pages, dtype=jnp.int32).reshape(
+        batch, max_pages_per_sequence
+    )
     seq_lens = jnp.array([5, 30], dtype=jnp.int32)
     query = jax.random.normal(
         key,
@@ -198,6 +201,14 @@ def test_paged_decode_attention_flashinfer_matches_reference():
             scale=scale,
         )
     )(query, k_cache, v_cache)
+    plan_info, _, _ = _batch_decode_plan_info(
+        dtype=query.dtype,
+        batch=batch,
+        num_qo_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+    )
     expected = paged_decode_attention_gqa_nhd_reference(
         query,
         k_cache,
@@ -216,6 +227,7 @@ def test_paged_decode_attention_flashinfer_matches_reference():
         rtol=5e-2,
         atol=5e-2,
     )
+    assert plan_info[-1] == 0, "bucket-independent decode plan must be non-split"
 
 
 @pytest.mark.skipif(
@@ -233,11 +245,13 @@ def test_paged_decode_fused_append_flashinfer_matches_reference():
     num_kv_heads = 2
     head_dim = 128
     page_size = 16
-    max_pages_per_sequence = 2
+    max_pages_per_sequence = 128
     num_pages = batch * max_pages_per_sequence
     layer_id = 1
     scale = 1.0 / np.sqrt(head_dim)
-    block_tables = jnp.array([[2, 0], [3, 1]], dtype=jnp.int32)
+    block_tables = jnp.arange(num_pages, dtype=jnp.int32).reshape(
+        batch, max_pages_per_sequence
+    )
     seq_lens = jnp.array([5, 30], dtype=jnp.int32)
     positions = seq_lens - 1
     query = jax.random.normal(
@@ -321,6 +335,103 @@ def test_paged_decode_fused_append_flashinfer_matches_reference():
     )
     np.testing.assert_array_equal(np.asarray(actual_k), np.asarray(expected_k))
     np.testing.assert_array_equal(np.asarray(actual_v), np.asarray(expected_v))
+
+
+@pytest.mark.skipif(
+    not (_has_module("flashinfer") and _has_module("jax_tvm_ffi")),
+    reason="FlashInfer/JAX FFI optional dependencies are not installed",
+)
+@pytest.mark.skipif(
+    not _has_cuda_backend(),
+    reason="FlashInfer FFI test requires a CUDA JAX backend",
+)
+def test_paged_decode_fused_append_skips_inactive_rows():
+    key = jax.random.PRNGKey(2)
+    batch = 2
+    num_heads = 4
+    num_kv_heads = 2
+    head_dim = 128
+    page_size = 16
+    scale = 1.0 / np.sqrt(head_dim)
+    block_tables = jnp.array([[0, 1], [0, 0]], dtype=jnp.int32)
+    seq_lens = jnp.array([5, 0], dtype=jnp.int32)
+    positions = jnp.array([4, 0], dtype=jnp.int32)
+    query = jax.random.normal(
+        key, (batch, num_heads, head_dim), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
+    new_k = jax.random.normal(
+        jax.random.fold_in(key, 1),
+        (batch, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    new_v = jax.random.normal(
+        jax.random.fold_in(key, 2),
+        (batch, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    k_cache = jax.random.normal(
+        jax.random.fold_in(key, 3),
+        (1, 2, page_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    v_cache = jax.random.normal(
+        jax.random.fold_in(key, 4),
+        (1, 2, page_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    ).astype(jnp.bfloat16)
+    kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
+        block_tables,
+        seq_lens,
+        page_size,
+    )
+    kv_last_page_len = kv_last_page_len_from_seq_lens(seq_lens, page_size)
+    expected_k_layer, expected_v_layer = kv_append_paged_nhd_reference(
+        new_k[:1],
+        new_v[:1],
+        jnp.array([0], dtype=jnp.int32),
+        positions[:1],
+        k_cache[0],
+        v_cache[0],
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+    )
+
+    actual, actual_k, actual_v = jax.jit(
+        lambda q, nk, nv, kc, vc: paged_decode_attention_with_kv_append_gqa_nhd(
+            q,
+            nk,
+            nv,
+            kc,
+            vc,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            positions,
+            layer_id=0,
+            scale=scale,
+        )
+    )(query, new_k, new_v, k_cache, v_cache)
+    expected = paged_decode_attention_gqa_nhd_reference(
+        query,
+        expected_k_layer,
+        expected_v_layer,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        seq_lens,
+        scale,
+        max_pages_per_sequence=2,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual[0], dtype=np.float32),
+        np.asarray(expected[0], dtype=np.float32),
+        rtol=5e-2,
+        atol=5e-2,
+    )
+    np.testing.assert_array_equal(np.asarray(actual_k[0]), np.asarray(expected_k_layer))
+    np.testing.assert_array_equal(np.asarray(actual_v[0]), np.asarray(expected_v_layer))
 
 
 @pytest.mark.skipif(

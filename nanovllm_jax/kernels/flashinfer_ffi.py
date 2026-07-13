@@ -28,7 +28,7 @@ _BATCH_DECODE_TARGETS: dict[tuple[str, int], str] = {}
 _BATCH_DECODE_FUSED_APPEND_TARGETS: dict[tuple[str, int], str] = {}
 _BATCH_DECODE_MODULES: dict[tuple[str, int], Any] = {}
 _BATCH_DECODE_PLANS: dict[
-    tuple[str, int, int, int, int, int, int],
+    tuple[str, int, int, int, int, int],
     tuple[tuple[int, ...], Any, int],
 ] = {}
 _FLASHINFER_NEW_CUB_FLAG = "-DFLASHINFER_CUB_SUBTRACTLEFT_DEFINED"
@@ -286,6 +286,92 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
 
 using namespace flashinfer;
 
+template <uint32_t HEAD_DIM, uint32_t VEC_SIZE, typename DType, typename IdType>
+__global__ void AppendActiveDecodeRowsKernel(
+    paged_kv_t<DType, IdType> paged_kv,
+    DType* __restrict__ append_key,
+    DType* __restrict__ append_value,
+    IdType* __restrict__ batch_indices,
+    IdType* __restrict__ positions,
+    size_t append_k_stride_n,
+    size_t append_k_stride_h,
+    size_t append_v_stride_n,
+    size_t append_v_stride_h,
+    uint32_t num_tokens) {{
+  uint32_t tx = threadIdx.x;
+  uint32_t head_idx = threadIdx.y;
+  uint32_t num_ctas = gridDim.x;
+
+  for (uint32_t token_idx = blockIdx.x; token_idx < num_tokens;
+       token_idx += num_ctas) {{
+    uint32_t batch_idx = batch_indices[token_idx];
+    if (paged_kv.last_page_len[batch_idx] == 0) {{
+      continue;
+    }}
+    uint32_t page_iter, entry_idx;
+    paged_kv.page_size.divmod(
+        paged_kv.indptr[batch_idx] * paged_kv.page_size + positions[token_idx],
+        page_iter, entry_idx);
+    DType* k_ptr = paged_kv.get_k_ptr(
+        page_iter, head_idx, entry_idx, tx * VEC_SIZE);
+    DType* v_ptr = paged_kv.get_v_ptr(
+        page_iter, head_idx, entry_idx, tx * VEC_SIZE);
+    vec_t<DType, VEC_SIZE>::memcpy(
+        k_ptr, append_key + token_idx * append_k_stride_n +
+                   head_idx * append_k_stride_h + tx * VEC_SIZE);
+    vec_t<DType, VEC_SIZE>::memcpy(
+        v_ptr, append_value + token_idx * append_v_stride_n +
+                   head_idx * append_v_stride_h + tx * VEC_SIZE);
+  }}
+}}
+
+template <typename DType, typename IdType>
+cudaError_t AppendActiveDecodeRows(
+    paged_kv_t<DType, IdType> paged_kv,
+    DType* append_key,
+    DType* append_value,
+    IdType* batch_indices,
+    IdType* positions,
+    uint32_t num_tokens,
+    size_t append_k_stride_n,
+    size_t append_k_stride_h,
+    size_t append_v_stride_n,
+    size_t append_v_stride_h,
+    cudaStream_t stream) {{
+  uint32_t head_dim = paged_kv.head_dim;
+  uint32_t num_heads = paged_kv.num_heads;
+  int device_id = 0;
+  int num_sms = 0;
+  int blocks_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device_id));
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id));
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {{
+    constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+    auto kernel = AppendActiveDecodeRowsKernel<HEAD_DIM, vec_size, DType, IdType>;
+    dim3 threads(HEAD_DIM / vec_size, num_heads);
+    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, kernel, threads.x * threads.y, 0));
+    blocks_per_sm = min(blocks_per_sm, ceil_div(int(num_tokens), num_sms));
+    dim3 blocks(blocks_per_sm * num_sms);
+    void* args[] = {{
+        (void*)&paged_kv,
+        (void*)&append_key,
+        (void*)&append_value,
+        (void*)&batch_indices,
+        (void*)&positions,
+        (void*)&append_k_stride_n,
+        (void*)&append_k_stride_h,
+        (void*)&append_v_stride_n,
+        (void*)&append_v_stride_h,
+        (void*)&num_tokens,
+    }};
+    FLASHINFER_CUDA_CALL(
+        cudaLaunchKernel((void*)kernel, blocks, threads, args, 0, stream));
+  }});
+  return cudaSuccess;
+}}
+
 void BatchDecodeWithPagedKVCacheFusedAppendJaxPlan(
     TensorView float_workspace_buffer,
     TensorView int_workspace_buffer,
@@ -378,14 +464,14 @@ void BatchDecodeWithPagedKVCacheFusedAppendJaxPlan(
 
   auto append_k_strides = append_key.strides();
   auto append_v_strides = append_value.strides();
-  cudaError_t append_status = AppendPagedKVCache(
+  cudaError_t append_status = AppendActiveDecodeRows(
         paged_kv, static_cast<DTypeKV*>(append_key.data_ptr()),
         static_cast<DTypeKV*>(append_value.data_ptr()),
         static_cast<int32_t*>(batch_indices.data_ptr()),
         static_cast<int32_t*>(positions.data_ptr()), batch_size, append_k_strides[0],
         append_k_strides[1], append_v_strides[0], append_v_strides[1], stream);
   TVM_FFI_ICHECK(append_status == cudaSuccess)
-        << "AppendPagedKVCache failed with error: " << cudaGetErrorString(append_status);
+        << "AppendActiveDecodeRows failed with error: " << cudaGetErrorString(append_status);
 
   void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
@@ -870,8 +956,16 @@ def _batch_decode_plan_info(
     num_kv_heads: int,
     head_dim: int,
     page_size: int,
-    max_pages_per_sequence: int,
 ) -> tuple[tuple[int, ...], Any, int]:
+    """Build a reusable non-split plan for one static decode batch.
+
+    FlashInfer scheduler tables encode the plan-time page counts. Runtime page
+    counts vary inside a compiled bucket, so a cached split-KV plan would be
+    invalid. A one-page signature deliberately selects one work item per row;
+    that non-split route reads the runtime indptr and is valid for every live
+    page count represented by the bucket.
+    """
+
     dtype_key = _dtype_key(dtype)
     cache_key = (
         dtype_key,
@@ -880,7 +974,6 @@ def _batch_decode_plan_info(
         int(num_kv_heads),
         int(head_dim),
         int(page_size),
-        int(max_pages_per_sequence),
     )
     if cache_key in _BATCH_DECODE_PLANS:
         return _BATCH_DECODE_PLANS[cache_key]
@@ -905,10 +998,7 @@ def _batch_decode_plan_info(
         device="cpu",
         pin_memory=True,
     )
-    indptr = (
-        torch.arange(int(batch) + 1, dtype=torch.int32, device="cpu")
-        * int(max_pages_per_sequence)
-    )
+    indptr = torch.arange(int(batch) + 1, dtype=torch.int32, device="cpu")
     torch_dtype = _torch_dtype_for_key(dtype_key)
     empty_q = torch.empty((0,), dtype=torch_dtype)
     empty_kv = torch.empty((0,), dtype=torch_dtype)
@@ -937,6 +1027,8 @@ def _batch_decode_plan_info(
             "FlashInfer DecodePlanInfo ABI changed; expected "
             f"{_FLASHINFER_BATCH_DECODE_PLAN_FIELDS} fields, got {len(plan_info)}"
         )
+    if plan_info[-1]:
+        raise RuntimeError("FlashInfer unexpectedly split the reusable decode plan")
     (
         padded_batch_size,
         _v_offset,
@@ -966,15 +1058,7 @@ def _batch_decode_plan_info(
     int_workspace_bytes = (
         int_workspace[:planned_int_bytes].detach().cpu().numpy().copy().astype(np.uint8)
     )
-    if _split_kv:
-        dtype_size = jnp.dtype(dtype).itemsize
-        planned_float_bytes = max(
-            _v_offset + max(1, padded_batch_size) * int(num_qo_heads) * int(head_dim) * dtype_size,
-            _s_offset + max(1, padded_batch_size) * int(num_qo_heads) * 4,
-        )
-    else:
-        planned_float_bytes = 1
-    result = (plan_info, int_workspace_bytes, int(planned_float_bytes))
+    result = (plan_info, int_workspace_bytes, 1)
     _BATCH_DECODE_PLANS[cache_key] = result
     return result
 
@@ -992,10 +1076,11 @@ def paged_decode_attention_gqa_nhd(
     """Run FlashInfer batch decode attention on an NHD paged KV cache.
 
     This wrapper intentionally exposes a broad paged-attention ABI: page table
-    indptr/indices/last-page-len are passed directly and the FlashInfer plan is
-    computed from the static dense shape. It currently allocates FlashInfer's
-    workspace inside the compiled program; serving-speed promotion requires
-    threading persistent workspace buffers through the executor state.
+    indptr/indices/last-page-len are passed directly. The cached non-split plan
+    is independent of runtime page counts, so one compiled bucket can safely
+    serve changing sequence lengths. Workspace is currently allocated inside
+    the compiled program; serving-speed promotion requires threading persistent
+    buffers through executor state.
     """
 
     query = _as_jax_array("query", query)
@@ -1036,7 +1121,6 @@ def paged_decode_attention_gqa_nhd(
 
     _require_flashinfer_modules()
     target = _register_batch_decode(query.dtype, int(head_dim))
-    max_pages_per_sequence = max(1, int(kv_indices.shape[0]) // int(batch))
     plan_info, planned_int_workspace, planned_float_workspace_nbytes = _batch_decode_plan_info(
         dtype=query.dtype,
         batch=int(batch),
@@ -1044,7 +1128,6 @@ def paged_decode_attention_gqa_nhd(
         num_kv_heads=int(num_kv_heads),
         head_dim=int(head_dim),
         page_size=int(page_size),
-        max_pages_per_sequence=max_pages_per_sequence,
     )
     float_workspace = jnp.zeros((planned_float_workspace_nbytes,), dtype=jnp.uint8)
     int_workspace = jnp.asarray(planned_int_workspace, dtype=jnp.uint8)
@@ -1149,7 +1232,6 @@ def paged_decode_attention_with_kv_append_gqa_nhd(
     _require_flashinfer_modules()
     _register_batch_decode(query.dtype, int(head_dim))
     target = _BATCH_DECODE_FUSED_APPEND_TARGETS[(_dtype_key(query.dtype), int(head_dim))]
-    max_pages_per_sequence = max(1, int(kv_indices.shape[0]) // int(batch))
     plan_info, planned_int_workspace, planned_float_workspace_nbytes = _batch_decode_plan_info(
         dtype=query.dtype,
         batch=int(batch),
@@ -1157,7 +1239,6 @@ def paged_decode_attention_with_kv_append_gqa_nhd(
         num_kv_heads=int(num_kv_heads),
         head_dim=int(head_dim),
         page_size=int(page_size),
-        max_pages_per_sequence=max_pages_per_sequence,
     )
     float_workspace = jnp.zeros((planned_float_workspace_nbytes,), dtype=jnp.uint8)
     int_workspace = jnp.asarray(planned_int_workspace, dtype=jnp.uint8)
