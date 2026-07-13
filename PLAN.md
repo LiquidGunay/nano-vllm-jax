@@ -223,7 +223,8 @@ bounded CPU cores, positive nice level, and mountpoint-owned caches/artifacts.
 
 ### PR 1: correct capacity, configuration, and base model ABI
 
-Status: [ ] draft PR [#7](https://github.com/LiquidGunay/nano-vllm-jax/pull/7), follow-up review fixes pushed; awaiting re-review
+Status: [x] merged as PR [#7](https://github.com/LiquidGunay/nano-vllm-jax/pull/7)
+at main commit `0b6aa72`
 
 Branch: `agent/base-correctness-abi` at `ef1ceab`
 
@@ -257,7 +258,25 @@ Merge gates:
 
 ### PR 2: explicit step, cache, route, and output ownership
 
-Status: [ ] blocked by PR 1
+Status: [ ] split in progress; host/device boundary is draft PR
+[#8](https://github.com/LiquidGunay/nano-vllm-jax/pull/8)
+
+PR 2a branch: `agent/step-ownership-abi` at `5cee688`
+
+PR 2a establishes the review boundary recommended by the cleanup audit:
+
+- `Scheduler.schedule()` returns immutable host-only `ScheduledRow` and
+  `SchedulePlan` values with an explicit `BucketShape`.
+- Runner-owned `BatchMaterializer` performs padding, packed layout,
+  `device_put`, and reusable decode-array lookup, then returns `DeviceBatch`.
+- `LLMEngine.step()` now exposes `schedule -> materialize -> execute`.
+- Importing scheduler and sequence in a clean process does not import JAX.
+- Exact guarded controls against the approved PR 1 head matched all output
+  tokens with no measured JIT growth: 0.8B B=8 measured `434.41` versus
+  `434.21` decode tok/s; 4B B=1 measured `49.92` versus `49.89`.
+
+PR 2b will keep the same ABI and complete route, commit, output, service,
+prefix-handle, and kernel-policy ownership below.
 
 Purpose: implement the host/device ABI that speculation will extend later.
 
