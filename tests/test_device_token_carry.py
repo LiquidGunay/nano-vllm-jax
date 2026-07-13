@@ -9,9 +9,11 @@ import pytest
 from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.device_batch import BatchMaterializer, DeviceBatch
 from nanovllm_jax.engine import LLMEngine
+from nanovllm_jax.output import DeviceTokenRef, OutputBuffer
 from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.scheduler import Scheduler
-from nanovllm_jax.sequence import DeviceTokenRef, SamplingParams, Sequence, SequenceStatus
+from nanovllm_jax.sequence import SamplingParams, Sequence, SequenceStatus
+from nanovllm_jax.step import RunResult
 
 
 def _batch_materializer(
@@ -53,96 +55,97 @@ def test_device_token_carry_comes_from_config():
     assert Scheduler(disabled).device_token_carry is False
 
 
-def test_sequence_materializes_deferred_device_tokens():
+def test_output_buffer_materializes_deferred_device_tokens():
     seq = Sequence([11, 22], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
 
-    seq.append_token_device(jnp.asarray(33, dtype=jnp.int32))
+    seq.output.append_device(jnp.asarray(33, dtype=jnp.int32))
 
     assert seq.num_completion_tokens == 1
-    assert seq.has_unmaterialized_device_tokens
+    assert seq.output.has_deferred_tokens
     assert seq.block_has_unmaterialized_device_tokens(0)
-    assert seq.completion_token_ids == [33]
-    assert not seq.has_unmaterialized_device_tokens
+    with pytest.raises(RuntimeError, match="materialize"):
+        seq.output.token_ids()
+    assert seq.output.materialize() == [33]
+    assert not seq.output.has_deferred_tokens
     assert seq.last_token == 33
 
 
-def test_sequence_materializes_deferred_device_tokens_for_multiple_sequences():
+def test_output_buffer_materializes_deferred_device_tokens_for_multiple_sequences():
     seq_a = Sequence([11], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
     seq_b = Sequence([22], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
 
-    seq_a.append_token_device(jnp.asarray(33, dtype=jnp.int32))
-    seq_b.append_token_device(jnp.asarray(44, dtype=jnp.int32))
+    seq_a.output.append_device(jnp.asarray(33, dtype=jnp.int32))
+    seq_b.output.append_device(jnp.asarray(44, dtype=jnp.int32))
 
-    Sequence.materialize_device_tokens_for_sequences([seq_a, seq_b])
+    OutputBuffer.materialize_many([seq_a.output, seq_b.output])
 
-    assert seq_a.completion_token_ids == [33]
-    assert seq_b.completion_token_ids == [44]
-    assert not seq_a.has_unmaterialized_device_tokens
-    assert not seq_b.has_unmaterialized_device_tokens
+    assert seq_a.output.token_ids() == [33]
+    assert seq_b.output.token_ids() == [44]
+    assert not seq_a.output.has_deferred_tokens
+    assert not seq_b.output.has_deferred_tokens
     assert seq_a.last_token == 33
     assert seq_b.last_token == 44
 
 
-def test_sequence_materializes_deferred_device_token_refs_for_multiple_sequences():
+def test_output_buffer_materializes_deferred_device_token_refs_for_multiple_sequences():
     seq_a = Sequence([11], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
     seq_b = Sequence([22], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
     token_vector = jnp.asarray([33, 44], dtype=jnp.int32)
 
-    seq_a.append_token_device(DeviceTokenRef(tokens=token_vector, row=0))
-    seq_b.append_token_device(DeviceTokenRef(tokens=token_vector, row=1))
+    seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
+    seq_b.output.append_device(DeviceTokenRef(tokens=token_vector, row=1))
 
-    Sequence.materialize_device_tokens_for_sequences([seq_a, seq_b])
+    OutputBuffer.materialize_many([seq_a.output, seq_b.output])
 
-    assert seq_a.completion_token_ids == [33]
-    assert seq_b.completion_token_ids == [44]
-    assert not seq_a.has_unmaterialized_device_tokens
-    assert not seq_b.has_unmaterialized_device_tokens
+    assert seq_a.output.token_ids() == [33]
+    assert seq_b.output.token_ids() == [44]
+    assert not seq_a.output.has_deferred_tokens
+    assert not seq_b.output.has_deferred_tokens
 
 
-def test_sequence_materializes_device_token_snapshot_without_clearing_newer_tokens():
+def test_output_snapshot_does_not_clear_newer_tokens():
     seq = Sequence([11], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True))
 
-    seq.append_token_device(jnp.asarray(33, dtype=jnp.int32))
-    snapshot = Sequence.snapshot_device_token_slots_for_sequences([seq])
-    Sequence.prefetch_device_token_slots(snapshot)
-    seq.append_token_device(jnp.asarray(44, dtype=jnp.int32))
+    seq.output.append_device(jnp.asarray(33, dtype=jnp.int32))
+    snapshot = seq.output.snapshot().prefetch()
+    seq.output.append_device(jnp.asarray(44, dtype=jnp.int32))
 
-    Sequence.materialize_device_token_slots(snapshot)
+    snapshot.materialize()
 
     assert seq.token_ids == [11, 33, 0]
-    assert seq.has_unmaterialized_device_tokens
+    assert seq.output.has_deferred_tokens
     assert seq.block_has_unmaterialized_device_tokens(0)
     assert seq.last_token == 0
     assert seq.last_token_device is not None
 
-    Sequence.materialize_device_tokens_for_sequences([seq])
+    seq.output.materialize()
 
-    assert seq.completion_token_ids == [33, 44]
-    assert not seq.has_unmaterialized_device_tokens
+    assert seq.output.token_ids() == [33, 44]
+    assert not seq.output.has_deferred_tokens
     assert seq.last_token == 44
 
 
-def test_sequence_prefetches_snapshot_before_later_materialization_without_clearing_newer_tokens():
+def test_output_prefetches_snapshot_before_later_materialization():
     events: list[str] = []
     first_token = _AsyncScalar(33, events)
     second_token = _AsyncScalar(44, events)
     seq = Sequence([11], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True))
 
-    seq.append_token_device(first_token)
-    snapshot = Sequence.snapshot_device_token_slots_for_sequences([seq])
-    prefetched = Sequence.prefetch_device_token_slots(snapshot)
-    seq.append_token_device(second_token)
+    seq.output.append_device(first_token)
+    snapshot = seq.output.snapshot()
+    prefetched = snapshot.prefetch()
+    seq.output.append_device(second_token)
 
     assert prefetched == snapshot
     assert first_token.prefetch_count == 1
     assert second_token.prefetch_count == 0
-    assert seq.materialized_completion_token_ids() == []
+    assert seq.output.materialized_prefix() == []
 
-    Sequence.materialize_device_token_slots(snapshot)
+    snapshot.materialize()
 
-    assert seq.materialized_completion_token_ids() == [33]
+    assert seq.output.materialized_prefix() == [33]
     assert seq.token_ids == [11, 33, 0]
-    assert seq.has_unmaterialized_device_tokens
+    assert seq.output.has_deferred_tokens
     assert seq.last_token_device is second_token
     assert events == ["prefetch-33", "materialize-33"]
 
@@ -450,16 +453,14 @@ def test_materializer_reuses_fixed_decode_arrays(monkeypatch):
     seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
     seq_a.block_table = [0]
     seq_b.block_table = [1]
-    seq_a.last_token = 0
-    seq_b.last_token = 0
-    seq_a.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
-    seq_b.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
+    seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
+    seq_b.output.append_device(DeviceTokenRef(tokens=token_vector, row=1))
 
     first = materializer.materialize(
         scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
     )
-    seq_a.append_token_device(DeviceTokenRef(tokens=token_vector, row=0))
-    seq_b.append_token_device(DeviceTokenRef(tokens=token_vector, row=1))
+    seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
+    seq_b.output.append_device(DeviceTokenRef(tokens=token_vector, row=1))
     second = materializer.materialize(
         scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
     )
@@ -471,9 +472,9 @@ def test_materializer_reuses_fixed_decode_arrays(monkeypatch):
     assert second.seq_ids is first.seq_ids
     assert second.query_start_loc is first.query_start_loc
     assert second.block_tables is first.block_tables
-    np.testing.assert_array_equal(np.asarray(first.seq_lens), np.asarray([2, 2]))
-    np.testing.assert_array_equal(np.asarray(second.seq_lens), np.asarray([3, 3]))
-    assert second.seq_lens_host == (3, 3)
+    np.testing.assert_array_equal(np.asarray(first.seq_lens), np.asarray([3, 3]))
+    np.testing.assert_array_equal(np.asarray(second.seq_lens), np.asarray([4, 4]))
+    assert second.seq_lens_host == (4, 4)
 
 
 def test_schedule_plan_selects_smallest_decode_block_bucket():
@@ -536,7 +537,9 @@ def test_scheduler_resident_capacity_can_exceed_execution_batch():
     assert first_decode.bucket.batch_size == 2
     assert len(scheduler.waiting) == 2
 
-    scheduler.postprocess(first_decode_seqs, [101, 102])
+    engine = object.__new__(LLMEngine)
+    engine.scheduler = scheduler
+    engine.commit(first_decode_seqs, first_decode, RunResult.from_rows([101, 102]))
     assert len(scheduler.running) == 0
 
     second_prefill_seqs, second_prefill = scheduler.schedule()
@@ -573,16 +576,14 @@ def test_materializer_can_reuse_seq_lens_placeholder(monkeypatch):
     seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
     seq_a.block_table = [0]
     seq_b.block_table = [1]
-    seq_a.last_token = 0
-    seq_b.last_token = 0
-    seq_a.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
-    seq_b.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
+    seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
+    seq_b.output.append_device(DeviceTokenRef(tokens=token_vector, row=1))
 
     first = materializer.materialize(
         scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
     )
-    seq_a.append_token_device(DeviceTokenRef(tokens=token_vector, row=0))
-    seq_b.append_token_device(DeviceTokenRef(tokens=token_vector, row=1))
+    seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
+    seq_b.output.append_device(DeviceTokenRef(tokens=token_vector, row=1))
     second = materializer.materialize(
         scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
     )
@@ -590,7 +591,7 @@ def test_materializer_can_reuse_seq_lens_placeholder(monkeypatch):
     assert first.uses_static_decode_metadata
     assert second.uses_static_decode_metadata
     assert second.seq_lens is first.seq_lens
-    assert second.seq_lens_host == (3, 3)
+    assert second.seq_lens_host == (4, 4)
 
 
 def test_materializer_uses_resident_metadata_placeholders(monkeypatch):
@@ -612,16 +613,14 @@ def test_materializer_uses_resident_metadata_placeholders(monkeypatch):
     seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
     seq_a.block_table = [1]
     seq_b.block_table = [2]
-    seq_a.last_token = 0
-    seq_b.last_token = 0
-    seq_a.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
-    seq_b.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
+    seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
+    seq_b.output.append_device(DeviceTokenRef(tokens=token_vector, row=1))
 
     first = materializer.materialize(
         scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
     )
-    seq_a.append_token_device(DeviceTokenRef(tokens=token_vector, row=0))
-    seq_b.append_token_device(DeviceTokenRef(tokens=token_vector, row=1))
+    seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
+    seq_b.output.append_device(DeviceTokenRef(tokens=token_vector, row=1))
     seq_a.block_table = [1, 4]
     second = materializer.materialize(
         scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
@@ -635,7 +634,7 @@ def test_materializer_uses_resident_metadata_placeholders(monkeypatch):
     np.testing.assert_array_equal(np.asarray(second.seq_lens), np.zeros((2,), dtype=np.int32))
     assert first.block_tables_host == ((1, 0, 0), (2, 0, 0))
     assert second.block_tables_host == ((1, 4, 0), (2, 0, 0))
-    assert second.seq_lens_host == (3, 3)
+    assert second.seq_lens_host == (4, 4)
 
 
 def test_materializer_reuses_resident_placeholders_across_seq_ids(monkeypatch):
@@ -657,10 +656,8 @@ def test_materializer_reuses_resident_placeholders_across_seq_ids(monkeypatch):
     seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
     seq_a.block_table = [1]
     seq_b.block_table = [2]
-    seq_a.last_token = 0
-    seq_b.last_token = 0
-    seq_a.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
-    seq_b.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
+    seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
+    seq_b.output.append_device(DeviceTokenRef(tokens=token_vector, row=1))
 
     first = materializer.materialize(
         scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
@@ -670,10 +667,8 @@ def test_materializer_reuses_resident_placeholders_across_seq_ids(monkeypatch):
     seq_d = Sequence([7, 8], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=18)
     seq_c.block_table = [3]
     seq_d.block_table = [4]
-    seq_c.last_token = 0
-    seq_d.last_token = 0
-    seq_c.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
-    seq_d.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
+    seq_c.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
+    seq_d.output.append_device(DeviceTokenRef(tokens=token_vector, row=1))
 
     second = materializer.materialize(
         scheduler.build_schedule_plan([seq_c, seq_d], is_prefill=False)
@@ -712,10 +707,8 @@ def test_materializer_preserves_greedy_burst_width(monkeypatch):
     seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True), seq_id=8)
     seq_a.block_table = [0]
     seq_b.block_table = [1]
-    seq_a.last_token = 0
-    seq_b.last_token = 0
-    seq_a.last_token_device = DeviceTokenRef(tokens=token_vector, row=0)
-    seq_b.last_token_device = DeviceTokenRef(tokens=token_vector, row=1)
+    seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
+    seq_b.output.append_device(DeviceTokenRef(tokens=token_vector, row=1))
 
     batch = materializer.materialize(
         scheduler.build_schedule_plan(
@@ -810,7 +803,7 @@ def test_model_runner_first_static_decode_can_use_scheduler_seq_lens(monkeypatch
     np.testing.assert_array_equal(np.asarray(carried_batch.seq_lens), np.asarray([5, 9]))
 
 
-def test_scheduler_postprocess_can_defer_greedy_device_token(monkeypatch):
+def test_engine_commit_can_defer_greedy_device_token(monkeypatch):
     scheduler = Scheduler(
         RuntimeConfig(
             max_num_seqs=1,
@@ -825,15 +818,21 @@ def test_scheduler_postprocess_can_defer_greedy_device_token(monkeypatch):
         seq_id=7,
     )
 
-    finished = scheduler.postprocess([seq], [jnp.asarray(202, dtype=jnp.int32)])
+    engine = object.__new__(LLMEngine)
+    engine.scheduler = scheduler
+    result = engine.commit(
+        [seq],
+        SimpleNamespace(is_prefill=False, num_scheduled_tokens=1),
+        RunResult.from_rows([jnp.asarray(202, dtype=jnp.int32)]),
+    )
 
-    assert finished == [False]
+    assert result.finished == ()
     assert seq.num_completion_tokens == 1
-    assert seq.has_unmaterialized_device_tokens
-    assert seq.completion_token_ids == [202]
+    assert seq.output.has_deferred_tokens
+    assert seq.output.materialize() == [202]
 
 
-def test_scheduler_postprocess_can_defer_sampled_device_token_ref(monkeypatch):
+def test_engine_commit_can_defer_sampled_device_token_ref(monkeypatch):
     scheduler = Scheduler(
         RuntimeConfig(
             max_num_seqs=1,
@@ -849,9 +848,15 @@ def test_scheduler_postprocess_can_defer_sampled_device_token_ref(monkeypatch):
     )
     token_vector = jnp.asarray([202], dtype=jnp.int32)
 
-    finished = scheduler.postprocess([seq], [DeviceTokenRef(tokens=token_vector, row=0)])
+    engine = object.__new__(LLMEngine)
+    engine.scheduler = scheduler
+    result = engine.commit(
+        [seq],
+        SimpleNamespace(is_prefill=False, num_scheduled_tokens=1),
+        RunResult.from_rows([DeviceTokenRef(tokens=token_vector, row=0)]),
+    )
 
-    assert finished == [False]
+    assert result.finished == ()
     assert seq.num_completion_tokens == 1
-    assert seq.has_unmaterialized_device_tokens
-    assert seq.completion_token_ids == [202]
+    assert seq.output.has_deferred_tokens
+    assert seq.output.materialize() == [202]

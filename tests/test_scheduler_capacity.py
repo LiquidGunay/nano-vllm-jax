@@ -9,6 +9,7 @@ from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.sequence import SamplingParams, Sequence
+from nanovllm_jax.step import RunResult
 
 
 def test_scheduler_and_sequence_import_without_jax():
@@ -51,6 +52,12 @@ def _scheduler(*, block_size: int = 2, num_blocks: int = 3) -> Scheduler:
     )
 
 
+def _commit(scheduler: Scheduler, seqs, plan, rows):
+    engine = object.__new__(LLMEngine)
+    engine.scheduler = scheduler
+    return engine.commit(seqs, plan, RunResult.from_rows(rows))
+
+
 def test_capacity_is_reserved_before_generation_and_never_preempted():
     scheduler = _scheduler()
     first = Sequence(
@@ -68,18 +75,18 @@ def test_capacity_is_reserved_before_generation_and_never_preempted():
     scheduler.add(first)
     scheduler.add(second)
 
-    seqs, _ = scheduler.schedule()
+    seqs, plan = scheduler.schedule()
     assert seqs == [first]
     assert len(first.block_table) == 1
     assert scheduler.block_manager.stats()["reserved_blocks"] == 2
-    scheduler.postprocess(seqs, [10], prefill_chunk_lengths=[2])
+    _commit(scheduler, seqs, plan, [10])
 
     for token in (11, 12, 13):
-        seqs, _ = scheduler.schedule()
+        seqs, plan = scheduler.schedule()
         assert seqs == [first]
-        scheduler.postprocess(seqs, [token])
+        _commit(scheduler, seqs, plan, [token])
 
-    assert first.completion_token_ids == [10, 11, 12, 13]
+    assert first.output.token_ids() == [10, 11, 12, 13]
     assert first.is_finished
     assert len(scheduler.block_manager.free_block_ids) == 3
     assert scheduler.block_manager.stats()["reserved_blocks"] == 0
@@ -177,8 +184,8 @@ def test_first_fitting_waiter_bypasses_blocked_large_request():
     )
     active = Sequence([1, 2], SamplingParams(max_tokens=2), seq_id=0, block_size=2)
     scheduler.add(active)
-    seqs, _ = scheduler.schedule()
-    scheduler.postprocess(seqs, [10], prefill_chunk_lengths=[2])
+    seqs, plan = scheduler.schedule()
+    _commit(scheduler, seqs, plan, [10])
 
     large = Sequence([3, 4], SamplingParams(max_tokens=6), seq_id=1, block_size=2)
     small = Sequence([5], SamplingParams(max_tokens=1), seq_id=2, block_size=2)

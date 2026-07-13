@@ -2,20 +2,18 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from nanovllm_jax.output import OutputBuffer
 from nanovllm_jax.service import EngineService
 from nanovllm_jax.sequence import SamplingParams
+from nanovllm_jax.step import FinishedRequest, FinishReason, StepResult, TokenEvent
 
 
 @dataclass
 class _FakeSeq:
     seq_id: int
     sampling_params: SamplingParams
-    completion: list[int] = field(default_factory=list)
+    output: OutputBuffer = field(default_factory=OutputBuffer)
     is_finished: bool = False
-
-    @property
-    def completion_token_ids(self):
-        return list(self.completion)
 
 
 class _FakeEngine:
@@ -33,13 +31,16 @@ class _FakeEngine:
     def step(self):
         active = [seq for seq in self.seqs if not seq.is_finished]
         self.step_batches.append(tuple(seq.seq_id for seq in active))
-        outputs = []
+        emitted = []
+        finished = []
         for seq in active:
-            seq.completion.append(100 + seq.seq_id + len(seq.completion))
-            if len(seq.completion) >= seq.sampling_params.max_tokens:
+            token_id = 100 + seq.seq_id + len(seq.output)
+            index = seq.output.append(token_id)
+            emitted.append(TokenEvent(seq.seq_id, index, token_id))
+            if len(seq.output) >= seq.sampling_params.max_tokens:
                 seq.is_finished = True
-                outputs.append((seq.seq_id, list(seq.completion)))
-        return outputs, -len(active)
+                finished.append(FinishedRequest(seq.seq_id, FinishReason.LENGTH))
+        return StepResult("decode", len(active), tuple(emitted), tuple(finished))
 
     def is_finished(self):
         return all(seq.is_finished for seq in self.seqs)
@@ -67,6 +68,8 @@ def test_service_admits_independent_requests_into_same_engine_step():
 
         assert first_result.token_ids == [100, 101]
         assert second_result.token_ids == [101, 102]
+        assert first_result.finish_reason is FinishReason.LENGTH
+        assert second_result.finish_reason is FinishReason.LENGTH
         assert (0, 1) in engine.step_batches
     finally:
         service.stop()
@@ -137,6 +140,7 @@ def test_service_streams_token_events_before_done():
         assert events[0]["event"] == "token"
         assert events[0]["token_id"] == 100
         assert events[-1]["event"] == "done"
+        assert events[-1]["result"]["finish_reason"] == "length"
         assert handle.wait(timeout=1.0).token_ids == [100]
     finally:
         service.stop()

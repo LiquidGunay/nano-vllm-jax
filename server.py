@@ -308,7 +308,11 @@ def _run_generation(inputs: list[str | list[int]], sampling_params: list[Samplin
     if service is None:
         return engine.generate(inputs, sampling_params=sampling_params, use_tqdm=False)
     return [
-        {"text": result.text, "token_ids": result.token_ids}
+        {
+            "text": result.text,
+            "token_ids": result.token_ids,
+            "finish_reason": result.finish_reason.value,
+        }
         for result in service.generate_many(inputs, sampling_params)
     ]
 
@@ -320,6 +324,7 @@ def _generation_payload(results, prompt_tokens: list[int], elapsed: float, is_ba
             "text": result["text"],
             "token_ids": result["token_ids"],
             "new_tokens": result["token_ids"],
+            "finish_reason": result.get("finish_reason", "length"),
             "usage": {
                 "prompt_tokens": prompt_count,
                 "completion_tokens": completion_count,
@@ -350,14 +355,18 @@ def _generation_payload(results, prompt_tokens: list[int], elapsed: float, is_ba
 def _completion_payload(results, prompt_tokens: list[int], elapsed: float):
     completion_tokens = [len(result["token_ids"]) for result in results]
     created = int(time.time())
-    model_name = engine.config.__class__.__name__ if engine is not None else "unknown"
+    model_name = engine.model_id if engine is not None else "unknown"
     return {
         "id": f"cmpl-{created}",
         "object": "text_completion",
         "created": created,
         "model": model_name,
         "choices": [
-            {"text": result["text"], "index": index, "finish_reason": "length"}
+            {
+                "text": result["text"],
+                "index": index,
+                "finish_reason": result.get("finish_reason", "length"),
+            }
             for index, result in enumerate(results)
         ],
         "usage": {

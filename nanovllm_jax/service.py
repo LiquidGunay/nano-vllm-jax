@@ -19,7 +19,9 @@ import threading
 import time
 from typing import Any, Iterable
 
+from nanovllm_jax.output import OutputBuffer
 from nanovllm_jax.sequence import SamplingParams
+from nanovllm_jax.step import FinishReason, StepResult
 
 
 _STOP = object()
@@ -30,6 +32,7 @@ _DONE = object()
 class GenerationResult:
     text: str
     token_ids: list[int]
+    finish_reason: FinishReason
 
 
 @dataclass(frozen=True)
@@ -43,7 +46,6 @@ class _PendingRequest:
 class _ActiveRequest:
     seq: Any
     handle: "RequestHandle"
-    seen_completion_tokens: int = 0
 
 
 class RequestHandle:
@@ -93,7 +95,11 @@ class RequestHandle:
                 "event": "done",
                 "request_id": self.request_id,
                 "seq_id": self.seq_id,
-                "result": {"text": result.text, "token_ids": result.token_ids},
+                "result": {
+                    "text": result.text,
+                    "token_ids": result.token_ids,
+                    "finish_reason": result.finish_reason.value,
+                },
             }
         )
         self._events.put(_DONE)
@@ -221,13 +227,13 @@ class EngineService:
 
             try:
                 with self.engine_lock:
-                    outputs, _ = self.engine.step()
+                    step_result = self.engine.step()
             except BaseException as exc:
                 self._mark_failed(exc)
                 break
 
-            self._publish_progress()
-            self._publish_finished(outputs)
+            self._publish_progress(step_result)
+            self._publish_finished(step_result)
 
     def _blocking_get(self) -> _PendingRequest | object | None:
         try:
@@ -278,42 +284,60 @@ class EngineService:
                 request.handle._set_seq_id(int(seq.seq_id))
                 self._active[int(seq.seq_id)] = _ActiveRequest(seq=seq, handle=request.handle)
 
-    def _publish_progress(self) -> None:
-        for seq_id, active in list(self._active.items()):
-            if not active.handle.stream:
-                continue
-            seq = active.seq
-            if not hasattr(seq, "completion_token_ids"):
-                continue
-            completion = list(seq.completion_token_ids)
-            if len(completion) <= active.seen_completion_tokens:
-                continue
-            for completion_index, token_id in enumerate(
-                completion[active.seen_completion_tokens:],
-                start=active.seen_completion_tokens,
-            ):
-                event = {
-                    "event": "token",
-                    "request_id": active.handle.request_id,
-                    "seq_id": seq_id,
-                    "completion_index": completion_index,
-                    "token_id": int(token_id),
-                }
-                detokenize = getattr(self.engine, "_detokenize", None)
-                if detokenize is not None:
-                    event["text"] = detokenize([int(token_id)])
-                active.handle._publish(event)
-            active.seen_completion_tokens = len(completion)
+    def _publish_progress(self, step_result: StepResult) -> None:
+        events = [
+            event
+            for event in step_result.emitted_tokens
+            if event.seq_id in self._active
+            and self._active[event.seq_id].handle.stream
+        ]
+        buffers = {
+            event.seq_id: self._active[event.seq_id].seq.output
+            for event in events
+        }
+        OutputBuffer.snapshot_many(buffers.values()).prefetch().materialize()
 
-    def _publish_finished(self, outputs: list[tuple[int, list[int]]]) -> None:
-        for seq_id, token_ids in outputs:
-            active = self._active.pop(int(seq_id), None)
+        for token in events:
+            active = self._active[token.seq_id]
+            token_id = active.seq.output.token_id(token.completion_index)
+            event = {
+                "event": "token",
+                "request_id": active.handle.request_id,
+                "seq_id": token.seq_id,
+                "completion_index": token.completion_index,
+                "token_id": token_id,
+            }
+            detokenize = getattr(self.engine, "_detokenize", None)
+            if detokenize is not None:
+                event["text"] = detokenize([token_id])
+            active.handle._publish(event)
+
+    def _publish_finished(self, step_result: StepResult) -> None:
+        active_requests = [
+            (request, self._active.get(request.seq_id))
+            for request in step_result.finished
+        ]
+        buffers = [
+            active.seq.output
+            for _, active in active_requests
+            if active is not None
+        ]
+        OutputBuffer.snapshot_many(buffers).prefetch().materialize()
+
+        for request, _ in active_requests:
+            active = self._active.pop(request.seq_id, None)
             if active is None:
                 continue
-            token_ids = [int(token) for token in token_ids]
+            token_ids = active.seq.output.token_ids()
             detokenize = getattr(self.engine, "_detokenize", None)
             text = detokenize(token_ids) if detokenize is not None else ""
-            active.handle._finish(GenerationResult(text=text, token_ids=token_ids))
+            active.handle._finish(
+                GenerationResult(
+                    text=text,
+                    token_ids=token_ids,
+                    finish_reason=request.reason,
+                )
+            )
 
     def _fail_all_active(self, exc: BaseException) -> None:
         for active in self._active.values():

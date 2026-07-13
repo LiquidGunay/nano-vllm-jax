@@ -42,8 +42,11 @@ Resolved in the structural cleanup:
 - Hardened `EngineService` lifecycle: engine failures are terminal for the
   service, queued/active waiters are failed on stop, and bounded queues fail
   clearly under backpressure.
-- Moved deferred device-token references, prefetch, and materialization policy
-  into `output.py`; `Sequence` now delegates compatibility methods.
+- Made `OutputBuffer` the owner of generated host tokens and deferred device
+  references; `Sequence` now contains only logical/cache request state.
+- Added typed `RunResult` and `StepResult` boundaries and one
+  `LLMEngine.commit()` transition. The service consumes token events directly,
+  and output materialization is always explicit.
 - Removed the dormant mixed prefill/decode scheduler path instead of leaving an
   uninvoked private scheduling mode on cleaned main.
 - Renamed the private merged execution config to `RuntimeConfig`; the public API

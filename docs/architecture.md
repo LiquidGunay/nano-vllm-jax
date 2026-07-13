@@ -19,8 +19,21 @@ worker advances the engine and publishes token events or final results.
 - create `Sequence` objects,
 - call the scheduler,
 - call the runner,
-- postprocess finished requests,
+- commit each `RunResult` exactly once,
 - release runner/cache state.
+
+The control boundary is explicit:
+
+```text
+Scheduler -> SchedulePlan
+ModelRunner -> DeviceBatch -> RunResult
+LLMEngine.commit() -> StepResult
+```
+
+`Sequence` owns logical positions and cache metadata. `OutputBuffer` owns every
+generated token, including deferred device references. Reading logical request
+state never synchronizes the accelerator; callers explicitly prefetch and
+materialize output snapshots when tokens must reach the host.
 
 ## Scheduling
 
@@ -64,6 +77,12 @@ counts. The fused append kernel skips rows whose logical length is zero, so a
 padded row cannot write through its placeholder page.
 
 `ModelExecutor` owns JIT cache keys and calls into `model.forward_step`.
+
+`RunResult` contains one emitted-token row per scheduled sequence. The engine
+commits those rows into `OutputBuffer`, advances logical/cache state, assigns
+EOS or length finish reasons, and returns a `StepResult` of token and finish
+events. The service consumes those events directly instead of scanning
+sequences for new output.
 
 Checkpoint `config.json` owns model dimensions and layer types. The loader
 accepts the validated Qwen3.5 0.8B, 2B, and 4B text configurations, validates
