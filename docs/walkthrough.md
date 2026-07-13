@@ -18,9 +18,13 @@ boundaries, so unwritten future tokens do not evict reusable prefixes. If the
 capacity reservation cannot be made, the request waits while active requests
 continue; a bounded first-fit scan still admits smaller requests behind it. An
 admitted request is never later evicted with partial state. The scheduler then
-chooses a prefill chunk and returns a `ScheduledBatch`.
+chooses a prefill chunk and returns a host-only `SchedulePlan`.
 The cleaned scheduler chooses either prefill work or decode work for a step; it
 does not carry a dormant mixed prefill/decode mode.
+
+`ModelRunner` materializes that plan. It pads rows to the selected bucket,
+reuses eligible device metadata, and produces the `DeviceBatch` consumed by
+compiled execution.
 
 Packed prefill arrays use fixed bucket shapes:
 
@@ -57,7 +61,7 @@ and GDN hybrid state all advance by the same committed prefix.
 ## One Decode Step
 
 On the next `engine.step()`, the scheduler picks running requests and returns a
-decode batch:
+decode plan. The runner materializes these arrays:
 
 ```text
 tokens       [batch_bucket, 1]

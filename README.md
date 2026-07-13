@@ -62,8 +62,9 @@ server.py
   -> EngineService
   -> LLMEngine
   -> Scheduler -> BlockManager
-  -> ScheduledBatch
+  -> SchedulePlan (host)
   -> ModelRunner
+  -> DeviceBatch
   -> ModelExecutor
   -> Qwen3.5 model
   -> attention / GDN / LM-head kernels
@@ -83,7 +84,9 @@ and GDN hybrid state advance by the same committed prefix.
 3. [nanovllm_jax/service.py](nanovllm_jax/service.py) - online request queue.
 4. [nanovllm_jax/engine.py](nanovllm_jax/engine.py) - request lifecycle and step loop.
 5. [nanovllm_jax/scheduler.py](nanovllm_jax/scheduler.py) and [nanovllm_jax/block_manager.py](nanovllm_jax/block_manager.py) - work selection and cache pages.
-6. [nanovllm_jax/batch.py](nanovllm_jax/batch.py) - Python-to-JAX batch contract.
+6. [nanovllm_jax/batch.py](nanovllm_jax/batch.py) and
+   [nanovllm_jax/device_batch.py](nanovllm_jax/device_batch.py) - host planning
+   and runner-owned device materialization.
 7. [nanovllm_jax/runner.py](nanovllm_jax/runner.py) and [nanovllm_jax/executor.py](nanovllm_jax/executor.py) - persistent device state and compiled calls.
 8. [nanovllm_jax/model.py](nanovllm_jax/model.py) - parameter structure, layer loop, and forward entrypoints.
 9. [nanovllm_jax/projection.py](nanovllm_jax/projection.py), [nanovllm_jax/attention.py](nanovllm_jax/attention.py), [nanovllm_jax/gdn.py](nanovllm_jax/gdn.py), and [nanovllm_jax/lm_head.py](nanovllm_jax/lm_head.py) - the model math split by role.

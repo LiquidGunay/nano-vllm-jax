@@ -257,22 +257,22 @@ class LLMEngine:
         return [self.add_request(prompt, sp) for prompt, sp in zip(request_inputs, sampling_params)]
 
     def step(self, *, materialize_finished_outputs: bool = True) -> tuple[List[tuple], int]:
-        seqs, scheduled_batch = self.scheduler.schedule()
-        prefill_chunk_lengths: list[int] | None = None
-        if scheduled_batch.is_prefill:
-            if scheduled_batch.query_lens_host is not None:
-                prefill_chunk_lengths = [int(x) for x in scheduled_batch.query_lens_host[:len(seqs)]]
-            else:
-                prefill_chunk_lengths = [int(x) for x in scheduled_batch.query_lens.tolist()[:len(seqs)]]
+        seqs, schedule_plan = self.scheduler.schedule()
+        prefill_chunk_lengths = (
+            list(schedule_plan.prefill_chunk_lengths)
+            if schedule_plan.is_prefill
+            else None
+        )
 
         self.model_runner.install_cached_prefix_hybrid_states(
             seqs,
             getattr(self.scheduler, "prefix_cache_hybrid_states", None),
         )
 
-        token_ids = self.model_runner.run(seqs, batch=scheduled_batch)
+        device_batch = self.model_runner.materialize(schedule_plan)
+        token_ids = self.model_runner.execute(seqs, device_batch)
 
-        if scheduled_batch.is_prefill:
+        if schedule_plan.is_prefill:
             prefix_states_by_seq = None
             if (
                 getattr(self.scheduler, "enable_prefix_cache_execution", False)
@@ -298,10 +298,14 @@ class LLMEngine:
         else:
             outputs = [(seq.seq_id, []) for seq in seqs if seq.is_finished]
 
-        if scheduled_batch.is_prefill:
-            num_tokens = scheduled_batch.num_prefill_tokens
+        if schedule_plan.is_prefill:
+            num_tokens = schedule_plan.num_scheduled_tokens
         else:
-            num_tokens = -getattr(self.scheduler, "last_num_generated_tokens", scheduled_batch.num_decode_tokens)
+            num_tokens = -getattr(
+                self.scheduler,
+                "last_num_generated_tokens",
+                schedule_plan.num_scheduled_tokens,
+            )
 
         return outputs, num_tokens
 

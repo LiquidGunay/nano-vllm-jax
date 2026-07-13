@@ -6,29 +6,19 @@ Owns:
 Receives:
     Admitted ``Sequence`` objects and static serving capacity config.
 Returns:
-    Scheduled sequences plus a fixed-shape ``ScheduledBatch``.
+    Scheduled sequences plus an immutable host-only ``SchedulePlan``.
 Invariant:
-    Scheduler chooses logical work; batch construction is the only place that
-    creates JAX arrays.
+    Scheduling never creates or reads accelerator arrays.
 """
 
 from collections import deque
 from typing import Deque, List, Tuple
 
-import jax
-import jax.numpy as jnp
-import numpy as np
-
 from nanovllm_jax.config import RuntimeConfig
-from nanovllm_jax.batch import ScheduledBatch
+from nanovllm_jax.batch import BucketShape, ScheduledRow, SchedulePlan
 from nanovllm_jax.output import DeviceTokenRef
 from nanovllm_jax.sequence import Sequence, SequenceStatus, SamplingParams
 from nanovllm_jax.block_manager import BlockManager
-
-
-def _device_int32_arrays(*values):
-    return jax.device_put(tuple(np.asarray(value, dtype=np.int32) for value in values))
-
 
 def _config_flag(config: RuntimeConfig | None, attr: str, *, default: bool = False) -> bool:
     if config is not None and hasattr(config, attr):
@@ -79,14 +69,7 @@ class Scheduler:
             raise ValueError("prefill_layout must be 'packed' or 'dense'")
         self.batch_size_buckets = tuple(getattr(config, "batch_size_buckets", ()))
         self.decode_block_table_buckets = tuple(getattr(config, "decode_block_table_buckets", ()) or ())
-        self.jax_execution = getattr(config, "jax_execution", "eager")
         self.device_token_carry = _config_flag(config, "device_token_carry")
-        self.static_decode_metadata = _config_flag(config, "static_decode_metadata")
-        self.resident_decode_metadata = _config_flag(config, "resident_decode_metadata")
-        self.static_decode_seq_lens_carry = _config_flag(
-            config,
-            "static_decode_seq_lens_carry",
-        )
         if self.prefill_layout == "packed" and self.prefill_buckets:
             self.prefill_chunk_budget = max(self.prefill_buckets)
         else:
@@ -110,9 +93,6 @@ class Scheduler:
             ),
         )
         self.max_blocks_per_seq = getattr(config, "max_blocks_per_seq", None)
-        self._static_decode_metadata_cache: dict[str, object] | None = None
-        self._static_decode_metadata_cache_by_key: dict[tuple[object, ...], dict[str, object]] = {}
-        self._static_decode_constant_cache: dict[tuple[object, ...], dict[str, object]] = {}
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, 
             config.block_size
@@ -229,11 +209,11 @@ class Scheduler:
                 )
         self.waiting.append(seq)
 
-    def schedule(self) -> Tuple[List[Sequence], ScheduledBatch]:
+    def schedule(self) -> Tuple[List[Sequence], SchedulePlan]:
         """Schedule sequences for execution.
         
         Returns:
-            Tuple of (scheduled sequences, scheduled batch)
+            Tuple of scheduled sequences and their host execution plan.
         """
         scheduled_seqs: List[Sequence] = []
         num_seqs = 0
@@ -331,7 +311,7 @@ class Scheduler:
 
         if scheduled_seqs:
             self.running.extend(scheduled_running)
-            return scheduled_seqs, self.build_scheduled_batch(
+            return scheduled_seqs, self.build_schedule_plan(
                 scheduled_seqs,
                 is_prefill=True,
                 prefill_chunk_lens=prefill_chunk_lens,
@@ -362,14 +342,14 @@ class Scheduler:
         if not scheduled_seqs:
             raise RuntimeError(self._capacity_exhausted_message())
         self.running.extendleft(reversed(scheduled_seqs))
-        decode_step_count = self._decode_step_count_for_scheduled_batch(scheduled_seqs)
-        return scheduled_seqs, self.build_scheduled_batch(
+        decode_step_count = self._decode_step_count(scheduled_seqs)
+        return scheduled_seqs, self.build_schedule_plan(
             scheduled_seqs,
             is_prefill=False,
             decode_step_count=decode_step_count,
         )
 
-    def _decode_step_count_for_scheduled_batch(self, seqs: List[Sequence]) -> int:
+    def _decode_step_count(self, seqs: List[Sequence]) -> int:
         step_counts: List[int] = []
         for seq in seqs:
             remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
@@ -404,7 +384,7 @@ class Scheduler:
             )
         return int(max_token_budget)
 
-    def build_scheduled_batch(
+    def build_schedule_plan(
         self,
         seqs: List[Sequence],
         *,
@@ -414,360 +394,117 @@ class Scheduler:
         max_blocks_per_seq: int | None = None,
         prefill_chunk_lens: List[int] | None = None,
         decode_step_count: int = 1,
-    ) -> ScheduledBatch:
-        """Build the canonical engine batch contract for one step."""
-        query_tokens: List[List[int]] = []
-        query_positions: List[List[int]] = []
-        block_tables: List[List[int]] = []
-        seq_lens: List[int] = []
-        query_lens: List[int] = []
-        prefill_is_final: List[bool] = []
+    ) -> SchedulePlan:
+        """Describe one step without allocating accelerator arrays."""
+        rows: List[ScheduledRow] = []
 
         actual_max_blocks = max(1, max(len(seq.block_table) for seq in seqs))
-        max_blocks = actual_max_blocks
+        block_table_width = actual_max_blocks
         if max_blocks_per_seq is None:
             max_blocks_per_seq = self.max_blocks_per_seq
         if max_blocks_per_seq is not None:
             if actual_max_blocks > max_blocks_per_seq:
                 raise ValueError(
-                    f"scheduled block table needs {actual_max_blocks} blocks but bucket has {max_blocks_per_seq}"
+                    f"scheduled block table needs {actual_max_blocks} blocks "
+                    f"but bucket has {max_blocks_per_seq}"
                 )
-            max_blocks = max_blocks_per_seq
+            block_table_width = max_blocks_per_seq
         if not is_prefill and self.decode_block_table_buckets:
-            max_blocks = self._select_bucket(
+            block_table_width = self._select_bucket(
                 actual_max_blocks,
                 self.decode_block_table_buckets,
                 "decode block table",
             )
-            if max_blocks_per_seq is not None and max_blocks > max_blocks_per_seq:
+            if max_blocks_per_seq is not None and block_table_width > max_blocks_per_seq:
                 raise ValueError(
-                    f"decode block table bucket {max_blocks} exceeds max_blocks_per_seq {max_blocks_per_seq}"
+                    f"decode block table bucket {block_table_width} exceeds "
+                    f"max_blocks_per_seq {max_blocks_per_seq}"
                 )
-        for seq in seqs:
+
+        for index, seq in enumerate(seqs):
             if is_prefill:
                 start = seq.num_cached_tokens
                 chunk_len = seq.num_tokens - start
                 if prefill_chunk_lens is not None:
-                    seq_idx = len(query_lens)
-                    if seq_idx >= len(prefill_chunk_lens):
+                    if index >= len(prefill_chunk_lens):
                         raise ValueError(
-                            "prefill_chunk_lens length must match number of scheduled prefill sequences"
+                            "prefill_chunk_lens length must match scheduled sequences"
                         )
-                    chunk_len = prefill_chunk_lens[seq_idx]
+                    chunk_len = prefill_chunk_lens[index]
                 if chunk_len <= 0:
-                    raise ValueError(f"Scheduled sequence {seq.seq_id} has no executable tokens")
+                    raise ValueError(
+                        f"Scheduled sequence {seq.seq_id} has no executable tokens"
+                    )
                 end = start + chunk_len
                 tokens = seq.token_ids[start:end]
-                positions = list(range(start, end))
+                positions = range(start, end)
                 final_chunk = end >= seq.num_tokens
+                seq_len = end
             else:
                 tokens = [seq.last_token]
                 positions = [seq.num_tokens - 1]
                 final_chunk = True
+                seq_len = seq.num_tokens
 
-            if not tokens:
-                raise ValueError(f"Scheduled sequence {seq.seq_id} has no executable tokens")
+            rows.append(
+                ScheduledRow(
+                    seq_id=int(seq.seq_id),
+                    token_ids=tuple(int(token) for token in tokens),
+                    positions=tuple(positions),
+                    block_table=tuple(int(block) for block in seq.block_table),
+                    seq_len=int(seq_len),
+                    prefill_is_final=bool(final_chunk),
+                    carries_device_token=(
+                        not is_prefill
+                        and seq.temperature == 0
+                        and seq.ignore_eos
+                        and _is_device_token(getattr(seq, "last_token_device", None))
+                    ),
+                )
+            )
 
-            query_tokens.append(tokens)
-            query_positions.append(positions)
-            block_tables.append(seq.block_table + [0] * (max_blocks - len(seq.block_table)))
-            seq_lens.append(end if is_prefill else seq.num_tokens)
-            query_lens.append(len(tokens))
-            prefill_is_final.append(final_chunk)
-
-        if batch_size_bucket is None and self.batch_size_buckets:
-            batch_size_bucket = self._select_bucket(len(seqs), self.batch_size_buckets, "batch")
         if batch_size_bucket is None:
-            batch_size_bucket = len(seqs)
-        if len(seqs) > batch_size_bucket:
-            raise ValueError(f"scheduled batch has {len(seqs)} seqs but bucket has {batch_size_bucket}")
-        seq_ids_host = tuple([seq.seq_id for seq in seqs] + [-1] * (batch_size_bucket - len(seqs)))
-        if is_prefill and self.prefill_layout == "packed":
-            return self._build_packed_prefill_batch(
+            batch_size_bucket = self._select_batch_size_bucket(len(rows))
+        if len(rows) > batch_size_bucket:
+            raise ValueError(
+                f"scheduled batch has {len(rows)} rows but bucket has {batch_size_bucket}"
+            )
+
+        max_query_len = max(row.query_len for row in rows)
+        packed_prefill = is_prefill and self.prefill_layout == "packed"
+        if packed_prefill:
+            query_tokens = self._select_prefill_token_bucket(
+                sum(row.query_len for row in rows)
+            )
+        else:
+            if query_len_bucket is None and is_prefill:
+                query_len_bucket = self._select_prefill_query_bucket(max_query_len)
+            if query_len_bucket is None:
+                query_len_bucket = max_query_len
+            if (
+                is_prefill
+                and prefill_chunk_lens is not None
+                and any(seq.num_cached_tokens > 0 for seq in seqs)
+            ):
+                query_len_bucket = max(query_len_bucket, 2)
+            if max_query_len > query_len_bucket:
+                raise ValueError(
+                    f"scheduled query needs {max_query_len} tokens "
+                    f"but bucket has {query_len_bucket}"
+                )
+            query_tokens = query_len_bucket
+
+        return SchedulePlan(
+            phase="prefill" if is_prefill else "decode",
+            rows=tuple(rows),
+            bucket=BucketShape(
+                batch_size=batch_size_bucket,
                 query_tokens=query_tokens,
-                query_positions=query_positions,
-                block_tables=block_tables,
-                seq_lens=seq_lens,
-                query_lens=query_lens,
-                prefill_is_final=prefill_is_final,
-                batch_size_bucket=batch_size_bucket,
-                max_blocks=max_blocks,
-                seq_ids_host=seq_ids_host,
-            )
-
-        max_query_len = max(query_lens)
-        if query_len_bucket is None and is_prefill and self.prefill_buckets:
-            query_len_bucket = self._select_bucket(max_query_len, self.prefill_buckets, "prefill")
-        if query_len_bucket is None:
-            query_len_bucket = max_query_len
-            if is_prefill and prefill_chunk_lens is not None:
-                has_cached_prefix = any(seq.num_cached_tokens > 0 for seq in seqs)
-                if has_cached_prefix:
-                    query_len_bucket = max(query_len_bucket, 2)
-        if max_query_len > query_len_bucket:
-            raise ValueError(f"scheduled query needs {max_query_len} tokens but bucket has {query_len_bucket}")
-
-        padded_tokens = [tokens + [0] * (query_len_bucket - len(tokens)) for tokens in query_tokens]
-        padded_positions = [positions + [0] * (query_len_bucket - len(positions)) for positions in query_positions]
-        query_start_loc = [0]
-        for qlen in query_lens:
-            query_start_loc.append(query_start_loc[-1] + qlen)
-        for _ in range(batch_size_bucket - len(seqs)):
-            padded_tokens.append([0] * query_len_bucket)
-            padded_positions.append([0] * query_len_bucket)
-            block_tables.append([0] * max_blocks)
-            seq_lens.append(0)
-            query_lens.append(0)
-            query_start_loc.append(query_start_loc[-1])
-
-        query_lens_host = tuple(query_lens)
-        seq_lens_host = tuple(seq_lens)
-        block_tables_host = tuple(tuple(int(block) for block in row) for row in block_tables)
-        uses_static_decode_metadata = self._can_use_static_decode_metadata(
-            seqs,
-            is_prefill=is_prefill,
-            query_len_bucket=query_len_bucket,
-            padded_tokens=padded_tokens,
-            query_lens_host=query_lens_host,
+                block_table_width=block_table_width,
+                packed_prefill=packed_prefill,
+            ),
+            decode_steps=1 if is_prefill else max(1, int(decode_step_count)),
         )
-        if uses_static_decode_metadata:
-            (
-                tokens_array,
-                positions_array,
-                seq_ids_array,
-                query_start_loc_array,
-                block_tables_array,
-                seq_lens_array,
-            ) = self._static_decode_device_arrays(
-                padded_tokens=padded_tokens,
-                padded_positions=padded_positions,
-                seq_ids_host=seq_ids_host,
-                query_start_loc=query_start_loc,
-                block_tables=block_tables,
-                seq_lens=seq_lens,
-                query_lens_host=query_lens_host,
-                resident_decode_metadata=self.resident_decode_metadata,
-            )
-        else:
-            if not is_prefill:
-                self._static_decode_metadata_cache = None
-            (
-                tokens_array,
-                positions_array,
-                seq_ids_array,
-                query_start_loc_array,
-                block_tables_array,
-                seq_lens_array,
-            ) = _device_int32_arrays(
-                padded_tokens,
-                padded_positions,
-                seq_ids_host,
-                query_start_loc,
-                block_tables,
-                seq_lens,
-            )
-        return ScheduledBatch(
-            tokens=tokens_array,
-            positions=positions_array,
-            seq_ids=seq_ids_array,
-            query_start_loc=query_start_loc_array,
-            is_prefill=is_prefill,
-            num_prefill_tokens=sum(query_lens) if is_prefill else 0,
-            num_decode_tokens=0 if is_prefill else sum(query_lens),
-            block_tables=block_tables_array,
-            seq_lens=seq_lens_array,
-            prefill_is_final=prefill_is_final if is_prefill else None,
-            seq_ids_host=seq_ids_host,
-            query_lens_host=query_lens_host,
-            seq_lens_host=seq_lens_host,
-            block_tables_host=block_tables_host,
-            decode_step_count_host=1 if is_prefill else max(1, int(decode_step_count)),
-            uses_static_decode_metadata=uses_static_decode_metadata,
-        )
-
-    def _build_packed_prefill_batch(
-        self,
-        *,
-        query_tokens: List[List[int]],
-        query_positions: List[List[int]],
-        block_tables: List[List[int]],
-        seq_lens: List[int],
-        query_lens: List[int],
-        prefill_is_final: List[bool],
-        batch_size_bucket: int,
-        max_blocks: int,
-        seq_ids_host: tuple[int, ...],
-    ) -> ScheduledBatch:
-        actual_tokens = sum(query_lens)
-        if actual_tokens <= 0:
-            raise ValueError("packed prefill requires at least one executable token")
-
-        token_bucket = self._select_prefill_token_bucket(actual_tokens)
-        if actual_tokens > token_bucket:
-            raise ValueError(f"scheduled prefill needs {actual_tokens} tokens but bucket has {token_bucket}")
-
-        packed_tokens: List[int] = []
-        packed_positions: List[int] = []
-        token_row_ids: List[int] = []
-        query_start_loc = [0]
-        for row, (tokens, positions, qlen) in enumerate(zip(query_tokens, query_positions, query_lens)):
-            if qlen != len(tokens):
-                raise ValueError("query_lens must match packed query token lengths")
-            packed_tokens.extend(tokens)
-            packed_positions.extend(positions)
-            token_row_ids.extend([row] * qlen)
-            query_start_loc.append(query_start_loc[-1] + qlen)
-
-        for _ in range(batch_size_bucket - len(query_lens)):
-            block_tables.append([0] * max_blocks)
-            seq_lens.append(0)
-            query_lens.append(0)
-            query_start_loc.append(query_start_loc[-1])
-
-        pad = token_bucket - actual_tokens
-        packed_tokens.extend([0] * pad)
-        packed_positions.extend([0] * pad)
-        token_row_ids.extend([0] * pad)
-
-        query_lens_host = tuple(query_lens)
-        seq_lens_host = tuple(seq_lens)
-        block_tables_host = tuple(tuple(int(block) for block in row) for row in block_tables)
-        return ScheduledBatch(
-            tokens=jnp.array([packed_tokens], dtype=jnp.int32),
-            positions=jnp.array([packed_positions], dtype=jnp.int32),
-            seq_ids=jnp.array(seq_ids_host, dtype=jnp.int32),
-            query_start_loc=jnp.array(query_start_loc, dtype=jnp.int32),
-            is_prefill=True,
-            num_prefill_tokens=actual_tokens,
-            num_decode_tokens=0,
-            block_tables=jnp.array(block_tables, dtype=jnp.int32),
-            seq_lens=jnp.array(seq_lens, dtype=jnp.int32),
-            prefill_is_final=prefill_is_final,
-            seq_ids_host=seq_ids_host,
-            query_lens_host=query_lens_host,
-            seq_lens_host=seq_lens_host,
-            block_tables_host=block_tables_host,
-            packed_prefill=True,
-            token_row_ids=jnp.array([token_row_ids], dtype=jnp.int32),
-        )
-
-    def _can_use_static_decode_metadata(
-        self,
-        seqs: List[Sequence],
-        *,
-        is_prefill: bool,
-        query_len_bucket: int,
-        padded_tokens: List[List[int]],
-        query_lens_host: tuple[int, ...],
-    ) -> bool:
-        if (
-            is_prefill
-            or not self.static_decode_metadata
-            or self.jax_execution not in {"decode-jit", "jit"}
-            or not self.device_token_carry
-            or query_len_bucket != 1
-            or not seqs
-        ):
-            return False
-        for row, seq in enumerate(seqs):
-            if int(query_lens_host[row]) != 1:
-                return False
-            if seq.temperature != 0 or not seq.ignore_eos:
-                return False
-            if not _is_device_token(getattr(seq, "last_token_device", None)):
-                return False
-            # The runner must replace this placeholder from its device-token
-            # carry map before executing the JIT. If it cannot, it raises.
-            if int(padded_tokens[row][0]) != 0:
-                return False
-        return True
-
-    def _static_decode_device_arrays(
-        self,
-        *,
-        padded_tokens: List[List[int]],
-        padded_positions: List[List[int]],
-        seq_ids_host: tuple[int, ...],
-        query_start_loc: List[int],
-        block_tables: List[List[int]],
-        seq_lens: List[int],
-        query_lens_host: tuple[int, ...],
-        resident_decode_metadata: bool = False,
-    ):
-        token_shape = tuple((len(padded_tokens), len(padded_tokens[0]) if padded_tokens else 0))
-        block_table_shape = tuple((len(block_tables), len(block_tables[0]) if block_tables else 0))
-        if resident_decode_metadata:
-            device_seq_ids_host = tuple(
-                row if int(query_len) > 0 else -1
-                for row, query_len in enumerate(query_lens_host)
-            )
-            constant_key = (token_shape, query_lens_host, "resident")
-        else:
-            device_seq_ids_host = seq_ids_host
-            constant_key = (token_shape, seq_ids_host, query_lens_host)
-        constant_cache = self._static_decode_constant_cache.get(constant_key)
-        if constant_cache is None:
-            query_start_loc_array = jax.device_put(np.asarray(query_start_loc, dtype=np.int32))
-            # Decode positions are recomputed from seq_lens inside the compiled
-            # executor for width-1 decode. Keep a stable placeholder here so
-            # block-table cache misses do not rebuild an unused host array.
-            positions_array = jax.device_put(np.zeros_like(np.asarray(padded_positions, dtype=np.int32)))
-            tokens_array = jax.device_put(np.asarray(padded_tokens, dtype=np.int32))
-            seq_ids_array = jax.device_put(np.asarray(device_seq_ids_host, dtype=np.int32))
-            constant_cache = {
-                "tokens": tokens_array,
-                "positions": positions_array,
-                "seq_ids": seq_ids_array,
-                "query_start_loc": query_start_loc_array,
-            }
-            self._static_decode_constant_cache[constant_key] = constant_cache
-        if resident_decode_metadata:
-            key = (token_shape, block_table_shape, query_lens_host, "resident")
-        else:
-            key = (
-                token_shape,
-                block_table_shape,
-                seq_ids_host,
-                query_lens_host,
-                tuple(tuple(row) for row in block_tables),
-            )
-        cache = self._static_decode_metadata_cache
-        if resident_decode_metadata:
-            cache = self._static_decode_metadata_cache_by_key.get(key)
-        if cache is None or cache.get("key") != key:
-            if resident_decode_metadata:
-                block_tables_array = jax.device_put(np.zeros(block_table_shape, dtype=np.int32))
-                seq_lens_array = jax.device_put(np.zeros((len(seq_lens),), dtype=np.int32))
-            else:
-                block_tables_array = jax.device_put(np.asarray(block_tables, dtype=np.int32))
-                seq_lens_array = jax.device_put(np.asarray(seq_lens, dtype=np.int32))
-            cache = {
-                "key": key,
-                "tokens": constant_cache["tokens"],
-                "positions": constant_cache["positions"],
-                "seq_ids": constant_cache["seq_ids"],
-                "query_start_loc": constant_cache["query_start_loc"],
-                "block_tables": block_tables_array,
-                "seq_lens": seq_lens_array,
-            }
-            if resident_decode_metadata:
-                self._static_decode_metadata_cache_by_key[key] = cache
-            else:
-                self._static_decode_metadata_cache = cache
-        else:
-            if self.static_decode_seq_lens_carry or resident_decode_metadata:
-                seq_lens_array = cache["seq_lens"]
-            else:
-                seq_lens_array = jax.device_put(np.asarray(seq_lens, dtype=np.int32))
-        return (
-            cache["tokens"],
-            cache["positions"],
-            cache["seq_ids"],
-            cache["query_start_loc"],
-            cache["block_tables"],
-            seq_lens_array,
-        )
-
     @staticmethod
     def _select_bucket(size: int, buckets: tuple[int, ...], name: str) -> int:
         for bucket in sorted(buckets):

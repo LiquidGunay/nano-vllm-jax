@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 
 from nanovllm_jax.ops import ServingOps, ServingOpsProtocol
-from nanovllm_jax.batch import ScheduledBatch
+from nanovllm_jax.device_batch import DeviceBatch
 from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.cache import AttentionMetadata, HybridLayerState, KVCacheState, KVCacheStorage
 from nanovllm_jax.layers import rms_norm
@@ -47,7 +47,7 @@ def _needs_static_prefill_token_count(config: RuntimeConfig | None = None) -> bo
 
 
 def _compact_prefill_token_count(
-    batch: ScheduledBatch,
+    batch: DeviceBatch,
     *,
     config: RuntimeConfig | None = None,
     max_num_batched_tokens: int | None = None,
@@ -67,7 +67,7 @@ def _compact_prefill_token_count(
 
 
 def _static_prefill_token_count_for_batch(
-    batch: ScheduledBatch,
+    batch: DeviceBatch,
     *,
     config: RuntimeConfig | None = None,
     max_num_batched_tokens: int | None = None,
@@ -108,7 +108,7 @@ class ModelExecutor:
         self.backend = backend if backend is not None else ServingOps(config=config)
         self._jit_cache = {}
 
-    def _validate_batch_contract(self, batch: ScheduledBatch):
+    def _validate_batch_contract(self, batch: DeviceBatch):
         if batch.tokens.ndim != 2:
             raise ValueError(f"Scheduled batch tokens must be 2D, got {batch.tokens.ndim}D")
         if batch.positions.ndim != 2:
@@ -120,7 +120,7 @@ class ModelExecutor:
         metadata_rows = int(batch.block_tables.shape[0]) if batch.packed_prefill else int(batch.tokens.shape[0])
         if batch.packed_prefill:
             if not batch.is_prefill:
-                raise ValueError("packed ScheduledBatch is supported only for prefill")
+                raise ValueError("packed DeviceBatch is supported only for prefill")
             if batch.token_row_ids is None:
                 raise ValueError("packed prefill requires token_row_ids")
             if batch.token_row_ids.shape != batch.tokens.shape:
@@ -166,7 +166,7 @@ class ModelExecutor:
                 raise ValueError("Decode inactive rows must have seq_len=0 and active rows must have seq_len>=1")
 
     @staticmethod
-    def _validate_batch_contract_host(batch: ScheduledBatch):
+    def _validate_batch_contract_host(batch: DeviceBatch):
         query_lens = tuple(int(x) for x in batch.query_lens_host or ())
         seq_ids = tuple(int(x) for x in batch.seq_ids_host or ())
         seq_lens = tuple(int(x) for x in batch.seq_lens_host or ())
@@ -199,7 +199,7 @@ class ModelExecutor:
             if (active and seq_len < 1) or ((not active) and seq_len != 0):
                 raise ValueError("Decode inactive rows must have seq_len=0 and active rows must have seq_len>=1")
 
-    def _packed_prefill_max_query_len(self, batch: ScheduledBatch) -> int | None:
+    def _packed_prefill_max_query_len(self, batch: DeviceBatch) -> int | None:
         if not batch.packed_prefill:
             return None
         prefill_buckets = tuple(getattr(self.config, "prefill_buckets", ()) or ())
@@ -211,7 +211,7 @@ class ModelExecutor:
 
     def forward_step(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: Optional[KVCacheStorage] = None,
         hybrid_state: Optional[HybridLayerState] = None,
@@ -292,7 +292,7 @@ class ModelExecutor:
 
     def forward_step_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state: HybridLayerState,
@@ -355,7 +355,7 @@ class ModelExecutor:
                 step_positions = positions
                 if not is_prefill and positions.shape[1] == 1:
                     step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
-                step_batch = ScheduledBatch(
+                step_batch = DeviceBatch(
                     tokens=tokens,
                     positions=step_positions,
                     seq_ids=jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
@@ -457,7 +457,7 @@ class ModelExecutor:
 
     def forward_step_token_ids_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state: HybridLayerState,
@@ -521,7 +521,7 @@ class ModelExecutor:
                 step_positions = positions
                 if not is_prefill and positions.shape[1] == 1:
                     step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
-                step_batch = ScheduledBatch(
+                step_batch = DeviceBatch(
                     tokens=tokens,
                     positions=step_positions,
                     seq_ids=jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
@@ -628,7 +628,7 @@ class ModelExecutor:
 
     def forward_prefill_token_ids_table_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state_table: HybridLayerState,
@@ -707,7 +707,7 @@ class ModelExecutor:
                     if static_num_prefill_tokens is not None
                     else num_query_tokens
                 )
-                step_batch = ScheduledBatch(
+                step_batch = DeviceBatch(
                     tokens=tokens,
                     positions=positions,
                     seq_ids=jnp.where(
@@ -835,7 +835,7 @@ class ModelExecutor:
 
     def forward_step_sampled_token_ids_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state: HybridLayerState,
@@ -903,7 +903,7 @@ class ModelExecutor:
                 step_positions = positions
                 if not is_prefill and positions.shape[1] == 1:
                     step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
-                step_batch = ScheduledBatch(
+                step_batch = DeviceBatch(
                     tokens=tokens,
                     positions=step_positions,
                     seq_ids=jnp.zeros((tokens.shape[0],), dtype=jnp.int32),
@@ -1017,7 +1017,7 @@ class ModelExecutor:
 
     def forward_step_token_ids_table_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state_table: HybridLayerState,
@@ -1080,7 +1080,7 @@ class ModelExecutor:
                 step_positions = positions
                 if positions.shape[1] == 1:
                     step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
-                step_batch = ScheduledBatch(
+                step_batch = DeviceBatch(
                     tokens=tokens,
                     positions=step_positions,
                     seq_ids=jnp.where(
@@ -1187,7 +1187,7 @@ class ModelExecutor:
 
     def forward_prefill_token_ids_slot_carry_table_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state_table: HybridLayerState,
@@ -1270,7 +1270,7 @@ class ModelExecutor:
                     if static_num_prefill_tokens is not None
                     else num_query_tokens
                 )
-                step_batch = ScheduledBatch(
+                step_batch = DeviceBatch(
                     tokens=tokens,
                     positions=positions,
                     seq_ids=jnp.where(
@@ -1414,7 +1414,7 @@ class ModelExecutor:
 
     def forward_step_token_ids_slot_carry_table_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state_table: HybridLayerState,
@@ -1483,7 +1483,7 @@ class ModelExecutor:
                 step_positions = positions
                 if positions.shape[1] == 1:
                     step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
-                step_batch = ScheduledBatch(
+                step_batch = DeviceBatch(
                     tokens=tokens,
                     positions=step_positions,
                     seq_ids=jnp.where(
@@ -1604,7 +1604,7 @@ class ModelExecutor:
 
     def forward_step_token_ids_resident_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state_table: HybridLayerState,
@@ -1685,7 +1685,7 @@ class ModelExecutor:
                     jnp.zeros_like(recurrent_state),
                 )
 
-                step_batch = ScheduledBatch(
+                step_batch = DeviceBatch(
                     tokens=tokens,
                     positions=positions,
                     seq_ids=jnp.where(
@@ -1796,7 +1796,7 @@ class ModelExecutor:
 
     def forward_step_token_ids_resident_slot_carry_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state_table: HybridLayerState,
@@ -1874,7 +1874,7 @@ class ModelExecutor:
                     jnp.zeros_like(recurrent_state),
                 )
 
-                step_batch = ScheduledBatch(
+                step_batch = DeviceBatch(
                     tokens=tokens,
                     positions=positions,
                     seq_ids=jnp.where(
@@ -2000,7 +2000,7 @@ class ModelExecutor:
 
     def forward_step_token_ids_resident_dense_slot_carry_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state_table: HybridLayerState,
@@ -2062,7 +2062,7 @@ class ModelExecutor:
 
                 conv_state = conv_state_table[slot_ids]
                 recurrent_state = recurrent_state_table[slot_ids]
-                step_batch = ScheduledBatch(
+                step_batch = DeviceBatch(
                     tokens=tokens,
                     positions=positions,
                     seq_ids=slot_ids,
@@ -2169,7 +2169,7 @@ class ModelExecutor:
 
     def forward_step_sampled_token_ids_resident_dense_slot_carry_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state_table: HybridLayerState,
@@ -2231,7 +2231,7 @@ class ModelExecutor:
 
                 conv_state = conv_state_table[slot_ids]
                 recurrent_state = recurrent_state_table[slot_ids]
-                step_batch = ScheduledBatch(
+                step_batch = DeviceBatch(
                     tokens=tokens,
                     positions=positions,
                     seq_ids=slot_ids,
@@ -2351,7 +2351,7 @@ class ModelExecutor:
 
     def forward_greedy_decode_burst_table_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state_table: HybridLayerState,
@@ -2423,7 +2423,7 @@ class ModelExecutor:
                         step_conv_state,
                         step_recurrent_state,
                     ) = carry
-                    step_batch = ScheduledBatch(
+                    step_batch = DeviceBatch(
                         tokens=step_tokens,
                         positions=step_positions,
                         seq_ids=jnp.where(
@@ -2567,7 +2567,7 @@ class ModelExecutor:
 
     def forward_greedy_decode_burst_jit(
         self,
-        batch: ScheduledBatch,
+        batch: DeviceBatch,
         *,
         cache_storage: KVCacheStorage,
         hybrid_state: HybridLayerState,
@@ -2625,7 +2625,7 @@ class ModelExecutor:
                         step_conv_state,
                         step_recurrent_state,
                     ) = carry
-                    step_batch = ScheduledBatch(
+                    step_batch = DeviceBatch(
                         tokens=step_tokens,
                         positions=step_positions,
                         seq_ids=jnp.where(
@@ -2754,7 +2754,7 @@ class ModelExecutor:
 
 
     @staticmethod
-    def _logit_positions(batch: ScheduledBatch):
+    def _logit_positions(batch: DeviceBatch):
         query_lens = jnp.diff(batch.query_start_loc).astype(jnp.int32)
         if batch.packed_prefill:
             return jnp.where(

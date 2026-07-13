@@ -65,15 +65,6 @@ class AttentionMetadata:
 
 
 @dataclass
-class BlockTables:
-    """Python/runtime-owned logical allocation state."""
-
-    tables: List[List[int]]
-    ref_counts: Optional[Any] = None
-    hashes: Optional[Any] = None
-
-
-@dataclass
 class HybridLayerState:
     """Qwen3.5 linear/GDN state kept separate from full-attention KV storage."""
 

@@ -13,12 +13,21 @@ Invariant:
 """
 
 from collections import deque
+from dataclasses import dataclass
 import xxhash
 import numpy as np
-from typing import Dict, List, Set, Deque
+from typing import Any, Dict, List, Set, Deque
 
-from nanovllm_jax.cache import BlockTables
 from nanovllm_jax.sequence import Sequence
+
+
+@dataclass
+class BlockTables:
+    """Snapshot of Python-owned allocation state."""
+
+    tables: List[List[int]]
+    ref_counts: Any = None
+    hashes: Any = None
 
 
 class Block:
