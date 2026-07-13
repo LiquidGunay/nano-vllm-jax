@@ -1,6 +1,6 @@
 # Mainline Cleanup and Speculative Decoding Plan
 
-Last updated: 2026-07-12
+Last updated: 2026-07-13
 
 ## Goal
 
@@ -16,7 +16,7 @@ one PR at a time, then build the next PR from the newly merged `main`.
 
 ## Source Revisions
 
-- Clean mainline: `origin/main@ef0eead`
+- Clean mainline: `origin/main@534f039`
 - Experimental evidence: `experimental/mtp-prefill-verifier-speed@7ced216`
 - Cleanup review: `/mountpoint/.exp/cleanup_and_diagnosis.md`
 
@@ -258,10 +258,12 @@ Merge gates:
 
 ### PR 2: explicit step, cache, route, and output ownership
 
-Status: [ ] split in progress; host/device boundary is draft PR
-[#8](https://github.com/LiquidGunay/nano-vllm-jax/pull/8)
+Status: [ ] split in progress; PR 2a is merged and PR 2b is draft PR
+[#9](https://github.com/LiquidGunay/nano-vllm-jax/pull/9)
 
-PR 2a branch: `agent/step-ownership-abi` at `5cee688`
+PR 2a branch: `agent/step-ownership-abi` at `5cee688`; merged as PR
+[#8](https://github.com/LiquidGunay/nano-vllm-jax/pull/8) at main commit
+`534f039`
 
 PR 2a establishes the review boundary recommended by the cleanup audit:
 
@@ -275,8 +277,19 @@ PR 2a establishes the review boundary recommended by the cleanup audit:
   tokens with no measured JIT growth: 0.8B B=8 measured `434.41` versus
   `434.21` decode tok/s; 4B B=1 measured `49.92` versus `49.89`.
 
-PR 2b will keep the same ABI and complete route, commit, output, service,
-prefix-handle, and kernel-policy ownership below.
+PR 2b branch: `agent/step-commit-output` at `2ab8961`
+
+PR 2b completes the execute/commit/output half of the ABI:
+
+- `ModelRunner.execute()` returns `RunResult`.
+- `LLMEngine.commit()` is the one logical transition and `step()` returns
+  `StepResult` rather than a signed integer tuple.
+- `OutputBuffer` owns every generated host token and device reference.
+- Service streaming consumes token events and materializes output explicitly.
+- EOS/length finish reasons and the configured model id reach server output.
+
+Route-registry, prefix-handle, cancellation/backpressure, and GDN policy work
+remain review-sized follow-up slices under PR 2.
 
 Purpose: implement the host/device ABI that speculation will extend later.
 
@@ -479,3 +492,9 @@ Do not transplant:
   128-page sparse-live metadata plus padded-row cache integrity. Same-envelope
   B=8 before/after output was exact with no measured JIT growth or speed loss;
   CI run 2 passed.
+- [x] Merge PR 1 as #7.
+- [x] Open, review, and merge host-only scheduling/device materialization PR
+  #8.
+- [x] Open typed step/commit/output ownership draft PR #9. Guarded control,
+  CUDA device-carry, kernel/GDN/layer, real-weight, and live 0.8B engine-smoke
+  checks passed; combined heavyweight parity was split at the RAM floor.
