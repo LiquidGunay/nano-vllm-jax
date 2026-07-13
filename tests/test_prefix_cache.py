@@ -21,7 +21,7 @@ def _sequence(tokens, *, seq_id=0, max_tokens=1):
     )
 
 
-def _tiny_hybrid_config(*, prefix_cache):
+def _tiny_hybrid_config(*, prefix_cache, max_num_resident_seqs=1):
     return RuntimeConfig(
         vocab_size=32,
         hidden_size=8,
@@ -42,7 +42,7 @@ def _tiny_hybrid_config(*, prefix_cache):
         num_kvcache_blocks=8,
         max_kv_cache_bytes=1 << 20,
         max_num_seqs=1,
-        max_num_resident_seqs=1,
+        max_num_resident_seqs=max_num_resident_seqs,
         max_num_batched_tokens=4,
         max_blocks_per_seq=4,
         prefill_buckets=(2, 4),
@@ -54,13 +54,48 @@ def _tiny_hybrid_config(*, prefix_cache):
     )
 
 
-def _tiny_engine(config, params):
-    engine = object.__new__(LLMEngine)
-    engine.config = config
-    engine.scheduler = Scheduler(config)
-    engine.model_runner = ModelRunner(config, params)
-    engine._next_seq_id = 0
-    return engine
+class _TinyEngine(LLMEngine):
+    """Explicit lightweight engine fixture that skips checkpoint loading."""
+
+    def __init__(self, config, params):
+        self.config = config
+        self.scheduler = Scheduler(config)
+        self.model_runner = ModelRunner(config, params)
+        self._next_seq_id = 0
+
+
+def _prefix_scheduler(*, max_num_seqs=1, max_num_resident_seqs=1):
+    return Scheduler(
+        RuntimeConfig(
+            block_size=2,
+            num_kvcache_blocks=16,
+            max_kv_cache_bytes=1 << 20,
+            max_num_seqs=max_num_seqs,
+            max_num_resident_seqs=max_num_resident_seqs,
+            max_num_batched_tokens=2,
+            max_blocks_per_seq=4,
+            prefill_buckets=(2,),
+            prefill_token_buckets=(2,),
+            batch_size_buckets=tuple(range(1, max_num_seqs + 1)),
+            decode_block_table_buckets=(4,),
+            prefix_cache=True,
+            linear_attn_layers=(0,),
+        )
+    )
+
+
+def _prime_prefix(scheduler, tokens, *, seq_id, handle):
+    seq = _sequence(tokens, seq_id=seq_id)
+    scheduler.add(seq)
+    seqs, plan = scheduler.schedule()
+    pending = scheduler.record_computed_prefixes(
+        seqs,
+        list(plan.prefill_chunk_lengths),
+    )
+    entry = pending[seq_id]
+    scheduler.publish_prefix_states(pending, {entry.prefix_hash: handle})
+    scheduler.release(seq)
+    return entry
 
 
 def _generate(engine, prompt):
@@ -169,23 +204,7 @@ def test_prefix_churn_keeps_metadata_and_handles_bounded():
 
 
 def test_scheduler_passes_only_exact_host_state_handles():
-    scheduler = Scheduler(
-        RuntimeConfig(
-            block_size=2,
-            num_kvcache_blocks=4,
-            max_kv_cache_bytes=1 << 20,
-            max_num_seqs=1,
-            max_num_resident_seqs=1,
-            max_num_batched_tokens=2,
-            max_blocks_per_seq=4,
-            prefill_buckets=(2,),
-            prefill_token_buckets=(2,),
-            batch_size_buckets=(1,),
-            decode_block_table_buckets=(4,),
-            prefix_cache=True,
-            linear_attn_layers=(0,),
-        )
-    )
+    scheduler = _prefix_scheduler()
     original = _sequence([1, 2, 3])
     scheduler.add(original)
     seqs, plan = scheduler.schedule()
@@ -206,11 +225,56 @@ def test_scheduler_passes_only_exact_host_state_handles():
     assert scheduler.take_released_prefix_state_handles() == ()
 
 
+def test_prefill_budget_does_not_admit_an_unseeded_prefix_hit():
+    scheduler = _prefix_scheduler(max_num_seqs=2, max_num_resident_seqs=3)
+    old = _prime_prefix(scheduler, [3, 4, 30], seq_id=0, handle=10)
+    _prime_prefix(scheduler, [5, 6, 30], seq_id=1, handle=11)
+    kept = _prime_prefix(scheduler, [1, 2, 30], seq_id=2, handle=12)
+
+    filler = _sequence([7, 8, 30], seq_id=3)
+    kept_waiter = _sequence([1, 2, 31], seq_id=4)
+    old_waiter = _sequence([3, 4, 31], seq_id=5)
+    for seq in (filler, kept_waiter, old_waiter):
+        scheduler.add(seq)
+
+    seqs, plan = scheduler.schedule()
+
+    assert seqs == [filler]
+    assert list(scheduler.waiting) == [kept_waiter, old_waiter]
+    assert kept_waiter.block_table == old_waiter.block_table == []
+    assert kept_waiter.cached_prefix_hash is None
+
+    pending = scheduler.record_computed_prefixes(
+        seqs,
+        list(plan.prefill_chunk_lengths),
+    )
+    new_entry = pending[filler.seq_id]
+    assert scheduler.take_released_prefix_state_handles() == (10,)
+    scheduler.publish_prefix_states(pending, {new_entry.prefix_hash: 13})
+    assert scheduler.block_manager.prefix_cache.get(old.prefix_hash) is not None
+    assert (
+        scheduler.block_manager.prefix_cache.get(old.prefix_hash).hybrid_state_handle
+        is None
+    )
+
+    scheduler.release(filler)
+    seqs, _ = scheduler.schedule()
+
+    assert seqs[0] is kept_waiter
+    assert kept_waiter.num_cached_tokens == 2
+    entries = scheduler.cached_prefix_entries(seqs)
+    entry = entries[kept_waiter.seq_id]
+    assert entry.prefix_hash == kept.prefix_hash
+    assert entry.hybrid_state_handle == 12
+    assert old_waiter.num_cached_tokens == 0
+    assert old_waiter.seq_id not in entries
+
+
 @pytest.mark.skipif(not _has_cuda(), reason="CUDA is required for engine parity")
 def test_hybrid_prefix_hit_matches_no_cache_execution():
     params = init_params(jax.random.PRNGKey(0), _tiny_hybrid_config(prefix_cache=False))
-    reference = _tiny_engine(_tiny_hybrid_config(prefix_cache=False), params)
-    cached = _tiny_engine(_tiny_hybrid_config(prefix_cache=True), params)
+    reference = _TinyEngine(_tiny_hybrid_config(prefix_cache=False), params)
+    cached = _TinyEngine(_tiny_hybrid_config(prefix_cache=True), params)
 
     expected = _generate(reference, [1, 2, 3, 4])
     _generate(cached, [1, 2])
@@ -235,3 +299,40 @@ def test_hybrid_prefix_hit_matches_no_cache_execution():
     )
     with pytest.raises(AssertionError, match="unknown prefix-state handle"):
         cached.model_runner.release_prefix_hybrid_states((999,))
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="CUDA is required for engine parity")
+def test_late_warmup_cannot_invalidate_or_crosswire_prefix_state():
+    config = _tiny_hybrid_config(prefix_cache=True, max_num_resident_seqs=2)
+    reference_config = _tiny_hybrid_config(
+        prefix_cache=False,
+        max_num_resident_seqs=2,
+    )
+    params = init_params(jax.random.PRNGKey(1), reference_config)
+    reference = _TinyEngine(reference_config, params)
+    cached = _TinyEngine(config, params)
+
+    expected = _generate(reference, [1, 2, 3, 4])
+    _generate(cached, [1, 2])
+    prefix_hash = cached.scheduler.block_manager.compute_hash([1, 2])
+    entry = cached.scheduler.block_manager.prefix_cache.get(prefix_hash)
+    assert entry is not None and entry.hybrid_state_handle is not None
+    handle = entry.hybrid_state_handle
+    snapshot = cached.model_runner._prefix_hybrid_states[handle]
+
+    crosswired = _sequence([1, 2, 9], seq_id=99)
+    crosswired.num_cached_tokens = entry.token_count
+    with pytest.raises(RuntimeError, match="state hashes differ"):
+        cached.model_runner.install_cached_prefix_hybrid_states(
+            [crosswired],
+            {99: replace(entry, prefix_hash=prefix_hash + 1)},
+        )
+    with pytest.raises(RuntimeError, match="warmup_compilation must run before"):
+        cached.warmup_compilation()
+    assert cached.scheduler.block_manager.prefix_cache.get(prefix_hash) == entry
+    assert cached.model_runner._prefix_hybrid_states[handle] is snapshot
+
+    _generate(cached, [5, 6])
+    actual = _generate(cached, [1, 2, 3, 4])
+
+    assert actual == expected

@@ -89,6 +89,15 @@ from nanovllm_jax.cache import HybridLayerState, KVCacheStorage
 
 
 @dataclass(frozen=True)
+class PrefixStateSnapshot:
+    """Runner-owned state tied to one exact content-addressed prefix."""
+
+    prefix_hash: int
+    token_count: int
+    state: HybridLayerState
+
+
+@dataclass(frozen=True)
 class RunnerRoute:
     """Executor route selected for one already-scheduled batch."""
 
@@ -204,7 +213,7 @@ class ModelRunner:
         self._hybrid_slots: Dict[int, int] = {}
         self._free_hybrid_slots: List[int] = list(range(max_seqs))
         self._zeroed_hybrid_slots: set[int] = set(range(max_seqs))
-        self._prefix_hybrid_states: Dict[int, tuple[int, HybridLayerState]] = {}
+        self._prefix_hybrid_states: Dict[int, PrefixStateSnapshot] = {}
         self._prefix_hybrid_state_capacity = (
             max_seqs if config.prefix_cache and config.linear_attn_layers else 0
         )
@@ -258,7 +267,10 @@ class ModelRunner:
             "full_attention_kv": nbytes(self.full_attention_nhd_cache),
             "hybrid_state": nbytes((self._empty_hybrid_state, self._hybrid_state_table)),
             "prefix_hybrid_state_current": nbytes(
-                tuple(state for _, state in self._prefix_hybrid_states.values())
+                tuple(
+                    snapshot.state
+                    for snapshot in self._prefix_hybrid_states.values()
+                )
             ),
             "prefix_hybrid_state_capacity": (
                 self._prefix_hybrid_state_capacity * nbytes(self._empty_hybrid_state)
@@ -1454,18 +1466,22 @@ class ModelRunner:
         ):
             raise RuntimeError("runner prefix-state capacity is exhausted")
 
-        states: dict[int, tuple[int, HybridLayerState]] = {}
+        states: dict[int, PrefixStateSnapshot] = {}
         for prefix_hash, (seq_id, token_count) in representative.items():
             state = self.hybrid_state_for_sequence(seq_id)
             if state is None:
                 raise RuntimeError(f"sequence {seq_id} has no hybrid state to cache")
-            states[prefix_hash] = (token_count, self._snapshot_hybrid_state(state))
+            states[prefix_hash] = PrefixStateSnapshot(
+                prefix_hash=prefix_hash,
+                token_count=token_count,
+                state=self._snapshot_hybrid_state(state),
+            )
 
         handles: dict[int, int] = {}
-        for prefix_hash, cached_state in states.items():
+        for prefix_hash, snapshot in states.items():
             handle = self._next_prefix_hybrid_state_handle
             self._next_prefix_hybrid_state_handle += 1
-            self._prefix_hybrid_states[handle] = cached_state
+            self._prefix_hybrid_states[handle] = snapshot
             handles[prefix_hash] = handle
         return handles
 
@@ -1495,16 +1511,20 @@ class ModelRunner:
                 continue
             if seq.cached_prefix_hybrid_seeded:
                 continue
-            cached_state = self._prefix_hybrid_states.get(entry.hybrid_state_handle)
-            if cached_state is None:
+            snapshot = self._prefix_hybrid_states.get(entry.hybrid_state_handle)
+            if snapshot is None:
                 raise RuntimeError(
                     "missing runner-owned hybrid prefix state handle "
                     f"{entry.hybrid_state_handle}"
                 )
-            token_count, state = cached_state
-            if token_count != entry.token_count or token_count != seq.num_cached_tokens:
+            if snapshot.prefix_hash != entry.prefix_hash:
+                raise RuntimeError("prefix metadata and runner state hashes differ")
+            if (
+                snapshot.token_count != entry.token_count
+                or snapshot.token_count != seq.num_cached_tokens
+            ):
                 raise RuntimeError("prefix KV and runner state token counts differ")
-            self._set_hybrid_state(seq_id, state)
+            self._set_hybrid_state(seq_id, snapshot.state)
             seq.cached_prefix_hybrid_seeded = True
 
     def _slice_batch(self, batch: DeviceBatch, idx: int) -> DeviceBatch:

@@ -177,6 +177,10 @@ class LLMEngine:
         decode_block_table_buckets: tuple[int, ...] | None = None,
     ) -> dict[str, object]:
         """Compile configured serving buckets without using live request data."""
+        if not self.scheduler.is_pristine():
+            raise RuntimeError(
+                "warmup_compilation must run before requests or prefix-cache state"
+            )
         if max_prefill_len is None:
             max_prefill_len = max(
                 tuple(getattr(self.config, "prefill_token_buckets", ()) or ())

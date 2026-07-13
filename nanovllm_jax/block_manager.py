@@ -100,6 +100,9 @@ class PrefixCache:
 
     def invalidate_block(self, block_id: int) -> None:
         """Remove every prefix whose physical KV chain includes ``block_id``."""
+        # Entries are bounded by physical blocks, so a linear scan keeps this
+        # lifecycle obvious. Add a reverse index only if reuse profiles show
+        # this host-side scan matters at larger cache sizes.
         stale_hashes = [
             prefix_hash
             for prefix_hash, entry in self.entries.items()

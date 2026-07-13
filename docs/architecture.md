@@ -86,6 +86,10 @@ the selected bucket shape. It neither imports JAX nor allocates device arrays.
 - device token carry,
 - compile-bucket lookup.
 
+Compilation warmup is a startup-only transition. The engine rejects it after a
+request has been admitted or any prefix metadata has been published, so runner
+state cannot be reset beneath surviving host handles.
+
 FlashInfer receives a fixed-size page-index buffer for JIT stability, but its
 CSR indptr exposes only each row's live page prefix. Static block-table padding
 is never treated as attention context. Decode uses a reusable non-split plan,

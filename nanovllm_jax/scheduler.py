@@ -207,6 +207,10 @@ class Scheduler:
         """Check if all sequences are done."""
         return not self.waiting and not self.running
 
+    def is_pristine(self) -> bool:
+        """Whether runner warmup can reset state without dangling host metadata."""
+        return self.is_finished() and not self.block_manager.prefix_cache.entries
+
     def add(self, seq: Sequence):
         """Add a sequence to the waiting queue."""
         if seq.block_size != self.block_size:
@@ -254,6 +258,8 @@ class Scheduler:
         # Phase 1: Prefill - schedule new/waiting sequences and unfinished
         # prompt tails from already-allocated running sequences.
         while num_seqs < self.max_num_seqs:
+            if num_batched_tokens >= prefill_token_budget:
+                break
             seq = None
             from_waiting = False
             if (
@@ -282,22 +288,12 @@ class Scheduler:
                 seq.status = SequenceStatus.RUNNING
                 self.running.append(seq)
                 continue
-            chunk_len = min(remaining_tokens, self.prefill_chunk_budget)
-            if (
-                prefill_token_budget > 0
-                and num_batched_tokens + chunk_len > prefill_token_budget
-            ):
-                available = prefill_token_budget - num_batched_tokens
-                if available <= 0:
-                    if from_waiting:
-                        seq.status = SequenceStatus.RUNNING
-                        self.running.append(seq)
-                    else:
-                        scheduled_running.append(seq)
-                    break
-                chunk_len = min(chunk_len, available)
+            chunk_len = min(
+                remaining_tokens,
+                self.prefill_chunk_budget,
+                prefill_token_budget - num_batched_tokens,
+            )
 
-            chunk_len = min(chunk_len, remaining_tokens)
             if self.prefill_layout != "packed":
                 prospective_query_bucket = self._select_prefill_query_bucket(
                     max(prefill_chunk_lens + [chunk_len])

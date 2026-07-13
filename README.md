@@ -121,7 +121,7 @@ another external scratch path.
 [docs/style.md](docs/style.md) defines the repository's lightweight complexity
 budget and review checks.
 
-CPU-safe control-plane checks (also run in GitHub Actions):
+CPU-safe control-plane checks:
 
 ```bash
 JAX_PLATFORMS=cpu pytest -q \
