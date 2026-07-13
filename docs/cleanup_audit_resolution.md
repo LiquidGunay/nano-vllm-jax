@@ -49,8 +49,13 @@ Resolved in the structural cleanup:
   and output materialization is always explicit.
 - Removed the dormant mixed prefill/decode scheduler path instead of leaving an
   uninvoked private scheduling mode on cleaned main.
-- Renamed the private merged execution config to `RuntimeConfig`; the public API
-  remains `LLM`, `EngineConfig`, and `SamplingParams`.
+- Split the private runtime aggregate into `ModelSpec`, `CapacitySpec`,
+  `CompileSpec`, and `KernelPlan`; the public API remains `LLM`, `EngineConfig`,
+  and `SamplingParams`.
+- Grouped retained Python batch facts in one immutable `HostBatch` instead of
+  optional parallel `*_host` fields on `DeviceBatch`.
+- Moved GDN route eligibility and strict fallback decisions into `ServingOps`
+  so model math consumes an operation decision rather than selecting policy.
 - Replaced the runner's overlapping route booleans with one typed
   `ExecutionPlan` selected from the shared route registry.
 - Unified prefix KV and GDN state under bounded `PrefixCacheEntry` metadata;

@@ -22,11 +22,11 @@ def test_top_level_public_imports_are_canonical():
 
     assert nanovllm_jax.__all__ == ["EngineConfig", "LLM", "SamplingParams"]
     assert engine_module.__all__ == ["LLM"]
-    assert not hasattr(nanovllm_jax, "FASTPATH")
-    assert not hasattr(nanovllm_jax, "FastPath")
+    assert not hasattr(nanovllm_jax, "KERNEL_PLAN")
+    assert not hasattr(nanovllm_jax, "KernelPlan")
     assert not hasattr(nanovllm_jax, "LLMEngine")
     assert not hasattr(nanovllm_jax, "ModelConfig")
-    assert not hasattr(nanovllm_jax, "RuntimeConfig")
+    assert not hasattr(nanovllm_jax, "RuntimeSpec")
     assert not hasattr(nanovllm_jax, "ServerSettings")
     assert not hasattr(nanovllm_jax, "ServingOps")
     assert not hasattr(nanovllm_jax, "select_backend")

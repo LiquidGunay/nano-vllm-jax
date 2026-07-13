@@ -62,7 +62,7 @@ def test_engine_stops_on_tokenizer_eos_when_checkpoint_eos_differs(tmp_path, mon
     monkeypatch.setattr(engine_module, "ModelRunner", FakeRunner)
 
     engine = LLMEngine(model, engine_config=_small_engine_config(model))
-    assert engine.config.eos_token_ids == (248044, 248046)
+    assert engine.config.capacity.eos_token_ids == (248044, 248046)
 
     seq = engine.add_request(
         [1],

@@ -35,9 +35,20 @@ The control boundary is explicit:
 
 ```text
 Scheduler -> SchedulePlan
-ModelRunner -> DeviceBatch -> RunResult
+ModelRunner -> DeviceBatch + HostBatch -> RunResult
 LLMEngine.commit() -> StepResult
 ```
+
+Startup composes one immutable `RuntimeSpec` from four owners:
+
+- `ModelSpec`: checkpoint architecture,
+- `CapacitySpec`: requests and cache limits,
+- `CompileSpec`: dtypes and static bucket shapes,
+- `KernelPlan`: promoted operation implementations.
+
+Public `EngineConfig` supplies workload and capacity only. Cache allocation,
+weight loading, projections, and operation dispatch receive their narrow spec
+instead of a flat runtime message bus.
 
 `Sequence` owns logical positions and cache metadata. `OutputBuffer` owns every
 generated token, including deferred device references. Reading logical request
@@ -85,6 +96,11 @@ the selected bucket shape. It neither imports JAX nor allocates device arrays.
 - resident decode metadata,
 - device token carry,
 - compile-bucket lookup.
+
+Materialization produces device arrays plus one immutable `HostBatch` containing
+the Python facts still needed for commit and resident-state bookkeeping. This
+keeps the host mirror explicit without eight optional `*_host` fields on the
+device object.
 
 For each batch, the runner produces one `ExecutionPlan`. `routes.py` selects a
 `RouteKind` from phase, token mode, and available resident-state capabilities;

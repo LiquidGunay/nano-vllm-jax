@@ -1,22 +1,27 @@
-from types import SimpleNamespace
-
 import jax
 import numpy as np
 import pytest
 from jax import nn
 import jax.numpy as jnp
 
-from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.fastpath import KernelPlan
 from nanovllm_jax.layers import rms_norm
-from nanovllm_jax.model import (
-    ModelParams,
+from nanovllm_jax.model import ModelParams
+from nanovllm_jax.projection import (
     _can_use_decode_padded_gemm,
     _compact_prefill_dot_if_enabled,
     _compact_prefill_mlp,
     _lm_head_greedy_top1_impl,
+)
+from nanovllm_jax.lm_head import (
     lm_head_sample_token_ids,
     lm_head_token_ids_and_topk,
 )
+from tests.runtime_specs import runtime_spec
+
+
+def _lm_runtime(**kernels):
+    return runtime_spec(model={"rms_norm_eps": 1e-6}, kernels=kernels)
 
 
 def test_lm_head_token_ids_and_topk_matches_full_logits(monkeypatch):
@@ -34,8 +39,7 @@ def test_lm_head_token_ids_and_topk_matches_full_logits(monkeypatch):
         norm_weight=jnp.array([1.0, 0.8, 1.2, 0.6], dtype=jnp.float32),
         lm_head=None,
     )
-    config = SimpleNamespace(
-        rms_norm_eps=1e-6,
+    config = _lm_runtime(
         decode_padded_gemm=False,
         lm_head_decode_act_dtype="fp32",
     )
@@ -48,7 +52,9 @@ def test_lm_head_token_ids_and_topk_matches_full_logits(monkeypatch):
         top_k=2,
     )
 
-    hidden_norm = rms_norm(hidden, params.norm_weight, config.rms_norm_eps).astype(jnp.float32)
+    hidden_norm = rms_norm(
+        hidden, params.norm_weight, config.model.rms_norm_eps
+    ).astype(jnp.float32)
     logits = jnp.dot(hidden_norm, embed_tokens.T)
     expected_top_values, expected_top_indices = jnp.flip(
         jnp.sort(logits, axis=-1)[..., -2:],
@@ -84,13 +90,11 @@ def test_lm_head_can_use_decode_padded_gemm_when_vocab_allowed():
         norm_weight=jnp.array([1.0, 0.8, 1.2, 0.6], dtype=jnp.float32),
         lm_head=None,
     )
-    reference_config = SimpleNamespace(
-        rms_norm_eps=1e-6,
+    reference_config = _lm_runtime(
         decode_padded_gemm=False,
         lm_head_decode_act_dtype="fp32",
     )
-    padded_config = SimpleNamespace(
-        rms_norm_eps=1e-6,
+    padded_config = _lm_runtime(
         decode_padded_gemm=True,
         decode_padded_gemm_rows=4,
         decode_padded_gemm_max_out_dim=7,
@@ -118,12 +122,10 @@ def test_lm_head_can_use_decode_padded_gemm_when_vocab_allowed():
 
 
 def test_lm_head_greedy_top1_impl_rejects_removed_cutlass_backend():
-    config = SimpleNamespace(
-        lm_head_greedy_top1_impl="cutlass",
-    )
+    plan = KernelPlan(lm_head_greedy="cutlass")
 
     with pytest.raises(ValueError, match="jax or triton"):
-        _lm_head_greedy_top1_impl(config)
+        _lm_head_greedy_top1_impl(plan)
 
 
 def test_lm_head_greedy_top1_triton_matches_jax_on_cuda(monkeypatch):
@@ -139,21 +141,19 @@ def test_lm_head_greedy_top1_triton_matches_jax_on_cuda(monkeypatch):
         norm_weight=jnp.zeros((32,), dtype=jnp.float32),
         lm_head=None,
     )
-    reference_config = SimpleNamespace(
-        rms_norm_eps=1e-6,
+    reference_config = _lm_runtime(
         decode_padded_gemm=True,
         decode_padded_gemm_rows=8,
         decode_padded_gemm_max_out_dim=1024,
         lm_head_decode_act_dtype="bf16",
-        lm_head_greedy_top1_impl="jax",
+        lm_head_greedy="jax",
     )
-    triton_config = SimpleNamespace(
-        rms_norm_eps=1e-6,
+    triton_config = _lm_runtime(
         decode_padded_gemm=True,
         decode_padded_gemm_rows=8,
         decode_padded_gemm_max_out_dim=1024,
         lm_head_decode_act_dtype="bf16",
-        lm_head_greedy_top1_impl="triton",
+        lm_head_greedy="triton",
     )
 
     expected, _, _ = lm_head_token_ids_and_topk(
@@ -175,12 +175,12 @@ def test_lm_head_greedy_top1_triton_matches_jax_on_cuda(monkeypatch):
 
 
 def test_decode_padded_gemm_default_cap_admits_qwen_vocab_projection():
-    config = RuntimeConfig(decode_padded_gemm=True)
+    plan = KernelPlan(decode_padded_gemm=True)
     x = jnp.zeros((8, 1, 1), dtype=jnp.bfloat16)
     qwen_vocab_projection = jnp.zeros((1, 248064), dtype=jnp.bfloat16)
 
-    assert config.decode_padded_gemm_max_out_dim >= qwen_vocab_projection.shape[1]
-    assert _can_use_decode_padded_gemm(x, qwen_vocab_projection, config)
+    assert plan.decode_padded_gemm_max_out_dim >= qwen_vocab_projection.shape[1]
+    assert _can_use_decode_padded_gemm(x, qwen_vocab_projection, plan)
 
 
 def test_lm_head_sample_token_ids_matches_greedy_and_categorical(monkeypatch):
@@ -198,8 +198,7 @@ def test_lm_head_sample_token_ids_matches_greedy_and_categorical(monkeypatch):
         norm_weight=jnp.array([1.0, 0.8, 1.2, 0.6], dtype=jnp.float32),
         lm_head=None,
     )
-    config = SimpleNamespace(
-        rms_norm_eps=1e-6,
+    config = _lm_runtime(
         decode_padded_gemm=False,
         lm_head_decode_act_dtype="fp32",
     )
@@ -215,7 +214,9 @@ def test_lm_head_sample_token_ids_matches_greedy_and_categorical(monkeypatch):
         is_prefill=False,
     )
 
-    hidden_norm = rms_norm(hidden, params.norm_weight, config.rms_norm_eps).astype(jnp.float32)
+    hidden_norm = rms_norm(
+        hidden, params.norm_weight, config.model.rms_norm_eps
+    ).astype(jnp.float32)
     logits = jnp.dot(hidden_norm, embed_tokens.T)[:, 0]
     expected = jnp.array(
         [
@@ -253,7 +254,7 @@ def test_compact_prefill_mlp_matches_dense_on_valid_tokens():
         nn.silu,
         valid_mask,
         compact_num_tokens=4,
-        config=RuntimeConfig(compact_prefill_mlp=True),
+        plan=KernelPlan(compact_prefill_mlp=True),
     )
     dense = jnp.dot(nn.silu(jnp.dot(x, gate_weight)) * jnp.dot(x, up_weight), down_weight)
 

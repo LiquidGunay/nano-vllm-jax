@@ -76,11 +76,13 @@ Configuration follows the same rule:
 - Public configuration describes workload and capacity, not kernel search.
 - Implementation policy has one internal promoted plan.
 - Components receive the narrowest spec they need.
-- Do not add a field to the flat `RuntimeConfig` as a convenient message bus.
+- Do not add a field to the `RuntimeSpec` aggregate as a convenient message
+  bus.
 
-The target shape is a small aggregate of model, capacity, compile, and kernel
-specs, with callees receiving only their relevant part. This is a structural
-refactor, not a reason to build compatibility adapters in unrelated PRs.
+`RuntimeSpec` is the small aggregate of model, capacity, compile, and kernel
+specs. Callees receive only the relevant part when they do not coordinate the
+whole execution transition. Do not rebuild the former flat shape with proxy
+properties or compatibility adapters.
 
 ## Model And Performance Code
 
@@ -119,21 +121,21 @@ Service, configuration, warmup, resident metadata, and specialized kernels are
 an advanced path. Documentation should not require those concepts before a
 reader can explain one generated token.
 
-## Tracked Structural Work
+## Landed Structural Work
 
-These are repository-level refactors, not requirements to expand the scope of
-every feature PR:
+The main reading path now has these ownership boundaries:
 
-- Split the flat runtime configuration into narrow model, capacity, compile,
-  and kernel specs.
-- Replace optional parallel host fields in `DeviceBatch` with one explicit
-  plan/host-metadata relationship.
-- Move serving policy out of GDN and other model-math functions.
+- Runtime configuration is split into model, capacity, compile, and kernel
+  specs.
+- `DeviceBatch.host` groups retained host facts in one immutable `HostBatch`.
+- Serving implementation decisions live in `ServingOps`, outside GDN model
+  math.
+
+One repository-level refactor remains intentionally separate from ordinary
+feature work:
+
 - Split runner/executor code only at coherent state transitions; create no
   forwarding-only modules.
-
-Until each lands, nearby changes should avoid deepening the corresponding
-debt.
 
 ## Review Check
 

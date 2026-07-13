@@ -28,7 +28,7 @@ from nanovllm_jax.kernels.gdn_fla import (
     unpack_segmented_gdn_output,
 )
 from nanovllm_jax.kernels.gdn_fla import gdn_segmented_prefill_chunk32
-from nanovllm_jax.model import jax_chunk_gated_delta_rule
+from nanovllm_jax.gdn import jax_chunk_gated_delta_rule
 
 
 def _has_cuda_backend() -> bool:

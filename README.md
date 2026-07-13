@@ -27,9 +27,10 @@ without evicting cached prefixes for unwritten future tokens. A request that
 can never fit is rejected. Tied vocabulary weights remain in checkpoint-native
 `[V, H]` layout instead of allocating a second transposed copy.
 
-[nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py) owns implementation
-policy: dtypes, attention/GDN routes, LM-head route, device token carry, and
-metadata residency. Users should not switch kernels through YAML on the cleaned
+[nanovllm_jax/config.py](nanovllm_jax/config.py) composes model, capacity, and
+compile specs once at startup. [nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py)
+owns attention/GDN routes, LM-head policy, device token carry, and metadata
+residency. Users should not switch implementations through YAML on the cleaned
 branch.
 
 The offline `LLM.generate(..., use_tqdm=True)` progress bar uses the optional
@@ -68,7 +69,7 @@ server.py
   -> Scheduler -> BlockManager
   -> SchedulePlan (host)
   -> ModelRunner
-  -> DeviceBatch
+  -> DeviceBatch + HostBatch
   -> ModelExecutor
   -> Qwen3.5 model
   -> attention / GDN / LM-head kernels

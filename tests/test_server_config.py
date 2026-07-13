@@ -4,9 +4,16 @@ from pathlib import Path
 import pytest
 import yaml
 
-from nanovllm_jax.config import EngineConfig, ModelConfig, RuntimeConfig, WarmupConfig, load_engine_config
+from nanovllm_jax.config import (
+    CapacitySpec,
+    EngineConfig,
+    ModelConfig,
+    RuntimeSpec,
+    WarmupConfig,
+    load_engine_config,
+)
 from nanovllm_jax.engine import _engine_config_from_public_kwargs
-from nanovllm_jax.fastpath import FASTPATH, engine_overrides
+from nanovllm_jax.fastpath import KERNEL_PLAN
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -65,7 +72,7 @@ def _write_checkpoint(path: Path, text: dict) -> None:
 
 
 def test_runtime_config_has_no_speculative_surface():
-    config = RuntimeConfig()
+    config = RuntimeSpec()
 
     assert not hasattr(config, "speculative_method")
     assert not hasattr(config, "num_speculative_tokens")
@@ -156,7 +163,7 @@ def test_server_yaml_is_the_only_committed_serving_config():
     assert settings.engine.warmup.enabled is True
 
 
-def test_engine_config_projects_only_capacity_plus_fastpath_for_engine():
+def test_runtime_spec_composes_engine_capacity_and_kernel_policy():
     config = EngineConfig(
         max_prefill=128,
         max_num_seqs=2,
@@ -176,18 +183,37 @@ def test_engine_config_projects_only_capacity_plus_fastpath_for_engine():
         prefix_cache=False,
     )
 
-    projected = config.to_engine_kwargs()
-    for key, value in engine_overrides(FASTPATH).items():
-        assert projected[key] == value
+    runtime = RuntimeSpec.promoted(ModelConfig(), config)
 
-    assert projected["max_num_seqs"] == 2
-    assert projected["max_num_resident_seqs"] == 3
-    assert projected["max_num_batched_tokens"] == 512
-    assert projected["max_blocks_per_seq"] == 64
-    assert projected["max_kv_cache_bytes"] == 256 * 1024 * 1024
-    assert projected["prefill_token_buckets"] == (64, 128, 512)
-    assert projected["decode_block_table_buckets"] == (64,)
-    assert projected["prefix_cache"] is False
+    assert runtime.kernels == KERNEL_PLAN
+    assert runtime.capacity.max_num_seqs == 2
+    assert runtime.capacity.max_num_resident_seqs == 3
+    assert runtime.capacity.max_num_batched_tokens == 512
+    assert runtime.capacity.max_blocks_per_seq == 64
+    assert runtime.capacity.max_kv_cache_bytes == 256 * 1024 * 1024
+    assert runtime.capacity.prefix_cache is False
+    assert runtime.compile.prefill_token_buckets == (64, 128, 512)
+    assert runtime.compile.decode_block_table_buckets == (64,)
+
+
+def test_server_request_validation_reads_runtime_capacity(monkeypatch):
+    import server
+
+    runtime = RuntimeSpec(
+        capacity=CapacitySpec(
+            block_size=4,
+            max_blocks_per_seq=2,
+            max_num_seqs=1,
+            max_num_resident_seqs=1,
+        )
+    )
+    monkeypatch.setattr(server, "engine", type("Engine", (), {"config": runtime})())
+
+    server._validate_inputs_fit_config([[1, 2]], [2], max_tokens=6)
+    with pytest.raises(ValueError, match="per-sequence KV capacity 8"):
+        server._validate_inputs_fit_config([[1, 2]], [2], max_tokens=7)
+    with pytest.raises(ValueError, match="exceeding max_num_seqs 1"):
+        server._validate_inputs_fit_config([[1], [2]], [1, 1], max_tokens=1)
 
 
 def test_engine_config_rejects_unsorted_or_uncovered_buckets():
@@ -202,11 +228,11 @@ def test_model_config_is_read_from_checkpoint(tmp_path, size):
     _write_checkpoint(tmp_path, _text_config(size))
 
     model = ModelConfig.from_checkpoint(tmp_path, model=f"Qwen/Qwen3.5-{size}")
-    runtime = RuntimeConfig.from_model_config(model)
+    runtime = RuntimeSpec(model=model)
 
-    assert model.hidden_size == runtime.hidden_size
-    assert model.num_hidden_layers == runtime.num_hidden_layers
-    assert model.linear_num_value_heads == runtime.linear_num_value_heads
+    assert model.hidden_size == runtime.model.hidden_size
+    assert model.num_hidden_layers == runtime.model.num_hidden_layers
+    assert model.linear_num_value_heads == runtime.model.linear_num_value_heads
 
 
 @pytest.mark.parametrize(

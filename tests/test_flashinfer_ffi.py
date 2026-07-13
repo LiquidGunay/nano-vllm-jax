@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from nanovllm_jax.ops import ServingOps
-from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.fastpath import KernelPlan
 from nanovllm_jax.kernels.flashinfer_ffi import (
     _batch_decode_plan_info,
     kv_append_paged_nhd,
@@ -30,7 +30,6 @@ from nanovllm_jax.cache import (
     AttentionMetadata,
     KVCacheStorage,
     compute_slot_mapping,
-    update_kv_cache,
 )
 
 
@@ -484,7 +483,7 @@ def test_backend_rejects_removed_flashinfer_kv_append_opt_in():
         positions=positions,
     )
     with pytest.raises(ValueError, match="full_attention_kv_append_impl"):
-        ServingOps(RuntimeConfig(full_attention_kv_append_impl="flashinfer")).write_kv(
+        ServingOps(KernelPlan(full_attention_kv_append="flashinfer")).write_kv(
             layer_id=layer_id,
             k=k,
             v=v,

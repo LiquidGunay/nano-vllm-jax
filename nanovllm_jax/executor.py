@@ -20,40 +20,35 @@ import jax.numpy as jnp
 
 from nanovllm_jax.ops import ServingOps, ServingOpsProtocol
 from nanovllm_jax.device_batch import DeviceBatch
-from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.config import RuntimeSpec
 from nanovllm_jax.cache import AttentionMetadata, HybridLayerState, KVCacheState, KVCacheStorage
 from nanovllm_jax.layers import rms_norm
 from nanovllm_jax.model import (
     ModelParams,
-    _lm_head_greedy_top1_token_ids,
     forward_step as model_forward_step,
+)
+from nanovllm_jax.lm_head import (
     lm_head_sample_token_ids,
     lm_head_token_ids_and_topk,
 )
 
-def _config_flag(config: RuntimeConfig | None, attr: str) -> bool:
-    if config is not None and hasattr(config, attr):
-        return bool(getattr(config, attr))
-    return False
-
-
-def _needs_static_prefill_token_count(config: RuntimeConfig | None = None) -> bool:
+def _needs_static_prefill_token_count(config: RuntimeSpec) -> bool:
+    kernels = config.kernels
     return (
-        _config_flag(config, "compact_prefill_in_proj_qkv")
-        or _config_flag(config, "compact_prefill_gdn_z")
-        or _config_flag(config, "compact_prefill_full_attn_proj")
-        or _config_flag(config, "compact_prefill_mlp")
+        kernels.compact_prefill_in_proj_qkv
+        or kernels.compact_prefill_gdn_z
+        or kernels.compact_prefill_full_attn_proj
+        or kernels.compact_prefill_mlp
     )
 
 
 def _compact_prefill_token_count(
     batch: DeviceBatch,
     *,
-    config: RuntimeConfig | None = None,
+    config: RuntimeSpec,
     max_num_batched_tokens: int | None = None,
 ) -> int:
-    mode = getattr(config, "compact_prefill_token_count_mode", "exact")
-    mode = str(mode or "exact").strip().lower()
+    mode = config.kernels.compact_prefill_token_count_mode
     if mode in {"exact", "true", "true_tokens"}:
         return int(batch.num_prefill_tokens)
     if mode in {"bucket", "padded", "padded_bucket"}:
@@ -69,7 +64,7 @@ def _compact_prefill_token_count(
 def _static_prefill_token_count_for_batch(
     batch: DeviceBatch,
     *,
-    config: RuntimeConfig | None = None,
+    config: RuntimeSpec,
     max_num_batched_tokens: int | None = None,
 ) -> int:
     if batch.is_prefill and _needs_static_prefill_token_count(config):
@@ -97,7 +92,7 @@ class ModelExecutor:
 
     def __init__(
         self,
-        config: RuntimeConfig,
+        config: RuntimeSpec,
         params: ModelParams,
         backend: ServingOpsProtocol | None = None,
     ):
@@ -105,7 +100,7 @@ class ModelExecutor:
         self.params = params
         params_leaves, self._params_treedef = jax.tree_util.tree_flatten(self.params)
         self._params_leaves = tuple(params_leaves)
-        self.backend = backend if backend is not None else ServingOps(config=config)
+        self.backend = backend if backend is not None else ServingOps(config.kernels)
         self._jit_cache = {}
 
     def _validate_batch_contract(self, batch: DeviceBatch):
@@ -137,9 +132,9 @@ class ModelExecutor:
             raise ValueError("Scheduled batch query_start_loc size must be batch_size + 1")
 
         if (
-            batch.query_lens_host is not None
-            and batch.seq_ids_host is not None
-            and batch.seq_lens_host is not None
+            batch.host.query_lens
+            and batch.host.seq_ids
+            and batch.host.seq_lens
         ):
             self._validate_batch_contract_host(batch)
             return
@@ -167,9 +162,9 @@ class ModelExecutor:
 
     @staticmethod
     def _validate_batch_contract_host(batch: DeviceBatch):
-        query_lens = tuple(int(x) for x in batch.query_lens_host or ())
-        seq_ids = tuple(int(x) for x in batch.seq_ids_host or ())
-        seq_lens = tuple(int(x) for x in batch.seq_lens_host or ())
+        query_lens = tuple(int(x) for x in batch.host.query_lens or ())
+        seq_ids = tuple(int(x) for x in batch.host.seq_ids or ())
+        seq_lens = tuple(int(x) for x in batch.host.seq_lens or ())
         batch_size = int(batch.batch_size)
         if len(query_lens) != batch_size:
             raise ValueError("Scheduled batch host query_lens size must match batch size")
@@ -202,11 +197,11 @@ class ModelExecutor:
     def _packed_prefill_max_query_len(self, batch: DeviceBatch) -> int | None:
         if not batch.packed_prefill:
             return None
-        prefill_buckets = tuple(getattr(self.config, "prefill_buckets", ()) or ())
+        prefill_buckets = self.config.compile.prefill_token_buckets
         if prefill_buckets:
             return int(max(prefill_buckets))
-        if batch.query_lens_host:
-            return max(int(length) for length in batch.query_lens_host)
+        if batch.host.query_lens:
+            return max(int(length) for length in batch.host.query_lens)
         return int(batch.tokens.shape[1])
 
     def forward_step(
@@ -227,7 +222,7 @@ class ModelExecutor:
                 positions=batch.positions,
                 block_tables=batch.block_tables,
                 seq_lens=batch.seq_lens,
-                block_size=self.config.block_size,
+                block_size=self.config.capacity.block_size,
                 is_prefill=batch.is_prefill,
                 query_start_loc=batch.query_start_loc,
                 num_prefill_tokens=batch.num_prefill_tokens,
@@ -272,7 +267,7 @@ class ModelExecutor:
             gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
             gathered_hidden = hidden[0, gather_idx, :][:, None, :]
             if return_hidden_with_logits or not return_hidden:
-                normed = rms_norm(gathered_hidden, self.params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                normed = rms_norm(gathered_hidden, self.params.norm_weight, self.config.model.rms_norm_eps).astype(jnp.float32)
                 vocab_weight = self.params.lm_head if self.params.lm_head is not None else self.params.embed_tokens
                 logits = jnp.dot(normed, vocab_weight.T)
                 activations = (gathered_hidden, logits) if return_hidden_with_logits else logits
@@ -318,7 +313,7 @@ class ModelExecutor:
             _static_prefill_token_count_for_batch(
                 batch,
                 config=self.config,
-                max_num_batched_tokens=getattr(self.config, "max_num_batched_tokens", None),
+                max_num_batched_tokens=self.config.capacity.max_num_batched_tokens,
             ),
         )
         if key not in self._jit_cache:
@@ -327,7 +322,7 @@ class ModelExecutor:
                 _compact_prefill_token_count(
                     batch,
                     config=self.config,
-                    max_num_batched_tokens=getattr(self.config, "max_num_batched_tokens", None),
+                    max_num_batched_tokens=self.config.capacity.max_num_batched_tokens,
                 )
                 if is_prefill and _needs_static_prefill_token_count(self.config)
                 else None
@@ -372,7 +367,7 @@ class ModelExecutor:
                     positions=step_batch.positions,
                     block_tables=step_batch.block_tables,
                     seq_lens=step_batch.seq_lens,
-                    block_size=self.config.block_size,
+                    block_size=self.config.capacity.block_size,
                     is_prefill=step_batch.is_prefill,
                     query_start_loc=step_batch.query_start_loc,
                     num_prefill_tokens=step_batch.num_prefill_tokens,
@@ -416,7 +411,7 @@ class ModelExecutor:
                     gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
                     gathered_hidden = hidden[0, gather_idx, :][:, None, :]
                     if return_hidden_with_logits or not return_hidden:
-                        normed = rms_norm(gathered_hidden, params.norm_weight, self.config.rms_norm_eps).astype(jnp.float32)
+                        normed = rms_norm(gathered_hidden, params.norm_weight, self.config.model.rms_norm_eps).astype(jnp.float32)
                         vocab_weight = params.lm_head if params.lm_head is not None else params.embed_tokens
                         logits = jnp.dot(normed, vocab_weight.T)
                         activations = (gathered_hidden, logits) if return_hidden_with_logits else logits
@@ -484,7 +479,7 @@ class ModelExecutor:
             _static_prefill_token_count_for_batch(
                 batch,
                 config=self.config,
-                max_num_batched_tokens=getattr(self.config, "max_num_batched_tokens", None),
+                max_num_batched_tokens=self.config.capacity.max_num_batched_tokens,
             ),
         )
         if key not in self._jit_cache:
@@ -493,7 +488,7 @@ class ModelExecutor:
                 _compact_prefill_token_count(
                     batch,
                     config=self.config,
-                    max_num_batched_tokens=getattr(self.config, "max_num_batched_tokens", None),
+                    max_num_batched_tokens=self.config.capacity.max_num_batched_tokens,
                 )
                 if is_prefill and _needs_static_prefill_token_count(self.config)
                 else None
@@ -538,7 +533,7 @@ class ModelExecutor:
                     positions=step_batch.positions,
                     block_tables=step_batch.block_tables,
                     seq_lens=step_batch.seq_lens,
-                    block_size=self.config.block_size,
+                    block_size=self.config.capacity.block_size,
                     is_prefill=step_batch.is_prefill,
                     query_start_loc=step_batch.query_start_loc,
                     num_prefill_tokens=step_batch.num_prefill_tokens,
@@ -655,7 +650,7 @@ class ModelExecutor:
             _static_prefill_token_count_for_batch(
                 batch,
                 config=self.config,
-                max_num_batched_tokens=getattr(self.config, "max_num_batched_tokens", None),
+                max_num_batched_tokens=self.config.capacity.max_num_batched_tokens,
             ),
         )
         if key not in self._jit_cache:
@@ -663,7 +658,7 @@ class ModelExecutor:
                 _compact_prefill_token_count(
                     batch,
                     config=self.config,
-                    max_num_batched_tokens=getattr(self.config, "max_num_batched_tokens", None),
+                    max_num_batched_tokens=self.config.capacity.max_num_batched_tokens,
                 )
                 if _needs_static_prefill_token_count(self.config)
                 else None
@@ -728,7 +723,7 @@ class ModelExecutor:
                     positions=step_batch.positions,
                     block_tables=step_batch.block_tables,
                     seq_lens=step_batch.seq_lens,
-                    block_size=self.config.block_size,
+                    block_size=self.config.capacity.block_size,
                     is_prefill=True,
                     query_start_loc=step_batch.query_start_loc,
                     num_prefill_tokens=step_batch.num_prefill_tokens,
@@ -862,7 +857,7 @@ class ModelExecutor:
             _static_prefill_token_count_for_batch(
                 batch,
                 config=self.config,
-                max_num_batched_tokens=getattr(self.config, "max_num_batched_tokens", None),
+                max_num_batched_tokens=self.config.capacity.max_num_batched_tokens,
             ),
         )
         if key not in self._jit_cache:
@@ -871,7 +866,7 @@ class ModelExecutor:
                 _compact_prefill_token_count(
                     batch,
                     config=self.config,
-                    max_num_batched_tokens=getattr(self.config, "max_num_batched_tokens", None),
+                    max_num_batched_tokens=self.config.capacity.max_num_batched_tokens,
                 )
                 if is_prefill and _needs_static_prefill_token_count(self.config)
                 else None
@@ -920,7 +915,7 @@ class ModelExecutor:
                     positions=step_batch.positions,
                     block_tables=step_batch.block_tables,
                     seq_lens=step_batch.seq_lens,
-                    block_size=self.config.block_size,
+                    block_size=self.config.capacity.block_size,
                     is_prefill=step_batch.is_prefill,
                     query_start_loc=step_batch.query_start_loc,
                     num_prefill_tokens=step_batch.num_prefill_tokens,
@@ -1099,7 +1094,7 @@ class ModelExecutor:
                     positions=step_batch.positions,
                     block_tables=step_batch.block_tables,
                     seq_lens=step_batch.seq_lens,
-                    block_size=self.config.block_size,
+                    block_size=self.config.capacity.block_size,
                     is_prefill=False,
                     query_start_loc=step_batch.query_start_loc,
                     num_prefill_tokens=0,
@@ -1216,7 +1211,7 @@ class ModelExecutor:
             _static_prefill_token_count_for_batch(
                 batch,
                 config=self.config,
-                max_num_batched_tokens=getattr(self.config, "max_num_batched_tokens", None),
+                max_num_batched_tokens=self.config.capacity.max_num_batched_tokens,
             ),
         )
         if key not in self._jit_cache:
@@ -1224,7 +1219,7 @@ class ModelExecutor:
                 _compact_prefill_token_count(
                     batch,
                     config=self.config,
-                    max_num_batched_tokens=getattr(self.config, "max_num_batched_tokens", None),
+                    max_num_batched_tokens=self.config.capacity.max_num_batched_tokens,
                 )
                 if _needs_static_prefill_token_count(self.config)
                 else None
@@ -1291,7 +1286,7 @@ class ModelExecutor:
                     positions=step_batch.positions,
                     block_tables=step_batch.block_tables,
                     seq_lens=step_batch.seq_lens,
-                    block_size=self.config.block_size,
+                    block_size=self.config.capacity.block_size,
                     is_prefill=True,
                     query_start_loc=step_batch.query_start_loc,
                     num_prefill_tokens=step_batch.num_prefill_tokens,
@@ -1502,7 +1497,7 @@ class ModelExecutor:
                     positions=step_batch.positions,
                     block_tables=step_batch.block_tables,
                     seq_lens=step_batch.seq_lens,
-                    block_size=self.config.block_size,
+                    block_size=self.config.capacity.block_size,
                     is_prefill=False,
                     query_start_loc=step_batch.query_start_loc,
                     num_prefill_tokens=0,
@@ -1704,7 +1699,7 @@ class ModelExecutor:
                     positions=step_batch.positions,
                     block_tables=step_batch.block_tables,
                     seq_lens=step_batch.seq_lens,
-                    block_size=self.config.block_size,
+                    block_size=self.config.capacity.block_size,
                     is_prefill=False,
                     query_start_loc=step_batch.query_start_loc,
                     num_prefill_tokens=0,
@@ -1893,7 +1888,7 @@ class ModelExecutor:
                     positions=step_batch.positions,
                     block_tables=step_batch.block_tables,
                     seq_lens=step_batch.seq_lens,
-                    block_size=self.config.block_size,
+                    block_size=self.config.capacity.block_size,
                     is_prefill=False,
                     query_start_loc=step_batch.query_start_loc,
                     num_prefill_tokens=0,
@@ -2077,7 +2072,7 @@ class ModelExecutor:
                     positions=step_batch.positions,
                     block_tables=step_batch.block_tables,
                     seq_lens=step_batch.seq_lens,
-                    block_size=self.config.block_size,
+                    block_size=self.config.capacity.block_size,
                     is_prefill=False,
                     query_start_loc=step_batch.query_start_loc,
                     num_prefill_tokens=0,
@@ -2246,7 +2241,7 @@ class ModelExecutor:
                     positions=step_batch.positions,
                     block_tables=step_batch.block_tables,
                     seq_lens=step_batch.seq_lens,
-                    block_size=self.config.block_size,
+                    block_size=self.config.capacity.block_size,
                     is_prefill=False,
                     query_start_loc=step_batch.query_start_loc,
                     num_prefill_tokens=0,
@@ -2442,7 +2437,7 @@ class ModelExecutor:
                         positions=step_batch.positions,
                         block_tables=step_batch.block_tables,
                         seq_lens=step_batch.seq_lens,
-                        block_size=self.config.block_size,
+                        block_size=self.config.capacity.block_size,
                         is_prefill=False,
                         query_start_loc=step_batch.query_start_loc,
                         num_prefill_tokens=0,
@@ -2644,7 +2639,7 @@ class ModelExecutor:
                         positions=step_batch.positions,
                         block_tables=step_batch.block_tables,
                         seq_lens=step_batch.seq_lens,
-                        block_size=self.config.block_size,
+                        block_size=self.config.capacity.block_size,
                         is_prefill=False,
                         query_start_loc=step_batch.query_start_loc,
                         num_prefill_tokens=0,

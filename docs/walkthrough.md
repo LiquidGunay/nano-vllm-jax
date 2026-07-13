@@ -24,7 +24,9 @@ does not carry a dormant mixed prefill/decode mode.
 
 `ModelRunner` materializes that plan. It pads rows to the selected bucket,
 reuses eligible device metadata, and produces the `DeviceBatch` consumed by
-compiled execution.
+compiled execution. The batch has one immutable `HostBatch` for retained
+sequence ids, lengths, block rows, hybrid slots, and route-independent commit
+facts; host mirrors are not parallel optional fields on the device object.
 
 Packed prefill arrays use fixed bucket shapes:
 

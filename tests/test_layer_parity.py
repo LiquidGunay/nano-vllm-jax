@@ -26,13 +26,13 @@ import jax.numpy as jnp
 import numpy as np
 torch = pytest.importorskip("torch")
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.config import RuntimeSpec
 from nanovllm_jax.layers import rms_norm, apply_rope
-from nanovllm_jax.model import (
+from nanovllm_jax.gdn import (
     jax_chunk_gated_delta_rule,
     jax_recurrent_gated_delta_rule,
-    full_attention_block,
 )
+from nanovllm_jax.attention import full_attention_block
 
 MODEL_NAME = os.getenv("HF_PARITY_MODEL", "Qwen/Qwen3.5-0.8B")
 
@@ -118,14 +118,14 @@ def test_rope(hf_model_and_tokenizer):
     # Ensure HF CUDA path is available and model weights load successfully.
     # Ensure fixture is resolved so CUDA-availability checks run.
     _ = hf_model_and_tokenizer
-    config = RuntimeConfig.qwen3_5_0_8b()
+    config = RuntimeSpec()
     
     # Create test input
     batch_size, seq_len, num_heads, head_dim = 1, 32, 8, 256
     
     # Create dummy query/key
     q_np = np.random.randn(batch_size, seq_len, num_heads, head_dim).astype(np.float32)
-    k_np = np.random.randn(batch_size, seq_len, config.num_key_value_heads, head_dim).astype(np.float32)
+    k_np = np.random.randn(batch_size, seq_len, config.model.num_key_value_heads, head_dim).astype(np.float32)
     
     q_jax = jnp.array(q_np)
     k_jax = jnp.array(k_np)
@@ -133,8 +133,8 @@ def test_rope(hf_model_and_tokenizer):
     positions_jax = jnp.tile(jnp.arange(seq_len), (batch_size, 1))
     
     # JAX RoPE - verify it runs correctly and has expected shape
-    q_rope = apply_rope(q_jax, positions_jax, config.head_dim, config.rope_theta, config.partial_rotary_factor)
-    k_rope = apply_rope(k_jax, positions_jax, config.head_dim, config.rope_theta, config.partial_rotary_factor)
+    q_rope = apply_rope(q_jax, positions_jax, config.model.head_dim, config.model.rope_theta, config.model.partial_rotary_factor)
+    k_rope = apply_rope(k_jax, positions_jax, config.model.head_dim, config.model.rope_theta, config.model.partial_rotary_factor)
     
     print(f"  JAX RoPE shapes: q={q_rope.shape}, k={k_rope.shape}")
     assert q_rope.shape == q_jax.shape
@@ -146,7 +146,7 @@ def test_full_attention(hf_model_and_tokenizer):
     print("\n=== Testing Full Attention ===")
     
     model, _ = hf_model_and_tokenizer
-    config = RuntimeConfig.qwen3_5_0_8b()
+    config = RuntimeSpec()
     
     # Find a full attention layer (layers 3, 7, 11, 15, 19, 23)
     full_attn_layer_idx = 3
@@ -154,7 +154,7 @@ def test_full_attention(hf_model_and_tokenizer):
     
     # Create test input
     batch_size, seq_len = 1, 16
-    hidden_np = np.random.randn(batch_size, seq_len, config.hidden_size).astype(np.float32)
+    hidden_np = np.random.randn(batch_size, seq_len, config.model.hidden_size).astype(np.float32)
     
     # Get layer weights
     q_proj = hf_layer.self_attn.q_proj.weight.detach().T.float().cpu().numpy()
@@ -225,7 +225,7 @@ def test_full_attention(hf_model_and_tokenizer):
     print(f"  Output shape: {out.shape}")
     print(f"  MSE: {mse:.2e}")
     print(f"  Max diff: {max_diff:.2e}")
-    assert out.shape == (batch_size, seq_len, config.hidden_size)
+    assert out.shape == (batch_size, seq_len, config.model.hidden_size)
     assert out_cache is None
     assert mse < 1e-5
 
@@ -235,7 +235,7 @@ def test_linear_attention_chunked(hf_model_and_tokenizer):
     print("\n=== Testing Linear Attention (Chunked) ===")
     
     model, _ = hf_model_and_tokenizer
-    config = RuntimeConfig.qwen3_5_0_8b()
+    config = RuntimeSpec()
     
     # Find a linear attention layer index (0, 1, 2, etc.)
     linear_layer_idx = 0
@@ -248,11 +248,11 @@ def test_linear_attention_chunked(hf_model_and_tokenizer):
     
     # Test chunked computation
     # Create test Q, K, V, g, beta
-    num_heads = config.linear_num_value_heads
-    head_dim = config.linear_value_head_dim
+    num_heads = config.model.linear_num_value_heads
+    head_dim = config.model.linear_value_head_dim
     
-    q_np = np.random.randn(batch_size, num_heads, seq_len, config.linear_key_head_dim).astype(np.float32)
-    k_np = np.random.randn(batch_size, num_heads, seq_len, config.linear_key_head_dim).astype(np.float32)
+    q_np = np.random.randn(batch_size, num_heads, seq_len, config.model.linear_key_head_dim).astype(np.float32)
+    k_np = np.random.randn(batch_size, num_heads, seq_len, config.model.linear_key_head_dim).astype(np.float32)
     v_np = np.random.randn(batch_size, num_heads, seq_len, head_dim).astype(np.float32)
     g_np = np.random.randn(batch_size, num_heads, seq_len).astype(np.float32) * 0.1
     beta_np = np.random.rand(batch_size, num_heads, seq_len).astype(np.float32)
@@ -266,8 +266,8 @@ def test_linear_attention_chunked(hf_model_and_tokenizer):
     
     output, _ = jax_chunk_gated_delta_rule(
         q_jax, k_jax, v_jax, g_jax, beta_jax,
-        chunk_size=config.linear_chunk_size,
-        use_qk_l2norm_in_kernel=config.use_qk_norm_in_gdn,
+        chunk_size=config.model.linear_chunk_size,
+        use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
     )
     
     print(f"  Input Q shape: {q_jax.shape}")
@@ -280,12 +280,12 @@ def test_linear_attention_recurrent():
     """Test linear attention (recurrent mode for decode) against chunked."""
     print("\n=== Testing Linear Attention (Recurrent) ===")
     
-    config = RuntimeConfig.qwen3_5_0_8b()
+    config = RuntimeSpec()
     
     # Create test input for single token decode
-    batch_size, num_heads, seq_len = 1, config.linear_num_value_heads, 1
-    k_dim = config.linear_key_head_dim
-    v_dim = config.linear_value_head_dim
+    batch_size, num_heads, seq_len = 1, config.model.linear_num_value_heads, 1
+    k_dim = config.model.linear_key_head_dim
+    v_dim = config.model.linear_value_head_dim
     
     q_np = np.random.randn(batch_size, num_heads, seq_len, k_dim).astype(np.float32)
     k_np = np.random.randn(batch_size, num_heads, seq_len, k_dim).astype(np.float32)
@@ -306,7 +306,7 @@ def test_linear_attention_recurrent():
     output, final_state = jax_recurrent_gated_delta_rule(
         q_jax, k_jax, v_jax, g_jax, beta_jax,
         initial_state=initial_state,
-        use_qk_l2norm_in_kernel=config.use_qk_norm_in_gdn,
+        use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
     )
     
     print(f"  Output shape: {output.shape}")
@@ -320,7 +320,7 @@ def test_mlp(hf_model_and_tokenizer):
     print("\n=== Testing MLP ===")
     
     model, _ = hf_model_and_tokenizer
-    config = RuntimeConfig.qwen3_5_0_8b()
+    config = RuntimeSpec()
     
     # Get MLP from any layer
     hf_layer = model.model.layers[0]
@@ -332,7 +332,7 @@ def test_mlp(hf_model_and_tokenizer):
     
     # Create test input
     batch_size, seq_len = 1, 16
-    hidden_np = np.random.randn(batch_size, seq_len, config.hidden_size).astype(np.float32)
+    hidden_np = np.random.randn(batch_size, seq_len, config.model.hidden_size).astype(np.float32)
     
     # HF forward
     hidden_torch = torch.from_numpy(hidden_np).to(device=gate_weight_torch.device)

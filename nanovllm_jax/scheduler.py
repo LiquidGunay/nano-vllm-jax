@@ -14,23 +14,11 @@ from collections import deque
 from dataclasses import replace
 from typing import Deque, List, Tuple
 
-from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.config import RuntimeSpec
 from nanovllm_jax.batch import BucketShape, ScheduledRow, SchedulePlan
 from nanovllm_jax.output import is_device_token
-from nanovllm_jax.sequence import Sequence, SequenceStatus, SamplingParams
+from nanovllm_jax.sequence import Sequence, SequenceStatus
 from nanovllm_jax.block_manager import BlockManager, PrefixCacheEntry
-
-def _config_flag(config: RuntimeConfig | None, attr: str, *, default: bool = False) -> bool:
-    if config is not None and hasattr(config, attr):
-        return bool(getattr(config, attr))
-    return bool(default)
-
-
-def _config_int(config: RuntimeConfig | None, attr: str, *, default: int = 0) -> int:
-    if config is not None and hasattr(config, attr):
-        return int(getattr(config, attr) or default)
-    return int(default)
-
 
 class Scheduler:
     """Scheduler for continuous batching.
@@ -42,34 +30,27 @@ class Scheduler:
     - Whole-request KV capacity reservation
     """
 
-    def __init__(self, config: RuntimeConfig):
-        self.max_num_seqs = int(getattr(config, 'max_num_seqs', 16) or 16)
-        self.max_num_resident_seqs = int(
-            getattr(config, "max_num_resident_seqs", None) or self.max_num_seqs
-        )
-        if self.max_num_resident_seqs < self.max_num_seqs:
-            raise ValueError("max_num_resident_seqs must be >= max_num_seqs")
-        self.max_num_batched_tokens = getattr(config, 'max_num_batched_tokens', 2048)
-        self.eos_token_ids = frozenset(
-            int(token_id)
-            for token_id in getattr(config, "eos_token_ids", ())
-        )
-        self.block_size = config.block_size
-        self.prefix_cache_enabled = bool(config.prefix_cache)
-        self.prefill_buckets = tuple(getattr(config, "prefill_buckets", ()))
-        self.prefill_token_buckets = tuple(getattr(config, "prefill_token_buckets", ()))
-        self.prefill_layout = str(getattr(config, "prefill_layout", "packed") or "packed").lower()
-        if self.prefill_layout not in {"packed", "dense"}:
-            raise ValueError("prefill_layout must be 'packed' or 'dense'")
-        self.batch_size_buckets = tuple(getattr(config, "batch_size_buckets", ()))
-        self.decode_block_table_buckets = tuple(getattr(config, "decode_block_table_buckets", ()) or ())
-        self.device_token_carry = _config_flag(config, "device_token_carry")
-        if self.prefill_layout == "packed" and self.prefill_buckets:
-            self.prefill_chunk_budget = max(self.prefill_buckets)
+    def __init__(self, config: RuntimeSpec):
+        capacity = config.capacity
+        compile = config.compile
+        kernels = config.kernels
+        self.max_num_seqs = capacity.max_num_seqs
+        self.max_num_resident_seqs = capacity.max_num_resident_seqs
+        self.max_num_batched_tokens = capacity.max_num_batched_tokens
+        self.eos_token_ids = frozenset(capacity.eos_token_ids)
+        self.block_size = capacity.block_size
+        self.prefix_cache_enabled = capacity.prefix_cache
+        self.prefill_token_buckets = compile.prefill_token_buckets
+        self.prefill_layout = compile.prefill_layout
+        self.batch_size_buckets = compile.batch_size_buckets
+        self.decode_block_table_buckets = compile.decode_block_table_buckets
+        self.device_token_carry = kernels.device_token_carry
+        if self.prefill_layout == "packed" and self.prefill_token_buckets:
+            self.prefill_chunk_budget = max(self.prefill_token_buckets)
         else:
             self.prefill_chunk_budget = (
-                max(self.prefill_token_buckets or self.prefill_buckets)
-                if (self.prefill_token_buckets or self.prefill_buckets)
+                max(self.prefill_token_buckets)
+                if self.prefill_token_buckets
                 else max(
                     64,
                     self.max_num_batched_tokens
@@ -78,21 +59,14 @@ class Scheduler:
                 )
             )
         self.decode_lookahead_tokens = 1
-        self.greedy_decode_burst_steps = max(
-            1,
-            _config_int(
-                config,
-                "greedy_decode_burst_steps",
-                default=1,
-            ),
-        )
-        self.max_blocks_per_seq = getattr(config, "max_blocks_per_seq", None)
+        self.greedy_decode_burst_steps = kernels.greedy_decode_burst_steps
+        self.max_blocks_per_seq = capacity.max_blocks_per_seq
         self.block_manager = BlockManager(
-            config.num_kvcache_blocks,
-            config.block_size,
+            capacity.num_kvcache_blocks,
+            capacity.block_size,
             prefix_state_capacity=(
                 self.max_num_resident_seqs
-                if self.prefix_cache_enabled and config.linear_attn_layers
+                if self.prefix_cache_enabled and config.model.linear_attn_layers
                 else 0
             ),
         )
@@ -387,18 +361,6 @@ class Scheduler:
         )
         if self.prefill_token_buckets:
             max_token_budget = min(max_token_budget, max(self.prefill_token_buckets))
-        elif self.prefill_layout == "packed" and self.prefill_buckets:
-            max_token_budget = min(max_token_budget, max(self.prefill_buckets))
-        elif self.prefill_buckets:
-            max_dense_batch = (
-                max(self.batch_size_buckets)
-                if self.batch_size_buckets
-                else self.max_num_seqs
-            )
-            max_token_budget = min(
-                max_token_budget,
-                max(self.prefill_buckets) * max(1, int(max_dense_batch)),
-            )
         return int(max_token_budget)
 
     def build_schedule_plan(
@@ -535,15 +497,15 @@ class Scheduler:
         return size
 
     def _select_prefill_query_bucket(self, size: int) -> int:
-        if self.prefill_buckets:
-            return self._select_bucket(size, self.prefill_buckets, "prefill")
+        if self.prefill_token_buckets:
+            return self._select_bucket(size, self.prefill_token_buckets, "prefill")
         return size
 
     def _select_prefill_token_bucket(self, size: int) -> int:
-        buckets = self.prefill_token_buckets or self.prefill_buckets
-        if buckets:
-            return self._select_bucket(size, buckets, "prefill token")
+        if self.prefill_token_buckets:
+            return self._select_bucket(size, self.prefill_token_buckets, "prefill token")
         return size
+
     def _capacity_exhausted_message(self) -> str:
         stats = self.block_manager.stats()
 

@@ -5,11 +5,11 @@ import sys
 import pytest
 
 from nanovllm_jax.block_manager import BlockManager
-from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.sequence import SamplingParams, Sequence
 from nanovllm_jax.step import RunResult
+from tests.runtime_specs import runtime_spec
 
 
 def test_scheduler_and_sequence_import_without_jax():
@@ -32,22 +32,22 @@ def test_scheduler_and_sequence_import_without_jax():
 
 def _scheduler(*, block_size: int = 2, num_blocks: int = 3) -> Scheduler:
     return Scheduler(
-        RuntimeConfig(
-            block_size=block_size,
-            num_kvcache_blocks=num_blocks,
-            max_kv_cache_bytes=1 << 30,
-            max_num_seqs=1,
-            max_num_resident_seqs=1,
-            max_num_batched_tokens=2,
-            max_blocks_per_seq=num_blocks,
-            prefill_buckets=(2,),
-            prefill_token_buckets=(2,),
-            batch_size_buckets=(1,),
-            decode_block_table_buckets=(num_blocks,),
-            prefix_cache=False,
-            device_token_carry=False,
-            static_decode_metadata=False,
-            resident_decode_metadata=False,
+        runtime_spec(
+            capacity={
+                "block_size": block_size,
+                "num_kvcache_blocks": num_blocks,
+                "max_kv_cache_bytes": 1 << 30,
+                "max_num_seqs": 1,
+                "max_num_resident_seqs": 1,
+                "max_num_batched_tokens": 2,
+                "max_blocks_per_seq": num_blocks,
+                "prefix_cache": False,
+            },
+            compile={
+                "prefill_token_buckets": (2,),
+                "batch_size_buckets": (1,),
+                "decode_block_table_buckets": (num_blocks,),
+            },
         )
     )
 
@@ -119,7 +119,7 @@ def test_sequence_ids_and_block_sizes_are_engine_local():
 
     def bare_engine(block_size: int) -> LLMEngine:
         engine = object.__new__(LLMEngine)
-        engine.config = SimpleNamespace(block_size=block_size)
+        engine.config = SimpleNamespace(capacity=SimpleNamespace(block_size=block_size))
         engine.scheduler = Queue()
         engine._next_seq_id = 0
         return engine
@@ -167,19 +167,22 @@ def test_future_capacity_reservation_does_not_evict_cached_prefix():
 
 def test_first_fitting_waiter_bypasses_blocked_large_request():
     scheduler = Scheduler(
-        RuntimeConfig(
-            block_size=2,
-            num_kvcache_blocks=5,
-            max_kv_cache_bytes=1 << 30,
-            max_num_seqs=2,
-            max_num_resident_seqs=2,
-            max_num_batched_tokens=2,
-            max_blocks_per_seq=5,
-            prefill_buckets=(2,),
-            prefill_token_buckets=(2,),
-            batch_size_buckets=(1, 2),
-            decode_block_table_buckets=(1, 2, 3, 4, 5),
-            prefix_cache=False,
+        runtime_spec(
+            capacity={
+                "block_size": 2,
+                "num_kvcache_blocks": 5,
+                "max_kv_cache_bytes": 1 << 30,
+                "max_num_seqs": 2,
+                "max_num_resident_seqs": 2,
+                "max_num_batched_tokens": 2,
+                "max_blocks_per_seq": 5,
+                "prefix_cache": False,
+            },
+            compile={
+                "prefill_token_buckets": (2,),
+                "batch_size_buckets": (1, 2),
+                "decode_block_table_buckets": (1, 2, 3, 4, 5),
+            },
         )
     )
     active = Sequence([1, 2], SamplingParams(max_tokens=2), seq_id=0, block_size=2)

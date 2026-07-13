@@ -260,16 +260,18 @@ def _validate_inputs_fit_config(inputs: list[str | list[int]], prompt_tokens: li
     if engine is None:
         raise RuntimeError("model is not loaded")
 
-    max_blocks_per_seq = getattr(engine.config, "max_blocks_per_seq", None)
-    if max_blocks_per_seq is not None:
-        capacity = int(max_blocks_per_seq) * int(engine.config.block_size)
-        needed = max(prompt_tokens) + max_tokens
-        if needed > capacity:
-            raise ValueError(f"request needs {needed} tokens, exceeding per-sequence KV capacity {capacity}")
-
-    max_num_seqs = getattr(engine.config, "max_num_seqs", None)
-    if max_num_seqs is not None and len(inputs) > int(max_num_seqs):
-        raise ValueError(f"request has {len(inputs)} prompts, exceeding max_num_seqs {max_num_seqs}")
+    runtime_capacity = engine.config.capacity
+    token_capacity = runtime_capacity.max_blocks_per_seq * runtime_capacity.block_size
+    needed = max(prompt_tokens) + max_tokens
+    if needed > token_capacity:
+        raise ValueError(
+            f"request needs {needed} tokens, exceeding per-sequence KV capacity {token_capacity}"
+        )
+    if len(inputs) > runtime_capacity.max_num_seqs:
+        raise ValueError(
+            f"request has {len(inputs)} prompts, exceeding max_num_seqs "
+            f"{runtime_capacity.max_num_seqs}"
+        )
 
 
 def _prepare_generation(data: dict[str, Any]):

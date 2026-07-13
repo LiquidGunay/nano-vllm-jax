@@ -10,7 +10,8 @@ import jax.numpy as jnp
 import pytest
 
 from nanovllm_jax.ops import ServingOps
-from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.config import RuntimeSpec
+from nanovllm_jax.fastpath import KernelPlan
 from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.kernels.flashinfer_ffi import kv_append_paged_nhd_reference
 from nanovllm_jax.cache import (
@@ -20,6 +21,7 @@ from nanovllm_jax.cache import (
     update_kv_cache,
 )
 from nanovllm_jax.model import init_params
+from tests.runtime_specs import runtime_spec
 
 
 def _spec() -> KVCacheSpec:
@@ -33,25 +35,28 @@ def _spec() -> KVCacheSpec:
     )
 
 
-def _tiny_full_attention_config() -> RuntimeConfig:
-    return RuntimeConfig(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-        block_size=2,
-        num_kvcache_blocks=4,
-        dtype="float32",
-        tie_word_embeddings=True,
-        layer_types=("full_attention",),
-        linear_attn_layers=(),
-        max_num_seqs=1,
-        max_blocks_per_seq=2,
-        max_kv_cache_bytes=4 * 2 * 2 * 1 * 8 * 4 * 2,
-        full_attention_decode_impl="flashinfer_paged",
+def _tiny_full_attention_config() -> RuntimeSpec:
+    return runtime_spec(
+        model={
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "tie_word_embeddings": True,
+            "layer_types": ("full_attention",),
+        },
+        capacity={
+            "block_size": 2,
+            "num_kvcache_blocks": 4,
+            "max_num_seqs": 1,
+            "max_blocks_per_seq": 2,
+            "max_kv_cache_bytes": 4 * 2 * 2 * 1 * 8 * 4 * 2,
+        },
+        compile={"dtype": "float32"},
+        kernels={"full_attention_decode": "flashinfer_paged"},
     )
 
 
@@ -65,7 +70,7 @@ def test_nhd_full_attention_cache_disabled_by_default():
 def test_nhd_full_attention_cache_shape_for_flashinfer_decode():
     spec = _spec()
 
-    backend = ServingOps(RuntimeConfig(full_attention_decode_impl="flashinfer_paged"))
+    backend = ServingOps(KernelPlan(full_attention_decode="flashinfer_paged"))
     nhd_cache = backend.allocate_full_attention_nhd_kv_cache(
         spec,
         full_attention_layers=(3, 7, 11, 15, 19, 23),
@@ -94,7 +99,7 @@ def test_nhd_full_attention_cache_uses_main_cache_block_cap():
         max_kv_cache_bytes=2 * 4 * 2 * 1 * 4 * 4 * 2,
     )
 
-    backend = ServingOps(RuntimeConfig(full_attention_decode_impl="flashinfer_paged"))
+    backend = ServingOps(KernelPlan(full_attention_decode="flashinfer_paged"))
     nhd_cache = backend.allocate_full_attention_nhd_kv_cache(
         spec,
         full_attention_layers=(1, 3),
@@ -108,7 +113,7 @@ def test_nhd_full_attention_cache_uses_main_cache_block_cap():
 
 def test_model_runner_sidecar_does_not_replace_canonical_cache():
     config = _tiny_full_attention_config()
-    params = init_params(jax.random.PRNGKey(0), config)
+    params = init_params(jax.random.PRNGKey(0), config.model)
 
     runner = ModelRunner(config, params)
 

@@ -43,7 +43,7 @@ dev = [
 ]
 
 [tool.ruff.lint]
-select = ["F821"]
+select = ["E9", "F63", "F7", "F82"]
 
 [build-system]
 requires = ["hatchling"]

@@ -12,7 +12,8 @@ import numpy as np
 import pytest
 
 from nanovllm_jax.ops import ServingOps
-from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.config import RuntimeSpec
+from nanovllm_jax.fastpath import KernelPlan
 from nanovllm_jax.kernels.gdn_fla import (
     gdn_fla_prefill_chunk32_fp32_reference,
     gdn_fla_prefill_varlen_reference,
@@ -25,7 +26,9 @@ from nanovllm_jax.kernels.gdn_fla import (
 )
 from nanovllm_jax.cache import HybridLayerState
 from nanovllm_jax.layers import l2norm
-from nanovllm_jax.model import gated_deltanet_block, init_transformer_block
+from nanovllm_jax.gdn import gated_deltanet_block
+from nanovllm_jax.model import init_transformer_block
+from tests.runtime_specs import runtime_spec
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
@@ -41,28 +44,37 @@ def _has_jax_triton() -> bool:
     return importlib.util.find_spec("jax_triton") is not None
 
 
-def _small_gdn_config(**overrides) -> RuntimeConfig:
-    fields = dict(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=1,
-        num_key_value_heads=1,
-        head_dim=4,
-        linear_num_key_heads=1,
-        linear_num_value_heads=2,
-        linear_key_head_dim=4,
-        linear_value_head_dim=4,
-        linear_conv_kernel_size=4,
-        linear_chunk_size=8,
-        linear_recurrent_prefill_threshold=4,
-        layer_types=("linear_attention",),
-        linear_attn_layers=(0,),
-        dtype="float32",
+def _small_gdn_config(
+    *,
+    gdn_prefill_post_conv_impl: str = "off",
+    gdn_disable_fallbacks: bool = False,
+    gdn_recurrent_prefill_threshold: int = 4,
+    prefill_token_buckets: tuple[int, ...] = (),
+) -> RuntimeSpec:
+    return runtime_spec(
+        model={
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 2,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_size": 4,
+            "linear_chunk_size": 8,
+            "layer_types": ("linear_attention",),
+        },
+        compile={"dtype": "float32", "prefill_token_buckets": prefill_token_buckets},
+        kernels={
+            "gdn_prefill": gdn_prefill_post_conv_impl,
+            "gdn_disable_fallbacks": gdn_disable_fallbacks,
+            "gdn_recurrent_prefill_threshold": gdn_recurrent_prefill_threshold,
+        },
     )
-    fields.update(overrides)
-    return RuntimeConfig(**fields)
 
 
 def _prefill_ops(
@@ -73,10 +85,10 @@ def _prefill_ops(
     disable_fallbacks: bool = False,
 ) -> ServingOps:
     return ServingOps(
-        RuntimeConfig(
-            gdn_prefill_post_conv_impl=impl,
+        KernelPlan(
+            gdn_prefill=impl,
             gdn_prefill_qkv_dtype=qkv_dtype,
-            gdn_prefill_post_conv_output_dtype=output_dtype,
+            gdn_prefill_output_dtype=output_dtype,
             gdn_disable_fallbacks=disable_fallbacks,
         )
     )
@@ -554,41 +566,41 @@ def test_prepared_fla_varlen_reference_matches_rectangular_reference():
 def test_model_post_conv_prefill_reference_matches_default_with_mask():
     config = _small_gdn_config()
     actual_config = _small_gdn_config(gdn_prefill_post_conv_impl="reference")
-    params = init_transformer_block(jax.random.PRNGKey(0), config, layer_idx=0)
+    params = init_transformer_block(jax.random.PRNGKey(0), config.model, layer_idx=0)
     batch = 3
     seq_len = 16
-    key_dim = config.linear_num_key_heads * config.linear_key_head_dim
-    value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+    key_dim = config.model.linear_num_key_heads * config.model.linear_key_head_dim
+    value_dim = config.model.linear_num_value_heads * config.model.linear_value_head_dim
     conv_dim = 2 * key_dim + value_dim
 
     x = jnp.linspace(
         -0.35,
         0.45,
-        batch * seq_len * config.hidden_size,
+        batch * seq_len * config.model.hidden_size,
         dtype=jnp.float32,
-    ).reshape(batch, seq_len, config.hidden_size)
+    ).reshape(batch, seq_len, config.model.hidden_size)
     hybrid_state = HybridLayerState(
         conv_state=jnp.linspace(
             -0.2,
             0.2,
-            batch * 1 * conv_dim * config.linear_conv_kernel_size,
+            batch * 1 * conv_dim * config.model.linear_conv_kernel_size,
             dtype=jnp.float32,
-        ).reshape(batch, 1, conv_dim, config.linear_conv_kernel_size),
+        ).reshape(batch, 1, conv_dim, config.model.linear_conv_kernel_size),
         recurrent_state=jnp.linspace(
             -0.03,
             0.04,
             batch
             * 1
-            * config.linear_num_value_heads
-            * config.linear_value_head_dim
-            * config.linear_key_head_dim,
+            * config.model.linear_num_value_heads
+            * config.model.linear_value_head_dim
+            * config.model.linear_key_head_dim,
             dtype=jnp.float32,
         ).reshape(
             batch,
             1,
-            config.linear_num_value_heads,
-            config.linear_value_head_dim,
-            config.linear_key_head_dim,
+            config.model.linear_num_value_heads,
+            config.model.linear_value_head_dim,
+            config.model.linear_key_head_dim,
         ),
     )
     lengths = jnp.array([16, 9, 0], dtype=jnp.int32)
@@ -644,40 +656,40 @@ def test_model_post_conv_triton_padded_matches_reference():
     config = _small_gdn_config()
     expected_config = _small_gdn_config(gdn_prefill_post_conv_impl="reference")
     actual_config = _small_gdn_config(gdn_prefill_post_conv_impl="triton_fla_padded")
-    params = init_transformer_block(jax.random.PRNGKey(7), config, layer_idx=0)
+    params = init_transformer_block(jax.random.PRNGKey(7), config.model, layer_idx=0)
     batch = 2
     seq_len = 12
-    key_dim = config.linear_num_key_heads * config.linear_key_head_dim
-    value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+    key_dim = config.model.linear_num_key_heads * config.model.linear_key_head_dim
+    value_dim = config.model.linear_num_value_heads * config.model.linear_value_head_dim
     conv_dim = 2 * key_dim + value_dim
     x = jnp.linspace(
         -0.2,
         0.3,
-        batch * seq_len * config.hidden_size,
+        batch * seq_len * config.model.hidden_size,
         dtype=jnp.float32,
-    ).reshape(batch, seq_len, config.hidden_size)
+    ).reshape(batch, seq_len, config.model.hidden_size)
     hybrid_state = HybridLayerState(
         conv_state=jnp.linspace(
             -0.05,
             0.15,
-            batch * 1 * conv_dim * config.linear_conv_kernel_size,
+            batch * 1 * conv_dim * config.model.linear_conv_kernel_size,
             dtype=jnp.float32,
-        ).reshape(batch, 1, conv_dim, config.linear_conv_kernel_size),
+        ).reshape(batch, 1, conv_dim, config.model.linear_conv_kernel_size),
         recurrent_state=jnp.linspace(
             -0.01,
             0.02,
             batch
             * 1
-            * config.linear_num_value_heads
-            * config.linear_value_head_dim
-            * config.linear_key_head_dim,
+            * config.model.linear_num_value_heads
+            * config.model.linear_value_head_dim
+            * config.model.linear_key_head_dim,
             dtype=jnp.float32,
         ).reshape(
             batch,
             1,
-            config.linear_num_value_heads,
-            config.linear_value_head_dim,
-            config.linear_key_head_dim,
+            config.model.linear_num_value_heads,
+            config.model.linear_value_head_dim,
+            config.model.linear_key_head_dim,
         ),
     )
     lengths = jnp.array([12, 10], dtype=jnp.int32)
@@ -873,19 +885,20 @@ def test_model_post_conv_prefill_strict_rejects_missing_triton_module(monkeypatc
 
 
 def test_model_packed_prefill_strict_rejects_prefix_state_fallback():
-    config = _small_gdn_config()
-    config.gdn_disable_fallbacks = True
-    config.gdn_prefill_post_conv_impl = "triton_fla_padded"
-    config.linear_recurrent_prefill_threshold = 0
-    config.prefill_buckets = (8,)
-    params = init_transformer_block(jax.random.PRNGKey(3), config, layer_idx=0)
+    config = _small_gdn_config(
+        gdn_disable_fallbacks=True,
+        gdn_prefill_post_conv_impl="triton_fla_padded",
+        gdn_recurrent_prefill_threshold=0,
+        prefill_token_buckets=(8,),
+    )
+    params = init_transformer_block(jax.random.PRNGKey(3), config.model, layer_idx=0)
     seq_len = 8
     x = jnp.linspace(
         -0.2,
         0.3,
-        seq_len * config.hidden_size,
+        seq_len * config.model.hidden_size,
         dtype=jnp.float32,
-    ).reshape(1, seq_len, config.hidden_size)
+    ).reshape(1, seq_len, config.model.hidden_size)
     positions = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
     packed_token_row_ids = jnp.array(
         [[0, 0, 0, 1, 1, 1, 1, 1]],
@@ -908,18 +921,19 @@ def test_model_packed_prefill_strict_rejects_prefix_state_fallback():
 
 
 def test_model_prefill_strict_rejects_prefix_state_fallback():
-    config = _small_gdn_config()
-    config.gdn_disable_fallbacks = True
-    config.gdn_prefill_post_conv_impl = "triton_fla_padded"
-    config.linear_recurrent_prefill_threshold = 0
-    params = init_transformer_block(jax.random.PRNGKey(4), config, layer_idx=0)
+    config = _small_gdn_config(
+        gdn_disable_fallbacks=True,
+        gdn_prefill_post_conv_impl="triton_fla_padded",
+        gdn_recurrent_prefill_threshold=0,
+    )
+    params = init_transformer_block(jax.random.PRNGKey(4), config.model, layer_idx=0)
     seq_len = 8
     x = jnp.linspace(
         -0.1,
         0.25,
-        seq_len * config.hidden_size,
+        seq_len * config.model.hidden_size,
         dtype=jnp.float32,
-    ).reshape(1, seq_len, config.hidden_size)
+    ).reshape(1, seq_len, config.model.hidden_size)
     positions = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
 
     with pytest.raises(RuntimeError, match="return_prefix_state"):
