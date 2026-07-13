@@ -334,6 +334,10 @@ PR 2c keeps the prefix-cache follow-up narrow:
 - Keep device snapshots runner-owned behind opaque handles.
 - Invalidate complete entries on physical block reuse and evict state by an
   explicit LRU budget.
+- Keep admission and cached-state seeding in one engine step; a full prefill
+  token budget must stop before another waiter is reserved.
+- Treat compilation warmup as startup-only, and bind each runner snapshot to
+  both its prefix hash and token count.
 - Leave at least one prompt token executable because entries do not cache the
   following logits.
 - Prove cache-hit parity on a tiny CUDA model and a real Qwen3.5 checkpoint;
@@ -536,6 +540,9 @@ Do not transplant:
 - Large models run one process at a time; caches and artifacts stay under
   `/mountpoint/.exp`.
 - New JIT boundaries pass small and medium diagnostics before the full lane.
+- A miss-heavy prefix-publication diagnostic reports GDN snapshot copy and
+  allocation cost before performance promotion. Move snapshots to a
+  preallocated slot table only if integrated profiling shows material overhead.
 - Raw results/profiles stay external. Only manifests, schemas, scripts, concise
   summaries, and tests are committed.
 - Every performance comparison records exact commit, model revision, package
@@ -552,12 +559,12 @@ Do not transplant:
 - [x] Open PR 1 as draft PR #7.
 - [x] Address PR 1 review: dual-EOS termination, complete architecture gate,
   capacity credits, first-fit admission, derived shorthand warmup, metadata-first
-  Hub resolution, live-page FlashInfer metadata, and CPU CI. CI run 1 passed.
+  Hub resolution, and live-page FlashInfer metadata.
 - [x] Address PR 1 follow-up: use a bucket-independent non-split FlashInfer
   decode plan, mask inactive fused-append rows in the CUDA binding, and cover
   128-page sparse-live metadata plus padded-row cache integrity. Same-envelope
   B=8 before/after output was exact with no measured JIT growth or speed loss;
-  CI run 2 passed.
+  the guarded validation passed.
 - [x] Merge PR 1 as #7.
 - [x] Open, review, and merge host-only scheduling/device materialization PR
   #8.
@@ -568,8 +575,7 @@ Do not transplant:
   cancellation, worker-aware health, and verified shutdown. The expanded
   control suite passes 57 tests, 205 tests collect, and a fresh guarded 0.8B
   CUDA smoke remains correct.
-- [x] Address both PR #9 review rounds, pass CI, and merge it at main commit
-  `850cd3e`.
+- [x] Address both PR #9 review rounds and merge it at main commit `850cd3e`.
 - [x] Review issue #10 and turn its critique into an explicit conceptual-
   compression contract and a core-versus-advanced reading path.
 - [x] Open prefix-lifecycle draft PR #11 from
@@ -577,5 +583,10 @@ Do not transplant:
   snapshots, issue #10 style guide, and guarded tiny/real-model cache-hit
   parity. The 0.8B smoke matched exact tokens with zero measured JIT growth;
   the guarded control suite passed 69 tests and 214 tests collect.
+- [x] Address PR #11 lifecycle review: prevent zero-token admission, reject
+  late warmup, validate snapshot hash plus token count, exercise LRU pressure,
+  and keep validation local to the relevant change. The expanded guarded
+  suite passes 71 tests, 33 runner/cache tests, and 217 tests collect; the real
+  0.8B cache-hit smoke remains exact with zero measured JIT growth.
 - [ ] Complete PR 2d's route/config/model-policy compression before the
   reproducibility artifact or speculative routes add new execution choices.
