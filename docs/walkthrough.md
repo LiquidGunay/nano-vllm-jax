@@ -40,8 +40,9 @@ seq_lens        [rows]
 Only the first `num_prefill_tokens` entries are live. The bucket padding is part
 of the static JAX contract.
 
-`ModelRunner` installs any cached hybrid state, selects a `RunnerRoute`, prepares
-device-token carry when applicable, and calls `ModelExecutor`. The executor runs
+`ModelRunner` installs any cached hybrid state and selects one `ExecutionPlan`
+from the route registry. That same route specification drives preparation,
+executor dispatch, startup warmup, and the route label. The executor then runs
 the Qwen layer loop:
 
 ```text

@@ -65,13 +65,11 @@ and should not exist.
 
 ## Routes And Configuration
 
-A route is one typed choice, not a mode plus a parallel boolean matrix. Route
-selection, preparation, execution, warmup, dependency validation, and metrics
-must derive from the same route specification.
-
-Until the route registry is complete, new work must not add another
-route-specific boolean. Consolidate an existing route or make the registry
-change explicit.
+A route is one typed choice, not a mode plus a parallel boolean matrix.
+`routes.py` owns the shared route specification used by selection, preparation,
+execution, warmup, executor validation, and route labels. New execution work
+must extend or consolidate that registry instead of adding a route-specific
+boolean.
 
 Configuration follows the same rule:
 
@@ -126,8 +124,6 @@ reader can explain one generated token.
 These are repository-level refactors, not requirements to expand the scope of
 every feature PR:
 
-- Replace the runner's route boolean matrix with `RouteKind`, `RouteSpec`, and
-  a small execution plan shared by dispatch, warmup, validation, and metrics.
 - Split the flat runtime configuration into narrow model, capacity, compile,
   and kernel specs.
 - Replace optional parallel host fields in `DeviceBatch` with one explicit
@@ -135,7 +131,6 @@ every feature PR:
 - Move serving policy out of GDN and other model-math functions.
 - Split runner/executor code only at coherent state transitions; create no
   forwarding-only modules.
-- Add a CPU-safe executable trace of scheduling, materialization, and commit.
 
 Until each lands, nearby changes should avoid deepening the corresponding
 debt.

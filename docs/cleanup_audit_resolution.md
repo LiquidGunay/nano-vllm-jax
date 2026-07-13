@@ -51,8 +51,8 @@ Resolved in the structural cleanup:
   uninvoked private scheduling mode on cleaned main.
 - Renamed the private merged execution config to `RuntimeConfig`; the public API
   remains `LLM`, `EngineConfig`, and `SamplingParams`.
-- Split runner route selection/preparation from resident-state commit through a
-  `RunnerRoute` object.
+- Replaced the runner's overlapping route booleans with one typed
+  `ExecutionPlan` selected from the shared route registry.
 - Unified prefix KV and GDN state under bounded `PrefixCacheEntry` metadata;
   accelerator snapshots are runner-owned and released when block reuse or the
   state budget invalidates an entry.
