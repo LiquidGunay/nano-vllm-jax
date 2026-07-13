@@ -27,6 +27,7 @@ from nanovllm_jax.model import ModelParams
 from nanovllm_jax.output import DeviceTokenRef
 from nanovllm_jax.step import RunResult
 from nanovllm_jax.sequence import Sequence
+from nanovllm_jax.block_manager import PrefixCacheEntry
 from nanovllm_jax.cache import (
     KVCacheState,
     KVCacheSpec,
@@ -203,6 +204,11 @@ class ModelRunner:
         self._hybrid_slots: Dict[int, int] = {}
         self._free_hybrid_slots: List[int] = list(range(max_seqs))
         self._zeroed_hybrid_slots: set[int] = set(range(max_seqs))
+        self._prefix_hybrid_states: Dict[int, tuple[int, HybridLayerState]] = {}
+        self._prefix_hybrid_state_capacity = (
+            max_seqs if config.prefix_cache and config.linear_attn_layers else 0
+        )
+        self._next_prefix_hybrid_state_handle = 0
 
         empty_hybrid_state = init_hybrid_state(
             config=config,
@@ -233,19 +239,30 @@ class ModelRunner:
         self._warmup_compiled = False
 
     def memory_bytes(self) -> dict[str, int]:
-        """Return the persistent non-parameter device allocation breakdown."""
+        """Return persistent allocations and bounded dynamic-state capacity."""
 
         def nbytes(value: object) -> int:
-            return sum(
-                int(leaf.size) * int(leaf.dtype.itemsize)
-                for leaf in jax.tree_util.tree_leaves(value)
-                if hasattr(leaf, "size") and hasattr(leaf, "dtype")
-            )
+            if hasattr(value, "size") and hasattr(value, "dtype"):
+                return int(value.size) * int(value.dtype.itemsize)
+            if isinstance(value, dict):
+                return sum(nbytes(item) for item in value.values())
+            if isinstance(value, (list, tuple)):
+                return sum(nbytes(item) for item in value)
+            fields = getattr(value, "__dataclass_fields__", None)
+            if fields is not None:
+                return sum(nbytes(getattr(value, name)) for name in fields)
+            return 0
 
         return {
             "target_kv": nbytes(self.cache_storage),
             "full_attention_kv": nbytes(self.full_attention_nhd_cache),
             "hybrid_state": nbytes((self._empty_hybrid_state, self._hybrid_state_table)),
+            "prefix_hybrid_state_current": nbytes(
+                tuple(state for _, state in self._prefix_hybrid_states.values())
+            ),
+            "prefix_hybrid_state_capacity": (
+                self._prefix_hybrid_state_capacity * nbytes(self._empty_hybrid_state)
+            ),
             "resident_metadata": nbytes(
                 (
                     self._resident_block_tables,
@@ -817,6 +834,8 @@ class ModelRunner:
         """Drop dummy warmup sequence state while keeping compiled executables."""
         if hasattr(self, "hybrid_states"):
             self.hybrid_states.clear()
+        self._prefix_hybrid_states.clear()
+        self._next_prefix_hybrid_state_handle = 0
         if hasattr(self, "_hybrid_slots"):
             self._hybrid_slots.clear()
         if hasattr(self, "_max_hybrid_slots"):
@@ -1392,7 +1411,7 @@ class ModelRunner:
         )
 
     def hybrid_state_for_sequence(self, seq_id: int) -> HybridLayerState | None:
-        if seq_id < 0 or getattr(self, "_hybrid_state_table", None) is None:
+        if seq_id < 0:
             return None
         if self._hybrid_state_table.conv_state is None and self._hybrid_state_table.recurrent_state is None:
             return None
@@ -1400,33 +1419,92 @@ class ModelRunner:
             return None
         return self._get_hybrid_state(seq_id)
 
-    def hybrid_states_for_sequences(self, seqs: List[Sequence]) -> dict[int, HybridLayerState]:
-        states: dict[int, HybridLayerState] = {}
-        for seq in seqs:
-            state = self.hybrid_state_for_sequence(int(seq.seq_id))
-            if state is not None:
-                states[int(seq.seq_id)] = state
-        return states
+    @staticmethod
+    def _snapshot_hybrid_state(state: HybridLayerState) -> HybridLayerState:
+        """Detach a cache snapshot from the donated resident-state table."""
+        return HybridLayerState(
+            conv_state=(
+                jax.device_put(state.conv_state, may_alias=False)
+                if state.conv_state is not None
+                else None
+            ),
+            recurrent_state=(
+                jax.device_put(state.recurrent_state, may_alias=False)
+                if state.recurrent_state is not None
+                else None
+            ),
+        )
+
+    def cache_prefix_hybrid_states(
+        self,
+        entries_by_seq: dict[int, PrefixCacheEntry],
+    ) -> dict[int, int]:
+        """Snapshot exact prefix states and return opaque handles by hash."""
+        representative: dict[int, tuple[int, int]] = {}
+        for seq_id, entry in entries_by_seq.items():
+            previous = representative.setdefault(
+                entry.prefix_hash,
+                (int(seq_id), entry.token_count),
+            )
+            if previous[1] != entry.token_count:
+                raise RuntimeError("one prefix hash has inconsistent token counts")
+        if (
+            len(self._prefix_hybrid_states) + len(representative)
+            > self._prefix_hybrid_state_capacity
+        ):
+            raise RuntimeError("runner prefix-state capacity is exhausted")
+
+        states: dict[int, tuple[int, HybridLayerState]] = {}
+        for prefix_hash, (seq_id, token_count) in representative.items():
+            state = self.hybrid_state_for_sequence(seq_id)
+            if state is None:
+                raise RuntimeError(f"sequence {seq_id} has no hybrid state to cache")
+            states[prefix_hash] = (token_count, self._snapshot_hybrid_state(state))
+
+        handles: dict[int, int] = {}
+        for prefix_hash, cached_state in states.items():
+            handle = self._next_prefix_hybrid_state_handle
+            self._next_prefix_hybrid_state_handle += 1
+            self._prefix_hybrid_states[handle] = cached_state
+            handles[prefix_hash] = handle
+        return handles
+
+    def release_prefix_hybrid_states(self, handles: tuple[int, ...]) -> None:
+        """Release cache snapshots after their host metadata is invalidated."""
+        for handle in handles:
+            if self._prefix_hybrid_states.pop(int(handle), None) is None:
+                raise AssertionError(f"unknown prefix-state handle {handle}")
+
+    def prefix_hybrid_state_stats(self) -> dict[str, int]:
+        return {
+            "handles": len(self._prefix_hybrid_states),
+            "capacity": self._prefix_hybrid_state_capacity,
+        }
 
     def install_cached_prefix_hybrid_states(
         self,
         seqs: List[Sequence],
-        prefix_states: dict[int, HybridLayerState] | None,
+        entries_by_seq: dict[int, PrefixCacheEntry],
     ) -> None:
-        if not prefix_states:
+        if not entries_by_seq:
             return
         for seq in seqs:
-            prefix_hash = getattr(seq, "cached_prefix_hash", None)
-            if prefix_hash is None or int(getattr(seq, "num_cached_tokens", 0)) <= 0:
+            seq_id = int(seq.seq_id)
+            entry = entries_by_seq.get(seq_id)
+            if entry is None or entry.hybrid_state_handle is None:
                 continue
-            if getattr(seq, "cached_prefix_hybrid_seeded", False):
+            if seq.cached_prefix_hybrid_seeded:
                 continue
-            state = prefix_states.get(int(prefix_hash))
-            if state is None:
+            cached_state = self._prefix_hybrid_states.get(entry.hybrid_state_handle)
+            if cached_state is None:
                 raise RuntimeError(
-                    f"missing hybrid prefix state for cached prefix hash {int(prefix_hash)}"
+                    "missing runner-owned hybrid prefix state handle "
+                    f"{entry.hybrid_state_handle}"
                 )
-            self._set_hybrid_state(int(seq.seq_id), state)
+            token_count, state = cached_state
+            if token_count != entry.token_count or token_count != seq.num_cached_tokens:
+                raise RuntimeError("prefix KV and runner state token counts differ")
+            self._set_hybrid_state(seq_id, state)
             seq.cached_prefix_hybrid_seeded = True
 
     def _slice_batch(self, batch: DeviceBatch, idx: int) -> DeviceBatch:

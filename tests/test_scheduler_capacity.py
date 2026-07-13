@@ -149,7 +149,7 @@ def test_future_capacity_reservation_does_not_evict_cached_prefix():
     cached_hash = manager.record_computed_prefix(cached, 2, publish=True)
     manager.deallocate(cached)
 
-    assert manager.hash_to_block_id[cached_hash] == cached_block
+    assert manager.prefix_cache.get(cached_hash).block_ids[-1] == cached_block
 
     long_request = Sequence(
         [9],
@@ -161,7 +161,7 @@ def test_future_capacity_reservation_does_not_evict_cached_prefix():
 
     assert len(long_request.block_table) == 1
     assert manager.stats()["reserved_blocks"] == 2
-    assert manager.hash_to_block_id[cached_hash] == cached_block
+    assert manager.prefix_cache.get(cached_hash).block_ids[-1] == cached_block
     assert manager.blocks[cached_block].token_ids == [1, 2]
 
 

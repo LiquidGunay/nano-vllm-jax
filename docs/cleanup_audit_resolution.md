@@ -53,6 +53,9 @@ Resolved in the structural cleanup:
   remains `LLM`, `EngineConfig`, and `SamplingParams`.
 - Split runner route selection/preparation from resident-state commit through a
   `RunnerRoute` object.
+- Unified prefix KV and GDN state under bounded `PrefixCacheEntry` metadata;
+  accelerator snapshots are runner-owned and released when block reuse or the
+  state budget invalidates an entry.
 - Removed model layer-stage/KV-prewrite diagnostic return payloads from the
   serving model path.
 - Pruned unused core dependencies (`flax`, `optax`) and made `tqdm` an optional

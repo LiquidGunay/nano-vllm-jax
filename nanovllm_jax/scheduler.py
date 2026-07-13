@@ -11,13 +11,14 @@ Invariant:
 """
 
 from collections import deque
+from dataclasses import replace
 from typing import Deque, List, Tuple
 
 from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.batch import BucketShape, ScheduledRow, SchedulePlan
 from nanovllm_jax.output import is_device_token
 from nanovllm_jax.sequence import Sequence, SequenceStatus, SamplingParams
-from nanovllm_jax.block_manager import BlockManager
+from nanovllm_jax.block_manager import BlockManager, PrefixCacheEntry
 
 def _config_flag(config: RuntimeConfig | None, attr: str, *, default: bool = False) -> bool:
     if config is not None and hasattr(config, attr):
@@ -54,9 +55,7 @@ class Scheduler:
             for token_id in getattr(config, "eos_token_ids", ())
         )
         self.block_size = config.block_size
-        self.enable_prefix_cache_execution = bool(getattr(config, "prefix_cache", True))
-        self.prefix_cache_requires_hybrid_state = bool(getattr(config, "linear_attn_layers", ()))
-        self.prefix_cache_hybrid_states: dict[int, object] = {}
+        self.prefix_cache_enabled = bool(config.prefix_cache)
         self.prefill_buckets = tuple(getattr(config, "prefill_buckets", ()))
         self.prefill_token_buckets = tuple(getattr(config, "prefill_token_buckets", ()))
         self.prefill_layout = str(getattr(config, "prefill_layout", "packed") or "packed").lower()
@@ -89,34 +88,30 @@ class Scheduler:
         )
         self.max_blocks_per_seq = getattr(config, "max_blocks_per_seq", None)
         self.block_manager = BlockManager(
-            config.num_kvcache_blocks, 
-            config.block_size
+            config.num_kvcache_blocks,
+            config.block_size,
+            prefix_state_capacity=(
+                self.max_num_resident_seqs
+                if self.prefix_cache_enabled and config.linear_attn_layers
+                else 0
+            ),
         )
         
         self.waiting: Deque[Sequence] = deque()
         self.running: Deque[Sequence] = deque()
 
-    def _prefix_cacheable_hashes(self) -> set[int] | None:
-        if not self.enable_prefix_cache_execution:
-            return None
-        if not self.prefix_cache_requires_hybrid_state:
-            return None
-        return set(self.prefix_cache_hybrid_states)
-
     def _can_reserve_waiting(self, seq: Sequence) -> bool:
         return self.block_manager.can_reserve(
             seq,
             total_blocks=self._required_blocks(seq),
-            use_prefix_cache=self.enable_prefix_cache_execution,
-            cacheable_hashes=self._prefix_cacheable_hashes(),
+            use_prefix_cache=self.prefix_cache_enabled,
         )
 
     def _reserve_waiting(self, seq: Sequence) -> None:
         self.block_manager.reserve(
             seq,
             total_blocks=self._required_blocks(seq),
-            use_prefix_cache=self.enable_prefix_cache_execution,
-            cacheable_hashes=self._prefix_cacheable_hashes(),
+            use_prefix_cache=self.prefix_cache_enabled,
         )
 
     def _required_blocks(self, seq: Sequence) -> int:
@@ -133,21 +128,42 @@ class Scheduler:
             self.waiting.append(candidate)
         return None
 
-    def record_computed_prefix_states(
+    def cached_prefix_entries(
+        self,
+        seqs: List[Sequence],
+    ) -> dict[int, PrefixCacheEntry]:
+        """Return exact host metadata for prefixes selected during admission."""
+        if not self.block_manager.prefix_cache.requires_state:
+            return {}
+        entries: dict[int, PrefixCacheEntry] = {}
+        for seq in seqs:
+            if seq.cached_prefix_hybrid_seeded:
+                continue
+            prefix_hash = seq.cached_prefix_hash
+            if prefix_hash is None or seq.num_cached_tokens <= 0:
+                continue
+            entry = self.block_manager.prefix_cache.get(prefix_hash)
+            if entry is None or entry.hybrid_state_handle is None:
+                raise RuntimeError(f"missing hybrid state for prefix {prefix_hash}")
+            if entry.token_count != seq.num_cached_tokens:
+                raise RuntimeError(
+                    "prefix KV and hybrid-state token counts differ: "
+                    f"entry={entry.token_count}, request={seq.num_cached_tokens}"
+                )
+            entries[int(seq.seq_id)] = entry
+        return entries
+
+    def record_computed_prefixes(
         self,
         seqs: List[Sequence],
         prefill_chunk_lengths: List[int],
-        prefix_states_by_seq: dict[int, object] | None = None,
-    ) -> None:
-        """Publish prefix-cache entries after prefill materializes them.
-
-        For hybrid/GDN models, a prefix is reusable only when the matching
-        hybrid state for that exact full-block prefix is also available.
-        """
-        if not self.enable_prefix_cache_execution:
-            return
+    ) -> dict[int, PrefixCacheEntry]:
+        """Publish KV metadata and return prefixes that still need GDN state."""
+        if not self.prefix_cache_enabled:
+            return {}
         if len(prefill_chunk_lengths) != len(seqs):
-            return
+            return {}
+        pending: dict[int, PrefixCacheEntry] = {}
         for seq, chunk_len in zip(seqs, prefill_chunk_lengths):
             chunk_len = int(chunk_len)
             if chunk_len <= 0:
@@ -155,27 +171,37 @@ class Scheduler:
             computed_tokens = min(seq.num_prompt_tokens, seq.num_cached_tokens + chunk_len)
             if computed_tokens <= 0:
                 continue
-            if self.prefix_cache_requires_hybrid_state:
-                block_hash = self.block_manager.record_computed_prefix(
-                    seq,
-                    computed_tokens,
-                    publish=False,
-                )
-                if block_hash is None:
-                    continue
-                state = (prefix_states_by_seq or {}).get(int(seq.seq_id))
-                if state is None:
-                    continue
-                self.prefix_cache_hybrid_states[int(block_hash)] = state
-                self.block_manager.publish_computed_prefix(seq, computed_tokens)
-            else:
-                self.block_manager.record_computed_prefix(
-                    seq,
-                    computed_tokens,
-                    publish=True,
-                )
+            entry = self.block_manager.publish_computed_prefix(seq, computed_tokens)
+            if (
+                self.block_manager.prefix_cache.requires_state
+                and entry is not None
+                and entry.hybrid_state_handle is None
+            ):
+                pending[int(seq.seq_id)] = entry
+        self.block_manager.prefix_cache.make_state_room(list(pending.values()))
+        return pending
 
+    def publish_prefix_states(
+        self,
+        pending: dict[int, PrefixCacheEntry],
+        handles_by_hash: dict[int, int],
+    ) -> None:
+        """Attach runner-owned state handles to already materialized KV entries."""
+        published: set[int] = set()
+        for entry in pending.values():
+            if entry.prefix_hash in published:
+                continue
+            handle = handles_by_hash.get(entry.prefix_hash)
+            if handle is None:
+                raise RuntimeError(f"runner did not cache prefix {entry.prefix_hash}")
+            self.block_manager.prefix_cache.publish(
+                replace(entry, hybrid_state_handle=handle)
+            )
+            published.add(entry.prefix_hash)
 
+    def take_released_prefix_state_handles(self) -> tuple[int, ...]:
+        """Drain state handles invalidated by KV reuse or state-budget pressure."""
+        return self.block_manager.prefix_cache.take_released_state_handles()
 
     def is_finished(self) -> bool:
         """Check if all sequences are done."""
