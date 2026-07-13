@@ -223,9 +223,9 @@ bounded CPU cores, positive nice level, and mountpoint-owned caches/artifacts.
 
 ### PR 1: correct capacity, configuration, and base model ABI
 
-Status: [ ] draft PR [#7](https://github.com/LiquidGunay/nano-vllm-jax/pull/7), review fixes pushed; awaiting re-review
+Status: [ ] draft PR [#7](https://github.com/LiquidGunay/nano-vllm-jax/pull/7), follow-up review fixes pushed; awaiting re-review
 
-Branch: `agent/base-correctness-abi` at `74093fb`
+Branch: `agent/base-correctness-abi` at `ef1ceab`
 
 Purpose: make the ordinary target model truthful and safe before moving state
 between components.
@@ -455,3 +455,8 @@ Do not transplant:
 - [x] Address PR 1 review: dual-EOS termination, complete architecture gate,
   capacity credits, first-fit admission, derived shorthand warmup, metadata-first
   Hub resolution, live-page FlashInfer metadata, and CPU CI. CI run 1 passed.
+- [x] Address PR 1 follow-up: use a bucket-independent non-split FlashInfer
+  decode plan, mask inactive fused-append rows in the CUDA binding, and cover
+  128-page sparse-live metadata plus padded-row cache integrity. Same-envelope
+  B=8 before/after output was exact with no measured JIT growth or speed loss;
+  CI run 2 passed.
