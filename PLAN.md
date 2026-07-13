@@ -286,9 +286,9 @@ Merge gates:
 
 ### PR 2: explicit step, cache, route, and output ownership
 
-Status: [ ] split in progress; PRs 2a and 2b are merged, PR 2c is draft PR
-[#11](https://github.com/LiquidGunay/nano-vllm-jax/pull/11), and PR 2d is
-planned from issue #10
+Status: [ ] split in progress; PRs 2a and 2b are merged, PR 2c is ready for
+re-review as PR [#11](https://github.com/LiquidGunay/nano-vllm-jax/pull/11),
+PR 2d is in local validation, and PR 2e remains planned from issue #10
 
 PR 2a branch: `agent/step-ownership-abi` at `5cee688`; merged as PR
 [#8](https://github.com/LiquidGunay/nano-vllm-jax/pull/8) at main commit
@@ -345,10 +345,21 @@ PR 2c keeps the prefix-cache follow-up narrow:
 - Add the style guide and put the core engine before advanced serving policy in
   the README reading path.
 
-PR 2d is the structural compression pass required before new optimization:
+PR 2d is the route-ownership compression pass:
 
 - Replace the runner boolean matrix with one `RouteKind`/`RouteSpec` registry
   shared by selection, preparation, dispatch, warmup, validation, and metrics.
+- Make `ExecutionPlan` carry one route kind plus only per-step values, with no
+  parallel route booleans.
+- Run warmup through the same execution-plan dispatch used by serving and
+  report the warmed route kinds directly.
+- Remove the unreachable resident sampled warmup path; sampled requests do not
+  use the scheduler's greedy-only static token-carry contract.
+- Add a host-only executable trace of schedule, materialize, execute, and
+  commit.
+
+PR 2e completes the remaining configuration and model-policy compression:
+
 - Split the flat `RuntimeConfig` into narrow model, capacity, compile, and
   kernel specs without compatibility adapters in the ordinary path.
 - Group host batch metadata at the materialization boundary instead of growing
@@ -357,12 +368,10 @@ PR 2d is the structural compression pass required before new optimization:
   reference implementation and parity tests.
 - Split runner/executor files only where an extracted module owns a complete
   state transition.
-- Add a CPU-safe executable trace of schedule, materialize, execute, and
-  commit.
 
 Purpose: implement the host/device ABI that speculation will extend later.
 
-Completed and remaining scope across PR 2a-2d:
+Completed and remaining scope across PR 2a-2e:
 
 - Add `ScheduledRow`, `SchedulePlan`, `DeviceBatch`, `ExecutionPlan`,
   `RunResult`, `StepResult`, and `TokenEvent`.
@@ -398,7 +407,7 @@ change does not earn scope merely because it appears in issue #10.
 
 ### PR 3: reproducible artifact and one benchmark claim
 
-Status: [ ] blocked by PR 2d
+Status: [ ] blocked by PR 2e
 
 Purpose: make the repository able to support and reproduce one honest claim.
 
@@ -588,5 +597,11 @@ Do not transplant:
   and keep validation local to the relevant change. The expanded guarded
   suite passes 71 tests, 33 runner/cache tests, and 217 tests collect; the real
   0.8B cache-hit smoke remains exact with zero measured JIT growth.
-- [ ] Complete PR 2d's route/config/model-policy compression before the
+- [x] Start PR 2d locally: one typed route registry now drives selection,
+  dispatch, validation, warmup, and labels; it removes the unreachable
+  resident sampled warmup route. Tiny greedy/sampled and real 0.8B checks are
+  exact with zero measured compilation. B=1 is within `+0.7%` of PR #11 and
+  B=8 within `-0.5%`, both inside observed variance and under the RAM guard.
+- [ ] Merge PR #11, rebase and open PR 2d, then complete PR 2e's
+  config/model-policy compression before the
   reproducibility artifact or speculative routes add new execution choices.
