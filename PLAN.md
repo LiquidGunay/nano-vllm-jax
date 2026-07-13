@@ -277,7 +277,7 @@ PR 2a establishes the review boundary recommended by the cleanup audit:
   tokens with no measured JIT growth: 0.8B B=8 measured `434.41` versus
   `434.21` decode tok/s; 4B B=1 measured `49.92` versus `49.89`.
 
-PR 2b branch: `agent/step-commit-output` at `2ab8961`
+PR 2b branch: `agent/step-commit-output` at `a30f8eb`
 
 PR 2b completes the execute/commit/output half of the ABI:
 
@@ -285,11 +285,17 @@ PR 2b completes the execute/commit/output half of the ABI:
 - `LLMEngine.commit()` is the one logical transition and `step()` returns
   `StepResult` rather than a signed integer tuple.
 - `OutputBuffer` owns every generated host token and device reference.
-- Service streaming consumes token events and materializes output explicitly.
-- EOS/length finish reasons and the configured model id reach server output.
+- Service streaming consumes explicit output watermarks, materializes output,
+  and emits bounded coalesced token chunks.
+- Cancellation is committed by the engine worker and releases scheduler,
+  runner, and KV state for waiting or running requests.
+- Queued plus active requests are bounded; disconnects cancel, health follows
+  the worker, and shutdown verifies that the worker actually stopped.
+- EOS/length/cancelled finish reasons and the configured model id reach server
+  output.
 
-Route-registry, prefix-handle, cancellation/backpressure, and GDN policy work
-remain review-sized follow-up slices under PR 2.
+Prefix-handle lifecycle remains one focused follow-up. Route-registry and GDN
+policy cleanup will be combined into the following structural PR.
 
 Purpose: implement the host/device ABI that speculation will extend later.
 
@@ -498,3 +504,7 @@ Do not transplant:
 - [x] Open typed step/commit/output ownership draft PR #9. Guarded control,
   CUDA device-carry, kernel/GDN/layer, real-weight, and live 0.8B engine-smoke
   checks passed; combined heavyweight parity was split at the RAM floor.
+- [x] Expand PR #9 with bounded/coalesced streaming, total-request pressure,
+  cancellation, worker-aware health, and verified shutdown. The expanded
+  control suite passes 57 tests, 205 tests collect, and a fresh guarded 0.8B
+  CUDA smoke remains correct.
