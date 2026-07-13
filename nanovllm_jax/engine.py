@@ -9,7 +9,8 @@ from dataclasses import replace
 import jax
 
 from nanovllm_jax.config import EngineConfig, ModelConfig, RuntimeSpec
-from nanovllm_jax.cache import KVCacheSpec, cap_num_kv_cache_blocks
+from nanovllm_jax.cache import KVCacheSpec
+from nanovllm_jax.ops import resolve_kv_cache_spec
 from nanovllm_jax.batch import SchedulePlan
 from nanovllm_jax.weights import (
     load_weights_from_hf_streaming,
@@ -108,16 +109,26 @@ class LLMEngine:
             engine_config,
             self.model_config,
         )
-        kv_spec = KVCacheSpec(
-            num_layers=self.config.model.num_hidden_layers,
-            num_blocks=self.config.capacity.num_kvcache_blocks,
-            block_size=self.config.capacity.block_size,
-            num_kv_heads=self.config.model.num_key_value_heads,
-            head_dim=self.config.model.head_dim,
-            dtype=self.config.compile.jax_dtype(),
-            max_kv_cache_bytes=self.config.capacity.max_kv_cache_bytes,
+        requested_kv_blocks = self.config.capacity.num_kvcache_blocks
+        kv_spec = resolve_kv_cache_spec(
+            KVCacheSpec(
+                num_layers=self.config.model.num_hidden_layers,
+                num_blocks=requested_kv_blocks,
+                block_size=self.config.capacity.block_size,
+                num_kv_heads=self.config.model.num_key_value_heads,
+                head_dim=self.config.model.head_dim,
+                dtype=self.config.compile.jax_dtype(),
+                max_kv_cache_bytes=self.config.capacity.max_kv_cache_bytes,
+            ),
+            self.config.kernels,
         )
-        effective_blocks = cap_num_kv_cache_blocks(kv_spec)
+        effective_blocks = kv_spec.num_blocks
+        if effective_blocks != requested_kv_blocks:
+            print(
+                "KV cache capped: "
+                f"{requested_kv_blocks} -> {effective_blocks} blocks "
+                f"({self.config.capacity.max_kv_cache_bytes} byte cap)"
+            )
         self.config = replace(
             self.config,
             capacity=replace(

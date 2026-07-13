@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 from nanovllm_jax.config import EngineConfig, ServerSettings, WarmupConfig, load_engine_config
-from nanovllm_jax.fastpath import format_manifest, validate_runtime_dependencies
+from nanovllm_jax.fastpath import validate_runtime_dependencies
 
 
 _DEFAULT_XLA_FLAGS = "--xla_gpu_autotune_level=4 --xla_gpu_enable_triton_gemm=false"
@@ -286,6 +286,8 @@ def load_engine(settings: ServerSettings) -> LLMEngine:
     global engine, service
     _validate_settings(settings)
     engine = LLMEngine(settings.engine.model, engine_config=settings.engine)
+    manifest = json.dumps(asdict(engine.config), indent=2, sort_keys=True)
+    print("runtime_manifest:\n" + manifest)
 
     if settings.engine.warmup.enabled:
         warmup = settings.engine.warmup
@@ -515,7 +517,6 @@ def main() -> None:
         f"max_num_batched_tokens:{settings.engine.max_num_batched_tokens} "
         f"max_blocks_per_seq:{settings.engine.max_blocks_per_seq}"
     )
-    print("fastpath_manifest:\n" + format_manifest())
     validate_runtime_dependencies()
     load_engine(settings)
     print(f"server_ready=http://{settings.host}:{settings.port}")

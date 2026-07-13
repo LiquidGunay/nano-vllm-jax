@@ -36,6 +36,17 @@ def _strict_keys(raw: Mapping[str, Any], allowed: set[str], name: str) -> None:
         raise ValueError(f"unknown {name} keys: {', '.join(unknown)}")
 
 
+def _checkpoint_bool(
+    raw: Mapping[str, Any],
+    name: str,
+    default: bool | None = None,
+) -> bool:
+    value = raw.get(name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
 def _bool_value(value: Any, field_name: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -105,6 +116,60 @@ _SUPPORTED_ARCHITECTURES = {
 }
 
 
+def _checkpoint_model_fields(checkpoint: str | Path, model: str) -> dict[str, Any]:
+    config_path = Path(checkpoint) / "config.json"
+    try:
+        raw = json.loads(config_path.read_text())
+    except FileNotFoundError as exc:
+        raise ValueError(f"checkpoint has no config.json: {checkpoint}") from exc
+    if raw.get("model_type") != "qwen3_5":
+        raise ValueError(f"unsupported model_type={raw.get('model_type')!r}; expected 'qwen3_5'")
+    text = raw.get("text_config")
+    if not isinstance(text, Mapping) or text.get("model_type") != "qwen3_5_text":
+        raise ValueError("checkpoint does not contain a Qwen3.5 text_config")
+    if text.get("mlp_only_layers", []) not in ([], None):
+        raise ValueError("mlp-only layers are not supported")
+    rope = text.get("rope_parameters") or {}
+    if rope.get("rope_type", "default") != "default":
+        raise ValueError("only default Qwen3.5 RoPE is supported")
+    use_qk_norm = _checkpoint_bool(text, "use_qk_norm_in_gdn", True)
+    return {
+        "model": model,
+        "vocab_size": int(text["vocab_size"]),
+        "hidden_size": int(text["hidden_size"]),
+        "intermediate_size": int(text["intermediate_size"]),
+        "num_hidden_layers": int(text["num_hidden_layers"]),
+        "num_attention_heads": int(text["num_attention_heads"]),
+        "num_key_value_heads": int(text["num_key_value_heads"]),
+        "head_dim": int(text["head_dim"]),
+        "linear_num_key_heads": int(text["linear_num_key_heads"]),
+        "linear_num_value_heads": int(text["linear_num_value_heads"]),
+        "linear_key_head_dim": int(text["linear_key_head_dim"]),
+        "linear_value_head_dim": int(text["linear_value_head_dim"]),
+        "linear_conv_kernel_size": int(text["linear_conv_kernel_dim"]),
+        "use_qk_norm_in_gdn": use_qk_norm,
+        "rope_theta": float(rope["rope_theta"]),
+        "partial_rotary_factor": float(rope["partial_rotary_factor"]),
+        "mrope_section": tuple(int(value) for value in rope["mrope_section"]),
+        "mrope_interleaved": _checkpoint_bool(rope, "mrope_interleaved"),
+        "max_position_embeddings": int(text["max_position_embeddings"]),
+        "layer_types": tuple(str(value) for value in text["layer_types"]),
+        "full_attention_interval": int(text["full_attention_interval"]),
+        "hidden_act": str(text["hidden_act"]),
+        "rms_norm_eps": float(text["rms_norm_eps"]),
+        "attention_dropout": float(text["attention_dropout"]),
+        "attention_bias": _checkpoint_bool(text, "attention_bias"),
+        "attn_output_gate": _checkpoint_bool(text, "attn_output_gate"),
+        "mamba_ssm_dtype": str(text["mamba_ssm_dtype"]),
+        "tie_word_embeddings": _checkpoint_bool(text, "tie_word_embeddings"),
+        "eos_token_id": (
+            int(text["eos_token_id"])
+            if text.get("eos_token_id") is not None
+            else None
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     """Qwen3.5 text architecture consumed by model code."""
@@ -122,7 +187,6 @@ class ModelSpec:
     linear_key_head_dim: int = 128
     linear_value_head_dim: int = 128
     linear_conv_kernel_size: int = 4
-    linear_chunk_size: int = 32
     use_qk_norm_in_gdn: bool = True
     rope_theta: float = 10_000_000
     partial_rotary_factor: float = 0.25
@@ -148,62 +212,14 @@ class ModelSpec:
             if layer_type == "linear_attention"
         )
 
-    @classmethod
-    def from_checkpoint(cls, checkpoint: str | Path, *, model: str) -> "ModelSpec":
-        config_path = Path(checkpoint) / "config.json"
-        try:
-            raw = json.loads(config_path.read_text())
-        except FileNotFoundError as exc:
-            raise ValueError(f"checkpoint has no config.json: {checkpoint}") from exc
-        if raw.get("model_type") != "qwen3_5":
-            raise ValueError(f"unsupported model_type={raw.get('model_type')!r}; expected 'qwen3_5'")
-        text = raw.get("text_config")
-        if not isinstance(text, Mapping) or text.get("model_type") != "qwen3_5_text":
-            raise ValueError("checkpoint does not contain a Qwen3.5 text_config")
-        if text.get("mlp_only_layers", []) not in ([], None):
-            raise ValueError("mlp-only layers are not supported")
-        rope = text.get("rope_parameters") or {}
-        if rope.get("rope_type", "default") != "default":
-            raise ValueError("only default Qwen3.5 RoPE is supported")
-        return cls(
-            model=model,
-            vocab_size=int(text["vocab_size"]),
-            hidden_size=int(text["hidden_size"]),
-            intermediate_size=int(text["intermediate_size"]),
-            num_hidden_layers=int(text["num_hidden_layers"]),
-            num_attention_heads=int(text["num_attention_heads"]),
-            num_key_value_heads=int(text["num_key_value_heads"]),
-            head_dim=int(text["head_dim"]),
-            linear_num_key_heads=int(text["linear_num_key_heads"]),
-            linear_num_value_heads=int(text["linear_num_value_heads"]),
-            linear_key_head_dim=int(text["linear_key_head_dim"]),
-            linear_value_head_dim=int(text["linear_value_head_dim"]),
-            linear_conv_kernel_size=int(text["linear_conv_kernel_dim"]),
-            rope_theta=float(rope["rope_theta"]),
-            partial_rotary_factor=float(rope["partial_rotary_factor"]),
-            mrope_section=tuple(int(value) for value in rope["mrope_section"]),
-            mrope_interleaved=bool(rope["mrope_interleaved"]),
-            max_position_embeddings=int(text["max_position_embeddings"]),
-            layer_types=tuple(str(value) for value in text["layer_types"]),
-            full_attention_interval=int(text["full_attention_interval"]),
-            hidden_act=str(text["hidden_act"]),
-            rms_norm_eps=float(text["rms_norm_eps"]),
-            attention_dropout=float(text["attention_dropout"]),
-            attention_bias=bool(text["attention_bias"]),
-            attn_output_gate=bool(text["attn_output_gate"]),
-            mamba_ssm_dtype=str(text["mamba_ssm_dtype"]),
-            tie_word_embeddings=bool(text["tie_word_embeddings"]),
-            eos_token_id=(
-                int(text["eos_token_id"])
-                if text.get("eos_token_id") is not None
-                else None
-            ),
-        )
-
 
 @dataclass(frozen=True)
 class ModelConfig(ModelSpec):
     """Validated architecture read from a supported checkpoint."""
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint: str | Path, *, model: str) -> "ModelConfig":
+        return cls(**_checkpoint_model_fields(checkpoint, model))
 
     def __post_init__(self) -> None:
         key = (self.hidden_size, self.num_hidden_layers)
@@ -229,7 +245,6 @@ class ModelConfig(ModelSpec):
                     f"unsupported Qwen3.5-{size} architecture: "
                     f"{name}={actual!r}, expected {expected_value!r}"
                 )
-
 
 
 @dataclass(frozen=True)

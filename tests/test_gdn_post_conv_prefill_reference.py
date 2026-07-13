@@ -65,13 +65,13 @@ def _small_gdn_config(
             "linear_key_head_dim": 4,
             "linear_value_head_dim": 4,
             "linear_conv_kernel_size": 4,
-            "linear_chunk_size": 8,
             "layer_types": ("linear_attention",),
         },
         compile={"dtype": "float32", "prefill_token_buckets": prefill_token_buckets},
         kernels={
             "gdn_prefill": gdn_prefill_post_conv_impl,
             "gdn_disable_fallbacks": gdn_disable_fallbacks,
+            "gdn_chunk_size": 8,
             "gdn_recurrent_prefill_threshold": gdn_recurrent_prefill_threshold,
         },
     )

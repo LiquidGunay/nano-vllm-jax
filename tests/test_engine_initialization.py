@@ -9,6 +9,7 @@ from nanovllm_jax.config import EngineConfig, ModelConfig, WarmupConfig
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.sequence import SamplingParams
 from nanovllm_jax.step import FinishReason, RunResult
+from tests.runtime_specs import qwen_text_config
 
 
 def _small_engine_config(model: str) -> EngineConfig:
@@ -96,6 +97,30 @@ def test_unsupported_hub_architecture_fails_before_weight_resolution(tmp_path, m
         LLMEngine(
             "unsupported/model",
             engine_config=_small_engine_config("unsupported/model"),
+        )
+
+    assert weight_resolutions == []
+
+
+def test_unsupported_gdn_norm_fails_before_weight_resolution(tmp_path, monkeypatch):
+    text = qwen_text_config("0.8B")
+    text["use_qk_norm_in_gdn"] = False
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "text_config": text})
+    )
+    weight_resolutions = []
+
+    monkeypatch.setattr(engine_module, "resolve_checkpoint_metadata", lambda _model: tmp_path)
+    monkeypatch.setattr(
+        engine_module,
+        "resolve_checkpoint",
+        lambda *args, **kwargs: weight_resolutions.append((args, kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="use_qk_norm_in_gdn=False"):
+        LLMEngine(
+            "unsupported/gdn-norm",
+            engine_config=_small_engine_config("unsupported/gdn-norm"),
         )
 
     assert weight_resolutions == []

@@ -69,7 +69,7 @@ def _packed_decode_ops(
 
 
 def _tiny_gdn_decode_config(
-    *, gdn_packed_decode_impl: str = "off"
+    *, gdn_packed_decode_impl: str = "off", use_qk_norm_in_gdn: bool = True
 ) -> "RuntimeSpec":
     return runtime_spec(
         model={
@@ -85,6 +85,7 @@ def _tiny_gdn_decode_config(
             "linear_key_head_dim": 4,
             "linear_value_head_dim": 4,
             "linear_conv_kernel_size": 4,
+            "use_qk_norm_in_gdn": use_qk_norm_in_gdn,
             "layer_types": ("linear_attention",),
         },
         compile={"dtype": "float32"},
@@ -424,6 +425,66 @@ def test_model_packed_gdn_decode_reference_matches_default():
         rtol=2e-5,
         atol=2e-5,
     )
+
+
+def test_model_threads_qk_norm_policy_through_prefill_and_decode():
+    config = _tiny_gdn_decode_config(use_qk_norm_in_gdn=False)
+    params = init_transformer_block(jax.random.PRNGKey(0), config.model, layer_idx=0)
+    calls = []
+
+    class RecordingOps(ServingOps):
+        def gated_delta_prefill(self, *args, **kwargs):
+            calls.append(("prefill", kwargs["use_qk_l2norm_in_kernel"]))
+            return super().gated_delta_prefill(*args, **kwargs)
+
+        def gated_delta_decode(self, *args, **kwargs):
+            calls.append(("decode", kwargs["use_qk_l2norm_in_kernel"]))
+            return super().gated_delta_decode(*args, **kwargs)
+
+    backend = RecordingOps(config.kernels)
+    gated_deltanet_block(
+        jnp.ones((1, 4, config.model.hidden_size), dtype=jnp.float32),
+        params,
+        jnp.arange(4, dtype=jnp.int32)[None, :],
+        config,
+        layer_idx=0,
+        is_prefill=True,
+        backend=backend,
+    )
+
+    key_dim = config.model.linear_num_key_heads * config.model.linear_key_head_dim
+    value_dim = config.model.linear_num_value_heads * config.model.linear_value_head_dim
+    conv_dim = 2 * key_dim + value_dim
+    state = HybridLayerState(
+        conv_state=jnp.zeros(
+            (1, 1, conv_dim, config.model.linear_conv_kernel_size),
+            dtype=jnp.float32,
+        ),
+        recurrent_state=jnp.zeros(
+            (
+                1,
+                1,
+                config.model.linear_num_value_heads,
+                config.model.linear_value_head_dim,
+                config.model.linear_key_head_dim,
+            ),
+            dtype=jnp.float32,
+        ),
+    )
+    gated_deltanet_block(
+        jnp.ones((1, 1, config.model.hidden_size), dtype=jnp.float32),
+        params,
+        jnp.zeros((1, 1), dtype=jnp.int32),
+        config,
+        layer_idx=0,
+        is_prefill=False,
+        hybrid_state=state,
+        backend=backend,
+    )
+
+    assert calls == [("prefill", False), ("decode", False)]
+
+
 def _packed_decode_expected(
     mixed_qkv: jnp.ndarray,
     a: jnp.ndarray,

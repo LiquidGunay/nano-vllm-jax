@@ -589,7 +589,7 @@ def gated_deltanet_block(
                     params["A"].astype(jnp.float32),
                     params["dt_bias"].astype(jnp.float32),
                     recurrent_state,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
                 )
                 output_parts.append(out_t)
                 if return_prefix_state or (return_first_prefix_state and token_idx == 0):
@@ -610,7 +610,7 @@ def gated_deltanet_block(
                 params["A"].astype(jnp.float32),
                 params["dt_bias"].astype(jnp.float32),
                 initial_recurrent.astype(jnp.float32),
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
             )
             prefix_recurrent_state_single = None
         else:
@@ -635,7 +635,7 @@ def gated_deltanet_block(
                     g,
                     beta,
                     initial_state=initial_recurrent,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
                     return_state_sequence=True,
                 )
             elif return_first_prefix_state:
@@ -646,7 +646,7 @@ def gated_deltanet_block(
                     g,
                     beta,
                     initial_state=initial_recurrent,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
                     return_first_state=True,
                 )
             elif seq_len > 1:
@@ -657,7 +657,7 @@ def gated_deltanet_block(
                     g,
                     beta,
                     initial_state=initial_recurrent,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
                 )
                 prefix_recurrent_state_single = None
             else:
@@ -668,7 +668,7 @@ def gated_deltanet_block(
                     g,
                     beta,
                     initial_state=initial_recurrent,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
                 )
                 prefix_recurrent_state_single = None
 
@@ -813,7 +813,7 @@ def gated_deltanet_block(
                     num_value_heads=config.model.linear_num_value_heads,
                     key_head_dim=config.model.linear_key_head_dim,
                     value_head_dim=config.model.linear_value_head_dim,
-                    chunk_size=config.model.linear_chunk_size,
+                    chunk_size=config.kernels.gdn_chunk_size,
                     initial_state=initial_recurrent,
                     use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
                     max_row_tokens=row_query_len if return_prefix_state else max_row_tokens,
@@ -1077,9 +1077,9 @@ def gated_deltanet_block(
                 num_value_heads=config.model.linear_num_value_heads,
                 key_head_dim=config.model.linear_key_head_dim,
                 value_head_dim=config.model.linear_value_head_dim,
-                chunk_size=config.model.linear_chunk_size,
+                chunk_size=config.kernels.gdn_chunk_size,
                 initial_state=initial_recurrent,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
             )
         else:
             query = conv_out[:, :, :key_dim].reshape(batch, seq_len, config.model.linear_num_key_heads, config.model.linear_key_head_dim)
@@ -1119,7 +1119,7 @@ def gated_deltanet_block(
                         g,
                         beta,
                         initial_state=initial_recurrent,
-                        use_qk_l2norm_in_kernel=True,
+                        use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
                         return_state_sequence=True,
                     )
                     prefix_recurrent_state_single = recurrent_state_steps
@@ -1131,7 +1131,7 @@ def gated_deltanet_block(
                         g,
                         beta,
                         initial_state=initial_recurrent,
-                        use_qk_l2norm_in_kernel=True,
+                        use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
                     )
             else:
                 # Longer prefill chunks use chunked prefill to amortize work.
@@ -1141,9 +1141,9 @@ def gated_deltanet_block(
                     value,
                     g,
                     beta,
-                    chunk_size=config.model.linear_chunk_size,
+                    chunk_size=config.kernels.gdn_chunk_size,
                     initial_state=initial_recurrent,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
                 )
 
         # Save final state to cache for decode mode

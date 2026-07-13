@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Tuple
 from functools import partial
 from dataclasses import dataclass, replace
 
-from nanovllm_jax.ops import ServingOps, ServingOpsProtocol
+from nanovllm_jax.ops import ServingOps, ServingOpsProtocol, resolve_kv_cache_spec
 from nanovllm_jax.batch import SchedulePlan
 from nanovllm_jax.config import RuntimeSpec
 from nanovllm_jax.device_batch import BatchMaterializer, DeviceBatch, HostBatch
@@ -43,7 +43,6 @@ from nanovllm_jax.block_manager import PrefixCacheEntry
 from nanovllm_jax.cache import (
     HybridLayerState,
     KVCacheSpec,
-    cap_num_kv_cache_blocks,
     init_hybrid_state,
 )
 
@@ -102,21 +101,21 @@ class ModelRunner:
         self.block_size = config.capacity.block_size
 
         max_seqs = config.capacity.max_num_resident_seqs
-        kv_spec = KVCacheSpec(
-            num_layers=config.model.num_hidden_layers,
-            num_blocks=config.capacity.num_kvcache_blocks,
-            block_size=config.capacity.block_size,
-            num_kv_heads=config.model.num_key_value_heads,
-            head_dim=config.model.head_dim,
-            dtype=config.compile.jax_dtype(),
-            max_kv_cache_bytes=config.capacity.max_kv_cache_bytes,
+        kv_spec = resolve_kv_cache_spec(
+            KVCacheSpec(
+                num_layers=config.model.num_hidden_layers,
+                num_blocks=config.capacity.num_kvcache_blocks,
+                block_size=config.capacity.block_size,
+                num_kv_heads=config.model.num_key_value_heads,
+                head_dim=config.model.head_dim,
+                dtype=config.compile.jax_dtype(),
+                max_kv_cache_bytes=config.capacity.max_kv_cache_bytes,
+            ),
+            config.kernels,
         )
-        effective_num_blocks = cap_num_kv_cache_blocks(kv_spec)
-        if effective_num_blocks != config.capacity.num_kvcache_blocks:
-            print(
-                "KV cache capped: "
-                f"{config.capacity.num_kvcache_blocks} -> {effective_num_blocks} blocks "
-                f"({config.capacity.max_kv_cache_bytes} byte cap)"
+        if kv_spec.num_blocks != config.capacity.num_kvcache_blocks:
+            raise ValueError(
+                "RuntimeSpec cache capacity was not finalized before runner construction"
             )
         self.max_blocks_per_seq = config.capacity.max_blocks_per_seq
         self.execution = config.compile.execution
@@ -135,12 +134,12 @@ class ModelRunner:
         )
 
         self.cache_storage = self.backend.allocate_kv_cache(
-            replace(kv_spec, num_blocks=effective_num_blocks),
+            kv_spec,
             max_seqs=max_seqs,
             max_blocks_per_seq=self.max_blocks_per_seq,
         )
         self.full_attention_nhd_cache = self.backend.allocate_full_attention_nhd_kv_cache(
-            replace(kv_spec, num_blocks=effective_num_blocks),
+            kv_spec,
             full_attention_layers=tuple(
                 layer_id
                 for layer_id, layer_type in enumerate(config.model.layer_types)

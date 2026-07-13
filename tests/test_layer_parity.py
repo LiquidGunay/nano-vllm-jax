@@ -266,7 +266,7 @@ def test_linear_attention_chunked(hf_model_and_tokenizer):
     
     output, _ = jax_chunk_gated_delta_rule(
         q_jax, k_jax, v_jax, g_jax, beta_jax,
-        chunk_size=config.model.linear_chunk_size,
+        chunk_size=config.kernels.gdn_chunk_size,
         use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
     )
     

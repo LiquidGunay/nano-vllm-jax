@@ -1,5 +1,6 @@
 """NHD full-attention KV cache allocation tests."""
 
+from dataclasses import replace
 import os
 import sys
 
@@ -9,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nanovllm_jax.ops import ServingOps
+from nanovllm_jax.ops import ServingOps, resolve_kv_cache_spec
 from nanovllm_jax.config import RuntimeSpec
 from nanovllm_jax.fastpath import KernelPlan
 from nanovllm_jax.runner import ModelRunner
@@ -89,7 +90,7 @@ def test_nhd_full_attention_cache_shape_for_flashinfer_decode():
 
 
 def test_nhd_full_attention_cache_uses_main_cache_block_cap():
-    spec = KVCacheSpec(
+    requested = KVCacheSpec(
         num_layers=4,
         num_blocks=8,
         block_size=2,
@@ -100,6 +101,10 @@ def test_nhd_full_attention_cache_uses_main_cache_block_cap():
     )
 
     backend = ServingOps(KernelPlan(full_attention_decode="flashinfer_paged"))
+    with pytest.raises(ValueError, match="must be finalized"):
+        backend.allocate_kv_cache(requested, max_seqs=1, max_blocks_per_seq=2)
+
+    spec = resolve_kv_cache_spec(requested, backend.plan)
     nhd_cache = backend.allocate_full_attention_nhd_kv_cache(
         spec,
         full_attention_layers=(1, 3),
@@ -122,6 +127,18 @@ def test_model_runner_sidecar_does_not_replace_canonical_cache():
     assert runner.full_attention_nhd_cache is not None
     assert runner.full_attention_nhd_cache.k_cache.shape == (1, 4, 2, 1, 8)
     assert runner.full_attention_nhd_cache.layer_indices == (0,)
+
+
+def test_model_runner_rejects_unfinalized_cache_capacity():
+    config = _tiny_full_attention_config()
+    config = replace(
+        config,
+        capacity=replace(config.capacity, num_kvcache_blocks=16),
+    )
+    params = init_params(jax.random.PRNGKey(0), config.model)
+
+    with pytest.raises(ValueError, match="was not finalized"):
+        ModelRunner(config, params)
 
 
 def test_nhd_full_attention_shape_helper_does_not_allocate():

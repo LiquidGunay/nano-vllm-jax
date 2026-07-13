@@ -8,61 +8,17 @@ from nanovllm_jax.config import (
     CapacitySpec,
     EngineConfig,
     ModelConfig,
+    ModelSpec,
     RuntimeSpec,
     WarmupConfig,
     load_engine_config,
 )
 from nanovllm_jax.engine import _engine_config_from_public_kwargs
 from nanovllm_jax.fastpath import KERNEL_PLAN
+from tests.runtime_specs import qwen_text_config
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-def _text_config(size: str = "4B") -> dict:
-    variants = {
-        "0.8B": (1024, 3584, 24, 8, 2, 16),
-        "2B": (2048, 6144, 24, 8, 2, 16),
-        "4B": (2560, 9216, 32, 16, 4, 32),
-    }
-    hidden, intermediate, layers, heads, kv_heads, linear_value_heads = variants[size]
-    return {
-        "model_type": "qwen3_5_text",
-        "vocab_size": 248320,
-        "hidden_size": hidden,
-        "intermediate_size": intermediate,
-        "num_hidden_layers": layers,
-        "num_attention_heads": heads,
-        "num_key_value_heads": kv_heads,
-        "head_dim": 256,
-        "linear_num_key_heads": 16,
-        "linear_num_value_heads": linear_value_heads,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_conv_kernel_dim": 4,
-        "full_attention_interval": 4,
-        "max_position_embeddings": 262144,
-        "layer_types": [
-            "linear_attention" if index % 4 != 3 else "full_attention"
-            for index in range(layers)
-        ],
-        "hidden_act": "silu",
-        "rms_norm_eps": 1e-6,
-        "attention_dropout": 0.0,
-        "attention_bias": False,
-        "attn_output_gate": True,
-        "mamba_ssm_dtype": "float32",
-        "tie_word_embeddings": True,
-        "eos_token_id": 248044,
-        "mlp_only_layers": [],
-        "rope_parameters": {
-            "rope_type": "default",
-            "rope_theta": 10_000_000,
-            "partial_rotary_factor": 0.25,
-            "mrope_section": [11, 11, 10],
-            "mrope_interleaved": True,
-        },
-    }
 
 
 def _write_checkpoint(path: Path, text: dict) -> None:
@@ -225,7 +181,7 @@ def test_engine_config_rejects_unsorted_or_uncovered_buckets():
 
 @pytest.mark.parametrize("size", ("0.8B", "2B", "4B"))
 def test_model_config_is_read_from_checkpoint(tmp_path, size):
-    _write_checkpoint(tmp_path, _text_config(size))
+    _write_checkpoint(tmp_path, qwen_text_config(size))
 
     model = ModelConfig.from_checkpoint(tmp_path, model=f"Qwen/Qwen3.5-{size}")
     runtime = RuntimeSpec(model=model)
@@ -233,6 +189,17 @@ def test_model_config_is_read_from_checkpoint(tmp_path, size):
     assert model.hidden_size == runtime.model.hidden_size
     assert model.num_hidden_layers == runtime.model.num_hidden_layers
     assert model.linear_num_value_heads == runtime.model.linear_num_value_heads
+
+
+def test_only_validated_model_type_parses_checkpoints(tmp_path):
+    assert not hasattr(ModelSpec, "from_checkpoint")
+
+    text = qwen_text_config()
+    text["use_qk_norm_in_gdn"] = False
+    _write_checkpoint(tmp_path, text)
+
+    with pytest.raises(ValueError, match="use_qk_norm_in_gdn=False"):
+        ModelConfig.from_checkpoint(tmp_path, model="Qwen/Qwen3.5-4B")
 
 
 @pytest.mark.parametrize(
@@ -259,7 +226,7 @@ def test_model_config_is_read_from_checkpoint(tmp_path, size):
     ),
 )
 def test_model_config_rejects_unvalidated_architecture_field(tmp_path, path, value):
-    text = _text_config()
+    text = qwen_text_config()
     target = text
     for name in path[:-1]:
         target = target[name]
@@ -271,7 +238,7 @@ def test_model_config_rejects_unvalidated_architecture_field(tmp_path, path, val
 
 
 def test_model_config_rejects_altered_layer_order(tmp_path):
-    text = _text_config()
+    text = qwen_text_config()
     text["layer_types"][0] = "full_attention"
     _write_checkpoint(tmp_path, text)
 

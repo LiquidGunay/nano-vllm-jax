@@ -52,6 +52,12 @@ Resolved in the structural cleanup:
 - Split the private runtime aggregate into `ModelSpec`, `CapacitySpec`,
   `CompileSpec`, and `KernelPlan`; the public API remains `LLM`, `EngineConfig`,
   and `SamplingParams`.
+- Intentionally removed `EngineConfig.to_engine_kwargs()`. Engine construction
+  now accepts `EngineConfig` directly, so the old internal-policy projection has
+  no compatibility shim.
+- Parse checkpoint architecture only through validated `ModelConfig`, keep GDN
+  chunk tuning in `KernelPlan`, and finalize physical KV-cache capacity once
+  before scheduler and runner construction.
 - Grouped retained Python batch facts in one immutable `HostBatch` instead of
   optional parallel `*_host` fields on `DeviceBatch`.
 - Moved GDN route eligibility and strict fallback decisions into `ServingOps`

@@ -40,7 +40,7 @@ class GDNDecodeMode(Enum):
     PACKED_SEQUENCE = "packed_sequence"
 
 
-def _full_attention_kv_cache_dtype(default_dtype, plan: KernelPlan):
+def _kv_cache_dtype(default_dtype, plan: KernelPlan):
     value = plan.kv_cache_dtype
     if value == "default" or value in _OFF_CONFIG_VALUES:
         return default_dtype
@@ -54,6 +54,25 @@ def _full_attention_kv_cache_dtype(default_dtype, plan: KernelPlan):
         f"Unknown full_attention_kv_cache_dtype={value!r}; "
         "expected fp32, bf16, fp16, default, or off"
     )
+
+
+def resolve_kv_cache_spec(spec: KVCacheSpec, plan: KernelPlan) -> KVCacheSpec:
+    """Resolve physical dtype and block count before scheduler construction."""
+
+    resolved = replace(spec, dtype=_kv_cache_dtype(spec.dtype, plan))
+    return replace(resolved, num_blocks=cap_num_kv_cache_blocks(resolved))
+
+
+def _require_finalized_kv_cache_spec(
+    spec: KVCacheSpec,
+    plan: KernelPlan,
+) -> KVCacheSpec:
+    resolved = resolve_kv_cache_spec(spec, plan)
+    if resolved.dtype != spec.dtype or resolved.num_blocks != spec.num_blocks:
+        raise ValueError(
+            "KVCacheSpec must be finalized before scheduler and runner construction"
+        )
+    return replace(resolved, max_kv_cache_bytes=None)
 
 
 def _full_attention_kv_append_impl(plan: KernelPlan) -> str:
@@ -572,22 +591,17 @@ class ServingOps:
         max_seqs: int,
         max_blocks_per_seq: int,
     ) -> KVCacheStorage:
-        cache_dtype = _full_attention_kv_cache_dtype(spec.dtype, self.plan)
-        capped_spec = replace(
-            spec,
-            dtype=cache_dtype,
-            num_blocks=cap_num_kv_cache_blocks(replace(spec, dtype=cache_dtype)),
-        )
+        finalized_spec = _require_finalized_kv_cache_spec(spec, self.plan)
         state = init_kv_cache(
-            num_blocks=capped_spec.num_blocks,
-            block_size=capped_spec.block_size,
-            num_kv_heads=capped_spec.num_kv_heads,
-            head_dim=capped_spec.head_dim,
+            num_blocks=finalized_spec.num_blocks,
+            block_size=finalized_spec.block_size,
+            num_kv_heads=finalized_spec.num_kv_heads,
+            head_dim=finalized_spec.head_dim,
             max_seqs=max_seqs,
             max_blocks_per_seq=max_blocks_per_seq,
-            num_layers=capped_spec.num_layers,
-            dtype=capped_spec.dtype,
-            max_kv_cache_bytes=capped_spec.max_kv_cache_bytes,
+            num_layers=finalized_spec.num_layers,
+            dtype=finalized_spec.dtype,
+            max_kv_cache_bytes=None,
         )
         return state.storage
 
@@ -598,13 +612,9 @@ class ServingOps:
     ) -> FullAttentionNHDKVCacheStorage | None:
         if self.full_attention_decode_impl != "flashinfer_paged":
             return None
-        cache_dtype = _full_attention_kv_cache_dtype(spec.dtype, self.plan)
+        finalized_spec = _require_finalized_kv_cache_spec(spec, self.plan)
         return init_full_attention_nhd_kv_cache(
-            spec=replace(
-                spec,
-                dtype=cache_dtype,
-                num_blocks=cap_num_kv_cache_blocks(replace(spec, dtype=cache_dtype)),
-            ),
+            spec=finalized_spec,
             full_attention_layers=full_attention_layers,
         )
 

@@ -259,6 +259,9 @@ def gdn_recurrent_decode_step(*args: Any, **kwargs: Any):
             "query, key, value, g, beta, initial_state"
         )
     query, key, value, g, beta, initial_state = args[:6]
+    use_qk_l2norm_in_kernel = kwargs.pop("use_qk_l2norm_in_kernel", True)
+    if kwargs:
+        raise TypeError(f"unexpected keyword arguments: {', '.join(sorted(kwargs))}")
 
     if query.shape != key.shape:
         raise ValueError("query and key shapes must match")
@@ -278,7 +281,7 @@ def gdn_recurrent_decode_step(*args: Any, **kwargs: Any):
         g,
         beta,
         initial_state=initial_state,
-        use_qk_l2norm_in_kernel=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
 

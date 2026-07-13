@@ -134,7 +134,7 @@ def test_linear_attention_chunked_vs_recurrent(seq_len):
     # Chunked computation (prefill mode)
     chunked_output, _ = jax_chunk_gated_delta_rule(
         query, key, value, g, beta,
-        chunk_size=config.model.linear_chunk_size,
+        chunk_size=config.kernels.gdn_chunk_size,
         use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
     )
     

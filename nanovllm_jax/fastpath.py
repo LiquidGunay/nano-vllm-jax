@@ -33,6 +33,7 @@ class KernelPlan:
     gdn_decode_qkv_dtype: str = "fp32"
     gdn_disable_fallbacks: bool = False
     gdn_decode_max_batch: int | None = None
+    gdn_chunk_size: int = 32
     gdn_recurrent_prefill_threshold: int = 8
 
     greedy_token_fastpath: bool = True
@@ -60,6 +61,10 @@ class KernelPlan:
     decode_padded_gemm_max_out_dim: int = 300000
     gdn_width1_packed_input_projection: bool = False
     greedy_decode_burst_steps: int = 1
+
+    def __post_init__(self) -> None:
+        if self.gdn_chunk_size <= 0:
+            raise ValueError("gdn_chunk_size must be positive")
 
 
 KERNEL_PLAN = KernelPlan(

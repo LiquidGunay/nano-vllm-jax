@@ -41,14 +41,19 @@ LLMEngine.commit() -> StepResult
 
 Startup composes one immutable `RuntimeSpec` from four owners:
 
-- `ModelSpec`: checkpoint architecture,
+- `ModelSpec`: checkpoint architecture, parsed and validated by `ModelConfig`,
 - `CapacitySpec`: requests and cache limits,
 - `CompileSpec`: dtypes and static bucket shapes,
-- `KernelPlan`: promoted operation implementations.
+- `KernelPlan`: promoted operation implementations and their tuning constants.
 
 Public `EngineConfig` supplies workload and capacity only. Cache allocation,
 weight loading, projections, and operation dispatch receive their narrow spec
 instead of a flat runtime message bus.
+
+Startup resolves the physical KV dtype and byte-capped block count once, before
+the scheduler and runner are constructed. The server then prints the resulting
+model, capacity, compile, and kernel specs as one runtime manifest before
+warmup.
 
 `Sequence` owns logical positions and cache metadata. `OutputBuffer` owns every
 generated token, including deferred device references. Reading logical request
