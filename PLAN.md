@@ -16,7 +16,7 @@ one PR at a time, then build the next PR from the newly merged `main`.
 
 ## Source Revisions
 
-- Clean mainline: `origin/main@850cd3e`
+- Clean mainline: `origin/main@0f6fbbc`
 - Experimental evidence: `experimental/mtp-prefill-verifier-speed@da91504`
 - Cleanup review: `/mountpoint/.exp/cleanup_and_diagnosis.md`
 
@@ -47,6 +47,9 @@ surface, and diagnostics will not be merged or cherry-picked wholesale.
 - The only production verifier is strict target-model packed-prefix
   verification. Sequential repair, unverified append, and forced acceptance
   remain test or diagnostic tools and cannot support a speed claim.
+- Continuous-integration automation is explicitly outside this plan and will
+  not be added by these PRs. Validation remains a documented set of guarded
+  local checks and reproducibility commands.
 
 ## Repository Style Contract
 
@@ -347,7 +350,7 @@ PR 2c keeps the prefix-cache follow-up narrow:
 - Add the style guide and put the core engine before advanced serving policy in
   the README reading path.
 
-PR 2d branch: `agent/route-registry` at `f55f349`; open as draft PR
+PR 2d branch: `agent/route-registry` at `8deb3e4`; open as draft PR
 [#12](https://github.com/LiquidGunay/nano-vllm-jax/pull/12)
 
 PR 2d is the route-ownership compression pass:
@@ -607,9 +610,16 @@ Do not transplant:
   resident sampled warmup route. Tiny greedy/sampled and real 0.8B checks are
   exact with zero measured compilation. B=1 is within `+0.7%` of PR #11 and
   B=8 within `-0.5%`, both inside observed variance and under the RAM guard.
+- [x] Address the first PR #12 review: warm dense-carry, sparse-carry,
+  ordinary no-carry, sampled, and burst scenarios through the serving path;
+  reject duplicate or ambiguous route tables; and narrow the style wording to
+  executor validation. Guarded tiny and real 0.8B B=1/B=8 runs have zero
+  measured JIT growth. Per the working decision above, CI is not part of this
+  plan and no workflow change is included.
 - [x] Merge PR #11 at main commit `0f6fbbc`, rebase the route-registry change,
-  and open draft PR #12 at `f55f349`. The rebased focused suite passes under a
-  3 GiB RAM guard; the patch remains net-negative in size.
+  and open draft PR #12. At current head `8deb3e4`, `runner.py` is 310 lines
+  smaller while the production source is nearly line-neutral; the added lines
+  are principally focused route and warmup regressions.
 - [ ] Review and merge PR #12, then complete PR 2e's config/model-policy
   compression before the reproducibility artifact or speculative routes add
   new execution choices.
