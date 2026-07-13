@@ -367,7 +367,7 @@ PR 2d is the route-ownership compression pass:
 - Add a host-only executable trace of schedule, materialize, execute, and
   commit.
 
-PR 2e branch: `agent/runtime-policy-ownership` at `0ab4293`; open as draft PR
+PR 2e branch: `agent/runtime-policy-ownership` at `1ca274b`; open as draft PR
 [#13](https://github.com/LiquidGunay/nano-vllm-jax/pull/13)
 
 PR 2e completes the remaining configuration and model-policy compression:
@@ -384,9 +384,9 @@ PR 2e completes the remaining configuration and model-policy compression:
 The implementation removes the flat runtime compatibility shape, replaces
 eight parallel host mirrors with one `HostBatch`, and leaves runner/executor
 unsplit because no complete transition could be extracted without adding
-forwarding-only modules. Production code is net 654 lines smaller. Guarded
+forwarding-only modules. Production code is net 645 lines smaller. Guarded
 real-model controls are exact with no measured JIT growth: Qwen3.5-4B B=1
-measured `51.68` versus merged-main `51.63` decode tok/s, and the 0.8B B=8
+measured `51.64` versus merged-main `51.63` decode tok/s, and the 0.8B B=8
 result stayed within the merged-main run range. The obsolete GitHub Actions
 workflow is removed in accordance with the explicit no-CI decision.
 
@@ -640,5 +640,13 @@ Do not transplant:
   `HostBatch` replaces parallel host mirrors; GDN serving decisions live in
   `ServingOps`; and production code is net 654 lines smaller. Guarded 4B B=1
   and 0.8B B=8 controls are exact with zero measured JIT growth.
+- [x] Address PR #13 review at `1ca274b`: checkpoint Q/K-normalization is now
+  parsed and consistent across prefill/decode; GDN chunking belongs to
+  `KernelPlan`; validated `ModelConfig` owns checkpoint parsing; KV capacity is
+  finalized before scheduler/runner construction; and startup reports the
+  composed model, capacity, compile, and kernel policy. The intentional
+  `EngineConfig.to_engine_kwargs()` removal is documented without a shim. A
+  guarded 4B B=1 replay remains exact at `51.64` decode tok/s with zero JIT
+  growth. The CI suggestion is declined under the explicit no-CI decision.
 - [ ] Review and merge PR #13, completing PR 2 before starting the
   reproducibility artifact.
