@@ -100,6 +100,19 @@ class _PacedUnicodeEngine(_FakeEngine):
         }[tuple(token_ids)]
 
 
+class _BadDetokenizer:
+    def _detokenize(self, token_ids):
+        raise ValueError("decode failed")
+
+
+class _BadFinalEngine(_BadDetokenizer, _FakeEngine):
+    pass
+
+
+class _BlockingBadFinalEngine(_BadDetokenizer, _BlockingEngine):
+    pass
+
+
 def test_service_admits_independent_requests_into_same_engine_step():
     engine = _FakeEngine()
     service = EngineService(engine, batch_window_seconds=0.02)
@@ -145,6 +158,41 @@ def test_service_engine_failure_fails_active_pending_and_future_requests():
         service.stop()
 
 
+def test_natural_finalization_failure_terminates_handle():
+    service = EngineService(_BadFinalEngine(), batch_window_seconds=0.0)
+    service.start()
+    try:
+        handle = service.submit(
+            [11],
+            SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        )
+        with pytest.raises(ValueError, match="decode failed"):
+            handle.wait(timeout=1.0)
+        assert service.health()["in_flight"] == 0
+    finally:
+        service.stop()
+
+
+def test_cancel_finalization_failure_terminates_handle():
+    engine = _BlockingBadFinalEngine()
+    service = EngineService(engine, batch_window_seconds=0.0)
+    service.start()
+    handle = service.submit(
+        [11],
+        SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True),
+    )
+    try:
+        assert engine.entered.wait(timeout=1.0)
+        handle.cancel()
+        engine.release.set()
+        with pytest.raises(ValueError, match="decode failed"):
+            handle.wait(timeout=1.0)
+        assert service.health()["in_flight"] == 0
+    finally:
+        engine.release.set()
+        service.stop()
+
+
 def test_service_stop_fails_pending_requests_before_start():
     engine = _FakeEngine()
     service = EngineService(engine, batch_window_seconds=0.0)
@@ -179,6 +227,25 @@ def test_service_rejects_when_queue_is_full():
         assert first.wait(timeout=1.0).finish_reason is FinishReason.LENGTH
     finally:
         engine.release.set()
+        service.stop()
+
+
+def test_generate_many_reserves_its_whole_batch_atomically():
+    engine = _FakeEngine()
+    service = EngineService(engine, batch_window_seconds=0.0, max_queue_size=1)
+    sampling = SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True)
+
+    with pytest.raises(RuntimeError, match="queue is full"):
+        service.generate_many([[11], [22]], sampling)
+    assert service.health()["in_flight"] == 0
+
+    service.start()
+    try:
+        handle = service.submit([33], sampling)
+        assert handle.request_id == 0
+        assert handle.wait(timeout=1.0).finish_reason is FinishReason.LENGTH
+        assert len(engine.seqs) == 1
+    finally:
         service.stop()
 
 
@@ -311,9 +378,10 @@ def test_stop_reports_a_worker_that_is_still_running():
         assert service.health()["state"] == "stopping"
     finally:
         engine.release.set()
-        service.stop(timeout=1.0)
 
     with pytest.raises(RuntimeError, match="stopped"):
-        handle.wait(timeout=0.1)
+        handle.wait(timeout=1.0)
+    assert service.health()["in_flight"] == 0
+    service.stop(timeout=1.0)
     assert service.health()["state"] == "stopped"
     assert service.health()["worker_alive"] is False

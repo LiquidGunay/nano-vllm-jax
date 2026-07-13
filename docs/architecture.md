@@ -28,7 +28,8 @@ instead of retaining one Python dictionary per token.
 Cancellation is also an engine transition: `cancel_request()` removes a
 waiting or running sequence and releases its scheduler, KV, and runner state.
 Health is derived from the worker thread rather than model allocation alone,
-and shutdown succeeds only after that worker has actually stopped.
+and shutdown succeeds only after that worker has actually stopped. If a stop
+deadline expires, the worker still fails remaining handles when it later exits.
 
 The control boundary is explicit:
 

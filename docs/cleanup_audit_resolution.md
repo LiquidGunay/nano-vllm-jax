@@ -61,11 +61,11 @@ Resolved in the structural cleanup:
 Validation completed under `tests/ram_guard.py`:
 - `python -m compileall -q server.py nanovllm_jax tests`.
 - `python -m ruff check server.py nanovllm_jax tests`.
-- `pytest --collect-only -q`: 205 tests collected.
+- `pytest --collect-only -q`: 208 tests collected.
 - `pytest -q tests/test_engine_initialization.py tests/test_fastpath_config.py
   tests/test_public_imports.py tests/test_scheduler_capacity.py
   tests/test_server_config.py tests/test_service.py tests/test_step_results.py`:
-  57 passed.
+  60 passed.
 - `pytest -q tests/test_device_token_carry.py tests/test_kv_cache.py
   tests/test_flashinfer_ffi.py tests/test_lm_head_helpers.py`: 55 passed.
 - `pytest -q tests/test_gdn_packed_decode_reference.py

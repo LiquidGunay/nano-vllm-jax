@@ -269,19 +269,32 @@ class EngineService:
         *,
         stream: bool = False,
     ) -> RequestHandle:
+        return self._submit_many([prompt], [sampling_params], stream=stream)[0]
+
+    def _submit_many(
+        self,
+        prompts: list[str | list[int]],
+        params: list[SamplingParams],
+        *,
+        stream: bool = False,
+    ) -> list[RequestHandle]:
         with self._state_lock:
             if self._failed is not None:
                 raise RuntimeError("engine service failed; restart the server") from self._failed
             if self._stop.is_set():
                 raise RuntimeError("engine service is stopping")
-            if self._max_requests is not None and self._in_flight >= self._max_requests:
+            count = len(prompts)
+            if self._max_requests is not None and self._in_flight + count > self._max_requests:
                 raise RuntimeError("engine service queue is full")
-            request_id = self._next_request_id
-            self._next_request_id += 1
-            self._in_flight += 1
-            handle = RequestHandle(request_id, stream=stream)
-            self._incoming.put(_PendingRequest(prompt, sampling_params, handle))
-        return handle
+            handles = [
+                RequestHandle(self._next_request_id + index, stream=stream)
+                for index in range(count)
+            ]
+            self._next_request_id += count
+            self._in_flight += count
+            for prompt, param, handle in zip(prompts, params, handles):
+                self._incoming.put(_PendingRequest(prompt, param, handle))
+            return handles
 
     def generate(self, prompt: str | list[int], sampling_params: SamplingParams) -> GenerationResult:
         return self.submit(prompt, sampling_params).wait()
@@ -297,7 +310,7 @@ class EngineService:
             params = sampling_params
         else:
             params = [sampling_params for _ in prompts]
-        handles = [self.submit(prompt, param) for prompt, param in zip(prompts, params)]
+        handles = self._submit_many(prompts, params)
         return [handle.wait() for handle in handles]
 
     def _run(self) -> None:
@@ -315,6 +328,10 @@ class EngineService:
                 self._publish_finished(step_result)
         except BaseException as exc:
             self._mark_failed(exc)
+        finally:
+            stopped = RuntimeError("engine service stopped before request completed")
+            self._abort_all_active(stopped)
+            self._fail_all_pending(stopped)
 
     def _take_pending(self, *, block: bool) -> list[_PendingRequest]:
         pending: list[_PendingRequest] = []
@@ -374,8 +391,8 @@ class EngineService:
             for _, active in cancelled:
                 self.engine.cancel_request(active.seq)
         for seq_id, active in cancelled:
-            self._active.pop(seq_id, None)
             self._finish_active(active, FinishReason.CANCELLED)
+            self._active.pop(seq_id, None)
 
     def _publish_progress(self, step: StepResult) -> None:
         through: dict[int, int] = {}
@@ -399,9 +416,10 @@ class EngineService:
             active.seq.output for _, active in finished if active is not None
         )
         for request, _ in finished:
-            active = self._active.pop(request.seq_id, None)
+            active = self._active.get(request.seq_id)
             if active is not None:
                 self._finish_active(active, request.reason)
+                self._active.pop(request.seq_id, None)
 
     def _finish_active(self, active: _ActiveRequest, reason: FinishReason) -> None:
         token_ids = active.seq.output.token_ids()
