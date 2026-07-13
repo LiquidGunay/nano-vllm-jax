@@ -286,9 +286,9 @@ Merge gates:
 
 ### PR 2: explicit step, cache, route, and output ownership
 
-Status: [ ] split in progress; PRs 2a and 2b are merged, PR 2c is ready for
-re-review as PR [#11](https://github.com/LiquidGunay/nano-vllm-jax/pull/11),
-PR 2d is in local validation, and PR 2e remains planned from issue #10
+Status: [ ] split in progress; PRs 2a-2c are merged, PR 2d is open for review
+as PR [#12](https://github.com/LiquidGunay/nano-vllm-jax/pull/12), and PR 2e
+remains planned from issue #10
 
 PR 2a branch: `agent/step-ownership-abi` at `5cee688`; merged as PR
 [#8](https://github.com/LiquidGunay/nano-vllm-jax/pull/8) at main commit
@@ -325,7 +325,9 @@ PR 2b completes the execute/commit/output half of the ABI:
 - EOS/length/cancelled finish reasons and the configured model id reach server
   output.
 
-PR 2c branch: `agent/prefix-cache-lifecycle` at `e3c7f67`
+PR 2c branch: `agent/prefix-cache-lifecycle`; merged as PR
+[#11](https://github.com/LiquidGunay/nano-vllm-jax/pull/11) at main commit
+`0f6fbbc`
 
 PR 2c keeps the prefix-cache follow-up narrow:
 
@@ -344,6 +346,9 @@ PR 2c keeps the prefix-cache follow-up narrow:
   add churn and capacity tests.
 - Add the style guide and put the core engine before advanced serving policy in
   the README reading path.
+
+PR 2d branch: `agent/route-registry` at `f55f349`; open as draft PR
+[#12](https://github.com/LiquidGunay/nano-vllm-jax/pull/12)
 
 PR 2d is the route-ownership compression pass:
 
@@ -602,6 +607,9 @@ Do not transplant:
   resident sampled warmup route. Tiny greedy/sampled and real 0.8B checks are
   exact with zero measured compilation. B=1 is within `+0.7%` of PR #11 and
   B=8 within `-0.5%`, both inside observed variance and under the RAM guard.
-- [ ] Merge PR #11, rebase and open PR 2d, then complete PR 2e's
-  config/model-policy compression before the
-  reproducibility artifact or speculative routes add new execution choices.
+- [x] Merge PR #11 at main commit `0f6fbbc`, rebase the route-registry change,
+  and open draft PR #12 at `f55f349`. The rebased focused suite passes under a
+  3 GiB RAM guard; the patch remains net-negative in size.
+- [ ] Review and merge PR #12, then complete PR 2e's config/model-policy
+  compression before the reproducibility artifact or speculative routes add
+  new execution choices.
