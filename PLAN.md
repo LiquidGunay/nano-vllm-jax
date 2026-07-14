@@ -1,6 +1,6 @@
 # Mainline Cleanup and Speculative Decoding Plan
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
 
 ## Goal
 
@@ -16,7 +16,7 @@ one PR at a time, then build the next PR from the newly merged `main`.
 
 ## Source Revisions
 
-- Clean mainline: `origin/main@ecab818` (through merged PR #12)
+- Clean mainline: `origin/main@9e1c14d` (through merged PR #13)
 - Experimental evidence: `experimental/mtp-prefill-verifier-speed@da91504`
 - Cleanup review: `/mountpoint/.exp/cleanup_and_diagnosis.md`
 
@@ -31,9 +31,10 @@ surface, and diagnostics will not be merged or cherry-picked wholesale.
 - The initially validated dense checkpoints are Qwen3.5 0.8B, 2B, and 4B.
   Larger models remain rejected until they have a real-weight test on suitable
   hardware.
-- The proposed headline workload is Qwen3.5-4B, BF16, batch 1, 64 prompt
-  tokens, 64 greedy output tokens, on one A10G. This is provisional until it is
-  freshly reproduced on the cleaned code and a pinned current vLLM release.
+- The artifact workload is Qwen3.5-4B, BF16, batch 1, 64 prompt tokens, and 64
+  greedy output tokens on one A10G. A clean run measured `53.98` decode tok/s
+  for JAX and `50.23` for vLLM 0.25.0 with exact output parity. TTFT is reported
+  separately; this is not an end-to-end latency or speculative-decoding claim.
 - B=1 is the speculative latency target. B=8 remains a non-regression lane for
   the ordinary engine; no B=1 optimization may silently replace the B=8 path.
 - JAX shape specialization is explicit in compile buckets and route keys. It
@@ -290,8 +291,7 @@ Merge gates:
 
 ### PR 2: explicit step, cache, route, and output ownership
 
-Status: [ ] split in progress; PRs 2a-2d are merged and PR 2e is open for
-review as draft PR [#13](https://github.com/LiquidGunay/nano-vllm-jax/pull/13)
+Status: [x] complete; PRs 2a-2e are merged
 
 PR 2a branch: `agent/step-ownership-abi` at `5cee688`; merged as PR
 [#8](https://github.com/LiquidGunay/nano-vllm-jax/pull/8) at main commit
@@ -367,8 +367,9 @@ PR 2d is the route-ownership compression pass:
 - Add a host-only executable trace of schedule, materialize, execute, and
   commit.
 
-PR 2e branch: `agent/runtime-policy-ownership` at `7f00634`; open as draft PR
-[#13](https://github.com/LiquidGunay/nano-vllm-jax/pull/13)
+PR 2e branch: `agent/runtime-policy-ownership` at `7f00634`; merged as PR
+[#13](https://github.com/LiquidGunay/nano-vllm-jax/pull/13) at main commit
+`9e1c14d`
 
 PR 2e completes the remaining configuration and model-policy compression:
 
@@ -428,7 +429,8 @@ change does not earn scope merely because it appears in issue #10.
 
 ### PR 3: reproducible artifact and one benchmark claim
 
-Status: [ ] blocked by PR 2e
+Status: [ ] open for review as draft PR
+[#14](https://github.com/LiquidGunay/nano-vllm-jax/pull/14) at `1d31754`
 
 Purpose: make the repository able to support and reproduce one honest claim.
 
@@ -454,8 +456,18 @@ Headline contract, subject to the fresh baseline:
 - Generated-token decode throughput is the single headline metric.
 - Three measured repeats, exact output comparison, zero measured-phase JIT.
 
-The script performs GPU/CUDA preflight and enforces the same 70% RAM guard. A
-claim is not written if parity, memory, compilation, or variance checks fail.
+The script performs GPU/CUDA preflight and defaults to an 80% system-RAM
+ceiling, a 10 GiB process-tree ceiling, and a 2 GiB available-memory floor.
+The earlier 70% ceiling safely stopped the clean JAX load at 70.8%; the bounded
+80% run completed without approaching the process-tree limit. A claim is not
+written if parity, memory, compilation, or variance checks fail.
+
+The clean A10G run is exact across backends and repeats. JAX measured `53.98`
+decode tok/s versus vLLM 0.25.0 at `50.23` (`1.075x`), with no JAX
+measured-phase JIT growth. JAX TTFT was slower (`122.8 ms` versus `54.5 ms`),
+so the report limits the claim to steady-state decode. Guard peak process-tree
+RSS was 2.74 GiB for JAX and 4.61 GiB for vLLM; raw outputs remain outside the
+repository.
 
 ### PR 4: generic drafter plus cheap target verifier
 
@@ -526,8 +538,8 @@ Merge/promotion gates:
 - No fallback labels and no measured-phase compilation.
 - INT8 reports proposal KL, top-1 flips with BF16 margins, and acceptance delta;
   near-tie flips are acceptable, unexplained quality loss is not.
-- Peak host RAM remains below the 70% guard and device memory retains explicit
-  headroom.
+- Peak host RAM remains below the guarded artifact ceiling and device memory
+  retains explicit headroom.
 - JAX MTP beats the freshly measured clean JAX base and vLLM without MTP on the
   primary workload before the README calls it a speedup.
 - vLLM MTP is reported as a framework comparison, not used to relax the JAX
@@ -655,5 +667,10 @@ Do not transplant:
   local ownership/configuration check. Production code is now net 678 lines
   smaller. The guarded 4B B=1 replay remains exact at `51.60` decode tok/s
   with zero measured JIT growth.
-- [ ] Review and merge PR #13, completing PR 2 before starting the
-  reproducibility artifact.
+- [x] Merge PR #13 at main commit `9e1c14d`, completing the cleanup and base
+  ABI sequence.
+- [x] Open reproducibility draft PR #14 at `1d31754`. Its clean guarded A10G
+  run has exact cross-backend output, zero measured JAX JIT growth, and records
+  `53.98` JAX versus `50.23` vLLM 0.25.0 decode tok/s. It adds no CI and keeps
+  raw artifacts under `/mountpoint/.exp`.
+- [ ] Review and merge PR #14 before starting the generic packed-verifier PR.
