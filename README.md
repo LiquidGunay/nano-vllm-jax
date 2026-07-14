@@ -36,6 +36,26 @@ branch.
 The offline `LLM.generate(..., use_tqdm=True)` progress bar uses the optional
 `progress` extra. Serving does not require it.
 
+## Run The Benchmark
+
+The repository makes one narrow claim: Qwen3.5-4B greedy B=1 decode with a
+64-token prompt and 64 generated tokens. The exact checkpoint, workload,
+framework version, and validity gates live in
+[benchmarks/benchmark.json](benchmarks/benchmark.json). The committed
+[recorded result](benchmarks/recorded_result.json) is one historical A10G
+observation, not a pass threshold for new runs.
+
+```bash
+./scripts/run_benchmark.sh both
+```
+
+JAX and vLLM run in separate environments because their CUDA Python packages
+conflict. vLLM is therefore optional. Environments, model cache, and raw JSON
+results derive from `NANO_VLLM_JAX_BENCHMARK_ROOT`, which defaults to
+`/mountpoint/.exp`; the script stops at 80% system RAM use by default.
+[docs/benchmark.md](docs/benchmark.md) defines the measured window and reports
+the committed result.
+
 ## API Smoke
 
 ```bash
@@ -115,9 +135,9 @@ Advanced serving:
 
 ## Development
 
-Generated results, profiles, and benchmark artifacts are not part of the
-cleaned branch. Keep ad hoc diagnostics under `/mountpoint/.exp/diagnostics` or
-another external scratch path.
+Generated results and profiles are not part of the cleaned branch. The fixed
+benchmark contract and concise report are committed; raw runs and ad hoc
+diagnostics stay under `/mountpoint/.exp`.
 
 [docs/style.md](docs/style.md) defines the repository's lightweight complexity
 budget and review checks.

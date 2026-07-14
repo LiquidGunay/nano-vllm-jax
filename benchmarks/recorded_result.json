@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "qwen35-4b-b1-p64-o64-greedy",
+  "benchmark_sha256": "6ed76245f4df82b32d0677db0a87e8bb5837c6c13fe50e5bff2e993dbfa4cd5e",
+  "recorded_at": "2026-07-14",
+  "implementation_commit": "d8c50abef771cf73e3ae31d8b96a8ed785b65652",
+  "hardware": {
+    "gpu": "NVIDIA A10G",
+    "gpu_memory_bytes": 24146608128,
+    "driver": "580.159.03"
+  },
+  "results": {
+    "jax": {
+      "framework": {
+        "jax": "0.10.0",
+        "jaxlib": "0.10.0",
+        "transformers": "5.6.2",
+        "triton": "3.6.0"
+      },
+      "samples": [
+        {"ttft_seconds": 0.12278242199681699, "decode_tokens_per_second": 53.97659219975553},
+        {"ttft_seconds": 0.12286994396708906, "decode_tokens_per_second": 53.94800986126448},
+        {"ttft_seconds": 0.12272863113321364, "decode_tokens_per_second": 53.979836060681905}
+      ],
+      "median_ttft_seconds": 0.12278242199681699,
+      "median_decode_tokens_per_second": 53.97659219975553,
+      "relative_spread": 0.000589629654640697,
+      "measured_executor_route_cache_growth": 0,
+      "guard_peak_process_tree_rss_bytes": 2938306560,
+      "max_observed_device_used_bytes": 18667798528
+    },
+    "vllm": {
+      "framework": {
+        "vllm": "0.25.0",
+        "torch": "2.11.0",
+        "transformers": "5.13.1",
+        "triton": "3.6.0"
+      },
+      "samples": [
+        {"ttft_seconds": 0.05181145668029785, "decode_tokens_per_second": 50.22790945646228},
+        {"ttft_seconds": 0.05984997749328613, "decode_tokens_per_second": 50.23059307254773},
+        {"ttft_seconds": 0.054529428482055664, "decode_tokens_per_second": 50.19809538829794}
+      ],
+      "median_ttft_seconds": 0.054529428482055664,
+      "median_decode_tokens_per_second": 50.22790945646228,
+      "relative_spread": 0.0006470045160440607,
+      "guard_peak_process_tree_rss_bytes": 4947369984,
+      "max_observed_device_used_bytes": 9545187328
+    }
+  },
+  "comparison": {
+    "jax_over_vllm_decode_ratio": 1.074633461433,
+    "output_sha256": "352a694746b191d9b1cbb50e43499729b3fc3903048745cad7d79b8b8d85ca5a",
+    "output_exact": true
+  }
+}
