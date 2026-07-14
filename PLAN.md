@@ -17,7 +17,7 @@ one PR at a time, then build the next PR from the newly merged `main`.
 
 ## Source Revisions
 
-- Clean mainline: `origin/main@9e1c14d` (through merged PR #13)
+- Clean mainline: `origin/main@6ee8bbc` (through merged PR #14)
 - Experimental evidence: `experimental/mtp-prefill-verifier-speed@da91504`
 - Cleanup review: `/mountpoint/.exp/cleanup_and_diagnosis.md`
 
@@ -430,8 +430,9 @@ change does not earn scope merely because it appears in issue #10.
 
 ### PR 3: runnable artifact and one recorded benchmark result
 
-Status: [ ] open for review as draft PR
-[#14](https://github.com/LiquidGunay/nano-vllm-jax/pull/14) at `fa96cd0`
+Status: [x] merged as PR
+[#14](https://github.com/LiquidGunay/nano-vllm-jax/pull/14) at main commit
+`6ee8bbc`
 
 Purpose: make the repository run one fixed benchmark and preserve one honest
 recorded result.
@@ -477,7 +478,7 @@ outside the repository.
 
 ### PR 4: generic drafter plus cheap target verifier
 
-Status: [ ] blocked by PR 3
+Status: [ ] implementation in progress on `agent/generic-packed-verifier`
 
 Purpose: prove cheap verification independently of MTP draft quality.
 
@@ -681,4 +682,7 @@ Do not transplant:
   output, zero measured executor route-cache growth, and records `53.98` JAX
   versus `50.23` vLLM 0.25.0 decode tok/s. It adds no CI and keeps raw
   artifacts under `/mountpoint/.exp`.
-- [ ] Review and merge PR #14 before starting the generic packed-verifier PR.
+- [x] Address PR #14 target-isolation follow-up at `7cde2b6` and merge it at
+  main commit `6ee8bbc`. The standalone vLLM target completed with no benchmark
+  JAX environment, exact 64-token parity, and 3.8 GiB guarded peak process RSS.
+- [ ] Implement and validate the generic packed-verifier PR from merged main.
