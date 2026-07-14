@@ -150,6 +150,7 @@ def invalid_reasons(
     backend_name: str,
     manifest: dict[str, Any],
     samples: list[dict[str, Any]],
+    output_rows: list[list[int]],
     *,
     repeat_exact: bool,
     reference_exact: bool | None,
@@ -168,6 +169,11 @@ def invalid_reasons(
         reasons.append("backend tokens differ from the reference backend")
     if any(sample["decode_tokens"] != expected_tokens for sample in samples):
         reasons.append("decode token count does not match the contract")
+    workload = manifest["workload"]
+    if len(output_rows) != workload["batch_size"] or any(
+        len(row) != workload["output_tokens"] for row in output_rows
+    ):
+        reasons.append("output token count does not match the contract")
     if any(sample["decode_seconds"] <= 0 for sample in samples):
         reasons.append("decode duration is not positive")
     if spread > manifest["measurement"]["max_relative_spread"]:
@@ -233,6 +239,7 @@ def run(
         backend_name,
         manifest,
         samples,
+        control["output_token_ids"],
         repeat_exact=repeat_exact,
         reference_exact=reference_exact,
         route_cache_growth=route_cache_growth,

@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "benchmark_id": "qwen35-4b-b1-p64-o64-greedy",
+  "benchmark_sha256": "6ed76245f4df82b32d0677db0a87e8bb5837c6c13fe50e5bff2e993dbfa4cd5e",
   "recorded_at": "2026-07-14",
   "implementation_commit": "d8c50abef771cf73e3ae31d8b96a8ed785b65652",
   "hardware": {

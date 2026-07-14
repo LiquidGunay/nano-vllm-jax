@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -78,6 +79,7 @@ def test_validity_rejects_unstable_or_nonmatching_tokens():
         "jax",
         manifest,
         samples,
+        [[0] * 64],
         repeat_exact=True,
         reference_exact=None,
         route_cache_growth=0,
@@ -86,6 +88,7 @@ def test_validity_rejects_unstable_or_nonmatching_tokens():
         "vllm",
         manifest,
         samples,
+        [[0] * 64],
         repeat_exact=False,
         reference_exact=False,
         route_cache_growth=None,
@@ -96,11 +99,34 @@ def test_validity_rejects_unstable_or_nonmatching_tokens():
         "jax",
         manifest,
         samples,
+        [[0] * 64],
         repeat_exact=True,
         reference_exact=None,
         route_cache_growth=1,
     )
     assert "JAX added an executor route-cache entry during measurement" in reasons
+
+
+def test_validity_rejects_the_wrong_final_output_length():
+    manifest = load_manifest(ROOT / "benchmarks/benchmark.json")
+    samples = [
+        {
+            "decode_tokens": 63,
+            "decode_seconds": 1.0,
+            "decode_tokens_per_second": 63.0,
+        }
+    ] * 3
+
+    reasons = invalid_reasons(
+        "jax",
+        manifest,
+        samples,
+        [[0] * 63],
+        repeat_exact=True,
+        reference_exact=None,
+        route_cache_growth=0,
+    )
+    assert "output token count does not match the contract" in reasons
 
 
 def test_comparison_reports_speed_and_hardware_without_gating_them():
@@ -120,12 +146,16 @@ def test_comparison_requires_matching_outputs():
 
 
 def test_recorded_result_matches_the_manifest():
-    manifest = load_manifest(ROOT / "benchmarks/benchmark.json")
+    benchmark_path = ROOT / "benchmarks/benchmark.json"
+    manifest = load_manifest(benchmark_path)
     recorded = json.loads((ROOT / "benchmarks/recorded_result.json").read_text())
     jax = recorded["results"]["jax"]
     vllm = recorded["results"]["vllm"]
 
     assert recorded["benchmark_id"] == manifest["benchmark_id"]
+    assert recorded["benchmark_sha256"] == hashlib.sha256(
+        benchmark_path.read_bytes()
+    ).hexdigest()
     assert recorded["comparison"]["output_exact"]
     assert recorded["comparison"]["jax_over_vllm_decode_ratio"] == pytest.approx(
         jax["median_decode_tokens_per_second"]

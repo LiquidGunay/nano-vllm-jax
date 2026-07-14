@@ -14,11 +14,11 @@ the measured window. TTFT is reported separately. Decode throughput is the 63
 tokens after the first token divided by time from first token to completion.
 
 Each backend runs three measured repeats in its own process and environment. A
-result is invalid if repeats change tokens, a new JAX executor route-cache entry
-appears during measurement, JAX and vLLM differ on any output token, or
-throughput spread exceeds 10%. Hardware, software, and repository state are
-recorded as provenance; they do not make a correctly executed benchmark
-invalid. Raw JSON results remain outside the repository.
+result is invalid if repeats change tokens, final rows are not 64 tokens, a new
+JAX executor route-cache entry appears during measurement, JAX and vLLM differ
+on any output token, or throughput spread exceeds 10%. Hardware, software, and
+repository state are recorded as provenance; they do not make a correctly
+executed benchmark invalid. Raw JSON results remain outside the repository.
 
 ## Run
 
@@ -27,10 +27,11 @@ invalid. Raw JSON results remain outside the repository.
 ```
 
 Run only the required side with `jax` or `vllm`; the vLLM side requires an
-existing JAX result for exact-token comparison. When both run, the script also
-writes `comparison.json` and prints the observed ratio; it does not enforce the
-historical ratio. The script creates isolated Python 3.11 environments from
-[uv.lock](../uv.lock) and
+existing JAX result for exact-token comparison but does not create or import a
+JAX environment. When both run, the script also writes `comparison.json` and
+prints the observed ratio; it does not enforce the historical ratio. A new run
+removes any older comparison first. The script creates isolated Python 3.11
+environments from [uv.lock](../uv.lock) and
 [vllm-requirements.txt](../benchmarks/vllm-requirements.txt). It checks one
 explicit CUDA GPU and runs each backend through the process-tree RAM guard. The
 default 80% system-RAM ceiling is paired with a 10 GiB process-tree limit and a
@@ -58,6 +59,7 @@ These values come from the committed
 commit `d8c50ab` on 2026-07-14. Both backends produced the same tokens on every
 repeat and the same output hash,
 `352a694746b191d9b1cbb50e43499729b3fc3903048745cad7d79b8b8d85ca5a`.
+The recorded summary includes the SHA-256 of the exact benchmark manifest.
 
 | Backend | Version | Median decode tok/s | Median TTFT | Spread | Output parity |
 | --- | --- | ---: | ---: | ---: | --- |
