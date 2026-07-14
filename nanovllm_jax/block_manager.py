@@ -377,6 +377,7 @@ class BlockManager:
         *,
         total_blocks: int | None = None,
         use_prefix_cache: bool = True,
+        initial_lookahead_tokens: int = 0,
     ):
         """Reserve lifetime capacity, then allocate only prompt blocks."""
         if seq.block_table:
@@ -399,6 +400,12 @@ class BlockManager:
             seq,
             use_prefix_cache=use_prefix_cache,
         )
+        initial_tokens = seq.num_tokens + max(0, int(initial_lookahead_tokens))
+        initial_blocks = (initial_tokens + self.block_size - 1) // self.block_size
+        if total_blocks is not None and initial_blocks > int(total_blocks):
+            raise ValueError("initial lookahead exceeds reserved request capacity")
+        while len(seq.block_table) < initial_blocks:
+            seq.block_table.append(self._allocate_reserved_block(seq))
 
     def _consume_reservation(self, seq: Sequence) -> None:
         key = id(seq)

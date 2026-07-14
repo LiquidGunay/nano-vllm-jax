@@ -1,15 +1,59 @@
-"""Typed boundary between a token drafter and the target verifier."""
+"""Small values shared by draft models and target verification."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Mapping, NamedTuple, Protocol, Sequence
-
-import jax
-import jax.numpy as jnp
-import numpy as np
+from dataclasses import dataclass
+from operator import index
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
-    from nanovllm_jax.sequence import Sequence as RequestSequence
+    import jax
+
+
+MAX_DRAFT_WIDTH = 15
+
+
+@dataclass(frozen=True)
+class DrafterConfig:
+    """Constructor-time selection of one persistent draft model."""
+
+    kind: str
+    width: int
+
+    def __post_init__(self) -> None:
+        if self.kind != "mtp":
+            raise ValueError("the only supported drafter kind is 'mtp'")
+        if isinstance(self.width, bool):
+            raise TypeError("draft width must be an integer")
+        try:
+            width = index(self.width)
+        except TypeError as exc:
+            raise TypeError("draft width must be an integer") from exc
+        if not 1 <= width <= MAX_DRAFT_WIDTH:
+            raise ValueError(
+                f"draft width must be between 1 and {MAX_DRAFT_WIDTH}"
+            )
+        object.__setattr__(self, "width", width)
+
+    @classmethod
+    def mtp(cls, width: int = 3) -> "DrafterConfig":
+        return cls("mtp", width)
+
+    @property
+    def verification_width(self) -> int:
+        return self.width + 1
+
+    @property
+    def prefill_lookahead_tokens(self) -> int:
+        return max(0, self.width - 1)
+
+    @property
+    def decode_lookahead_slots(self) -> int:
+        return 2 * self.width
+
+    @property
+    def capacity_padding_tokens(self) -> int:
+        return max(0, self.width - 2)
 
 
 class DraftProposal(NamedTuple):
@@ -30,11 +74,14 @@ class VerificationResult(NamedTuple):
     accepted_counts: jax.Array
     next_token_ids: jax.Array
 
+
 def verify_greedy_drafts(
     proposal: DraftProposal,
     target_token_ids: jax.Array,
 ) -> VerificationResult:
     """Accept the longest matching draft prefix and append one target token."""
+
+    import jax.numpy as jnp
 
     draft_width = proposal.width
     if target_token_ids.shape != (proposal.token_ids.shape[0], draft_width + 1):
@@ -66,55 +113,3 @@ def verify_greedy_drafts(
         accepted_counts,
         next_tokens.astype(jnp.int32),
     )
-
-
-class Drafter(Protocol):
-    """Produces device token proposals without defining verification policy."""
-
-    @property
-    def width(self) -> int: ...
-
-    def propose(
-        self,
-        seqs: Sequence[RequestSequence],
-    ) -> DraftProposal: ...
-
-
-class SuppliedDrafter:
-    """Diagnostic drafter backed by known completion token streams."""
-
-    def __init__(
-        self,
-        token_ids_by_seq: Mapping[int, Sequence[int]],
-        *,
-        width: int,
-    ) -> None:
-        if width < 1:
-            raise ValueError("draft width must be positive")
-        self._width = int(width)
-        self._tokens = {
-            int(seq_id): tuple(int(token) for token in tokens)
-            for seq_id, tokens in token_ids_by_seq.items()
-        }
-
-    @property
-    def width(self) -> int:
-        return self._width
-
-    def propose(
-        self,
-        seqs: Sequence[RequestSequence],
-    ) -> DraftProposal:
-        rows = np.zeros((len(seqs), self.width), dtype=np.int32)
-        for row, seq in enumerate(seqs):
-            source = self._tokens.get(int(seq.seq_id))
-            if source is None:
-                raise KeyError(f"no supplied drafts for sequence {seq.seq_id}")
-            start = int(seq.num_completion_tokens)
-            drafts = source[start : start + self.width]
-            if len(drafts) != self.width:
-                raise ValueError(
-                    f"sequence {seq.seq_id} needs {self.width} drafts at token {start}"
-                )
-            rows[row] = drafts
-        return DraftProposal(jnp.asarray(rows))

@@ -2,8 +2,10 @@
 
 from nanovllm_jax.config import EngineConfig
 from nanovllm_jax.sequence import SamplingParams
+from nanovllm_jax.speculation import DrafterConfig
 
 __all__ = [
+    "DrafterConfig",
     "EngineConfig",
     "LLM",
     "SamplingParams",

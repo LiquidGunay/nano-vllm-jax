@@ -13,6 +13,7 @@ from nanovllm_jax.cache import KVCacheSpec
 from nanovllm_jax.ops import resolve_kv_cache_spec
 from nanovllm_jax.batch import SchedulePlan
 from nanovllm_jax.weights import (
+    load_mtp_weights_from_hf_streaming,
     load_weights_from_hf_streaming,
     resolve_checkpoint,
     resolve_checkpoint_metadata,
@@ -21,7 +22,7 @@ from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.output import OutputBuffer, is_device_token
 from nanovllm_jax.sequence import Sequence, SequenceStatus, SamplingParams
-from nanovllm_jax.speculation import Drafter
+from nanovllm_jax.speculation import DrafterConfig
 from nanovllm_jax.step import (
     FinishedRequest,
     FinishReason,
@@ -65,8 +66,9 @@ def _engine_config_from_public_kwargs(model_path: str, kwargs: dict[str, Any]) -
 def _runtime_spec_from_engine_config(
     engine_config: EngineConfig,
     model_config: ModelConfig,
+    drafter: DrafterConfig | None,
 ) -> RuntimeSpec:
-    return RuntimeSpec.promoted(model_config, engine_config)
+    return RuntimeSpec.promoted(model_config, engine_config, drafter=drafter)
 
 
 def _tree_nbytes(value: object) -> int:
@@ -85,6 +87,7 @@ class LLMEngine:
         model_path: str,
         *,
         engine_config: EngineConfig | None = None,
+        drafter: DrafterConfig | None = None,
         **kwargs,
     ):
         if engine_config is not None and kwargs:
@@ -108,6 +111,7 @@ class LLMEngine:
         self.config = _runtime_spec_from_engine_config(
             engine_config,
             self.model_config,
+            drafter,
         )
         requested_kv_blocks = self.config.capacity.num_kvcache_blocks
         kv_spec = resolve_kv_cache_spec(
@@ -162,28 +166,33 @@ class LLMEngine:
             self.config.model,
             self.config.compile.weight_dtype,
         )
+        self.mtp_params = (
+            load_mtp_weights_from_hf_streaming(
+                self.checkpoint_path,
+                self.config.model,
+                self.config.compile.weight_dtype,
+            )
+            if self.config.drafter is not None
+            else None
+        )
         print("✓ Using pretrained weights")
 
         self.scheduler = Scheduler(self.config)
-        self.model_runner = ModelRunner(self.config, self.params)
+        runner_kwargs = (
+            {"mtp_params": self.mtp_params}
+            if self.mtp_params is not None
+            else {}
+        )
+        self.model_runner = ModelRunner(self.config, self.params, **runner_kwargs)
         self.startup_device_budget_bytes = {
             "parameters": _tree_nbytes(self.params),
+            "draft_parameters": _tree_nbytes(self.mtp_params),
             **self.model_runner.memory_bytes(),
         }
         memory_mib = sum(self.startup_device_budget_bytes.values()) / (1024 * 1024)
         print(f"Startup device budget: {memory_mib:.1f} MiB")
         self._next_seq_id = 0
         atexit.register(self.exit)
-
-    def install_drafter(self, drafter: Drafter | None) -> None:
-        """Install an optional drafter before warmup or request admission."""
-
-        if not self.scheduler.is_pristine():
-            raise RuntimeError("install the drafter before adding requests")
-        self.model_runner.install_drafter(drafter)
-        self.scheduler.set_speculative_draft_width(
-            0 if drafter is None else int(drafter.width)
-        )
 
     def warmup_compilation(
         self,
@@ -352,6 +361,9 @@ class LLMEngine:
             scheduled_tokens=int(schedule_plan.num_scheduled_tokens),
             emitted_tokens=tuple(emitted),
             finished=tuple(finished),
+            verified_target_tokens=run_result.verified_target_tokens,
+            draft_tokens=run_result.draft_tokens,
+            accepted_draft_tokens=run_result.accepted_draft_tokens,
         )
 
     def _release_invalidated_prefix_states(self) -> None:
@@ -504,6 +516,9 @@ class LLMEngine:
                     "step_end_seconds": step_end - stream_start,
                     "scheduler_step_tokens": step_result.scheduled_tokens,
                     "scheduler_step_is_decode": step_result.is_decode,
+                    "verified_target_tokens": step_result.verified_target_tokens,
+                    "draft_tokens": step_result.draft_tokens,
+                    "accepted_draft_tokens": step_result.accepted_draft_tokens,
                 }
                 if include_text:
                     token_event["text"] = self._detokenize([token_id])

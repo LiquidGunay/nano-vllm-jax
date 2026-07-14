@@ -59,7 +59,7 @@ class Scheduler:
                 )
             )
         self.decode_lookahead_tokens = 1
-        self.speculative_draft_width = 0
+        self.drafter = config.drafter
         self.greedy_decode_burst_steps = kernels.greedy_decode_burst_steps
         self.max_blocks_per_seq = capacity.max_blocks_per_seq
         self.block_manager = BlockManager(
@@ -71,19 +71,16 @@ class Scheduler:
                 else 0
             ),
         )
-        
+
         self.waiting: Deque[Sequence] = deque()
         self.running: Deque[Sequence] = deque()
 
-    def set_speculative_draft_width(self, width: int) -> None:
-        if width < 0 or width > 15:
-            raise ValueError("draft width must be between 0 and 15")
-        self.speculative_draft_width = int(width)
-
     def _speculative_lookahead(self, seq: Sequence, remaining_tokens: int) -> int:
-        width = self.speculative_draft_width
-        if width and seq.temperature == 0 and seq.ignore_eos and remaining_tokens > width:
-            return width + 1
+        if self.drafter is None:
+            return 0
+        width = self.drafter.width
+        if seq.temperature == 0 and seq.ignore_eos and remaining_tokens > width:
+            return self.drafter.decode_lookahead_slots
         return 0
 
     def _can_reserve_waiting(self, seq: Sequence) -> bool:
@@ -98,10 +95,17 @@ class Scheduler:
             seq,
             total_blocks=self._required_blocks(seq),
             use_prefix_cache=self.prefix_cache_enabled,
+            initial_lookahead_tokens=(
+                self.drafter.prefill_lookahead_tokens
+                if self.drafter is not None
+                else 0
+            ),
         )
 
     def _required_blocks(self, seq: Sequence) -> int:
         total_tokens = seq.num_prompt_tokens + seq.max_tokens
+        if self.drafter is not None:
+            total_tokens += self.drafter.capacity_padding_tokens
         return (total_tokens + self.block_size - 1) // self.block_size
 
     def _admit_first_fitting_waiter(self) -> Sequence | None:
@@ -210,6 +214,8 @@ class Scheduler:
         if self.max_blocks_per_seq is not None:
             max_tokens_per_seq = self.max_blocks_per_seq * seq.block_size
             requested_tokens = seq.num_tokens + seq.max_tokens
+            if self.drafter is not None:
+                requested_tokens += self.drafter.capacity_padding_tokens
             if seq.num_blocks > self.max_blocks_per_seq:
                 raise ValueError(
                     f"prompt needs {seq.num_blocks} blocks but max_blocks_per_seq is {self.max_blocks_per_seq}"

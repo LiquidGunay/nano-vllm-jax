@@ -131,14 +131,15 @@ padded row cannot write through its placeholder page.
 
 `ModelExecutor` owns JIT cache keys and calls into `model.forward_step`.
 
-An installed drafter adds one optional decode route. It supplies a fixed-width
-`DraftProposal`; the executor verifies current plus draft tokens in one packed
-target forward and returns a compact `VerificationResult`. The runner commits
-only target-approved token references and the device-selected KV/GDN prefix.
-The ordinary route and configuration remain unchanged when no drafter is
-installed.
+A constructor-time `DrafterConfig` adds the optional persistent MTP routes.
+Packed prefill seeds one-layer predictor KV and a resident proposal table.
+Decode reads that table, verifies current plus draft tokens in one packed target
+forward, selects the target-approved KV/GDN prefix, and refreshes predictor
+state before returning. The ordinary route and configuration remain unchanged
+when no drafter is configured.
 
-`RunResult` contains one emitted-token row per scheduled sequence. The engine
+`RunResult` contains one emitted-token row per scheduled sequence plus explicit
+speculative-work counts. The engine
 commits those rows into `OutputBuffer`, advances logical/cache state, assigns
 EOS or length finish reasons, and returns a `StepResult` of token and finish
 events. The service consumes those events directly instead of scanning

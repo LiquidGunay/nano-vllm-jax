@@ -123,6 +123,9 @@ Core engine:
 
 Advanced serving:
 
+- [docs/speculative-verification.md](docs/speculative-verification.md) and
+  [nanovllm_jax/mtp.py](nanovllm_jax/mtp.py) - optional constructor-time
+  persistent MTP with packed target verification.
 - [nanovllm_jax/service.py](nanovllm_jax/service.py), [server.yaml](server.yaml),
   and [nanovllm_jax/config.py](nanovllm_jax/config.py) - online queues and capacity.
 - [nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py) - promoted operation policy.

@@ -7,6 +7,7 @@ import numpy as np
 
 from nanovllm_jax.config import ModelSpec
 from nanovllm_jax.model import ModelParams
+from nanovllm_jax.mtp import MTPParams
 
 
 GDN_DECODE_IN_PROJ_PACKED_KEY = "in_proj_qkv_abz"
@@ -353,4 +354,151 @@ def load_weights_from_hf_streaming(
         lm_head=lm_head,
     )
     _validate_params(params, config)
+    return params
+
+
+def load_mtp_weights_from_hf_streaming(
+    model: str | Path,
+    config: ModelSpec,
+    dtype: str,
+) -> MTPParams:
+    """Load the single Qwen3.5 predictor layer without copying shared weights."""
+
+    if config.mtp_num_hidden_layers != 1:
+        raise ValueError("Qwen3.5 MTP requires exactly one predictor layer")
+    if config.mtp_use_dedicated_embeddings:
+        raise ValueError("dedicated MTP embeddings are not supported")
+    model_path = Path(model)
+    reader = _SafeTensorReader(model_path)
+    if not reader.has("mtp.fc.weight"):
+        raise ValueError("checkpoint does not contain Qwen3.5 MTP weights")
+
+    prefix = "mtp.layers.0."
+    q_proj = _to_jax_weight(
+        reader,
+        f"{prefix}self_attn.q_proj.weight",
+        dtype,
+        transpose=True,
+    )
+    k_proj = _to_jax_weight(
+        reader,
+        f"{prefix}self_attn.k_proj.weight",
+        dtype,
+        transpose=True,
+    )
+    v_proj = _to_jax_weight(
+        reader,
+        f"{prefix}self_attn.v_proj.weight",
+        dtype,
+        transpose=True,
+    )
+    gate_proj = _to_jax_weight(
+        reader,
+        f"{prefix}mlp.gate_proj.weight",
+        dtype,
+        transpose=True,
+    )
+    up_proj = _to_jax_weight(
+        reader,
+        f"{prefix}mlp.up_proj.weight",
+        dtype,
+        transpose=True,
+    )
+    params = MTPParams(
+        input_projection=_to_jax_weight(
+            reader,
+            "mtp.fc.weight",
+            dtype,
+            transpose=True,
+        ),
+        layer={
+            FULL_ATTN_DECODE_QKV_PACKED_KEY: jnp.concatenate(
+                (q_proj, k_proj, v_proj),
+                axis=1,
+            ),
+            "o_proj": _to_jax_weight(
+                reader,
+                f"{prefix}self_attn.o_proj.weight",
+                dtype,
+                transpose=True,
+            ),
+            "q_norm": _to_jax_weight(
+                reader,
+                f"{prefix}self_attn.q_norm.weight",
+                dtype,
+            ),
+            "k_norm": _to_jax_weight(
+                reader,
+                f"{prefix}self_attn.k_norm.weight",
+                dtype,
+            ),
+            "input_norm": _to_jax_weight(
+                reader,
+                f"{prefix}input_layernorm.weight",
+                dtype,
+            ),
+            "post_attn_norm": _to_jax_weight(
+                reader,
+                f"{prefix}post_attention_layernorm.weight",
+                dtype,
+            ),
+            MLP_GATE_UP_PACKED_KEY: jnp.concatenate(
+                (gate_proj, up_proj),
+                axis=1,
+            ),
+            "down_proj": _to_jax_weight(
+                reader,
+                f"{prefix}mlp.down_proj.weight",
+                dtype,
+                transpose=True,
+            ),
+        },
+        hidden_norm=_to_jax_weight(
+            reader,
+            "mtp.pre_fc_norm_hidden.weight",
+            dtype,
+        ),
+        embedding_norm=_to_jax_weight(
+            reader,
+            "mtp.pre_fc_norm_embedding.weight",
+            dtype,
+        ),
+        output_norm=_to_jax_weight(reader, "mtp.norm.weight", dtype),
+    )
+    hidden = config.hidden_size
+    query = config.num_attention_heads * config.head_dim
+    kv = config.num_key_value_heads * config.head_dim
+    expected = {
+        "input_projection": (2 * hidden, hidden),
+        "qkv": (hidden, 2 * query + 2 * kv),
+        "o_proj": (query, hidden),
+        "gate_up": (hidden, 2 * config.intermediate_size),
+        "down_proj": (config.intermediate_size, hidden),
+        "q_norm": (config.head_dim,),
+        "k_norm": (config.head_dim,),
+        "input_norm": (hidden,),
+        "post_attn_norm": (hidden,),
+        "hidden_norm": (hidden,),
+        "embedding_norm": (hidden,),
+        "output_norm": (hidden,),
+    }
+    actual = {
+        "input_projection": params.input_projection.shape,
+        "qkv": params.layer[FULL_ATTN_DECODE_QKV_PACKED_KEY].shape,
+        "o_proj": params.layer["o_proj"].shape,
+        "gate_up": params.layer[MLP_GATE_UP_PACKED_KEY].shape,
+        "down_proj": params.layer["down_proj"].shape,
+        "q_norm": params.layer["q_norm"].shape,
+        "k_norm": params.layer["k_norm"].shape,
+        "input_norm": params.layer["input_norm"].shape,
+        "post_attn_norm": params.layer["post_attn_norm"].shape,
+        "hidden_norm": params.hidden_norm.shape,
+        "embedding_norm": params.embedding_norm.shape,
+        "output_norm": params.output_norm.shape,
+    }
+    for name, shape in expected.items():
+        if tuple(actual[name]) != shape:
+            raise ValueError(
+                f"MTP {name} has shape {tuple(actual[name])}, expected {shape}"
+            )
     return params
