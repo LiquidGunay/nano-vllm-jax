@@ -478,7 +478,8 @@ outside the repository.
 
 ### PR 4: generic drafter plus cheap target verifier
 
-Status: [ ] implementation in progress on `agent/generic-packed-verifier`
+Status: [ ] draft PR [#15](https://github.com/LiquidGunay/nano-vllm-jax/pull/15)
+open from `agent/generic-packed-verifier@f589a41`
 
 Purpose: prove cheap verification independently of MTP draft quality.
 
@@ -505,6 +506,32 @@ Merge gates:
 
 The supplied-draft adapter is never a public serving method and never supports
 a production speed claim.
+
+PR #15 implements the verifier-facing subset of the eventual speculative ABI.
+The diagnostic drafter supplies only `DraftProposal[B, K]`; the verifier owns
+target acceptance and target-state commit. The next PR adds drafter-owned MTP
+state and composes proposal, verification, and MTP commit inside one compiled
+transition. The Python supplied-draft callback is therefore a verifier-cost
+probe, not the production orchestration boundary.
+
+The guarded B=1 P64/O64 K=3 upper-bound results use one deliberately wrong
+draft per repeat and zero measured route-cache growth:
+
+| Model | Base JAX | Supplied verifier | Ratio | Exact |
+| --- | ---: | ---: | ---: | --- |
+| Qwen3.5-4B | `54.30` tok/s | `156.87` tok/s | `2.889x` | yes |
+| Qwen3.5-2B | `113.66` tok/s | `294.45` tok/s | `2.591x` | yes |
+| Qwen3.5-0.8B | `197.62` tok/s | `467.81` tok/s | `2.367x` | yes |
+
+Each run accepted `90/96` draft positions across two repeats. The final 4B
+run peaked at `2.8 GiB` process RSS and `9.7 GiB` system use. Perfect 4B drafts
+reached `2.905x`. These results prove that target verification is cheap enough;
+they deliberately exclude drafting cost and are not MTP claims.
+
+An early 0.8B rejection can still move a later near-tied token relative to
+width-1 BF16 replay. At the inspected accumulated boundary, both paths retained
+the same top-1 with KL `0.00252` and JS `0.00063`. The primary 4B run, 2B run,
+and matched late-error 0.8B run were exact.
 
 ### PR 5: Qwen3.5 MTP drafter and speculative promotion
 
@@ -685,4 +712,12 @@ Do not transplant:
 - [x] Address PR #14 target-isolation follow-up at `7cde2b6` and merge it at
   main commit `6ee8bbc`. The standalone vLLM target completed with no benchmark
   JAX environment, exact 64-token parity, and 3.8 GiB guarded peak process RSS.
-- [ ] Implement and validate the generic packed-verifier PR from merged main.
+- [x] Open generic packed-verifier draft PR #15 at `f589a41`. A single packed
+  target pass, device accept/state selection, compact result boundary, and
+  stale-KV-safe commit reach `2.889x` the same 4B base JAX route with an
+  injected rejection and exact output. The 2B and matched 0.8B checks are also
+  exact and faster. Guarded validation passed 247/248 collected tests; the one
+  legacy full-sequence generation test reached the unchanged 80% RAM limit,
+  while its ten-prompt logits check and a scaled generation equivalent passed.
+- [ ] Review and merge PR #15, then implement the persistent Qwen3.5 MTP
+  drafter against its verifier boundary.
