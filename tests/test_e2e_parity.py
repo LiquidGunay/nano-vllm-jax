@@ -26,7 +26,7 @@ import pytest
 torch = pytest.importorskip("torch")
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import List, Optional
-from nanovllm_jax.config import RuntimeSpec
+from tests.runtime_specs import runtime_spec
 from nanovllm_jax.weights import load_weights_from_hf_streaming
 from nanovllm_jax.model import forward
  
@@ -84,7 +84,7 @@ def load_models(model_name: str = MODEL_NAME):
     
     # Load JAX model with HF weights
     print("  Loading JAX model...")
-    config = RuntimeSpec()
+    config = runtime_spec()
     params = load_weights_from_hf_streaming(
         model_name, config.model, "bfloat16"
     )

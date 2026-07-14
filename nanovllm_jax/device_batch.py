@@ -20,7 +20,6 @@ class HostBatch:
     query_lens: tuple[int, ...] = ()
     seq_lens: tuple[int, ...] = ()
     block_tables: tuple[tuple[int, ...], ...] = ()
-    hybrid_slot_ids: tuple[int, ...] = ()
     prefill_is_final: tuple[bool, ...] = ()
     decode_steps: int = 1
     uses_static_decode_metadata: bool = False

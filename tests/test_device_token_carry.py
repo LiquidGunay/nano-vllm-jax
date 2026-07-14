@@ -279,7 +279,6 @@ def test_model_runner_device_token_carry_updates_resident_last_tokens(monkeypatc
     seq_a = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
     seq_b = Sequence([2], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=8)
     batch = _decode_batch((7, 8, -1, -1), [0, 0, 0, 0], seq_lens=[4, 5, 0, 0])
-    batch.host = replace(batch.host, hybrid_slot_ids=(2, 1, -1, -1))
 
     runner._record_device_token_carry(
         batch,

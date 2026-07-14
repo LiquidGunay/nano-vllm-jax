@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, replace
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -12,7 +12,13 @@ from threading import Lock
 import time
 from typing import Any
 
-from nanovllm_jax.config import EngineConfig, ServerSettings, WarmupConfig, load_engine_config
+from nanovllm_jax.config import (
+    EngineConfig,
+    RuntimeSpec,
+    ServerSettings,
+    WarmupConfig,
+    load_engine_config,
+)
 from nanovllm_jax.fastpath import validate_runtime_dependencies
 
 
@@ -113,7 +119,6 @@ def _settings_from_args(args: argparse.Namespace) -> ServerSettings:
     )
     engine_config = EngineConfig(
         model=args.model,
-        max_prefill=args.max_prefill,
         max_num_seqs=args.max_num_seqs,
         max_num_resident_seqs=args.max_num_resident_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
@@ -143,6 +148,47 @@ def _validate_settings(settings: ServerSettings) -> None:
         and max(settings.engine.batch_size_buckets) > settings.engine.max_num_seqs
     ):
         raise ValueError("--batch-size-buckets cannot exceed --max-num-seqs")
+
+
+def _runtime_manifest(runtime: RuntimeSpec) -> dict[str, object]:
+    linear_layers = len(runtime.model.linear_attn_layers)
+    return {
+        "model": {
+            "id": runtime.model.model,
+            "hidden_size": runtime.model.hidden_size,
+            "layers": runtime.model.num_hidden_layers,
+            "linear_attention_layers": linear_layers,
+            "full_attention_layers": runtime.model.num_hidden_layers - linear_layers,
+            "full_attention_interval": runtime.model.full_attention_interval,
+        },
+        "capacity": {
+            "max_num_seqs": runtime.capacity.max_num_seqs,
+            "max_num_resident_seqs": runtime.capacity.max_num_resident_seqs,
+            "max_num_batched_tokens": runtime.capacity.max_num_batched_tokens,
+            "max_blocks_per_seq": runtime.capacity.max_blocks_per_seq,
+            "block_size": runtime.capacity.block_size,
+            "num_kvcache_blocks": runtime.capacity.num_kvcache_blocks,
+            "max_kv_cache_bytes": runtime.capacity.max_kv_cache_bytes,
+        },
+        "compile": {
+            "dtype": runtime.compile.dtype,
+            "weight_dtype": runtime.compile.weight_dtype,
+            "execution": runtime.compile.execution,
+            "prefill_layout": runtime.compile.prefill_layout,
+            "prefill_token_buckets": runtime.compile.prefill_token_buckets,
+            "batch_size_buckets": runtime.compile.batch_size_buckets,
+            "decode_block_table_buckets": runtime.compile.decode_block_table_buckets,
+        },
+        "kernels": {
+            "kv_cache_dtype": runtime.kernels.kv_cache_dtype,
+            "full_attention_prefill": runtime.kernels.full_attention_prefill,
+            "full_attention_decode": runtime.kernels.full_attention_decode,
+            "gdn_prefill": runtime.kernels.gdn_prefill,
+            "gdn_decode": runtime.kernels.gdn_decode,
+            "lm_head_greedy": runtime.kernels.lm_head_greedy,
+            "lm_head_sampled": runtime.kernels.lm_head_sampled,
+        },
+    }
 
 
 def _is_token_ids(value: Any) -> bool:
@@ -286,7 +332,7 @@ def load_engine(settings: ServerSettings) -> LLMEngine:
     global engine, service
     _validate_settings(settings)
     engine = LLMEngine(settings.engine.model, engine_config=settings.engine)
-    manifest = json.dumps(asdict(engine.config), indent=2, sort_keys=True)
+    manifest = json.dumps(_runtime_manifest(engine.config), indent=2, sort_keys=True)
     print("runtime_manifest:\n" + manifest)
 
     if settings.engine.warmup.enabled:
@@ -481,7 +527,6 @@ def _build_parser(settings: ServerSettings) -> argparse.ArgumentParser:
     parser.add_argument("--warmup-sampled-routes", action=argparse.BooleanOptionalAction, default=cfg.warmup.include_sampled_routes)
 
     for name in (
-        "max_prefill",
         "max_num_seqs",
         "max_num_resident_seqs",
         "max_num_batched_tokens",

@@ -15,7 +15,6 @@ from tests.runtime_specs import qwen_text_config
 def _small_engine_config(model: str) -> EngineConfig:
     return EngineConfig(
         model=model,
-        max_prefill=1,
         max_num_seqs=1,
         max_num_resident_seqs=1,
         max_num_batched_tokens=1,

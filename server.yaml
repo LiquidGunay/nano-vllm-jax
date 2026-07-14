@@ -10,7 +10,6 @@ server:
 
 engine:
   model: "Qwen/Qwen3.5-0.8B"
-  max_prefill: 4096
   max_num_seqs: 8
   max_num_resident_seqs: 8
   max_num_batched_tokens: 4096

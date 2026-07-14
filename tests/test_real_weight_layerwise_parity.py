@@ -20,6 +20,7 @@ from nanovllm_jax.config import RuntimeSpec
 from nanovllm_jax.layers import rms_norm
 from nanovllm_jax.weights import load_weights_from_hf_streaming
 from nanovllm_jax.projection import _stable_rmsnorm_fp32
+from tests.runtime_specs import runtime_spec
 
 
 jax.config.update("jax_default_matmul_precision", "highest")
@@ -206,7 +207,7 @@ def real_weight_artifacts() -> RealWeightArtifacts:
     del hf_model
     torch.cuda.empty_cache()
 
-    runtime_config = RuntimeSpec()
+    runtime_config = runtime_spec()
     params = load_weights_from_hf_streaming(
         MODEL_NAME, runtime_config.model, "bfloat16"
     )

@@ -122,19 +122,14 @@ another external scratch path.
 [docs/style.md](docs/style.md) defines the repository's lightweight complexity
 budget and review checks.
 
-CPU-safe control-plane checks:
+Ownership and configuration contract checks:
 
 ```bash
-JAX_PLATFORMS=cpu pytest -q \
+JAX_PLATFORMS=cuda PYTHONPATH=$PWD python tests/ram_guard.py -- pytest -q \
   tests/test_engine_initialization.py \
   tests/test_fastpath_config.py \
-  tests/test_paged_attention_abi.py \
-  tests/test_prefix_cache.py \
   tests/test_public_imports.py \
-  tests/test_scheduler_capacity.py \
-  tests/test_server_config.py \
-  tests/test_service.py \
-  tests/test_step_results.py
+  tests/test_server_config.py
 ```
 
 For GPU correctness, verify CUDA visibility first and run JAX with

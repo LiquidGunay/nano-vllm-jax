@@ -5,7 +5,6 @@ import pytest
 import yaml
 
 from nanovllm_jax.config import (
-    CapacitySpec,
     EngineConfig,
     ModelConfig,
     ModelSpec,
@@ -13,9 +12,10 @@ from nanovllm_jax.config import (
     WarmupConfig,
     load_engine_config,
 )
+from nanovllm_jax.device_batch import HostBatch
 from nanovllm_jax.engine import _engine_config_from_public_kwargs
 from nanovllm_jax.fastpath import KERNEL_PLAN
-from tests.runtime_specs import qwen_text_config
+from tests.runtime_specs import qwen_text_config, runtime_spec
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,10 +28,16 @@ def _write_checkpoint(path: Path, text: dict) -> None:
 
 
 def test_runtime_config_has_no_speculative_surface():
-    config = RuntimeSpec()
+    config = runtime_spec()
 
     assert not hasattr(config, "speculative_method")
     assert not hasattr(config, "num_speculative_tokens")
+    with pytest.raises(TypeError):
+        RuntimeSpec()
+
+
+def test_materialized_host_batch_has_one_writer():
+    assert "hybrid_slot_ids" not in HostBatch.__dataclass_fields__
 
 
 def test_engine_config_validates_capacity():
@@ -45,10 +51,13 @@ def test_engine_config_validates_capacity():
 def test_engine_config_is_strict_and_parses_canonical_capacity():
     with pytest.raises(ValueError, match="unknown engine keys"):
         EngineConfig.from_mapping({"kv_cache_mb": 1024})
+    with pytest.raises(ValueError, match="unknown engine keys: max_prefill"):
+        EngineConfig.from_mapping({"max_prefill": 128})
+
+    assert not hasattr(EngineConfig(), "max_prefill")
 
     config = EngineConfig.from_mapping(
         {
-            "max_prefill": 128,
             "max_num_seqs": 2,
             "max_num_resident_seqs": 2,
             "max_num_batched_tokens": 128,
@@ -84,7 +93,6 @@ def test_shorthand_bucket_overrides_derive_matching_warmup():
     config = _engine_config_from_public_kwargs(
         "Qwen/Qwen3.5-0.8B",
         {
-            "max_prefill": 64,
             "max_num_seqs": 1,
             "max_num_batched_tokens": 64,
             "max_blocks_per_seq": 64,
@@ -121,7 +129,6 @@ def test_server_yaml_is_the_only_committed_serving_config():
 
 def test_runtime_spec_composes_engine_capacity_and_kernel_policy():
     config = EngineConfig(
-        max_prefill=128,
         max_num_seqs=2,
         max_num_resident_seqs=3,
         max_num_batched_tokens=512,
@@ -151,17 +158,26 @@ def test_runtime_spec_composes_engine_capacity_and_kernel_policy():
     assert runtime.compile.prefill_token_buckets == (64, 128, 512)
     assert runtime.compile.decode_block_table_buckets == (64,)
 
+    import server
+
+    manifest = server._runtime_manifest(runtime)
+    assert tuple(manifest) == ("model", "capacity", "compile", "kernels")
+    assert manifest["compile"]["dtype"] == "bfloat16"
+    assert manifest["kernels"]["full_attention_decode"] == "flashinfer_paged"
+    assert "layer_types" not in json.dumps(manifest)
+    assert "decode_padded_gemm" not in json.dumps(manifest)
+
 
 def test_server_request_validation_reads_runtime_capacity(monkeypatch):
     import server
 
-    runtime = RuntimeSpec(
-        capacity=CapacitySpec(
-            block_size=4,
-            max_blocks_per_seq=2,
-            max_num_seqs=1,
-            max_num_resident_seqs=1,
-        )
+    runtime = runtime_spec(
+        capacity={
+            "block_size": 4,
+            "max_blocks_per_seq": 2,
+            "max_num_seqs": 1,
+            "max_num_resident_seqs": 1,
+        }
     )
     monkeypatch.setattr(server, "engine", type("Engine", (), {"config": runtime})())
 
@@ -181,14 +197,14 @@ def test_engine_config_rejects_unsorted_or_uncovered_buckets():
 
 @pytest.mark.parametrize("size", ("0.8B", "2B", "4B"))
 def test_model_config_is_read_from_checkpoint(tmp_path, size):
-    _write_checkpoint(tmp_path, qwen_text_config(size))
+    text = qwen_text_config(size)
+    _write_checkpoint(tmp_path, text)
 
     model = ModelConfig.from_checkpoint(tmp_path, model=f"Qwen/Qwen3.5-{size}")
-    runtime = RuntimeSpec(model=model)
 
-    assert model.hidden_size == runtime.model.hidden_size
-    assert model.num_hidden_layers == runtime.model.num_hidden_layers
-    assert model.linear_num_value_heads == runtime.model.linear_num_value_heads
+    assert model.hidden_size == text["hidden_size"]
+    assert model.num_hidden_layers == text["num_hidden_layers"]
+    assert model.linear_num_value_heads == text["linear_num_value_heads"]
 
 
 def test_only_validated_model_type_parses_checkpoints(tmp_path):

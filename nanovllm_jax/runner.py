@@ -865,12 +865,10 @@ class ModelRunner:
             or not batch.host.seq_ids
         ):
             return
-        slot_values = list(batch.host.hybrid_slot_ids or ())
-        if not slot_values:
-            slot_values = [
-                self._hybrid_slots.get(int(seq_id), -1)
-                for seq_id in batch.host.seq_ids
-            ]
+        slot_values = [
+            self._hybrid_slots.get(int(seq_id), -1)
+            for seq_id in batch.host.seq_ids
+        ]
         slots: list[int] = []
         token_rows: list[int] = []
         for row in eligible_rows:
@@ -1305,7 +1303,6 @@ class ModelRunner:
                 query_lens=(query_len,),
                 seq_lens=batch.host.seq_lens[idx : idx + 1],
                 block_tables=batch.host.block_tables[idx : idx + 1],
-                hybrid_slot_ids=batch.host.hybrid_slot_ids[idx : idx + 1],
                 prefill_is_final=batch.host.prefill_is_final[idx : idx + 1],
                 decode_steps=batch.host.decode_steps,
             ),
@@ -1433,10 +1430,6 @@ class ModelRunner:
             block_tables_host = tuple(tuple(int(block) for block in row) for row in batch.host.block_tables) + tuple(
                 zero_row for _ in range(pad_rows)
             )
-        hybrid_slot_ids_host: tuple[int, ...] = ()
-        if batch.host.hybrid_slot_ids:
-            hybrid_slot_ids_host = tuple(int(x) for x in batch.host.hybrid_slot_ids) + tuple(-1 for _ in range(pad_rows))
-
         return replace(
             batch,
             tokens=jnp.concatenate([batch.tokens, zero_tokens], axis=0),
@@ -1465,7 +1458,6 @@ class ModelRunner:
                 query_lens=query_lens_host,
                 seq_lens=seq_lens_host,
                 block_tables=block_tables_host,
-                hybrid_slot_ids=hybrid_slot_ids_host,
                 prefill_is_final=batch.host.prefill_is_final,
                 decode_steps=batch.host.decode_steps,
             ),
@@ -1546,10 +1538,6 @@ class ModelRunner:
             seq_lens_host = tuple(int(value) for value in seq_len_values)
         elif batch.host.seq_lens:
             seq_lens_host = tuple(int(batch.host.seq_lens[row]) for row in rows)
-        hybrid_slot_ids_host: tuple[int, ...] = ()
-        if batch.host.hybrid_slot_ids:
-            hybrid_slot_ids_host = tuple(int(batch.host.hybrid_slot_ids[row]) for row in rows)
-
         compact_size = len(rows)
         return DeviceBatch(
             tokens=tokens,
@@ -1566,12 +1554,14 @@ class ModelRunner:
                 query_lens=query_lens_host,
                 seq_lens=seq_lens_host,
                 block_tables=block_tables_host,
-                hybrid_slot_ids=hybrid_slot_ids_host,
                 decode_steps=batch.host.decode_steps,
             ),
         )
 
-    def _batch_hybrid_state(self, batch: DeviceBatch) -> HybridLayerState:
+    def _batch_hybrid_state(
+        self,
+        batch: DeviceBatch,
+    ) -> tuple[HybridLayerState, list[int]]:
         seq_ids = (
             list(batch.host.seq_ids)
             if batch.host.seq_ids
@@ -1588,11 +1578,8 @@ class ModelRunner:
                     direct_slots = False
                     break
             if direct_slots:
-                batch.host = replace(
-                    batch.host,
-                    hybrid_slot_ids=tuple(range(len(seq_ids))),
-                )
-                return self._hybrid_state_table
+                slot_values = list(range(len(seq_ids)))
+                return self._hybrid_state_table, slot_values
         slot_allocations = [
             self._assign_hybrid_slot(int(seq_id), preferred_slot=row)
             for row, seq_id in enumerate(seq_ids)
@@ -1602,7 +1589,6 @@ class ModelRunner:
         self._zero_hybrid_slots(
             [slot for slot, allocated in slot_allocations if allocated]
         )
-        batch.host = replace(batch.host, hybrid_slot_ids=tuple(slot_values))
         if (
             self._hybrid_state_table.conv_state is not None
             and self._hybrid_state_table.recurrent_state is not None
@@ -1610,7 +1596,7 @@ class ModelRunner:
             and slot_values == list(range(len(slot_values)))
             and all(newly_allocated)
         ):
-            return self._hybrid_state_table
+            return self._hybrid_state_table, slot_values
         if (
             self._hybrid_state_table.conv_state is not None
             and self._hybrid_state_table.recurrent_state is not None
@@ -1618,7 +1604,7 @@ class ModelRunner:
             and slot_values == list(range(len(slot_values)))
             and not any(newly_allocated)
         ):
-            return self._hybrid_state_table
+            return self._hybrid_state_table, slot_values
         slot_ids = jnp.array(slot_values, dtype=jnp.int32)
         safe_slot_ids = jnp.maximum(slot_ids, 0)
         valid = (slot_ids >= 0) & jnp.logical_not(jnp.array(newly_allocated, dtype=bool))
@@ -1638,9 +1624,17 @@ class ModelRunner:
                 recurrent_state,
                 jnp.zeros_like(recurrent_state),
             )
-        return HybridLayerState(conv_state=conv_state, recurrent_state=recurrent_state)
+        return HybridLayerState(
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+        ), slot_values
 
-    def _store_batch_hybrid_state(self, batch: DeviceBatch, state: HybridLayerState | None):
+    def _store_batch_hybrid_state(
+        self,
+        batch: DeviceBatch,
+        state: HybridLayerState | None,
+        slot_values_all: list[int],
+    ) -> None:
         if state is None:
             return
         valid_rows: List[int] = []
@@ -1653,11 +1647,6 @@ class ModelRunner:
             list(batch.host.seq_ids)
             if batch.host.seq_ids
             else [int(x) for x in batch.seq_ids.tolist()]
-        )
-        slot_values_all = (
-            list(batch.host.hybrid_slot_ids)
-            if batch.host.hybrid_slot_ids
-            else [self._ensure_hybrid_slot(seq_id) for seq_id in seq_ids]
         )
         slot_values: List[int] = []
         for row, seq_id in enumerate(seq_ids):
@@ -1691,7 +1680,10 @@ class ModelRunner:
         )
         self._mark_hybrid_slots_written(slot_values)
 
-    def _batch_hybrid_slot_ids(self, batch: DeviceBatch) -> jnp.ndarray:
+    def _batch_hybrid_slot_ids(
+        self,
+        batch: DeviceBatch,
+    ) -> tuple[jnp.ndarray, list[int]]:
         """Assign hybrid slots for a batch without gathering the state table."""
 
         seq_ids = (
@@ -1705,7 +1697,6 @@ class ModelRunner:
             if allocated:
                 self._zero_hybrid_slots([slot])
             slot_values.append(slot)
-        batch.host = replace(batch.host, hybrid_slot_ids=tuple(slot_values))
         slot_key = tuple(slot_values)
         cache = getattr(self, "_hybrid_slot_ids_device_cache", None)
         if cache is None:
@@ -1715,7 +1706,7 @@ class ModelRunner:
         if cached is None:
             cached = jax.device_put(np.asarray(slot_key, dtype=np.int32))
             cache[slot_key] = cached
-        return cached
+        return cached, slot_values
 
     def _prefill_final_flags_device(self, batch: DeviceBatch) -> jnp.ndarray:
         rows = max(0, int(batch.query_start_loc.shape[0]) - 1)
@@ -1952,72 +1943,6 @@ class ModelRunner:
             if slot >= 0 and row in active:
                 self._resident_seq_lens_host[slot] += int(steps)
 
-    def _record_resident_committed_seq_lens(self, batch: DeviceBatch) -> None:
-        """Mirror committed per-row decode lengths into resident metadata."""
-        if (
-            not bool(getattr(self, "resident_decode_metadata", False))
-            or not hasattr(self, "_resident_seq_lens")
-            or not batch.host.hybrid_slot_ids
-            or not batch.host.seq_ids
-            or not batch.host.query_lens
-        ):
-            return
-        slots: list[int] = []
-        rows: list[int] = []
-        for row, (slot, seq_id, query_len) in enumerate(
-            zip(batch.host.hybrid_slot_ids, batch.host.seq_ids, batch.host.query_lens)
-        ):
-            if int(slot) < 0 or int(seq_id) < 0 or int(query_len) <= 0:
-                continue
-            slots.append(int(slot))
-            rows.append(row)
-        if not slots:
-            return
-        row_ids = jnp.asarray(rows, dtype=jnp.int32)
-        committed_lens = batch.seq_lens.astype(jnp.int32)[row_ids]
-        self._resident_seq_lens = self._scatter_resident_seq_lens(
-            self._resident_seq_lens,
-            self._resident_update_slots_device(slots),
-            committed_lens,
-        )
-        if hasattr(self, "_resident_seq_lens_host") and batch.host.seq_lens:
-            for slot, row in zip(slots, rows):
-                if row < len(batch.host.seq_lens):
-                    self._resident_seq_lens_host[int(slot)] = int(batch.host.seq_lens[row])
-
-    def _record_resident_committed_seq_lens_host(
-        self,
-        batch: DeviceBatch,
-        row_to_committed_len: dict[int, int],
-    ) -> None:
-        """Mirror committed per-row decode lengths into the resident host cache."""
-        if (
-            not row_to_committed_len
-            or not bool(getattr(self, "resident_decode_metadata", False))
-            or not hasattr(self, "_resident_seq_lens_host")
-            or not batch.host.hybrid_slot_ids
-            or not batch.host.seq_ids
-            or not batch.host.query_lens
-        ):
-            return
-        for row, committed_len in row_to_committed_len.items():
-            row = int(row)
-            if (
-                row < 0
-                or row >= len(batch.host.hybrid_slot_ids)
-                or row >= len(batch.host.seq_ids)
-                or row >= len(batch.host.query_lens)
-            ):
-                continue
-            slot = int(batch.host.hybrid_slot_ids[row])
-            if (
-                slot < 0
-                or int(batch.host.seq_ids[row]) < 0
-                or int(batch.host.query_lens[row]) <= 0
-            ):
-                continue
-            self._resident_seq_lens_host[slot] = int(committed_len)
-
     def _step_fn(self, batch: DeviceBatch):
         execution = self.execution
         if execution == "jit" or (execution == "decode-jit" and not batch.is_prefill):
@@ -2067,6 +1992,7 @@ class ModelRunner:
     def _sample_rng_slots_and_counters_device(
         self,
         batch: DeviceBatch,
+        slot_values: list[int],
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         self._flush_resident_rng_counter_resets()
         row_count = (
@@ -2074,7 +2000,7 @@ class ModelRunner:
             if batch.is_prefill and batch.packed_prefill and batch.host.query_lens
             else int(batch.tokens.shape[0])
         )
-        slot_values = list(batch.host.hybrid_slot_ids or ())
+        slot_values = list(slot_values)
         if len(slot_values) < row_count:
             slot_values.extend([-1] * (row_count - len(slot_values)))
         safe_slots = [max(0, int(slot)) for slot in slot_values[:row_count]]
@@ -2105,13 +2031,13 @@ class ModelRunner:
         batch: DeviceBatch,
         updated_counters: jnp.ndarray | None,
         *,
+        slot_values: list[int],
         active_rows: list[int],
         prefill_final_flags: list[bool],
     ) -> None:
         if updated_counters is None or not hasattr(self, "_resident_rng_counters"):
             return
         self._flush_resident_rng_counter_resets()
-        slot_values = list(batch.host.hybrid_slot_ids or ())
         if not slot_values:
             return
         slots: list[int] = []
@@ -2253,14 +2179,11 @@ class ModelRunner:
         batch: DeviceBatch,
     ) -> tuple[jnp.ndarray | None, list[int], HybridLayerState]:
         if route.spec.uses_table_state:
-            hybrid_slot_ids = self._batch_hybrid_slot_ids(batch)
-            hybrid_slot_values = list(batch.host.hybrid_slot_ids or ())
+            hybrid_slot_ids, hybrid_slot_values = self._batch_hybrid_slot_ids(batch)
             hybrid_state = self._hybrid_state_table
         else:
             hybrid_slot_ids = None
-            hybrid_slot_values = list(batch.host.hybrid_slot_ids or ())
-            hybrid_state = self._batch_hybrid_state(batch)
-            hybrid_slot_values = list(batch.host.hybrid_slot_ids or hybrid_slot_values)
+            hybrid_state, hybrid_slot_values = self._batch_hybrid_state(batch)
         return hybrid_slot_ids, hybrid_slot_values, hybrid_state
 
     def _sync_route_resident_metadata(
@@ -2283,7 +2206,7 @@ class ModelRunner:
         self.cache_storage = output.cache_storage
         if route.spec.uses_table_state:
             self._hybrid_state_table = output.hybrid_state
-            self._mark_hybrid_slots_written(list(batch.host.hybrid_slot_ids or ()))
+            self._mark_hybrid_slots_written(hybrid_slot_values)
             if route.spec.uses_resident_metadata and output.resident_seq_lens is not None:
                 self._resident_seq_lens = output.resident_seq_lens
                 self._advance_resident_seq_lens_host(
@@ -2292,16 +2215,25 @@ class ModelRunner:
                     steps=1,
                 )
         else:
-            self._store_batch_hybrid_state(batch, output.hybrid_state)
+            self._store_batch_hybrid_state(
+                batch,
+                output.hybrid_state,
+                hybrid_slot_values,
+            )
             if route.spec.tokens is TokenMode.SAMPLED:
                 self._record_resident_rng_counters(
                     batch,
                     output.resident_rng_counters,
+                    slot_values=hybrid_slot_values,
                     active_rows=list(route.active_rows),
                     prefill_final_flags=list(route.prefill_final_flags),
                 )
         if batch.is_prefill and bool(getattr(self, "resident_decode_metadata", False)):
-            self._sync_resident_decode_metadata(batch, list(batch.host.hybrid_slot_ids or ()), sync_seq_lens=True)
+            self._sync_resident_decode_metadata(
+                batch,
+                hybrid_slot_values,
+                sync_seq_lens=True,
+            )
 
     def _invoke_route(
         self,
@@ -2310,6 +2242,7 @@ class ModelRunner:
         batch: DeviceBatch,
         *,
         hybrid_slot_ids: jnp.ndarray | None,
+        hybrid_slot_values: list[int],
         hybrid_state: HybridLayerState,
     ) -> Any:
         spec = route.spec
@@ -2344,7 +2277,10 @@ class ModelRunner:
             kwargs["decode_steps"] = route.decode_steps
         if spec.tokens is TokenMode.SAMPLED:
             kwargs["temperatures"] = self._sample_temperatures_device(seqs, batch)
-            rng_slots, rng_counters = self._sample_rng_slots_and_counters_device(batch)
+            rng_slots, rng_counters = self._sample_rng_slots_and_counters_device(
+                batch,
+                hybrid_slot_values,
+            )
             kwargs.update(rng_slots=rng_slots, rng_counters=rng_counters)
         return getattr(self.executor, spec.executor)(batch, **kwargs)
 
@@ -2375,6 +2311,7 @@ class ModelRunner:
             seqs,
             batch,
             hybrid_slot_ids=hybrid_slot_ids,
+            hybrid_slot_values=hybrid_slot_values,
             hybrid_state=hybrid_state,
         )
         prefill_resident_tokens_seeded = (

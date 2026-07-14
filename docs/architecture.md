@@ -51,9 +51,9 @@ weight loading, projections, and operation dispatch receive their narrow spec
 instead of a flat runtime message bus.
 
 Startup resolves the physical KV dtype and byte-capped block count once, before
-the scheduler and runner are constructed. The server then prints the resulting
-model, capacity, compile, and kernel specs as one runtime manifest before
-warmup.
+the scheduler and runner are constructed. Before warmup, the server prints a
+concise model, capacity, compile, and kernel summary rather than dumping every
+layer and tuning flag.
 
 `Sequence` owns logical positions and cache metadata. `OutputBuffer` owns every
 generated token, including deferred device references. Reading logical request
@@ -105,7 +105,8 @@ the selected bucket shape. It neither imports JAX nor allocates device arrays.
 Materialization produces device arrays plus one immutable `HostBatch` containing
 the Python facts still needed for commit and resident-state bookkeeping. This
 keeps the host mirror explicit without eight optional `*_host` fields on the
-device object.
+device object. Runner-assigned hybrid slot ids remain local execution
+bookkeeping and never rewrite that materialization snapshot.
 
 For each batch, the runner produces one `ExecutionPlan`. `routes.py` selects a
 `RouteKind` from phase, token mode, and available resident-state capabilities;

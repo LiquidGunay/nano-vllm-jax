@@ -37,7 +37,6 @@ except ImportError:
 
 
 _PUBLIC_ENGINE_KWARGS = {
-    "max_prefill",
     "max_num_seqs",
     "max_num_resident_seqs",
     "max_num_batched_tokens",

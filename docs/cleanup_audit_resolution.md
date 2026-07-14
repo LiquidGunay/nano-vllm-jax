@@ -55,6 +55,9 @@ Resolved in the structural cleanup:
 - Intentionally removed `EngineConfig.to_engine_kwargs()`. Engine construction
   now accepts `EngineConfig` directly, so the old internal-policy projection has
   no compatibility shim.
+- Removed the public `max_prefill` no-op. Actual prefill capacity is described
+  by `max_num_batched_tokens`, static prefill buckets, and per-sequence KV
+  capacity.
 - Parse checkpoint architecture only through validated `ModelConfig`, keep GDN
   chunk tuning in `KernelPlan`, and finalize physical KV-cache capacity once
   before scheduler and runner construction.

@@ -27,7 +27,6 @@ import pytest
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
-from nanovllm_jax.config import RuntimeSpec
 from nanovllm_jax.cache import (
     init_kv_cache,
     init_linear_attention_states,
@@ -37,13 +36,14 @@ from nanovllm_jax.cache import (
     compute_slot_mapping,
 )
 from nanovllm_jax.gdn import jax_chunk_gated_delta_rule, jax_recurrent_gated_delta_rule
+from tests.runtime_specs import runtime_spec
 
 
 def test_paged_attention_vs_standard():
     """Verify paged attention produces identical results to standard attention."""
     print("\n=== Testing Paged Attention vs Standard ===")
     
-    config = RuntimeSpec()
+    config = runtime_spec()
     
     # Test parameters
     batch_size = 1
@@ -117,7 +117,7 @@ def test_linear_attention_chunked_vs_recurrent(seq_len):
     """Verify chunked and recurrent linear attention produce same results."""
     print("\n=== Testing Linear Attention: Chunked vs Recurrent ===")
     
-    config = RuntimeSpec()
+    config = runtime_spec()
     
     # Test parameters
     batch_size = 1
@@ -219,7 +219,7 @@ def test_linear_attention_state_persistence():
     """Test that linear attention state persists correctly across decode steps."""
     print("\n=== Testing Linear Attention State Persistence ===")
     
-    config = RuntimeSpec()
+    config = runtime_spec()
     
     # Initialize state
     batch_size = 1
@@ -271,7 +271,7 @@ def test_kv_cache_block_allocation():
     """Test KV cache block allocation and slot mapping."""
     print("\n=== Testing KV Cache Block Allocation ===")
     
-    config = RuntimeSpec()
+    config = runtime_spec()
     
     # Initialize KV cache
     num_blocks = 64
@@ -321,7 +321,7 @@ def test_multi_layer_linear_attention_states():
     """Test that multiple linear attention layers maintain separate states."""
     print("\n=== Testing Multi-Layer Linear Attention States ===")
     
-    config = RuntimeSpec()
+    config = runtime_spec()
     
     # Initialize linear attention states for all layers
     batch_size = 1
@@ -367,7 +367,7 @@ def test_paged_attention_non_identity_blocks():
     """Test that paged attention works with non-identity block tables."""
     print("\n=== Testing Paged Attention with Non-Identity Blocks ===")
     
-    config = RuntimeSpec()
+    config = runtime_spec()
     
     # Create non-identity block table
     # Sequence A: uses blocks [5, 2, 8, 1, 3]
@@ -426,7 +426,7 @@ def test_decode_attention_long_sequences():
     """Test decode attention with sequences > 128 tokens."""
     print("\n=== Testing Decode Attention with Long Sequences ===")
     
-    config = RuntimeSpec()
+    config = runtime_spec()
     
     # Create sequence with 200 tokens
     seq_len = 200

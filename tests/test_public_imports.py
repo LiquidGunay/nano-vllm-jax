@@ -39,6 +39,9 @@ def test_llm_constructor_rejects_internal_policy_kwargs_before_loading_model():
     with pytest.raises(TypeError, match="weight_dtype"):
         PublicLLMEngine("Qwen/Qwen3.5-0.8B", weight_dtype="float32")
 
+    with pytest.raises(TypeError, match="max_prefill"):
+        PublicLLMEngine("Qwen/Qwen3.5-0.8B", max_prefill=64)
+
 
 def test_internal_imports_use_top_level_modules():
     assert BlockManager.__module__ == "nanovllm_jax.block_manager"

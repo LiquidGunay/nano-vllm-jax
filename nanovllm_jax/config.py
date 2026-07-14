@@ -316,7 +316,6 @@ class EngineConfig:
     """Workload and capacity config for the serving engine."""
 
     model: str = "Qwen/Qwen3.5-0.8B"
-    max_prefill: int = 4096
     max_num_seqs: int = 8
     max_num_resident_seqs: int = 8
     max_num_batched_tokens: int = 4096
@@ -330,8 +329,6 @@ class EngineConfig:
     prefix_cache: bool = True
 
     def __post_init__(self):
-        if self.max_prefill <= 0:
-            raise ValueError("max_prefill must be positive")
         if self.max_num_seqs <= 0:
             raise ValueError("max_num_seqs must be positive")
         if self.max_num_resident_seqs < self.max_num_seqs:
@@ -348,8 +345,6 @@ class EngineConfig:
             value = getattr(self, name)
             if not value or value != tuple(sorted(set(value))) or any(item <= 0 for item in value):
                 raise ValueError(f"{name} must be sorted, unique, and positive")
-        if max(self.prefill_token_buckets) < self.max_prefill:
-            raise ValueError("prefill_token_buckets must cover max_prefill")
         if max(self.prefill_token_buckets) < self.max_num_batched_tokens:
             raise ValueError("prefill_token_buckets must cover max_num_batched_tokens")
         if max(self.batch_size_buckets) < self.max_num_seqs:
@@ -370,7 +365,6 @@ class EngineConfig:
             raw,
             {
                 "model",
-                "max_prefill",
                 "max_num_seqs",
                 "max_num_resident_seqs",
                 "max_num_batched_tokens",
@@ -406,7 +400,6 @@ class EngineConfig:
             warmup = WarmupConfig.from_mapping(warmup_raw)
         return cls(
             model=str(raw.get("model", cls.model)),
-            max_prefill=int(raw.get("max_prefill", cls.max_prefill)),
             max_num_seqs=int(raw.get("max_num_seqs", cls.max_num_seqs)),
             max_num_resident_seqs=int(
                 raw.get("max_num_resident_seqs", raw.get("max_num_seqs", cls.max_num_resident_seqs))
@@ -535,10 +528,10 @@ class CompileSpec:
 class RuntimeSpec:
     """Frozen internal aggregate composed once by the engine."""
 
-    model: ModelSpec = field(default_factory=ModelSpec)
-    capacity: CapacitySpec = field(default_factory=CapacitySpec)
-    compile: CompileSpec = field(default_factory=CompileSpec)
-    kernels: KernelPlan = field(default_factory=KernelPlan)
+    model: ModelSpec
+    capacity: CapacitySpec
+    compile: CompileSpec
+    kernels: KernelPlan
 
     @classmethod
     def promoted(
