@@ -45,7 +45,6 @@ class Backend:
 
     def warmup(self) -> dict[str, Any]:
         return {
-            "cuda_graphs": True,
             "language_model_only": True,
             "speculative_decoding": False,
             "flashinfer_sampler": False,
@@ -69,7 +68,7 @@ class Backend:
             "output_token_ids": rows,
         }
 
-    def compile_fingerprint(self) -> None:
+    def route_cache_fingerprint(self) -> None:
         return None
 
     def software(self) -> dict[str, str]:

@@ -106,7 +106,7 @@ class Backend:
             "output_token_ids": outputs,
         }
 
-    def compile_fingerprint(self) -> tuple[str, ...]:
+    def route_cache_fingerprint(self) -> tuple[str, ...]:
         cache = self.engine.model_runner.executor._jit_cache
         return tuple(sorted(repr(key) for key in cache))
 

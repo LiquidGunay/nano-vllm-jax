@@ -22,7 +22,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
     manifest = json.loads(path.read_text())
     required = {
         "schema_version",
-        "claim_id",
+        "benchmark_id",
         "model",
         "workload",
         "capacity",
@@ -35,11 +35,11 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise ValueError("unsupported manifest schema")
     workload = manifest["workload"]
     if workload["batch_size"] != 1:
-        raise ValueError("this artifact makes one B=1 claim")
+        raise ValueError("this artifact defines one B=1 benchmark")
     if workload["temperature"] != 0 or not workload["ignore_eos"]:
-        raise ValueError("the claim requires greedy fixed-length decode")
+        raise ValueError("the benchmark requires greedy fixed-length decode")
     if workload["prefix_cache"]:
-        raise ValueError("the claim requires a prefix miss")
+        raise ValueError("the benchmark requires a prefix miss")
     measurement = manifest["measurement"]
     if measurement["warmup_repeats"] < 1 or measurement["repeats"] < 1:
         raise ValueError("warmup and measured repeats must be positive")
@@ -88,8 +88,15 @@ def _process_tree_rss_bytes(root: int) -> int:
 
 
 def _nvidia_smi(*fields: str) -> list[str]:
+    gpu = os.environ.get("NANO_VLLM_JAX_BENCHMARK_GPU", "0")
     output = subprocess.check_output(
-        ["nvidia-smi", f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"],
+        [
+            "nvidia-smi",
+            "-i",
+            gpu,
+            f"--query-gpu={','.join(fields)}",
+            "--format=csv,noheader,nounits",
+        ],
         text=True,
     )
     rows = [line.strip() for line in output.splitlines() if line.strip()]
@@ -128,7 +135,7 @@ def _reference_rows(
     result = json.loads(path.read_text())
     if result["backend"] != "jax" or not result["valid"]:
         raise ValueError("the reference must be a valid JAX result")
-    for field in ("claim_id", "model", "workload", "capacity"):
+    for field in ("benchmark_id", "model", "workload", "capacity"):
         if result[field] != manifest[field]:
             raise ValueError(f"reference {field} does not match the manifest")
     return result["correctness"]["output_token_ids"]
@@ -137,6 +144,37 @@ def _reference_rows(
 def _sample_memory(maximum: dict[str, int]) -> None:
     maximum["rss"] = max(maximum["rss"], _process_tree_rss_bytes(os.getpid()))
     maximum["device"] = max(maximum["device"], _device_used_bytes())
+
+
+def invalid_reasons(
+    backend_name: str,
+    manifest: dict[str, Any],
+    samples: list[dict[str, Any]],
+    *,
+    repeat_exact: bool,
+    reference_exact: bool | None,
+    route_cache_growth: int | None,
+) -> list[str]:
+    reasons = []
+    expected_tokens = (
+        manifest["workload"]["batch_size"]
+        * (manifest["workload"]["output_tokens"] - 1)
+    )
+    speeds = [sample["decode_tokens_per_second"] for sample in samples]
+    spread = (max(speeds) - min(speeds)) / median(speeds)
+    if not repeat_exact:
+        reasons.append("measured repeats produced different tokens")
+    if reference_exact is False:
+        reasons.append("backend tokens differ from the reference backend")
+    if any(sample["decode_tokens"] != expected_tokens for sample in samples):
+        reasons.append("decode token count does not match the contract")
+    if any(sample["decode_seconds"] <= 0 for sample in samples):
+        reasons.append("decode duration is not positive")
+    if spread > manifest["measurement"]["max_relative_spread"]:
+        reasons.append("decode throughput spread exceeds the contract")
+    if backend_name == "jax" and route_cache_growth != 0:
+        reasons.append("JAX added an executor route-cache entry during measurement")
+    return reasons
 
 
 def run(
@@ -160,7 +198,7 @@ def run(
         control = backend.run_once()
     _sample_memory(memory)
 
-    compiled_before = backend.compile_fingerprint()
+    route_cache_before = backend.route_cache_fingerprint()
     samples = []
     repeat_exact = True
     for _ in range(manifest["measurement"]["repeats"]):
@@ -174,11 +212,11 @@ def run(
             }
         )
         _sample_memory(memory)
-    compiled_after = backend.compile_fingerprint()
+    route_cache_after = backend.route_cache_fingerprint()
 
-    jit_growth = None
-    if compiled_before is not None:
-        jit_growth = len(set(compiled_after) - set(compiled_before))
+    route_cache_growth = None
+    if route_cache_before is not None:
+        route_cache_growth = len(set(route_cache_after) - set(route_cache_before))
 
     speeds = [sample["decode_tokens_per_second"] for sample in samples]
     ttfts = [sample["ttft_seconds"] for sample in samples]
@@ -191,23 +229,14 @@ def run(
         else reference_rows == control["output_token_ids"]
     )
 
-    invalid_reasons = []
-    expected_decode_tokens = (
-        manifest["workload"]["batch_size"]
-        * (manifest["workload"]["output_tokens"] - 1)
+    reasons = invalid_reasons(
+        backend_name,
+        manifest,
+        samples,
+        repeat_exact=repeat_exact,
+        reference_exact=reference_exact,
+        route_cache_growth=route_cache_growth,
     )
-    if not repeat_exact:
-        invalid_reasons.append("measured repeats produced different tokens")
-    if reference_exact is False:
-        invalid_reasons.append("backend tokens differ from the reference backend")
-    if any(sample["decode_tokens"] != expected_decode_tokens for sample in samples):
-        invalid_reasons.append("decode token count does not match the contract")
-    if any(sample["decode_seconds"] <= 0 for sample in samples):
-        invalid_reasons.append("decode duration is not positive")
-    if relative_spread > manifest["measurement"]["max_relative_spread"]:
-        invalid_reasons.append("decode throughput spread exceeds the contract")
-    if backend_name == "jax" and jit_growth != 0:
-        invalid_reasons.append("JAX compiled a new route during measurement")
 
     gpu_name, gpu_uuid, gpu_memory_mib, driver = _nvidia_smi(
         "name", "uuid", "memory.total", "driver_version"
@@ -215,7 +244,7 @@ def run(
     backend_memory = backend.memory()
     return {
         "schema_version": 1,
-        "claim_id": manifest["claim_id"],
+        "benchmark_id": manifest["benchmark_id"],
         "backend": backend_name,
         "model": manifest["model"],
         "workload": manifest["workload"],
@@ -249,22 +278,24 @@ def run(
             "reference_exact": reference_exact,
             "output_sha256": _output_hash(control["output_token_ids"]),
             "output_token_ids": control["output_token_ids"],
-            "measured_jit_cache_growth": jit_growth,
+            "measured_executor_route_cache_growth": route_cache_growth,
         },
         "memory": {
             "max_observed_process_tree_rss_bytes": memory["rss"],
             "max_observed_device_used_bytes": memory["device"],
             **backend_memory,
         },
-        "valid": not invalid_reasons,
-        "invalid_reasons": invalid_reasons,
+        "valid": not reasons,
+        "invalid_reasons": reasons,
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("backend", choices=("jax", "vllm"))
-    parser.add_argument("--manifest", type=Path, default=ROOT / "benchmarks/claim.json")
+    parser.add_argument(
+        "--manifest", type=Path, default=ROOT / "benchmarks/benchmark.json"
+    )
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)

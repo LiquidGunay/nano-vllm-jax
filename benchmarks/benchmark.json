@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "claim_id": "qwen35-4b-b1-p64-o64-greedy",
+  "benchmark_id": "qwen35-4b-b1-p64-o64-greedy",
   "model": {
     "id": "Qwen/Qwen3.5-4B",
     "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",

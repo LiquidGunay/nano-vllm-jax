@@ -53,8 +53,8 @@ PY
 - Do not commit generated `results/`, profile dumps, server run logs, caches, or
   model checkpoints.
 - Keep new diagnostics in a sibling worktree or external scratch area. The
-  committed claim may contain only its fixed manifest, two adapters, schema,
-  and reproduction entry point.
+  committed benchmark may contain only its fixed manifest, two adapters,
+  runner, focused contract tests, and concise recorded summary.
 - Do not add CI; benchmark validation is a guarded, explicit GPU run.
 
 ## Editing

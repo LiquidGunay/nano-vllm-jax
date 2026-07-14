@@ -8,23 +8,31 @@ case "$target" in
   *) echo "usage: $0 [jax|vllm|both]" >&2; exit 2 ;;
 esac
 
-artifact_root=${NANO_VLLM_JAX_ARTIFACT_ROOT:-/mountpoint/.exp/artifacts/nano-vllm-jax/claim}
-jax_env=${NANO_VLLM_JAX_CLAIM_JAX_ENV:-/mountpoint/.exp/envs/nano-vllm-jax-claim-jax}
-vllm_env=${NANO_VLLM_JAX_CLAIM_VLLM_ENV:-/mountpoint/.exp/envs/nano-vllm-jax-claim-vllm}
+scratch_root=${NANO_VLLM_JAX_BENCHMARK_ROOT:-/mountpoint/.exp}
+artifact_root=$scratch_root/artifacts/nano-vllm-jax/benchmark
+jax_env=$scratch_root/envs/nano-vllm-jax-benchmark-jax
+vllm_env=$scratch_root/envs/nano-vllm-jax-benchmark-vllm
 ram_percent=${NANO_VLLM_JAX_MAX_SYSTEM_RAM_PERCENT:-80}
-mkdir -p "$artifact_root/results" /mountpoint/.exp/.cache/huggingface
+gpu=${NANO_VLLM_JAX_BENCHMARK_GPU:-${CUDA_VISIBLE_DEVICES:-0}}
+[[ "$gpu" != *,* ]] || {
+  echo "select exactly one GPU with NANO_VLLM_JAX_BENCHMARK_GPU" >&2
+  exit 2
+}
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-export HF_HOME=${HF_HOME:-/mountpoint/.exp/.cache/huggingface}
-export UV_CACHE_DIR=${UV_CACHE_DIR:-/mountpoint/.exp/.cache/uv}
-export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-/mountpoint/.exp/.cache/vllm}
-export VLLM_CONFIG_ROOT=${VLLM_CONFIG_ROOT:-/mountpoint/.exp/.config/vllm}
-export FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WORKSPACE_BASE:-/mountpoint/.exp}
+export NANO_VLLM_JAX_BENCHMARK_GPU=$gpu
+export CUDA_VISIBLE_DEVICES=$gpu
+export HF_HOME=$scratch_root/.cache/huggingface
+export UV_CACHE_DIR=$scratch_root/.cache/uv
+export VLLM_CACHE_ROOT=$scratch_root/.cache/vllm
+export VLLM_CONFIG_ROOT=$scratch_root/.config/vllm
+export FLASHINFER_WORKSPACE_BASE=$scratch_root
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export UV_NO_PROGRESS=1
+mkdir -p "$artifact_root/results" "$HF_HOME"
 
 setup_jax() {
-  UV_PROJECT_ENVIRONMENT="$jax_env" uv sync --project "$root" --frozen --no-dev \
+  UV_PROJECT_ENVIRONMENT="$jax_env" uv sync --python 3.11 \
+    --project "$root" --frozen --no-dev \
     --extra cuda13 --extra flashinfer-ffi --extra gdn-fla-triton
 }
 
@@ -32,6 +40,8 @@ setup_vllm() {
   if [[ ! -x "$vllm_env/bin/python" ]]; then
     uv venv --python 3.11 "$vllm_env"
   fi
+  "$vllm_env/bin/python" -c \
+    'import sys; assert sys.version_info[:2] == (3, 11)'
   uv pip install --python "$vllm_env/bin/python" \
     --requirements "$root/benchmarks/vllm-requirements.txt"
   # vLLM treats TorchCodec as optional, but its import raises when FFmpeg video
@@ -40,7 +50,8 @@ setup_vllm() {
 }
 
 preflight() {
-  nvidia-smi --query-gpu=name,uuid,memory.total,driver_version --format=csv,noheader
+  nvidia-smi -i "$gpu" \
+    --query-gpu=name,uuid,memory.total,driver_version --format=csv,noheader
   JAX_PLATFORMS=cuda "$jax_env/bin/python" -c \
     'import jax, jax.numpy as jnp; assert len(jax.devices("gpu")) == 1; jnp.ones(1).block_until_ready()'
 }
@@ -56,7 +67,7 @@ guard() {
 run_jax() {
   JAX_PLATFORMS=cuda PYTHONPATH="$root" guard \
     "$artifact_root/results/jax.ram.json" \
-    "$jax_env/bin/python" -m benchmarks.run_claim jax \
+    "$jax_env/bin/python" -m benchmarks.run_benchmark jax \
     --output "$artifact_root/results/jax.json"
 }
 
@@ -67,7 +78,7 @@ run_vllm() {
   }
   PYTHONPATH="$root" guard \
     "$artifact_root/results/vllm.ram.json" \
-    "$vllm_env/bin/python" -m benchmarks.run_claim vllm \
+    "$vllm_env/bin/python" -m benchmarks.run_benchmark vllm \
     --reference "$artifact_root/results/jax.json" \
     --output "$artifact_root/results/vllm.json"
 }
@@ -80,4 +91,10 @@ fi
 if [[ "$target" == vllm || "$target" == both ]]; then
   setup_vllm
   run_vllm
+fi
+if [[ "$target" == both ]]; then
+  "$jax_env/bin/python" -m benchmarks.compare_results \
+    --jax "$artifact_root/results/jax.json" \
+    --vllm "$artifact_root/results/vllm.json" \
+    --output "$artifact_root/results/comparison.json"
 fi
