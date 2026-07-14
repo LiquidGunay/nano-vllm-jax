@@ -36,6 +36,23 @@ branch.
 The offline `LLM.generate(..., use_tqdm=True)` progress bar uses the optional
 `progress` extra. Serving does not require it.
 
+## Reproduce The Benchmark Claim
+
+The repository makes one narrow claim: Qwen3.5-4B greedy B=1 decode with a
+64-token prompt and 64 generated tokens. The exact checkpoint, workload,
+framework version, and validity gates live in
+[benchmarks/claim.json](benchmarks/claim.json).
+
+```bash
+./scripts/reproduce_claim.sh both
+```
+
+JAX and vLLM run in separate environments because their CUDA Python packages
+conflict. vLLM is therefore optional. Environments, model cache, and raw JSON
+results stay under `/mountpoint/.exp`; the script stops at 80% system RAM use
+by default. [docs/benchmark.md](docs/benchmark.md) defines the measured window
+and reports the committed result.
+
 ## API Smoke
 
 ```bash
@@ -115,9 +132,9 @@ Advanced serving:
 
 ## Development
 
-Generated results, profiles, and benchmark artifacts are not part of the
-cleaned branch. Keep ad hoc diagnostics under `/mountpoint/.exp/diagnostics` or
-another external scratch path.
+Generated results and profiles are not part of the cleaned branch. The fixed
+benchmark contract and concise report are committed; raw runs and ad hoc
+diagnostics stay under `/mountpoint/.exp`.
 
 [docs/style.md](docs/style.md) defines the repository's lightweight complexity
 budget and review checks.

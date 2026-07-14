@@ -11,8 +11,9 @@ pedagogical.
 - `nanovllm_jax/fastpath.py` owns implementation policy. Do not add YAML or
   environment switches for alternative kernels on this branch.
 - The supported runtime is the promoted CUDA/JAX Qwen3.5 text-serving path.
-- Speculative decoding, Metal/TPU alternates, benchmark harnesses, result
-  dumps, and historical optimization notes do not belong on cleaned main.
+- Speculative decoding, Metal/TPU alternates, general benchmark harnesses,
+  result dumps, and historical optimization notes do not belong on cleaned
+  main. The single claim under `benchmarks/` is the narrow exception.
 
 ## Validation
 
@@ -51,8 +52,10 @@ PY
   under `/mountpoint/.exp/diagnostics`.
 - Do not commit generated `results/`, profile dumps, server run logs, caches, or
   model checkpoints.
-- If a benchmark or diagnostic script is needed, keep it in a sibling worktree
-  or external scratch area rather than restoring it to cleaned main.
+- Keep new diagnostics in a sibling worktree or external scratch area. The
+  committed claim may contain only its fixed manifest, two adapters, schema,
+  and reproduction entry point.
+- Do not add CI; benchmark validation is a guarded, explicit GPU run.
 
 ## Editing
 

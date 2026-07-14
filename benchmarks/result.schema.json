@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Nano-VLLM-JAX benchmark result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "claim_id",
+    "backend",
+    "model",
+    "workload",
+    "capacity",
+    "environment",
+    "timing",
+    "correctness",
+    "memory",
+    "valid",
+    "invalid_reasons"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "claim_id": {"type": "string"},
+    "backend": {"enum": ["jax", "vllm"]},
+    "model": {
+      "type": "object",
+      "required": ["id", "revision", "dtype"]
+    },
+    "workload": {
+      "type": "object",
+      "required": ["batch_size", "prompt_tokens", "output_tokens"]
+    },
+    "capacity": {
+      "type": "object",
+      "required": ["max_model_len", "kv_cache_bytes"]
+    },
+    "environment": {
+      "type": "object",
+      "required": ["python", "framework", "gpu"]
+    },
+    "timing": {
+      "type": "object",
+      "required": ["samples", "median_ttft_seconds", "median_decode_tokens_per_second", "relative_spread"]
+    },
+    "correctness": {
+      "type": "object",
+      "required": ["repeat_exact", "reference_exact", "output_sha256", "output_token_ids", "measured_jit_cache_growth"]
+    },
+    "memory": {
+      "type": "object",
+      "required": ["max_observed_process_tree_rss_bytes", "max_observed_device_used_bytes"]
+    },
+    "valid": {"type": "boolean"},
+    "invalid_reasons": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}

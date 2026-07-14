@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "claim_id": "qwen35-4b-b1-p64-o64-greedy",
+  "model": {
+    "id": "Qwen/Qwen3.5-4B",
+    "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+    "dtype": "bfloat16"
+  },
+  "workload": {
+    "batch_size": 1,
+    "prompt_tokens": 64,
+    "output_tokens": 64,
+    "temperature": 0.0,
+    "ignore_eos": true,
+    "prefix_cache": false,
+    "prompt_start_token": 1,
+    "prompt_row_stride": 997
+  },
+  "capacity": {
+    "max_model_len": 128,
+    "max_blocks_per_seq": 8,
+    "num_kvcache_blocks": 8,
+    "kv_cache_bytes": 536870912
+  },
+  "measurement": {
+    "warmup_repeats": 1,
+    "repeats": 3,
+    "max_relative_spread": 0.1
+  },
+  "frameworks": {
+    "vllm": "0.25.0"
+  }
+}
