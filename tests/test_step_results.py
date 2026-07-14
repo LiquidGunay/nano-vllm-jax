@@ -1,8 +1,33 @@
-from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.sequence import SamplingParams, Sequence
 from nanovllm_jax.step import FinishReason, RunResult
+from tests.runtime_specs import runtime_spec
+
+
+def _config(*, num_blocks=2, prefix_cache=False, linear_attention=False):
+    return runtime_spec(
+        model=(
+            {"num_hidden_layers": 1, "layer_types": ("linear_attention",)}
+            if linear_attention
+            else None
+        ),
+        capacity={
+            "block_size": 2,
+            "num_kvcache_blocks": num_blocks,
+            "max_kv_cache_bytes": 1 << 20,
+            "max_num_seqs": 1,
+            "max_num_resident_seqs": 1,
+            "max_num_batched_tokens": 2,
+            "max_blocks_per_seq": num_blocks,
+            "prefix_cache": prefix_cache,
+        },
+        compile={
+            "prefill_token_buckets": (2,),
+            "batch_size_buckets": (1,),
+            "decode_block_table_buckets": (num_blocks,),
+        },
+    )
 
 
 class _Runner:
@@ -74,21 +99,7 @@ class _Engine(LLMEngine):
 
 
 def test_step_executes_then_commits_one_typed_transition():
-    config = RuntimeConfig(
-        block_size=2,
-        num_kvcache_blocks=2,
-        max_kv_cache_bytes=1 << 20,
-        max_num_seqs=1,
-        max_num_resident_seqs=1,
-        max_num_batched_tokens=2,
-        max_blocks_per_seq=2,
-        prefill_buckets=(2,),
-        prefill_token_buckets=(2,),
-        batch_size_buckets=(1,),
-        decode_block_table_buckets=(2,),
-        prefix_cache=False,
-        device_token_carry=False,
-    )
+    config = _config()
     trace = []
     engine = _Engine(config, _Runner([[101], [102]], trace), trace)
     seq = Sequence(
@@ -117,16 +128,7 @@ def test_step_executes_then_commits_one_typed_transition():
 
 
 def test_cancel_request_releases_scheduler_and_runner_state():
-    config = RuntimeConfig(
-        block_size=2,
-        num_kvcache_blocks=2,
-        max_kv_cache_bytes=1 << 20,
-        max_num_seqs=1,
-        max_num_resident_seqs=1,
-        max_num_batched_tokens=2,
-        max_blocks_per_seq=2,
-        prefix_cache=False,
-    )
+    config = _config()
     engine = _Engine(config, _Runner([]))
     seq = Sequence(
         [1, 2],
@@ -143,21 +145,7 @@ def test_cancel_request_releases_scheduler_and_runner_state():
 
 
 def test_step_reuses_runner_owned_prefix_state_by_handle():
-    config = RuntimeConfig(
-        block_size=2,
-        num_kvcache_blocks=4,
-        max_kv_cache_bytes=1 << 20,
-        max_num_seqs=1,
-        max_num_resident_seqs=1,
-        max_num_batched_tokens=2,
-        max_blocks_per_seq=4,
-        prefill_buckets=(2,),
-        prefill_token_buckets=(2,),
-        batch_size_buckets=(1,),
-        decode_block_table_buckets=(4,),
-        prefix_cache=True,
-        linear_attn_layers=(0,),
-    )
+    config = _config(num_blocks=4, prefix_cache=True, linear_attention=True)
     engine = _Engine(config, _Runner([[101], [102]]))
     first = Sequence(
         [1, 2],

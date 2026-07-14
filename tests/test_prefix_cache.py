@@ -3,13 +3,13 @@ from dataclasses import replace
 import jax
 import pytest
 
-from nanovllm_jax.block_manager import BlockManager, PrefixCacheEntry
-from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.block_manager import BlockManager
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.model import init_params
 from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.sequence import SamplingParams, Sequence
+from tests.runtime_specs import runtime_spec
 
 
 def _sequence(tokens, *, seq_id=0, max_tokens=1):
@@ -22,35 +22,38 @@ def _sequence(tokens, *, seq_id=0, max_tokens=1):
 
 
 def _tiny_hybrid_config(*, prefix_cache, max_num_resident_seqs=1):
-    return RuntimeConfig(
-        vocab_size=32,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=1,
-        num_key_value_heads=1,
-        head_dim=4,
-        linear_num_key_heads=1,
-        linear_num_value_heads=2,
-        linear_key_head_dim=4,
-        linear_value_head_dim=4,
-        linear_conv_kernel_size=4,
-        layer_types=("linear_attention",),
-        linear_attn_layers=(0,),
-        dtype="float32",
-        block_size=2,
-        num_kvcache_blocks=8,
-        max_kv_cache_bytes=1 << 20,
-        max_num_seqs=1,
-        max_num_resident_seqs=max_num_resident_seqs,
-        max_num_batched_tokens=4,
-        max_blocks_per_seq=4,
-        prefill_buckets=(2, 4),
-        prefill_token_buckets=(2, 4),
-        batch_size_buckets=(1,),
-        decode_block_table_buckets=(4,),
-        prefix_cache=prefix_cache,
-        device_token_carry=False,
+    return runtime_spec(
+        model={
+            "vocab_size": 32,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 2,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_size": 4,
+            "layer_types": ("linear_attention",),
+        },
+        capacity={
+            "block_size": 2,
+            "num_kvcache_blocks": 8,
+            "max_kv_cache_bytes": 1 << 20,
+            "max_num_seqs": 1,
+            "max_num_resident_seqs": max_num_resident_seqs,
+            "max_num_batched_tokens": 4,
+            "max_blocks_per_seq": 4,
+            "prefix_cache": prefix_cache,
+        },
+        compile={
+            "dtype": "float32",
+            "prefill_token_buckets": (2, 4),
+            "batch_size_buckets": (1,),
+            "decode_block_table_buckets": (4,),
+        },
     )
 
 
@@ -66,20 +69,23 @@ class _TinyEngine(LLMEngine):
 
 def _prefix_scheduler(*, max_num_seqs=1, max_num_resident_seqs=1):
     return Scheduler(
-        RuntimeConfig(
-            block_size=2,
-            num_kvcache_blocks=16,
-            max_kv_cache_bytes=1 << 20,
-            max_num_seqs=max_num_seqs,
-            max_num_resident_seqs=max_num_resident_seqs,
-            max_num_batched_tokens=2,
-            max_blocks_per_seq=4,
-            prefill_buckets=(2,),
-            prefill_token_buckets=(2,),
-            batch_size_buckets=tuple(range(1, max_num_seqs + 1)),
-            decode_block_table_buckets=(4,),
-            prefix_cache=True,
-            linear_attn_layers=(0,),
+        runtime_spec(
+            model={"num_hidden_layers": 1, "layer_types": ("linear_attention",)},
+            capacity={
+                "block_size": 2,
+                "num_kvcache_blocks": 16,
+                "max_kv_cache_bytes": 1 << 20,
+                "max_num_seqs": max_num_seqs,
+                "max_num_resident_seqs": max_num_resident_seqs,
+                "max_num_batched_tokens": 2,
+                "max_blocks_per_seq": 4,
+                "prefix_cache": True,
+            },
+            compile={
+                "prefill_token_buckets": (2,),
+                "batch_size_buckets": tuple(range(1, max_num_seqs + 1)),
+                "decode_block_table_buckets": (4,),
+            },
         )
     )
 
@@ -272,7 +278,8 @@ def test_prefill_budget_does_not_admit_an_unseeded_prefix_hit():
 
 @pytest.mark.skipif(not _has_cuda(), reason="CUDA is required for engine parity")
 def test_hybrid_prefix_hit_matches_no_cache_execution():
-    params = init_params(jax.random.PRNGKey(0), _tiny_hybrid_config(prefix_cache=False))
+    config = _tiny_hybrid_config(prefix_cache=False)
+    params = init_params(jax.random.PRNGKey(0), config.model)
     reference = _TinyEngine(_tiny_hybrid_config(prefix_cache=False), params)
     cached = _TinyEngine(_tiny_hybrid_config(prefix_cache=True), params)
 
@@ -308,7 +315,7 @@ def test_late_warmup_cannot_invalidate_or_crosswire_prefix_state():
         prefix_cache=False,
         max_num_resident_seqs=2,
     )
-    params = init_params(jax.random.PRNGKey(1), reference_config)
+    params = init_params(jax.random.PRNGKey(1), reference_config.model)
     reference = _TinyEngine(reference_config, params)
     cached = _TinyEngine(config, params)
 

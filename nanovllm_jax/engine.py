@@ -3,15 +3,15 @@
 import atexit
 from pathlib import Path
 from time import perf_counter
-from typing import Any, List, Dict, Optional, Union
+from typing import Any, Dict, List, Union
 from dataclasses import replace
 
 import jax
 
-from nanovllm_jax.config import EngineConfig, ModelConfig, RuntimeConfig
-from nanovllm_jax.cache import KVCacheSpec, cap_num_kv_cache_blocks
+from nanovllm_jax.config import EngineConfig, ModelConfig, RuntimeSpec
+from nanovllm_jax.cache import KVCacheSpec
+from nanovllm_jax.ops import resolve_kv_cache_spec
 from nanovllm_jax.batch import SchedulePlan
-from nanovllm_jax.model import ModelParams
 from nanovllm_jax.weights import (
     load_weights_from_hf_streaming,
     resolve_checkpoint,
@@ -37,7 +37,6 @@ except ImportError:
 
 
 _PUBLIC_ENGINE_KWARGS = {
-    "max_prefill",
     "max_num_seqs",
     "max_num_resident_seqs",
     "max_num_batched_tokens",
@@ -62,15 +61,11 @@ def _engine_config_from_public_kwargs(model_path: str, kwargs: dict[str, Any]) -
     return EngineConfig.from_mapping({"model": model_path, **kwargs})
 
 
-def _runtime_config_from_engine_config(
+def _runtime_spec_from_engine_config(
     engine_config: EngineConfig,
     model_config: ModelConfig,
-) -> tuple[RuntimeConfig, str]:
-    engine_kwargs = engine_config.to_engine_kwargs()
-    weight_dtype = str(engine_kwargs.pop("weight_dtype", engine_kwargs.get("dtype", "bfloat16")))
-    runtime_fields = set(RuntimeConfig.__dataclass_fields__)
-    runtime_kwargs = {key: value for key, value in engine_kwargs.items() if key in runtime_fields}
-    return RuntimeConfig.from_model_config(model_config, **runtime_kwargs), weight_dtype
+) -> RuntimeSpec:
+    return RuntimeSpec.promoted(model_config, engine_config)
 
 
 def _tree_nbytes(value: object) -> int:
@@ -109,49 +104,62 @@ class LLMEngine:
             if Path(model_path).expanduser().exists()
             else resolve_checkpoint(model_path, revision=metadata_path.name)
         )
-        self.config, self.weight_dtype = _runtime_config_from_engine_config(
+        self.config = _runtime_spec_from_engine_config(
             engine_config,
             self.model_config,
         )
-        kv_spec = KVCacheSpec(
-            num_layers=self.config.num_hidden_layers,
-            num_blocks=self.config.num_kvcache_blocks,
-            block_size=self.config.block_size,
-            num_kv_heads=self.config.num_key_value_heads,
-            head_dim=self.config.head_dim,
-            dtype=self.config.get_dtype(),
-            max_kv_cache_bytes=self.config.max_kv_cache_bytes,
+        requested_kv_blocks = self.config.capacity.num_kvcache_blocks
+        kv_spec = resolve_kv_cache_spec(
+            KVCacheSpec(
+                num_layers=self.config.model.num_hidden_layers,
+                num_blocks=requested_kv_blocks,
+                block_size=self.config.capacity.block_size,
+                num_kv_heads=self.config.model.num_key_value_heads,
+                head_dim=self.config.model.head_dim,
+                dtype=self.config.compile.jax_dtype(),
+                max_kv_cache_bytes=self.config.capacity.max_kv_cache_bytes,
+            ),
+            self.config.kernels,
         )
-        self.config.num_kvcache_blocks = cap_num_kv_cache_blocks(kv_spec)
-        if self.config.max_blocks_per_seq is None:
-            resident_capacity = int(
-                getattr(self.config, "max_num_resident_seqs", None)
-                or self.config.max_num_seqs
+        effective_blocks = kv_spec.num_blocks
+        if effective_blocks != requested_kv_blocks:
+            print(
+                "KV cache capped: "
+                f"{requested_kv_blocks} -> {effective_blocks} blocks "
+                f"({self.config.capacity.max_kv_cache_bytes} byte cap)"
             )
-            self.config.max_blocks_per_seq = max(1, self.config.num_kvcache_blocks // resident_capacity)
+        self.config = replace(
+            self.config,
+            capacity=replace(
+                self.config.capacity,
+                num_kvcache_blocks=effective_blocks,
+            ),
+        )
 
         if not HAS_TRANSFORMERS:
             raise ImportError("transformers is required; install it with the package dependencies")
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path, trust_remote_code=True)
-        self.config.eos_token_ids = tuple(
-            sorted(
-                {
-                    int(token_id)
-                    for token_id in (
-                        *self.config.eos_token_ids,
-                        self.tokenizer.eos_token_id,
-                    )
-                    if token_id is not None
-                }
-            )
+        eos_token_ids = tuple(
+            sorted({
+                int(token_id)
+                for token_id in (
+                    *self.config.capacity.eos_token_ids,
+                    self.tokenizer.eos_token_id,
+                )
+                if token_id is not None
+            })
+        )
+        self.config = replace(
+            self.config,
+            capacity=replace(self.config.capacity, eos_token_ids=eos_token_ids),
         )
 
         print(f"Loading pretrained weights from {self.checkpoint_path}...")
-        load_config = replace(self.config, dtype=self.weight_dtype)
         self.params = load_weights_from_hf_streaming(
             self.checkpoint_path,
-            load_config,
+            self.config.model,
+            self.config.compile.weight_dtype,
         )
         print("✓ Using pretrained weights")
 
@@ -183,15 +191,13 @@ class LLMEngine:
             )
         if max_prefill_len is None:
             max_prefill_len = max(
-                tuple(getattr(self.config, "prefill_token_buckets", ()) or ())
-                or
-                tuple(getattr(self.config, "prefill_buckets", ()) or ())
-                or (int(getattr(self.config, "max_num_batched_tokens", 64) or 64),)
+                self.config.compile.prefill_token_buckets
+                or (self.config.capacity.max_num_batched_tokens,)
             )
         if max_batch is None:
             max_batch = max(
-                tuple(getattr(self.config, "batch_size_buckets", ()) or ())
-                or (int(getattr(self.config, "max_num_seqs", 1) or 1),)
+                self.config.compile.batch_size_buckets
+                or (self.config.capacity.max_num_seqs,)
             )
 
         started = perf_counter()
@@ -228,7 +234,7 @@ class LLMEngine:
             prompt,
             sampling_params,
             seq_id=self._next_seq_id,
-            block_size=self.config.block_size,
+            block_size=self.config.capacity.block_size,
         )
         self._next_seq_id += 1
         self.scheduler.add(seq)

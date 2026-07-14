@@ -27,7 +27,6 @@ import pytest
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
-from nanovllm_jax.config import RuntimeConfig
 from nanovllm_jax.cache import (
     init_kv_cache,
     init_linear_attention_states,
@@ -35,23 +34,23 @@ from nanovllm_jax.cache import (
     paged_attention,
     paged_attention_decode,
     compute_slot_mapping,
-    KVCacheState,
 )
-from nanovllm_jax.model import jax_chunk_gated_delta_rule, jax_recurrent_gated_delta_rule
+from nanovllm_jax.gdn import jax_chunk_gated_delta_rule, jax_recurrent_gated_delta_rule
+from tests.runtime_specs import runtime_spec
 
 
 def test_paged_attention_vs_standard():
     """Verify paged attention produces identical results to standard attention."""
     print("\n=== Testing Paged Attention vs Standard ===")
     
-    config = RuntimeConfig.qwen3_5_0_8b()
+    config = runtime_spec()
     
     # Test parameters
     batch_size = 1
     seq_len = 32
-    num_heads = config.num_attention_heads
-    num_kv_heads = config.num_key_value_heads
-    head_dim = config.head_dim
+    num_heads = config.model.num_attention_heads
+    num_kv_heads = config.model.num_key_value_heads
+    head_dim = config.model.head_dim
     
     # Create test Q, K, V in [B, T, H, D] format (input format)
     query_input = jnp.array(np.random.randn(batch_size, seq_len, num_heads, head_dim).astype(np.float32))
@@ -88,7 +87,7 @@ def test_paged_attention_vs_standard():
     # Initialize KV cache
     kv_cache = init_kv_cache(
         num_blocks=64,
-        block_size=config.block_size,
+        block_size=config.capacity.block_size,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         max_seqs=1,
@@ -118,13 +117,13 @@ def test_linear_attention_chunked_vs_recurrent(seq_len):
     """Verify chunked and recurrent linear attention produce same results."""
     print("\n=== Testing Linear Attention: Chunked vs Recurrent ===")
     
-    config = RuntimeConfig.qwen3_5_0_8b()
+    config = runtime_spec()
     
     # Test parameters
     batch_size = 1
-    num_heads = config.linear_num_value_heads
-    k_dim = config.linear_key_head_dim
-    v_dim = config.linear_value_head_dim
+    num_heads = config.model.linear_num_value_heads
+    k_dim = config.model.linear_key_head_dim
+    v_dim = config.model.linear_value_head_dim
     # Create test inputs
     query = jnp.array(np.random.randn(batch_size, num_heads, seq_len, k_dim).astype(np.float32))
     key = jnp.array(np.random.randn(batch_size, num_heads, seq_len, k_dim).astype(np.float32))
@@ -135,8 +134,8 @@ def test_linear_attention_chunked_vs_recurrent(seq_len):
     # Chunked computation (prefill mode)
     chunked_output, _ = jax_chunk_gated_delta_rule(
         query, key, value, g, beta,
-        chunk_size=config.linear_chunk_size,
-        use_qk_l2norm_in_kernel=config.use_qk_norm_in_gdn,
+        chunk_size=config.kernels.gdn_chunk_size,
+        use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
     )
     
     # Recurrent computation (decode mode) - step by step
@@ -153,7 +152,7 @@ def test_linear_attention_chunked_vs_recurrent(seq_len):
         out_t, state = jax_recurrent_gated_delta_rule(
             q_t, k_t, v_t, g_t, beta_t,
             initial_state=state,
-            use_qk_l2norm_in_kernel=config.use_qk_norm_in_gdn,
+            use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
         )
         recurrent_outputs.append(out_t)
     
@@ -220,13 +219,13 @@ def test_linear_attention_state_persistence():
     """Test that linear attention state persists correctly across decode steps."""
     print("\n=== Testing Linear Attention State Persistence ===")
     
-    config = RuntimeConfig.qwen3_5_0_8b()
+    config = runtime_spec()
     
     # Initialize state
     batch_size = 1
-    num_heads = config.linear_num_value_heads
-    k_dim = config.linear_key_head_dim
-    v_dim = config.linear_value_head_dim
+    num_heads = config.model.linear_num_value_heads
+    k_dim = config.model.linear_key_head_dim
+    v_dim = config.model.linear_value_head_dim
     
     state = jnp.zeros((batch_size, num_heads, v_dim, k_dim), dtype=jnp.float32)
     
@@ -246,7 +245,7 @@ def test_linear_attention_state_persistence():
         _, state = jax_recurrent_gated_delta_rule(
             q, k, v, g, beta,
             initial_state=state,
-            use_qk_l2norm_in_kernel=config.use_qk_norm_in_gdn,
+            use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
         )
         states.append(state)
     
@@ -272,7 +271,7 @@ def test_kv_cache_block_allocation():
     """Test KV cache block allocation and slot mapping."""
     print("\n=== Testing KV Cache Block Allocation ===")
     
-    config = RuntimeConfig.qwen3_5_0_8b()
+    config = runtime_spec()
     
     # Initialize KV cache
     num_blocks = 64
@@ -281,8 +280,8 @@ def test_kv_cache_block_allocation():
     kv_cache = init_kv_cache(
         num_blocks=num_blocks,
         block_size=block_size,
-        num_kv_heads=config.num_key_value_heads,
-        head_dim=config.head_dim,
+        num_kv_heads=config.model.num_key_value_heads,
+        head_dim=config.model.head_dim,
         max_seqs=2,
         max_blocks_per_seq=32,
         dtype=jnp.float32,
@@ -312,7 +311,7 @@ def test_kv_cache_block_allocation():
     print(f"  Slot mapping: {slot_mapping}")
     
     # Verify shapes (note: KV cache has num_layers dimension)
-    expected_shape = (config.num_hidden_layers, num_blocks, block_size, config.num_key_value_heads, config.head_dim)
+    expected_shape = (config.model.num_hidden_layers, num_blocks, block_size, config.model.num_key_value_heads, config.model.head_dim)
     assert kv_cache.k_cache.shape == expected_shape
     assert kv_cache.v_cache.shape == expected_shape
     print("  ✓ PASS: KV cache shapes correct")
@@ -322,34 +321,36 @@ def test_multi_layer_linear_attention_states():
     """Test that multiple linear attention layers maintain separate states."""
     print("\n=== Testing Multi-Layer Linear Attention States ===")
     
-    config = RuntimeConfig.qwen3_5_0_8b()
+    config = runtime_spec()
     
     # Initialize linear attention states for all layers
     batch_size = 1
     
     # Count linear attention layers
-    num_linear_layers = len(config.linear_attn_layers)
+    num_linear_layers = len(config.model.linear_attn_layers)
     
     kv_cache = init_kv_cache(
         num_blocks=64,
-        block_size=config.block_size,
-        num_kv_heads=config.num_key_value_heads,
-        head_dim=config.head_dim,
+        block_size=config.capacity.block_size,
+        num_kv_heads=config.model.num_key_value_heads,
+        head_dim=config.model.head_dim,
         max_seqs=1,
         max_blocks_per_seq=64,
         dtype=jnp.float32,
     )
     
-    kv_cache = init_linear_attention_states(kv_cache, config, batch_size, dtype=jnp.float32)
+    kv_cache = init_linear_attention_states(
+        kv_cache, config.model, batch_size, dtype=jnp.float32
+    )
     
-    print(f"  Total layers: {config.num_hidden_layers}")
+    print(f"  Total layers: {config.model.num_hidden_layers}")
     print(f"  Linear attention layers: {num_linear_layers}")
-    print(f"  Linear layer indices: {config.linear_attn_layers}")
+    print(f"  Linear layer indices: {config.model.linear_attn_layers}")
     
     # Check recurrent state shape
     if hasattr(kv_cache, 'recurrent_state') and kv_cache.recurrent_state is not None:
-        expected_shape = (batch_size, num_linear_layers, config.linear_num_value_heads,
-                          config.linear_value_head_dim, config.linear_key_head_dim)
+        expected_shape = (batch_size, num_linear_layers, config.model.linear_num_value_heads,
+                          config.model.linear_value_head_dim, config.model.linear_key_head_dim)
         actual_shape = kv_cache.recurrent_state.shape
         
         print(f"  Expected recurrent state shape: {expected_shape}")
@@ -366,7 +367,7 @@ def test_paged_attention_non_identity_blocks():
     """Test that paged attention works with non-identity block tables."""
     print("\n=== Testing Paged Attention with Non-Identity Blocks ===")
     
-    config = RuntimeConfig.qwen3_5_0_8b()
+    config = runtime_spec()
     
     # Create non-identity block table
     # Sequence A: uses blocks [5, 2, 8, 1, 3]
@@ -383,11 +384,11 @@ def test_paged_attention_non_identity_blocks():
     kv_cache = init_kv_cache(
         num_blocks=num_blocks,
         block_size=block_size,
-        num_kv_heads=config.num_key_value_heads,
-        head_dim=config.head_dim,
+        num_kv_heads=config.model.num_key_value_heads,
+        head_dim=config.model.head_dim,
         max_seqs=2,
         max_blocks_per_seq=5,
-        num_layers=config.num_hidden_layers,
+        num_layers=config.model.num_hidden_layers,
         dtype=jnp.float32,
     )
     
@@ -425,7 +426,7 @@ def test_decode_attention_long_sequences():
     """Test decode attention with sequences > 128 tokens."""
     print("\n=== Testing Decode Attention with Long Sequences ===")
     
-    config = RuntimeConfig.qwen3_5_0_8b()
+    config = runtime_spec()
     
     # Create sequence with 200 tokens
     seq_len = 200
@@ -438,16 +439,16 @@ def test_decode_attention_long_sequences():
     kv_cache = init_kv_cache(
         num_blocks=num_blocks,
         block_size=block_size,
-        num_kv_heads=config.num_key_value_heads,
-        head_dim=config.head_dim,
+        num_kv_heads=config.model.num_key_value_heads,
+        head_dim=config.model.head_dim,
         max_seqs=1,
         max_blocks_per_seq=20,
-        num_layers=config.num_hidden_layers,
+        num_layers=config.model.num_hidden_layers,
         dtype=jnp.float32,
     )
     
     # Simulate decode at position 199 (200th token)
-    query = jnp.ones((batch_size, 1, config.num_attention_heads, config.head_dim), dtype=jnp.float32)
+    query = jnp.ones((batch_size, 1, config.model.num_attention_heads, config.model.head_dim), dtype=jnp.float32)
     kv_lens = jnp.array([200])  # 200 tokens in cache
     block_table = jnp.array([list(range(20))])  # Uses blocks 0-12 (200 tokens)
     
@@ -459,8 +460,8 @@ def test_decode_attention_long_sequences():
         block_table=block_table,
         kv_lens=kv_lens,
         block_size=block_size,
-        scale=1.0 / jnp.sqrt(config.head_dim),
-        num_key_value_groups=config.num_attention_heads // config.num_key_value_heads,
+        scale=1.0 / jnp.sqrt(config.model.head_dim),
+        num_key_value_groups=config.model.num_attention_heads // config.model.num_key_value_heads,
         max_kv_len=200,
     )
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import jax
@@ -10,6 +10,19 @@ import jax.numpy as jnp
 import numpy as np
 
 from nanovllm_jax.batch import SchedulePlan
+
+
+@dataclass(frozen=True)
+class HostBatch:
+    """Host facts retained beside one materialized device batch."""
+
+    seq_ids: tuple[int, ...] = ()
+    query_lens: tuple[int, ...] = ()
+    seq_lens: tuple[int, ...] = ()
+    block_tables: tuple[tuple[int, ...], ...] = ()
+    prefill_is_final: tuple[bool, ...] = ()
+    decode_steps: int = 1
+    uses_static_decode_metadata: bool = False
 
 
 @dataclass
@@ -25,14 +38,7 @@ class DeviceBatch:
     num_decode_tokens: int
     block_tables: jax.Array
     seq_lens: jax.Array
-    prefill_is_final: list[bool] | tuple[bool, ...] | None = None
-    seq_ids_host: tuple[int, ...] | None = None
-    query_lens_host: tuple[int, ...] | None = None
-    seq_lens_host: tuple[int, ...] | None = None
-    block_tables_host: tuple[tuple[int, ...], ...] | None = None
-    hybrid_slot_ids_host: tuple[int, ...] | None = None
-    decode_step_count_host: int = 1
-    uses_static_decode_metadata: bool = False
+    host: HostBatch = field(default_factory=HostBatch)
     packed_prefill: bool = False
     token_row_ids: jax.Array | None = None
 
@@ -52,9 +58,9 @@ class DeviceBatch:
 
     @property
     def prefill_final_flags(self) -> list[bool]:
-        if self.prefill_is_final is None:
+        if not self.host.prefill_is_final:
             return [True] * self.batch_size
-        return [bool(value) for value in self.prefill_is_final]
+        return [bool(value) for value in self.host.prefill_is_final]
 
 
 class BatchMaterializer:
@@ -100,7 +106,6 @@ class BatchMaterializer:
         query_lens.extend([0] * padding)
         seq_lens.extend([0] * padding)
         query_start_loc = self._query_start_loc(query_lens)
-        host = self._host_metadata(seq_ids, query_lens, seq_lens, block_tables)
         use_static = self._can_reuse_decode_arrays(plan, tokens)
         arrays = (
             self._static_decode_arrays(
@@ -125,10 +130,19 @@ class BatchMaterializer:
             num_decode_tokens=0 if plan.is_prefill else plan.num_scheduled_tokens,
             block_tables=arrays[4],
             seq_lens=arrays[5],
-            prefill_is_final=tuple(row.prefill_is_final for row in plan.rows) if plan.is_prefill else None,
-            **host,
-            decode_step_count_host=1 if plan.is_prefill else plan.decode_steps,
-            uses_static_decode_metadata=use_static,
+            host=self._host_batch(
+                seq_ids,
+                query_lens,
+                seq_lens,
+                block_tables,
+                prefill_is_final=(
+                    tuple(row.prefill_is_final for row in plan.rows)
+                    if plan.is_prefill
+                    else ()
+                ),
+                decode_steps=1 if plan.is_prefill else plan.decode_steps,
+                uses_static_decode_metadata=use_static,
+            ),
         )
 
     def _packed_prefill(self, plan: SchedulePlan) -> DeviceBatch:
@@ -164,7 +178,6 @@ class BatchMaterializer:
         positions.extend([0] * token_padding)
         token_row_ids.extend([0] * token_padding)
         query_start_loc = self._query_start_loc(query_lens)
-        host = self._host_metadata(seq_ids, query_lens, seq_lens, block_tables)
         arrays = self._device_put(
             [tokens],
             [positions],
@@ -183,8 +196,13 @@ class BatchMaterializer:
             num_decode_tokens=0,
             block_tables=arrays[4],
             seq_lens=arrays[5],
-            prefill_is_final=tuple(row.prefill_is_final for row in plan.rows),
-            **host,
+            host=self._host_batch(
+                seq_ids,
+                query_lens,
+                seq_lens,
+                block_tables,
+                prefill_is_final=tuple(row.prefill_is_final for row in plan.rows),
+            ),
             packed_prefill=True,
             token_row_ids=jax.device_put(np.asarray([token_row_ids], dtype=np.int32)),
         )
@@ -267,15 +285,22 @@ class BatchMaterializer:
         return result
 
     @staticmethod
-    def _host_metadata(
+    def _host_batch(
         seq_ids: list[int],
         query_lens: list[int],
         seq_lens: list[int],
         block_tables: list[list[int]],
-    ) -> dict[str, tuple[Any, ...]]:
-        return {
-            "seq_ids_host": tuple(seq_ids),
-            "query_lens_host": tuple(query_lens),
-            "seq_lens_host": tuple(seq_lens),
-            "block_tables_host": tuple(tuple(row) for row in block_tables),
-        }
+        *,
+        prefill_is_final: tuple[bool, ...] = (),
+        decode_steps: int = 1,
+        uses_static_decode_metadata: bool = False,
+    ) -> HostBatch:
+        return HostBatch(
+            seq_ids=tuple(seq_ids),
+            query_lens=tuple(query_lens),
+            seq_lens=tuple(seq_lens),
+            block_tables=tuple(tuple(row) for row in block_tables),
+            prefill_is_final=prefill_is_final,
+            decode_steps=decode_steps,
+            uses_static_decode_metadata=uses_static_decode_metadata,
+        )

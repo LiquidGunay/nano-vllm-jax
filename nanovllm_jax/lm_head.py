@@ -14,7 +14,6 @@ from nanovllm_jax.projection import (
     _force_width1_decode_math,
     _lm_head_decode_activation_dtype,
     _lm_head_greedy_top1_impl,
-    _lm_head_topk_impl,
     _tokenwise_decode_dot,
 )
 
@@ -36,14 +35,14 @@ def _lm_head_normed_hidden_and_weight(
             )
 
             hidden_norm = (
-                decode_rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
+                decode_rms_norm(hidden, params.norm_weight, config.model.rms_norm_eps)
                 if lowered_decode_rms_norm_enabled()
-                else rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
+                else rms_norm(hidden, params.norm_weight, config.model.rms_norm_eps)
             )
         else:
-            hidden_norm = rms_norm(hidden, params.norm_weight, config.rms_norm_eps)
+            hidden_norm = rms_norm(hidden, params.norm_weight, config.model.rms_norm_eps)
     hidden_norm = hidden_norm.astype(
-        _lm_head_decode_activation_dtype(config) if not is_prefill else jnp.float32
+        _lm_head_decode_activation_dtype(config.kernels) if not is_prefill else jnp.float32
     )
     vocab_weight = params.lm_head if params.lm_head is not None else params.embed_tokens
     return hidden_norm, vocab_weight
@@ -57,8 +56,8 @@ def _lm_head_logits_from_normed(
     is_prefill: bool = True,
 ):
     projection_weight = vocab_weight.T
-    if _can_use_decode_padded_gemm(hidden_norm, projection_weight, config):
-        logits = _decode_padded_gemm_dot(hidden_norm, projection_weight, config)
+    if _can_use_decode_padded_gemm(hidden_norm, projection_weight, config.kernels):
+        logits = _decode_padded_gemm_dot(hidden_norm, projection_weight, config.kernels)
     else:
         logits = _tokenwise_decode_dot(
             hidden_norm,
@@ -96,7 +95,7 @@ def _lm_head_greedy_top1_token_ids(
     vocab_weight: jnp.ndarray,
     config,
 ) -> jnp.ndarray:
-    impl = _lm_head_greedy_top1_impl(config)
+    impl = _lm_head_greedy_top1_impl(config.kernels)
     if impl == "jax":
         logits = _lm_head_logits_from_normed(
             hidden_norm,
@@ -132,7 +131,7 @@ def lm_head_token_ids_and_topk(
         (not is_prefill)
         and top_k == 0
         and hidden.ndim == 3
-        and _lm_head_greedy_top1_impl(config) != "jax"
+        and _lm_head_greedy_top1_impl(config.kernels) != "jax"
     ):
         hidden_norm, vocab_weight = _lm_head_normed_hidden_and_weight(
             hidden,

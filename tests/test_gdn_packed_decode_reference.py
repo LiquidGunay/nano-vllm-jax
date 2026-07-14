@@ -26,14 +26,15 @@ else:
         local_gdn_state_to_k_last,
         split_packed_gdn_decode_mixed_qkv,
     )
-    from nanovllm_jax.kernels import KernelUnavailable
-    from nanovllm_jax.config import RuntimeConfig
+    from nanovllm_jax.config import RuntimeSpec
+    from nanovllm_jax.fastpath import KernelPlan
     from nanovllm_jax.cache import HybridLayerState
-    from nanovllm_jax.model import (
+    from nanovllm_jax.gdn import (
         gated_deltanet_block,
-        init_transformer_block,
         jax_recurrent_gated_delta_rule,
     )
+    from nanovllm_jax.model import init_transformer_block
+    from tests.runtime_specs import runtime_spec
 
 pytestmark = pytest.mark.skipif(
     jax is None,
@@ -58,35 +59,38 @@ def _packed_decode_ops(
     max_batch: int | None = None,
 ) -> "ServingOps":
     return ServingOps(
-        RuntimeConfig(
-            gdn_packed_decode_impl=impl,
-            gdn_packed_decode_qkv_dtype=qkv_dtype,
+        KernelPlan(
+            gdn_decode=impl,
+            gdn_decode_qkv_dtype=qkv_dtype,
             gdn_disable_fallbacks=disable_fallbacks,
-            gdn_packed_decode_max_batch=max_batch,
+            gdn_decode_max_batch=max_batch,
         )
     )
 
 
-def _tiny_gdn_decode_config(**overrides) -> "RuntimeConfig":
-    fields = dict(
-        vocab_size=16,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=1,
-        num_key_value_heads=1,
-        head_dim=4,
-        linear_num_key_heads=1,
-        linear_num_value_heads=2,
-        linear_key_head_dim=4,
-        linear_value_head_dim=4,
-        linear_conv_kernel_size=4,
-        layer_types=("linear_attention",),
-        linear_attn_layers=(0,),
-        dtype="float32",
+def _tiny_gdn_decode_config(
+    *, gdn_packed_decode_impl: str = "off", use_qk_norm_in_gdn: bool = True
+) -> "RuntimeSpec":
+    return runtime_spec(
+        model={
+            "vocab_size": 16,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 2,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_size": 4,
+            "use_qk_norm_in_gdn": use_qk_norm_in_gdn,
+            "layer_types": ("linear_attention",),
+        },
+        compile={"dtype": "float32"},
+        kernels={"gdn_decode": gdn_packed_decode_impl},
     )
-    fields.update(overrides)
-    return RuntimeConfig(**fields)
 
 
 def test_gdn_fla_reference_module_is_fallback_compatible():
@@ -345,40 +349,40 @@ def test_packed_gdn_decode_from_decay_matches_a_log_reference():
 def test_model_packed_gdn_decode_reference_matches_default():
     config = _tiny_gdn_decode_config()
     actual_config = _tiny_gdn_decode_config(gdn_packed_decode_impl="reference")
-    params = init_transformer_block(jax.random.PRNGKey(0), config, layer_idx=0)
+    params = init_transformer_block(jax.random.PRNGKey(0), config.model, layer_idx=0)
     batch = 2
     seq_len = 1
-    key_dim = config.linear_num_key_heads * config.linear_key_head_dim
-    value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+    key_dim = config.model.linear_num_key_heads * config.model.linear_key_head_dim
+    value_dim = config.model.linear_num_value_heads * config.model.linear_value_head_dim
     conv_dim = 2 * key_dim + value_dim
     x = jnp.linspace(
         -0.4,
         0.3,
-        batch * seq_len * config.hidden_size,
+        batch * seq_len * config.model.hidden_size,
         dtype=jnp.float32,
-    ).reshape(batch, seq_len, config.hidden_size)
+    ).reshape(batch, seq_len, config.model.hidden_size)
     hybrid_state = HybridLayerState(
         conv_state=jnp.linspace(
             -0.2,
             0.2,
-            batch * 1 * conv_dim * config.linear_conv_kernel_size,
+            batch * 1 * conv_dim * config.model.linear_conv_kernel_size,
             dtype=jnp.float32,
-        ).reshape(batch, 1, conv_dim, config.linear_conv_kernel_size),
+        ).reshape(batch, 1, conv_dim, config.model.linear_conv_kernel_size),
         recurrent_state=jnp.linspace(
             -0.03,
             0.04,
             batch
             * 1
-            * config.linear_num_value_heads
-            * config.linear_value_head_dim
-            * config.linear_key_head_dim,
+            * config.model.linear_num_value_heads
+            * config.model.linear_value_head_dim
+            * config.model.linear_key_head_dim,
             dtype=jnp.float32,
         ).reshape(
             batch,
             1,
-            config.linear_num_value_heads,
-            config.linear_value_head_dim,
-            config.linear_key_head_dim,
+            config.model.linear_num_value_heads,
+            config.model.linear_value_head_dim,
+            config.model.linear_key_head_dim,
         ),
     )
     positions = jnp.zeros((batch, seq_len), dtype=jnp.int32)
@@ -421,6 +425,66 @@ def test_model_packed_gdn_decode_reference_matches_default():
         rtol=2e-5,
         atol=2e-5,
     )
+
+
+def test_model_threads_qk_norm_policy_through_prefill_and_decode():
+    config = _tiny_gdn_decode_config(use_qk_norm_in_gdn=False)
+    params = init_transformer_block(jax.random.PRNGKey(0), config.model, layer_idx=0)
+    calls = []
+
+    class RecordingOps(ServingOps):
+        def gated_delta_prefill(self, *args, **kwargs):
+            calls.append(("prefill", kwargs["use_qk_l2norm_in_kernel"]))
+            return super().gated_delta_prefill(*args, **kwargs)
+
+        def gated_delta_decode(self, *args, **kwargs):
+            calls.append(("decode", kwargs["use_qk_l2norm_in_kernel"]))
+            return super().gated_delta_decode(*args, **kwargs)
+
+    backend = RecordingOps(config.kernels)
+    gated_deltanet_block(
+        jnp.ones((1, 4, config.model.hidden_size), dtype=jnp.float32),
+        params,
+        jnp.arange(4, dtype=jnp.int32)[None, :],
+        config,
+        layer_idx=0,
+        is_prefill=True,
+        backend=backend,
+    )
+
+    key_dim = config.model.linear_num_key_heads * config.model.linear_key_head_dim
+    value_dim = config.model.linear_num_value_heads * config.model.linear_value_head_dim
+    conv_dim = 2 * key_dim + value_dim
+    state = HybridLayerState(
+        conv_state=jnp.zeros(
+            (1, 1, conv_dim, config.model.linear_conv_kernel_size),
+            dtype=jnp.float32,
+        ),
+        recurrent_state=jnp.zeros(
+            (
+                1,
+                1,
+                config.model.linear_num_value_heads,
+                config.model.linear_value_head_dim,
+                config.model.linear_key_head_dim,
+            ),
+            dtype=jnp.float32,
+        ),
+    )
+    gated_deltanet_block(
+        jnp.ones((1, 1, config.model.hidden_size), dtype=jnp.float32),
+        params,
+        jnp.zeros((1, 1), dtype=jnp.int32),
+        config,
+        layer_idx=0,
+        is_prefill=False,
+        hybrid_state=state,
+        backend=backend,
+    )
+
+    assert calls == [("prefill", False), ("decode", False)]
+
+
 def _packed_decode_expected(
     mixed_qkv: jnp.ndarray,
     a: jnp.ndarray,
@@ -431,7 +495,6 @@ def _packed_decode_expected(
     *,
     use_qk_l2norm_in_kernel: bool = True,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    batch = state.shape[0]
     num_value_heads = state.shape[1]
     key_dim = state.shape[3]
     value_dim = state.shape[2]

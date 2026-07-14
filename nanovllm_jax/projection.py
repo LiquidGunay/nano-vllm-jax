@@ -8,9 +8,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.fastpath import KernelPlan
 from nanovllm_jax.layers import rms_norm
-from nanovllm_jax.ops import gdn_packed_decode_enabled
 
 _GDN_DECODE_IN_PROJ_PACKED_KEY = "in_proj_qkv_abz"
 _FULL_ATTN_DECODE_QKV_PACKED_KEY = "qkv_proj_decode"
@@ -36,39 +35,6 @@ def _causal_conv1d(
     if activation == "relu":
         return jax.nn.relu(out)
     return out
-
-
-def _config_bool(
-    config: Optional[RuntimeConfig],
-    attr: str,
-    *,
-    default: bool = False,
-) -> bool:
-    if config is not None and hasattr(config, attr):
-        return bool(getattr(config, attr))
-    return default
-
-
-def _config_str(
-    config: Optional[RuntimeConfig],
-    attr: str,
-    *,
-    default: str,
-) -> str:
-    if config is not None and hasattr(config, attr):
-        return str(getattr(config, attr) or default).strip().lower()
-    return default
-
-
-def _config_int(
-    config: Optional[RuntimeConfig],
-    attr: str,
-    *,
-    default: int,
-) -> int:
-    if config is not None and hasattr(config, attr):
-        return int(getattr(config, attr) or default)
-    return default
 
 
 def _tokenwise_decode_dot(x: jnp.ndarray, weight: jnp.ndarray, *, force_width1: bool = False) -> jnp.ndarray:
@@ -213,12 +179,8 @@ def _force_width1_decode_math() -> bool:
     return True
 
 
-def _lm_head_decode_activation_dtype(config: Optional[RuntimeConfig] = None) -> jnp.dtype:
-    value = _config_str(
-        config,
-        "lm_head_decode_act_dtype",
-        default="fp32",
-    )
+def _lm_head_decode_activation_dtype(plan: KernelPlan) -> jnp.dtype:
+    value = plan.lm_head_decode_act_dtype
     if value in {"", "0", "false", "no", "off", "none", "fp32", "float32"}:
         return jnp.float32
     if value in {"bf16", "bfloat16"}:
@@ -228,71 +190,41 @@ def _lm_head_decode_activation_dtype(config: Optional[RuntimeConfig] = None) -> 
     )
 
 
-def _decode_padded_gemm_enabled(config: Optional[RuntimeConfig] = None) -> bool:
-    return _config_bool(
-        config,
-        "decode_padded_gemm",
-    )
+def _decode_padded_gemm_enabled(plan: KernelPlan) -> bool:
+    return plan.decode_padded_gemm
 
 
-def _decode_padded_gemm_gate_up_enabled(config: Optional[RuntimeConfig] = None) -> bool:
-    return _config_bool(
-        config,
-        "decode_padded_gemm_gate_up",
-    )
+def _decode_padded_gemm_gate_up_enabled(plan: KernelPlan) -> bool:
+    return plan.decode_padded_gemm_gate_up
 
 
-def _decode_rms_padded_gemm_enabled(config: Optional[RuntimeConfig] = None) -> bool:
-    return bool(getattr(config, "decode_rms_padded_gemm", False))
+def _decode_rms_padded_gemm_enabled(plan: KernelPlan) -> bool:
+    return plan.decode_rms_padded_gemm
 
 
-def _decode_padded_gemm_rows(config: Optional[RuntimeConfig] = None) -> int:
-    value = _config_int(
-        config,
-        "decode_padded_gemm_rows",
-        default=8,
-    )
-    try:
-        rows = int(value)
-    except ValueError as exc:
-        raise ValueError(
-            f"decode_padded_gemm_rows must be an integer, got {value!r}"
-        ) from exc
+def _decode_padded_gemm_rows(plan: KernelPlan) -> int:
+    rows = plan.decode_padded_gemm_rows
     if rows < 1:
         raise ValueError("decode_padded_gemm_rows must be positive")
     return rows
 
 
-def _decode_padded_gemm_max_out_dim(config: Optional[RuntimeConfig] = None) -> int:
-    value = _config_int(
-        config,
-        "decode_padded_gemm_max_out_dim",
-        default=300000,
-    )
-    try:
-        out_dim = int(value)
-    except ValueError as exc:
-        raise ValueError(
-            f"decode_padded_gemm_max_out_dim must be an integer, got {value!r}"
-        ) from exc
+def _decode_padded_gemm_max_out_dim(plan: KernelPlan) -> int:
+    out_dim = plan.decode_padded_gemm_max_out_dim
     if out_dim < 1:
         raise ValueError("decode_padded_gemm_max_out_dim must be positive")
     return out_dim
 
 
-def _lm_head_topk_impl(config: Optional[RuntimeConfig] = None) -> str:
-    value = _config_str(
-        config,
-        "lm_head_topk_impl",
-        default="jax",
-    )
+def _lm_head_topk_impl(plan: KernelPlan) -> str:
+    value = plan.lm_head_sampled
     if value in {"", "0", "false", "no", "off", "none", "jax", "reference"}:
         return "jax"
     raise ValueError(f"lm_head_topk_impl must be jax, got {value!r}")
 
 
-def _lm_head_greedy_top1_impl(config: Optional[RuntimeConfig] = None) -> str:
-    value = str(getattr(config, "lm_head_greedy_top1_impl", "jax") or "jax").strip().lower()
+def _lm_head_greedy_top1_impl(plan: KernelPlan) -> str:
+    value = plan.lm_head_greedy
     if value in {"", "0", "false", "no", "off", "none", "jax", "reference"}:
         return "jax"
     if value in {"triton", "triton_tensorcore", "triton_epilogue"}:
@@ -303,30 +235,30 @@ def _lm_head_greedy_top1_impl(config: Optional[RuntimeConfig] = None) -> str:
 def _can_use_decode_padded_gemm(
     x: jnp.ndarray,
     weight: jnp.ndarray,
-    config: Optional[RuntimeConfig] = None,
+    plan: KernelPlan,
 ) -> bool:
-    rows = _decode_padded_gemm_rows(config)
+    rows = _decode_padded_gemm_rows(plan)
     return (
-        _decode_padded_gemm_enabled(config)
+        _decode_padded_gemm_enabled(plan)
         and x.ndim == 3
         and weight.ndim == 2
         and int(x.shape[0]) <= rows
         and int(x.shape[1]) == 1
         and int(x.shape[-1]) == int(weight.shape[0])
-        and int(weight.shape[1]) <= _decode_padded_gemm_max_out_dim(config)
+        and int(weight.shape[1]) <= _decode_padded_gemm_max_out_dim(plan)
     )
 
 
 def _decode_padded_gemm_dot(
     x: jnp.ndarray,
     weight: jnp.ndarray,
-    config: Optional[RuntimeConfig] = None,
+    plan: KernelPlan,
 ) -> jnp.ndarray:
     """Run a small-B decode projection through a row-padded GEMM."""
     batch = int(x.shape[0])
     hidden = int(x.shape[-1])
     out_dim = int(weight.shape[1])
-    rows = _decode_padded_gemm_rows(config)
+    rows = _decode_padded_gemm_rows(plan)
     x_rows = jnp.reshape(x, (batch, hidden))
     if batch < rows:
         x_padded = jnp.pad(x_rows, ((0, rows - batch), (0, 0)))
@@ -340,13 +272,13 @@ def _can_use_decode_rms_padded_gemm(
     x: jnp.ndarray,
     norm_weight: jnp.ndarray,
     weight: jnp.ndarray,
-    config: Optional[RuntimeConfig] = None,
+    plan: KernelPlan,
 ) -> bool:
-    rows = _decode_padded_gemm_rows(config)
+    rows = _decode_padded_gemm_rows(plan)
     return (
-        _decode_rms_padded_gemm_enabled(config)
-        and _decode_padded_gemm_gate_up_enabled(config)
-        and _decode_projection_activation_dtype(int(x.shape[0]), config) == jnp.bfloat16
+        _decode_rms_padded_gemm_enabled(plan)
+        and _decode_padded_gemm_gate_up_enabled(plan)
+        and _decode_projection_activation_dtype(int(x.shape[0]), plan) == jnp.bfloat16
         and x.ndim == 3
         and norm_weight.ndim == 1
         and weight.ndim == 2
@@ -355,7 +287,7 @@ def _can_use_decode_rms_padded_gemm(
         and int(x.shape[-1]) == int(norm_weight.shape[0])
         and int(x.shape[-1]) == int(weight.shape[0])
         and weight.dtype == jnp.bfloat16
-        and int(weight.shape[1]) <= _decode_padded_gemm_max_out_dim(config)
+        and int(weight.shape[1]) <= _decode_padded_gemm_max_out_dim(plan)
     )
 
 
@@ -363,7 +295,8 @@ def _decode_rms_padded_gemm_dot(
     x: jnp.ndarray,
     norm_weight: jnp.ndarray,
     weight: jnp.ndarray,
-    config: Optional[RuntimeConfig] = None,
+    eps: float,
+    plan: KernelPlan,
 ) -> jnp.ndarray:
     from nanovllm_jax.kernels.decode_reductions import triton_decode_rms_padded_gemm
 
@@ -371,20 +304,16 @@ def _decode_rms_padded_gemm_dot(
         x,
         norm_weight,
         weight,
-        eps=config.rms_norm_eps if config is not None else 1e-6,
-        rows=_decode_padded_gemm_rows(config),
+        eps=eps,
+        rows=_decode_padded_gemm_rows(plan),
     )
 
 
 def _decode_projection_activation_dtype(
-    batch_size: int | None = None,
-    config: Optional[RuntimeConfig] = None,
+    batch_size: int | None,
+    plan: KernelPlan,
 ) -> jnp.dtype:
-    value = _config_str(
-        config,
-        "decode_proj_act_dtype",
-        default="fp32",
-    )
+    value = plan.decode_proj_act_dtype
     if value in {"", "0", "false", "no", "off", "none", "fp32", "float32"}:
         return jnp.float32
     if value in {"bf16", "bfloat16"}:
@@ -402,13 +331,13 @@ def _use_gdn_decode_packed_in_proj(
     is_prefill: bool,
     batch: int,
     seq_len: int,
-    config: Optional[RuntimeConfig] = None,
+    plan: KernelPlan,
 ) -> bool:
-    width_one = bool(getattr(config, "gdn_width1_packed_input_projection", False))
+    width_one = plan.gdn_width1_packed_input_projection
     return (
         not is_prefill
         and _GDN_DECODE_IN_PROJ_PACKED_KEY in params
-        and (seq_len == 1 or gdn_packed_decode_enabled(config))
+        and (seq_len == 1 or plan.gdn_decode != "off")
         and (batch > 1 or width_one)
     )
 
@@ -417,13 +346,13 @@ def _use_gdn_prefill_packed_in_proj(
     params: Dict[str, jnp.ndarray],
     *,
     is_prefill: bool,
-    config: Optional[RuntimeConfig] = None,
+    plan: KernelPlan,
 ) -> bool:
     return (
         is_prefill
         and _GDN_DECODE_IN_PROJ_PACKED_KEY in params
-        and _enable_compact_prefill_in_proj_qkv(config)
-        and _enable_compact_prefill_gdn_z(config)
+        and _enable_compact_prefill_in_proj_qkv(plan)
+        and _enable_compact_prefill_gdn_z(plan)
     )
 
 
@@ -446,50 +375,33 @@ def _use_full_attention_prefill_packed_qkv(
     params: Dict[str, jnp.ndarray],
     *,
     is_prefill: bool,
-    config: Optional[RuntimeConfig] = None,
+    plan: KernelPlan,
 ) -> bool:
     return (
         is_prefill
         and _FULL_ATTN_DECODE_QKV_PACKED_KEY in params
-        and _enable_compact_prefill_full_attn_proj(config)
+        and _enable_compact_prefill_full_attn_proj(plan)
     )
 
 
-def _enable_chunked_gdn_prefill() -> bool:
-    """Use the promoted chunked cached-prefill GDN path."""
-    return True
-
-
-def _enable_compact_prefill_in_proj_qkv(config: Optional[RuntimeConfig] = None) -> bool:
+def _enable_compact_prefill_in_proj_qkv(plan: KernelPlan) -> bool:
     """Compact true prefill tokens for the GDN QKV input projection."""
-    return _config_bool(
-        config,
-        "compact_prefill_in_proj_qkv",
-    )
+    return plan.compact_prefill_in_proj_qkv
 
 
-def _enable_compact_prefill_mlp(config: Optional[RuntimeConfig] = None) -> bool:
+def _enable_compact_prefill_mlp(plan: KernelPlan) -> bool:
     """Compact true prefill tokens for tokenwise MLP projections."""
-    return _config_bool(
-        config,
-        "compact_prefill_mlp",
-    )
+    return plan.compact_prefill_mlp
 
 
-def _enable_compact_prefill_gdn_z(config: Optional[RuntimeConfig] = None) -> bool:
+def _enable_compact_prefill_gdn_z(plan: KernelPlan) -> bool:
     """Compact true prefill tokens for the GDN Z input projection."""
-    return _config_bool(
-        config,
-        "compact_prefill_gdn_z",
-    )
+    return plan.compact_prefill_gdn_z
 
 
-def _enable_compact_prefill_full_attn_proj(config: Optional[RuntimeConfig] = None) -> bool:
+def _enable_compact_prefill_full_attn_proj(plan: KernelPlan) -> bool:
     """Compact true prefill tokens for full-attention Q/K/V projections."""
-    return _config_bool(
-        config,
-        "compact_prefill_full_attn_proj",
-    )
+    return plan.compact_prefill_full_attn_proj
 
 
 def _compact_prefill_dot_if_enabled(
@@ -522,7 +434,7 @@ def _compact_prefill_tokenwise_dot(
     weight: jnp.ndarray,
     valid_token_mask: Optional[jnp.ndarray],
     compact_num_tokens: Optional[int],
-    config: Optional[RuntimeConfig] = None,
+    plan: KernelPlan,
 ) -> jnp.ndarray:
     """Run a tokenwise projection only on true ragged prefill tokens."""
     return _compact_prefill_dot_if_enabled(
@@ -530,7 +442,7 @@ def _compact_prefill_tokenwise_dot(
         weight,
         valid_token_mask,
         compact_num_tokens,
-        enabled=_enable_compact_prefill_in_proj_qkv(config),
+        enabled=_enable_compact_prefill_in_proj_qkv(plan),
     )
 
 
@@ -542,11 +454,11 @@ def _compact_prefill_mlp(
     activation_fn,
     valid_token_mask: Optional[jnp.ndarray],
     compact_num_tokens: Optional[int],
-    config: Optional[RuntimeConfig] = None,
+    plan: KernelPlan,
 ) -> jnp.ndarray:
     """Run tokenwise prefill MLP only on true ragged tokens."""
     if (
-        not _enable_compact_prefill_mlp(config)
+        not _enable_compact_prefill_mlp(plan)
         or valid_token_mask is None
         or compact_num_tokens is None
         or x.ndim != 3
@@ -572,11 +484,11 @@ def _compact_prefill_mlp_packed(
     activation_fn,
     valid_token_mask: Optional[jnp.ndarray],
     compact_num_tokens: Optional[int],
-    config: Optional[RuntimeConfig] = None,
+    plan: KernelPlan,
 ) -> jnp.ndarray:
     """Run tokenwise prefill MLP only on true ragged tokens with packed gate/up."""
     if (
-        not _enable_compact_prefill_mlp(config)
+        not _enable_compact_prefill_mlp(plan)
         or valid_token_mask is None
         or compact_num_tokens is None
         or x.ndim != 3

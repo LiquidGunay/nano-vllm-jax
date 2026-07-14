@@ -5,7 +5,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 
-from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.config import ModelSpec
 from nanovllm_jax.model import ModelParams
 
 
@@ -165,10 +165,14 @@ def _normalize_hf_key(key: str) -> str:
     return key
 
 
-def _checkpoint_dtypes(config: RuntimeConfig):
+def _checkpoint_dtypes(dtype: str):
     import ml_dtypes
 
-    target_dtype = config.get_dtype()
+    target_dtype = {
+        "bfloat16": jnp.bfloat16,
+        "float16": jnp.float16,
+        "float32": jnp.float32,
+    }[dtype]
     if target_dtype == jnp.bfloat16:
         return ml_dtypes.bfloat16, jnp.bfloat16
     if target_dtype == jnp.float16:
@@ -179,13 +183,13 @@ def _checkpoint_dtypes(config: RuntimeConfig):
 def _to_jax_weight(
     reader: _SafeTensorReader,
     key: str,
-    config: RuntimeConfig,
+    dtype: str,
     *,
     transpose: bool = False,
     squeeze_axis: int | None = None,
     exp: bool = False,
 ):
-    np_dtype, jax_dtype = _checkpoint_dtypes(config)
+    np_dtype, jax_dtype = _checkpoint_dtypes(dtype)
     value = np.asarray(reader.get(key))
     if squeeze_axis is not None and value.ndim > squeeze_axis:
         value = np.squeeze(value, axis=squeeze_axis)
@@ -213,7 +217,7 @@ def _expect_shape(name: str, value: jnp.ndarray, expected: tuple[int, ...]) -> N
         raise ValueError(f"{name} has shape {actual}, expected {expected}")
 
 
-def _validate_params(params: ModelParams, config: RuntimeConfig) -> None:
+def _validate_params(params: ModelParams, config: ModelSpec) -> None:
     hidden = config.hidden_size
     intermediate = config.intermediate_size
     key_dim = config.linear_num_key_heads * config.linear_key_head_dim
@@ -276,21 +280,19 @@ def _validate_params(params: ModelParams, config: RuntimeConfig) -> None:
 
 def load_weights_from_hf_streaming(
     model: str | Path,
-    config: RuntimeConfig,
+    config: ModelSpec,
+    dtype: str,
     *,
     verbose: bool = False,
     cache_dir: str = None,
 ) -> ModelParams:
     """Load HF weights one tensor at a time to keep peak memory bounded."""
-    if config is None:
-        raise ValueError("config is required - cannot be None")
-
     hf_path = resolve_checkpoint(model, cache_dir=cache_dir)
     print(f"Loading weights from {hf_path}...")
     reader = _SafeTensorReader(hf_path)
 
     print("Converting weights...")
-    embed_tokens = _to_jax_weight(reader, "embed_tokens.weight", config)
+    embed_tokens = _to_jax_weight(reader, "embed_tokens.weight", dtype)
 
     layers = []
     for i in range(config.num_hidden_layers):
@@ -299,35 +301,35 @@ def load_weights_from_hf_streaming(
         layer_type = config.layer_types[i]
 
         if layer_type == "full_attention":
-            layer_params["q_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.q_proj.weight", config, transpose=True)
-            layer_params["k_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.k_proj.weight", config, transpose=True)
-            layer_params["v_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.v_proj.weight", config, transpose=True)
-            layer_params["o_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.o_proj.weight", config, transpose=True)
-            layer_params["q_norm"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.q_norm.weight", config)
-            layer_params["k_norm"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.k_norm.weight", config)
-            layer_params["input_norm"] = _to_jax_weight(reader, f"{layer_prefix}input_layernorm.weight", config)
-            layer_params["gate_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.gate_proj.weight", config, transpose=True)
-            layer_params["up_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.up_proj.weight", config, transpose=True)
-            layer_params["down_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.down_proj.weight", config, transpose=True)
-            layer_params["ffn_norm"] = _to_jax_weight(reader, f"{layer_prefix}post_attention_layernorm.weight", config)
+            layer_params["q_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.q_proj.weight", dtype, transpose=True)
+            layer_params["k_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.k_proj.weight", dtype, transpose=True)
+            layer_params["v_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.v_proj.weight", dtype, transpose=True)
+            layer_params["o_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.o_proj.weight", dtype, transpose=True)
+            layer_params["q_norm"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.q_norm.weight", dtype)
+            layer_params["k_norm"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.k_norm.weight", dtype)
+            layer_params["input_norm"] = _to_jax_weight(reader, f"{layer_prefix}input_layernorm.weight", dtype)
+            layer_params["gate_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.gate_proj.weight", dtype, transpose=True)
+            layer_params["up_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.up_proj.weight", dtype, transpose=True)
+            layer_params["down_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.down_proj.weight", dtype, transpose=True)
+            layer_params["ffn_norm"] = _to_jax_weight(reader, f"{layer_prefix}post_attention_layernorm.weight", dtype)
             _add_full_attention_decode_packed_qkv(layer_params)
             _add_mlp_packed_gate_up(layer_params)
         else:
             linear_prefix = f"{layer_prefix}linear_attn."
-            layer_params["in_proj_qkv"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_qkv.weight", config, transpose=True)
-            layer_params["in_proj_a"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_a.weight", config, transpose=True)
-            layer_params["in_proj_b"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_b.weight", config, transpose=True)
-            layer_params["in_proj_z"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_z.weight", config, transpose=True)
-            layer_params["conv1d_weight"] = _to_jax_weight(reader, f"{linear_prefix}conv1d.weight", config, squeeze_axis=1)
-            layer_params["dt_bias"] = _to_jax_weight(reader, f"{linear_prefix}dt_bias", config)
-            layer_params["A"] = _to_jax_weight(reader, f"{linear_prefix}A_log", config, exp=True)
-            layer_params["norm_weight"] = _to_jax_weight(reader, f"{linear_prefix}norm.weight", config)
-            layer_params["out_proj"] = _to_jax_weight(reader, f"{linear_prefix}out_proj.weight", config, transpose=True)
-            layer_params["input_norm"] = _to_jax_weight(reader, f"{layer_prefix}input_layernorm.weight", config)
-            layer_params["ffn_norm"] = _to_jax_weight(reader, f"{layer_prefix}post_attention_layernorm.weight", config)
-            layer_params["gate_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.gate_proj.weight", config, transpose=True)
-            layer_params["up_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.up_proj.weight", config, transpose=True)
-            layer_params["down_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.down_proj.weight", config, transpose=True)
+            layer_params["in_proj_qkv"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_qkv.weight", dtype, transpose=True)
+            layer_params["in_proj_a"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_a.weight", dtype, transpose=True)
+            layer_params["in_proj_b"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_b.weight", dtype, transpose=True)
+            layer_params["in_proj_z"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_z.weight", dtype, transpose=True)
+            layer_params["conv1d_weight"] = _to_jax_weight(reader, f"{linear_prefix}conv1d.weight", dtype, squeeze_axis=1)
+            layer_params["dt_bias"] = _to_jax_weight(reader, f"{linear_prefix}dt_bias", dtype)
+            layer_params["A"] = _to_jax_weight(reader, f"{linear_prefix}A_log", dtype, exp=True)
+            layer_params["norm_weight"] = _to_jax_weight(reader, f"{linear_prefix}norm.weight", dtype)
+            layer_params["out_proj"] = _to_jax_weight(reader, f"{linear_prefix}out_proj.weight", dtype, transpose=True)
+            layer_params["input_norm"] = _to_jax_weight(reader, f"{layer_prefix}input_layernorm.weight", dtype)
+            layer_params["ffn_norm"] = _to_jax_weight(reader, f"{layer_prefix}post_attention_layernorm.weight", dtype)
+            layer_params["gate_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.gate_proj.weight", dtype, transpose=True)
+            layer_params["up_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.up_proj.weight", dtype, transpose=True)
+            layer_params["down_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.down_proj.weight", dtype, transpose=True)
             _add_gdn_decode_packed_in_proj(layer_params)
             _add_mlp_packed_gate_up(layer_params)
 
@@ -335,9 +337,9 @@ def load_weights_from_hf_streaming(
         if verbose:
             print(f"  converted layer {i}: {layer_type}")
 
-    norm_weight = _to_jax_weight(reader, "norm.weight", config)
+    norm_weight = _to_jax_weight(reader, "norm.weight", dtype)
     if reader.has("lm_head.weight"):
-        lm_head = _to_jax_weight(reader, "lm_head.weight", config)
+        lm_head = _to_jax_weight(reader, "lm_head.weight", dtype)
     elif config.tie_word_embeddings:
         lm_head = None
     else:

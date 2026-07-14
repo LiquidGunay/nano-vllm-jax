@@ -2,8 +2,10 @@
 
 import jax
 import jax.numpy as jnp
-from typing import Any, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 from dataclasses import dataclass, replace
+
+from nanovllm_jax.config import ModelSpec
 
 
 @dataclass
@@ -305,7 +307,7 @@ def full_attention_nhd_kv_cache_shape(
 
 def init_linear_attention_states(
     cache: KVCacheState,
-    config,
+    config: ModelSpec,
     batch_size: int = 1,
     dtype=None,
 ) -> KVCacheState:
@@ -315,7 +317,7 @@ def init_linear_attention_states(
         cache: Existing KVCacheState
         config: Model config with linear attention parameters
         batch_size: Batch size
-        dtype: Data type for conv_state (defaults to config.get_dtype() or float32)
+        dtype: Data type for conv_state (defaults to float32)
         
     Returns:
         Updated KVCacheState with initialized linear states
@@ -368,18 +370,18 @@ def _default_backend_is_gpu() -> bool:
 
 
 def init_hybrid_state(
-    config,
+    config: ModelSpec,
     batch_size: int = 1,
     dtype=None,
 ) -> HybridLayerState:
     """Initialize GDN conv/recurrent state separately from the KV cache."""
     if dtype is None:
-        dtype = getattr(config, "get_dtype", lambda: jnp.float32)()
+        dtype = jnp.float32
 
     key_dim = config.linear_num_key_heads * config.linear_key_head_dim
     value_dim = config.linear_num_value_heads * config.linear_value_head_dim
     conv_dim = key_dim * 2 + value_dim
-    num_linear_layers = sum(1 for lt in config.layer_types if lt == "linear_attention")
+    num_linear_layers = len(config.linear_attn_layers)
 
     conv_state = jnp.zeros(
         (batch_size, num_linear_layers, conv_dim, config.linear_conv_kernel_size),

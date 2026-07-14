@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from nanovllm_jax.ops import ServingOps
-from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.fastpath import KernelPlan
 
 
 def test_packed_post_conv_prefill_returns_prefix_states():
@@ -32,7 +32,7 @@ def test_packed_post_conv_prefill_returns_prefix_states():
         (2, num_value_heads, value_dim, key_dim),
         dtype=jnp.float32,
     )
-    backend = ServingOps(RuntimeConfig(gdn_prefill_post_conv_impl="reference"))
+    backend = ServingOps(KernelPlan(gdn_prefill="reference"))
 
     without_prefix = backend.gated_delta_packed_prefill_post_conv(
         conv_out,

@@ -251,7 +251,7 @@ def gdn_recurrent_decode_step(*args: Any, **kwargs: Any):
     from the frontend even while no external recurrent kernel is implemented.
     """
 
-    from nanovllm_jax.model import jax_recurrent_gated_delta_rule
+    from nanovllm_jax.gdn import jax_recurrent_gated_delta_rule
 
     if len(args) < 6:
         raise TypeError(
@@ -259,6 +259,9 @@ def gdn_recurrent_decode_step(*args: Any, **kwargs: Any):
             "query, key, value, g, beta, initial_state"
         )
     query, key, value, g, beta, initial_state = args[:6]
+    use_qk_l2norm_in_kernel = kwargs.pop("use_qk_l2norm_in_kernel", True)
+    if kwargs:
+        raise TypeError(f"unexpected keyword arguments: {', '.join(sorted(kwargs))}")
 
     if query.shape != key.shape:
         raise ValueError("query and key shapes must match")
@@ -278,7 +281,7 @@ def gdn_recurrent_decode_step(*args: Any, **kwargs: Any):
         g,
         beta,
         initial_state=initial_state,
-        use_qk_l2norm_in_kernel=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
 
@@ -464,7 +467,7 @@ def gdn_packed_decode_reference_from_decay(
     naming.
     """
 
-    from nanovllm_jax.model import jax_recurrent_gated_delta_rule
+    from nanovllm_jax.gdn import jax_recurrent_gated_delta_rule
 
     (
         mixed_qkv,
@@ -637,7 +640,7 @@ def gdn_fla_prefill_chunk32_fp32_reference(
     applies the chunk rule's query scale once.
     """
 
-    from nanovllm_jax.model import jax_chunk_gated_delta_rule
+    from nanovllm_jax.gdn import jax_chunk_gated_delta_rule
 
     inputs = prepare_gdn_fla_prefill_kernel_inputs(
         query,
@@ -705,7 +708,7 @@ def gdn_post_conv_prefill_reference_from_decay(
     packing, and the final call into the existing chunked reference.
     """
 
-    from nanovllm_jax.model import jax_chunk_gated_delta_rule
+    from nanovllm_jax.gdn import jax_chunk_gated_delta_rule
 
     query, key, value, gate, beta, _ = prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
         conv_out,
@@ -1955,7 +1958,7 @@ def gdn_segmented_prefill_chunk32_reference(
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Pure-JAX reference for the planned packed segmented GDN prefill ABI."""
 
-    from nanovllm_jax.model import jax_chunk_gated_delta_rule
+    from nanovllm_jax.gdn import jax_chunk_gated_delta_rule
 
     offsets = np.asarray(jax.device_get(cu_seqlens), dtype=np.int64).reshape(-1)
     if len(offsets) == 0 or offsets[0] != 0:

@@ -16,10 +16,11 @@ import pytest
 torch = pytest.importorskip("torch")
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from nanovllm_jax.config import RuntimeConfig
+from nanovllm_jax.config import RuntimeSpec
 from nanovllm_jax.layers import rms_norm
 from nanovllm_jax.weights import load_weights_from_hf_streaming
-from nanovllm_jax.model import _stable_rmsnorm_fp32
+from nanovllm_jax.projection import _stable_rmsnorm_fp32
+from tests.runtime_specs import runtime_spec
 
 
 jax.config.update("jax_default_matmul_precision", "highest")
@@ -53,7 +54,7 @@ class PromptTrace:
 
 @dataclass
 class RealWeightArtifacts:
-    config: RuntimeConfig
+    config: RuntimeSpec
     params: object
     traces: tuple[PromptTrace, ...]
 
@@ -206,12 +207,10 @@ def real_weight_artifacts() -> RealWeightArtifacts:
     del hf_model
     torch.cuda.empty_cache()
 
-    load_config = RuntimeConfig.qwen3_5_0_8b()
-    load_config.dtype = "bfloat16"
-    params = load_weights_from_hf_streaming(MODEL_NAME, load_config)
-
-    runtime_config = RuntimeConfig.qwen3_5_0_8b()
-    runtime_config.dtype = "float32"
+    runtime_config = runtime_spec()
+    params = load_weights_from_hf_streaming(
+        MODEL_NAME, runtime_config.model, "bfloat16"
+    )
     return RealWeightArtifacts(config=runtime_config, params=params, traces=traces)
 
 
@@ -232,14 +231,14 @@ def test_real_weight_rmsnorm_offset_semantics(real_weight_artifacts: RealWeightA
         rms_norm(
             jnp.array(standard["input"]),
             jnp.array(standard["weight"]),
-            real_weight_artifacts.config.rms_norm_eps,
+            real_weight_artifacts.config.model.rms_norm_eps,
         )
     )
     raw_weight_out = np.array(
         _stable_rmsnorm_fp32(
             jnp.array(standard["input"]),
             jnp.array(standard["weight"]),
-            real_weight_artifacts.config.rms_norm_eps,
+            real_weight_artifacts.config.model.rms_norm_eps,
         )
     )
 
@@ -250,14 +249,14 @@ def test_real_weight_rmsnorm_offset_semantics(real_weight_artifacts: RealWeightA
     gated_normed = _stable_rmsnorm_fp32(
         jnp.array(gated["input"]),
         jnp.array(gated["weight"]),
-        real_weight_artifacts.config.rms_norm_eps,
+        real_weight_artifacts.config.model.rms_norm_eps,
     )
     gated_out = np.array(gated_normed * jax.nn.silu(jnp.array(gated["gate"])))
     gated_off_by_one = np.array(
         rms_norm(
             jnp.array(gated["input"]),
             jnp.array(gated["weight"]),
-            real_weight_artifacts.config.rms_norm_eps,
+            real_weight_artifacts.config.model.rms_norm_eps,
         )
         * jax.nn.silu(jnp.array(gated["gate"]))
     )

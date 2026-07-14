@@ -1,19 +1,20 @@
 """Focused tests for deferred greedy token materialization."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from nanovllm_jax.config import RuntimeConfig
-from nanovllm_jax.device_batch import BatchMaterializer, DeviceBatch
+from nanovllm_jax.device_batch import BatchMaterializer, DeviceBatch, HostBatch
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.output import DeviceTokenRef, OutputBuffer
 from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.scheduler import Scheduler
-from nanovllm_jax.sequence import SamplingParams, Sequence, SequenceStatus
+from nanovllm_jax.sequence import SamplingParams, Sequence
 from nanovllm_jax.step import RunResult
+from tests.runtime_specs import runtime_spec
 
 
 def _batch_materializer(
@@ -48,8 +49,8 @@ class _AsyncScalar:
 
 
 def test_device_token_carry_comes_from_config():
-    enabled = RuntimeConfig(device_token_carry=True)
-    disabled = RuntimeConfig(device_token_carry=False)
+    enabled = runtime_spec(kernels={"device_token_carry": True})
+    disabled = runtime_spec(kernels={"device_token_carry": False})
 
     assert Scheduler(enabled).device_token_carry is True
     assert Scheduler(disabled).device_token_carry is False
@@ -172,9 +173,11 @@ def _decode_batch(
         num_decode_tokens=sum(query_lens),
         block_tables=jnp.zeros((len(seq_ids), 1), dtype=jnp.int32),
         seq_lens=jnp.asarray(seq_lens, dtype=jnp.int32),
-        seq_ids_host=seq_ids,
-        query_lens_host=tuple(query_lens),
-        seq_lens_host=tuple(seq_lens),
+        host=HostBatch(
+            seq_ids=seq_ids,
+            query_lens=tuple(query_lens),
+            seq_lens=tuple(seq_lens),
+        ),
     )
 
 
@@ -198,16 +201,18 @@ def _prefill_batch(
         num_decode_tokens=0,
         block_tables=jnp.zeros((len(seq_ids), 1), dtype=jnp.int32),
         seq_lens=jnp.asarray(query_lens, dtype=jnp.int32),
-        prefill_is_final=final_flags,
-        seq_ids_host=seq_ids,
-        query_lens_host=tuple(query_lens),
-        seq_lens_host=tuple(query_lens),
+        host=HostBatch(
+            seq_ids=seq_ids,
+            query_lens=tuple(query_lens),
+            seq_lens=tuple(query_lens),
+            prefill_is_final=final_flags,
+        ),
     )
 
 
 def test_model_runner_device_token_carry_uses_whole_vector_when_seq_ids_match(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = RuntimeConfig(device_token_carry=True)
+    runner.config = runtime_spec(kernels={"device_token_carry": True})
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -233,7 +238,7 @@ def test_model_runner_device_token_carry_uses_whole_vector_when_seq_ids_match(mo
 
 def test_model_runner_device_token_carry_records_full_static_decode_rows(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = RuntimeConfig(device_token_carry=True)
+    runner.config = runtime_spec(kernels={"device_token_carry": True})
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -263,7 +268,7 @@ def test_model_runner_device_token_carry_records_full_static_decode_rows(monkeyp
 
 def test_model_runner_device_token_carry_updates_resident_last_tokens(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = RuntimeConfig(device_token_carry=True)
+    runner.config = runtime_spec(kernels={"device_token_carry": True})
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -274,7 +279,6 @@ def test_model_runner_device_token_carry_updates_resident_last_tokens(monkeypatc
     seq_a = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
     seq_b = Sequence([2], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=8)
     batch = _decode_batch((7, 8, -1, -1), [0, 0, 0, 0], seq_lens=[4, 5, 0, 0])
-    batch.hybrid_slot_ids_host = (2, 1, -1, -1)
 
     runner._record_device_token_carry(
         batch,
@@ -294,7 +298,7 @@ def test_model_runner_device_token_carry_clears_resident_stale_when_tokens_alrea
     monkeypatch,
 ):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = RuntimeConfig(device_token_carry=True)
+    runner.config = runtime_spec(kernels={"device_token_carry": True})
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -323,7 +327,7 @@ def test_model_runner_device_token_carry_marks_resident_stale_when_not_updated(
     monkeypatch,
 ):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = RuntimeConfig(device_token_carry=True)
+    runner.config = runtime_spec(kernels={"device_token_carry": True})
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -347,7 +351,7 @@ def test_model_runner_device_token_carry_marks_resident_stale_when_not_updated(
 
 def test_model_runner_device_token_carry_follows_seq_ids_after_row_order_change(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = RuntimeConfig(device_token_carry=True)
+    runner.config = runtime_spec(kernels={"device_token_carry": True})
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -373,7 +377,7 @@ def test_model_runner_device_token_carry_follows_seq_ids_after_row_order_change(
 
 def test_model_runner_device_token_carry_survives_nonfinal_prefill_chunk(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = RuntimeConfig(device_token_carry=True)
+    runner.config = runtime_spec(kernels={"device_token_carry": True})
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
@@ -404,7 +408,7 @@ def test_model_runner_device_token_carry_survives_nonfinal_prefill_chunk(monkeyp
         seqs=[seq_b],
     )
     next_batch = _decode_batch((7, 8), [0, 0], seq_lens=[1, 1])
-    next_batch.uses_static_decode_metadata = True
+    next_batch.host = replace(next_batch.host, uses_static_decode_metadata=True)
 
     carried_batch = runner._maybe_apply_device_token_carry(next_batch)
 
@@ -413,7 +417,7 @@ def test_model_runner_device_token_carry_survives_nonfinal_prefill_chunk(monkeyp
 
 def test_model_runner_release_preserves_carry_for_still_running_rows():
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = RuntimeConfig(device_token_carry=True)
+    runner.config = runtime_spec(kernels={"device_token_carry": True})
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner.hybrid_states = {}
@@ -438,14 +442,17 @@ def test_model_runner_release_preserves_carry_for_still_running_rows():
 def test_materializer_reuses_fixed_decode_arrays(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
-        RuntimeConfig(
-            max_num_seqs=2,
-            batch_size_buckets=(2,),
-            max_blocks_per_seq=2,
-            num_kvcache_blocks=4,
-            jax_execution="jit",
-            device_token_carry=True,
-            static_decode_metadata=True,
+        runtime_spec(
+            capacity={
+                "max_num_seqs": 2,
+                "max_blocks_per_seq": 2,
+                "num_kvcache_blocks": 4,
+            },
+            compile={"batch_size_buckets": (2,), "execution": "jit"},
+            kernels={
+                "device_token_carry": True,
+                "static_decode_metadata": True,
+            },
         )
     )
     materializer = _batch_materializer()
@@ -465,8 +472,8 @@ def test_materializer_reuses_fixed_decode_arrays(monkeypatch):
         scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
     )
 
-    assert first.uses_static_decode_metadata
-    assert second.uses_static_decode_metadata
+    assert first.host.uses_static_decode_metadata
+    assert second.host.uses_static_decode_metadata
     assert second.tokens is first.tokens
     assert second.positions is first.positions
     assert second.seq_ids is first.seq_ids
@@ -474,18 +481,22 @@ def test_materializer_reuses_fixed_decode_arrays(monkeypatch):
     assert second.block_tables is first.block_tables
     np.testing.assert_array_equal(np.asarray(first.seq_lens), np.asarray([3, 3]))
     np.testing.assert_array_equal(np.asarray(second.seq_lens), np.asarray([4, 4]))
-    assert second.seq_lens_host == (4, 4)
+    assert second.host.seq_lens == (4, 4)
 
 
 def test_schedule_plan_selects_smallest_decode_block_bucket():
     scheduler = Scheduler(
-        RuntimeConfig(
-            max_num_seqs=2,
-            batch_size_buckets=(2,),
-            max_blocks_per_seq=8,
-            decode_block_table_buckets=(2, 4, 8),
-            num_kvcache_blocks=16,
-            jax_execution="jit",
+        runtime_spec(
+            capacity={
+                "max_num_seqs": 2,
+                "max_blocks_per_seq": 8,
+                "num_kvcache_blocks": 16,
+            },
+            compile={
+                "batch_size_buckets": (2,),
+                "decode_block_table_buckets": (2, 4, 8),
+                "execution": "jit",
+            },
         )
     )
     materializer = _batch_materializer()
@@ -505,14 +516,15 @@ def test_schedule_plan_selects_smallest_decode_block_bucket():
 
 def test_scheduler_resident_capacity_can_exceed_execution_batch():
     scheduler = Scheduler(
-        RuntimeConfig(
-            max_num_seqs=2,
-            max_num_resident_seqs=4,
-            max_num_batched_tokens=4,
-            batch_size_buckets=(2,),
-            max_blocks_per_seq=2,
-            num_kvcache_blocks=8,
-            jax_execution="jit",
+        runtime_spec(
+            capacity={
+                "max_num_seqs": 2,
+                "max_num_resident_seqs": 4,
+                "max_num_batched_tokens": 4,
+                "max_blocks_per_seq": 2,
+                "num_kvcache_blocks": 8,
+            },
+            compile={"batch_size_buckets": (2,), "execution": "jit"},
         )
     )
     seqs = [
@@ -560,15 +572,18 @@ def test_scheduler_resident_capacity_can_exceed_execution_batch():
 def test_materializer_can_reuse_seq_lens_placeholder(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
-        RuntimeConfig(
-            max_num_seqs=2,
-            batch_size_buckets=(2,),
-            max_blocks_per_seq=2,
-            num_kvcache_blocks=4,
-            jax_execution="jit",
-            device_token_carry=True,
-            static_decode_metadata=True,
-            static_decode_seq_lens_carry=True,
+        runtime_spec(
+            capacity={
+                "max_num_seqs": 2,
+                "max_blocks_per_seq": 2,
+                "num_kvcache_blocks": 4,
+            },
+            compile={"batch_size_buckets": (2,), "execution": "jit"},
+            kernels={
+                "device_token_carry": True,
+                "static_decode_metadata": True,
+                "static_decode_seq_lens_carry": True,
+            },
         )
     )
     materializer = _batch_materializer(seq_lens_carry=True)
@@ -588,24 +603,27 @@ def test_materializer_can_reuse_seq_lens_placeholder(monkeypatch):
         scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
     )
 
-    assert first.uses_static_decode_metadata
-    assert second.uses_static_decode_metadata
+    assert first.host.uses_static_decode_metadata
+    assert second.host.uses_static_decode_metadata
     assert second.seq_lens is first.seq_lens
-    assert second.seq_lens_host == (4, 4)
+    assert second.host.seq_lens == (4, 4)
 
 
 def test_materializer_uses_resident_metadata_placeholders(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
-        RuntimeConfig(
-            max_num_seqs=2,
-            batch_size_buckets=(2,),
-            max_blocks_per_seq=3,
-            num_kvcache_blocks=6,
-            jax_execution="jit",
-            device_token_carry=True,
-            static_decode_metadata=True,
-            resident_decode_metadata=True,
+        runtime_spec(
+            capacity={
+                "max_num_seqs": 2,
+                "max_blocks_per_seq": 3,
+                "num_kvcache_blocks": 6,
+            },
+            compile={"batch_size_buckets": (2,), "execution": "jit"},
+            kernels={
+                "device_token_carry": True,
+                "static_decode_metadata": True,
+                "resident_decode_metadata": True,
+            },
         )
     )
     materializer = _batch_materializer(resident=True)
@@ -626,29 +644,32 @@ def test_materializer_uses_resident_metadata_placeholders(monkeypatch):
         scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
     )
 
-    assert first.uses_static_decode_metadata
-    assert second.uses_static_decode_metadata
+    assert first.host.uses_static_decode_metadata
+    assert second.host.uses_static_decode_metadata
     assert second.block_tables is first.block_tables
     assert second.seq_lens is first.seq_lens
     np.testing.assert_array_equal(np.asarray(first.block_tables), np.zeros((2, 3), dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(second.seq_lens), np.zeros((2,), dtype=np.int32))
-    assert first.block_tables_host == ((1, 0, 0), (2, 0, 0))
-    assert second.block_tables_host == ((1, 4, 0), (2, 0, 0))
-    assert second.seq_lens_host == (4, 4)
+    assert first.host.block_tables == ((1, 0, 0), (2, 0, 0))
+    assert second.host.block_tables == ((1, 4, 0), (2, 0, 0))
+    assert second.host.seq_lens == (4, 4)
 
 
 def test_materializer_reuses_resident_placeholders_across_seq_ids(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
-        RuntimeConfig(
-            max_num_seqs=2,
-            batch_size_buckets=(2,),
-            max_blocks_per_seq=3,
-            num_kvcache_blocks=6,
-            jax_execution="jit",
-            device_token_carry=True,
-            static_decode_metadata=True,
-            resident_decode_metadata=True,
+        runtime_spec(
+            capacity={
+                "max_num_seqs": 2,
+                "max_blocks_per_seq": 3,
+                "num_kvcache_blocks": 6,
+            },
+            compile={"batch_size_buckets": (2,), "execution": "jit"},
+            kernels={
+                "device_token_carry": True,
+                "static_decode_metadata": True,
+                "resident_decode_metadata": True,
+            },
         )
     )
     materializer = _batch_materializer(resident=True)
@@ -674,10 +695,10 @@ def test_materializer_reuses_resident_placeholders_across_seq_ids(monkeypatch):
         scheduler.build_schedule_plan([seq_c, seq_d], is_prefill=False)
     )
 
-    assert first.uses_static_decode_metadata
-    assert second.uses_static_decode_metadata
-    assert first.seq_ids_host == (7, 8)
-    assert second.seq_ids_host == (17, 18)
+    assert first.host.uses_static_decode_metadata
+    assert second.host.uses_static_decode_metadata
+    assert first.host.seq_ids == (7, 8)
+    assert second.host.seq_ids == (17, 18)
     assert second.tokens is first.tokens
     assert second.positions is first.positions
     assert second.seq_ids is first.seq_ids
@@ -691,15 +712,18 @@ def test_materializer_reuses_resident_placeholders_across_seq_ids(monkeypatch):
 def test_materializer_preserves_greedy_burst_width(monkeypatch):
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     scheduler = Scheduler(
-        RuntimeConfig(
-            max_num_seqs=2,
-            batch_size_buckets=(2,),
-            max_blocks_per_seq=2,
-            num_kvcache_blocks=4,
-            jax_execution="jit",
-            device_token_carry=True,
-            static_decode_metadata=True,
-            greedy_decode_burst_steps=2,
+        runtime_spec(
+            capacity={
+                "max_num_seqs": 2,
+                "max_blocks_per_seq": 2,
+                "num_kvcache_blocks": 4,
+            },
+            compile={"batch_size_buckets": (2,), "execution": "jit"},
+            kernels={
+                "device_token_carry": True,
+                "static_decode_metadata": True,
+                "greedy_decode_burst_steps": 2,
+            },
         )
     )
     materializer = _batch_materializer()
@@ -718,20 +742,20 @@ def test_materializer_preserves_greedy_burst_width(monkeypatch):
         )
     )
 
-    assert batch.uses_static_decode_metadata
-    assert batch.decode_step_count_host == 2
+    assert batch.host.uses_static_decode_metadata
+    assert batch.host.decode_steps == 2
 
 
 def test_model_runner_static_decode_metadata_requires_token_carry(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = RuntimeConfig(device_token_carry=True)
+    runner.config = runtime_spec(kernels={"device_token_carry": True})
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = False
     runner._device_token_carry_seq_ids = None
     runner._device_token_carry_tokens = None
     runner._device_token_carry_by_seq_id = {}
     batch = _decode_batch((7,), [0])
-    batch.uses_static_decode_metadata = True
+    batch.host = replace(batch.host, uses_static_decode_metadata=True)
 
     with pytest.raises(RuntimeError, match="requires a device-token carry"):
         runner._maybe_apply_device_token_carry(batch)
@@ -739,9 +763,11 @@ def test_model_runner_static_decode_metadata_requires_token_carry(monkeypatch):
 
 def test_model_runner_static_decode_metadata_applies_carried_seq_lens(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = RuntimeConfig(
-        device_token_carry=True,
-        static_decode_seq_lens_carry=True,
+    runner.config = runtime_spec(
+        kernels={
+            "device_token_carry": True,
+            "static_decode_seq_lens_carry": True,
+        }
     )
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = True
@@ -762,7 +788,7 @@ def test_model_runner_static_decode_metadata_applies_carried_seq_lens(monkeypatc
         seqs=[seq_a, seq_b],
     )
     next_batch = _decode_batch((7, 8), [0, 0], seq_lens=[1, 1])
-    next_batch.uses_static_decode_metadata = True
+    next_batch.host = replace(next_batch.host, uses_static_decode_metadata=True)
 
     carried_batch = runner._maybe_apply_device_token_carry(next_batch)
 
@@ -772,9 +798,11 @@ def test_model_runner_static_decode_metadata_applies_carried_seq_lens(monkeypatc
 
 def test_model_runner_first_static_decode_can_use_scheduler_seq_lens(monkeypatch):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.config = RuntimeConfig(
-        device_token_carry=True,
-        static_decode_seq_lens_carry=True,
+    runner.config = runtime_spec(
+        kernels={
+            "device_token_carry": True,
+            "static_decode_seq_lens_carry": True,
+        }
     )
     runner.device_token_carry = True
     runner.static_decode_seq_lens_carry = True
@@ -795,7 +823,7 @@ def test_model_runner_first_static_decode_can_use_scheduler_seq_lens(monkeypatch
         seqs=[seq_a, seq_b],
     )
     next_batch = _decode_batch((7, 8), [0, 0], seq_lens=[5, 9])
-    next_batch.uses_static_decode_metadata = True
+    next_batch.host = replace(next_batch.host, uses_static_decode_metadata=True)
 
     carried_batch = runner._maybe_apply_device_token_carry(next_batch)
 
@@ -805,11 +833,13 @@ def test_model_runner_first_static_decode_can_use_scheduler_seq_lens(monkeypatch
 
 def test_engine_commit_can_defer_greedy_device_token(monkeypatch):
     scheduler = Scheduler(
-        RuntimeConfig(
-            max_num_seqs=1,
-            num_kvcache_blocks=4,
-            max_blocks_per_seq=4,
-            device_token_carry=True,
+        runtime_spec(
+            capacity={
+                "max_num_seqs": 1,
+                "num_kvcache_blocks": 4,
+                "max_blocks_per_seq": 4,
+            },
+            kernels={"device_token_carry": True},
         )
     )
     seq = Sequence(
@@ -834,11 +864,13 @@ def test_engine_commit_can_defer_greedy_device_token(monkeypatch):
 
 def test_engine_commit_can_defer_sampled_device_token_ref(monkeypatch):
     scheduler = Scheduler(
-        RuntimeConfig(
-            max_num_seqs=1,
-            num_kvcache_blocks=4,
-            max_blocks_per_seq=4,
-            device_token_carry=True,
+        runtime_spec(
+            capacity={
+                "max_num_seqs": 1,
+                "num_kvcache_blocks": 4,
+                "max_blocks_per_seq": 4,
+            },
+            kernels={"device_token_carry": True},
         )
     )
     seq = Sequence(

@@ -4,58 +4,21 @@ from pathlib import Path
 import pytest
 import yaml
 
-from nanovllm_jax.config import EngineConfig, ModelConfig, RuntimeConfig, WarmupConfig, load_engine_config
+from nanovllm_jax.config import (
+    EngineConfig,
+    ModelConfig,
+    ModelSpec,
+    RuntimeSpec,
+    WarmupConfig,
+    load_engine_config,
+)
+from nanovllm_jax.device_batch import HostBatch
 from nanovllm_jax.engine import _engine_config_from_public_kwargs
-from nanovllm_jax.fastpath import FASTPATH, engine_overrides
+from nanovllm_jax.fastpath import KERNEL_PLAN
+from tests.runtime_specs import qwen_text_config, runtime_spec
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-def _text_config(size: str = "4B") -> dict:
-    variants = {
-        "0.8B": (1024, 3584, 24, 8, 2, 16),
-        "2B": (2048, 6144, 24, 8, 2, 16),
-        "4B": (2560, 9216, 32, 16, 4, 32),
-    }
-    hidden, intermediate, layers, heads, kv_heads, linear_value_heads = variants[size]
-    return {
-        "model_type": "qwen3_5_text",
-        "vocab_size": 248320,
-        "hidden_size": hidden,
-        "intermediate_size": intermediate,
-        "num_hidden_layers": layers,
-        "num_attention_heads": heads,
-        "num_key_value_heads": kv_heads,
-        "head_dim": 256,
-        "linear_num_key_heads": 16,
-        "linear_num_value_heads": linear_value_heads,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_conv_kernel_dim": 4,
-        "full_attention_interval": 4,
-        "max_position_embeddings": 262144,
-        "layer_types": [
-            "linear_attention" if index % 4 != 3 else "full_attention"
-            for index in range(layers)
-        ],
-        "hidden_act": "silu",
-        "rms_norm_eps": 1e-6,
-        "attention_dropout": 0.0,
-        "attention_bias": False,
-        "attn_output_gate": True,
-        "mamba_ssm_dtype": "float32",
-        "tie_word_embeddings": True,
-        "eos_token_id": 248044,
-        "mlp_only_layers": [],
-        "rope_parameters": {
-            "rope_type": "default",
-            "rope_theta": 10_000_000,
-            "partial_rotary_factor": 0.25,
-            "mrope_section": [11, 11, 10],
-            "mrope_interleaved": True,
-        },
-    }
 
 
 def _write_checkpoint(path: Path, text: dict) -> None:
@@ -65,10 +28,16 @@ def _write_checkpoint(path: Path, text: dict) -> None:
 
 
 def test_runtime_config_has_no_speculative_surface():
-    config = RuntimeConfig()
+    config = runtime_spec()
 
     assert not hasattr(config, "speculative_method")
     assert not hasattr(config, "num_speculative_tokens")
+    with pytest.raises(TypeError):
+        RuntimeSpec()
+
+
+def test_materialized_host_batch_has_one_writer():
+    assert "hybrid_slot_ids" not in HostBatch.__dataclass_fields__
 
 
 def test_engine_config_validates_capacity():
@@ -82,10 +51,13 @@ def test_engine_config_validates_capacity():
 def test_engine_config_is_strict_and_parses_canonical_capacity():
     with pytest.raises(ValueError, match="unknown engine keys"):
         EngineConfig.from_mapping({"kv_cache_mb": 1024})
+    with pytest.raises(ValueError, match="unknown engine keys: max_prefill"):
+        EngineConfig.from_mapping({"max_prefill": 128})
+
+    assert not hasattr(EngineConfig(), "max_prefill")
 
     config = EngineConfig.from_mapping(
         {
-            "max_prefill": 128,
             "max_num_seqs": 2,
             "max_num_resident_seqs": 2,
             "max_num_batched_tokens": 128,
@@ -121,7 +93,6 @@ def test_shorthand_bucket_overrides_derive_matching_warmup():
     config = _engine_config_from_public_kwargs(
         "Qwen/Qwen3.5-0.8B",
         {
-            "max_prefill": 64,
             "max_num_seqs": 1,
             "max_num_batched_tokens": 64,
             "max_blocks_per_seq": 64,
@@ -156,9 +127,8 @@ def test_server_yaml_is_the_only_committed_serving_config():
     assert settings.engine.warmup.enabled is True
 
 
-def test_engine_config_projects_only_capacity_plus_fastpath_for_engine():
+def test_runtime_spec_composes_engine_capacity_and_kernel_policy():
     config = EngineConfig(
-        max_prefill=128,
         max_num_seqs=2,
         max_num_resident_seqs=3,
         max_num_batched_tokens=512,
@@ -176,18 +146,46 @@ def test_engine_config_projects_only_capacity_plus_fastpath_for_engine():
         prefix_cache=False,
     )
 
-    projected = config.to_engine_kwargs()
-    for key, value in engine_overrides(FASTPATH).items():
-        assert projected[key] == value
+    runtime = RuntimeSpec.promoted(ModelConfig(), config)
 
-    assert projected["max_num_seqs"] == 2
-    assert projected["max_num_resident_seqs"] == 3
-    assert projected["max_num_batched_tokens"] == 512
-    assert projected["max_blocks_per_seq"] == 64
-    assert projected["max_kv_cache_bytes"] == 256 * 1024 * 1024
-    assert projected["prefill_token_buckets"] == (64, 128, 512)
-    assert projected["decode_block_table_buckets"] == (64,)
-    assert projected["prefix_cache"] is False
+    assert runtime.kernels == KERNEL_PLAN
+    assert runtime.capacity.max_num_seqs == 2
+    assert runtime.capacity.max_num_resident_seqs == 3
+    assert runtime.capacity.max_num_batched_tokens == 512
+    assert runtime.capacity.max_blocks_per_seq == 64
+    assert runtime.capacity.max_kv_cache_bytes == 256 * 1024 * 1024
+    assert runtime.capacity.prefix_cache is False
+    assert runtime.compile.prefill_token_buckets == (64, 128, 512)
+    assert runtime.compile.decode_block_table_buckets == (64,)
+
+    import server
+
+    manifest = server._runtime_manifest(runtime)
+    assert tuple(manifest) == ("model", "capacity", "compile", "kernels")
+    assert manifest["compile"]["dtype"] == "bfloat16"
+    assert manifest["kernels"]["full_attention_decode"] == "flashinfer_paged"
+    assert "layer_types" not in json.dumps(manifest)
+    assert "decode_padded_gemm" not in json.dumps(manifest)
+
+
+def test_server_request_validation_reads_runtime_capacity(monkeypatch):
+    import server
+
+    runtime = runtime_spec(
+        capacity={
+            "block_size": 4,
+            "max_blocks_per_seq": 2,
+            "max_num_seqs": 1,
+            "max_num_resident_seqs": 1,
+        }
+    )
+    monkeypatch.setattr(server, "engine", type("Engine", (), {"config": runtime})())
+
+    server._validate_inputs_fit_config([[1, 2]], [2], max_tokens=6)
+    with pytest.raises(ValueError, match="per-sequence KV capacity 8"):
+        server._validate_inputs_fit_config([[1, 2]], [2], max_tokens=7)
+    with pytest.raises(ValueError, match="exceeding max_num_seqs 1"):
+        server._validate_inputs_fit_config([[1], [2]], [1, 1], max_tokens=1)
 
 
 def test_engine_config_rejects_unsorted_or_uncovered_buckets():
@@ -199,14 +197,25 @@ def test_engine_config_rejects_unsorted_or_uncovered_buckets():
 
 @pytest.mark.parametrize("size", ("0.8B", "2B", "4B"))
 def test_model_config_is_read_from_checkpoint(tmp_path, size):
-    _write_checkpoint(tmp_path, _text_config(size))
+    text = qwen_text_config(size)
+    _write_checkpoint(tmp_path, text)
 
     model = ModelConfig.from_checkpoint(tmp_path, model=f"Qwen/Qwen3.5-{size}")
-    runtime = RuntimeConfig.from_model_config(model)
 
-    assert model.hidden_size == runtime.hidden_size
-    assert model.num_hidden_layers == runtime.num_hidden_layers
-    assert model.linear_num_value_heads == runtime.linear_num_value_heads
+    assert model.hidden_size == text["hidden_size"]
+    assert model.num_hidden_layers == text["num_hidden_layers"]
+    assert model.linear_num_value_heads == text["linear_num_value_heads"]
+
+
+def test_only_validated_model_type_parses_checkpoints(tmp_path):
+    assert not hasattr(ModelSpec, "from_checkpoint")
+
+    text = qwen_text_config()
+    text["use_qk_norm_in_gdn"] = False
+    _write_checkpoint(tmp_path, text)
+
+    with pytest.raises(ValueError, match="use_qk_norm_in_gdn=False"):
+        ModelConfig.from_checkpoint(tmp_path, model="Qwen/Qwen3.5-4B")
 
 
 @pytest.mark.parametrize(
@@ -233,7 +242,7 @@ def test_model_config_is_read_from_checkpoint(tmp_path, size):
     ),
 )
 def test_model_config_rejects_unvalidated_architecture_field(tmp_path, path, value):
-    text = _text_config()
+    text = qwen_text_config()
     target = text
     for name in path[:-1]:
         target = target[name]
@@ -245,7 +254,7 @@ def test_model_config_rejects_unvalidated_architecture_field(tmp_path, path, val
 
 
 def test_model_config_rejects_altered_layer_order(tmp_path):
-    text = _text_config()
+    text = qwen_text_config()
     text["layer_types"][0] = "full_attention"
     _write_checkpoint(tmp_path, text)
 

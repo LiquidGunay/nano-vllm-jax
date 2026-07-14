@@ -8,10 +8,12 @@ single serving operation surface, not a backend-selection hierarchy.
 from __future__ import annotations
 
 from dataclasses import replace
+from enum import Enum
 from typing import Protocol
 
 import jax
 import jax.numpy as jnp
+from nanovllm_jax.fastpath import KernelPlan
 from nanovllm_jax.cache import (
     AttentionMetadata,
     FullAttentionNHDKVCacheStorage,
@@ -29,38 +31,17 @@ from nanovllm_jax.cache import (
     update_kv_cache,
 )
 
-_TRUE_CONFIG_VALUES = {"1", "true", "yes", "on"}
 _OFF_CONFIG_VALUES = {"", "0", "false", "no", "off", "none"}
 
 
-def _config_bool(config, attr: str, *, default: bool = False) -> bool:
-    if config is not None and hasattr(config, attr):
-        return bool(getattr(config, attr))
-    return default
+class GDNDecodeMode(Enum):
+    REFERENCE = "reference"
+    PACKED = "packed"
+    PACKED_SEQUENCE = "packed_sequence"
 
 
-def _config_str(config, attr: str, *, default: str) -> str:
-    if config is not None and hasattr(config, attr):
-        return str(getattr(config, attr) or default).strip().lower()
-    return default
-
-
-def _config_int_or_none(config, attr: str) -> int | None:
-    if config is not None and hasattr(config, attr):
-        value = getattr(config, attr)
-        if value is None:
-            return None
-        parsed = int(value)
-        return parsed if parsed > 0 else None
-    return None
-
-
-def _full_attention_kv_cache_dtype(default_dtype, config=None):
-    value = _config_str(
-        config,
-        "full_attention_kv_cache_dtype",
-        default="default",
-    )
+def _kv_cache_dtype(default_dtype, plan: KernelPlan):
+    value = plan.kv_cache_dtype
     if value == "default" or value in _OFF_CONFIG_VALUES:
         return default_dtype
     if value in {"bf16", "bfloat16"}:
@@ -75,81 +56,94 @@ def _full_attention_kv_cache_dtype(default_dtype, config=None):
     )
 
 
-def _full_attention_kv_append_impl(config=None) -> str:
-    value = _config_str(config, "full_attention_kv_append_impl", default="reference")
+def resolve_kv_cache_spec(spec: KVCacheSpec, plan: KernelPlan) -> KVCacheSpec:
+    """Resolve physical dtype and block count before scheduler construction."""
+
+    resolved = replace(spec, dtype=_kv_cache_dtype(spec.dtype, plan))
+    return replace(resolved, num_blocks=cap_num_kv_cache_blocks(resolved))
+
+
+def _require_finalized_kv_cache_spec(
+    spec: KVCacheSpec,
+    plan: KernelPlan,
+) -> KVCacheSpec:
+    resolved = resolve_kv_cache_spec(spec, plan)
+    if resolved.dtype != spec.dtype or resolved.num_blocks != spec.num_blocks:
+        raise ValueError(
+            "KVCacheSpec must be finalized before scheduler and runner construction"
+        )
+    return replace(resolved, max_kv_cache_bytes=None)
+
+
+def _full_attention_kv_append_impl(plan: KernelPlan) -> str:
+    value = plan.full_attention_kv_append
     if value == "reference":
         return "reference"
     raise ValueError("full_attention_kv_append_impl must be exactly 'reference'")
 
 
-def _full_attention_decode_impl(config=None) -> str:
-    value = _config_str(config, "full_attention_decode_impl", default="reference")
+def _full_attention_decode_impl(plan: KernelPlan) -> str:
+    value = plan.full_attention_decode
     if value in {"reference", "flashinfer_paged"}:
         return value
     raise ValueError("full_attention_decode_impl must be 'reference' or 'flashinfer_paged'")
 
 
-def _full_attention_prefill_impl(config=None) -> str:
-    value = _config_str(config, "full_attention_prefill_impl", default="reference")
+def _full_attention_prefill_impl(plan: KernelPlan) -> str:
+    value = plan.full_attention_prefill
     if value in {"reference", "triton_packed"}:
         return value
     raise ValueError("full_attention_prefill_impl must be 'reference' or 'triton_packed'")
 
 
-def _gdn_disable_fallbacks(config=None) -> bool:
-    return _config_bool(
-        config,
-        "gdn_disable_fallbacks",
-    )
+def _gdn_disable_fallbacks(plan: KernelPlan) -> bool:
+    return plan.gdn_disable_fallbacks
 
 
-def gdn_disable_fallbacks_enabled(config=None) -> bool:
+def gdn_disable_fallbacks_enabled(plan: KernelPlan) -> bool:
     """Return whether GDN kernel requests must fail instead of falling back."""
 
-    return _gdn_disable_fallbacks(config)
+    return _gdn_disable_fallbacks(plan)
 
 
-def _raise_if_gdn_fallback_disabled(reason: str, config=None) -> None:
-    if _gdn_disable_fallbacks(config):
+def _raise_if_gdn_fallback_disabled(reason: str, plan: KernelPlan) -> None:
+    if _gdn_disable_fallbacks(plan):
         raise RuntimeError(
             f"{reason}; implicit GDN kernel fallbacks are disabled by "
             "gdn_disable_fallbacks=True"
         )
 
 
-def _gdn_packed_decode_impl(config=None) -> str:
-    value = _config_str(config, "gdn_packed_decode_impl", default="off")
+def _gdn_packed_decode_impl(plan: KernelPlan) -> str:
+    value = plan.gdn_decode
     if value in {"off", "reference"}:
         return value
     raise ValueError("gdn_packed_decode_impl must be 'off' or 'reference'")
 
 
-def gdn_packed_decode_impl(config=None) -> str:
+def gdn_packed_decode_impl(plan: KernelPlan) -> str:
     """Return the normalized packed GDN decode implementation name."""
 
-    return _gdn_packed_decode_impl(config)
+    return _gdn_packed_decode_impl(plan)
 
 
-def gdn_packed_decode_enabled(config=None) -> bool:
-    return _gdn_packed_decode_impl(config) != "off"
+def gdn_packed_decode_enabled(plan: KernelPlan) -> bool:
+    return _gdn_packed_decode_impl(plan) != "off"
 
 
-def gdn_packed_decode_max_batch(config=None) -> int | None:
-    return _config_int_or_none(
-        config,
-        "gdn_packed_decode_max_batch",
-    )
+def gdn_packed_decode_max_batch(plan: KernelPlan) -> int | None:
+    return plan.gdn_decode_max_batch
 
 
-def _gdn_prefill_post_conv_impl(config=None) -> str:
-    value = _config_str(config, "gdn_prefill_post_conv_impl", default="off")
+def _gdn_prefill_post_conv_impl(plan: KernelPlan) -> str:
+    value = plan.gdn_prefill
     if value in {"off", "reference", "triton_fla_padded"}:
         return value
     raise ValueError("gdn_prefill_post_conv_impl must be 'off', 'reference', or 'triton_fla_padded'")
 
 
-def gdn_prefill_post_conv_enabled(config=None) -> bool:
-    return _gdn_prefill_post_conv_impl(config) != "off"
+def gdn_prefill_post_conv_enabled(plan: KernelPlan) -> bool:
+    return _gdn_prefill_post_conv_impl(plan) != "off"
 
 
 def _normalize_gdn_prefill_dtype(value: str, field_name: str) -> str:
@@ -161,80 +155,35 @@ def _normalize_gdn_prefill_dtype(value: str, field_name: str) -> str:
     raise ValueError(f"Unknown {field_name}={value!r}; expected fp32 or bf16")
 
 
-def _gdn_prefill_qkv_activation_dtype(config=None) -> str:
-    if config is not None and hasattr(config, "gdn_prefill_qkv_dtype"):
-        value = getattr(config, "gdn_prefill_qkv_dtype")
-    else:
-        value = "fp32"
-    return _normalize_gdn_prefill_dtype(str(value).strip(), "gdn_prefill_qkv_dtype")
+def _gdn_prefill_qkv_activation_dtype(plan: KernelPlan) -> str:
+    return _normalize_gdn_prefill_dtype(plan.gdn_prefill_qkv_dtype, "gdn_prefill_qkv_dtype")
 
 
-def _gdn_packed_decode_qkv_activation_dtype(config=None) -> str:
-    value = _config_str(
-        config,
-        "gdn_packed_decode_qkv_dtype",
-        default="fp32",
-    )
-    return _normalize_gdn_prefill_dtype(value, "gdn_packed_decode_qkv_dtype")
+def _gdn_packed_decode_qkv_activation_dtype(plan: KernelPlan) -> str:
+    return _normalize_gdn_prefill_dtype(plan.gdn_decode_qkv_dtype, "gdn_packed_decode_qkv_dtype")
 
 
-def _gdn_prefill_activation_dtype(config=None) -> str:
-    return _gdn_prefill_qkv_activation_dtype(config)
-
-
-def _gdn_prefill_qkv_activation_jnp_dtype(config=None) -> jnp.dtype:
-    if _gdn_prefill_qkv_activation_dtype(config) == "bf16":
+def _gdn_prefill_qkv_activation_jnp_dtype(plan: KernelPlan) -> jnp.dtype:
+    if _gdn_prefill_qkv_activation_dtype(plan) == "bf16":
         return jnp.bfloat16
     return jnp.float32
 
 
-def _gdn_packed_decode_qkv_activation_jnp_dtype(config=None) -> jnp.dtype:
-    if _gdn_packed_decode_qkv_activation_dtype(config) == "bf16":
+def _gdn_packed_decode_qkv_activation_jnp_dtype(plan: KernelPlan) -> jnp.dtype:
+    if _gdn_packed_decode_qkv_activation_dtype(plan) == "bf16":
         return jnp.bfloat16
     return jnp.float32
 
 
-def _gdn_packed_decode_pre_normalize_qk(config=None) -> bool:
-    return _config_bool(
-        config,
-        "gdn_packed_decode_pre_normalize_qk",
-    )
-
-
-def _gdn_prefill_fla_vllm_like_enabled() -> bool:
-    return False
-
-
-def _gdn_prefill_post_conv_output_dtype(config=None) -> str:
-    value = _config_str(
-        config,
-        "gdn_prefill_post_conv_output_dtype",
-        default="fp32",
-    )
+def _gdn_prefill_post_conv_output_dtype(plan: KernelPlan) -> str:
     return _normalize_gdn_prefill_dtype(
-        value,
+        plan.gdn_prefill_output_dtype,
         "gdn_prefill_post_conv_output_dtype",
     )
 
 
-def _cast_gdn_prefill_activations(
-    query: jnp.ndarray,
-    key: jnp.ndarray,
-    value: jnp.ndarray,
-    config=None,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    act_dtype = _gdn_prefill_qkv_activation_jnp_dtype(config)
-    if act_dtype == jnp.bfloat16:
-        return (
-            query.astype(jnp.bfloat16),
-            key.astype(jnp.bfloat16),
-            value.astype(jnp.bfloat16),
-        )
-    return query, key, value
-
-
-def _cast_gdn_prefill_post_conv_output(output: jnp.ndarray, config=None) -> jnp.ndarray:
-    if _gdn_prefill_post_conv_output_dtype(config) == "bf16":
+def _cast_gdn_prefill_post_conv_output(output: jnp.ndarray, plan: KernelPlan) -> jnp.ndarray:
+    if _gdn_prefill_post_conv_output_dtype(plan) == "bf16":
         return output.astype(jnp.bfloat16)
     return output
 
@@ -285,7 +234,7 @@ def _prepare_packed_gdn_post_conv_inputs_from_decay(
     key_head_dim: int,
     value_head_dim: int,
     use_qk_l2norm_in_kernel: bool,
-    config=None,
+    plan: KernelPlan,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     if conv_out.ndim != 3 or conv_out.shape[0] != 1:
         raise ValueError("packed conv_out must have shape [1, token_bucket, conv_dim]")
@@ -353,7 +302,7 @@ def _prepare_packed_gdn_post_conv_inputs_from_decay(
     gate = jnp.where(valid[None, :, None], gate, 0.0)
     beta = jnp.where(valid[None, :, None], beta, 0.0)
 
-    qkv_dtype = _gdn_prefill_qkv_activation_jnp_dtype(config)
+    qkv_dtype = _gdn_prefill_qkv_activation_jnp_dtype(plan)
     packed_query = query.reshape(token_bucket, num_value_heads, key_head_dim)
     packed_key = key.reshape(token_bucket, num_value_heads, key_head_dim)
     packed_value = value.reshape(token_bucket, num_value_heads, value_head_dim)
@@ -373,6 +322,27 @@ class ServingOpsProtocol(Protocol):
     """Operation API used by the runner and model."""
 
     name: str
+
+    def select_gdn_decode(
+        self,
+        *,
+        batch_size: int,
+        sequence_width: int,
+        return_prefix_state: bool,
+        return_first_prefix_state: bool,
+        has_initial_state: bool,
+    ) -> GDNDecodeMode:
+        ...
+
+    def use_gdn_post_conv_prefill(
+        self,
+        *,
+        recurrent: bool,
+        return_prefix_state: bool,
+        return_first_prefix_state: bool,
+        packed: bool,
+    ) -> bool:
+        ...
 
     def allocate_kv_cache(
         self,
@@ -526,13 +496,94 @@ class ServingOps:
 
     name = "serving_manifest"
 
-    def __init__(self, config=None):
-        self.config = config
-        self.full_attention_kv_append_impl = _full_attention_kv_append_impl(config)
-        self.full_attention_decode_impl = _full_attention_decode_impl(config)
-        self.full_attention_prefill_impl = _full_attention_prefill_impl(config)
-        self.gdn_prefill_post_conv_impl = _gdn_prefill_post_conv_impl(config)
-        self.gdn_packed_decode_impl = _gdn_packed_decode_impl(config)
+    def __init__(self, plan: KernelPlan | None = None):
+        self.plan = plan or KernelPlan()
+        self.full_attention_kv_append_impl = _full_attention_kv_append_impl(self.plan)
+        self.full_attention_decode_impl = _full_attention_decode_impl(self.plan)
+        self.full_attention_prefill_impl = _full_attention_prefill_impl(self.plan)
+        self.gdn_prefill_post_conv_impl = _gdn_prefill_post_conv_impl(self.plan)
+        self.gdn_packed_decode_impl = _gdn_packed_decode_impl(self.plan)
+
+    def select_gdn_decode(
+        self,
+        *,
+        batch_size: int,
+        sequence_width: int,
+        return_prefix_state: bool,
+        return_first_prefix_state: bool,
+        has_initial_state: bool,
+    ) -> GDNDecodeMode:
+        requested = self.gdn_packed_decode_impl != "off"
+        if requested and sequence_width > 1 and has_initial_state:
+            return GDNDecodeMode.PACKED_SEQUENCE
+        eligible = (
+            requested
+            and sequence_width == 1
+            and has_initial_state
+            and not return_prefix_state
+            and not return_first_prefix_state
+            and (
+                self.plan.gdn_decode_max_batch is None
+                or batch_size <= self.plan.gdn_decode_max_batch
+            )
+        )
+        if eligible:
+            return GDNDecodeMode.PACKED
+        if requested and self.plan.gdn_disable_fallbacks:
+            reasons = []
+            if sequence_width != 1:
+                reasons.append(f"sequence width {sequence_width} is not width-1 decode")
+            if (
+                self.plan.gdn_decode_max_batch is not None
+                and batch_size > self.plan.gdn_decode_max_batch
+            ):
+                reasons.append(
+                    f"batch {batch_size} exceeds packed_decode.max_batch "
+                    f"{self.plan.gdn_decode_max_batch}"
+                )
+            if return_prefix_state:
+                reasons.append("return_prefix_state needs state-sequence output")
+            if return_first_prefix_state:
+                reasons.append("return_first_prefix_state needs prefix-state output")
+            if not has_initial_state:
+                reasons.append("initial recurrent state is missing")
+            raise RuntimeError(
+                "GDN packed decode fallback is disabled: "
+                + "; ".join(reasons or ["the packed decode predicate was false"])
+            )
+        return GDNDecodeMode.REFERENCE
+
+    def use_gdn_post_conv_prefill(
+        self,
+        *,
+        recurrent: bool,
+        return_prefix_state: bool,
+        return_first_prefix_state: bool,
+        packed: bool,
+    ) -> bool:
+        enabled = self.gdn_prefill_post_conv_impl != "off"
+        use_post_conv = (
+            enabled
+            and not recurrent
+            and not return_prefix_state
+            and not return_first_prefix_state
+        )
+        if self.plan.gdn_disable_fallbacks and not use_post_conv:
+            reasons = []
+            if not enabled:
+                reasons.append("post-conv prefill kernel is disabled")
+            if recurrent:
+                reasons.append("recurrent prefill is requested")
+            if return_prefix_state:
+                reasons.append("return_prefix_state needs state-sequence output")
+            if return_first_prefix_state:
+                reasons.append("return_first_prefix_state needs prefix-state output")
+            route = "packed prefill" if packed else "prefill"
+            raise RuntimeError(
+                f"GDN {route} fallback is disabled: "
+                + "; ".join(reasons or ["the post-conv predicate was false"])
+            )
+        return use_post_conv
 
     def allocate_kv_cache(
         self,
@@ -540,22 +591,17 @@ class ServingOps:
         max_seqs: int,
         max_blocks_per_seq: int,
     ) -> KVCacheStorage:
-        cache_dtype = _full_attention_kv_cache_dtype(spec.dtype, self.config)
-        capped_spec = replace(
-            spec,
-            dtype=cache_dtype,
-            num_blocks=cap_num_kv_cache_blocks(replace(spec, dtype=cache_dtype)),
-        )
+        finalized_spec = _require_finalized_kv_cache_spec(spec, self.plan)
         state = init_kv_cache(
-            num_blocks=capped_spec.num_blocks,
-            block_size=capped_spec.block_size,
-            num_kv_heads=capped_spec.num_kv_heads,
-            head_dim=capped_spec.head_dim,
+            num_blocks=finalized_spec.num_blocks,
+            block_size=finalized_spec.block_size,
+            num_kv_heads=finalized_spec.num_kv_heads,
+            head_dim=finalized_spec.head_dim,
             max_seqs=max_seqs,
             max_blocks_per_seq=max_blocks_per_seq,
-            num_layers=capped_spec.num_layers,
-            dtype=capped_spec.dtype,
-            max_kv_cache_bytes=capped_spec.max_kv_cache_bytes,
+            num_layers=finalized_spec.num_layers,
+            dtype=finalized_spec.dtype,
+            max_kv_cache_bytes=None,
         )
         return state.storage
 
@@ -566,13 +612,9 @@ class ServingOps:
     ) -> FullAttentionNHDKVCacheStorage | None:
         if self.full_attention_decode_impl != "flashinfer_paged":
             return None
-        cache_dtype = _full_attention_kv_cache_dtype(spec.dtype, self.config)
+        finalized_spec = _require_finalized_kv_cache_spec(spec, self.plan)
         return init_full_attention_nhd_kv_cache(
-            spec=replace(
-                spec,
-                dtype=cache_dtype,
-                num_blocks=cap_num_kv_cache_blocks(replace(spec, dtype=cache_dtype)),
-            ),
+            spec=finalized_spec,
             full_attention_layers=full_attention_layers,
         )
 
@@ -846,7 +888,7 @@ class ServingOps:
         initial_state: jnp.ndarray | None,
         use_qk_l2norm_in_kernel: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        from nanovllm_jax.model import jax_chunk_gated_delta_rule
+        from nanovllm_jax.gdn import jax_chunk_gated_delta_rule
 
         return jax_chunk_gated_delta_rule(
             query,
@@ -945,7 +987,7 @@ class ServingOps:
                 beta.astype(jnp.float32),
                 seq_lens,
                 initial_state.astype(jnp.float32),
-                qkv_dtype=_gdn_prefill_qkv_activation_jnp_dtype(self.config),
+                qkv_dtype=_gdn_prefill_qkv_activation_jnp_dtype(self.plan),
             )
             packed_query = prepared.query.reshape(
                 -1,
@@ -994,7 +1036,7 @@ class ServingOps:
             if gdn_fla_chunk_gated_delta_rule_packed_triton is None:
                 _raise_if_gdn_fallback_disabled(
                     "Triton FLA padded prefill kernel is unavailable",
-                    self.config,
+                    self.plan,
                 )
                 output, final_state = gdn_fla_prefill_chunk32_fp32_reference(
                     prepared.query,
@@ -1007,7 +1049,7 @@ class ServingOps:
                     chunk_size=chunk_size,
                 )
                 output = output.reshape(batch, seq_len, num_key_heads_out, value_dim)
-                output = _cast_gdn_prefill_post_conv_output(output, self.config)
+                output = _cast_gdn_prefill_post_conv_output(output, self.plan)
                 return output.transpose(0, 2, 1, 3), final_state
 
             output, final_state = gdn_fla_chunk_gated_delta_rule_packed_triton(
@@ -1027,7 +1069,7 @@ class ServingOps:
                 chunk_offsets=packed_chunk_offsets,
             )
             output = output.reshape(batch, seq_len, num_key_heads_out, value_dim)
-            output = _cast_gdn_prefill_post_conv_output(output, self.config)
+            output = _cast_gdn_prefill_post_conv_output(output, self.plan)
             return output.transpose(0, 2, 1, 3), final_state
 
 
@@ -1090,7 +1132,7 @@ class ServingOps:
             key_head_dim=key_head_dim,
             value_head_dim=value_head_dim,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            config=self.config,
+            plan=self.plan,
         )
 
         def reference_scan() -> tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -1136,7 +1178,7 @@ class ServingOps:
                     beta_tokens,
                 ),
             )
-            output = _cast_gdn_prefill_post_conv_output(output_tokens, self.config)
+            output = _cast_gdn_prefill_post_conv_output(output_tokens, self.plan)
             if return_prefix_state:
                 return output[None, :, :, :], final_state, prefix_states
             return output[None, :, :, :], final_state
@@ -1146,7 +1188,7 @@ class ServingOps:
         if impl != "triton_fla_padded":
             _raise_if_gdn_fallback_disabled(
                 f"{impl!r} does not support packed GDN prefill ABI",
-                self.config,
+                self.plan,
             )
             return reference_scan()
 
@@ -1160,7 +1202,7 @@ class ServingOps:
         if gdn_fla_chunk_gated_delta_rule_packed_triton is None:
             _raise_if_gdn_fallback_disabled(
                 "Triton FLA packed prefill kernel is unavailable",
-                self.config,
+                self.plan,
             )
             return reference_scan()
 
@@ -1168,13 +1210,13 @@ class ServingOps:
             if max_row_tokens is None:
                 _raise_if_gdn_fallback_disabled(
                     "Packed-prefix GDN route requires static max_row_tokens",
-                    self.config,
+                    self.plan,
                 )
                 return reference_scan()
             if int(max_row_tokens) > 16:
                 _raise_if_gdn_fallback_disabled(
                     "Packed-prefix GDN route requires max_row_tokens <= 16",
-                    self.config,
+                    self.plan,
                 )
                 return reference_scan()
             try:
@@ -1186,7 +1228,7 @@ class ServingOps:
             if gdn_packed_prefix_state_triton is None:
                 _raise_if_gdn_fallback_disabled(
                     "Tiny packed-prefix GDN kernel is unavailable",
-                    self.config,
+                    self.plan,
                 )
                 return reference_scan()
             output, final_state, prefix_states = gdn_packed_prefix_state_triton(
@@ -1200,7 +1242,7 @@ class ServingOps:
                 max_row_tokens=int(max_row_tokens),
             )
             output = jnp.where(valid_tokens[:, None, None], output, 0.0)
-            output = _cast_gdn_prefill_post_conv_output(output, self.config)
+            output = _cast_gdn_prefill_post_conv_output(output, self.plan)
             prefix_states = jnp.where(
                 valid_tokens[:, None, None, None],
                 prefix_states,
@@ -1232,7 +1274,7 @@ class ServingOps:
             max_row_chunks=max_row_chunks,
         )
         output = jnp.where(valid_tokens[:, None, None], output, 0.0)
-        output = _cast_gdn_prefill_post_conv_output(output, self.config)
+        output = _cast_gdn_prefill_post_conv_output(output, self.plan)
         return output[None, :, :, :], final_state
 
     def gated_delta_decode(
@@ -1245,7 +1287,7 @@ class ServingOps:
         initial_state: jnp.ndarray | None,
         use_qk_l2norm_in_kernel: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        from nanovllm_jax.model import jax_recurrent_gated_delta_rule
+        from nanovllm_jax.gdn import jax_recurrent_gated_delta_rule
 
         return jax_recurrent_gated_delta_rule(
             query,
@@ -1286,7 +1328,7 @@ class ServingOps:
                 decay=decay,
                 dt_bias=dt_bias,
                 state=initial_state,
-                qkv_dtype=_gdn_packed_decode_qkv_activation_jnp_dtype(self.config),
+                qkv_dtype=_gdn_packed_decode_qkv_activation_jnp_dtype(self.plan),
             )
         )
         return gdn_packed_decode_reference_from_decay(
@@ -1296,6 +1338,6 @@ class ServingOps:
             decay,
             dt_bias,
             initial_state,
-            qkv_dtype=_gdn_packed_decode_qkv_activation_jnp_dtype(self.config),
+            qkv_dtype=_gdn_packed_decode_qkv_activation_jnp_dtype(self.plan),
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )

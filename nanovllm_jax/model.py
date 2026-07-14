@@ -10,19 +10,9 @@ import jax.numpy as jnp
 
 from nanovllm_jax.attention import full_attention_block
 from nanovllm_jax.cache import AttentionMetadata, HybridLayerState, KVCacheState, init_linear_attention_states
-from nanovllm_jax.config import RuntimeConfig
-from nanovllm_jax.gdn import (
-    gated_deltanet_block,
-    jax_chunk_gated_delta_rule,
-    jax_recurrent_gated_delta_rule,
-)
+from nanovllm_jax.config import ModelSpec
+from nanovllm_jax.gdn import gated_deltanet_block
 from nanovllm_jax.layers import causal_mask, get_activation, rms_norm
-from nanovllm_jax.lm_head import (
-    _lm_head_greedy_top1_impl,
-    _lm_head_greedy_top1_token_ids,
-    lm_head_sample_token_ids,
-    lm_head_token_ids_and_topk,
-)
 from nanovllm_jax.ops import ServingOpsProtocol
 from nanovllm_jax.projection import (
     _FULL_ATTN_DECODE_QKV_PACKED_KEY,
@@ -30,7 +20,6 @@ from nanovllm_jax.projection import (
     _MLP_GATE_UP_PACKED_KEY,
     _can_use_decode_padded_gemm,
     _can_use_decode_rms_padded_gemm,
-    _compact_prefill_dot_if_enabled,
     _compact_prefill_mlp,
     _compact_prefill_mlp_packed,
     _decode_padded_gemm_dot,
@@ -39,7 +28,6 @@ from nanovllm_jax.projection import (
     _decode_rms_padded_gemm_dot,
     _decode_width1_rms_norm,
     _force_width1_decode_math,
-    _stable_rmsnorm_fp32,
     _tokenwise_decode_dot,
 )
 
@@ -115,7 +103,7 @@ jax.tree_util.register_pytree_node(
 )
 
 
-def init_params(key: jax.Array, config: RuntimeConfig) -> ModelParams:
+def init_params(key: jax.Array, config: ModelSpec) -> ModelParams:
     keys = jax.random.split(key, config.num_hidden_layers + 3)
     embed_tokens = jax.random.normal(keys[0], (config.vocab_size, config.hidden_size)) * (config.hidden_size ** -0.5)
     layers = [init_transformer_block(keys[i + 1], config, i) for i in range(config.num_hidden_layers)]
@@ -127,7 +115,7 @@ def init_params(key: jax.Array, config: RuntimeConfig) -> ModelParams:
     return ModelParams(embed_tokens=embed_tokens, layers=layers, norm_weight=norm_weight, lm_head=lm_head)
 
 
-def init_transformer_block(key: jax.Array, config: RuntimeConfig, layer_idx: int) -> Dict[str, jnp.ndarray]:
+def init_transformer_block(key: jax.Array, config: ModelSpec, layer_idx: int) -> Dict[str, jnp.ndarray]:
     keys = jax.random.split(key, 10)
     if config.layer_types[layer_idx] == "full_attention":
         # Qwen3.5 full attention: q_proj outputs [query, gate] each of size num_attention_heads * head_dim
@@ -212,7 +200,7 @@ def transformer_block(
     x = _decode_width1_rms_norm(
         x,
         params["input_norm"],
-        config.rms_norm_eps,
+        config.model.rms_norm_eps,
         force_width1=force_width1_norm,
     )
 
@@ -237,7 +225,7 @@ def transformer_block(
     )
 
     # Apply attention/linear_attn
-    if config.layer_types[layer_idx] == "full_attention":
+    if config.model.layer_types[layer_idx] == "full_attention":
         x, kv_cache_state = full_attention_block(
             x,
             params,
@@ -280,7 +268,10 @@ def transformer_block(
             if (return_prefix_hybrid or return_first_prefix_hybrid) and len(result) == 3:
                 x, hybrid_state, prefix_layer_state = result
                 if prefix_hybrid_state is not None and prefix_layer_state is not None:
-                    linear_layer_idx = len([l for l in config.linear_attn_layers if l < layer_idx])
+                    linear_layer_idx = sum(
+                        linear_layer < layer_idx
+                        for linear_layer in config.model.linear_attn_layers
+                    )
                     if return_prefix_hybrid:
                         prefix_hybrid_state = replace(
                             prefix_hybrid_state,
@@ -331,26 +322,27 @@ def transformer_block(
             x,
             params["ffn_norm"],
             params[_MLP_GATE_UP_PACKED_KEY],
-            config,
+            config.kernels,
         )
     ):
         fused_mlp_gate_up = _decode_rms_padded_gemm_dot(
             x,
             params["ffn_norm"],
             params[_MLP_GATE_UP_PACKED_KEY],
-            config,
+            config.model.rms_norm_eps,
+            config.kernels,
         )
     else:
         x = _decode_width1_rms_norm(
             x,
             params["ffn_norm"],
-            config.rms_norm_eps,
+            config.model.rms_norm_eps,
             force_width1=force_width1_norm,
         )
 
     # MLP computation (stays in bfloat16)
     force_width1_dot = (not is_prefill) and x.ndim == 3 and x.shape[1] > 1 and _force_width1_decode_math()
-    activation_fn = get_activation(config.hidden_act)
+    activation_fn = get_activation(config.model.hidden_act)
     if is_prefill:
         if _MLP_GATE_UP_PACKED_KEY in params:
             x = _compact_prefill_mlp_packed(
@@ -360,7 +352,7 @@ def transformer_block(
                 activation_fn,
                 valid_token_mask,
                 compact_prefill_tokens,
-                config,
+                config.kernels,
             )
         else:
             x = _compact_prefill_mlp(
@@ -371,20 +363,20 @@ def transformer_block(
                 activation_fn,
                 valid_token_mask,
                 compact_prefill_tokens,
-                config,
+                config.kernels,
             )
     else:
         if fused_mlp_gate_up is not None:
             gate_up = fused_mlp_gate_up
             gate, up = jnp.split(gate_up, 2, axis=-1)
         else:
-            x_proj = x.astype(_decode_projection_activation_dtype(x.shape[0], config))
+            x_proj = x.astype(_decode_projection_activation_dtype(x.shape[0], config.kernels))
         if fused_mlp_gate_up is None and _MLP_GATE_UP_PACKED_KEY in params:
             if (
-                _decode_padded_gemm_gate_up_enabled(config)
-                and _can_use_decode_padded_gemm(x_proj, params[_MLP_GATE_UP_PACKED_KEY], config)
+                _decode_padded_gemm_gate_up_enabled(config.kernels)
+                and _can_use_decode_padded_gemm(x_proj, params[_MLP_GATE_UP_PACKED_KEY], config.kernels)
             ):
-                gate_up = _decode_padded_gemm_dot(x_proj, params[_MLP_GATE_UP_PACKED_KEY], config)
+                gate_up = _decode_padded_gemm_dot(x_proj, params[_MLP_GATE_UP_PACKED_KEY], config.kernels)
             else:
                 gate_up = _tokenwise_decode_dot(
                     x_proj,
@@ -394,18 +386,18 @@ def transformer_block(
             gate, up = jnp.split(gate_up, 2, axis=-1)
         elif fused_mlp_gate_up is None:
             if (
-                _decode_padded_gemm_gate_up_enabled(config)
-                and _can_use_decode_padded_gemm(x_proj, params["gate_proj"], config)
+                _decode_padded_gemm_gate_up_enabled(config.kernels)
+                and _can_use_decode_padded_gemm(x_proj, params["gate_proj"], config.kernels)
                 and params["up_proj"].shape == params["gate_proj"].shape
             ):
-                gate = _decode_padded_gemm_dot(x_proj, params["gate_proj"], config)
-                up = _decode_padded_gemm_dot(x_proj, params["up_proj"], config)
+                gate = _decode_padded_gemm_dot(x_proj, params["gate_proj"], config.kernels)
+                up = _decode_padded_gemm_dot(x_proj, params["up_proj"], config.kernels)
             else:
                 gate = _tokenwise_decode_dot(x_proj, params["gate_proj"], force_width1=force_width1_dot)
                 up = _tokenwise_decode_dot(x_proj, params["up_proj"], force_width1=force_width1_dot)
         x = activation_fn(gate) * up
-        if _can_use_decode_padded_gemm(x, params["down_proj"], config):
-            x = _decode_padded_gemm_dot(x, params["down_proj"], config)
+        if _can_use_decode_padded_gemm(x, params["down_proj"], config.kernels):
+            x = _decode_padded_gemm_dot(x, params["down_proj"], config.kernels)
         else:
             x = _tokenwise_decode_dot(x, params["down_proj"], force_width1=force_width1_dot)
     x = residual + x
@@ -437,7 +429,7 @@ def forward_step(
 ):
     """Canonical forward step shared by cached and non-cached inference paths."""
     batch, seq_len = tokens.shape
-    dtype = config.get_dtype()
+    dtype = config.compile.jax_dtype()
     x = params.embed_tokens[tokens].astype(dtype)
 
     if positions is None:
@@ -503,7 +495,7 @@ def forward_step(
             recurrent_state=hybrid_state.recurrent_state,
         )
 
-    num_linear_layers = len(config.linear_attn_layers)
+    num_linear_layers = len(config.model.linear_attn_layers)
     use_layerwise_hybrid = (
         hybrid_state_layerwise
         and hybrid_state is not None
@@ -527,7 +519,7 @@ def forward_step(
     for i, lp in enumerate(params.layers):
         block_hybrid_state = hybrid_state
         block_hybrid_state_is_layer = False
-        if use_layerwise_hybrid and config.layer_types[i] != "full_attention":
+        if use_layerwise_hybrid and config.model.layer_types[i] != "full_attention":
             block_hybrid_state = HybridLayerState(
                 conv_state=hybrid_conv_layers[linear_layer_cursor],
                 recurrent_state=hybrid_recurrent_layers[linear_layer_cursor],
@@ -574,7 +566,7 @@ def forward_step(
             return hidden_pre, kv_cache_state, hybrid_state, prefix_hybrid_state
         return hidden_pre, kv_cache_state, hybrid_state
 
-    x = rms_norm(x, params.norm_weight, config.rms_norm_eps)
+    x = rms_norm(x, params.norm_weight, config.model.rms_norm_eps)
     x = x.astype(jnp.float32)
     if last_logits_only:
         if logit_positions is None:
@@ -619,7 +611,7 @@ def forward(
     if is_prefill and kv_cache_state is not None and hybrid_state is None:
         kv_cache_state = init_linear_attention_states(
             kv_cache_state,
-            config,
+            config.model,
             batch_size=tokens.shape[0],
         )
         hybrid_state = kv_cache_state.hybrid_state

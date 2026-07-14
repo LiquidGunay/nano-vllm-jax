@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from nanovllm_jax.model import jax_chunk_gated_delta_rule
+from nanovllm_jax.gdn import jax_chunk_gated_delta_rule
 
 
 def local_gdn_state_to_k_last(state: jnp.ndarray) -> jnp.ndarray:
@@ -82,7 +82,7 @@ def gdn_packed_decode_reference_local_state(
     serving recurrent-state contract `[B,H,V,K]`.
     """
 
-    from nanovllm_jax.model import jax_recurrent_gated_delta_rule
+    from nanovllm_jax.gdn import jax_recurrent_gated_delta_rule
 
     if state.ndim != 4:
         raise ValueError("state must have shape [batch, heads, value_dim, key_dim]")

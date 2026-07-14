@@ -27,9 +27,10 @@ without evicting cached prefixes for unwritten future tokens. A request that
 can never fit is rejected. Tied vocabulary weights remain in checkpoint-native
 `[V, H]` layout instead of allocating a second transposed copy.
 
-[nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py) owns implementation
-policy: dtypes, attention/GDN routes, LM-head route, device token carry, and
-metadata residency. Users should not switch kernels through YAML on the cleaned
+[nanovllm_jax/config.py](nanovllm_jax/config.py) composes model, capacity, and
+compile specs once at startup. [nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py)
+owns attention/GDN routes, LM-head policy, device token carry, and metadata
+residency. Users should not switch implementations through YAML on the cleaned
 branch.
 
 The offline `LLM.generate(..., use_tqdm=True)` progress bar uses the optional
@@ -68,7 +69,7 @@ server.py
   -> Scheduler -> BlockManager
   -> SchedulePlan (host)
   -> ModelRunner
-  -> DeviceBatch
+  -> DeviceBatch + HostBatch
   -> ModelExecutor
   -> Qwen3.5 model
   -> attention / GDN / LM-head kernels
@@ -121,19 +122,14 @@ another external scratch path.
 [docs/style.md](docs/style.md) defines the repository's lightweight complexity
 budget and review checks.
 
-CPU-safe control-plane checks:
+Ownership and configuration contract checks:
 
 ```bash
-JAX_PLATFORMS=cpu pytest -q \
+JAX_PLATFORMS=cuda PYTHONPATH=$PWD python tests/ram_guard.py -- pytest -q \
   tests/test_engine_initialization.py \
   tests/test_fastpath_config.py \
-  tests/test_paged_attention_abi.py \
-  tests/test_prefix_cache.py \
   tests/test_public_imports.py \
-  tests/test_scheduler_capacity.py \
-  tests/test_server_config.py \
-  tests/test_service.py \
-  tests/test_step_results.py
+  tests/test_server_config.py
 ```
 
 For GPU correctness, verify CUDA visibility first and run JAX with

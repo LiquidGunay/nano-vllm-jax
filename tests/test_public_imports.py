@@ -22,11 +22,11 @@ def test_top_level_public_imports_are_canonical():
 
     assert nanovllm_jax.__all__ == ["EngineConfig", "LLM", "SamplingParams"]
     assert engine_module.__all__ == ["LLM"]
-    assert not hasattr(nanovllm_jax, "FASTPATH")
-    assert not hasattr(nanovllm_jax, "FastPath")
+    assert not hasattr(nanovllm_jax, "KERNEL_PLAN")
+    assert not hasattr(nanovllm_jax, "KernelPlan")
     assert not hasattr(nanovllm_jax, "LLMEngine")
     assert not hasattr(nanovllm_jax, "ModelConfig")
-    assert not hasattr(nanovllm_jax, "RuntimeConfig")
+    assert not hasattr(nanovllm_jax, "RuntimeSpec")
     assert not hasattr(nanovllm_jax, "ServerSettings")
     assert not hasattr(nanovllm_jax, "ServingOps")
     assert not hasattr(nanovllm_jax, "select_backend")
@@ -38,6 +38,9 @@ def test_llm_constructor_rejects_internal_policy_kwargs_before_loading_model():
 
     with pytest.raises(TypeError, match="weight_dtype"):
         PublicLLMEngine("Qwen/Qwen3.5-0.8B", weight_dtype="float32")
+
+    with pytest.raises(TypeError, match="max_prefill"):
+        PublicLLMEngine("Qwen/Qwen3.5-0.8B", max_prefill=64)
 
 
 def test_internal_imports_use_top_level_modules():
