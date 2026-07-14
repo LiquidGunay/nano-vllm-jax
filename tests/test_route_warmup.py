@@ -7,6 +7,7 @@ from nanovllm_jax.routes import RouteKind
 from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.sequence import SamplingParams
+from nanovllm_jax.speculation import SuppliedDrafter
 from tests.runtime_specs import runtime_spec
 
 
@@ -110,3 +111,14 @@ def test_warmup_covers_default_and_sparse_greedy_decode_routes():
     _decode_request(engine, ignore_eos=True)
     assert routes == [RouteKind.PREFILL_RESIDENT, RouteKind.DECODE_RESIDENT]
     assert set(engine.model_runner.executor._jit_cache) == compiled
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="CUDA is required for JIT warmup")
+def test_warmup_covers_installed_speculative_route():
+    config = _config()
+    engine = _Engine(config, init_params(jax.random.PRNGKey(0), config.model))
+    engine.install_drafter(SuppliedDrafter({}, width=2))
+
+    summary = engine.warmup_compilation()["runner"]
+
+    assert RouteKind.DECODE_SPECULATIVE.value in summary["warmed_routes"]

@@ -26,6 +26,7 @@ from nanovllm_jax.device_batch import BatchMaterializer, DeviceBatch, HostBatch
 from nanovllm_jax.executor import ModelExecutor
 from nanovllm_jax.model import ModelParams
 from nanovllm_jax.output import DeviceTokenRef
+from nanovllm_jax.speculation import Drafter, DraftProposal, VerificationResult
 from nanovllm_jax.routes import (
     BatchPhase,
     ExecutionPlan,
@@ -184,6 +185,28 @@ class ModelRunner:
         self._resident_rng_counter_reset_slots: set[int] = set()
         self._sample_fn = jax.jit(self._sample_logits)
         self._warmup_compiled = False
+        self._drafter: Drafter | None = None
+        self._speculation_suppressed = False
+        self._warmup_proposal: DraftProposal | None = None
+        self.speculation_stats = {
+            "drafted": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "bonus": 0,
+        }
+
+    def install_drafter(self, drafter: Drafter | None) -> None:
+        """Enable an optional drafter without changing target verification."""
+
+        if self._warmup_compiled:
+            raise RuntimeError("install the drafter before compilation warmup")
+        if drafter is not None and not 1 <= int(drafter.width) <= 15:
+            raise ValueError("draft width must be between 1 and 15")
+        self._drafter = drafter
+
+    def reset_speculation_stats(self) -> None:
+        for name in self.speculation_stats:
+            self.speculation_stats[name] = 0
 
     def memory_bytes(self) -> dict[str, int]:
         """Return persistent allocations and bounded dynamic-state capacity."""
@@ -418,6 +441,7 @@ class ModelRunner:
                         }
                     )
 
+        self._speculation_suppressed = self._drafter is not None
         for batch_size in batch_buckets:
             for block_table_width in decode_block_table_buckets:
                 scenarios = decode_warmup_scenarios(
@@ -473,6 +497,35 @@ class ModelRunner:
                             "route": route.kind.value,
                         }
                     )
+                if self._drafter is not None:
+                    scenario = WarmupScenario(
+                        "speculative",
+                        TokenMode.SPECULATIVE,
+                        True,
+                        True,
+                        True,
+                    )
+                    seqs, batch = self._warmup_decode_inputs(
+                        batch_size,
+                        int(block_table_width),
+                        scenario,
+                    )
+                    for seq in seqs:
+                        seq.max_tokens = int(self._drafter.width) + 2
+                    self._speculation_suppressed = False
+                    self._warmup_proposal = DraftProposal(
+                        jnp.zeros(
+                            (batch_size, int(self._drafter.width)),
+                            dtype=jnp.int32,
+                        )
+                    )
+                    try:
+                        route = self._warm_route(seqs, batch)
+                    finally:
+                        self._warmup_proposal = None
+                        self._speculation_suppressed = True
+                    record_decode(route, batch, scenario)
+        self._speculation_suppressed = False
         if bool(getattr(self, "resident_decode_metadata", False)):
             for row_count in range(1, int(max(batch_buckets)) + 1):
                 if row_count > int(self._resident_block_tables.shape[0]):
@@ -650,6 +703,7 @@ class ModelRunner:
 
     def _reset_runtime_state_after_warmup(self) -> None:
         """Drop dummy warmup sequence state while keeping compiled executables."""
+        self.reset_speculation_stats()
         if hasattr(self, "hybrid_states"):
             self.hybrid_states.clear()
         self._prefix_hybrid_states.clear()
@@ -1843,6 +1897,7 @@ class ModelRunner:
         slot_values: List[int] | Tuple[int, ...],
         *,
         sync_seq_lens: bool,
+        force_block_tables: bool = False,
     ) -> None:
         """Refresh resident per-slot paging metadata from scheduler-owned rows.
 
@@ -1889,7 +1944,8 @@ class ModelRunner:
                 seq_len_for_blocks = max(0, int(seq_lens[row]))
                 next_block_count = (seq_len_for_blocks + block_size - 1) // block_size
             skip_block_row_check = (
-                not batch.is_prefill
+                not force_block_tables
+                and not batch.is_prefill
                 and next_block_count is not None
                 and self._resident_block_counts_host[slot] == next_block_count
             )
@@ -1978,6 +2034,22 @@ class ModelRunner:
             if temperature > 0.0:
                 has_sampling = True
         return has_sampling
+
+    def _can_speculate(self, seqs: List[Sequence], batch: DeviceBatch) -> bool:
+        drafter = self._drafter
+        if drafter is None or self._speculation_suppressed or batch.is_prefill:
+            return False
+        if not (self.device_token_carry and self.resident_decode_metadata):
+            return False
+        if int(batch.tokens.shape[0]) != len(seqs):
+            return False
+        needed = int(drafter.width) + 1
+        return all(
+            seq.temperature == 0
+            and seq.ignore_eos
+            and seq.max_tokens - seq.num_completion_tokens >= needed
+            for seq in seqs
+        )
 
     def _sample_temperatures_device(self, seqs: List[Sequence], batch: DeviceBatch) -> jnp.ndarray:
         row_count = len(seqs) if batch.is_prefill and batch.packed_prefill else int(batch.tokens.shape[0])
@@ -2110,7 +2182,14 @@ class ModelRunner:
         prefill_final_flags = self._prefill_final_flags_for_batch(seqs, batch)
         greedy = self._can_use_greedy_token_fastpath(seqs, batch)
         sampled = not greedy and self._can_use_sampled_token_fastpath(seqs, batch)
-        decode_steps = self._greedy_decode_burst_steps(seqs, batch) if greedy else 1
+        speculation_candidate = greedy and self._can_speculate(seqs, batch)
+        decode_steps = (
+            1
+            if speculation_candidate
+            else self._greedy_decode_burst_steps(seqs, batch)
+            if greedy
+            else 1
+        )
         phase = BatchPhase.PREFILL if batch.is_prefill else BatchPhase.DECODE
         tokens = (
             TokenMode.BURST
@@ -2154,6 +2233,12 @@ class ModelRunner:
                 active_rows=active_decode_rows,
             ):
                 capabilities.add(RouteCapability.DENSE_ROWS)
+        if (
+            speculation_candidate
+            and RouteCapability.DENSE_ROWS in capabilities
+        ):
+            tokens = TokenMode.SPECULATIVE
+            decode_steps = 1
         kind = select_route(
             RouteRequest(
                 phase=phase,
@@ -2193,7 +2278,12 @@ class ModelRunner:
         hybrid_slot_values: list[int],
     ) -> None:
         if route.spec.uses_resident_metadata:
-            self._sync_resident_decode_metadata(batch, hybrid_slot_values, sync_seq_lens=True)
+            self._sync_resident_decode_metadata(
+                batch,
+                hybrid_slot_values,
+                sync_seq_lens=True,
+                force_block_tables=route.spec.tokens is TokenMode.SPECULATIVE,
+            )
 
     def _commit_route_output(
         self,
@@ -2202,6 +2292,7 @@ class ModelRunner:
         output: Any,
         *,
         hybrid_slot_values: list[int],
+        emitted_counts: tuple[int, ...] | None = None,
     ) -> None:
         self.cache_storage = output.cache_storage
         if route.spec.uses_table_state:
@@ -2209,11 +2300,17 @@ class ModelRunner:
             self._mark_hybrid_slots_written(hybrid_slot_values)
             if route.spec.uses_resident_metadata and output.resident_seq_lens is not None:
                 self._resident_seq_lens = output.resident_seq_lens
-                self._advance_resident_seq_lens_host(
-                    hybrid_slot_values,
-                    active_rows=list(route.active_rows),
-                    steps=1,
-                )
+                if emitted_counts is None:
+                    self._advance_resident_seq_lens_host(
+                        hybrid_slot_values,
+                        active_rows=list(route.active_rows),
+                        steps=1,
+                    )
+                else:
+                    active = set(route.active_rows)
+                    for row, slot in enumerate(hybrid_slot_values):
+                        if row in active and slot >= 0:
+                            self._resident_seq_lens_host[slot] += emitted_counts[row]
         else:
             self._store_batch_hybrid_state(
                 batch,
@@ -2275,6 +2372,13 @@ class ModelRunner:
             kwargs["prefill_final_flags"] = self._prefill_final_flags_device(batch)
         if spec.tokens is TokenMode.BURST:
             kwargs["decode_steps"] = route.decode_steps
+        if spec.tokens is TokenMode.SPECULATIVE:
+            if self._drafter is None:
+                raise RuntimeError("speculative route requires an installed drafter")
+            proposal = self._warmup_proposal or self._drafter.propose(seqs)
+            if not isinstance(proposal, DraftProposal):
+                raise TypeError("drafter must return DraftProposal")
+            kwargs["proposal"] = proposal
         if spec.tokens is TokenMode.SAMPLED:
             kwargs["temperatures"] = self._sample_temperatures_device(seqs, batch)
             rng_slots, rng_counters = self._sample_rng_slots_and_counters_device(
@@ -2283,6 +2387,72 @@ class ModelRunner:
             )
             kwargs.update(rng_slots=rng_slots, rng_counters=rng_counters)
         return getattr(self.executor, spec.executor)(batch, **kwargs)
+
+    @staticmethod
+    def _verification_output(
+        route: ExecutionPlan,
+        output: Any,
+    ) -> tuple[
+        VerificationResult | None,
+        tuple[int, ...] | None,
+        tuple[int, ...] | None,
+    ]:
+        if route.spec.tokens is not TokenMode.SPECULATIVE:
+            return None, None, None
+        verification = output.activations
+        if not isinstance(verification, VerificationResult):
+            raise TypeError("speculative executor must return VerificationResult")
+        emitted, accepted = jax.device_get(
+            (verification.emitted_counts, verification.accepted_counts)
+        )
+        return (
+            verification,
+            tuple(int(value) for value in np.asarray(emitted)),
+            tuple(int(value) for value in np.asarray(accepted)),
+        )
+
+    def _speculative_token_rows(
+        self,
+        seqs: List[Sequence],
+        batch: DeviceBatch,
+        verification: VerificationResult,
+        emitted_counts: tuple[int, ...],
+        accepted_counts: tuple[int, ...],
+        *,
+        active_rows: list[int],
+        prefill_final_flags: list[bool],
+    ) -> List[List[DeviceTokenRef]]:
+        self._record_device_token_carry(
+            batch,
+            verification.next_token_ids,
+            active_rows=active_rows,
+            prefill_final_flags=prefill_final_flags,
+            seqs=seqs,
+            update_resident_tokens=False,
+            resident_tokens_already_current=True,
+        )
+        draft_width = int(verification.emitted_token_ids.shape[1]) - 1
+        drafted = len(active_rows) * draft_width
+        accepted = sum(accepted_counts[row] for row in active_rows)
+        self.speculation_stats["drafted"] += drafted
+        self.speculation_stats["accepted"] += accepted
+        self.speculation_stats["rejected"] += drafted - accepted
+        self.speculation_stats["bonus"] += sum(
+            accepted_counts[row] == draft_width for row in active_rows
+        )
+        width = draft_width + 1
+        return [
+            [
+                DeviceTokenRef(
+                    tokens=verification.emitted_token_ids,
+                    row=row * width + column,
+                )
+                for column in range(emitted_counts[row])
+            ]
+            if row in active_rows
+            else []
+            for row in range(len(seqs))
+        ]
 
 
     def _run_main_and_sample(
@@ -2314,12 +2484,34 @@ class ModelRunner:
             hybrid_slot_values=hybrid_slot_values,
             hybrid_state=hybrid_state,
         )
+        verification, emitted_counts, accepted_counts = self._verification_output(
+            route, output
+        )
         prefill_resident_tokens_seeded = (
             route.spec.seeds_slot_tokens and output.resident_last_tokens is not None
         )
         if output.resident_last_tokens is not None:
             self._resident_last_tokens = output.resident_last_tokens
-        self._commit_route_output(route, batch, output, hybrid_slot_values=hybrid_slot_values)
+        self._commit_route_output(
+            route,
+            batch,
+            output,
+            hybrid_slot_values=hybrid_slot_values,
+            emitted_counts=emitted_counts,
+        )
+
+        if verification is not None:
+            if emitted_counts is None or accepted_counts is None:
+                raise AssertionError("verification counts were not materialized")
+            return self._speculative_token_rows(
+                seqs,
+                batch,
+                verification,
+                emitted_counts,
+                accepted_counts,
+                active_rows=active_rows,
+                prefill_final_flags=prefill_final_flags,
+            )
 
         emits_token_ids = route.spec.tokens is not TokenMode.LOGITS
         token_ids_all = None

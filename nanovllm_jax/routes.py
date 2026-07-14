@@ -16,6 +16,7 @@ class TokenMode(Enum):
     GREEDY = "greedy"
     SAMPLED = "sampled"
     BURST = "burst"
+    SPECULATIVE = "speculative"
 
 
 class RouteCapability(Enum):
@@ -40,6 +41,7 @@ class RouteKind(Enum):
     DECODE_RESIDENT_METADATA = "decode_resident_metadata"
     DECODE_RESIDENT = "decode_resident"
     DECODE_RESIDENT_DENSE = "decode_resident_dense"
+    DECODE_SPECULATIVE = "decode_speculative"
     DECODE_BURST = "decode_burst"
     DECODE_TABLE_BURST = "decode_table_burst"
 
@@ -111,6 +113,18 @@ ROUTE_SPECS = (
         "forward_step_sampled_token_ids_jit",
     ),
     RouteSpec(RouteKind.PREFILL_LOGITS, BatchPhase.PREFILL, TokenMode.LOGITS, None),
+    RouteSpec(
+        RouteKind.DECODE_SPECULATIVE,
+        BatchPhase.DECODE,
+        TokenMode.SPECULATIVE,
+        "verify_packed_prefix_jit",
+        _caps(
+            RouteCapability.TABLE_STATE,
+            RouteCapability.RESIDENT_METADATA,
+            RouteCapability.SLOT_TOKENS,
+            RouteCapability.DENSE_ROWS,
+        ),
+    ),
     RouteSpec(
         RouteKind.DECODE_RESIDENT_DENSE,
         BatchPhase.DECODE,

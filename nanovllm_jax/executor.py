@@ -27,6 +27,11 @@ from nanovllm_jax.model import (
     ModelParams,
     forward_step as model_forward_step,
 )
+from nanovllm_jax.speculation import (
+    DraftProposal,
+    VerificationResult,
+    verify_greedy_drafts,
+)
 from nanovllm_jax.lm_head import (
     lm_head_sample_token_ids,
     lm_head_token_ids_and_topk,
@@ -2160,6 +2165,191 @@ class ModelExecutor:
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
             resident_seq_lens=seq_lens_table,
             resident_last_tokens=last_tokens_table,
+        )
+
+    def verify_packed_prefix_jit(
+        self,
+        batch: DeviceBatch,
+        *,
+        cache_storage: KVCacheStorage,
+        hybrid_state_table: HybridLayerState,
+        hybrid_slot_ids: jnp.ndarray,
+        resident_block_tables: jnp.ndarray,
+        resident_seq_lens: jnp.ndarray,
+        resident_last_tokens: jnp.ndarray,
+        proposal: DraftProposal,
+    ) -> ExecutorOutput:
+        """Verify current plus draft tokens in one packed target forward."""
+
+        if batch.is_prefill:
+            raise ValueError("packed-prefix verification is decode-only")
+        if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
+            raise ValueError("packed-prefix verification requires hybrid state tables")
+        if proposal.token_ids.ndim != 2:
+            raise ValueError("draft token ids must have shape [batch, width]")
+        if proposal.token_ids.shape[0] != batch.tokens.shape[0]:
+            raise ValueError("draft rows must match the physical decode batch")
+        if proposal.width < 1 or proposal.width > 15:
+            raise ValueError("packed-prefix draft width must be between 1 and 15")
+        self._validate_batch_contract(batch)
+
+        batch_size = int(batch.tokens.shape[0])
+        draft_width = proposal.width
+        verify_width = draft_width + 1
+        block_table_width = int(batch.block_tables.shape[1])
+        key = (
+            "packed-prefix-verifier",
+            batch_size,
+            draft_width,
+            block_table_width,
+            tuple(hybrid_state_table.conv_state.shape),
+            tuple(hybrid_state_table.recurrent_state.shape),
+            tuple(resident_block_tables.shape),
+            tuple(resident_seq_lens.shape),
+            tuple(resident_last_tokens.shape),
+        )
+        if key not in self._jit_cache:
+
+            def compiled(
+                params_leaves,
+                k_cache,
+                v_cache,
+                conv_state_table,
+                recurrent_state_table,
+                slot_ids,
+                block_table_table,
+                seq_lens_table,
+                last_tokens_table,
+                draft_token_ids,
+            ):
+                params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
+                slot_ids = slot_ids.astype(jnp.int32)
+                seq_lens = seq_lens_table[slot_ids]
+                block_tables = block_table_table[slot_ids, :block_table_width]
+                current_tokens = last_tokens_table[slot_ids, None].astype(jnp.int32)
+                token_rows = jnp.concatenate([current_tokens, draft_token_ids], axis=1)
+                positions = jnp.maximum(seq_lens - 1, 0)[:, None]
+                positions = positions + jnp.arange(verify_width, dtype=jnp.int32)[None, :]
+                query_start_loc = jnp.arange(batch_size + 1, dtype=jnp.int32) * verify_width
+                token_row_ids = jnp.broadcast_to(
+                    jnp.arange(batch_size, dtype=jnp.int32)[:, None],
+                    (batch_size, verify_width),
+                ).reshape(1, batch_size * verify_width)
+                packed_tokens = token_rows.reshape(1, batch_size * verify_width)
+                packed_positions = positions.reshape(1, batch_size * verify_width)
+                verify_lens = seq_lens + draft_width
+                metadata = self.backend.build_attention_metadata(
+                    positions=packed_positions,
+                    block_tables=block_tables,
+                    seq_lens=verify_lens,
+                    block_size=self.config.capacity.block_size,
+                    is_prefill=True,
+                    query_start_loc=query_start_loc,
+                    num_prefill_tokens=batch_size * verify_width,
+                    num_decode_tokens=0,
+                    token_row_ids=token_row_ids,
+                    max_query_len=verify_width,
+                )
+                kv_state = KVCacheState(
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_table=block_tables,
+                    kv_lens=verify_lens,
+                    slot_mapping=metadata.slot_mapping,
+                )
+                hidden, updated_kv, _, prefix_state = model_forward_step(
+                    packed_tokens,
+                    params,
+                    self.config,
+                    positions=packed_positions,
+                    kv_cache_state=kv_state,
+                    attention_metadata=metadata,
+                    hybrid_state=HybridLayerState(
+                        conv_state_table[slot_ids],
+                        recurrent_state_table[slot_ids],
+                    ),
+                    is_prefill=True,
+                    return_hidden=True,
+                    return_hidden_with_logits=False,
+                    return_prefix_hybrid=True,
+                    backend=self.backend,
+                )
+                hidden = hidden.reshape(batch_size, verify_width, hidden.shape[-1])
+                target_token_ids, _, _ = lm_head_token_ids_and_topk(
+                    hidden,
+                    params,
+                    self.config,
+                    hidden_is_normed=False,
+                    is_prefill=False,
+                    top_k=0,
+                )
+                verification = verify_greedy_drafts(
+                    DraftProposal(draft_token_ids),
+                    target_token_ids,
+                )
+
+                row_ids = jnp.arange(batch_size, dtype=jnp.int32)
+                selected_conv = prefix_state.conv_state[
+                    row_ids, verification.accepted_counts
+                ]
+                selected_recurrent = prefix_state.recurrent_state[
+                    row_ids, verification.accepted_counts
+                ]
+                conv_state_table = conv_state_table.at[slot_ids].set(
+                    selected_conv.astype(conv_state_table.dtype)
+                )
+                recurrent_state_table = recurrent_state_table.at[slot_ids].set(
+                    selected_recurrent.astype(recurrent_state_table.dtype)
+                )
+
+                seq_lens_table = seq_lens_table.at[slot_ids].set(
+                    seq_lens + verification.emitted_counts
+                )
+                last_tokens_table = last_tokens_table.at[slot_ids].set(
+                    verification.next_token_ids
+                )
+                return (
+                    verification,
+                    updated_kv.k_cache,
+                    updated_kv.v_cache,
+                    conv_state_table,
+                    recurrent_state_table,
+                    seq_lens_table,
+                    last_tokens_table,
+                )
+
+            self._jit_cache[key] = jax.jit(
+                compiled,
+                donate_argnums=(1, 2, 3, 4, 7, 8),
+            )
+
+        (
+            verification,
+            k_cache,
+            v_cache,
+            conv_state,
+            recurrent_state,
+            seq_lens,
+            last_tokens,
+        ) = self._jit_cache[key](
+            self._params_leaves,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state_table.conv_state,
+            hybrid_state_table.recurrent_state,
+            hybrid_slot_ids,
+            resident_block_tables,
+            resident_seq_lens,
+            resident_last_tokens,
+            proposal.token_ids.astype(jnp.int32),
+        )
+        return ExecutorOutput(
+            activations=verification,
+            cache_storage=KVCacheStorage(k_cache, v_cache),
+            attention_metadata=None,
+            hybrid_state=HybridLayerState(conv_state, recurrent_state),
+            resident_seq_lens=seq_lens,
+            resident_last_tokens=last_tokens,
         )
 
     def forward_step_sampled_token_ids_resident_dense_slot_carry_jit(

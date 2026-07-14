@@ -21,6 +21,7 @@ from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.output import OutputBuffer, is_device_token
 from nanovllm_jax.sequence import Sequence, SequenceStatus, SamplingParams
+from nanovllm_jax.speculation import Drafter
 from nanovllm_jax.step import (
     FinishedRequest,
     FinishReason,
@@ -173,6 +174,16 @@ class LLMEngine:
         print(f"Startup device budget: {memory_mib:.1f} MiB")
         self._next_seq_id = 0
         atexit.register(self.exit)
+
+    def install_drafter(self, drafter: Drafter | None) -> None:
+        """Install an optional drafter before warmup or request admission."""
+
+        if not self.scheduler.is_pristine():
+            raise RuntimeError("install the drafter before adding requests")
+        self.model_runner.install_drafter(drafter)
+        self.scheduler.set_speculative_draft_width(
+            0 if drafter is None else int(drafter.width)
+        )
 
     def warmup_compilation(
         self,

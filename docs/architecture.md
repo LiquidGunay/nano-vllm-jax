@@ -131,6 +131,13 @@ padded row cannot write through its placeholder page.
 
 `ModelExecutor` owns JIT cache keys and calls into `model.forward_step`.
 
+An installed drafter adds one optional decode route. It supplies a fixed-width
+`DraftProposal`; the executor verifies current plus draft tokens in one packed
+target forward and returns a compact `VerificationResult`. The runner commits
+only target-approved token references and the device-selected KV/GDN prefix.
+The ordinary route and configuration remain unchanged when no drafter is
+installed.
+
 `RunResult` contains one emitted-token row per scheduled sequence. The engine
 commits those rows into `OutputBuffer`, advances logical/cache state, assigns
 EOS or length finish reasons, and returns a `StepResult` of token and finish
