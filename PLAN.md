@@ -7,7 +7,8 @@ Last updated: 2026-07-14
 Build the next mainline in three stages:
 
 1. Make the non-speculative engine correct, explicit, and easy to teach.
-2. Make its single performance claim reproducible from a clean checkout.
+2. Make one fixed benchmark runnable from a clean checkout and record one
+   honest result.
 3. Add speculative decoding behind a generic drafter/verifier boundary, with
    Qwen3.5 MTP as the first drafter.
 
@@ -50,7 +51,7 @@ surface, and diagnostics will not be merged or cherry-picked wholesale.
   remain test or diagnostic tools and cannot support a speed claim.
 - Continuous-integration automation is explicitly outside this plan and will
   not be added by these PRs. Validation remains a documented set of guarded
-  local checks and reproducibility commands.
+  local benchmark and correctness commands.
 
 ## Repository Style Contract
 
@@ -427,26 +428,29 @@ The work is deliberately split at coherent ownership boundaries. Every part
 must leave `main` fully working and reduce or consolidate concepts; a structural
 change does not earn scope merely because it appears in issue #10.
 
-### PR 3: reproducible artifact and one benchmark claim
+### PR 3: runnable artifact and one recorded benchmark result
 
 Status: [ ] open for review as draft PR
-[#14](https://github.com/LiquidGunay/nano-vllm-jax/pull/14) at `1d31754`
+[#14](https://github.com/LiquidGunay/nano-vllm-jax/pull/14) at `fa96cd0`
 
-Purpose: make the repository able to support and reproduce one honest claim.
+Purpose: make the repository run one fixed benchmark and preserve one honest
+recorded result.
 
 Committed pieces:
 
-- One deterministic workload manifest and metric schema.
+- One deterministic workload manifest and explicit result contract.
 - One compact benchmark driver shared by JAX and vLLM adapters.
-- A small `scripts/reproduce_claim.sh` entry point driven by the manifest.
-- Locked environment metadata and an optional, isolated vLLM dependency.
+- A small `scripts/run_benchmark.sh` entry point driven by the manifest.
+- A locked JAX environment and optional, isolated pinned vLLM dependency.
 - A concise benchmark report with exact model revision, hardware, software,
   measurement window, parity result, median, spread, and memory use.
 
 The JAX and vLLM environments remain isolated because their Torch, Triton, and
-cuDNN constraints can conflict. The reproduction script owns both environments
+cuDNN constraints can conflict. The benchmark script owns both environments
 and writes raw results outside the repository. vLLM comparison is optional;
-the JAX run and contract remain usable without installing vLLM.
+the JAX run and contract remain usable without installing vLLM. Fresh results
+report their observed ratio but do not fail for differing from the recorded
+historical ratio or environment.
 
 Headline contract, subject to the fresh baseline:
 
@@ -459,15 +463,17 @@ Headline contract, subject to the fresh baseline:
 The script performs GPU/CUDA preflight and defaults to an 80% system-RAM
 ceiling, a 10 GiB process-tree ceiling, and a 2 GiB available-memory floor.
 The earlier 70% ceiling safely stopped the clean JAX load at 70.8%; the bounded
-80% run completed without approaching the process-tree limit. A claim is not
-written if parity, memory, compilation, or variance checks fail.
+80% run completed without approaching the process-tree limit. A benchmark
+result is invalid if token stability, parity, timing, executor route-cache, or
+variance checks fail; hardware, software, checkout state, and speed ratio are
+recorded provenance rather than pass criteria.
 
 The clean A10G run is exact across backends and repeats. JAX measured `53.98`
-decode tok/s versus vLLM 0.25.0 at `50.23` (`1.075x`), with no JAX
-measured-phase JIT growth. JAX TTFT was slower (`122.8 ms` versus `54.5 ms`),
-so the report limits the claim to steady-state decode. Guard peak process-tree
-RSS was 2.74 GiB for JAX and 4.61 GiB for vLLM; raw outputs remain outside the
-repository.
+decode tok/s versus vLLM 0.25.0 at `50.23` (`1.075x`), with no executor
+route-cache growth during measurement. JAX TTFT was slower (`122.8 ms` versus
+`54.5 ms`), so the report limits the claim to steady-state decode. Guard peak
+process-tree RSS was 2.74 GiB for JAX and 4.61 GiB for vLLM; raw outputs remain
+outside the repository.
 
 ### PR 4: generic drafter plus cheap target verifier
 
@@ -669,8 +675,10 @@ Do not transplant:
   with zero measured JIT growth.
 - [x] Merge PR #13 at main commit `9e1c14d`, completing the cleanup and base
   ABI sequence.
-- [x] Open reproducibility draft PR #14 at `1d31754`. Its clean guarded A10G
-  run has exact cross-backend output, zero measured JAX JIT growth, and records
-  `53.98` JAX versus `50.23` vLLM 0.25.0 decode tok/s. It adds no CI and keeps
-  raw artifacts under `/mountpoint/.exp`.
+- [x] Open benchmark-artifact draft PR #14. At review head `fa96cd0`, the
+  command runs and reports the fixed workload without enforcing its historical
+  ratio or environment. Its clean guarded A10G run has exact cross-backend
+  output, zero measured executor route-cache growth, and records `53.98` JAX
+  versus `50.23` vLLM 0.25.0 decode tok/s. It adds no CI and keeps raw
+  artifacts under `/mountpoint/.exp`.
 - [ ] Review and merge PR #14 before starting the generic packed-verifier PR.
