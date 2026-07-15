@@ -1,4 +1,5 @@
 import jax
+import numpy as np
 import pytest
 
 from nanovllm_jax.engine import LLMEngine
@@ -128,6 +129,11 @@ def test_warmup_covers_persistent_speculative_route():
 
     assert RouteKind.PREFILL_MTP.value in summary["warmed_routes"]
     assert RouteKind.DECODE_SPECULATIVE.value in summary["warmed_routes"]
+    mtp_state = engine.model_runner.mtp_state
+    assert mtp_state is not None
+    assert not np.asarray(mtp_state.cache_storage.k_cache).any()
+    assert not np.asarray(mtp_state.cache_storage.v_cache).any()
+    assert not np.asarray(mtp_state.draft_token_ids).any()
     assert summary["include_sampled_routes"] is False
     assert summary["sampled_token_fastpath_runs"] == []
     assert RouteKind.DECODE_SAMPLED.value not in summary["warmed_routes"]
