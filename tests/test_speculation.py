@@ -93,14 +93,64 @@ def test_runtime_rejects_incompatible_mtp_at_construction():
         )
     with pytest.raises(ValueError, match="resident_decode_metadata"):
         runtime_spec(
-            capacity={"prefix_cache": False},
-            compile={"execution": "jit", "prefill_layout": "packed"},
+            capacity={
+                "prefix_cache": False,
+                "max_num_seqs": 1,
+                "max_num_resident_seqs": 1,
+            },
+            compile={
+                "execution": "jit",
+                "prefill_layout": "packed",
+                "batch_size_buckets": (1,),
+            },
             kernels={
                 "device_token_carry": True,
                 "static_decode_metadata": True,
             },
             drafter=DrafterConfig.mtp(2),
         )
+
+
+def test_runtime_rejects_sparse_mtp_batch_buckets():
+    config = _runtime(mtp=True, max_seqs=2)
+
+    with pytest.raises(ValueError, match="exact batch_size_buckets"):
+        replace(
+            config,
+            compile=replace(config.compile, batch_size_buckets=(2,)),
+        )
+
+
+def test_mtp_engine_rejects_incompatible_requests_before_admission():
+    engine = object.__new__(LLMEngine)
+    engine.config = _runtime(mtp=True)
+    engine._next_seq_id = 0
+
+    class Queue:
+        def __init__(self):
+            self.seqs = []
+
+        def add(self, seq):
+            self.seqs.append(seq)
+
+    engine.scheduler = Queue()
+
+    with pytest.raises(ValueError, match="persistent MTP requires"):
+        engine.generate([[1, 2, 3]], use_tqdm=False)
+
+    compatible = engine.add_request(
+        [1, 2, 3],
+        SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True),
+    )
+    incompatible = (
+        SamplingParams(temperature=1.0, max_tokens=8, ignore_eos=True),
+        SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=False),
+    )
+    for sampling in incompatible:
+        with pytest.raises(ValueError, match="persistent MTP requires"):
+            engine.add_request([4, 5, 6], sampling)
+
+    assert engine.scheduler.seqs == [compatible]
 
 
 def test_scheduler_derives_mtp_capacity_from_frozen_width():
@@ -160,7 +210,7 @@ def _runtime(*, mtp: bool = False, max_seqs: int = 1):
             "dtype": "float32",
             "execution": "jit",
             "prefill_token_buckets": (3 * max_seqs,),
-            "batch_size_buckets": (max_seqs,),
+            "batch_size_buckets": tuple(range(1, max_seqs + 1)),
             "decode_block_table_buckets": (16,),
         },
         kernels={
@@ -280,6 +330,51 @@ def test_packed_target_state_continues_after_reject_partial_and_full_accept():
         while not engine.is_finished():
             engine.step()
         assert seq.output.materialize() == expected
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="CUDA is required for MTP lifecycle")
+def test_persistent_mtp_seeds_across_chunked_prefill():
+    base_config = _runtime()
+    base_config = replace(
+        base_config,
+        capacity=replace(base_config.capacity, max_num_batched_tokens=2),
+        compile=replace(base_config.compile, prefill_token_buckets=(2,)),
+    )
+    mtp_config = replace(base_config, drafter=DrafterConfig.mtp(2))
+    params = init_params(jax.random.PRNGKey(7), base_config.model)
+    prompt = (1, 2, 3, 4, 5)
+    expected = _generate(
+        _Engine(base_config, params),
+        max_tokens=8,
+        prompt=prompt,
+    )
+    engine = _Engine(
+        mtp_config,
+        params,
+        init_mtp_params(jax.random.PRNGKey(8), mtp_config),
+    )
+    seq = engine.add_request(
+        list(prompt),
+        SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True),
+    )
+
+    for cached_tokens in (2, 4):
+        step = engine.step()
+        assert step.phase == "prefill"
+        assert not step.emitted_tokens
+        assert seq.num_cached_tokens == cached_tokens
+        assert seq.seq_id not in engine.model_runner._mtp_ready_seq_ids
+
+    final_prefill = engine.step()
+    assert final_prefill.phase == "prefill"
+    assert final_prefill.num_emitted_tokens == 1
+    assert seq.num_cached_tokens == len(prompt)
+    assert seq.seq_id in engine.model_runner._mtp_ready_seq_ids
+
+    while not engine.is_finished():
+        engine.step()
+
+    assert seq.output.materialize() == expected
 
 
 @pytest.mark.skipif(not _has_cuda(), reason="CUDA is required for verifier parity")

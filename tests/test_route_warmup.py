@@ -50,7 +50,7 @@ def _config(*, mtp: bool = False):
             "dtype": "float32",
             "execution": "jit",
             "prefill_token_buckets": (4,),
-            "batch_size_buckets": (1, 4),
+            "batch_size_buckets": (1, 2, 3, 4) if mtp else (1, 4),
             "decode_block_table_buckets": (4,),
         },
         kernels={

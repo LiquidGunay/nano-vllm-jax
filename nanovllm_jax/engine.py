@@ -103,20 +103,20 @@ class LLMEngine:
             metadata_path,
             model=model_path,
         )
-        self.checkpoint_path = (
-            metadata_path
-            if Path(model_path).expanduser().exists()
-            else resolve_checkpoint(model_path, revision=metadata_path.name)
-        )
         self.config = _runtime_spec_from_engine_config(
             engine_config,
             self.model_config,
             drafter,
         )
         requested_kv_blocks = self.config.capacity.num_kvcache_blocks
+        cache_layers = self.config.model.num_hidden_layers + (
+            self.config.model.mtp_num_hidden_layers
+            if self.config.drafter is not None
+            else 0
+        )
         kv_spec = resolve_kv_cache_spec(
             KVCacheSpec(
-                num_layers=self.config.model.num_hidden_layers,
+                num_layers=cache_layers,
                 num_blocks=requested_kv_blocks,
                 block_size=self.config.capacity.block_size,
                 num_kv_heads=self.config.model.num_key_value_heads,
@@ -139,6 +139,11 @@ class LLMEngine:
                 self.config.capacity,
                 num_kvcache_blocks=effective_blocks,
             ),
+        )
+        self.checkpoint_path = (
+            metadata_path
+            if Path(model_path).expanduser().exists()
+            else resolve_checkpoint(model_path, revision=metadata_path.name)
         )
 
         if not HAS_TRANSFORMERS:
@@ -245,10 +250,7 @@ class LLMEngine:
 
         if not prompt:
             raise ValueError("prompt must contain at least one token")
-        if sampling_params.max_tokens <= 0:
-            raise ValueError("max_tokens must be positive")
-        if sampling_params.temperature < 0:
-            raise ValueError("temperature must be non-negative")
+        self._validate_sampling_params(sampling_params)
 
         seq = Sequence(
             prompt,
@@ -260,12 +262,22 @@ class LLMEngine:
         self.scheduler.add(seq)
         return seq
 
+    def _validate_sampling_params(self, sampling_params: SamplingParams) -> None:
+        if sampling_params.max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if sampling_params.temperature < 0:
+            raise ValueError("temperature must be non-negative")
+        if self.config.drafter is not None and (
+            sampling_params.temperature != 0 or not sampling_params.ignore_eos
+        ):
+            raise ValueError(
+                "persistent MTP requires temperature=0 and ignore_eos=True"
+            )
+
     def _prepare_generation_sequences(
         self,
         prompts: List[Union[str, List[int]]],
         sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
-        *,
-        require_greedy_ignore_eos: bool = False,
     ) -> List[Sequence]:
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -283,15 +295,7 @@ class LLMEngine:
             request_inputs.append(token_ids)
 
         for sp in sampling_params:
-            if sp.max_tokens <= 0:
-                raise ValueError("max_tokens must be positive")
-            if sp.temperature < 0:
-                raise ValueError("temperature must be non-negative")
-            if require_greedy_ignore_eos and (sp.temperature != 0 or not sp.ignore_eos):
-                raise ValueError(
-                    "device_token_carry requires greedy sampling "
-                    "with ignore_eos=True"
-                )
+            self._validate_sampling_params(sp)
 
         return [self.add_request(prompt, sp) for prompt, sp in zip(request_inputs, sampling_params)]
 
@@ -501,9 +505,10 @@ class LLMEngine:
                 for event in step_result.emitted_tokens
             }
             OutputBuffer.snapshot_many(event_buffers.values()).prefetch().materialize()
-            for event in step_result.emitted_tokens:
+            for event_index, event in enumerate(step_result.emitted_tokens):
                 seq = seqs_by_id[event.seq_id]
                 token_id = seq.output.token_id(event.completion_index)
+                owns_step_metrics = event_index == 0
                 token_event = {
                     "event": "token",
                     "seq_id": event.seq_id,
@@ -516,9 +521,15 @@ class LLMEngine:
                     "step_end_seconds": step_end - stream_start,
                     "scheduler_step_tokens": step_result.scheduled_tokens,
                     "scheduler_step_is_decode": step_result.is_decode,
-                    "verified_target_tokens": step_result.verified_target_tokens,
-                    "draft_tokens": step_result.draft_tokens,
-                    "accepted_draft_tokens": step_result.accepted_draft_tokens,
+                    "verified_target_tokens": (
+                        step_result.verified_target_tokens if owns_step_metrics else 0
+                    ),
+                    "draft_tokens": (
+                        step_result.draft_tokens if owns_step_metrics else 0
+                    ),
+                    "accepted_draft_tokens": (
+                        step_result.accepted_draft_tokens if owns_step_metrics else 0
+                    ),
                 }
                 if include_text:
                     token_event["text"] = self._detokenize([token_id])

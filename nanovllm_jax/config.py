@@ -559,6 +559,16 @@ class RuntimeSpec:
             raise ValueError("persistent MTP requires JIT execution and packed prefill")
         if self.capacity.prefix_cache:
             raise ValueError("persistent MTP currently requires prefix_cache=False")
+        missing_batch_sizes = tuple(
+            size
+            for size in range(1, self.capacity.max_num_seqs + 1)
+            if size not in self.compile.batch_size_buckets
+        )
+        if missing_batch_sizes:
+            raise ValueError(
+                "persistent MTP requires exact batch_size_buckets for every "
+                f"admitted batch size; missing {missing_batch_sizes}"
+            )
         required = {
             "greedy_token_fastpath": self.kernels.greedy_token_fastpath,
             "device_token_carry": self.kernels.device_token_carry,

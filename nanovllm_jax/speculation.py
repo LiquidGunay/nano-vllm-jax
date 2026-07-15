@@ -15,7 +15,7 @@ MAX_DRAFT_WIDTH = 15
 
 @dataclass(frozen=True)
 class DrafterConfig:
-    """Constructor-time selection of one persistent draft model."""
+    """Constructor-time selection of the experimental persistent drafter."""
 
     kind: str
     width: int

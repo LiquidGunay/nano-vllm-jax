@@ -119,7 +119,10 @@ def test_sequence_ids_and_block_sizes_are_engine_local():
 
     def bare_engine(block_size: int) -> LLMEngine:
         engine = object.__new__(LLMEngine)
-        engine.config = SimpleNamespace(capacity=SimpleNamespace(block_size=block_size))
+        engine.config = SimpleNamespace(
+            capacity=SimpleNamespace(block_size=block_size),
+            drafter=None,
+        )
         engine.scheduler = Queue()
         engine._next_seq_id = 0
         return engine

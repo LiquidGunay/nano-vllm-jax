@@ -1,14 +1,19 @@
 # Persistent MTP
 
-MTP is an optional constructor-time overlay on the promoted greedy path:
+Persistent MTP is an experimental, constructor-time overlay on the promoted
+greedy path:
 
 ```python
-from nanovllm_jax import DrafterConfig, LLM
+from nanovllm_jax import DrafterConfig, LLM, SamplingParams
 
 llm = LLM(
     "Qwen/Qwen3.5-4B",
     prefix_cache=False,
     drafter=DrafterConfig.mtp(width=3),
+)
+outputs = llm.generate(
+    ["The future of small serving engines"],
+    SamplingParams(temperature=0, max_tokens=64, ignore_eos=True),
 )
 ```
 
@@ -52,7 +57,8 @@ observe them and subsequent writes replace them.
 
 `RunResult` and `StepResult` report draft tokens, accepted draft tokens, and
 the number of target positions evaluated by verification separately from the
-scheduler's input-token count.
+scheduler's input-token count. Streaming attaches those step-wide counters to
+the first token event from the step and uses zero for later events from it.
 
 ## Limits and correctness
 
@@ -60,9 +66,16 @@ scheduler's input-token count.
   server unchanged.
 - It currently requires JIT packed prefill, prefix caching disabled, greedy
   sampling, ignored EOS, dense resident decode rows, device token carry, and
-  resident metadata. Static incompatibilities fail during construction.
-- A tail with fewer than `K + 1` output tokens remaining uses the already-warmed
-  ordinary greedy route.
+  resident metadata. Static incompatibilities fail during construction and
+  incompatible requests fail at admission.
+- Exact decode buckets are required for every admitted batch cardinality, so
+  configuring MTP cannot silently select a padded ordinary route.
+- `kv_cache_bytes` caps the combined canonical target and predictor KV arrays;
+  enabling MTP can therefore reduce their shared block count.
+- Tail eligibility is batch-wide. If any row has fewer than `K + 1` output
+  tokens remaining, the whole batch uses the already-warmed ordinary route and
+  discards its proposals; longer rows do not resume MTP after the short row
+  finishes.
 - `K <= 15`; the packed target width includes one additional current token.
 - The loader targets Qwen3.5 dense checkpoints with one tied-embedding MTP
   layer; model-size support follows that checkpoint contract rather than a
@@ -74,3 +87,8 @@ exact token parity as the strongest result, but permits isolated top-1 changes
 only when an explicit full-vocabulary KL/JS and logit-margin check shows that
 they are numerical near ties. Acceptance, state advancement, and emitted-token
 accounting must still follow the packed target distribution exactly.
+
+Because of that numerical limitation, MTP remains experimental even when a
+checkpoint passes an exact generation run. Promotion checks use identical base
+and MTP prompts, compare every emitted token, and inspect both full-vocabulary
+distributions at the first mismatch rather than accepting token drift alone.
