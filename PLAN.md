@@ -1,6 +1,6 @@
 # Mainline Cleanup and Speculative Decoding Plan
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 ## Goal
 
@@ -17,8 +17,8 @@ one PR at a time, then build the next PR from the newly merged `main`.
 
 ## Source Revisions
 
-- Clean mainline: `origin/main@6ee8bbc` (through merged PR #14)
-- Experimental evidence: `experimental/mtp-prefill-verifier-speed@da91504`
+- Clean mainline: `origin/main@faaf175` (through merged PR #15)
+- Experimental evidence: `experimental/mtp-prefill-verifier-speed@4884542`
 - Cleanup review: `/mountpoint/.exp/cleanup_and_diagnosis.md`
 
 The clean mainline is the implementation base. The experimental branch is a
@@ -32,10 +32,12 @@ surface, and diagnostics will not be merged or cherry-picked wholesale.
 - The initially validated dense checkpoints are Qwen3.5 0.8B, 2B, and 4B.
   Larger models remain rejected until they have a real-weight test on suitable
   hardware.
-- The artifact workload is Qwen3.5-4B, BF16, batch 1, 64 prompt tokens, and 64
-  greedy output tokens on one A10G. A clean run measured `53.98` decode tok/s
-  for JAX and `50.23` for vLLM 0.25.0 with exact output parity. TTFT is reported
-  separately; this is not an end-to-end latency or speculative-decoding claim.
+- The artifact workload is Qwen3.5-4B, BF16, batch 1, 64 prompt tokens, 64
+  greedy output tokens, and optional K=2 MTP on one A10G. A clean exact run
+  measured JAX base/MTP at `53.95/83.94` decode tok/s and vLLM 0.25.1
+  base/MTP at `50.32/86.82`. JAX MTP is `1.556x` its base and `1.668x`
+  vLLM without MTP. TTFT is reported separately; this is a steady-state
+  decode claim, not an end-to-end latency claim.
 - B=1 is the speculative latency target. B=8 remains a non-regression lane for
   the ordinary engine; no B=1 optimization may silently replace the B=8 path.
 - JAX shape specialization is explicit in compile buckets and route keys. It
@@ -478,8 +480,7 @@ outside the repository.
 
 ### PR 4: generic drafter plus cheap target verifier
 
-Status: [ ] draft PR [#15](https://github.com/LiquidGunay/nano-vllm-jax/pull/15)
-open from `agent/generic-packed-verifier@f589a41`
+Status: [x] merged with persistent MTP as PR #15 at main commit `faaf175`.
 
 Purpose: prove cheap verification independently of MTP draft quality.
 
@@ -535,7 +536,8 @@ and matched late-error 0.8B run were exact.
 
 ### PR 5: Qwen3.5 MTP drafter and speculative promotion
 
-Status: [ ] blocked by PR 4
+Status: [ ] draft PR [#16](https://github.com/LiquidGunay/nano-vllm-jax/pull/16)
+open from `agent/mtp-benchmark-promotion@5c3a654`
 
 Purpose: attach MTP through the generic drafter ABI and determine where it is a
 real speed win.
@@ -583,6 +585,27 @@ If only 4B passes the speed gate, MTP is documented as a 4B/B=1 route. Smaller
 models remain supported by base decode and their speculative limitation is
 reported rather than hidden.
 
+PR #15 expanded to include the persistent BF16 MTP implementation: checkpoint
+loading, prefill cache seeding, resident proposals, packed target verification,
+device-side state selection, recursive proposal refresh, strict counters, and
+the optional constructor ABI. The BF16 route already meets the speed gate, so
+an INT8 proposal mode is deferred rather than adding a second public policy
+surface without a demonstrated need.
+
+The current guarded A10G artifact is exact across JAX base/MTP and vLLM 0.25.1
+base/MTP. Smaller non-claim diagnostics show the size trend:
+
+| Model | JAX base | JAX MTP | JAX ratio | vLLM base | vLLM MTP |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0.8B | `208.91` | `238.57` | `1.142x` | `243.24` | `277.84`* |
+| 2B | `113.50` | `149.74` | `1.319x` | `112.06` | `167.06` |
+| 4B | `53.95` | `83.94` | `1.556x` | `50.32` | `86.82` |
+
+`*` The 0.8B vLLM-MTP run changed only its final token and is diagnostic, not
+a valid parity result. JAX MTP was exact for all three sizes. The 0.8B JAX
+route beats its own base but not vLLM base; 2B and 4B beat both. Fixed boundary
+cost and lower 0.8B acceptance explain the weaker small-model gain.
+
 ## Experimental Transplant Map
 
 Reimplement against the clean ABI:
@@ -610,7 +633,9 @@ Do not transplant:
 
 - GPU visibility: `nvidia-smi` plus a CUDA-only JAX smoke before GPU work.
 - JAX correctness/performance: `JAX_PLATFORMS=cuda`; never CPU fallback.
-- System RAM: guarded subprocesses, default hard stop at 70%.
+- System RAM: guarded subprocesses; the artifact defaults to an 80% ceiling,
+  a 10 GiB process-tree cap, and a 2 GiB available-memory floor. Use 70% when
+  the smaller envelope fits.
 - GPU memory: estimate before load, record peak, and retain a documented safety
   margin rather than merely avoiding OOM.
 - Large models run one process at a time; caches and artifacts stay under
@@ -719,5 +744,10 @@ Do not transplant:
   exact and faster. Guarded validation passed 247/248 collected tests; the one
   legacy full-sequence generation test reached the unchanged 80% RAM limit,
   while its ten-prompt logits check and a scaled generation equivalent passed.
-- [ ] Review and merge PR #15, then implement the persistent Qwen3.5 MTP
-  drafter against its verifier boundary.
+- [x] Merge PR #15 with the generic packed verifier and persistent Qwen3.5 MTP
+  drafter at main commit `faaf175`.
+- [x] Open benchmark-promotion PR #16 with the exact four-route 4B table,
+  smaller-family diagnostics, vLLM 0.25.1 pin, and the warmup-state reset found
+  by repeated fresh-process parity checks.
+- [ ] Review and merge PR #16, then decide whether the next mainline pass should
+  be prefix-cache ownership or broader resident decode metadata cleanup.
