@@ -1,16 +1,20 @@
 {
-  "schema_version": 1,
-  "benchmark_id": "qwen35-4b-b1-p64-o64-greedy",
-  "benchmark_sha256": "6ed76245f4df82b32d0677db0a87e8bb5837c6c13fe50e5bff2e993dbfa4cd5e",
-  "recorded_at": "2026-07-14",
-  "implementation_commit": "d8c50abef771cf73e3ae31d8b96a8ed785b65652",
+  "schema_version": 2,
+  "benchmark_id": "qwen35-4b-b1-p64-o64-greedy-mtp2",
+  "benchmark_sha256": "0b8892a5d66ca2dd9d289a320e3bea76fdca5de232b581a00ea16dde68f1ff8d",
+  "recorded_at": "2026-07-15",
+  "implementation_commit": "f991b63c335260150f09113b0bb7cf7d4aa25cca",
   "hardware": {
     "gpu": "NVIDIA A10G",
+    "gpu_uuid": "GPU-e5dec035-32bc-c974-42bc-ad80b6fd3553",
     "gpu_memory_bytes": 24146608128,
     "driver": "580.159.03"
   },
   "results": {
-    "jax": {
+    "jax_base": {
+      "valid": true,
+      "reference_exact": null,
+      "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
       "framework": {
         "jax": "0.10.0",
         "jaxlib": "0.10.0",
@@ -18,39 +22,94 @@
         "triton": "3.6.0"
       },
       "samples": [
-        {"ttft_seconds": 0.12278242199681699, "decode_tokens_per_second": 53.97659219975553},
-        {"ttft_seconds": 0.12286994396708906, "decode_tokens_per_second": 53.94800986126448},
-        {"ttft_seconds": 0.12272863113321364, "decode_tokens_per_second": 53.979836060681905}
+        {"ttft_seconds": 0.12429690198041499, "decode_tokens_per_second": 53.95256882925237},
+        {"ttft_seconds": 0.12418342009186745, "decode_tokens_per_second": 53.9183774177377},
+        {"ttft_seconds": 0.12445161584764719, "decode_tokens_per_second": 53.966977931854835}
       ],
-      "median_ttft_seconds": 0.12278242199681699,
-      "median_decode_tokens_per_second": 53.97659219975553,
-      "relative_spread": 0.000589629654640697,
+      "median_ttft_seconds": 0.12429690198041499,
+      "median_decode_tokens_per_second": 53.95256882925237,
+      "relative_spread": 0.0009008007435372146,
       "measured_executor_route_cache_growth": 0,
-      "guard_peak_process_tree_rss_bytes": 2938306560,
+      "guard_peak_process_tree_rss_bytes": 3003199488,
       "max_observed_device_used_bytes": 18667798528
     },
-    "vllm": {
+    "jax_mtp": {
+      "valid": true,
+      "reference_exact": true,
+      "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
       "framework": {
-        "vllm": "0.25.0",
+        "jax": "0.10.0",
+        "jaxlib": "0.10.0",
+        "transformers": "5.6.2",
+        "triton": "3.6.0"
+      },
+      "samples": [
+        {"ttft_seconds": 0.12975622597150505, "decode_tokens_per_second": 83.9376670034473},
+        {"ttft_seconds": 0.1296198528725654, "decode_tokens_per_second": 83.8436377714318},
+        {"ttft_seconds": 0.12966951518319547, "decode_tokens_per_second": 84.06693263757498}
+      ],
+      "median_ttft_seconds": 0.12966951518319547,
+      "median_decode_tokens_per_second": 83.9376670034473,
+      "relative_spread": 0.002660246276966538,
+      "draft_tokens_per_repeat": 50,
+      "accepted_draft_tokens_per_repeat": 36,
+      "verified_target_tokens_per_repeat": 75,
+      "measured_executor_route_cache_growth": 0,
+      "guard_peak_process_tree_rss_bytes": 3390173184,
+      "max_observed_device_used_bytes": 18680381440
+    },
+    "vllm_base": {
+      "valid": true,
+      "reference_exact": true,
+      "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
+      "framework": {
+        "vllm": "0.25.1",
         "torch": "2.11.0",
         "transformers": "5.13.1",
         "triton": "3.6.0"
       },
       "samples": [
-        {"ttft_seconds": 0.05181145668029785, "decode_tokens_per_second": 50.22790945646228},
-        {"ttft_seconds": 0.05984997749328613, "decode_tokens_per_second": 50.23059307254773},
-        {"ttft_seconds": 0.054529428482055664, "decode_tokens_per_second": 50.19809538829794}
+        {"ttft_seconds": 0.05183553695678711, "decode_tokens_per_second": 50.321436005905184},
+        {"ttft_seconds": 0.05728316307067871, "decode_tokens_per_second": 50.322690579798035},
+        {"ttft_seconds": 0.05170273780822754, "decode_tokens_per_second": 50.31492880588558}
       ],
-      "median_ttft_seconds": 0.054529428482055664,
-      "median_decode_tokens_per_second": 50.22790945646228,
-      "relative_spread": 0.0006470045160440607,
-      "guard_peak_process_tree_rss_bytes": 4947369984,
-      "max_observed_device_used_bytes": 9545187328
+      "median_ttft_seconds": 0.05183553695678711,
+      "median_decode_tokens_per_second": 50.321436005905184,
+      "relative_spread": 0.00015424388746667345,
+      "guard_peak_process_tree_rss_bytes": 4761927680,
+      "max_observed_device_used_bytes": 9543090176
+    },
+    "vllm_mtp": {
+      "valid": true,
+      "reference_exact": true,
+      "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
+      "framework": {
+        "vllm": "0.25.1",
+        "torch": "2.11.0",
+        "transformers": "5.13.1",
+        "triton": "3.6.0"
+      },
+      "samples": [
+        {"ttft_seconds": 0.06968450546264648, "decode_tokens_per_second": 86.82285995409659},
+        {"ttft_seconds": 0.0718533992767334, "decode_tokens_per_second": 87.11265117445105},
+        {"ttft_seconds": 0.05652117729187012, "decode_tokens_per_second": 86.75859202600388}
+      ],
+      "median_ttft_seconds": 0.06968450546264648,
+      "median_decode_tokens_per_second": 86.82285995409659,
+      "relative_spread": 0.004077948464659597,
+      "draft_tokens_per_repeat": 51,
+      "accepted_draft_tokens_per_repeat": 36,
+      "guard_peak_process_tree_rss_bytes": 5203382272,
+      "max_observed_device_used_bytes": 9771679744
     }
   },
   "comparison": {
-    "jax_over_vllm_decode_ratio": 1.074633461433,
-    "output_sha256": "352a694746b191d9b1cbb50e43499729b3fc3903048745cad7d79b8b8d85ca5a",
+    "jax_base_over_vllm_base": 1.072158767943766,
+    "jax_mtp_over_jax_base": 1.5557677572145074,
+    "vllm_mtp_over_vllm_base": 1.725365308412661,
+    "jax_mtp_over_vllm_base": 1.6680300417817424,
+    "jax_mtp_over_vllm_mtp": 0.9667692016575509,
+    "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
     "output_exact": true
   }
 }

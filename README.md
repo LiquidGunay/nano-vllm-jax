@@ -39,11 +39,19 @@ The offline `LLM.generate(..., use_tqdm=True)` progress bar uses the optional
 ## Run The Benchmark
 
 The repository makes one narrow claim: Qwen3.5-4B greedy B=1 decode with a
-64-token prompt and 64 generated tokens. The exact checkpoint, workload,
-framework version, and validity gates live in
+64-token prompt, 64 generated tokens, and optional K=2 MTP. The exact
+checkpoint, workload, framework version, and validity gates live in
 [benchmarks/benchmark.json](benchmarks/benchmark.json). The committed
 [recorded result](benchmarks/recorded_result.json) is one historical A10G
 observation, not a pass threshold for new runs.
+
+| Framework | Base decode tok/s | MTP decode tok/s | MTP/base |
+| --- | ---: | ---: | ---: |
+| Nano-VLLM-JAX | 53.95 | 83.94 | 1.556x |
+| vLLM 0.25.1 | 50.32 | 86.82 | 1.725x |
+
+All four routes produced the same tokens. JAX MTP is 1.668x vLLM without MTP
+and 0.967x vLLM with MTP on this fixed workload.
 
 ```bash
 ./scripts/run_benchmark.sh both

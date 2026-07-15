@@ -16,6 +16,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ROUTES = ("base", "mtp")
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -25,13 +26,14 @@ def load_manifest(path: Path) -> dict[str, Any]:
         "benchmark_id",
         "model",
         "workload",
+        "speculation",
         "capacity",
         "measurement",
         "frameworks",
     }
     if set(manifest) != required:
         raise ValueError(f"manifest keys must be exactly {sorted(required)}")
-    if manifest["schema_version"] != 1:
+    if manifest["schema_version"] != 2:
         raise ValueError("unsupported manifest schema")
     workload = manifest["workload"]
     if workload["batch_size"] != 1:
@@ -40,6 +42,19 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise ValueError("the benchmark requires greedy fixed-length decode")
     if workload["prefix_cache"]:
         raise ValueError("the benchmark requires a prefix miss")
+    prompt = workload["prompt_token_ids"]
+    if len(prompt) != workload["prompt_tokens"] or any(
+        isinstance(token, bool) or not isinstance(token, int) or token < 0
+        for token in prompt
+    ):
+        raise ValueError(
+            "prompt_token_ids must contain prompt_tokens nonnegative integers"
+        )
+    speculation = manifest["speculation"]
+    if set(speculation) != {"method", "draft_tokens"}:
+        raise ValueError("speculation must define method and draft_tokens")
+    if speculation["method"] != "mtp" or speculation["draft_tokens"] < 1:
+        raise ValueError("the benchmark requires a positive-width MTP drafter")
     measurement = manifest["measurement"]
     if measurement["warmup_repeats"] < 1 or measurement["repeats"] < 1:
         raise ValueError("warmup and measured repeats must be positive")
@@ -48,15 +63,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
 
 def prompt_rows(manifest: dict[str, Any]) -> list[list[int]]:
     workload = manifest["workload"]
-    return [
-        [
-            workload["prompt_start_token"]
-            + row * workload["prompt_row_stride"]
-            + position
-            for position in range(workload["prompt_tokens"])
-        ]
-        for row in range(workload["batch_size"])
-    ]
+    return [list(workload["prompt_token_ids"])]
 
 
 def _children(pid: int) -> list[int]:
@@ -126,19 +133,49 @@ def _output_hash(rows: list[list[int]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _file_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _reference_rows(
     path: Path | None,
     manifest: dict[str, Any],
+    benchmark_sha256: str,
+    repository: dict[str, Any],
 ) -> list[list[int]] | None:
     if path is None:
         return None
     result = json.loads(path.read_text())
     if result["backend"] != "jax" or not result["valid"]:
         raise ValueError("the reference must be a valid JAX result")
-    for field in ("benchmark_id", "model", "workload", "capacity"):
+    if result["route"] != "base":
+        raise ValueError("the reference must use base JAX decode")
+    if result.get("benchmark_sha256") != benchmark_sha256:
+        raise ValueError("reference benchmark manifest does not match")
+    if result.get("environment", {}).get("repository") != repository:
+        raise ValueError("reference implementation commit does not match")
+    for field in (
+        "benchmark_id",
+        "model",
+        "workload",
+        "speculation",
+        "capacity",
+    ):
         if result[field] != manifest[field]:
             raise ValueError(f"reference {field} does not match the manifest")
     return result["correctness"]["output_token_ids"]
+
+
+def _validate_reference_role(
+    backend_name: str,
+    route: str,
+    reference_path: Path | None,
+) -> None:
+    is_jax_base = backend_name == "jax" and route == "base"
+    if is_jax_base and reference_path is not None:
+        raise ValueError("JAX base is the canonical reference")
+    if not is_jax_base and reference_path is None:
+        raise ValueError("JAX MTP and vLLM routes require a JAX-base reference")
 
 
 def _sample_memory(maximum: dict[str, int]) -> None:
@@ -148,6 +185,7 @@ def _sample_memory(maximum: dict[str, int]) -> None:
 
 def invalid_reasons(
     backend_name: str,
+    route: str,
     manifest: dict[str, Any],
     samples: list[dict[str, Any]],
     output_rows: list[list[int]],
@@ -157,9 +195,8 @@ def invalid_reasons(
     route_cache_growth: int | None,
 ) -> list[str]:
     reasons = []
-    expected_tokens = (
-        manifest["workload"]["batch_size"]
-        * (manifest["workload"]["output_tokens"] - 1)
+    expected_tokens = manifest["workload"]["batch_size"] * (
+        manifest["workload"]["output_tokens"] - 1
     )
     speeds = [sample["decode_tokens_per_second"] for sample in samples]
     spread = (max(speeds) - min(speeds)) / median(speeds)
@@ -180,20 +217,49 @@ def invalid_reasons(
         reasons.append("decode throughput spread exceeds the contract")
     if backend_name == "jax" and route_cache_growth != 0:
         reasons.append("JAX added an executor route-cache entry during measurement")
+    for sample in samples:
+        stats = sample["speculation"]
+        drafted = stats["draft_tokens"]
+        accepted = stats["accepted_draft_tokens"]
+        verified = stats["verified_target_tokens"]
+        if not 0 <= accepted <= drafted:
+            reasons.append("speculative acceptance counters are inconsistent")
+            break
+        if route == "base" and (drafted or accepted or verified not in (0, None)):
+            reasons.append("base decode reported speculative work")
+            break
+        if route == "mtp" and (
+            drafted == 0
+            or (backend_name == "jax" and (verified is None or verified == 0))
+        ):
+            reasons.append("MTP decode did not report target-verified drafts")
+            break
     return reasons
 
 
 def run(
     backend_name: str,
+    route: str,
     manifest: dict[str, Any],
+    benchmark_sha256: str,
     reference_path: Path | None,
 ) -> dict[str, Any]:
+    _validate_reference_role(backend_name, route, reference_path)
     prompts = prompt_rows(manifest)
-    backend_module = importlib.import_module(f"benchmarks.backends.{backend_name}")
     memory = {"rss": 0, "device": 0}
+    repository = _git_state()
+    if repository["dirty"]:
+        raise RuntimeError("the benchmark requires a clean repository")
+    reference_rows = _reference_rows(
+        reference_path,
+        manifest,
+        benchmark_sha256,
+        repository,
+    )
+    backend_module = importlib.import_module(f"benchmarks.backends.{backend_name}")
 
     init_started = perf_counter()
-    backend = backend_module.Backend(manifest, prompts)
+    backend = backend_module.Backend(manifest, prompts, route)
     init_seconds = perf_counter() - init_started
     _sample_memory(memory)
 
@@ -211,11 +277,7 @@ def run(
         sample = backend.run_once()
         repeat_exact &= sample["output_token_ids"] == control["output_token_ids"]
         samples.append(
-            {
-                key: value
-                for key, value in sample.items()
-                if key != "output_token_ids"
-            }
+            {key: value for key, value in sample.items() if key != "output_token_ids"}
         )
         _sample_memory(memory)
     route_cache_after = backend.route_cache_fingerprint()
@@ -228,7 +290,6 @@ def run(
     ttfts = [sample["ttft_seconds"] for sample in samples]
     median_speed = median(speeds)
     relative_spread = (max(speeds) - min(speeds)) / median_speed
-    reference_rows = _reference_rows(reference_path, manifest)
     reference_exact = (
         None
         if reference_rows is None
@@ -237,6 +298,7 @@ def run(
 
     reasons = invalid_reasons(
         backend_name,
+        route,
         manifest,
         samples,
         control["output_token_ids"],
@@ -250,11 +312,14 @@ def run(
     )
     backend_memory = backend.memory()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark_id": manifest["benchmark_id"],
+        "benchmark_sha256": benchmark_sha256,
         "backend": backend_name,
+        "route": route,
         "model": manifest["model"],
         "workload": manifest["workload"],
+        "speculation": manifest["speculation"],
         "capacity": manifest["capacity"],
         "environment": {
             "python": platform.python_version(),
@@ -266,7 +331,7 @@ def run(
                 "memory_bytes": int(gpu_memory_mib) * 1024 * 1024,
                 "driver": driver,
             },
-            "repository": _git_state(),
+            "repository": repository,
         },
         "timing": {
             "initialization_seconds": init_seconds,
@@ -300,6 +365,7 @@ def run(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("backend", choices=("jax", "vllm"))
+    parser.add_argument("--route", choices=ROUTES, required=True)
     parser.add_argument(
         "--manifest", type=Path, default=ROOT / "benchmarks/benchmark.json"
     )
@@ -307,11 +373,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
 
-    result = run(args.backend, load_manifest(args.manifest), args.reference)
+    manifest = load_manifest(args.manifest)
+    result = run(
+        args.backend,
+        args.route,
+        manifest,
+        _file_hash(args.manifest),
+        args.reference,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(
-        f"{args.backend}: {result['timing']['median_decode_tokens_per_second']:.2f} "
+        f"{args.backend}-{args.route}: "
+        f"{result['timing']['median_decode_tokens_per_second']:.2f} "
         f"decode tok/s, valid={result['valid']}"
     )
     return 0 if result["valid"] else 2

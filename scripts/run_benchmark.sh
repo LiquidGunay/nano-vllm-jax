@@ -4,8 +4,8 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 target=${1:-both}
 case "$target" in
-  jax|vllm|both) ;;
-  *) echo "usage: $0 [jax|vllm|both]" >&2; exit 2 ;;
+  jax|jax-base|jax-mtp|vllm|vllm-base|vllm-mtp|both) ;;
+  *) echo "usage: $0 [jax|jax-base|jax-mtp|vllm|vllm-base|vllm-mtp|both]" >&2; exit 2 ;;
 esac
 
 scratch_root=${NANO_VLLM_JAX_BENCHMARK_ROOT:-/mountpoint/.exp}
@@ -29,7 +29,22 @@ export FLASHINFER_WORKSPACE_BASE=$scratch_root
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export UV_NO_PROGRESS=1
 mkdir -p "$artifact_root/results" "$HF_HOME"
+
+clear_routes() {
+  local route
+  for route in "$@"; do
+    rm -f "$artifact_root/results/$route.json" \
+      "$artifact_root/results/$route.ram.json"
+  done
+}
+
 rm -f "$artifact_root/results/comparison.json"
+case "$target" in
+  jax-base|jax-mtp|vllm-base|vllm-mtp) clear_routes "$target" ;;
+  jax) clear_routes jax-base jax-mtp ;;
+  vllm) clear_routes vllm-base vllm-mtp ;;
+  both) clear_routes jax-base jax-mtp vllm-base vllm-mtp ;;
+esac
 
 setup_jax() {
   UV_PROJECT_ENVIRONMENT="$jax_env" uv sync --python 3.11 \
@@ -70,46 +85,77 @@ guard_with() {
 }
 
 run_jax() {
+  local route=$1
+  local reference=()
+  if [[ "$route" == mtp ]]; then
+    reference=(--reference "$artifact_root/results/jax-base.json")
+  fi
   JAX_PLATFORMS=cuda PYTHONPATH="$root" guard_with \
     "$jax_env/bin/python" \
-    "$artifact_root/results/jax.ram.json" \
+    "$artifact_root/results/jax-$route.ram.json" \
     "$jax_env/bin/python" -m benchmarks.run_benchmark jax \
-    --output "$artifact_root/results/jax.json"
+    --route "$route" "${reference[@]}" \
+    --output "$artifact_root/results/jax-$route.json"
 }
 
 run_vllm() {
+  local route=$1
   PYTHONPATH="$root" guard_with \
     "$vllm_env/bin/python" \
-    "$artifact_root/results/vllm.ram.json" \
+    "$artifact_root/results/vllm-$route.ram.json" \
     "$vllm_env/bin/python" -m benchmarks.run_benchmark vllm \
-    --reference "$artifact_root/results/jax.json" \
-    --output "$artifact_root/results/vllm.json"
+    --route "$route" \
+    --reference "$artifact_root/results/jax-base.json" \
+    --output "$artifact_root/results/vllm-$route.json"
 }
 
 gpu_preflight
 case "$target" in
+  jax-base|jax-mtp)
+    [[ "$target" != jax-mtp || -f "$artifact_root/results/jax-base.json" ]] || {
+      echo "run jax-base first so JAX MTP has an exact-token reference" >&2
+      exit 2
+    }
+    setup_jax
+    jax_preflight
+    run_jax "${target#jax-}"
+    ;;
   jax)
     setup_jax
     jax_preflight
-    run_jax
+    run_jax base
+    run_jax mtp
     ;;
-  vllm)
-    [[ -f "$artifact_root/results/jax.json" ]] || {
-      echo "run the JAX side first so vLLM has an exact-token reference" >&2
+  vllm-base|vllm-mtp)
+    [[ -f "$artifact_root/results/jax-base.json" ]] || {
+      echo "run jax-base first so vLLM has a base-token reference" >&2
       exit 2
     }
     setup_vllm
-    run_vllm
+    run_vllm "${target#vllm-}"
+    ;;
+  vllm)
+    [[ -f "$artifact_root/results/jax-base.json" ]] || {
+      echo "run the JAX side first so vLLM has a base-token reference" >&2
+      exit 2
+    }
+    setup_vllm
+    run_vllm base
+    run_vllm mtp
     ;;
   both)
     setup_jax
     jax_preflight
-    run_jax
+    run_jax base
+    run_jax mtp
     setup_vllm
-    run_vllm
+    run_vllm base
+    run_vllm mtp
     "$jax_env/bin/python" -m benchmarks.compare_results \
-      --jax "$artifact_root/results/jax.json" \
-      --vllm "$artifact_root/results/vllm.json" \
+      --jax-base "$artifact_root/results/jax-base.json" \
+      --jax-mtp "$artifact_root/results/jax-mtp.json" \
+      --vllm-base "$artifact_root/results/vllm-base.json" \
+      --vllm-mtp "$artifact_root/results/vllm-mtp.json" \
       --output "$artifact_root/results/comparison.json"
     ;;
 esac

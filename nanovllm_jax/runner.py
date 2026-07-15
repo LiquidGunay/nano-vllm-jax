@@ -733,6 +733,14 @@ class ModelRunner:
         """Drop dummy warmup sequence state while keeping compiled executables."""
         self.reset_speculation_stats()
         self._mtp_ready_seq_ids.clear()
+        if self.mtp_state is not None:
+            self.mtp_state = MTPState(
+                cache_storage=KVCacheStorage(
+                    jnp.zeros_like(self.mtp_state.cache_storage.k_cache),
+                    jnp.zeros_like(self.mtp_state.cache_storage.v_cache),
+                ),
+                draft_token_ids=jnp.zeros_like(self.mtp_state.draft_token_ids),
+            )
         if hasattr(self, "hybrid_states"):
             self.hybrid_states.clear()
         self._prefix_hybrid_states.clear()
