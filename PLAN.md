@@ -537,7 +537,7 @@ and matched late-error 0.8B run were exact.
 ### PR 5: Qwen3.5 MTP drafter and speculative promotion
 
 Status: [ ] draft PR [#16](https://github.com/LiquidGunay/nano-vllm-jax/pull/16)
-open from `agent/mtp-benchmark-promotion@5c3a654`
+open from `agent/mtp-benchmark-promotion@c570bc4`
 
 Purpose: attach MTP through the generic drafter ABI and determine where it is a
 real speed win.
@@ -749,5 +749,8 @@ Do not transplant:
 - [x] Open benchmark-promotion PR #16 with the exact four-route 4B table,
   smaller-family diagnostics, vLLM 0.25.1 pin, and the warmup-state reset found
   by repeated fresh-process parity checks.
+- [x] Address the first PR #16 review at `c570bc4`: require the canonical JAX
+  base reference before backend import, retain the GPU UUID, verify every
+  recorded statistic, remove stale route outputs, and document the prompt text.
 - [ ] Review and merge PR #16, then decide whether the next mainline pass should
   be prefix-cache ownership or broader resident decode metadata cleanup.
