@@ -28,7 +28,14 @@ def compare_results(
             raise ValueError(f"{name} is not a valid benchmark result")
 
     reference = jax_base
-    fields = ("benchmark_id", "model", "workload", "speculation", "capacity")
+    fields = (
+        "benchmark_id",
+        "benchmark_sha256",
+        "model",
+        "workload",
+        "speculation",
+        "capacity",
+    )
     if any(
         result[field] != reference[field]
         for result in results.values()
@@ -45,6 +52,14 @@ def compare_results(
         for name, result in results.items()
     }
     gpu_uuids = {result["environment"]["gpu"]["uuid"] for result in results.values()}
+    if len(gpu_uuids) != 1:
+        raise ValueError("results were not measured on the same GPU")
+    repositories = [result["environment"]["repository"] for result in results.values()]
+    if (
+        any(repository["dirty"] for repository in repositories)
+        or len({repository["commit"] for repository in repositories}) != 1
+    ):
+        raise ValueError("results were not measured at the same clean commit")
     return {
         "schema_version": 2,
         "benchmark_id": reference["benchmark_id"],
@@ -57,7 +72,7 @@ def compare_results(
             "jax_mtp_over_vllm_mtp": speeds["jax_mtp"] / speeds["vllm_mtp"],
         },
         "output_sha256": hashes.pop(),
-        "same_gpu": len(gpu_uuids) == 1,
+        "gpu_uuid": gpu_uuids.pop(),
     }
 
 

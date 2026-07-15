@@ -133,9 +133,15 @@ def _output_hash(rows: list[list[int]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _file_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _reference_rows(
     path: Path | None,
     manifest: dict[str, Any],
+    benchmark_sha256: str,
+    repository: dict[str, Any],
 ) -> list[list[int]] | None:
     if path is None:
         return None
@@ -144,6 +150,10 @@ def _reference_rows(
         raise ValueError("the reference must be a valid JAX result")
     if result["route"] != "base":
         raise ValueError("the reference must use base JAX decode")
+    if result.get("benchmark_sha256") != benchmark_sha256:
+        raise ValueError("reference benchmark manifest does not match")
+    if result.get("environment", {}).get("repository") != repository:
+        raise ValueError("reference implementation commit does not match")
     for field in (
         "benchmark_id",
         "model",
@@ -219,11 +229,21 @@ def run(
     backend_name: str,
     route: str,
     manifest: dict[str, Any],
+    benchmark_sha256: str,
     reference_path: Path | None,
 ) -> dict[str, Any]:
     prompts = prompt_rows(manifest)
-    backend_module = importlib.import_module(f"benchmarks.backends.{backend_name}")
     memory = {"rss": 0, "device": 0}
+    repository = _git_state()
+    if repository["dirty"]:
+        raise RuntimeError("the benchmark requires a clean repository")
+    reference_rows = _reference_rows(
+        reference_path,
+        manifest,
+        benchmark_sha256,
+        repository,
+    )
+    backend_module = importlib.import_module(f"benchmarks.backends.{backend_name}")
 
     init_started = perf_counter()
     backend = backend_module.Backend(manifest, prompts, route)
@@ -257,7 +277,6 @@ def run(
     ttfts = [sample["ttft_seconds"] for sample in samples]
     median_speed = median(speeds)
     relative_spread = (max(speeds) - min(speeds)) / median_speed
-    reference_rows = _reference_rows(reference_path, manifest)
     reference_exact = (
         None
         if reference_rows is None
@@ -282,6 +301,7 @@ def run(
     return {
         "schema_version": 2,
         "benchmark_id": manifest["benchmark_id"],
+        "benchmark_sha256": benchmark_sha256,
         "backend": backend_name,
         "route": route,
         "model": manifest["model"],
@@ -298,7 +318,7 @@ def run(
                 "memory_bytes": int(gpu_memory_mib) * 1024 * 1024,
                 "driver": driver,
             },
-            "repository": _git_state(),
+            "repository": repository,
         },
         "timing": {
             "initialization_seconds": init_seconds,
@@ -340,10 +360,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
 
+    manifest = load_manifest(args.manifest)
     result = run(
         args.backend,
         args.route,
-        load_manifest(args.manifest),
+        manifest,
+        _file_hash(args.manifest),
         args.reference,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -7,6 +7,7 @@ import pytest
 from benchmarks.compare_results import compare_results
 from benchmarks.run_benchmark import (
     _nvidia_smi,
+    _reference_rows,
     invalid_reasons,
     load_manifest,
     prompt_rows,
@@ -27,13 +28,17 @@ def _result(
         "route": route,
         "valid": True,
         "benchmark_id": "benchmark",
+        "benchmark_sha256": "manifest",
         "model": {"id": "model"},
         "workload": {"batch_size": 1},
         "speculation": {"method": "mtp", "draft_tokens": 2},
         "capacity": {"max_model_len": 8},
         "correctness": {"output_sha256": output_hash},
         "timing": {"median_decode_tokens_per_second": speed},
-        "environment": {"gpu": {"uuid": "GPU-0"}},
+        "environment": {
+            "gpu": {"uuid": "GPU-0"},
+            "repository": {"commit": "commit", "dirty": False},
+        },
     }
 
 
@@ -162,18 +167,51 @@ def test_validity_requires_verified_mtp_drafts():
 
 
 def test_comparison_reports_the_base_and_mtp_ratios():
-    vllm_mtp = _result("vllm", "mtp", 90.0)
-    vllm_mtp["environment"]["gpu"]["uuid"] = "GPU-1"
     comparison = compare_results(
         _result("jax", "base", 40.0),
         _result("jax", "mtp", 60.0),
         _result("vllm", "base", 50.0),
-        vllm_mtp,
+        _result("vllm", "mtp", 90.0),
     )
 
     assert comparison["ratios"]["jax_mtp_over_jax_base"] == pytest.approx(1.5)
     assert comparison["ratios"]["jax_mtp_over_vllm_base"] == pytest.approx(1.2)
-    assert not comparison["same_gpu"]
+    assert comparison["gpu_uuid"] == "GPU-0"
+
+
+def test_comparison_rejects_mixed_gpus_and_commits():
+    results = [
+        _result("jax", "base", 40.0),
+        _result("jax", "mtp", 60.0),
+        _result("vllm", "base", 50.0),
+        _result("vllm", "mtp", 90.0),
+    ]
+    results[-1]["environment"]["gpu"]["uuid"] = "GPU-1"
+    with pytest.raises(ValueError, match="same GPU"):
+        compare_results(*results)
+
+    results[-1]["environment"]["gpu"]["uuid"] = "GPU-0"
+    results[-1]["environment"]["repository"]["commit"] = "other"
+    with pytest.raises(ValueError, match="same clean commit"):
+        compare_results(*results)
+
+
+def test_reference_requires_the_same_manifest_and_commit(tmp_path):
+    result = _result("jax", "base", 40.0)
+    result["correctness"]["output_token_ids"] = [[1, 2]]
+    path = tmp_path / "jax-base.json"
+    path.write_text(json.dumps(result))
+    manifest = {
+        name: result[name]
+        for name in ("benchmark_id", "model", "workload", "speculation", "capacity")
+    }
+    repository = {"commit": "commit", "dirty": False}
+
+    assert _reference_rows(path, manifest, "manifest", repository) == [[1, 2]]
+    with pytest.raises(ValueError, match="manifest"):
+        _reference_rows(path, manifest, "other", repository)
+    with pytest.raises(ValueError, match="commit"):
+        _reference_rows(path, manifest, "manifest", {**repository, "commit": "other"})
 
 
 def test_comparison_requires_matching_outputs():

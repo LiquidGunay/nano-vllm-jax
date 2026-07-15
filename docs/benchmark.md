@@ -24,6 +24,9 @@ base JAX, JAX adds an executor route-cache entry during measurement, speculative
 counters are inconsistent, or throughput spread exceeds 10%. A numerical
 near-tie is useful diagnostic evidence only when accompanied by logits and a
 KL/JS check; the benchmark itself retains the exact-token gate.
+The runner requires a clean checkout. Standalone routes also require their
+JAX-base reference to have the same manifest digest and implementation commit,
+and cross-framework ratios require one physical GPU.
 
 ## Run
 
