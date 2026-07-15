@@ -17,7 +17,7 @@ one PR at a time, then build the next PR from the newly merged `main`.
 
 ## Source Revisions
 
-- Clean mainline: `origin/main@faaf175` (through merged PR #15)
+- Clean mainline: `origin/main@38c253b` (through merged PR #16)
 - Experimental evidence: `experimental/mtp-prefill-verifier-speed@4884542`
 - Cleanup review: `/mountpoint/.exp/cleanup_and_diagnosis.md`
 
@@ -536,8 +536,9 @@ and matched late-error 0.8B run were exact.
 
 ### PR 5: Qwen3.5 MTP drafter and speculative promotion
 
-Status: [ ] draft PR [#16](https://github.com/LiquidGunay/nano-vllm-jax/pull/16)
-open from `agent/mtp-benchmark-promotion@64f1018`
+Status: [x] merged as PR
+[#16](https://github.com/LiquidGunay/nano-vllm-jax/pull/16) at main commit
+`38c253b`
 
 Purpose: attach MTP through the generic drafter ABI and determine where it is a
 real speed win.
@@ -755,5 +756,7 @@ Do not transplant:
 - [x] Address the independent PR #16 audit at `64f1018`: clear all selected
   outputs at invocation start, retain per-route parity evidence, and attach
   concise provenance to the smaller-model diagnostics.
-- [ ] Review and merge PR #16, then decide whether the next mainline pass should
-  be prefix-cache ownership or broader resident decode metadata cleanup.
+- [x] Review and merge PR #16 at main commit `38c253b`, completing the original
+  cleanup, artifact, and MTP promotion sequence.
+- [ ] Decide whether the next mainline pass should be prefix-cache ownership or
+  broader resident decode metadata cleanup.
