@@ -4,8 +4,8 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 target=${1:-both}
 case "$target" in
-  jax|vllm|both) ;;
-  *) echo "usage: $0 [jax|vllm|both]" >&2; exit 2 ;;
+  jax|jax-base|jax-mtp|vllm|vllm-base|vllm-mtp|both) ;;
+  *) echo "usage: $0 [jax|jax-base|jax-mtp|vllm|vllm-base|vllm-mtp|both]" >&2; exit 2 ;;
 esac
 
 scratch_root=${NANO_VLLM_JAX_BENCHMARK_ROOT:-/mountpoint/.exp}
@@ -96,11 +96,28 @@ run_vllm() {
 
 gpu_preflight
 case "$target" in
+  jax-base|jax-mtp)
+    [[ "$target" != jax-mtp || -f "$artifact_root/results/jax-base.json" ]] || {
+      echo "run jax-base first so JAX MTP has an exact-token reference" >&2
+      exit 2
+    }
+    setup_jax
+    jax_preflight
+    run_jax "${target#jax-}"
+    ;;
   jax)
     setup_jax
     jax_preflight
     run_jax base
     run_jax mtp
+    ;;
+  vllm-base|vllm-mtp)
+    [[ -f "$artifact_root/results/jax-base.json" ]] || {
+      echo "run jax-base first so vLLM has a base-token reference" >&2
+      exit 2
+    }
+    setup_vllm
+    run_vllm "${target#vllm-}"
     ;;
   vllm)
     [[ -f "$artifact_root/results/jax-base.json" ]] || {
