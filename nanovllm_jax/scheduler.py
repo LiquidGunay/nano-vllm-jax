@@ -59,6 +59,7 @@ class Scheduler:
                 )
             )
         self.decode_lookahead_tokens = 1
+        self.drafter = config.drafter
         self.greedy_decode_burst_steps = kernels.greedy_decode_burst_steps
         self.max_blocks_per_seq = capacity.max_blocks_per_seq
         self.block_manager = BlockManager(
@@ -70,9 +71,17 @@ class Scheduler:
                 else 0
             ),
         )
-        
+
         self.waiting: Deque[Sequence] = deque()
         self.running: Deque[Sequence] = deque()
+
+    def _speculative_lookahead(self, seq: Sequence, remaining_tokens: int) -> int:
+        if self.drafter is None:
+            return 0
+        width = self.drafter.width
+        if seq.temperature == 0 and seq.ignore_eos and remaining_tokens > width:
+            return self.drafter.decode_lookahead_slots
+        return 0
 
     def _can_reserve_waiting(self, seq: Sequence) -> bool:
         return self.block_manager.can_reserve(
@@ -86,10 +95,17 @@ class Scheduler:
             seq,
             total_blocks=self._required_blocks(seq),
             use_prefix_cache=self.prefix_cache_enabled,
+            initial_lookahead_tokens=(
+                self.drafter.prefill_lookahead_tokens
+                if self.drafter is not None
+                else 0
+            ),
         )
 
     def _required_blocks(self, seq: Sequence) -> int:
         total_tokens = seq.num_prompt_tokens + seq.max_tokens
+        if self.drafter is not None:
+            total_tokens += self.drafter.capacity_padding_tokens
         return (total_tokens + self.block_size - 1) // self.block_size
 
     def _admit_first_fitting_waiter(self) -> Sequence | None:
@@ -198,6 +214,8 @@ class Scheduler:
         if self.max_blocks_per_seq is not None:
             max_tokens_per_seq = self.max_blocks_per_seq * seq.block_size
             requested_tokens = seq.num_tokens + seq.max_tokens
+            if self.drafter is not None:
+                requested_tokens += self.drafter.capacity_padding_tokens
             if seq.num_blocks > self.max_blocks_per_seq:
                 raise ValueError(
                     f"prompt needs {seq.num_blocks} blocks but max_blocks_per_seq is {self.max_blocks_per_seq}"
@@ -321,9 +339,15 @@ class Scheduler:
             # Complete capacity credits were reserved before prefill, so decode
             # can allocate physical pages without eviction or recomputation.
             remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
-            lookahead_tokens = 1
-            if self.greedy_decode_burst_steps > 1 and seq.temperature == 0 and seq.ignore_eos:
+            lookahead_tokens = self._speculative_lookahead(seq, remaining_tokens)
+            if (
+                not lookahead_tokens
+                and self.greedy_decode_burst_steps > 1
+                and seq.temperature == 0
+                and seq.ignore_eos
+            ):
                 lookahead_tokens = min(self.greedy_decode_burst_steps, remaining_tokens)
+            lookahead_tokens = max(1, lookahead_tokens)
             if not self.block_manager.can_append_slots(seq, lookahead_tokens):
                 raise AssertionError("reserved request ran out of KV blocks")
             num_seqs += 1
@@ -344,7 +368,9 @@ class Scheduler:
         step_counts: List[int] = []
         for seq in seqs:
             remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
-            if self.greedy_decode_burst_steps > 1 and seq.temperature == 0 and seq.ignore_eos:
+            if self._speculative_lookahead(seq, remaining_tokens):
+                step_count = 1
+            elif self.greedy_decode_burst_steps > 1 and seq.temperature == 0 and seq.ignore_eos:
                 step_count = min(self.greedy_decode_burst_steps, remaining_tokens)
             else:
                 step_count = 1

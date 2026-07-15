@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from nanovllm_jax.fastpath import KERNEL_PLAN, KernelPlan
+from nanovllm_jax.speculation import DrafterConfig
 
 
 def _int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
@@ -162,6 +163,12 @@ def _checkpoint_model_fields(checkpoint: str | Path, model: str) -> dict[str, An
         "attn_output_gate": _checkpoint_bool(text, "attn_output_gate"),
         "mamba_ssm_dtype": str(text["mamba_ssm_dtype"]),
         "tie_word_embeddings": _checkpoint_bool(text, "tie_word_embeddings"),
+        "mtp_num_hidden_layers": int(text.get("mtp_num_hidden_layers", 1)),
+        "mtp_use_dedicated_embeddings": _checkpoint_bool(
+            text,
+            "mtp_use_dedicated_embeddings",
+            False,
+        ),
         "eos_token_id": (
             int(text["eos_token_id"])
             if text.get("eos_token_id") is not None
@@ -202,6 +209,8 @@ class ModelSpec:
     mrope_interleaved: bool = True
     mamba_ssm_dtype: str = "float32"
     tie_word_embeddings: bool = True
+    mtp_num_hidden_layers: int = 1
+    mtp_use_dedicated_embeddings: bool = False
     eos_token_id: int | None = 248044
 
     @property
@@ -532,6 +541,43 @@ class RuntimeSpec:
     capacity: CapacitySpec
     compile: CompileSpec
     kernels: KernelPlan
+    drafter: DrafterConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.drafter is None:
+            return
+        if self.model.mtp_num_hidden_layers != 1:
+            raise ValueError("persistent MTP requires exactly one predictor layer")
+        if self.model.mtp_use_dedicated_embeddings or not self.model.tie_word_embeddings:
+            raise ValueError("persistent MTP requires the checkpoint's tied embeddings")
+        rotary_dim = int(self.model.head_dim * self.model.partial_rotary_factor)
+        if rotary_dim < 2 or rotary_dim % 2:
+            raise ValueError("persistent MTP requires a positive even rotary dimension")
+        if self.compile.execution != "jit" or self.compile.prefill_layout != "packed":
+            raise ValueError("persistent MTP requires JIT execution and packed prefill")
+        if self.capacity.prefix_cache:
+            raise ValueError("persistent MTP currently requires prefix_cache=False")
+        missing_batch_sizes = tuple(
+            size
+            for size in range(1, self.capacity.max_num_seqs + 1)
+            if size not in self.compile.batch_size_buckets
+        )
+        if missing_batch_sizes:
+            raise ValueError(
+                "persistent MTP requires exact batch_size_buckets for every "
+                f"admitted batch size; missing {missing_batch_sizes}"
+            )
+        required = {
+            "greedy_token_fastpath": self.kernels.greedy_token_fastpath,
+            "device_token_carry": self.kernels.device_token_carry,
+            "static_decode_metadata": self.kernels.static_decode_metadata,
+            "resident_decode_metadata": self.kernels.resident_decode_metadata,
+        }
+        missing = [name for name, enabled in required.items() if not enabled]
+        if missing:
+            raise ValueError(
+                "persistent MTP requires " + ", ".join(missing)
+            )
 
     @classmethod
     def promoted(
@@ -539,6 +585,7 @@ class RuntimeSpec:
         model: ModelConfig,
         engine: EngineConfig,
         kernels: KernelPlan = KERNEL_PLAN,
+        drafter: DrafterConfig | None = None,
     ) -> "RuntimeSpec":
         eos_token_ids = (
             (model.eos_token_id,)
@@ -567,4 +614,5 @@ class RuntimeSpec:
                 decode_block_table_buckets=engine.decode_block_buckets,
             ),
             kernels=kernels,
+            drafter=drafter,
         )

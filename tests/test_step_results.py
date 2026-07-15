@@ -64,7 +64,8 @@ class _Runner:
     def execute(self, seqs, batch):
         if self.trace is not None:
             self.trace.append("execute")
-        return RunResult.from_rows(next(self.rows))
+        result = next(self.rows)
+        return result if isinstance(result, RunResult) else RunResult.from_rows(result)
 
     def release(self, seq_ids):
         self.released.extend(seq_ids)
@@ -168,3 +169,28 @@ def test_step_reuses_runner_owned_prefix_state_by_handle():
     assert second.output.token_ids() == [102]
     assert engine.model_runner.installed_prefix_handles == [{}, {1: 100}]
     assert engine.model_runner.released_prefix_handles == []
+
+
+def test_iter_generate_attributes_step_counters_once():
+    config = _config(num_blocks=4)
+    speculative = RunResult.from_rows(
+        [[102, 103, 104]],
+        verified_target_tokens=3,
+        draft_tokens=2,
+        accepted_draft_tokens=2,
+    )
+    engine = _Engine(config, _Runner([[101], speculative]))
+
+    events = list(
+        engine.iter_generate(
+            [[1, 2]],
+            SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True),
+            include_text=False,
+        )
+    )
+    tokens = [event for event in events if event["event"] == "token"]
+
+    assert [event["token_id"] for event in tokens] == [101, 102, 103, 104]
+    assert [event["verified_target_tokens"] for event in tokens] == [0, 3, 0, 0]
+    assert [event["draft_tokens"] for event in tokens] == [0, 2, 0, 0]
+    assert [event["accepted_draft_tokens"] for event in tokens] == [0, 2, 0, 0]

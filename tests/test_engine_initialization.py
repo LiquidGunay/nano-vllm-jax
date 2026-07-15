@@ -1,13 +1,17 @@
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
+import jax.numpy as jnp
 import pytest
 
 import nanovllm_jax.engine as engine_module
 import nanovllm_jax.weights as weights_module
-from nanovllm_jax.config import EngineConfig, ModelConfig, WarmupConfig
+from nanovllm_jax.cache import KVCacheSpec, estimate_kv_cache_bytes
+from nanovllm_jax.config import EngineConfig, ModelConfig, RuntimeSpec, WarmupConfig
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.sequence import SamplingParams
+from nanovllm_jax.speculation import DrafterConfig
 from nanovllm_jax.step import FinishReason, RunResult
 from tests.runtime_specs import qwen_text_config
 
@@ -123,6 +127,113 @@ def test_unsupported_gdn_norm_fails_before_weight_resolution(tmp_path, monkeypat
         )
 
     assert weight_resolutions == []
+
+
+def test_invalid_mtp_runtime_fails_before_weight_resolution(tmp_path, monkeypatch):
+    text = qwen_text_config("0.8B")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "text_config": text})
+    )
+    weight_resolutions = []
+
+    monkeypatch.setattr(engine_module, "resolve_checkpoint_metadata", lambda _model: tmp_path)
+    monkeypatch.setattr(
+        engine_module,
+        "resolve_checkpoint",
+        lambda *args, **kwargs: weight_resolutions.append((args, kwargs)),
+    )
+    config = replace(_small_engine_config("example/Qwen3.5"), prefix_cache=True)
+
+    with pytest.raises(ValueError, match="prefix_cache=False"):
+        LLMEngine(
+            "example/Qwen3.5",
+            engine_config=config,
+            drafter=DrafterConfig.mtp(2),
+        )
+
+    assert weight_resolutions == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("mtp_num_hidden_layers", 2, "exactly one predictor layer"),
+        ("mtp_use_dedicated_embeddings", True, "tied embeddings"),
+    ),
+)
+def test_mtp_metadata_only_constrains_mtp_runtime(tmp_path, field, value, message):
+    text = qwen_text_config("0.8B")
+    text[field] = value
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "text_config": text})
+    )
+    model = "example/Qwen3.5"
+    model_config = ModelConfig.from_checkpoint(tmp_path, model=model)
+    engine_config = _small_engine_config(model)
+
+    RuntimeSpec.promoted(model_config, engine_config)
+    with pytest.raises(ValueError, match=message):
+        RuntimeSpec.promoted(
+            model_config,
+            engine_config,
+            drafter=DrafterConfig.mtp(2),
+        )
+
+
+def test_mtp_kv_byte_cap_includes_predictor_cache(tmp_path, monkeypatch):
+    model = "example/Qwen3.5"
+    text = qwen_text_config("0.8B")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "text_config": text})
+    )
+    bytes_per_layer_block = estimate_kv_cache_bytes(
+        KVCacheSpec(
+            num_layers=1,
+            num_blocks=1,
+            block_size=16,
+            num_kv_heads=int(text["num_key_value_heads"]),
+            head_dim=int(text["head_dim"]),
+            dtype=jnp.bfloat16,
+        )
+    )
+    target_layers = int(text["num_hidden_layers"])
+    byte_cap = 2 * target_layers * bytes_per_layer_block
+    config = replace(
+        _small_engine_config(model),
+        kv_cache_bytes=byte_cap,
+        num_kvcache_blocks=4,
+    )
+
+    class FakeRunner:
+        def __init__(self, config, params, *, mtp_params):
+            self.config = config
+
+        def memory_bytes(self):
+            return {}
+
+    monkeypatch.setattr(engine_module, "resolve_checkpoint_metadata", lambda _model: tmp_path)
+    monkeypatch.setattr(engine_module, "resolve_checkpoint", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr(
+        engine_module,
+        "AutoTokenizer",
+        SimpleNamespace(
+            from_pretrained=lambda *_args, **_kwargs: SimpleNamespace(eos_token_id=248044)
+        ),
+    )
+    monkeypatch.setattr(engine_module, "load_weights_from_hf_streaming", lambda *_a, **_k: object())
+    monkeypatch.setattr(engine_module, "load_mtp_weights_from_hf_streaming", lambda *_a, **_k: object())
+    monkeypatch.setattr(engine_module, "ModelRunner", FakeRunner)
+
+    engine = LLMEngine(
+        model,
+        engine_config=config,
+        drafter=DrafterConfig.mtp(2),
+    )
+
+    assert engine.config.capacity.num_kvcache_blocks == 1
+    combined_layers = target_layers + int(text.get("mtp_num_hidden_layers", 1))
+    assert combined_layers * bytes_per_layer_block <= byte_cap
+    assert 2 * combined_layers * bytes_per_layer_block > byte_cap
 
 
 def test_hub_resolution_fetches_metadata_before_weights(tmp_path, monkeypatch):

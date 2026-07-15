@@ -1,6 +1,6 @@
 import pytest
 
-from nanovllm_jax import EngineConfig, LLM, SamplingParams
+from nanovllm_jax import DrafterConfig, EngineConfig, LLM, SamplingParams
 from nanovllm_jax.batch import SchedulePlan
 from nanovllm_jax.block_manager import BlockManager
 from nanovllm_jax.executor import ModelExecutor
@@ -20,7 +20,13 @@ def test_top_level_public_imports_are_canonical():
     assert EngineConfig.__name__ == "EngineConfig"
     import nanovllm_jax
 
-    assert nanovllm_jax.__all__ == ["EngineConfig", "LLM", "SamplingParams"]
+    assert nanovllm_jax.__all__ == [
+        "DrafterConfig",
+        "EngineConfig",
+        "LLM",
+        "SamplingParams",
+    ]
+    assert DrafterConfig.mtp(2).width == 2
     assert engine_module.__all__ == ["LLM"]
     assert not hasattr(nanovllm_jax, "KERNEL_PLAN")
     assert not hasattr(nanovllm_jax, "KernelPlan")

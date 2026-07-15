@@ -111,6 +111,27 @@ def _lm_head_greedy_top1_token_ids(
     raise AssertionError(f"unexpected LM-head greedy top1 impl: {impl!r}")
 
 
+def lm_head_greedy_token_ids_from_normed(
+    hidden_norm: jnp.ndarray,
+    vocab_weight: jnp.ndarray,
+    config,
+) -> jnp.ndarray:
+    """Greedy full-vocabulary projection for already-normalized hidden rows."""
+
+    hidden_norm = hidden_norm.astype(
+        _lm_head_decode_activation_dtype(config.kernels)
+    )
+    if hidden_norm.ndim != 3:
+        raise ValueError("greedy LM head expects hidden shape [batch, width, hidden]")
+    batch, width, hidden_dim = hidden_norm.shape
+    token_ids = _lm_head_greedy_top1_token_ids(
+        hidden_norm.reshape(batch * width, 1, hidden_dim),
+        vocab_weight,
+        config,
+    )
+    return token_ids.reshape(batch, width).astype(jnp.int32)
+
+
 def lm_head_token_ids_and_topk(
     hidden: jnp.ndarray,
     params: Any,
@@ -140,10 +161,15 @@ def lm_head_token_ids_and_topk(
             hidden_is_normed=hidden_is_normed,
             is_prefill=False,
         )
-        batch, width, hidden_dim = hidden_norm.shape
-        flat_hidden = hidden_norm.reshape(batch * width, 1, hidden_dim)
-        token_ids = _lm_head_greedy_top1_token_ids(flat_hidden, vocab_weight, config)
-        return token_ids.reshape(batch, width), None, None
+        return (
+            lm_head_greedy_token_ids_from_normed(
+                hidden_norm,
+                vocab_weight,
+                config,
+            ),
+            None,
+            None,
+        )
 
     logits = _lm_head_logits(
         hidden,

@@ -562,11 +562,21 @@ class ServingOps:
         packed: bool,
     ) -> bool:
         enabled = self.gdn_prefill_post_conv_impl != "off"
+        packed_prefix = (
+            packed
+            and return_prefix_state
+            and not return_first_prefix_state
+        )
         use_post_conv = (
             enabled
-            and not recurrent
-            and not return_prefix_state
-            and not return_first_prefix_state
+            and (
+                packed_prefix
+                or (
+                    not recurrent
+                    and not return_prefix_state
+                    and not return_first_prefix_state
+                )
+            )
         )
         if self.plan.gdn_disable_fallbacks and not use_post_conv:
             reasons = []

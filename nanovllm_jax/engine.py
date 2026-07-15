@@ -13,6 +13,7 @@ from nanovllm_jax.cache import KVCacheSpec
 from nanovllm_jax.ops import resolve_kv_cache_spec
 from nanovllm_jax.batch import SchedulePlan
 from nanovllm_jax.weights import (
+    load_mtp_weights_from_hf_streaming,
     load_weights_from_hf_streaming,
     resolve_checkpoint,
     resolve_checkpoint_metadata,
@@ -21,6 +22,7 @@ from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.output import OutputBuffer, is_device_token
 from nanovllm_jax.sequence import Sequence, SequenceStatus, SamplingParams
+from nanovllm_jax.speculation import DrafterConfig
 from nanovllm_jax.step import (
     FinishedRequest,
     FinishReason,
@@ -64,8 +66,9 @@ def _engine_config_from_public_kwargs(model_path: str, kwargs: dict[str, Any]) -
 def _runtime_spec_from_engine_config(
     engine_config: EngineConfig,
     model_config: ModelConfig,
+    drafter: DrafterConfig | None,
 ) -> RuntimeSpec:
-    return RuntimeSpec.promoted(model_config, engine_config)
+    return RuntimeSpec.promoted(model_config, engine_config, drafter=drafter)
 
 
 def _tree_nbytes(value: object) -> int:
@@ -84,6 +87,7 @@ class LLMEngine:
         model_path: str,
         *,
         engine_config: EngineConfig | None = None,
+        drafter: DrafterConfig | None = None,
         **kwargs,
     ):
         if engine_config is not None and kwargs:
@@ -99,19 +103,20 @@ class LLMEngine:
             metadata_path,
             model=model_path,
         )
-        self.checkpoint_path = (
-            metadata_path
-            if Path(model_path).expanduser().exists()
-            else resolve_checkpoint(model_path, revision=metadata_path.name)
-        )
         self.config = _runtime_spec_from_engine_config(
             engine_config,
             self.model_config,
+            drafter,
         )
         requested_kv_blocks = self.config.capacity.num_kvcache_blocks
+        cache_layers = self.config.model.num_hidden_layers + (
+            self.config.model.mtp_num_hidden_layers
+            if self.config.drafter is not None
+            else 0
+        )
         kv_spec = resolve_kv_cache_spec(
             KVCacheSpec(
-                num_layers=self.config.model.num_hidden_layers,
+                num_layers=cache_layers,
                 num_blocks=requested_kv_blocks,
                 block_size=self.config.capacity.block_size,
                 num_kv_heads=self.config.model.num_key_value_heads,
@@ -134,6 +139,11 @@ class LLMEngine:
                 self.config.capacity,
                 num_kvcache_blocks=effective_blocks,
             ),
+        )
+        self.checkpoint_path = (
+            metadata_path
+            if Path(model_path).expanduser().exists()
+            else resolve_checkpoint(model_path, revision=metadata_path.name)
         )
 
         if not HAS_TRANSFORMERS:
@@ -161,12 +171,27 @@ class LLMEngine:
             self.config.model,
             self.config.compile.weight_dtype,
         )
+        self.mtp_params = (
+            load_mtp_weights_from_hf_streaming(
+                self.checkpoint_path,
+                self.config.model,
+                self.config.compile.weight_dtype,
+            )
+            if self.config.drafter is not None
+            else None
+        )
         print("✓ Using pretrained weights")
 
         self.scheduler = Scheduler(self.config)
-        self.model_runner = ModelRunner(self.config, self.params)
+        runner_kwargs = (
+            {"mtp_params": self.mtp_params}
+            if self.mtp_params is not None
+            else {}
+        )
+        self.model_runner = ModelRunner(self.config, self.params, **runner_kwargs)
         self.startup_device_budget_bytes = {
             "parameters": _tree_nbytes(self.params),
+            "draft_parameters": _tree_nbytes(self.mtp_params),
             **self.model_runner.memory_bytes(),
         }
         memory_mib = sum(self.startup_device_budget_bytes.values()) / (1024 * 1024)
@@ -199,12 +224,15 @@ class LLMEngine:
                 self.config.compile.batch_size_buckets
                 or (self.config.capacity.max_num_seqs,)
             )
+        include_sampled_routes = bool(
+            include_sampled_routes and self.config.drafter is None
+        )
 
         started = perf_counter()
         runner_summary = self.model_runner.warmup_compilation(
             max_prefill_len=int(max_prefill_len),
             max_batch=int(max_batch),
-            include_sampled_routes=bool(include_sampled_routes),
+            include_sampled_routes=include_sampled_routes,
             prefill_token_buckets=prefill_token_buckets,
             batch_size_buckets=batch_size_buckets,
             decode_block_table_buckets=decode_block_table_buckets,
@@ -225,10 +253,7 @@ class LLMEngine:
 
         if not prompt:
             raise ValueError("prompt must contain at least one token")
-        if sampling_params.max_tokens <= 0:
-            raise ValueError("max_tokens must be positive")
-        if sampling_params.temperature < 0:
-            raise ValueError("temperature must be non-negative")
+        self._validate_sampling_params(sampling_params)
 
         seq = Sequence(
             prompt,
@@ -240,12 +265,22 @@ class LLMEngine:
         self.scheduler.add(seq)
         return seq
 
+    def _validate_sampling_params(self, sampling_params: SamplingParams) -> None:
+        if sampling_params.max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if sampling_params.temperature < 0:
+            raise ValueError("temperature must be non-negative")
+        if self.config.drafter is not None and (
+            sampling_params.temperature != 0 or not sampling_params.ignore_eos
+        ):
+            raise ValueError(
+                "persistent MTP requires temperature=0 and ignore_eos=True"
+            )
+
     def _prepare_generation_sequences(
         self,
         prompts: List[Union[str, List[int]]],
         sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
-        *,
-        require_greedy_ignore_eos: bool = False,
     ) -> List[Sequence]:
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -263,15 +298,7 @@ class LLMEngine:
             request_inputs.append(token_ids)
 
         for sp in sampling_params:
-            if sp.max_tokens <= 0:
-                raise ValueError("max_tokens must be positive")
-            if sp.temperature < 0:
-                raise ValueError("temperature must be non-negative")
-            if require_greedy_ignore_eos and (sp.temperature != 0 or not sp.ignore_eos):
-                raise ValueError(
-                    "device_token_carry requires greedy sampling "
-                    "with ignore_eos=True"
-                )
+            self._validate_sampling_params(sp)
 
         return [self.add_request(prompt, sp) for prompt, sp in zip(request_inputs, sampling_params)]
 
@@ -341,6 +368,9 @@ class LLMEngine:
             scheduled_tokens=int(schedule_plan.num_scheduled_tokens),
             emitted_tokens=tuple(emitted),
             finished=tuple(finished),
+            verified_target_tokens=run_result.verified_target_tokens,
+            draft_tokens=run_result.draft_tokens,
+            accepted_draft_tokens=run_result.accepted_draft_tokens,
         )
 
     def _release_invalidated_prefix_states(self) -> None:
@@ -478,9 +508,10 @@ class LLMEngine:
                 for event in step_result.emitted_tokens
             }
             OutputBuffer.snapshot_many(event_buffers.values()).prefetch().materialize()
-            for event in step_result.emitted_tokens:
+            for event_index, event in enumerate(step_result.emitted_tokens):
                 seq = seqs_by_id[event.seq_id]
                 token_id = seq.output.token_id(event.completion_index)
+                owns_step_metrics = event_index == 0
                 token_event = {
                     "event": "token",
                     "seq_id": event.seq_id,
@@ -493,6 +524,15 @@ class LLMEngine:
                     "step_end_seconds": step_end - stream_start,
                     "scheduler_step_tokens": step_result.scheduled_tokens,
                     "scheduler_step_is_decode": step_result.is_decode,
+                    "verified_target_tokens": (
+                        step_result.verified_target_tokens if owns_step_metrics else 0
+                    ),
+                    "draft_tokens": (
+                        step_result.draft_tokens if owns_step_metrics else 0
+                    ),
+                    "accepted_draft_tokens": (
+                        step_result.accepted_draft_tokens if owns_step_metrics else 0
+                    ),
                 }
                 if include_text:
                     token_event["text"] = self._detokenize([token_id])

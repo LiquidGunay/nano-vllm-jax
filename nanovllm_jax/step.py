@@ -18,14 +18,27 @@ class RunResult:
     """Tokens emitted by each physical execution row."""
 
     rows: tuple[tuple[Any, ...], ...]
+    verified_target_tokens: int = 0
+    draft_tokens: int = 0
+    accepted_draft_tokens: int = 0
 
     @classmethod
-    def from_rows(cls, rows: Iterable[Any]) -> "RunResult":
+    def from_rows(
+        cls,
+        rows: Iterable[Any],
+        *,
+        verified_target_tokens: int = 0,
+        draft_tokens: int = 0,
+        accepted_draft_tokens: int = 0,
+    ) -> "RunResult":
         return cls(
             tuple(
                 tuple(row) if isinstance(row, (list, tuple)) else (row,)
                 for row in rows
-            )
+            ),
+            int(verified_target_tokens),
+            int(draft_tokens),
+            int(accepted_draft_tokens),
         )
 
 
@@ -50,6 +63,9 @@ class StepResult:
     scheduled_tokens: int
     emitted_tokens: tuple[TokenEvent, ...]
     finished: tuple[FinishedRequest, ...]
+    verified_target_tokens: int = 0
+    draft_tokens: int = 0
+    accepted_draft_tokens: int = 0
 
     @property
     def is_decode(self) -> bool:

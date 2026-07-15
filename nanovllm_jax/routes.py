@@ -16,6 +16,7 @@ class TokenMode(Enum):
     GREEDY = "greedy"
     SAMPLED = "sampled"
     BURST = "burst"
+    SPECULATIVE = "speculative"
 
 
 class RouteCapability(Enum):
@@ -24,6 +25,7 @@ class RouteCapability(Enum):
     RESIDENT_METADATA = "resident_metadata"
     SLOT_TOKENS = "slot_tokens"
     DENSE_ROWS = "dense_rows"
+    DRAFT_STATE = "draft_state"
 
 
 class RouteKind(Enum):
@@ -32,6 +34,7 @@ class RouteKind(Enum):
     PREFILL_SAMPLED = "prefill_sampled"
     PREFILL_TABLE = "prefill_table"
     PREFILL_RESIDENT = "prefill_resident"
+    PREFILL_MTP = "prefill_mtp"
     DECODE_LOGITS = "decode_logits"
     DECODE_GREEDY = "decode_greedy"
     DECODE_SAMPLED = "decode_sampled"
@@ -40,6 +43,7 @@ class RouteKind(Enum):
     DECODE_RESIDENT_METADATA = "decode_resident_metadata"
     DECODE_RESIDENT = "decode_resident"
     DECODE_RESIDENT_DENSE = "decode_resident_dense"
+    DECODE_SPECULATIVE = "decode_speculative"
     DECODE_BURST = "decode_burst"
     DECODE_TABLE_BURST = "decode_table_burst"
 
@@ -68,6 +72,10 @@ class RouteSpec:
     def seeds_slot_tokens(self) -> bool:
         return RouteCapability.PREFILL_TOKEN_SEED in self.requires
 
+    @property
+    def uses_draft_state(self) -> bool:
+        return RouteCapability.DRAFT_STATE in self.requires
+
 
 @dataclass(frozen=True)
 class WarmupScenario:
@@ -84,6 +92,17 @@ def _caps(*values: RouteCapability) -> frozenset[RouteCapability]:
 
 
 ROUTE_SPECS = (
+    RouteSpec(
+        RouteKind.PREFILL_MTP,
+        BatchPhase.PREFILL,
+        TokenMode.GREEDY,
+        "forward_prefill_mtp_seed_jit",
+        _caps(
+            RouteCapability.TABLE_STATE,
+            RouteCapability.PREFILL_TOKEN_SEED,
+            RouteCapability.DRAFT_STATE,
+        ),
+    ),
     RouteSpec(
         RouteKind.PREFILL_RESIDENT,
         BatchPhase.PREFILL,
@@ -111,6 +130,19 @@ ROUTE_SPECS = (
         "forward_step_sampled_token_ids_jit",
     ),
     RouteSpec(RouteKind.PREFILL_LOGITS, BatchPhase.PREFILL, TokenMode.LOGITS, None),
+    RouteSpec(
+        RouteKind.DECODE_SPECULATIVE,
+        BatchPhase.DECODE,
+        TokenMode.SPECULATIVE,
+        "forward_mtp_speculative_jit",
+        _caps(
+            RouteCapability.TABLE_STATE,
+            RouteCapability.RESIDENT_METADATA,
+            RouteCapability.SLOT_TOKENS,
+            RouteCapability.DENSE_ROWS,
+            RouteCapability.DRAFT_STATE,
+        ),
+    ),
     RouteSpec(
         RouteKind.DECODE_RESIDENT_DENSE,
         BatchPhase.DECODE,

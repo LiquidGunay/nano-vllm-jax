@@ -7,6 +7,7 @@ from nanovllm_jax.config import (
     RuntimeSpec,
 )
 from nanovllm_jax.fastpath import KernelPlan
+from nanovllm_jax.speculation import DrafterConfig
 
 
 def qwen_text_config(size: str = "4B") -> dict[str, object]:
@@ -55,7 +56,14 @@ def qwen_text_config(size: str = "4B") -> dict[str, object]:
     }
 
 
-def runtime_spec(*, model=None, capacity=None, compile=None, kernels=None) -> RuntimeSpec:
+def runtime_spec(
+    *,
+    model=None,
+    capacity=None,
+    compile=None,
+    kernels=None,
+    drafter: DrafterConfig | None = None,
+) -> RuntimeSpec:
     """Build an explicitly owned test runtime without production adapters."""
 
     return RuntimeSpec(
@@ -63,4 +71,5 @@ def runtime_spec(*, model=None, capacity=None, compile=None, kernels=None) -> Ru
         capacity=replace(CapacitySpec(), **(capacity or {})),
         compile=replace(CompileSpec(), **(compile or {})),
         kernels=replace(KernelPlan(), **(kernels or {})),
+        drafter=drafter,
     )

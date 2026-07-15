@@ -11,9 +11,15 @@ pedagogical.
 - `nanovllm_jax/fastpath.py` owns implementation policy. Do not add YAML or
   environment switches for alternative kernels on this branch.
 - The supported runtime is the promoted CUDA/JAX Qwen3.5 text-serving path.
-- Speculative decoding, Metal/TPU alternates, general benchmark harnesses,
-  result dumps, and historical optimization notes do not belong on cleaned
-  main. The single claim under `benchmarks/` is the narrow exception.
+- The optional Qwen3.5 persistent-MTP overlay is the only speculative route.
+  It must use constructor-time immutable width, prefill cache seeding, resident
+  MTP KV/proposals, recursive drafts, one packed target verifier, and on-device
+  accepted-prefix state selection. Host proposals, unverified acceptance,
+  sequential target repair, and hidden ordinary-decode fallbacks are not speed
+  paths.
+- Metal/TPU alternates, general benchmark harnesses, result dumps, and
+  historical optimization notes do not belong on cleaned main. The single
+  claim under `benchmarks/` is the narrow exception.
 
 ## Validation
 
@@ -60,6 +66,8 @@ PY
 ## Editing
 
 - Prefer existing module boundaries and naming.
-- Keep public configuration limited to workload and capacity.
+- Keep base public configuration limited to workload and capacity.
+  `DrafterConfig` is the single optional experimental overlay; do not turn it
+  into implementation-policy switches.
 - Keep comments focused on ownership, shapes, and invariants.
 - Do not reintroduce `nanovllm_jax.engine` compatibility imports.

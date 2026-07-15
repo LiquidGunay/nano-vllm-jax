@@ -423,6 +423,7 @@ def test_model_runner_release_preserves_carry_for_still_running_rows():
     runner.hybrid_states = {}
     runner._hybrid_slots = {}
     runner._free_hybrid_slots = []
+    runner._mtp_ready_seq_ids = set()
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     runner._device_token_carry_seq_ids = (7, 8)
     runner._device_token_carry_tokens = token_vector

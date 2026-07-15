@@ -101,8 +101,10 @@ server.py
 The central invariant is:
 
 ```text
-logical sequence length, allocated block capacity, full-attention KV state,
-and GDN hybrid state advance by the same committed prefix.
+Logical output, resident target length, and selected GDN state advance only by
+the committed prefix. Physical target and predictor KV writes may run ahead,
+but resident length bounds attention visibility and reserved block capacity
+covers the farthest speculative write.
 ```
 
 ## Reading Path
@@ -123,6 +125,9 @@ Core engine:
 
 Advanced serving:
 
+- [docs/speculative-verification.md](docs/speculative-verification.md) and
+  [nanovllm_jax/mtp.py](nanovllm_jax/mtp.py) - experimental constructor-time
+  persistent MTP with packed target verification.
 - [nanovllm_jax/service.py](nanovllm_jax/service.py), [server.yaml](server.yaml),
   and [nanovllm_jax/config.py](nanovllm_jax/config.py) - online queues and capacity.
 - [nanovllm_jax/fastpath.py](nanovllm_jax/fastpath.py) - promoted operation policy.
