@@ -90,8 +90,6 @@ _COMMON_ARCHITECTURE = {
     "attn_output_gate": True,
     "mamba_ssm_dtype": "float32",
     "tie_word_embeddings": True,
-    "mtp_num_hidden_layers": 1,
-    "mtp_use_dedicated_embeddings": False,
 }
 
 _SUPPORTED_ARCHITECTURES = {

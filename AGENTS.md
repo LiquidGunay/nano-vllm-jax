@@ -66,6 +66,8 @@ PY
 ## Editing
 
 - Prefer existing module boundaries and naming.
-- Keep public configuration limited to workload and capacity.
+- Keep base public configuration limited to workload and capacity.
+  `DrafterConfig` is the single optional experimental overlay; do not turn it
+  into implementation-policy switches.
 - Keep comments focused on ownership, shapes, and invariants.
 - Do not reintroduce `nanovllm_jax.engine` compatibility imports.

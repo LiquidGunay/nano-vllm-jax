@@ -39,16 +39,18 @@ ModelRunner -> DeviceBatch + HostBatch -> RunResult
 LLMEngine.commit() -> StepResult
 ```
 
-Startup composes one immutable `RuntimeSpec` from four owners:
+Startup composes one immutable `RuntimeSpec` from four base-runtime owners:
 
 - `ModelSpec`: checkpoint architecture, parsed and validated by `ModelConfig`,
 - `CapacitySpec`: requests and cache limits,
 - `CompileSpec`: dtypes and static bucket shapes,
 - `KernelPlan`: promoted operation implementations and their tuning constants.
 
-Public `EngineConfig` supplies workload and capacity only. Cache allocation,
-weight loading, projections, and operation dispatch receive their narrow spec
-instead of a flat runtime message bus.
+The optional experimental `DrafterConfig` is a fifth overlay. It owns MTP width
+and the verifier, proposal-table, capacity, and warmup shapes derived from that
+width. Public `EngineConfig` still supplies base workload and capacity only.
+Cache allocation, weight loading, projections, and operation dispatch receive
+their narrow spec instead of a flat runtime message bus.
 
 Startup resolves the physical KV dtype and byte-capped block count once, before
 the scheduler and runner are constructed. Before warmup, the server prints a
@@ -72,12 +74,21 @@ materialize output snapshots when tokens must reach the host.
 - prefix-cache lookup and publication.
 
 `BlockManager` owns physical cache page ids, reference counts, prefix-cache
-metadata, and future-capacity credits. Admission reserves enough capacity for
+metadata, and future-capacity credits. The base route reserves
 `prompt + max_tokens`, but allocates pages only for the current prompt and as
-decode crosses block boundaries. Thus future capacity cannot be stolen, yet an
-unwritten completion does not evict a cached prefix or widen its block table.
-Admission scans the bounded waiting queue for the first request that fits, so a
-large blocked request does not stall smaller requests behind it.
+decode crosses block boundaries. MTP width `K` adds three bounded allowances:
+
+- `K - 1` prefill slots for the recursive predictor writes after its first
+  draft is projected directly from the final prompt state;
+- `2K` decode lookahead slots covering the packed target pass and the next
+  recursive proposal refresh;
+- `max(0, K - 2)` lifetime tokens because the last eligible `K + 1` output
+  group can leave that many predictor writes beyond the final logical token.
+
+Thus future capacity cannot be stolen, yet an unwritten base completion does
+not evict a cached prefix or widen its block table. Admission scans the bounded
+waiting queue for the first request that fits, so a large blocked request does
+not stall smaller requests behind it.
 
 Each reusable prefix is one `PrefixCacheEntry`: its chained hash, exact token
 count, physical block chain, and an optional opaque GDN-state handle. The
@@ -166,8 +177,10 @@ Low-level promoted kernels live under `nanovllm_jax/kernels/`.
 ## Invariant
 
 ```text
-Logical length, block-table capacity, full-attention KV writes, and GDN hybrid
-state all advance by the same committed prefix.
+Logical output, resident target length, and selected GDN state advance only by
+the committed prefix. Physical target and predictor KV writes may run ahead,
+but resident length bounds attention visibility and block-table capacity covers
+the farthest speculative write.
 ```
 
 That invariant is the main correctness rule for scheduler, block manager,

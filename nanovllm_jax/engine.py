@@ -224,12 +224,15 @@ class LLMEngine:
                 self.config.compile.batch_size_buckets
                 or (self.config.capacity.max_num_seqs,)
             )
+        include_sampled_routes = bool(
+            include_sampled_routes and self.config.drafter is None
+        )
 
         started = perf_counter()
         runner_summary = self.model_runner.warmup_compilation(
             max_prefill_len=int(max_prefill_len),
             max_batch=int(max_batch),
-            include_sampled_routes=bool(include_sampled_routes),
+            include_sampled_routes=include_sampled_routes,
             prefill_token_buckets=prefill_token_buckets,
             batch_size_buckets=batch_size_buckets,
             decode_block_table_buckets=decode_block_table_buckets,

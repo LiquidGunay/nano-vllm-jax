@@ -21,6 +21,16 @@ outputs = llm.generate(
 lookahead, request-capacity padding, the resident proposal table, and warmup.
 There is no post-construction drafter installation or host `propose()` call.
 
+For draft width `K`, the scheduler derives three physical allowances:
+
+- prefill allocates `K - 1` future slots because the first draft comes directly
+  from the final prompt predictor state and only the remaining drafts write KV;
+- decode allocates `2K` lookahead slots for current-plus-`K` target verification
+  followed by as many as `K - 1` recursive predictor writes;
+- lifetime reservation adds `max(0, K - 2)` tokens because the final eligible
+  `K + 1` output group can leave that many predictor writes beyond the logical
+  end.
+
 ```text
 packed prefill
   -> target hidden + shifted prompt tokens

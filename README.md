@@ -101,8 +101,10 @@ server.py
 The central invariant is:
 
 ```text
-logical sequence length, allocated block capacity, full-attention KV state,
-and GDN hybrid state advance by the same committed prefix.
+Logical output, resident target length, and selected GDN state advance only by
+the committed prefix. Physical target and predictor KV writes may run ahead,
+but resident length bounds attention visibility and reserved block capacity
+covers the farthest speculative write.
 ```
 
 ## Reading Path

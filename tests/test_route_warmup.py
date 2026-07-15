@@ -128,6 +128,9 @@ def test_warmup_covers_persistent_speculative_route():
 
     assert RouteKind.PREFILL_MTP.value in summary["warmed_routes"]
     assert RouteKind.DECODE_SPECULATIVE.value in summary["warmed_routes"]
+    assert summary["include_sampled_routes"] is False
+    assert summary["sampled_token_fastpath_runs"] == []
+    assert RouteKind.DECODE_SAMPLED.value not in summary["warmed_routes"]
     compiled = set(engine.model_runner.executor._jit_cache)
     routes = []
     select_route = engine.model_runner._select_route

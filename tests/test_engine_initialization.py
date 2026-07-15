@@ -8,7 +8,7 @@ import pytest
 import nanovllm_jax.engine as engine_module
 import nanovllm_jax.weights as weights_module
 from nanovllm_jax.cache import KVCacheSpec, estimate_kv_cache_bytes
-from nanovllm_jax.config import EngineConfig, ModelConfig, WarmupConfig
+from nanovllm_jax.config import EngineConfig, ModelConfig, RuntimeSpec, WarmupConfig
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.sequence import SamplingParams
 from nanovllm_jax.speculation import DrafterConfig
@@ -152,6 +152,32 @@ def test_invalid_mtp_runtime_fails_before_weight_resolution(tmp_path, monkeypatc
         )
 
     assert weight_resolutions == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("mtp_num_hidden_layers", 2, "exactly one predictor layer"),
+        ("mtp_use_dedicated_embeddings", True, "tied embeddings"),
+    ),
+)
+def test_mtp_metadata_only_constrains_mtp_runtime(tmp_path, field, value, message):
+    text = qwen_text_config("0.8B")
+    text[field] = value
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "text_config": text})
+    )
+    model = "example/Qwen3.5"
+    model_config = ModelConfig.from_checkpoint(tmp_path, model=model)
+    engine_config = _small_engine_config(model)
+
+    RuntimeSpec.promoted(model_config, engine_config)
+    with pytest.raises(ValueError, match=message):
+        RuntimeSpec.promoted(
+            model_config,
+            engine_config,
+            drafter=DrafterConfig.mtp(2),
+        )
 
 
 def test_mtp_kv_byte_cap_includes_predictor_cache(tmp_path, monkeypatch):
