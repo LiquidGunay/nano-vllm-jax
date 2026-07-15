@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "benchmark_id": "qwen35-4b-b1-p64-o64-greedy",
+  "schema_version": 2,
+  "benchmark_id": "qwen35-4b-b1-p64-o64-greedy-mtp2",
   "model": {
     "id": "Qwen/Qwen3.5-4B",
     "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
@@ -16,6 +16,10 @@
     "prompt_start_token": 1,
     "prompt_row_stride": 997
   },
+  "speculation": {
+    "method": "mtp",
+    "draft_tokens": 2
+  },
   "capacity": {
     "max_model_len": 128,
     "max_blocks_per_seq": 8,
@@ -28,6 +32,6 @@
     "max_relative_spread": 0.1
   },
   "frameworks": {
-    "vllm": "0.25.0"
+    "vllm": "0.25.1"
   }
 }

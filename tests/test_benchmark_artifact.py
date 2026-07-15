@@ -16,17 +16,37 @@ from benchmarks.run_benchmark import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _result(backend: str, speed: float, output_hash: str = "same") -> dict:
+def _result(
+    backend: str,
+    route: str,
+    speed: float,
+    output_hash: str = "same",
+) -> dict:
     return {
         "backend": backend,
+        "route": route,
         "valid": True,
         "benchmark_id": "benchmark",
         "model": {"id": "model"},
         "workload": {"batch_size": 1},
+        "speculation": {"method": "mtp", "draft_tokens": 2},
         "capacity": {"max_model_len": 8},
         "correctness": {"output_sha256": output_hash},
         "timing": {"median_decode_tokens_per_second": speed},
         "environment": {"gpu": {"uuid": "GPU-0"}},
+    }
+
+
+def _sample(*, drafted: int = 0, accepted: int = 0, verified: int | None = 0):
+    return {
+        "decode_tokens": 63,
+        "decode_seconds": 1.0,
+        "decode_tokens_per_second": 63.0,
+        "speculation": {
+            "draft_tokens": drafted,
+            "accepted_draft_tokens": accepted,
+            "verified_target_tokens": verified,
+        },
     }
 
 
@@ -42,6 +62,7 @@ def test_benchmark_is_one_fixed_greedy_b1_workload():
     assert len(prompts) == 1
     assert len(prompts[0]) == workload["prompt_tokens"]
     assert prompts[0][:4] == [1, 2, 3, 4]
+    assert manifest["speculation"] == {"method": "mtp", "draft_tokens": 2}
 
 
 def test_manifest_matches_the_vllm_requirement():
@@ -67,16 +88,11 @@ def test_nvidia_smi_uses_the_selected_physical_gpu(monkeypatch):
 
 def test_validity_rejects_unstable_or_nonmatching_tokens():
     manifest = load_manifest(ROOT / "benchmarks/benchmark.json")
-    samples = [
-        {
-            "decode_tokens": 63,
-            "decode_seconds": 1.0,
-            "decode_tokens_per_second": 63.0,
-        }
-    ] * 3
+    samples = [_sample()] * 3
 
     assert not invalid_reasons(
         "jax",
+        "base",
         manifest,
         samples,
         [[0] * 64],
@@ -86,6 +102,7 @@ def test_validity_rejects_unstable_or_nonmatching_tokens():
     )
     reasons = invalid_reasons(
         "vllm",
+        "base",
         manifest,
         samples,
         [[0] * 64],
@@ -97,6 +114,7 @@ def test_validity_rejects_unstable_or_nonmatching_tokens():
     assert "backend tokens differ from the reference backend" in reasons
     reasons = invalid_reasons(
         "jax",
+        "base",
         manifest,
         samples,
         [[0] * 64],
@@ -109,16 +127,11 @@ def test_validity_rejects_unstable_or_nonmatching_tokens():
 
 def test_validity_rejects_the_wrong_final_output_length():
     manifest = load_manifest(ROOT / "benchmarks/benchmark.json")
-    samples = [
-        {
-            "decode_tokens": 63,
-            "decode_seconds": 1.0,
-            "decode_tokens_per_second": 63.0,
-        }
-    ] * 3
+    samples = [_sample()] * 3
 
     reasons = invalid_reasons(
         "jax",
+        "base",
         manifest,
         samples,
         [[0] * 63],
@@ -129,19 +142,46 @@ def test_validity_rejects_the_wrong_final_output_length():
     assert "output token count does not match the contract" in reasons
 
 
-def test_comparison_reports_speed_and_hardware_without_gating_them():
-    vllm = _result("vllm", 60.0)
-    vllm["environment"]["gpu"]["uuid"] = "GPU-1"
-    comparison = compare_results(_result("jax", 40.0), vllm)
+def test_validity_requires_verified_mtp_drafts():
+    manifest = load_manifest(ROOT / "benchmarks/benchmark.json")
+    samples = [_sample()] * 3
 
-    assert comparison["jax_over_vllm_decode_ratio"] == pytest.approx(2 / 3)
+    reasons = invalid_reasons(
+        "jax",
+        "mtp",
+        manifest,
+        samples,
+        [[0] * 64],
+        repeat_exact=True,
+        reference_exact=True,
+        route_cache_growth=0,
+    )
+
+    assert "MTP decode did not report target-verified drafts" in reasons
+
+
+def test_comparison_reports_the_base_and_mtp_ratios():
+    vllm_mtp = _result("vllm", "mtp", 90.0)
+    vllm_mtp["environment"]["gpu"]["uuid"] = "GPU-1"
+    comparison = compare_results(
+        _result("jax", "base", 40.0),
+        _result("jax", "mtp", 60.0),
+        _result("vllm", "base", 50.0),
+        vllm_mtp,
+    )
+
+    assert comparison["ratios"]["jax_mtp_over_jax_base"] == pytest.approx(1.5)
+    assert comparison["ratios"]["jax_mtp_over_vllm_base"] == pytest.approx(1.2)
     assert not comparison["same_gpu"]
 
 
 def test_comparison_requires_matching_outputs():
     with pytest.raises(ValueError, match="tokens differ"):
         compare_results(
-            _result("jax", 40.0, "jax"), _result("vllm", 60.0, "vllm")
+            _result("jax", "base", 40.0, "jax"),
+            _result("jax", "mtp", 60.0),
+            _result("vllm", "base", 50.0),
+            _result("vllm", "mtp", 70.0, "vllm"),
         )
 
 
@@ -149,15 +189,21 @@ def test_recorded_result_matches_the_manifest():
     benchmark_path = ROOT / "benchmarks/benchmark.json"
     manifest = load_manifest(benchmark_path)
     recorded = json.loads((ROOT / "benchmarks/recorded_result.json").read_text())
-    jax = recorded["results"]["jax"]
-    vllm = recorded["results"]["vllm"]
+    jax_base = recorded["results"]["jax_base"]
+    jax_mtp = recorded["results"]["jax_mtp"]
+    vllm_base = recorded["results"]["vllm_base"]
 
     assert recorded["benchmark_id"] == manifest["benchmark_id"]
-    assert recorded["benchmark_sha256"] == hashlib.sha256(
-        benchmark_path.read_bytes()
-    ).hexdigest()
+    assert (
+        recorded["benchmark_sha256"]
+        == hashlib.sha256(benchmark_path.read_bytes()).hexdigest()
+    )
     assert recorded["comparison"]["output_exact"]
-    assert recorded["comparison"]["jax_over_vllm_decode_ratio"] == pytest.approx(
-        jax["median_decode_tokens_per_second"]
-        / vllm["median_decode_tokens_per_second"]
+    assert recorded["comparison"]["jax_mtp_over_jax_base"] == pytest.approx(
+        jax_mtp["median_decode_tokens_per_second"]
+        / jax_base["median_decode_tokens_per_second"]
+    )
+    assert recorded["comparison"]["jax_mtp_over_vllm_base"] == pytest.approx(
+        jax_mtp["median_decode_tokens_per_second"]
+        / vllm_base["median_decode_tokens_per_second"]
     )

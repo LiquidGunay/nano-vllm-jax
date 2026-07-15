@@ -16,6 +16,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ROUTES = ("base", "mtp")
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -25,13 +26,14 @@ def load_manifest(path: Path) -> dict[str, Any]:
         "benchmark_id",
         "model",
         "workload",
+        "speculation",
         "capacity",
         "measurement",
         "frameworks",
     }
     if set(manifest) != required:
         raise ValueError(f"manifest keys must be exactly {sorted(required)}")
-    if manifest["schema_version"] != 1:
+    if manifest["schema_version"] != 2:
         raise ValueError("unsupported manifest schema")
     workload = manifest["workload"]
     if workload["batch_size"] != 1:
@@ -40,6 +42,11 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise ValueError("the benchmark requires greedy fixed-length decode")
     if workload["prefix_cache"]:
         raise ValueError("the benchmark requires a prefix miss")
+    speculation = manifest["speculation"]
+    if set(speculation) != {"method", "draft_tokens"}:
+        raise ValueError("speculation must define method and draft_tokens")
+    if speculation["method"] != "mtp" or speculation["draft_tokens"] < 1:
+        raise ValueError("the benchmark requires a positive-width MTP drafter")
     measurement = manifest["measurement"]
     if measurement["warmup_repeats"] < 1 or measurement["repeats"] < 1:
         raise ValueError("warmup and measured repeats must be positive")
@@ -135,7 +142,15 @@ def _reference_rows(
     result = json.loads(path.read_text())
     if result["backend"] != "jax" or not result["valid"]:
         raise ValueError("the reference must be a valid JAX result")
-    for field in ("benchmark_id", "model", "workload", "capacity"):
+    if result["route"] != "base":
+        raise ValueError("the reference must use base JAX decode")
+    for field in (
+        "benchmark_id",
+        "model",
+        "workload",
+        "speculation",
+        "capacity",
+    ):
         if result[field] != manifest[field]:
             raise ValueError(f"reference {field} does not match the manifest")
     return result["correctness"]["output_token_ids"]
@@ -148,6 +163,7 @@ def _sample_memory(maximum: dict[str, int]) -> None:
 
 def invalid_reasons(
     backend_name: str,
+    route: str,
     manifest: dict[str, Any],
     samples: list[dict[str, Any]],
     output_rows: list[list[int]],
@@ -157,9 +173,8 @@ def invalid_reasons(
     route_cache_growth: int | None,
 ) -> list[str]:
     reasons = []
-    expected_tokens = (
-        manifest["workload"]["batch_size"]
-        * (manifest["workload"]["output_tokens"] - 1)
+    expected_tokens = manifest["workload"]["batch_size"] * (
+        manifest["workload"]["output_tokens"] - 1
     )
     speeds = [sample["decode_tokens_per_second"] for sample in samples]
     spread = (max(speeds) - min(speeds)) / median(speeds)
@@ -180,11 +195,29 @@ def invalid_reasons(
         reasons.append("decode throughput spread exceeds the contract")
     if backend_name == "jax" and route_cache_growth != 0:
         reasons.append("JAX added an executor route-cache entry during measurement")
+    for sample in samples:
+        stats = sample["speculation"]
+        drafted = stats["draft_tokens"]
+        accepted = stats["accepted_draft_tokens"]
+        verified = stats["verified_target_tokens"]
+        if not 0 <= accepted <= drafted:
+            reasons.append("speculative acceptance counters are inconsistent")
+            break
+        if route == "base" and (drafted or accepted or verified not in (0, None)):
+            reasons.append("base decode reported speculative work")
+            break
+        if route == "mtp" and (
+            drafted == 0
+            or (backend_name == "jax" and (verified is None or verified == 0))
+        ):
+            reasons.append("MTP decode did not report target-verified drafts")
+            break
     return reasons
 
 
 def run(
     backend_name: str,
+    route: str,
     manifest: dict[str, Any],
     reference_path: Path | None,
 ) -> dict[str, Any]:
@@ -193,7 +226,7 @@ def run(
     memory = {"rss": 0, "device": 0}
 
     init_started = perf_counter()
-    backend = backend_module.Backend(manifest, prompts)
+    backend = backend_module.Backend(manifest, prompts, route)
     init_seconds = perf_counter() - init_started
     _sample_memory(memory)
 
@@ -211,11 +244,7 @@ def run(
         sample = backend.run_once()
         repeat_exact &= sample["output_token_ids"] == control["output_token_ids"]
         samples.append(
-            {
-                key: value
-                for key, value in sample.items()
-                if key != "output_token_ids"
-            }
+            {key: value for key, value in sample.items() if key != "output_token_ids"}
         )
         _sample_memory(memory)
     route_cache_after = backend.route_cache_fingerprint()
@@ -237,6 +266,7 @@ def run(
 
     reasons = invalid_reasons(
         backend_name,
+        route,
         manifest,
         samples,
         control["output_token_ids"],
@@ -250,11 +280,13 @@ def run(
     )
     backend_memory = backend.memory()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark_id": manifest["benchmark_id"],
         "backend": backend_name,
+        "route": route,
         "model": manifest["model"],
         "workload": manifest["workload"],
+        "speculation": manifest["speculation"],
         "capacity": manifest["capacity"],
         "environment": {
             "python": platform.python_version(),
@@ -300,6 +332,7 @@ def run(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("backend", choices=("jax", "vllm"))
+    parser.add_argument("--route", choices=ROUTES, required=True)
     parser.add_argument(
         "--manifest", type=Path, default=ROOT / "benchmarks/benchmark.json"
     )
@@ -307,11 +340,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
 
-    result = run(args.backend, load_manifest(args.manifest), args.reference)
+    result = run(
+        args.backend,
+        args.route,
+        load_manifest(args.manifest),
+        args.reference,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(
-        f"{args.backend}: {result['timing']['median_decode_tokens_per_second']:.2f} "
+        f"{args.backend}-{args.route}: "
+        f"{result['timing']['median_decode_tokens_per_second']:.2f} "
         f"decode tok/s, valid={result['valid']}"
     )
     return 0 if result["valid"] else 2

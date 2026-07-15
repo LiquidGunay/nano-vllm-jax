@@ -70,20 +70,28 @@ guard_with() {
 }
 
 run_jax() {
+  local route=$1
+  local reference=()
+  if [[ "$route" == mtp ]]; then
+    reference=(--reference "$artifact_root/results/jax-base.json")
+  fi
   JAX_PLATFORMS=cuda PYTHONPATH="$root" guard_with \
     "$jax_env/bin/python" \
-    "$artifact_root/results/jax.ram.json" \
+    "$artifact_root/results/jax-$route.ram.json" \
     "$jax_env/bin/python" -m benchmarks.run_benchmark jax \
-    --output "$artifact_root/results/jax.json"
+    --route "$route" "${reference[@]}" \
+    --output "$artifact_root/results/jax-$route.json"
 }
 
 run_vllm() {
+  local route=$1
   PYTHONPATH="$root" guard_with \
     "$vllm_env/bin/python" \
-    "$artifact_root/results/vllm.ram.json" \
+    "$artifact_root/results/vllm-$route.ram.json" \
     "$vllm_env/bin/python" -m benchmarks.run_benchmark vllm \
-    --reference "$artifact_root/results/jax.json" \
-    --output "$artifact_root/results/vllm.json"
+    --route "$route" \
+    --reference "$artifact_root/results/jax-base.json" \
+    --output "$artifact_root/results/vllm-$route.json"
 }
 
 gpu_preflight
@@ -91,25 +99,31 @@ case "$target" in
   jax)
     setup_jax
     jax_preflight
-    run_jax
+    run_jax base
+    run_jax mtp
     ;;
   vllm)
-    [[ -f "$artifact_root/results/jax.json" ]] || {
-      echo "run the JAX side first so vLLM has an exact-token reference" >&2
+    [[ -f "$artifact_root/results/jax-base.json" ]] || {
+      echo "run the JAX side first so vLLM has a base-token reference" >&2
       exit 2
     }
     setup_vllm
-    run_vllm
+    run_vllm base
+    run_vllm mtp
     ;;
   both)
     setup_jax
     jax_preflight
-    run_jax
+    run_jax base
+    run_jax mtp
     setup_vllm
-    run_vllm
+    run_vllm base
+    run_vllm mtp
     "$jax_env/bin/python" -m benchmarks.compare_results \
-      --jax "$artifact_root/results/jax.json" \
-      --vllm "$artifact_root/results/vllm.json" \
+      --jax-base "$artifact_root/results/jax-base.json" \
+      --jax-mtp "$artifact_root/results/jax-mtp.json" \
+      --vllm-base "$artifact_root/results/vllm-base.json" \
+      --vllm-mtp "$artifact_root/results/vllm-mtp.json" \
       --output "$artifact_root/results/comparison.json"
     ;;
 esac

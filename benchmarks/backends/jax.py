@@ -13,6 +13,7 @@ from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.fastpath import validate_runtime_dependencies
 from nanovllm_jax.output import OutputBuffer
 from nanovllm_jax.sequence import SamplingParams
+from nanovllm_jax.speculation import DrafterConfig
 
 
 def _versions(*packages: str) -> dict[str, str]:
@@ -26,7 +27,12 @@ def _versions(*packages: str) -> dict[str, str]:
 
 
 class Backend:
-    def __init__(self, manifest: dict[str, Any], prompts: list[list[int]]):
+    def __init__(
+        self,
+        manifest: dict[str, Any],
+        prompts: list[list[int]],
+        route: str,
+    ):
         validate_runtime_dependencies()
         self.manifest = manifest
         self.prompts = prompts
@@ -57,7 +63,16 @@ class Backend:
             warmup=warmup,
             prefix_cache=False,
         )
-        self.engine = LLMEngine(checkpoint, engine_config=config)
+        drafter = (
+            DrafterConfig.mtp(manifest["speculation"]["draft_tokens"])
+            if route == "mtp"
+            else None
+        )
+        self.engine = LLMEngine(
+            checkpoint,
+            engine_config=config,
+            drafter=drafter,
+        )
         self.sampling = SamplingParams(
             temperature=0.0,
             max_tokens=workload["output_tokens"],
@@ -80,14 +95,19 @@ class Backend:
 
     def run_once(self) -> dict[str, Any]:
         seqs = [
-            self.engine.add_request(prompt, self.sampling)
-            for prompt in self.prompts
+            self.engine.add_request(prompt, self.sampling) for prompt in self.prompts
         ]
         started = perf_counter()
         first_token_time = None
         decode_tokens = 0
+        drafted = 0
+        accepted = 0
+        verified = 0
         while not self.engine.is_finished():
             result = self.engine.step()
+            drafted += result.draft_tokens
+            accepted += result.accepted_draft_tokens
+            verified += result.verified_target_tokens
             if result.phase == "prefill":
                 OutputBuffer.materialize_many(seq.output for seq in seqs)
                 first_token_time = perf_counter()
@@ -103,6 +123,11 @@ class Backend:
             "decode_seconds": decode_seconds,
             "decode_tokens": decode_tokens,
             "decode_tokens_per_second": decode_tokens / decode_seconds,
+            "speculation": {
+                "draft_tokens": drafted,
+                "accepted_draft_tokens": accepted,
+                "verified_target_tokens": verified,
+            },
             "output_token_ids": outputs,
         }
 
