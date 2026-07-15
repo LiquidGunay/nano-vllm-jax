@@ -166,6 +166,18 @@ def _reference_rows(
     return result["correctness"]["output_token_ids"]
 
 
+def _validate_reference_role(
+    backend_name: str,
+    route: str,
+    reference_path: Path | None,
+) -> None:
+    is_jax_base = backend_name == "jax" and route == "base"
+    if is_jax_base and reference_path is not None:
+        raise ValueError("JAX base is the canonical reference")
+    if not is_jax_base and reference_path is None:
+        raise ValueError("JAX MTP and vLLM routes require a JAX-base reference")
+
+
 def _sample_memory(maximum: dict[str, int]) -> None:
     maximum["rss"] = max(maximum["rss"], _process_tree_rss_bytes(os.getpid()))
     maximum["device"] = max(maximum["device"], _device_used_bytes())
@@ -232,6 +244,7 @@ def run(
     benchmark_sha256: str,
     reference_path: Path | None,
 ) -> dict[str, Any]:
+    _validate_reference_role(backend_name, route, reference_path)
     prompts = prompt_rows(manifest)
     memory = {"rss": 0, "device": 0}
     repository = _git_state()

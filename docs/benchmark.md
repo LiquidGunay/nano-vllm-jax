@@ -13,6 +13,16 @@ revision, BF16 weights and activations, one committed 64-token natural-language
 prompt, 64 output tokens, greedy sampling, ignored EOS, a prefix-cache miss,
 and two MTP draft positions.
 
+For orientation, the committed token IDs decode to:
+
+> Explain why speculative decoding can improve single-request inference
+> latency, and describe the tradeoff between draft accuracy and verification
+> cost. Discuss memory bandwidth, batch size, compilation overhead, and the
+> verifier's packed execution. Give a concrete intuition for why fewer
+> target-model steps can still lose in end-to-end serving. Use one example.
+
+The token IDs, not this explanatory text, are the executable prompt contract.
+
 Initialization, model download, compilation, graph capture, and one control
 request are outside the measured window. TTFT is reported separately. Decode
 throughput is the 63 tokens after the first token divided by time from first

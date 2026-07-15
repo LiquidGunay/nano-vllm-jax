@@ -75,6 +75,8 @@ run_jax() {
   if [[ "$route" == mtp ]]; then
     reference=(--reference "$artifact_root/results/jax-base.json")
   fi
+  rm -f "$artifact_root/results/jax-$route.json" \
+    "$artifact_root/results/jax-$route.ram.json"
   JAX_PLATFORMS=cuda PYTHONPATH="$root" guard_with \
     "$jax_env/bin/python" \
     "$artifact_root/results/jax-$route.ram.json" \
@@ -85,6 +87,8 @@ run_jax() {
 
 run_vllm() {
   local route=$1
+  rm -f "$artifact_root/results/vllm-$route.json" \
+    "$artifact_root/results/vllm-$route.ram.json"
   PYTHONPATH="$root" guard_with \
     "$vllm_env/bin/python" \
     "$artifact_root/results/vllm-$route.ram.json" \

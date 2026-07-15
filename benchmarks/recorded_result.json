@@ -6,6 +6,7 @@
   "implementation_commit": "f991b63c335260150f09113b0bb7cf7d4aa25cca",
   "hardware": {
     "gpu": "NVIDIA A10G",
+    "gpu_uuid": "GPU-e5dec035-32bc-c974-42bc-ad80b6fd3553",
     "gpu_memory_bytes": 24146608128,
     "driver": "580.159.03"
   },

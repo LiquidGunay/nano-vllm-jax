@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+from statistics import median
 
 import pytest
 
@@ -8,9 +9,11 @@ from benchmarks.compare_results import compare_results
 from benchmarks.run_benchmark import (
     _nvidia_smi,
     _reference_rows,
+    _validate_reference_role,
     invalid_reasons,
     load_manifest,
     prompt_rows,
+    run,
 )
 
 
@@ -208,10 +211,32 @@ def test_reference_requires_the_same_manifest_and_commit(tmp_path):
     repository = {"commit": "commit", "dirty": False}
 
     assert _reference_rows(path, manifest, "manifest", repository) == [[1, 2]]
+    result["route"] = "mtp"
+    path.write_text(json.dumps(result))
+    with pytest.raises(ValueError, match="base JAX"):
+        _reference_rows(path, manifest, "manifest", repository)
+    result["route"] = "base"
+    path.write_text(json.dumps(result))
     with pytest.raises(ValueError, match="manifest"):
         _reference_rows(path, manifest, "other", repository)
     with pytest.raises(ValueError, match="commit"):
         _reference_rows(path, manifest, "manifest", {**repository, "commit": "other"})
+
+
+def test_only_jax_base_can_omit_the_reference(monkeypatch):
+    _validate_reference_role("jax", "base", None)
+    monkeypatch.setattr(
+        "benchmarks.run_benchmark.importlib.import_module",
+        lambda _name: pytest.fail("backend imported before reference validation"),
+    )
+    for backend, route in (("jax", "mtp"), ("vllm", "base"), ("vllm", "mtp")):
+        with pytest.raises(ValueError, match="require a JAX-base reference"):
+            run(backend, route, {}, "manifest", None)
+
+
+def test_jax_base_rejects_an_unnecessary_reference(tmp_path):
+    with pytest.raises(ValueError, match="canonical reference"):
+        run("jax", "base", {}, "manifest", tmp_path / "reference.json")
 
 
 def test_comparison_requires_matching_outputs():
@@ -228,21 +253,34 @@ def test_recorded_result_matches_the_manifest():
     benchmark_path = ROOT / "benchmarks/benchmark.json"
     manifest = load_manifest(benchmark_path)
     recorded = json.loads((ROOT / "benchmarks/recorded_result.json").read_text())
-    jax_base = recorded["results"]["jax_base"]
-    jax_mtp = recorded["results"]["jax_mtp"]
-    vllm_base = recorded["results"]["vllm_base"]
+    results = recorded["results"]
 
     assert recorded["benchmark_id"] == manifest["benchmark_id"]
     assert (
         recorded["benchmark_sha256"]
         == hashlib.sha256(benchmark_path.read_bytes()).hexdigest()
     )
+    assert recorded["hardware"]["gpu_uuid"].startswith("GPU-")
     assert recorded["comparison"]["output_exact"]
-    assert recorded["comparison"]["jax_mtp_over_jax_base"] == pytest.approx(
-        jax_mtp["median_decode_tokens_per_second"]
-        / jax_base["median_decode_tokens_per_second"]
-    )
-    assert recorded["comparison"]["jax_mtp_over_vllm_base"] == pytest.approx(
-        jax_mtp["median_decode_tokens_per_second"]
-        / vllm_base["median_decode_tokens_per_second"]
-    )
+    speeds = {}
+    for name, result in results.items():
+        samples = result["samples"]
+        sample_speeds = [sample["decode_tokens_per_second"] for sample in samples]
+        sample_ttfts = [sample["ttft_seconds"] for sample in samples]
+        assert len(samples) == manifest["measurement"]["repeats"]
+        assert result["median_decode_tokens_per_second"] == median(sample_speeds)
+        assert result["median_ttft_seconds"] == median(sample_ttfts)
+        assert result["relative_spread"] == pytest.approx(
+            (max(sample_speeds) - min(sample_speeds)) / median(sample_speeds)
+        )
+        speeds[name] = result["median_decode_tokens_per_second"]
+
+    expected_ratios = {
+        "jax_base_over_vllm_base": speeds["jax_base"] / speeds["vllm_base"],
+        "jax_mtp_over_jax_base": speeds["jax_mtp"] / speeds["jax_base"],
+        "vllm_mtp_over_vllm_base": speeds["vllm_mtp"] / speeds["vllm_base"],
+        "jax_mtp_over_vllm_base": speeds["jax_mtp"] / speeds["vllm_base"],
+        "jax_mtp_over_vllm_mtp": speeds["jax_mtp"] / speeds["vllm_mtp"],
+    }
+    for name, ratio in expected_ratios.items():
+        assert recorded["comparison"][name] == pytest.approx(ratio)
