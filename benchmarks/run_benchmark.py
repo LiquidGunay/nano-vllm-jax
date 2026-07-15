@@ -42,6 +42,14 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise ValueError("the benchmark requires greedy fixed-length decode")
     if workload["prefix_cache"]:
         raise ValueError("the benchmark requires a prefix miss")
+    prompt = workload["prompt_token_ids"]
+    if len(prompt) != workload["prompt_tokens"] or any(
+        isinstance(token, bool) or not isinstance(token, int) or token < 0
+        for token in prompt
+    ):
+        raise ValueError(
+            "prompt_token_ids must contain prompt_tokens nonnegative integers"
+        )
     speculation = manifest["speculation"]
     if set(speculation) != {"method", "draft_tokens"}:
         raise ValueError("speculation must define method and draft_tokens")
@@ -55,15 +63,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
 
 def prompt_rows(manifest: dict[str, Any]) -> list[list[int]]:
     workload = manifest["workload"]
-    return [
-        [
-            workload["prompt_start_token"]
-            + row * workload["prompt_row_stride"]
-            + position
-            for position in range(workload["prompt_tokens"])
-        ]
-        for row in range(workload["batch_size"])
-    ]
+    return [list(workload["prompt_token_ids"])]
 
 
 def _children(pid: int) -> list[int]:

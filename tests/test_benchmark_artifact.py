@@ -61,7 +61,8 @@ def test_benchmark_is_one_fixed_greedy_b1_workload():
     assert not workload["prefix_cache"]
     assert len(prompts) == 1
     assert len(prompts[0]) == workload["prompt_tokens"]
-    assert prompts[0][:4] == [1, 2, 3, 4]
+    assert prompts[0][:4] == [814, 20139, 3069, 63520]
+    assert prompts[0][-4:] == [5272, 799, 3010, 13]
     assert manifest["speculation"] == {"method": "mtp", "draft_tokens": 2}
 
 
