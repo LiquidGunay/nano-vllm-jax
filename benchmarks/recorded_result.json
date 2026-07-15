@@ -12,6 +12,9 @@
   },
   "results": {
     "jax_base": {
+      "valid": true,
+      "reference_exact": null,
+      "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
       "framework": {
         "jax": "0.10.0",
         "jaxlib": "0.10.0",
@@ -31,6 +34,9 @@
       "max_observed_device_used_bytes": 18667798528
     },
     "jax_mtp": {
+      "valid": true,
+      "reference_exact": true,
+      "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
       "framework": {
         "jax": "0.10.0",
         "jaxlib": "0.10.0",
@@ -53,6 +59,9 @@
       "max_observed_device_used_bytes": 18680381440
     },
     "vllm_base": {
+      "valid": true,
+      "reference_exact": true,
+      "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
       "framework": {
         "vllm": "0.25.1",
         "torch": "2.11.0",
@@ -71,6 +80,9 @@
       "max_observed_device_used_bytes": 9543090176
     },
     "vllm_mtp": {
+      "valid": true,
+      "reference_exact": true,
+      "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
       "framework": {
         "vllm": "0.25.1",
         "torch": "2.11.0",

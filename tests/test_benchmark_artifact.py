@@ -261,8 +261,14 @@ def test_recorded_result_matches_the_manifest():
         == hashlib.sha256(benchmark_path.read_bytes()).hexdigest()
     )
     assert recorded["hardware"]["gpu_uuid"].startswith("GPU-")
-    assert recorded["comparison"]["output_exact"]
+    expected_reference = {
+        "jax_base": None,
+        "jax_mtp": True,
+        "vllm_base": True,
+        "vllm_mtp": True,
+    }
     speeds = {}
+    output_hashes = set()
     for name, result in results.items():
         samples = result["samples"]
         sample_speeds = [sample["decode_tokens_per_second"] for sample in samples]
@@ -273,7 +279,14 @@ def test_recorded_result_matches_the_manifest():
         assert result["relative_spread"] == pytest.approx(
             (max(sample_speeds) - min(sample_speeds)) / median(sample_speeds)
         )
+        assert result["valid"]
+        assert result["reference_exact"] is expected_reference[name]
+        output_hashes.add(result["output_sha256"])
         speeds[name] = result["median_decode_tokens_per_second"]
+
+    assert len(output_hashes) == 1
+    assert recorded["comparison"]["output_exact"]
+    assert recorded["comparison"]["output_sha256"] == output_hashes.pop()
 
     expected_ratios = {
         "jax_base_over_vllm_base": speeds["jax_base"] / speeds["vllm_base"],

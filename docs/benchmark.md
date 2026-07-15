@@ -104,7 +104,12 @@ latency claim. Raw result and guard JSON stay outside the repository under
 
 The same B=1/P64/O64/K2 contract was also run as a non-claim diagnostic on the
 0.8B revision `2fc06364715b967f1860aea9cf38778875588b17` and 2B revision
-`15852e8c16360a2fea060d615a32b45270f8a8fc`:
+`15852e8c16360a2fea060d615a32b45270f8a8fc`. These were guarded three-repeat
+fresh-process runs from clean implementation commit `f991b63` on the same
+physical A10G and driver as the primary result, using JAX 0.10.0 and vLLM
+0.25.1. Their raw
+JSON remains external, so they are diagnostic context rather than additional
+artifact claims:
 
 | Model | JAX base | JAX MTP | JAX ratio | vLLM base | vLLM MTP | vLLM ratio | Output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |

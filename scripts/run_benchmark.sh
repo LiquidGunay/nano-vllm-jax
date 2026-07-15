@@ -29,7 +29,22 @@ export FLASHINFER_WORKSPACE_BASE=$scratch_root
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export UV_NO_PROGRESS=1
 mkdir -p "$artifact_root/results" "$HF_HOME"
+
+clear_routes() {
+  local route
+  for route in "$@"; do
+    rm -f "$artifact_root/results/$route.json" \
+      "$artifact_root/results/$route.ram.json"
+  done
+}
+
 rm -f "$artifact_root/results/comparison.json"
+case "$target" in
+  jax-base|jax-mtp|vllm-base|vllm-mtp) clear_routes "$target" ;;
+  jax) clear_routes jax-base jax-mtp ;;
+  vllm) clear_routes vllm-base vllm-mtp ;;
+  both) clear_routes jax-base jax-mtp vllm-base vllm-mtp ;;
+esac
 
 setup_jax() {
   UV_PROJECT_ENVIRONMENT="$jax_env" uv sync --python 3.11 \
@@ -75,8 +90,6 @@ run_jax() {
   if [[ "$route" == mtp ]]; then
     reference=(--reference "$artifact_root/results/jax-base.json")
   fi
-  rm -f "$artifact_root/results/jax-$route.json" \
-    "$artifact_root/results/jax-$route.ram.json"
   JAX_PLATFORMS=cuda PYTHONPATH="$root" guard_with \
     "$jax_env/bin/python" \
     "$artifact_root/results/jax-$route.ram.json" \
@@ -87,8 +100,6 @@ run_jax() {
 
 run_vllm() {
   local route=$1
-  rm -f "$artifact_root/results/vllm-$route.json" \
-    "$artifact_root/results/vllm-$route.ram.json"
   PYTHONPATH="$root" guard_with \
     "$vllm_env/bin/python" \
     "$artifact_root/results/vllm-$route.ram.json" \
