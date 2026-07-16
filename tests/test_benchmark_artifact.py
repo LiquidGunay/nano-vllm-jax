@@ -8,10 +8,13 @@ import pytest
 from benchmarks.compare_results import compare_results
 from benchmarks.run_benchmark import (
     _nvidia_smi,
+    _output_hash,
     _reference_rows,
     _validate_reference_role,
+    adjudicate_reference,
     invalid_reasons,
     load_manifest,
+    load_parity_evidence,
     prompt_rows,
     run,
 )
@@ -36,6 +39,7 @@ def _result(
         "workload": {"batch_size": 1},
         "speculation": {"method": "mtp", "draft_tokens": 2},
         "capacity": {"max_model_len": 8},
+        "parity": {"evidence": "parity_evidence.json", "sha256": "evidence"},
         "correctness": {"output_sha256": output_hash},
         "timing": {"median_decode_tokens_per_second": speed},
         "environment": {
@@ -81,6 +85,49 @@ def test_manifest_matches_the_vllm_requirement():
     assert requirement == f"vllm=={manifest['frameworks']['vllm']}"
 
 
+def test_manifest_content_addresses_bounded_parity_evidence():
+    benchmark = ROOT / "benchmarks/benchmark.json"
+    manifest = load_manifest(benchmark)
+    evidence = load_parity_evidence(benchmark, manifest)
+
+    assert evidence["benchmark_id"] == manifest["benchmark_id"]
+    assert evidence["mismatches"] == [
+        {"row": 0, "output_index": 44, "reference_token": 5129, "variant_token": 8343}
+    ]
+    assert evidence["diagnostic"]["kl_reference_to_variant"] < 0.001
+    assert evidence["diagnostic"]["jensen_shannon"] < 0.00025
+
+
+def test_parity_adjudication_accepts_only_the_named_token_change():
+    reference = [[1, 2, 3]]
+    variant = [[1, 9, 3]]
+    evidence = {
+        "reference_output_sha256": _output_hash(reference),
+        "variant_output_sha256": _output_hash(variant),
+        "mismatches": [{"row": 0, "output_index": 1, "reference_token": 2, "variant_token": 9}],
+        "diagnostic": {"full_vocabulary": True},
+        "limits": {"max_mismatches": 1},
+    }
+
+    accepted = adjudicate_reference(
+        evidence,
+        reference,
+        variant,
+        evidence_sha256="evidence",
+    )
+
+    assert accepted["variant_output_sha256"] == _output_hash(variant)
+    assert (
+        adjudicate_reference(
+            evidence,
+            reference,
+            [[1, 8, 3]],
+            evidence_sha256="evidence",
+        )
+        is None
+    )
+
+
 def test_nvidia_smi_uses_the_selected_physical_gpu(monkeypatch):
     command = []
 
@@ -121,6 +168,18 @@ def test_validity_rejects_unstable_or_nonmatching_tokens():
     )
     assert "measured repeats produced different tokens" in reasons
     assert "backend tokens differ from the reference backend" in reasons
+    reasons = invalid_reasons(
+        "vllm",
+        "base",
+        manifest,
+        samples,
+        [[0] * 64],
+        repeat_exact=True,
+        reference_exact=False,
+        reference_adjudicated=True,
+        route_cache_growth=None,
+    )
+    assert "backend tokens differ from the reference backend" not in reasons
     reasons = invalid_reasons(
         "jax",
         "base",
@@ -206,7 +265,7 @@ def test_reference_requires_the_same_manifest_and_commit(tmp_path):
     path.write_text(json.dumps(result))
     manifest = {
         name: result[name]
-        for name in ("benchmark_id", "model", "workload", "speculation", "capacity")
+        for name in ("benchmark_id", "model", "workload", "speculation", "capacity", "parity")
     }
     repository = {"commit": "commit", "dirty": False}
 
@@ -249,6 +308,29 @@ def test_comparison_requires_matching_outputs():
         )
 
 
+def test_comparison_accepts_only_the_content_addressed_variant():
+    results = [
+        _result("jax", "base", 40.0, "reference"),
+        _result("jax", "mtp", 60.0, "variant"),
+        _result("vllm", "base", 50.0, "variant"),
+        _result("vllm", "mtp", 70.0, "variant"),
+    ]
+    for result in results[1:]:
+        result["correctness"].update(
+            reference_adjudicated=True,
+            parity_evidence={
+                "variant_output_sha256": "variant",
+                "evidence_sha256": "evidence",
+            },
+        )
+
+    comparison = compare_results(*results)
+
+    assert not comparison["output_exact"]
+    assert comparison["output_sha256"] == "reference"
+    assert comparison["adjudicated_routes"] == ["jax_mtp", "vllm_base", "vllm_mtp"]
+
+
 def test_recorded_result_matches_the_manifest():
     benchmark_path = ROOT / "benchmarks/benchmark.json"
     manifest = load_manifest(benchmark_path)
@@ -259,10 +341,10 @@ def test_recorded_result_matches_the_manifest():
     assert recorded["benchmark_sha256"] == hashlib.sha256(benchmark_path.read_bytes()).hexdigest()
     assert recorded["hardware"]["gpu_uuid"].startswith("GPU-")
     expected_reference = {
-        "jax_base": None,
-        "jax_mtp": True,
-        "vllm_base": True,
-        "vllm_mtp": True,
+        "jax_base": (None, False),
+        "jax_mtp": (False, True),
+        "vllm_base": (False, True),
+        "vllm_mtp": (False, True),
     }
     speeds = {}
     output_hashes = set()
@@ -277,13 +359,21 @@ def test_recorded_result_matches_the_manifest():
             (max(sample_speeds) - min(sample_speeds)) / median(sample_speeds)
         )
         assert result["valid"]
-        assert result["reference_exact"] is expected_reference[name]
+        exact, adjudicated = expected_reference[name]
+        assert result["reference_exact"] is exact
+        assert result["reference_adjudicated"] is adjudicated
         output_hashes.add(result["output_sha256"])
         speeds[name] = result["median_decode_tokens_per_second"]
 
-    assert len(output_hashes) == 1
-    assert recorded["comparison"]["output_exact"]
-    assert recorded["comparison"]["output_sha256"] == output_hashes.pop()
+    assert len(output_hashes) == 2
+    assert not recorded["comparison"]["output_exact"]
+    assert recorded["comparison"]["output_sha256"] == results["jax_base"]["output_sha256"]
+    assert set(recorded["comparison"]["observed_output_sha256"]) == output_hashes
+    assert recorded["comparison"]["adjudicated_routes"] == [
+        "jax_mtp",
+        "vllm_base",
+        "vllm_mtp",
+    ]
 
     expected_ratios = {
         "jax_base_over_vllm_base": speeds["jax_base"] / speeds["vllm_base"],

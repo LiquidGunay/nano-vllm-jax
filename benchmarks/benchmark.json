@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "benchmark_id": "qwen35-4b-b1-p64-o64-greedy-mtp2",
   "model": {
     "id": "Qwen/Qwen3.5-4B",
@@ -94,6 +94,10 @@
     "warmup_repeats": 1,
     "repeats": 3,
     "max_relative_spread": 0.1
+  },
+  "parity": {
+    "evidence": "parity_evidence.json",
+    "sha256": "c964bb7de62b1a2e777693ea510e983bb929565ed331bd6d226f8c5d3df34912"
   },
   "frameworks": {
     "vllm": "0.25.1"

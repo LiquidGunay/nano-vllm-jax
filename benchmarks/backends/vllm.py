@@ -5,6 +5,7 @@ from __future__ import annotations
 from importlib.metadata import version
 from typing import Any
 
+from huggingface_hub import snapshot_download
 from vllm import LLM, SamplingParams
 
 
@@ -23,6 +24,7 @@ class Backend:
         self.route = route
         self.prompts = [{"prompt_token_ids": prompt} for prompt in prompts]
         model = manifest["model"]
+        checkpoint = snapshot_download(model["id"], revision=model["revision"])
         workload = manifest["workload"]
         capacity = manifest["capacity"]
         speculation = (
@@ -34,12 +36,10 @@ class Backend:
             else {}
         )
         self.llm = LLM(
-            model=model["id"],
-            revision=model["revision"],
+            model=checkpoint,
             dtype=model["dtype"],
             seed=0,
             skip_tokenizer_init=True,
-            trust_remote_code=True,
             language_model_only=True,
             mm_processor_cache_gb=0,
             max_model_len=capacity["max_model_len"],
