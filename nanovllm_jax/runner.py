@@ -74,6 +74,19 @@ def _block_until_ready_tree(value: object) -> None:
             leaf_ready()
 
 
+def _nbytes(value: object) -> int:
+    if hasattr(value, "size") and hasattr(value, "dtype"):
+        return int(value.size) * int(value.dtype.itemsize)
+    if isinstance(value, dict):
+        return sum(_nbytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_nbytes(item) for item in value)
+    fields = getattr(value, "__dataclass_fields__", None)
+    if fields is not None:
+        return sum(_nbytes(getattr(value, name)) for name in fields)
+    return 0
+
+
 def _int32_device_vector(value) -> jnp.ndarray:
     """Return a 1D int32 device vector without re-wrapping existing int32 arrays."""
 
@@ -182,14 +195,12 @@ class ModelRunner:
                     dtype=jnp.int32,
                 ),
             )
-        self.full_attention_nhd_cache = self.backend.allocate_full_attention_nhd_kv_cache(
-            kv_spec,
-            full_attention_layers=tuple(
-                layer_id
-                for layer_id, layer_type in enumerate(config.model.layer_types)
-                if layer_type == "full_attention"
-            ),
-        )
+        kv_bytes = sum(self.persistent_kv_bytes().values())
+        if kv_bytes > config.capacity.max_kv_cache_bytes:
+            raise RuntimeError(
+                f"persistent KV allocations need {kv_bytes} bytes but the "
+                f"configured cap is {config.capacity.max_kv_cache_bytes}"
+            )
         self.hybrid_states: Dict[int, HybridLayerState] = {}
         self._max_hybrid_slots = max_seqs
         self._hybrid_slots: Dict[int, int] = {}
@@ -244,32 +255,19 @@ class ModelRunner:
     def memory_bytes(self) -> dict[str, int]:
         """Return persistent allocations and bounded dynamic-state capacity."""
 
-        def nbytes(value: object) -> int:
-            if hasattr(value, "size") and hasattr(value, "dtype"):
-                return int(value.size) * int(value.dtype.itemsize)
-            if isinstance(value, dict):
-                return sum(nbytes(item) for item in value.values())
-            if isinstance(value, (list, tuple)):
-                return sum(nbytes(item) for item in value)
-            fields = getattr(value, "__dataclass_fields__", None)
-            if fields is not None:
-                return sum(nbytes(getattr(value, name)) for name in fields)
-            return 0
-
         return {
-            "target_kv": nbytes(self.cache_storage),
-            "full_attention_kv": nbytes(self.full_attention_nhd_cache),
-            "hybrid_state": nbytes((self._empty_hybrid_state, self._hybrid_state_table)),
-            "prefix_hybrid_state_current": nbytes(
+            **self.persistent_kv_bytes(),
+            "hybrid_state": _nbytes((self._empty_hybrid_state, self._hybrid_state_table)),
+            "prefix_hybrid_state_current": _nbytes(
                 tuple(
                     snapshot.state
                     for snapshot in self._prefix_hybrid_states.values()
                 )
             ),
             "prefix_hybrid_state_capacity": (
-                self._prefix_hybrid_state_capacity * nbytes(self._empty_hybrid_state)
+                self._prefix_hybrid_state_capacity * _nbytes(self._empty_hybrid_state)
             ),
-            "resident_metadata": nbytes(
+            "resident_metadata": _nbytes(
                 (
                     self._resident_block_tables,
                     self._resident_seq_lens,
@@ -277,8 +275,20 @@ class ModelRunner:
                     self._resident_rng_counters,
                 )
             ),
-            "mtp_state": nbytes(self.mtp_state),
+            "mtp_draft_tokens": (
+                _nbytes(self.mtp_state.draft_token_ids)
+                if self.mtp_state is not None
+                else 0
+            ),
         }
+
+    def persistent_kv_bytes(self) -> dict[str, int]:
+        """Enumerate every persistent paged KV owner."""
+
+        allocations = {"target_kv": _nbytes(self.cache_storage)}
+        if self.mtp_state is not None:
+            allocations["predictor_kv"] = _nbytes(self.mtp_state.cache_storage)
+        return allocations
 
     def _warmup_sequences(
         self,

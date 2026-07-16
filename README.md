@@ -35,6 +35,9 @@ branch.
 
 The offline `LLM.generate(..., use_tqdm=True)` progress bar uses the optional
 `progress` extra. Serving does not require it.
+`SamplingParams` defaults to greedy decoding (`temperature=0`), matching HTTP;
+explicit token-id prompts are checked against the checkpoint vocabulary before
+the request enters the scheduler.
 
 ## Run The Benchmark
 

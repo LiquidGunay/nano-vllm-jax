@@ -113,6 +113,10 @@ the selected bucket shape. It neither imports JAX nor allocates device arrays.
 - device token carry,
 - compile-bucket lookup.
 
+Target KV has one canonical `[layers, pages, page_size, kv_heads, head_dim]`
+allocation. FlashInfer consumes an NHD layer slice of that allocation directly;
+MTP adds only its separately enumerated predictor KV allocation.
+
 Materialization produces device arrays plus one immutable `HostBatch` containing
 the Python facts still needed for commit and resident-state bookkeeping. This
 keeps the host mirror explicit without eight optional `*_host` fields on the

@@ -1,6 +1,7 @@
 """Request lifecycle engine for Qwen 3.5 JAX serving."""
 
 import atexit
+from numbers import Integral
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, List, Union
@@ -248,28 +249,76 @@ class LLMEngine:
         prompt: Union[str, List[int]],
         sampling_params: SamplingParams,
     ) -> Sequence:
-        if isinstance(prompt, str):
-            prompt = self._tokenize(prompt)
-
-        if not prompt:
-            raise ValueError("prompt must contain at least one token")
-        self._validate_sampling_params(sampling_params)
-
-        seq = Sequence(
-            prompt,
-            sampling_params,
-            seq_id=self._next_seq_id,
-            block_size=self.config.capacity.block_size,
-        )
+        seq = self._prepare_sequence(prompt, sampling_params, self._next_seq_id)
+        self.scheduler.add_many([seq])
         self._next_seq_id += 1
-        self.scheduler.add(seq)
         return seq
 
+    def _prepare_sequence(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        seq_id: int,
+        *,
+        request_index: int | None = None,
+    ) -> Sequence:
+        if not isinstance(sampling_params, SamplingParams):
+            raise TypeError("sampling_params must be a SamplingParams instance")
+        self._validate_sampling_params(sampling_params)
+        token_ids = self._tokenize(prompt) if isinstance(prompt, str) else prompt
+        token_ids = self.validate_token_ids(token_ids, request_index=request_index)
+        return Sequence(
+            token_ids,
+            sampling_params,
+            seq_id=seq_id,
+            block_size=self.config.capacity.block_size,
+        )
+
+    def validate_token_ids(
+        self,
+        token_ids: object,
+        *,
+        request_index: int | None = None,
+    ) -> list[int]:
+        """Return validated prompt ids at the public engine boundary."""
+
+        owner = "prompt" if request_index is None else f"prompt[{request_index}]"
+        if not isinstance(token_ids, (list, tuple)):
+            raise TypeError(f"{owner} must be a sequence of token ids")
+        if not token_ids:
+            raise ValueError(f"{owner} must contain at least one token")
+        validated: list[int] = []
+        for index, token_id in enumerate(token_ids):
+            if isinstance(token_id, bool) or not isinstance(token_id, Integral):
+                raise TypeError(f"{owner} token {index} must be an integer")
+            token_id = int(token_id)
+            if not 0 <= token_id < self.config.model.vocab_size:
+                raise ValueError(
+                    f"{owner} token {index} is {token_id}; expected 0 <= token id "
+                    f"< {self.config.model.vocab_size}"
+                )
+            validated.append(token_id)
+        return validated
+
+    def validate_request_capacity(
+        self,
+        prompt_tokens: int,
+        sampling_params: SamplingParams,
+        *,
+        request_index: int | None = None,
+    ) -> None:
+        """Validate one request against scheduler-owned capacity."""
+
+        self._validate_sampling_params(sampling_params)
+        self.scheduler.validate_request_capacity(
+            prompt_tokens,
+            sampling_params.max_tokens,
+            request_index=request_index,
+        )
+
     def _validate_sampling_params(self, sampling_params: SamplingParams) -> None:
-        if sampling_params.max_tokens <= 0:
-            raise ValueError("max_tokens must be positive")
-        if sampling_params.temperature < 0:
-            raise ValueError("temperature must be non-negative")
+        if not isinstance(sampling_params, SamplingParams):
+            raise TypeError("sampling_params must be a SamplingParams instance")
         if self.config.drafter is not None and (
             sampling_params.temperature != 0 or not sampling_params.ignore_eos
         ):
@@ -282,6 +331,8 @@ class LLMEngine:
         prompts: List[Union[str, List[int]]],
         sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
     ) -> List[Sequence]:
+        if not isinstance(prompts, list) or not prompts:
+            raise ValueError("prompts must be a non-empty list")
         if sampling_params is None:
             sampling_params = SamplingParams()
 
@@ -290,17 +341,18 @@ class LLMEngine:
         elif len(sampling_params) != len(prompts):
             raise ValueError("sampling_params length must match prompts length")
 
-        request_inputs: List[List[int]] = []
-        for prompt in prompts:
-            token_ids = self._tokenize(prompt) if isinstance(prompt, str) else list(prompt)
-            if not token_ids:
-                raise ValueError("prompt must contain at least one token")
-            request_inputs.append(token_ids)
-
-        for sp in sampling_params:
-            self._validate_sampling_params(sp)
-
-        return [self.add_request(prompt, sp) for prompt, sp in zip(request_inputs, sampling_params)]
+        seqs = [
+            self._prepare_sequence(
+                prompt,
+                params,
+                self._next_seq_id + index,
+                request_index=index,
+            )
+            for index, (prompt, params) in enumerate(zip(prompts, sampling_params))
+        ]
+        self.scheduler.add_many(seqs)
+        self._next_seq_id += len(seqs)
+        return seqs
 
     def commit(
         self,

@@ -103,10 +103,51 @@ class Scheduler:
         )
 
     def _required_blocks(self, seq: Sequence) -> int:
-        total_tokens = seq.num_prompt_tokens + seq.max_tokens
+        return self._required_blocks_for(seq.num_prompt_tokens, seq.max_tokens)
+
+    def _required_blocks_for(self, prompt_tokens: int, max_tokens: int) -> int:
+        total_tokens = int(prompt_tokens) + int(max_tokens)
         if self.drafter is not None:
             total_tokens += self.drafter.capacity_padding_tokens
         return (total_tokens + self.block_size - 1) // self.block_size
+
+    def validate_request_capacity(
+        self,
+        prompt_tokens: int,
+        max_tokens: int,
+        *,
+        request_index: int | None = None,
+    ) -> None:
+        """Validate one request without mutating queues or block state."""
+
+        owner = "request" if request_index is None else f"request[{request_index}]"
+        if int(prompt_tokens) <= 0:
+            raise ValueError(f"{owner} prompt must contain at least one token")
+        padding = self.drafter.capacity_padding_tokens if self.drafter is not None else 0
+        requested_tokens = int(prompt_tokens) + int(max_tokens) + padding
+        required_blocks = self._required_blocks_for(prompt_tokens, max_tokens)
+        total_blocks = len(self.block_manager.blocks)
+        if required_blocks > total_blocks:
+            raise ValueError(
+                f"{owner} needs {required_blocks} blocks but the engine has {total_blocks}"
+            )
+        token_capacity = self.max_blocks_per_seq * self.block_size
+        if requested_tokens > token_capacity:
+            raise ValueError(
+                f"{owner} needs {requested_tokens} total tokens but per-sequence "
+                f"capacity is {token_capacity}"
+            )
+
+    def validate(self, seq: Sequence, *, request_index: int | None = None) -> None:
+        """Validate a candidate sequence without admitting it."""
+
+        if seq.block_size != self.block_size:
+            raise ValueError("sequence and scheduler use different block sizes")
+        self.validate_request_capacity(
+            seq.num_prompt_tokens,
+            seq.max_tokens,
+            request_index=request_index,
+        )
 
     def _admit_first_fitting_waiter(self) -> Sequence | None:
         """Return the first request that fits without stalling later waiters."""
@@ -201,30 +242,16 @@ class Scheduler:
         """Whether runner warmup can reset state without dangling host metadata."""
         return self.is_finished() and not self.block_manager.prefix_cache.entries
 
-    def add(self, seq: Sequence):
+    def add_many(self, seqs: List[Sequence]) -> None:
+        """Atomically validate and append a batch to the waiting queue."""
+
+        for index, seq in enumerate(seqs):
+            self.validate(seq, request_index=index if len(seqs) > 1 else None)
+        self.waiting.extend(seqs)
+
+    def add(self, seq: Sequence) -> None:
         """Add a sequence to the waiting queue."""
-        if seq.block_size != self.block_size:
-            raise ValueError("sequence and scheduler use different block sizes")
-        required_blocks = self._required_blocks(seq)
-        if required_blocks > len(self.block_manager.blocks):
-            raise ValueError(
-                f"request needs {required_blocks} blocks but the engine has "
-                f"{len(self.block_manager.blocks)}"
-            )
-        if self.max_blocks_per_seq is not None:
-            max_tokens_per_seq = self.max_blocks_per_seq * seq.block_size
-            requested_tokens = seq.num_tokens + seq.max_tokens
-            if self.drafter is not None:
-                requested_tokens += self.drafter.capacity_padding_tokens
-            if seq.num_blocks > self.max_blocks_per_seq:
-                raise ValueError(
-                    f"prompt needs {seq.num_blocks} blocks but max_blocks_per_seq is {self.max_blocks_per_seq}"
-                )
-            if requested_tokens > max_tokens_per_seq:
-                raise ValueError(
-                    f"request needs {requested_tokens} total tokens but per-sequence capacity is {max_tokens_per_seq}"
-                )
-        self.waiting.append(seq)
+        self.add_many([seq])
 
     def schedule(self) -> Tuple[List[Sequence], SchedulePlan]:
         """Schedule sequences for execution.

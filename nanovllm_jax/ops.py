@@ -16,13 +16,11 @@ import jax.numpy as jnp
 from nanovllm_jax.fastpath import KernelPlan
 from nanovllm_jax.cache import (
     AttentionMetadata,
-    FullAttentionNHDKVCacheStorage,
     KVCacheSpec,
     KVCacheStorage,
     cap_num_kv_cache_blocks,
     compute_slot_mapping,
     init_kv_cache,
-    init_full_attention_nhd_kv_cache,
     paged_attention,
     paged_attention_prefill,
     paged_attention_prefill_packed,
@@ -352,13 +350,6 @@ class ServingOpsProtocol(Protocol):
     ) -> KVCacheStorage:
         ...
 
-    def allocate_full_attention_nhd_kv_cache(
-        self,
-        spec: KVCacheSpec,
-        full_attention_layers: tuple[int, ...],
-    ) -> FullAttentionNHDKVCacheStorage | None:
-        ...
-
     def build_attention_metadata(
         self,
         positions: jnp.ndarray,
@@ -614,19 +605,6 @@ class ServingOps:
             max_kv_cache_bytes=None,
         )
         return state.storage
-
-    def allocate_full_attention_nhd_kv_cache(
-        self,
-        spec: KVCacheSpec,
-        full_attention_layers: tuple[int, ...],
-    ) -> FullAttentionNHDKVCacheStorage | None:
-        if self.full_attention_decode_impl != "flashinfer_paged":
-            return None
-        finalized_spec = _require_finalized_kv_cache_spec(spec, self.plan)
-        return init_full_attention_nhd_kv_cache(
-            spec=finalized_spec,
-            full_attention_layers=full_attention_layers,
-        )
 
     def build_attention_metadata(
         self,

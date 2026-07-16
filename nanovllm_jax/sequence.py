@@ -3,6 +3,8 @@
 from copy import copy
 from dataclasses import dataclass
 from enum import Enum, auto
+import math
+from numbers import Integral, Real
 from typing import List, Optional
 
 from nanovllm_jax.output import OutputBuffer
@@ -14,13 +16,29 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 
-@dataclass
+@dataclass(frozen=True)
 class SamplingParams:
     """Sampling parameters for generation."""
 
-    temperature: float = 1.0
+    temperature: float = 0.0
     max_tokens: int = 256
     ignore_eos: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.temperature, bool) or not isinstance(self.temperature, Real):
+            raise TypeError("temperature must be a real number")
+        temperature = float(self.temperature)
+        if not math.isfinite(temperature) or temperature < 0:
+            raise ValueError("temperature must be finite and non-negative")
+        if isinstance(self.max_tokens, bool) or not isinstance(self.max_tokens, Integral):
+            raise TypeError("max_tokens must be an integer")
+        max_tokens = int(self.max_tokens)
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if not isinstance(self.ignore_eos, bool):
+            raise TypeError("ignore_eos must be a boolean")
+        object.__setattr__(self, "temperature", temperature)
+        object.__setattr__(self, "max_tokens", max_tokens)
 
 
 class Sequence:

@@ -1,42 +1,18 @@
-"""NHD full-attention KV cache allocation tests."""
-
-from dataclasses import replace
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+"""Canonical NHD KV layout and ownership tests."""
 
 import jax
 import jax.numpy as jnp
-import pytest
 
-from nanovllm_jax.ops import ServingOps, resolve_kv_cache_spec
-from nanovllm_jax.config import RuntimeSpec
-from nanovllm_jax.fastpath import KernelPlan
-from nanovllm_jax.runner import ModelRunner
+from nanovllm_jax.cache import update_kv_cache
 from nanovllm_jax.kernels.flashinfer_ffi import kv_append_paged_nhd_reference
-from nanovllm_jax.cache import (
-    KVCacheSpec,
-    full_attention_nhd_kv_cache_shape,
-    init_full_attention_nhd_kv_cache,
-    update_kv_cache,
-)
 from nanovllm_jax.model import init_params
+from nanovllm_jax.mtp import init_mtp_params
+from nanovllm_jax.runner import ModelRunner
+from nanovllm_jax.speculation import DrafterConfig
 from tests.runtime_specs import runtime_spec
 
 
-def _spec() -> KVCacheSpec:
-    return KVCacheSpec(
-        num_layers=24,
-        num_blocks=8,
-        block_size=16,
-        num_kv_heads=2,
-        head_dim=256,
-        dtype=jnp.float32,
-    )
-
-
-def _tiny_full_attention_config() -> RuntimeSpec:
+def _tiny_full_attention_config(*, mtp: bool = False):
     return runtime_spec(
         model={
             "vocab_size": 32,
@@ -53,106 +29,41 @@ def _tiny_full_attention_config() -> RuntimeSpec:
             "block_size": 2,
             "num_kvcache_blocks": 4,
             "max_num_seqs": 1,
+            "max_num_resident_seqs": 1,
             "max_blocks_per_seq": 2,
-            "max_kv_cache_bytes": 4 * 2 * 2 * 1 * 8 * 4 * 2,
+            "max_kv_cache_bytes": 2 * 4 * 2 * 1 * 8 * 4 * 2,
+            "prefix_cache": False,
         },
-        compile={"dtype": "float32"},
-        kernels={"full_attention_decode": "flashinfer_paged"},
+        compile={
+            "dtype": "float32",
+            "execution": "jit",
+            "prefill_token_buckets": (2,),
+            "batch_size_buckets": (1,),
+            "decode_block_table_buckets": (2,),
+        },
+        kernels={
+            "full_attention_decode": "flashinfer_paged",
+            "device_token_carry": True,
+            "static_decode_metadata": True,
+            "resident_decode_metadata": True,
+        },
+        drafter=DrafterConfig.mtp(1) if mtp else None,
     )
 
 
-def test_nhd_full_attention_cache_disabled_by_default():
-    backend = ServingOps()
-    cache = backend.allocate_full_attention_nhd_kv_cache(_spec(), full_attention_layers=(3, 7))
-
-    assert cache is None
-
-
-def test_nhd_full_attention_cache_shape_for_flashinfer_decode():
-    spec = _spec()
-
-    backend = ServingOps(KernelPlan(full_attention_decode="flashinfer_paged"))
-    nhd_cache = backend.allocate_full_attention_nhd_kv_cache(
-        spec,
-        full_attention_layers=(3, 7, 11, 15, 19, 23),
-    )
-    canonical_cache = backend.allocate_kv_cache(spec, max_seqs=4, max_blocks_per_seq=8)
-
-    assert nhd_cache is not None
-    assert nhd_cache.layout == "NHD"
-    assert nhd_cache.page_size == spec.block_size
-    assert nhd_cache.layer_indices == (3, 7, 11, 15, 19, 23)
-    assert nhd_cache.k_cache.shape == (6, 8, 16, 2, 256)
-    assert nhd_cache.v_cache.shape == (6, 8, 16, 2, 256)
-    assert nhd_cache.k_cache.dtype == jnp.float32
-    assert canonical_cache.k_cache.shape == (24, 8, 16, 2, 256)
-    assert canonical_cache.v_cache.shape == (24, 8, 16, 2, 256)
-
-
-def test_nhd_full_attention_cache_uses_main_cache_block_cap():
-    requested = KVCacheSpec(
-        num_layers=4,
-        num_blocks=8,
-        block_size=2,
-        num_kv_heads=1,
-        head_dim=4,
-        dtype=jnp.float32,
-        max_kv_cache_bytes=2 * 4 * 2 * 1 * 4 * 4 * 2,
-    )
-
-    backend = ServingOps(KernelPlan(full_attention_decode="flashinfer_paged"))
-    with pytest.raises(ValueError, match="must be finalized"):
-        backend.allocate_kv_cache(requested, max_seqs=1, max_blocks_per_seq=2)
-
-    spec = resolve_kv_cache_spec(requested, backend.plan)
-    nhd_cache = backend.allocate_full_attention_nhd_kv_cache(
-        spec,
-        full_attention_layers=(1, 3),
-    )
-    canonical_cache = backend.allocate_kv_cache(spec, max_seqs=1, max_blocks_per_seq=2)
-
-    assert nhd_cache is not None
-    assert nhd_cache.k_cache.shape == (2, 2, 2, 1, 4)
-    assert canonical_cache.k_cache.shape == (4, 2, 2, 1, 4)
-
-
-def test_model_runner_sidecar_does_not_replace_canonical_cache():
-    config = _tiny_full_attention_config()
+def test_runner_has_one_capped_physical_owner_per_kv_layer():
+    config = _tiny_full_attention_config(mtp=True)
     params = init_params(jax.random.PRNGKey(0), config.model)
+    mtp_params = init_mtp_params(jax.random.PRNGKey(1), config)
 
-    runner = ModelRunner(config, params)
+    runner = ModelRunner(config, params, mtp_params=mtp_params)
 
+    allocations = runner.persistent_kv_bytes()
+    assert tuple(allocations) == ("target_kv", "predictor_kv")
+    assert sum(allocations.values()) == config.capacity.max_kv_cache_bytes
     assert runner.cache_storage.k_cache.shape == (1, 4, 2, 1, 8)
-    assert runner.cache_storage.v_cache.shape == (1, 4, 2, 1, 8)
-    assert runner.full_attention_nhd_cache is not None
-    assert runner.full_attention_nhd_cache.k_cache.shape == (1, 4, 2, 1, 8)
-    assert runner.full_attention_nhd_cache.layer_indices == (0,)
-
-
-def test_model_runner_rejects_unfinalized_cache_capacity():
-    config = _tiny_full_attention_config()
-    config = replace(
-        config,
-        capacity=replace(config.capacity, num_kvcache_blocks=16),
-    )
-    params = init_params(jax.random.PRNGKey(0), config.model)
-
-    with pytest.raises(ValueError, match="was not finalized"):
-        ModelRunner(config, params)
-
-
-def test_nhd_full_attention_shape_helper_does_not_allocate():
-    shape = full_attention_nhd_kv_cache_shape(
-        _spec(),
-        full_attention_layers=(3, 7, 11, 15, 19, 23),
-    )
-
-    assert shape == (6, 8, 16, 2, 256)
-
-
-def test_nhd_full_attention_cache_requires_full_attention_layers():
-    with pytest.raises(ValueError, match="full_attention_layers"):
-        init_full_attention_nhd_kv_cache(_spec(), full_attention_layers=())
+    assert runner.mtp_state.cache_storage.k_cache.shape == (1, 4, 2, 1, 8)
+    assert "full_attention_kv" not in runner.memory_bytes()
 
 
 def test_kv_append_paged_nhd_reference_matches_canonical_update():
@@ -173,7 +84,10 @@ def test_kv_append_paged_nhd_reference_matches_canonical_update():
         head_dim,
     )
     new_v = new_k + 100.0
-    canonical_k = jnp.zeros((1, num_pages, page_size, num_kv_heads, head_dim), dtype=jnp.float32)
+    canonical_k = jnp.zeros(
+        (1, num_pages, page_size, num_kv_heads, head_dim),
+        dtype=jnp.float32,
+    )
     canonical_v = jnp.zeros_like(canonical_k)
 
     canonical_k, canonical_v = update_kv_cache(
@@ -189,14 +103,18 @@ def test_kv_append_paged_nhd_reference_matches_canonical_update():
         append_value=new_v.reshape(-1, num_kv_heads, head_dim),
         batch_indices=jnp.array([0, 0, 1, 1], dtype=jnp.int32),
         positions=positions.reshape(-1),
-        k_cache=jnp.zeros((num_pages, page_size, num_kv_heads, head_dim), dtype=jnp.float32),
-        v_cache=jnp.zeros((num_pages, page_size, num_kv_heads, head_dim), dtype=jnp.float32),
+        k_cache=jnp.zeros(
+            (num_pages, page_size, num_kv_heads, head_dim),
+            dtype=jnp.float32,
+        ),
+        v_cache=jnp.zeros(
+            (num_pages, page_size, num_kv_heads, head_dim),
+            dtype=jnp.float32,
+        ),
         kv_indices=jnp.array([3, 1, 2, 4], dtype=jnp.int32),
         kv_indptr=jnp.array([0, 2, 4], dtype=jnp.int32),
         kv_last_page_len=jnp.array([1, 3], dtype=jnp.int32),
     )
 
-    assert nhd_k.shape == (num_pages, page_size, num_kv_heads, head_dim)
-    assert nhd_v.shape == (num_pages, page_size, num_kv_heads, head_dim)
     assert jnp.array_equal(nhd_k, canonical_k[0])
     assert jnp.array_equal(nhd_v, canonical_v[0])

@@ -192,7 +192,11 @@ def _runtime_manifest(runtime: RuntimeSpec) -> dict[str, object]:
 
 
 def _is_token_ids(value: Any) -> bool:
-    return isinstance(value, list) and bool(value) and all(isinstance(token, int) for token in value)
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(token, int) and not isinstance(token, bool) for token in value)
+    )
 
 
 def _is_token_id_batch(value: Any) -> bool:
@@ -266,34 +270,24 @@ def _inputs_from_request(data: dict[str, Any]) -> tuple[list[str | list[int]], b
     raise ValueError("prompt must be a non-empty string or list of strings")
 
 
-def _positive_int(value: Any, name: str) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be an integer") from exc
-    if parsed <= 0:
-        raise ValueError(f"{name} must be positive")
-    return parsed
-
-
-def _sampling_params(data: dict[str, Any], count: int) -> tuple[list[SamplingParams], int]:
-    try:
-        temperature = float(data.get("temperature", 0.0))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("temperature must be a number") from exc
-    if temperature < 0:
-        raise ValueError("temperature must be non-negative")
-
+def _sampling_params(data: dict[str, Any], count: int) -> list[SamplingParams]:
+    temperature = data.get("temperature", 0.0)
     raw_limits = data.get("max_tokens", app.config["MAX_TOKENS_DEFAULT"])
     limits = raw_limits if isinstance(raw_limits, list) else [raw_limits] * count
     if len(limits) != count:
         raise ValueError("max_tokens list length must match number of prompts")
-    limits = [_positive_int(limit, "max_tokens") for limit in limits]
-    ignore_eos = bool(data.get("ignore_eos", False))
-    return (
-        [SamplingParams(temperature=temperature, max_tokens=limit, ignore_eos=ignore_eos) for limit in limits],
-        max(limits),
-    )
+    ignore_eos = data.get("ignore_eos", False)
+    try:
+        return [
+            SamplingParams(
+                temperature=temperature,
+                max_tokens=limit,
+                ignore_eos=ignore_eos,
+            )
+            for limit in limits
+        ]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _token_counts(inputs: list[str | list[int]]) -> list[int]:
@@ -302,29 +296,39 @@ def _token_counts(inputs: list[str | list[int]]) -> list[int]:
     return [len(item) if isinstance(item, list) else len(engine._tokenize(item)) for item in inputs]
 
 
-def _validate_inputs_fit_config(inputs: list[str | list[int]], prompt_tokens: list[int], max_tokens: int) -> None:
+def _validate_inputs_fit_config(
+    inputs: list[str | list[int]],
+    prompt_tokens: list[int],
+    sampling_params: list[SamplingParams],
+) -> None:
     if engine is None:
         raise RuntimeError("model is not loaded")
+    if not (len(inputs) == len(prompt_tokens) == len(sampling_params)):
+        raise ValueError("inputs, prompt lengths, and sampling parameters must align")
 
     runtime_capacity = engine.config.capacity
-    token_capacity = runtime_capacity.max_blocks_per_seq * runtime_capacity.block_size
-    needed = max(prompt_tokens) + max_tokens
-    if needed > token_capacity:
-        raise ValueError(
-            f"request needs {needed} tokens, exceeding per-sequence KV capacity {token_capacity}"
-        )
     if len(inputs) > runtime_capacity.max_num_seqs:
         raise ValueError(
             f"request has {len(inputs)} prompts, exceeding max_num_seqs "
             f"{runtime_capacity.max_num_seqs}"
         )
+    for index, (item, prompt_len, params) in enumerate(
+        zip(inputs, prompt_tokens, sampling_params)
+    ):
+        if isinstance(item, list):
+            engine.validate_token_ids(item, request_index=index)
+        engine.validate_request_capacity(
+            prompt_len,
+            params,
+            request_index=index,
+        )
 
 
 def _prepare_generation(data: dict[str, Any]):
     inputs, is_batch = _inputs_from_request(data)
-    sampling_params, max_tokens = _sampling_params(data, len(inputs))
+    sampling_params = _sampling_params(data, len(inputs))
     prompt_tokens = _token_counts(inputs)
-    _validate_inputs_fit_config(inputs, prompt_tokens, max_tokens)
+    _validate_inputs_fit_config(inputs, prompt_tokens, sampling_params)
     return inputs, sampling_params, prompt_tokens, is_batch
 
 

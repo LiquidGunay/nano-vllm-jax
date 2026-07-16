@@ -13,8 +13,10 @@ from nanovllm_jax.config import (
     load_engine_config,
 )
 from nanovllm_jax.device_batch import HostBatch
-from nanovllm_jax.engine import _engine_config_from_public_kwargs
+from nanovllm_jax.engine import LLMEngine, _engine_config_from_public_kwargs
 from nanovllm_jax.fastpath import KERNEL_PLAN
+from nanovllm_jax.scheduler import Scheduler
+from nanovllm_jax.sequence import SamplingParams
 from tests.runtime_specs import qwen_text_config, runtime_spec
 
 
@@ -179,13 +181,73 @@ def test_server_request_validation_reads_runtime_capacity(monkeypatch):
             "max_num_resident_seqs": 1,
         }
     )
-    monkeypatch.setattr(server, "engine", type("Engine", (), {"config": runtime})())
+    engine = object.__new__(LLMEngine)
+    engine.config = runtime
+    engine.scheduler = Scheduler(runtime)
+    monkeypatch.setattr(server, "engine", engine)
 
-    server._validate_inputs_fit_config([[1, 2]], [2], max_tokens=6)
-    with pytest.raises(ValueError, match="per-sequence KV capacity 8"):
-        server._validate_inputs_fit_config([[1, 2]], [2], max_tokens=7)
+    server._validate_inputs_fit_config(
+        [[1, 2]],
+        [2],
+        [SamplingParams(max_tokens=6)],
+    )
+    with pytest.raises(ValueError, match="per-sequence capacity is 8"):
+        server._validate_inputs_fit_config(
+            [[1, 2]],
+            [2],
+            [SamplingParams(max_tokens=7)],
+        )
     with pytest.raises(ValueError, match="exceeding max_num_seqs 1"):
-        server._validate_inputs_fit_config([[1], [2]], [1, 1], max_tokens=1)
+        server._validate_inputs_fit_config(
+            [[1], [2]],
+            [1, 1],
+            [SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
+        )
+
+
+def test_server_capacity_validation_is_pairwise(monkeypatch):
+    import server
+
+    runtime = runtime_spec(
+        capacity={
+            "block_size": 1,
+            "max_blocks_per_seq": 101,
+            "max_num_seqs": 2,
+            "max_num_resident_seqs": 2,
+        }
+    )
+    engine = object.__new__(LLMEngine)
+    engine.config = runtime
+    engine.scheduler = Scheduler(runtime)
+    monkeypatch.setattr(server, "engine", engine)
+
+    server._validate_inputs_fit_config(
+        [[1], [2]],
+        [100, 1],
+        [SamplingParams(max_tokens=1), SamplingParams(max_tokens=100)],
+    )
+    with pytest.raises(ValueError, match=r"request\[1\] needs 102 total tokens"):
+        server._validate_inputs_fit_config(
+            [[1], [2]],
+            [100, 1],
+            [SamplingParams(max_tokens=1), SamplingParams(max_tokens=101)],
+        )
+
+
+@pytest.mark.parametrize(
+    "data",
+    (
+        {"max_tokens": True},
+        {"max_tokens": 1.5},
+        {"temperature": float("nan")},
+        {"ignore_eos": "false"},
+    ),
+)
+def test_server_sampling_validation_is_strict(data):
+    import server
+
+    with pytest.raises(ValueError):
+        server._sampling_params(data, 1)
 
 
 def test_engine_config_rejects_unsorted_or_uncovered_buckets():

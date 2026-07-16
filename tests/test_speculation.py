@@ -125,15 +125,7 @@ def test_mtp_engine_rejects_incompatible_requests_before_admission():
     engine = object.__new__(LLMEngine)
     engine.config = _runtime(mtp=True)
     engine._next_seq_id = 0
-
-    class Queue:
-        def __init__(self):
-            self.seqs = []
-
-        def add(self, seq):
-            self.seqs.append(seq)
-
-    engine.scheduler = Queue()
+    engine.scheduler = Scheduler(engine.config)
 
     with pytest.raises(ValueError, match="persistent MTP requires"):
         engine.generate([[1, 2, 3]], use_tqdm=False)
@@ -150,7 +142,7 @@ def test_mtp_engine_rejects_incompatible_requests_before_admission():
         with pytest.raises(ValueError, match="persistent MTP requires"):
             engine.add_request([4, 5, 6], sampling)
 
-    assert engine.scheduler.seqs == [compatible]
+    assert list(engine.scheduler.waiting) == [compatible]
 
 
 def test_scheduler_derives_mtp_capacity_from_frozen_width():
