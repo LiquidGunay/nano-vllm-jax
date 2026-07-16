@@ -265,9 +265,13 @@ def adjudicate_reference(
 
     if evidence is None or reference_rows is None:
         return None
-    if _output_hash(reference_rows) != evidence["reference_output_sha256"]:
-        return None
-    if _output_hash(output_rows) != evidence["variant_output_sha256"]:
+    reference_hash = _output_hash(reference_rows)
+    output_hash = _output_hash(output_rows)
+    allowed_hashes = {
+        evidence["reference_output_sha256"],
+        evidence["variant_output_sha256"],
+    }
+    if reference_hash == output_hash or {reference_hash, output_hash} != allowed_hashes:
         return None
     if len(reference_rows) != len(output_rows):
         return None
@@ -285,11 +289,22 @@ def adjudicate_reference(
             for index, (reference_token, variant_token) in enumerate(zip(reference, output))
             if reference_token != variant_token
         )
-    if observed != evidence["mismatches"]:
+    expected = evidence["mismatches"]
+    if reference_hash == evidence["variant_output_sha256"]:
+        expected = [
+            {
+                **item,
+                "reference_token": item["variant_token"],
+                "variant_token": item["reference_token"],
+            }
+            for item in expected
+        ]
+    if observed != expected:
         return None
     return {
         "evidence_sha256": evidence_sha256,
-        "variant_output_sha256": evidence["variant_output_sha256"],
+        "output_sha256": output_hash,
+        "equivalent_output_sha256": sorted(allowed_hashes),
         "mismatches": observed,
         "diagnostic": evidence["diagnostic"],
         "limits": evidence["limits"],

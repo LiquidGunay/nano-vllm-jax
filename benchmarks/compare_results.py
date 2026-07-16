@@ -52,7 +52,7 @@ def compare_results(
         if (
             not result["correctness"].get("reference_adjudicated")
             or parity is None
-            or parity["variant_output_sha256"] != output_hash
+            or parity["output_sha256"] != output_hash
             or parity["evidence_sha256"] != result["parity"]["sha256"]
         ):
             raise ValueError("result tokens differ without parity evidence")

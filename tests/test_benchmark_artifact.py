@@ -116,7 +116,13 @@ def test_parity_adjudication_accepts_only_the_named_token_change():
         evidence_sha256="evidence",
     )
 
-    assert accepted["variant_output_sha256"] == _output_hash(variant)
+    assert accepted["output_sha256"] == _output_hash(variant)
+    assert adjudicate_reference(
+        evidence,
+        variant,
+        reference,
+        evidence_sha256="evidence",
+    )["output_sha256"] == _output_hash(reference)
     assert (
         adjudicate_reference(
             evidence,
@@ -319,7 +325,7 @@ def test_comparison_accepts_only_the_content_addressed_variant():
         result["correctness"].update(
             reference_adjudicated=True,
             parity_evidence={
-                "variant_output_sha256": "variant",
+                "output_sha256": "variant",
                 "evidence_sha256": "evidence",
             },
         )
