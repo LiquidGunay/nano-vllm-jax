@@ -192,20 +192,18 @@ def test_post_conv_fla_input_prep_matches_manual_reference():
     np.testing.assert_allclose(np.asarray(actual_beta), np.asarray(beta))
     np.testing.assert_array_equal(np.asarray(actual_seq_lens), np.asarray(expected_seq_lens))
 
-    normalized_query, normalized_key, *_ = (
-        prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
-            conv_out,
-            a,
-            b,
-            decay,
-            dt_bias,
-            valid_mask,
-            num_key_heads=num_key_heads,
-            num_value_heads=num_value_heads,
-            key_head_dim=key_dim,
-            value_head_dim=value_dim,
-            normalize_qk=True,
-        )
+    normalized_query, normalized_key, *_ = prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
+        conv_out,
+        a,
+        b,
+        decay,
+        dt_bias,
+        valid_mask,
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        key_head_dim=key_dim,
+        value_head_dim=value_dim,
+        normalize_qk=True,
     )
     np.testing.assert_allclose(
         np.asarray(normalized_query),
@@ -240,11 +238,14 @@ def test_prepared_fla_chunk32_reference_matches_post_conv_reference():
         [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1, 1]],
         dtype=jnp.int32,
     )
-    initial_state = jax.random.normal(
-        keys[3],
-        (batch, num_value_heads, value_dim, key_dim),
-        dtype=jnp.float32,
-    ) * 0.01
+    initial_state = (
+        jax.random.normal(
+            keys[3],
+            (batch, num_value_heads, value_dim, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.01
+    )
 
     expected_out, expected_state = gdn_post_conv_prefill_reference_from_decay(
         conv_out,
@@ -261,20 +262,18 @@ def test_prepared_fla_chunk32_reference_matches_post_conv_reference():
         initial_state=initial_state,
         use_qk_l2norm_in_kernel=True,
     )
-    query, key, value, gate, beta, seq_lens = (
-        prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
-            conv_out,
-            a,
-            b,
-            decay,
-            dt_bias,
-            valid_mask,
-            num_key_heads=num_key_heads,
-            num_value_heads=num_value_heads,
-            key_head_dim=key_dim,
-            value_head_dim=value_dim,
-            normalize_qk=True,
-        )
+    query, key, value, gate, beta, seq_lens = prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
+        conv_out,
+        a,
+        b,
+        decay,
+        dt_bias,
+        valid_mask,
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        key_head_dim=key_dim,
+        value_head_dim=value_dim,
+        normalize_qk=True,
     )
     actual_out, actual_state = gdn_fla_prefill_chunk32_fp32_reference(
         query,
@@ -419,11 +418,14 @@ def test_prepared_fla_chunk32_reference_masks_padded_rows():
     value = jax.random.normal(keys[2], (batch, seq_len, num_heads, value_dim), dtype=jnp.float32)
     gate = jax.random.normal(keys[3], (batch, seq_len, num_heads), dtype=jnp.float32) * 0.1
     beta = jax.random.uniform(keys[4], (batch, seq_len, num_heads), dtype=jnp.float32)
-    initial_state = jax.random.normal(
-        keys[5],
-        (batch, num_heads, value_dim, key_dim),
-        dtype=jnp.float32,
-    ) * 0.01
+    initial_state = (
+        jax.random.normal(
+            keys[5],
+            (batch, num_heads, value_dim, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.01
+    )
     seq_lens = jnp.array([5, 8], dtype=jnp.int32)
     valid = jnp.arange(seq_len, dtype=jnp.int32)[None, :] < seq_lens[:, None]
 
@@ -487,11 +489,14 @@ def test_prepared_fla_varlen_reference_matches_rectangular_reference():
     value = jax.random.normal(keys[2], (batch, seq_len, num_heads, value_dim), dtype=jnp.float32)
     gate = jax.random.normal(keys[3], (batch, seq_len, num_heads), dtype=jnp.float32) * 0.1
     beta = jax.random.uniform(keys[4], (batch, seq_len, num_heads), dtype=jnp.float32)
-    initial_state = jax.random.normal(
-        keys[5],
-        (batch, num_heads, value_dim, key_dim),
-        dtype=jnp.float32,
-    ) * 0.01
+    initial_state = (
+        jax.random.normal(
+            keys[5],
+            (batch, num_heads, value_dim, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.01
+    )
 
     valid = jnp.arange(seq_len, dtype=jnp.int32)[None, :] < lengths[:, None]
     query = jnp.where(valid[:, :, None, None], query, 0.0)
@@ -650,6 +655,8 @@ def test_model_post_conv_prefill_reference_matches_default_with_mask():
         rtol=2e-5,
         atol=2e-5,
     )
+
+
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
 def test_model_post_conv_triton_padded_matches_reference():
@@ -778,20 +785,18 @@ def test_model_post_conv_prefill_fallback_without_triton_module(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "nanovllm_jax.kernels.gdn_fla_triton", None)
 
-    query, key, value, gate, beta, seq_lens = (
-        prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
-            conv_out,
-            a,
-            b,
-            decay,
-            dt_bias,
-            valid_token_mask,
-            num_key_heads=num_key_heads,
-            num_value_heads=num_value_heads,
-            key_head_dim=key_dim,
-            value_head_dim=value_dim,
-            normalize_qk=True,
-        )
+    query, key, value, gate, beta, seq_lens = prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
+        conv_out,
+        a,
+        b,
+        decay,
+        dt_bias,
+        valid_token_mask,
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        key_head_dim=key_dim,
+        value_head_dim=value_dim,
+        normalize_qk=True,
     )
     prepared = prepare_gdn_fla_prefill_kernel_inputs(
         query,

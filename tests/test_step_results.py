@@ -1,3 +1,7 @@
+from threading import Lock
+
+import pytest
+
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.sequence import SamplingParams, Sequence
@@ -91,6 +95,9 @@ class _Engine(LLMEngine):
         )
         self.model_runner = runner
         self._next_seq_id = 0
+        self._closed = False
+        self._control_owner = None
+        self._control_lock = Lock()
         self.trace = trace
 
     def commit(self, seqs, schedule_plan, run_result):
@@ -143,6 +150,24 @@ def test_cancel_request_releases_scheduler_and_runner_state():
     assert seq.is_finished
     assert engine.scheduler.is_finished()
     assert engine.model_runner.released == [seq.seq_id]
+
+
+def test_offline_generation_rejects_a_manual_request():
+    config = _config()
+    engine = _Engine(config, _Runner([]))
+    engine.add_request(
+        [1, 2],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+    )
+
+    with pytest.raises(RuntimeError, match="requires an idle engine"):
+        engine.generate(
+            [[3, 4]],
+            SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+            use_tqdm=False,
+        )
+
+    assert len(engine.scheduler.waiting) == 1
 
 
 def test_step_reuses_runner_owned_prefix_state_by_handle():

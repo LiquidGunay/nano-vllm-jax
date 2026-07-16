@@ -44,12 +44,9 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise ValueError("the benchmark requires a prefix miss")
     prompt = workload["prompt_token_ids"]
     if len(prompt) != workload["prompt_tokens"] or any(
-        isinstance(token, bool) or not isinstance(token, int) or token < 0
-        for token in prompt
+        isinstance(token, bool) or not isinstance(token, int) or token < 0 for token in prompt
     ):
-        raise ValueError(
-            "prompt_token_ids must contain prompt_tokens nonnegative integers"
-        )
+        raise ValueError("prompt_token_ids must contain prompt_tokens nonnegative integers")
     speculation = manifest["speculation"]
     if set(speculation) != {"method", "draft_tokens"}:
         raise ValueError("speculation must define method and draft_tokens")
@@ -117,13 +114,9 @@ def _device_used_bytes() -> int:
 
 
 def _git_state() -> dict[str, Any]:
-    commit = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-    ).strip()
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     dirty = bool(
-        subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=ROOT, text=True
-        ).strip()
+        subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip()
     )
     return {"commit": commit, "dirty": dirty}
 
@@ -229,8 +222,7 @@ def invalid_reasons(
             reasons.append("base decode reported speculative work")
             break
         if route == "mtp" and (
-            drafted == 0
-            or (backend_name == "jax" and (verified is None or verified == 0))
+            drafted == 0 or (backend_name == "jax" and (verified is None or verified == 0))
         ):
             reasons.append("MTP decode did not report target-verified drafts")
             break
@@ -276,9 +268,7 @@ def run(
     for _ in range(manifest["measurement"]["repeats"]):
         sample = backend.run_once()
         repeat_exact &= sample["output_token_ids"] == control["output_token_ids"]
-        samples.append(
-            {key: value for key, value in sample.items() if key != "output_token_ids"}
-        )
+        samples.append({key: value for key, value in sample.items() if key != "output_token_ids"})
         _sample_memory(memory)
     route_cache_after = backend.route_cache_fingerprint()
 
@@ -291,9 +281,7 @@ def run(
     median_speed = median(speeds)
     relative_spread = (max(speeds) - min(speeds)) / median_speed
     reference_exact = (
-        None
-        if reference_rows is None
-        else reference_rows == control["output_token_ids"]
+        None if reference_rows is None else reference_rows == control["output_token_ids"]
     )
 
     reasons = invalid_reasons(
@@ -340,9 +328,7 @@ def run(
             "median_ttft_seconds": median(ttfts),
             "median_decode_tokens_per_second": median_speed,
             "relative_spread": relative_spread,
-            "decode_definition": (
-                "tokens after the first / time from first token to completion"
-            ),
+            "decode_definition": ("tokens after the first / time from first token to completion"),
         },
         "warmup": warmup,
         "correctness": {
@@ -366,9 +352,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("backend", choices=("jax", "vllm"))
     parser.add_argument("--route", choices=ROUTES, required=True)
-    parser.add_argument(
-        "--manifest", type=Path, default=ROOT / "benchmarks/benchmark.json"
-    )
+    parser.add_argument("--manifest", type=Path, default=ROOT / "benchmarks/benchmark.json")
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)

@@ -16,18 +16,8 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, replace
 import xxhash
 import numpy as np
-from typing import Any, Dict, List, Set, Deque
 
 from nanovllm_jax.sequence import Sequence
-
-
-@dataclass
-class BlockTables:
-    """Snapshot of Python-owned allocation state."""
-
-    tables: List[List[int]]
-    ref_counts: Any = None
-    hashes: Any = None
 
 
 @dataclass(frozen=True)
@@ -49,7 +39,7 @@ class PrefixCache:
     def __init__(self, state_capacity: int = 0):
         self.entries: OrderedDict[int, PrefixCacheEntry] = OrderedDict()
         self.state_capacity = max(0, int(state_capacity))
-        self._released_state_handles: Deque[int] = deque()
+        self._released_state_handles: deque[int] = deque()
         self.hits = 0
         self.misses = 0
         self.evictions = 0
@@ -81,7 +71,7 @@ class PrefixCache:
         self.entries.move_to_end(entry.prefix_hash)
         return entry
 
-    def make_state_room(self, entries: List[PrefixCacheEntry]) -> None:
+    def make_state_room(self, entries: list[PrefixCacheEntry]) -> None:
         """Make room for new runner-owned state before it is published."""
         new_hashes: set[int] = set()
         for entry in entries:
@@ -121,10 +111,7 @@ class PrefixCache:
 
     @property
     def num_state_entries(self) -> int:
-        return sum(
-            entry.hybrid_state_handle is not None
-            for entry in self.entries.values()
-        )
+        return sum(entry.hybrid_state_handle is not None for entry in self.entries.values())
 
     @property
     def requires_state(self) -> bool:
@@ -158,15 +145,15 @@ class Block:
         self.block_id = block_id
         self.ref_count = 0
         self.hash = -1
-        self.token_ids: List[int] = []
+        self.token_ids: list[int] = []
 
-    def update(self, hash_val: int, token_ids: List[int]):
+    def update(self, hash_val: int, token_ids: list[int]):
         """Update block with hash and token IDs."""
         self.hash = hash_val
         self.token_ids = token_ids
 
-    def reset(self):
-        """Reset block for reuse."""
+    def mark_allocated(self) -> None:
+        """Clear stale metadata and establish one live owner."""
         self.ref_count = 1
         self.hash = -1
         self.token_ids = []
@@ -174,7 +161,7 @@ class Block:
 
 class BlockManager:
     """Manages KV cache block allocation with prefix caching.
-    
+
     Features:
     - Reference counting for block sharing
     - Hash-based prefix caching (content-addressable)
@@ -189,20 +176,20 @@ class BlockManager:
         prefix_state_capacity: int = 0,
     ):
         self.block_size = block_size
-        self.blocks: List[Block] = [Block(i) for i in range(num_blocks)]
+        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.prefix_cache = PrefixCache(prefix_state_capacity)
-        self.free_block_ids: Deque[int] = deque(range(num_blocks))
-        self.used_block_ids: Set[int] = set()
-        self._reserved_by_sequence: Dict[int, int] = {}
+        self.free_block_ids: deque[int] = deque(range(num_blocks))
+        self.used_block_ids: set[int] = set()
+        self._reserved_by_sequence: dict[int, int] = {}
         self.num_reserved_blocks = 0
 
     @classmethod
-    def compute_hash(cls, token_ids: List[int], prefix: int = -1) -> int:
+    def compute_hash(cls, token_ids: list[int], prefix: int = -1) -> int:
         """Compute hash for token sequence."""
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids).tobytes())
+        h.update(np.asarray(token_ids, dtype="<i4").tobytes())
         return h.intdigest()
 
     def _allocate_block(self, block_id: int) -> Block:
@@ -210,7 +197,7 @@ class BlockManager:
         block = self.blocks[block_id]
         assert block.ref_count == 0
         self.prefix_cache.invalidate_block(block_id)
-        block.reset()
+        block.mark_allocated()
         self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
         return self.blocks[block_id]
@@ -224,7 +211,7 @@ class BlockManager:
         self.used_block_ids.add(block_id)
         return block
 
-    def _deallocate_block(self, block_id: int) -> Block:
+    def _deallocate_block(self, block_id: int) -> None:
         """Free a block."""
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
@@ -233,7 +220,7 @@ class BlockManager:
     def _num_blocks(self, seq: Sequence) -> int:
         return (seq.num_tokens + self.block_size - 1) // self.block_size
 
-    def _block_tokens(self, seq: Sequence, block_idx: int) -> List[int]:
+    def _block_tokens(self, seq: Sequence, block_idx: int) -> list[int]:
         start = block_idx * self.block_size
         end = (block_idx + 1) * self.block_size
         return seq.token_ids[start:end]
@@ -279,7 +266,7 @@ class BlockManager:
             block_ids=tuple(seq.block_table[: block_idx + 1]),
         )
 
-    def _cached_block_id(self, h: int, token_ids: List[int]) -> int:
+    def _cached_block_id(self, h: int, token_ids: list[int]) -> int:
         entry = self.prefix_cache.get(h)
         if entry is None:
             return -1
@@ -442,11 +429,7 @@ class BlockManager:
         seq.cached_prefix_hash = None
         seq.cached_prefix_hybrid_seeded = False
         seq.prefix_cache_enabled = bool(use_prefix_cache)
-        cached_tokens, cached_hash = (
-            self.cached_prefix_info(seq)
-            if use_prefix_cache
-            else (0, None)
-        )
+        cached_tokens, cached_hash = self.cached_prefix_info(seq) if use_prefix_cache else (0, None)
         if use_prefix_cache:
             self.prefix_cache.record_access(cached_hash)
         cached_blocks = cached_tokens // self.block_size
@@ -529,22 +512,14 @@ class BlockManager:
     def take_released_prefix_state_handles(self) -> tuple[int, ...]:
         return self.prefix_cache.take_released_state_handles()
 
-    def snapshot(self, seqs: List[Sequence] | None = None) -> BlockTables:
-        """Expose Python-side prefix-cache state without touching JAX arrays."""
-        return BlockTables(
-            tables=[list(seq.block_table) for seq in seqs] if seqs is not None else [],
-            ref_counts=[block.ref_count for block in self.blocks],
-            hashes=[block.hash for block in self.blocks],
-        )
-
-    def may_append(self, seq: Sequence):
+    def may_append(self, seq: Sequence) -> None:
         """Append a token to sequence, allocating new block if needed.
-        
+
         Updates hash for completed blocks.
         """
         self.may_append_slots(seq, 1)
 
-    def may_append_slots(self, seq: Sequence, num_slots: int):
+    def may_append_slots(self, seq: Sequence, num_slots: int) -> None:
         """Reserve block-table entries for a decode lookahead window.
 
         The scheduled decode token is already present in ``seq.token_ids``.
@@ -554,13 +529,15 @@ class BlockManager:
         """
         block_table = seq.block_table
         current_required_blocks = (len(seq) + self.block_size - 1) // self.block_size
-        
+
         if current_required_blocks > len(block_table):
             # Just crossed block boundary - allocate new block
             last_block_idx = len(block_table) - 1
             self._record_completed_block_hash(seq, last_block_idx)
             last_block = self.blocks[block_table[-1]]
-            if last_block.hash == -1 and not seq.block_has_unmaterialized_device_tokens(last_block_idx):
+            if last_block.hash == -1 and not seq.block_has_unmaterialized_device_tokens(
+                last_block_idx
+            ):
                 raise AssertionError("completed block hash was not recorded")
             block_table.append(self._allocate_reserved_block(seq))
 
@@ -587,7 +564,9 @@ class BlockManager:
         block_idx = len(seq) // self.block_size - 1
         self._record_completed_block_hash(seq, block_idx)
 
-    def record_computed_prefix(self, seq: Sequence, upto_tokens: int, *, publish: bool) -> int | None:
+    def record_computed_prefix(
+        self, seq: Sequence, upto_tokens: int, *, publish: bool
+    ) -> int | None:
         """Record completed full prompt blocks through ``upto_tokens``.
 
         Returns the chained hash for ``upto_tokens`` when it is exactly on a

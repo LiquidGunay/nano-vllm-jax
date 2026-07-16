@@ -135,9 +135,7 @@ def cu_seqlens_from_seq_lens(seq_lens: Any) -> jnp.ndarray:
     """Build FlashAttention-style cumulative sequence lengths."""
 
     lengths = _seq_lens_to_tuple(seq_lens)
-    offsets = np.concatenate(
-        [np.zeros((1,), dtype=np.int32), np.cumsum(lengths, dtype=np.int32)]
-    )
+    offsets = np.concatenate([np.zeros((1,), dtype=np.int32), np.cumsum(lengths, dtype=np.int32)])
     return jnp.asarray(offsets, dtype=jnp.int32)
 
 

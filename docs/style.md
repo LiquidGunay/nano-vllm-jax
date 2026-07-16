@@ -59,6 +59,35 @@ point. Do not add another optional `*_host` mirror merely because one caller
 needs a Python value; carry the typed host plan or group host metadata at a
 single boundary.
 
+## State And Mutation
+
+- Constructors establish every canonical field. Production code uses direct
+  access; focused tests use valid fixtures rather than partial `__new__`
+  objects that require defensive branches.
+- Mutate at one commit point. Planning may calculate prospective state and
+  kernels may write invisible speculative slots, but logical lengths, outputs,
+  and selected recurrent state advance together.
+- Admission validates a whole user operation before assigning ids, queueing
+  requests, reserving blocks, or publishing cache metadata.
+- A host mirror exists only when Python makes a decision from it. Name its
+  device owner and the exact event that refreshes or invalidates the mirror.
+
+## Synchronization And Resources
+
+- Device-to-host transfer is an ABI decision. Use an explicit token or result
+  reference; do not identify device values by duck-typing `shape` and `dtype`.
+- Keep values on device through route selection, model execution, and commit
+  when Python does not need their contents. When synchronization is required,
+  make it visible at the result or materialization boundary.
+- Persistent allocations have one owner, a byte-accounting entry, and an
+  explicit release path. Optional caches are bounded and report current versus
+  capacity bytes separately.
+- Background services acquire engine control before starting and release it
+  only after their worker stops. Engine cleanup rejects a live owner and is
+  harmless when repeated.
+- Warmup data obeys physical cache constraints. Unsupported bucket products
+  are skipped with a reason; dummy requests never alias visible KV blocks.
+
 Extract a module only when it owns a coherent concept or transition. A facade
 that forwards calls without reducing concepts makes the reading path longer
 and should not exist.
@@ -105,6 +134,21 @@ Comments explain ownership, shapes, synchronization, or a non-obvious
 invariant. They do not narrate implementation history. A deliberate simple
 algorithm with a real scaling ceiling should name that ceiling and the event
 that would justify replacing it.
+
+## Proof And Repository Hygiene
+
+- Correctness claims name the reference, workload, parity condition, and
+  accelerator. Speed claims additionally name the measured window and prove no
+  measured-phase compilation.
+- Start with the smallest test that owns the invariant, then run the relevant
+  guarded CUDA groups. Microbenchmarks diagnose; only integrated serving runs
+  promote performance changes.
+- Keep raw profiles, model caches, generated results, and temporary manifests
+  under `/mountpoint/.exp`. Commit only contracts, small recorded summaries,
+  tests, and documentation.
+- The repository uses local checks and explicit guarded GPU commands. Do not
+  add CI, compatibility shims, archived implementations, or generated config
+  matrices to compensate for a weak ordinary path.
 
 ## Reading Path
 

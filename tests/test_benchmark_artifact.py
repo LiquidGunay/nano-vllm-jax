@@ -256,10 +256,7 @@ def test_recorded_result_matches_the_manifest():
     results = recorded["results"]
 
     assert recorded["benchmark_id"] == manifest["benchmark_id"]
-    assert (
-        recorded["benchmark_sha256"]
-        == hashlib.sha256(benchmark_path.read_bytes()).hexdigest()
-    )
+    assert recorded["benchmark_sha256"] == hashlib.sha256(benchmark_path.read_bytes()).hexdigest()
     assert recorded["hardware"]["gpu_uuid"].startswith("GPU-")
     expected_reference = {
         "jax_base": None,

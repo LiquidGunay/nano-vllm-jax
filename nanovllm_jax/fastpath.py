@@ -116,9 +116,7 @@ def required_modules(plan: KernelPlan = KERNEL_PLAN) -> tuple[str, ...]:
 
 def missing_required_modules(plan: KernelPlan = KERNEL_PLAN) -> tuple[str, ...]:
     return tuple(
-        module
-        for module in required_modules(plan)
-        if importlib.util.find_spec(module) is None
+        module for module in required_modules(plan) if importlib.util.find_spec(module) is None
     )
 
 
@@ -129,5 +127,5 @@ def validate_runtime_dependencies(plan: KernelPlan = KERNEL_PLAN) -> None:
             "Promoted fast path dependencies are missing: "
             + ", ".join(missing)
             + ". Install the serving extras with "
-            "`pip install -e \".[cuda13,flashinfer-ffi,gdn-fla-triton]\"`."
+            '`pip install -e ".[cuda13,flashinfer-ffi,gdn-fla-triton]"`.'
         )

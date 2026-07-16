@@ -66,13 +66,9 @@ def test_registry_rejects_duplicate_route_kinds():
 
 
 def test_registry_rejects_ambiguous_capabilities():
-    dense = next(
-        spec for spec in ROUTE_SPECS if spec.kind is RouteKind.DECODE_RESIDENT_DENSE
-    )
+    dense = next(spec for spec in ROUTE_SPECS if spec.kind is RouteKind.DECODE_RESIDENT_DENSE)
     ambiguous = tuple(
-        replace(spec, requires=dense.requires)
-        if spec.kind is RouteKind.DECODE_RESIDENT
-        else spec
+        replace(spec, requires=dense.requires) if spec.kind is RouteKind.DECODE_RESIDENT else spec
         for spec in ROUTE_SPECS
     )
 

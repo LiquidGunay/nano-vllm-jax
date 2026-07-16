@@ -1,8 +1,10 @@
+from dataclasses import FrozenInstanceError, replace
+from threading import Lock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from dataclasses import FrozenInstanceError, replace
 
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.model import init_params
@@ -126,6 +128,9 @@ def test_mtp_engine_rejects_incompatible_requests_before_admission():
     engine.config = _runtime(mtp=True)
     engine._next_seq_id = 0
     engine.scheduler = Scheduler(engine.config)
+    engine._closed = False
+    engine._control_owner = None
+    engine._control_lock = Lock()
 
     with pytest.raises(ValueError, match="persistent MTP requires"):
         engine.generate([[1, 2, 3]], use_tqdm=False)
@@ -240,9 +245,7 @@ def _replace_slot_drafts(engine, seq, token_ids):
     slot = runner._hybrid_slots[seq.seq_id]
     runner.mtp_state = MTPState(
         state.cache_storage,
-        state.draft_token_ids.at[slot].set(
-            jnp.asarray(token_ids, dtype=jnp.int32)
-        ),
+        state.draft_token_ids.at[slot].set(jnp.asarray(token_ids, dtype=jnp.int32)),
     )
 
 
@@ -375,7 +378,7 @@ def test_rejected_speculative_kv_is_safe_after_cancellation_and_slot_reuse():
     config = _runtime(mtp=True)
     params = init_params(jax.random.PRNGKey(1), config.model)
     control = _Engine(base_config, params)
-    first_expected = _generate(control, max_tokens=10)
+    _generate(control, max_tokens=10)
     second_expected = _generate(control, max_tokens=8, prompt=(4, 5, 6))
     engine = _Engine(
         config,

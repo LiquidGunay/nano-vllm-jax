@@ -302,35 +302,81 @@ def load_weights_from_hf_streaming(
         layer_type = config.layer_types[i]
 
         if layer_type == "full_attention":
-            layer_params["q_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.q_proj.weight", dtype, transpose=True)
-            layer_params["k_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.k_proj.weight", dtype, transpose=True)
-            layer_params["v_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.v_proj.weight", dtype, transpose=True)
-            layer_params["o_proj"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.o_proj.weight", dtype, transpose=True)
-            layer_params["q_norm"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.q_norm.weight", dtype)
-            layer_params["k_norm"] = _to_jax_weight(reader, f"{layer_prefix}self_attn.k_norm.weight", dtype)
-            layer_params["input_norm"] = _to_jax_weight(reader, f"{layer_prefix}input_layernorm.weight", dtype)
-            layer_params["gate_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.gate_proj.weight", dtype, transpose=True)
-            layer_params["up_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.up_proj.weight", dtype, transpose=True)
-            layer_params["down_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.down_proj.weight", dtype, transpose=True)
-            layer_params["ffn_norm"] = _to_jax_weight(reader, f"{layer_prefix}post_attention_layernorm.weight", dtype)
+            layer_params["q_proj"] = _to_jax_weight(
+                reader, f"{layer_prefix}self_attn.q_proj.weight", dtype, transpose=True
+            )
+            layer_params["k_proj"] = _to_jax_weight(
+                reader, f"{layer_prefix}self_attn.k_proj.weight", dtype, transpose=True
+            )
+            layer_params["v_proj"] = _to_jax_weight(
+                reader, f"{layer_prefix}self_attn.v_proj.weight", dtype, transpose=True
+            )
+            layer_params["o_proj"] = _to_jax_weight(
+                reader, f"{layer_prefix}self_attn.o_proj.weight", dtype, transpose=True
+            )
+            layer_params["q_norm"] = _to_jax_weight(
+                reader, f"{layer_prefix}self_attn.q_norm.weight", dtype
+            )
+            layer_params["k_norm"] = _to_jax_weight(
+                reader, f"{layer_prefix}self_attn.k_norm.weight", dtype
+            )
+            layer_params["input_norm"] = _to_jax_weight(
+                reader, f"{layer_prefix}input_layernorm.weight", dtype
+            )
+            layer_params["gate_proj"] = _to_jax_weight(
+                reader, f"{layer_prefix}mlp.gate_proj.weight", dtype, transpose=True
+            )
+            layer_params["up_proj"] = _to_jax_weight(
+                reader, f"{layer_prefix}mlp.up_proj.weight", dtype, transpose=True
+            )
+            layer_params["down_proj"] = _to_jax_weight(
+                reader, f"{layer_prefix}mlp.down_proj.weight", dtype, transpose=True
+            )
+            layer_params["ffn_norm"] = _to_jax_weight(
+                reader, f"{layer_prefix}post_attention_layernorm.weight", dtype
+            )
             _add_full_attention_decode_packed_qkv(layer_params)
             _add_mlp_packed_gate_up(layer_params)
         else:
             linear_prefix = f"{layer_prefix}linear_attn."
-            layer_params["in_proj_qkv"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_qkv.weight", dtype, transpose=True)
-            layer_params["in_proj_a"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_a.weight", dtype, transpose=True)
-            layer_params["in_proj_b"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_b.weight", dtype, transpose=True)
-            layer_params["in_proj_z"] = _to_jax_weight(reader, f"{linear_prefix}in_proj_z.weight", dtype, transpose=True)
-            layer_params["conv1d_weight"] = _to_jax_weight(reader, f"{linear_prefix}conv1d.weight", dtype, squeeze_axis=1)
+            layer_params["in_proj_qkv"] = _to_jax_weight(
+                reader, f"{linear_prefix}in_proj_qkv.weight", dtype, transpose=True
+            )
+            layer_params["in_proj_a"] = _to_jax_weight(
+                reader, f"{linear_prefix}in_proj_a.weight", dtype, transpose=True
+            )
+            layer_params["in_proj_b"] = _to_jax_weight(
+                reader, f"{linear_prefix}in_proj_b.weight", dtype, transpose=True
+            )
+            layer_params["in_proj_z"] = _to_jax_weight(
+                reader, f"{linear_prefix}in_proj_z.weight", dtype, transpose=True
+            )
+            layer_params["conv1d_weight"] = _to_jax_weight(
+                reader, f"{linear_prefix}conv1d.weight", dtype, squeeze_axis=1
+            )
             layer_params["dt_bias"] = _to_jax_weight(reader, f"{linear_prefix}dt_bias", dtype)
             layer_params["A"] = _to_jax_weight(reader, f"{linear_prefix}A_log", dtype, exp=True)
-            layer_params["norm_weight"] = _to_jax_weight(reader, f"{linear_prefix}norm.weight", dtype)
-            layer_params["out_proj"] = _to_jax_weight(reader, f"{linear_prefix}out_proj.weight", dtype, transpose=True)
-            layer_params["input_norm"] = _to_jax_weight(reader, f"{layer_prefix}input_layernorm.weight", dtype)
-            layer_params["ffn_norm"] = _to_jax_weight(reader, f"{layer_prefix}post_attention_layernorm.weight", dtype)
-            layer_params["gate_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.gate_proj.weight", dtype, transpose=True)
-            layer_params["up_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.up_proj.weight", dtype, transpose=True)
-            layer_params["down_proj"] = _to_jax_weight(reader, f"{layer_prefix}mlp.down_proj.weight", dtype, transpose=True)
+            layer_params["norm_weight"] = _to_jax_weight(
+                reader, f"{linear_prefix}norm.weight", dtype
+            )
+            layer_params["out_proj"] = _to_jax_weight(
+                reader, f"{linear_prefix}out_proj.weight", dtype, transpose=True
+            )
+            layer_params["input_norm"] = _to_jax_weight(
+                reader, f"{layer_prefix}input_layernorm.weight", dtype
+            )
+            layer_params["ffn_norm"] = _to_jax_weight(
+                reader, f"{layer_prefix}post_attention_layernorm.weight", dtype
+            )
+            layer_params["gate_proj"] = _to_jax_weight(
+                reader, f"{layer_prefix}mlp.gate_proj.weight", dtype, transpose=True
+            )
+            layer_params["up_proj"] = _to_jax_weight(
+                reader, f"{layer_prefix}mlp.up_proj.weight", dtype, transpose=True
+            )
+            layer_params["down_proj"] = _to_jax_weight(
+                reader, f"{layer_prefix}mlp.down_proj.weight", dtype, transpose=True
+            )
             _add_gdn_decode_packed_in_proj(layer_params)
             _add_mlp_packed_gate_up(layer_params)
 
@@ -498,7 +544,5 @@ def load_mtp_weights_from_hf_streaming(
     }
     for name, shape in expected.items():
         if tuple(actual[name]) != shape:
-            raise ValueError(
-                f"MTP {name} has shape {tuple(actual[name])}, expected {shape}"
-            )
+            raise ValueError(f"MTP {name} has shape {tuple(actual[name])}, expected {shape}")
     return params

@@ -1,11 +1,11 @@
 """Request lifecycle engine for Qwen 3.5 JAX serving."""
 
-import atexit
+from dataclasses import replace
 from numbers import Integral
 from pathlib import Path
+from threading import Lock
 from time import perf_counter
-from typing import Any, Dict, List, Union
-from dataclasses import replace
+from typing import Any
 
 import jax
 
@@ -34,6 +34,7 @@ from nanovllm_jax.step import (
 
 try:
     from transformers import AutoTokenizer
+
     HAS_TRANSFORMERS = True
 except ImportError:
     HAS_TRANSFORMERS = False
@@ -111,9 +112,7 @@ class LLMEngine:
         )
         requested_kv_blocks = self.config.capacity.num_kvcache_blocks
         cache_layers = self.config.model.num_hidden_layers + (
-            self.config.model.mtp_num_hidden_layers
-            if self.config.drafter is not None
-            else 0
+            self.config.model.mtp_num_hidden_layers if self.config.drafter is not None else 0
         )
         kv_spec = resolve_kv_cache_spec(
             KVCacheSpec(
@@ -150,16 +149,18 @@ class LLMEngine:
         if not HAS_TRANSFORMERS:
             raise ImportError("transformers is required; install it with the package dependencies")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path)
         eos_token_ids = tuple(
-            sorted({
-                int(token_id)
-                for token_id in (
-                    *self.config.capacity.eos_token_ids,
-                    self.tokenizer.eos_token_id,
-                )
-                if token_id is not None
-            })
+            sorted(
+                {
+                    int(token_id)
+                    for token_id in (
+                        *self.config.capacity.eos_token_ids,
+                        self.tokenizer.eos_token_id,
+                    )
+                    if token_id is not None
+                }
+            )
         )
         self.config = replace(
             self.config,
@@ -184,11 +185,7 @@ class LLMEngine:
         print("✓ Using pretrained weights")
 
         self.scheduler = Scheduler(self.config)
-        runner_kwargs = (
-            {"mtp_params": self.mtp_params}
-            if self.mtp_params is not None
-            else {}
-        )
+        runner_kwargs = {"mtp_params": self.mtp_params} if self.mtp_params is not None else {}
         self.model_runner = ModelRunner(self.config, self.params, **runner_kwargs)
         self.startup_device_budget_bytes = {
             "parameters": _tree_nbytes(self.params),
@@ -198,7 +195,71 @@ class LLMEngine:
         memory_mib = sum(self.startup_device_budget_bytes.values()) / (1024 * 1024)
         print(f"Startup device budget: {memory_mib:.1f} MiB")
         self._next_seq_id = 0
-        atexit.register(self.exit)
+        self._closed = False
+        self._control_owner: object | None = None
+        self._control_lock = Lock()
+
+    def __enter__(self) -> "LLMEngine":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+    def claim_control(self, owner: object) -> None:
+        """Give one offline call or service exclusive stepping ownership."""
+
+        with self._control_lock:
+            if self._closed:
+                raise RuntimeError("engine is closed")
+            if self._control_owner is not None:
+                raise RuntimeError("engine already has an active control owner")
+            if not self.scheduler.is_finished():
+                raise RuntimeError(
+                    "engine control requires idle request queues; finish or cancel "
+                    "manually managed requests first"
+                )
+            self._control_owner = owner
+
+    def release_control(self, owner: object) -> None:
+        with self._control_lock:
+            if self._control_owner is owner:
+                self._control_owner = None
+            elif self._control_owner is not None:
+                raise RuntimeError("engine control may be released only by its owner")
+
+    def _check_control_locked(self, owner: object | None) -> None:
+        if self._closed:
+            raise RuntimeError("engine is closed")
+        if self._control_owner is not None and self._control_owner is not owner:
+            raise RuntimeError("engine mutation is reserved for its active control owner")
+
+    def close(self) -> None:
+        """Release model-owned accelerator state; repeated calls are harmless."""
+
+        with self._control_lock:
+            if self._closed:
+                return
+            if self._control_owner is not None:
+                raise RuntimeError("stop the active engine owner before closing")
+            self._closed = True
+
+        seqs = list(self.scheduler.waiting) + list(self.scheduler.running)
+        for seq in seqs:
+            self.scheduler.release(seq)
+            seq.status = SequenceStatus.FINISHED
+        if seqs:
+            self.model_runner.release([seq.seq_id for seq in seqs])
+        self._release_invalidated_prefix_states()
+
+        del self.model_runner
+        del self.params
+        del self.mtp_params
+        del self.tokenizer
+
+    def exit(self) -> None:
+        """Backward-compatible spelling for :meth:`close`."""
+
+        self.close()
 
     def warmup_compilation(
         self,
@@ -212,9 +273,7 @@ class LLMEngine:
     ) -> dict[str, object]:
         """Compile configured serving buckets without using live request data."""
         if not self.scheduler.is_pristine():
-            raise RuntimeError(
-                "warmup_compilation must run before requests or prefix-cache state"
-            )
+            raise RuntimeError("warmup_compilation must run before requests or prefix-cache state")
         if max_prefill_len is None:
             max_prefill_len = max(
                 self.config.compile.prefill_token_buckets
@@ -222,12 +281,9 @@ class LLMEngine:
             )
         if max_batch is None:
             max_batch = max(
-                self.config.compile.batch_size_buckets
-                or (self.config.capacity.max_num_seqs,)
+                self.config.compile.batch_size_buckets or (self.config.capacity.max_num_seqs,)
             )
-        include_sampled_routes = bool(
-            include_sampled_routes and self.config.drafter is None
-        )
+        include_sampled_routes = bool(include_sampled_routes and self.config.drafter is None)
 
         started = perf_counter()
         runner_summary = self.model_runner.warmup_compilation(
@@ -241,22 +297,25 @@ class LLMEngine:
         elapsed = perf_counter() - started
         return {"enabled": True, "seconds": elapsed, "runner": runner_summary}
 
-    def exit(self):
-        del self.model_runner
-
     def add_request(
         self,
-        prompt: Union[str, List[int]],
+        prompt: str | list[int],
         sampling_params: SamplingParams,
+        *,
+        owner: object | None = None,
     ) -> Sequence:
-        seq = self._prepare_sequence(prompt, sampling_params, self._next_seq_id)
-        self.scheduler.add_many([seq])
-        self._next_seq_id += 1
-        return seq
+        """Admit one manually stepped request, respecting any active lease."""
+
+        with self._control_lock:
+            self._check_control_locked(owner)
+            seq = self._prepare_sequence(prompt, sampling_params, self._next_seq_id)
+            self.scheduler.add_many([seq])
+            self._next_seq_id += 1
+            return seq
 
     def _prepare_sequence(
         self,
-        prompt: Union[str, List[int]],
+        prompt: str | list[int],
         sampling_params: SamplingParams,
         seq_id: int,
         *,
@@ -265,7 +324,7 @@ class LLMEngine:
         if not isinstance(sampling_params, SamplingParams):
             raise TypeError("sampling_params must be a SamplingParams instance")
         self._validate_sampling_params(sampling_params)
-        token_ids = self._tokenize(prompt) if isinstance(prompt, str) else prompt
+        token_ids = self.tokenize(prompt) if isinstance(prompt, str) else prompt
         token_ids = self.validate_token_ids(token_ids, request_index=request_index)
         return Sequence(
             token_ids,
@@ -322,15 +381,13 @@ class LLMEngine:
         if self.config.drafter is not None and (
             sampling_params.temperature != 0 or not sampling_params.ignore_eos
         ):
-            raise ValueError(
-                "persistent MTP requires temperature=0 and ignore_eos=True"
-            )
+            raise ValueError("persistent MTP requires temperature=0 and ignore_eos=True")
 
     def _prepare_generation_sequences(
         self,
-        prompts: List[Union[str, List[int]]],
-        sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
-    ) -> List[Sequence]:
+        prompts: list[str | list[int]],
+        sampling_params: SamplingParams | list[SamplingParams] = None,
+    ) -> list[Sequence]:
         if not isinstance(prompts, list) or not prompts:
             raise ValueError("prompts must be a non-empty list")
         if sampling_params is None:
@@ -356,7 +413,7 @@ class LLMEngine:
 
     def commit(
         self,
-        seqs: List[Sequence],
+        seqs: list[Sequence],
         schedule_plan: SchedulePlan,
         run_result: RunResult,
     ) -> StepResult:
@@ -365,9 +422,7 @@ class LLMEngine:
             raise ValueError("run result rows must align with scheduled sequences")
 
         prefill_chunk_lengths = (
-            schedule_plan.prefill_chunk_lengths
-            if schedule_plan.is_prefill
-            else (0,) * len(seqs)
+            schedule_plan.prefill_chunk_lengths if schedule_plan.is_prefill else (0,) * len(seqs)
         )
         if len(prefill_chunk_lengths) != len(seqs):
             raise ValueError("prefill chunk lengths must align with scheduled sequences")
@@ -387,9 +442,7 @@ class LLMEngine:
 
             for index, token in enumerate(tokens):
                 deferred = (
-                    self.scheduler.device_token_carry
-                    and seq.ignore_eos
-                    and is_device_token(token)
+                    self.scheduler.device_token_carry and seq.ignore_eos and is_device_token(token)
                 )
                 if deferred:
                     completion_index = seq.output.append_device(token)
@@ -430,58 +483,86 @@ class LLMEngine:
         if handles:
             self.model_runner.release_prefix_hybrid_states(handles)
 
-    def step(self) -> StepResult:
-        seqs, schedule_plan = self.scheduler.schedule()
-        prefill_chunk_lengths = (
-            list(schedule_plan.prefill_chunk_lengths)
-            if schedule_plan.is_prefill
-            else None
-        )
+    def step(self, *, owner: object | None = None) -> StepResult:
+        """Advance all scheduled work once for the manual caller or lease owner."""
 
-        self._release_invalidated_prefix_states()
-        self.model_runner.install_cached_prefix_hybrid_states(
-            seqs,
-            self.scheduler.cached_prefix_entries(seqs),
-        )
-
-        device_batch = self.model_runner.materialize(schedule_plan)
-        run_result = self.model_runner.execute(seqs, device_batch)
-
-        if schedule_plan.is_prefill:
-            pending = self.scheduler.record_computed_prefixes(
-                seqs,
-                prefill_chunk_lengths or [],
+        with self._control_lock:
+            self._check_control_locked(owner)
+            seqs, schedule_plan = self.scheduler.schedule()
+            prefill_chunk_lengths = (
+                list(schedule_plan.prefill_chunk_lengths) if schedule_plan.is_prefill else None
             )
+
             self._release_invalidated_prefix_states()
-            if pending:
-                handles = self.model_runner.cache_prefix_hybrid_states(
-                    pending,
+            self.model_runner.install_cached_prefix_hybrid_states(
+                seqs,
+                self.scheduler.cached_prefix_entries(seqs),
+            )
+
+            device_batch = self.model_runner.materialize(schedule_plan)
+            run_result = self.model_runner.execute(seqs, device_batch)
+
+            if schedule_plan.is_prefill:
+                pending = self.scheduler.record_computed_prefixes(
+                    seqs,
+                    prefill_chunk_lengths or [],
                 )
-                self.scheduler.publish_prefix_states(pending, handles)
-        step_result = self.commit(seqs, schedule_plan, run_result)
-        finished_seq_ids = [request.seq_id for request in step_result.finished]
-        if finished_seq_ids:
-            self.model_runner.release(finished_seq_ids)
-        return step_result
+                self._release_invalidated_prefix_states()
+                if pending:
+                    handles = self.model_runner.cache_prefix_hybrid_states(
+                        pending,
+                    )
+                    self.scheduler.publish_prefix_states(pending, handles)
+            step_result = self.commit(seqs, schedule_plan, run_result)
+            finished_seq_ids = [request.seq_id for request in step_result.finished]
+            if finished_seq_ids:
+                self.model_runner.release(finished_seq_ids)
+            return step_result
 
     def is_finished(self) -> bool:
         return self.scheduler.is_finished()
 
-    def cancel_request(self, seq: Sequence) -> bool:
-        """Commit cancellation and release all state owned by one request."""
-        if seq.is_finished:
-            return False
-        self.scheduler.release(seq)
-        self.model_runner.release([seq.seq_id])
-        seq.status = SequenceStatus.FINISHED
-        return True
+    def cancel_request(self, seq: Sequence, *, owner: object | None = None) -> bool:
+        """Cancel one request for the manual caller or current lease owner."""
+        with self._control_lock:
+            self._check_control_locked(owner)
+            if seq.is_finished:
+                return False
+            self.scheduler.release(seq)
+            self.model_runner.release([seq.seq_id])
+            seq.status = SequenceStatus.FINISHED
+            return True
 
     def generate(
         self,
-        prompts: List[Union[str, List[int]]],
-        sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
+        prompts: list[str | list[int]],
+        sampling_params: SamplingParams | list[SamplingParams] = None,
         use_tqdm: bool = True,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
+        """Own an idle engine until one atomic request batch finishes."""
+
+        owner = object()
+        self.claim_control(owner)
+        complete = False
+        started = False
+        try:
+            started = True
+            results = self._generate(prompts, sampling_params, use_tqdm, owner=owner)
+            complete = True
+            return results
+        finally:
+            if started and not complete:
+                self._cancel_all_requests(owner=owner)
+            self.release_control(owner)
+
+    def _generate(
+        self,
+        prompts: list[str | list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        use_tqdm: bool,
+        *,
+        owner: object,
+    ) -> list[dict[str, Any]]:
         seqs = self._prepare_generation_sequences(prompts, sampling_params)
         seqs_by_id = {seq.seq_id: seq for seq in seqs}
         if use_tqdm:
@@ -500,7 +581,7 @@ class LLMEngine:
 
         while not self.is_finished():
             t = perf_counter()
-            step_result = self.step()
+            step_result = self.step(owner=owner)
 
             if use_tqdm:
                 if step_result.phase == "prefill":
@@ -508,15 +589,14 @@ class LLMEngine:
                 else:
                     decode_throughput = step_result.num_emitted_tokens / (perf_counter() - t)
 
-                pbar.set_postfix({
-                    "Prefill": f"{int(prefill_throughput)} tok/s",
-                    "Decode": f"{int(decode_throughput)} tok/s",
-                })
+                pbar.set_postfix(
+                    {
+                        "Prefill": f"{int(prefill_throughput)} tok/s",
+                        "Decode": f"{int(decode_throughput)} tok/s",
+                    }
+                )
 
-            finished_seqs = [
-                seqs_by_id[request.seq_id]
-                for request in step_result.finished
-            ]
+            finished_seqs = [seqs_by_id[request.seq_id] for request in step_result.finished]
             token_rows = OutputBuffer.materialize_many(seq.output for seq in finished_seqs)
             for request, seq, token_ids in zip(step_result.finished, finished_seqs, token_rows):
                 outputs[seq.seq_id] = token_ids
@@ -527,7 +607,7 @@ class LLMEngine:
         ordered_ids = sorted(outputs)
         results = [
             {
-                "text": self._detokenize(outputs[seq_id]),
+                "text": self.detokenize(outputs[seq_id]),
                 "token_ids": outputs[seq_id],
                 "finish_reason": finish_reasons[seq_id],
             }
@@ -541,10 +621,36 @@ class LLMEngine:
 
     def iter_generate(
         self,
-        prompts: List[Union[str, List[int]]],
-        sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
+        prompts: list[str | list[int]],
+        sampling_params: SamplingParams | list[SamplingParams] = None,
         *,
         include_text: bool = True,
+    ):
+        """Stream one atomic batch while holding exclusive engine control."""
+
+        owner = object()
+        self.claim_control(owner)
+        started = False
+        try:
+            started = True
+            yield from self._iter_generate(
+                prompts,
+                sampling_params,
+                include_text=include_text,
+                owner=owner,
+            )
+        finally:
+            if started:
+                self._cancel_all_requests(owner=owner)
+            self.release_control(owner)
+
+    def _iter_generate(
+        self,
+        prompts: list[str | list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        *,
+        include_text: bool,
+        owner: object,
     ):
         seqs = self._prepare_generation_sequences(prompts, sampling_params)
         seq_to_request = {seq.seq_id: index for index, seq in enumerate(seqs)}
@@ -553,7 +659,7 @@ class LLMEngine:
 
         while not self.is_finished():
             step_start = perf_counter()
-            step_result = self.step()
+            step_result = self.step(owner=owner)
             step_end = perf_counter()
             event_buffers = {
                 event.seq_id: seqs_by_id[event.seq_id].output
@@ -579,15 +685,13 @@ class LLMEngine:
                     "verified_target_tokens": (
                         step_result.verified_target_tokens if owns_step_metrics else 0
                     ),
-                    "draft_tokens": (
-                        step_result.draft_tokens if owns_step_metrics else 0
-                    ),
+                    "draft_tokens": (step_result.draft_tokens if owns_step_metrics else 0),
                     "accepted_draft_tokens": (
                         step_result.accepted_draft_tokens if owns_step_metrics else 0
                     ),
                 }
                 if include_text:
-                    token_event["text"] = self._detokenize([token_id])
+                    token_event["text"] = self.detokenize([token_id])
                 yield token_event
             for request in step_result.finished:
                 seq = seqs_by_id[request.seq_id]
@@ -608,18 +712,23 @@ class LLMEngine:
             "results": [
                 {
                     "request_index": index,
-                    "text": self._detokenize(seq.output.token_ids()) if include_text else "",
+                    "text": self.detokenize(seq.output.token_ids()) if include_text else "",
                     "token_ids": seq.output.token_ids(),
                 }
                 for index, seq in enumerate(seqs)
             ],
         }
 
-    def _tokenize(self, text: str) -> List[int]:
+    def _cancel_all_requests(self, *, owner: object) -> None:
+        seqs = list(self.scheduler.waiting) + list(self.scheduler.running)
+        for seq in seqs:
+            self.cancel_request(seq, owner=owner)
+
+    def tokenize(self, text: str) -> list[int]:
         """Tokenize text using Qwen tokenizer."""
         return self.tokenizer.encode(text, add_special_tokens=False)
 
-    def _detokenize(self, token_ids: List[int]) -> str:
+    def detokenize(self, token_ids: list[int]) -> str:
         """Detokenize token IDs using Qwen tokenizer."""
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 

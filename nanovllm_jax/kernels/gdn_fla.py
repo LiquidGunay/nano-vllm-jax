@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from nanovllm_jax.kernels import KernelUnavailable, missing_modules, require_modules
+from nanovllm_jax.kernels import missing_modules, require_modules
 
 
 def availability() -> dict[str, object]:
@@ -151,10 +151,7 @@ def _normalize_gdn_fla_prefill_qkv_dtype(dtype: Any) -> jnp.dtype:
             return jnp.dtype(jnp.float32)
     actual = jnp.dtype(dtype)
     if actual not in _GDN_QKV_PREFILL_DTYPES:
-        raise ValueError(
-            "qkv_dtype must be "
-            f"{_dtype_names(_GDN_QKV_PREFILL_DTYPES)}, got {actual}"
-        )
+        raise ValueError(f"qkv_dtype must be {_dtype_names(_GDN_QKV_PREFILL_DTYPES)}, got {actual}")
     return actual
 
 
@@ -305,13 +302,25 @@ def gdn_segmented_prefill_chunk32(
         )
     except (ImportError, ModuleNotFoundError):
         return gdn_segmented_prefill_chunk32_reference(
-            query, key, value, beta, gate, cu_seqlens, initial_state,
+            query,
+            key,
+            value,
+            beta,
+            gate,
+            cu_seqlens,
+            initial_state,
             chunk_size=chunk_size,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             reference_seq_len=reference_seq_len,
         )
     return gdn_fla_chunk_gated_delta_rule_packed_triton(
-        query, key, value, gate, beta, cu_seqlens, initial_state,
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        cu_seqlens,
+        initial_state,
         chunk_size=chunk_size,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
@@ -512,7 +521,9 @@ def gdn_packed_decode_reference_from_decay(
     key = key.astype(jnp.float32)
     value = value.astype(jnp.float32)
 
-    gate = -decay.astype(jnp.float32)[None, :] * jax.nn.softplus(a.astype(jnp.float32) + dt_bias[None, :])
+    gate = -decay.astype(jnp.float32)[None, :] * jax.nn.softplus(
+        a.astype(jnp.float32) + dt_bias[None, :]
+    )
     beta = jax.nn.sigmoid(b).astype(jnp.float32)
     output, new_state = jax_recurrent_gated_delta_rule(
         query,
@@ -563,9 +574,7 @@ def prepare_gdn_post_conv_prefill_fla_inputs_from_decay(
     value_dim = num_value_heads * value_head_dim
     expected_conv_dim = 2 * key_dim + value_dim
     if conv_dim != expected_conv_dim:
-        raise ValueError(
-            f"conv_out last dimension must be {expected_conv_dim}, got {conv_dim}"
-        )
+        raise ValueError(f"conv_out last dimension must be {expected_conv_dim}, got {conv_dim}")
     if a.shape != (batch, seq_len, num_value_heads):
         raise ValueError("a must have shape [batch, time, value_heads]")
     if b.shape != (batch, seq_len, num_value_heads):
@@ -752,9 +761,7 @@ def cu_seqlens_from_seq_lens(seq_lens: Any) -> jnp.ndarray:
     """Build FlashAttention-style cumulative sequence lengths."""
 
     lengths = _seq_lens_to_tuple(seq_lens)
-    offsets = np.concatenate(
-        [np.zeros((1,), dtype=np.int32), np.cumsum(lengths, dtype=np.int32)]
-    )
+    offsets = np.concatenate([np.zeros((1,), dtype=np.int32), np.cumsum(lengths, dtype=np.int32)])
     return jnp.asarray(offsets, dtype=jnp.int32)
 
 
@@ -905,9 +912,7 @@ def gdn_fla_chunk_scaled_dot_kkt_packed_reference(
             chunk_matrix = (chunk_key * chunk_beta[:, None]) @ chunk_key.T
             if gate_cumsum is not None:
                 chunk_gate = gate_cumsum[chunk_start:chunk_end, head].astype(jnp.float32)
-                chunk_matrix = chunk_matrix * jnp.exp(
-                    chunk_gate[:, None] - chunk_gate[None, :]
-                )
+                chunk_matrix = chunk_matrix * jnp.exp(chunk_gate[:, None] - chunk_gate[None, :])
             chunk_matrix = chunk_matrix * local_mask
             output = output.at[chunk_start:chunk_end, head, :length].set(chunk_matrix)
     return output
@@ -952,9 +957,7 @@ def gdn_fla_solve_tril_packed_reference(
         length = chunk_end - chunk_start
         identity = jnp.eye(length, dtype=jnp.float32)
         for head in range(attention_matrix.shape[1]):
-            matrix = attention_matrix[chunk_start:chunk_end, head, :length].astype(
-                jnp.float32
-            )
+            matrix = attention_matrix[chunk_start:chunk_end, head, :length].astype(jnp.float32)
             inverse = jnp.linalg.inv(identity + matrix)
             output = output.at[chunk_start:chunk_end, head, :length].set(inverse)
     return output
@@ -1158,9 +1161,7 @@ def gdn_fla_recompute_w_u_packed_reference(
     if gate_cumsum.shape != beta.shape:
         raise ValueError("gate_cumsum must have the same shape as beta")
     if attention_inverse.ndim != 3:
-        raise ValueError(
-            "attention_inverse must have shape [nnz_tokens, output_heads, chunk_size]"
-        )
+        raise ValueError("attention_inverse must have shape [nnz_tokens, output_heads, chunk_size]")
     if key.shape[0] != value.shape[0] or key.shape[0] != beta.shape[0]:
         raise ValueError("key, value, and beta token counts must match")
     if value.shape[:2] != beta.shape:
@@ -1200,9 +1201,7 @@ def gdn_fla_recompute_w_u_packed_reference(
         length = chunk_end - chunk_start
         for head in range(output_heads):
             key_head = head // head_group
-            matrix = attention_inverse[chunk_start:chunk_end, head, :length].astype(
-                jnp.float32
-            )
+            matrix = attention_inverse[chunk_start:chunk_end, head, :length].astype(jnp.float32)
             chunk_beta = beta[chunk_start:chunk_end, head].astype(jnp.float32)
             chunk_gate = gate_cumsum[chunk_start:chunk_end, head].astype(jnp.float32)
             chunk_value = value[chunk_start:chunk_end, head, :].astype(jnp.float32)
@@ -1217,18 +1216,12 @@ def gdn_fla_recompute_w_u_packed_reference(
                     output_dtype=stage_output_dtype,
                 )
                 weighted_key = _vllm_like_quantize_stage(
-                    chunk_key
-                    * chunk_beta[:, None]
-                    * jnp.exp(chunk_gate)[:, None],
+                    chunk_key * chunk_beta[:, None] * jnp.exp(chunk_gate)[:, None],
                     output_dtype=stage_output_dtype,
                 )
             else:
                 weighted_value = chunk_value * chunk_beta[:, None]
-                weighted_key = (
-                    chunk_key
-                    * chunk_beta[:, None]
-                    * jnp.exp(chunk_gate)[:, None]
-                )
+                weighted_key = chunk_key * chunk_beta[:, None] * jnp.exp(chunk_gate)[:, None]
             u_chunk = matrix @ weighted_value
             w_chunk = matrix @ weighted_key
             if vllm_like:
@@ -1316,7 +1309,9 @@ def gdn_fla_chunk_delta_h_packed_reference(
         state = jnp.zeros((batch, output_heads, value_dim, key_dim), dtype=jnp.float32)
     else:
         if initial_state.shape != (batch, output_heads, value_dim, key_dim):
-            raise ValueError("initial_state must have shape [batch, output_heads, value_dim, key_dim]")
+            raise ValueError(
+                "initial_state must have shape [batch, output_heads, value_dim, key_dim]"
+            )
         state = initial_state.astype(jnp.float32)
 
     head_group = output_heads // key_heads
@@ -1383,9 +1378,7 @@ def gdn_fla_chunk_delta_h_packed_reference(
                     )
                 update_delta = delta
                 if gate_cumsum is not None:
-                    chunk_gate = gate_cumsum[chunk_start:chunk_end, head].astype(
-                        jnp.float32
-                    )
+                    chunk_gate = gate_cumsum[chunk_start:chunk_end, head].astype(jnp.float32)
                     last_gate = chunk_gate[length - 1]
                     update_delta = delta * jnp.exp(last_gate - chunk_gate)[:, None]
                     updated_state = head_state_for_dot * jnp.exp(last_gate)
@@ -1513,13 +1506,9 @@ def gdn_fla_chunk_fwd_o_packed_reference(
             state_out = chunk_query @ state.T
             attention = chunk_query @ chunk_key.T
             if gate_cumsum is not None:
-                chunk_gate = gate_cumsum[chunk_start:chunk_end, head].astype(
-                    jnp.float32
-                )
+                chunk_gate = gate_cumsum[chunk_start:chunk_end, head].astype(jnp.float32)
                 state_out = state_out * jnp.exp(chunk_gate)[:, None]
-                attention = attention * jnp.exp(
-                    chunk_gate[:, None] - chunk_gate[None, :]
-                )
+                attention = attention * jnp.exp(chunk_gate[:, None] - chunk_gate[None, :])
             attention = attention * causal
             if vllm_like:
                 attention = _vllm_like_quantize_stage(

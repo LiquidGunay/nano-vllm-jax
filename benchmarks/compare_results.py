@@ -36,11 +36,7 @@ def compare_results(
         "speculation",
         "capacity",
     )
-    if any(
-        result[field] != reference[field]
-        for result in results.values()
-        for field in fields
-    ):
+    if any(result[field] != reference[field] for result in results.values() for field in fields):
         raise ValueError("result benchmark contracts differ")
 
     hashes = {result["correctness"]["output_sha256"] for result in results.values()}

@@ -1,5 +1,9 @@
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -9,6 +13,7 @@ from nanovllm_jax.config import (
     ModelConfig,
     ModelSpec,
     RuntimeSpec,
+    ServerSettings,
     WarmupConfig,
     load_engine_config,
 )
@@ -24,9 +29,85 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _write_checkpoint(path: Path, text: dict) -> None:
-    (path / "config.json").write_text(
-        json.dumps({"model_type": "qwen3_5", "text_config": text})
+    (path / "config.json").write_text(json.dumps({"model_type": "qwen3_5", "text_config": text}))
+
+
+def test_server_import_has_no_jax_runtime_side_effects():
+    env = dict(os.environ)
+    for name in (
+        "JAX_PLATFORMS",
+        "JAX_COMPILATION_CACHE_DIR",
+        "NANO_VLLM_JAX_COMPILE_CACHE_DIR",
+    ):
+        env.pop(name, None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, os, sys, server; "
+            "values = {k: os.environ.get(k) for k in "
+            "('JAX_PLATFORMS', 'JAX_COMPILATION_CACHE_DIR', "
+            "'NANO_VLLM_JAX_COMPILE_CACHE_DIR')}; "
+            "values['jax_imported'] = 'jax' in sys.modules; "
+            "values['engine_imported'] = 'nanovllm_jax.engine' in sys.modules; "
+            "print(json.dumps(values))",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
     )
+
+    assert json.loads(result.stdout) == {
+        "JAX_PLATFORMS": None,
+        "JAX_COMPILATION_CACHE_DIR": None,
+        "NANO_VLLM_JAX_COMPILE_CACHE_DIR": None,
+        "jax_imported": False,
+        "engine_imported": False,
+    }
+
+
+def test_server_app_factory_registers_only_transport_routes():
+    import server
+
+    application = server.create_app(ServerSettings(max_tokens_default=17))
+
+    assert application.config["MAX_TOKENS_DEFAULT"] == 17
+    assert {rule.rule for rule in application.url_map.iter_rules()} == {
+        "/static/<path:filename>",
+        "/health",
+        "/v1/generate",
+        "/v1/generate_stream",
+        "/v1/completions",
+    }
+
+
+def test_server_shutdown_stops_service_before_engine(monkeypatch):
+    import server
+
+    events = []
+    old_service = SimpleNamespace(stop=lambda: events.append("service"))
+    old_engine = SimpleNamespace(close=lambda: events.append("engine"))
+    monkeypatch.setattr(server, "service", old_service)
+    monkeypatch.setattr(server, "engine", old_engine)
+
+    server.shutdown_engine()
+
+    assert events == ["service", "engine"]
+    assert server.service is None
+    assert server.engine is None
+
+
+def test_completion_ids_are_unique():
+    import server
+
+    results = [{"text": "x", "token_ids": [1], "finish_reason": "length"}]
+    first = server._completion_payload(results, [1], 0.1)
+    second = server._completion_payload(results, [1], 0.1)
+
+    assert first["id"].startswith("cmpl-")
+    assert first["id"] != second["id"]
 
 
 def test_runtime_config_has_no_speculative_surface():

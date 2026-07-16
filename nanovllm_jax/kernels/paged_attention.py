@@ -100,8 +100,7 @@ def _validate_paged_decode_inputs(
         raise ValueError("k_cache and v_cache must have the same shape")
     if k_cache.ndim != 4:
         raise ValueError(
-            "k_cache must have NHD shape "
-            "[num_pages, page_size, num_kv_heads, head_dim]"
+            "k_cache must have NHD shape [num_pages, page_size, num_kv_heads, head_dim]"
         )
     if q.shape[-1] != k_cache.shape[-1]:
         raise ValueError("q and cache head_dim must match")
@@ -204,8 +203,7 @@ def paged_decode_attention_gqa_nhd_reference(
 
     effective_lens = jnp.where(
         page_counts > 0,
-        (page_counts - 1) * jnp.asarray(page_size, dtype=jnp.int32)
-        + kv_last_page_len,
+        (page_counts - 1) * jnp.asarray(page_size, dtype=jnp.int32) + kv_last_page_len,
         0,
     )
     effective_lens = jnp.minimum(effective_lens, seq_lens.astype(jnp.int32))

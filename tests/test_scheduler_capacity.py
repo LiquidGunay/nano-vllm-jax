@@ -1,5 +1,7 @@
 import subprocess
 import sys
+from threading import Lock
+from types import SimpleNamespace
 
 import pytest
 
@@ -72,7 +74,11 @@ def _bare_engine(*, block_size: int = 2, num_blocks: int = 3) -> LLMEngine:
         },
     )
     engine.scheduler = Scheduler(engine.config)
+    engine.model_runner = SimpleNamespace(release=lambda seq_ids: None)
     engine._next_seq_id = 0
+    engine._closed = False
+    engine._control_owner = None
+    engine._control_lock = Lock()
     return engine
 
 
@@ -144,6 +150,30 @@ def test_sequence_ids_and_block_sizes_are_engine_local():
 
     assert (first_a.seq_id, first_b.seq_id, second_a.seq_id) == (0, 1, 0)
     assert (first_a.block_size, first_b.block_size, second_a.block_size) == (8, 8, 32)
+
+
+def test_control_lease_guards_every_mutating_entrypoint():
+    engine = _bare_engine()
+    owner = object()
+    engine.claim_control(owner)
+
+    with pytest.raises(RuntimeError, match="active control owner"):
+        engine.add_request([1], SamplingParams(max_tokens=1))
+    with pytest.raises(RuntimeError, match="active control owner"):
+        engine.step()
+
+    admitted = engine.add_request([1], SamplingParams(max_tokens=1), owner=owner)
+    assert admitted.seq_id == 0
+    engine.cancel_request(admitted, owner=owner)
+    engine.release_control(owner)
+
+
+def test_control_lease_rejects_preexisting_manual_requests():
+    engine = _bare_engine()
+    engine.add_request([1], SamplingParams(max_tokens=1))
+
+    with pytest.raises(RuntimeError, match="idle request queues"):
+        engine.claim_control(object())
 
 
 @pytest.mark.parametrize("entrypoint", ("generate", "iter_generate"))

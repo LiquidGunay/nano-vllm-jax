@@ -74,9 +74,7 @@ def _has_cuda_backend() -> bool:
 )
 @pytest.mark.parametrize("head_dim", [128, 256])
 def test_kv_append_paged_nhd_flashinfer_matches_reference(head_dim):
-    append_key = jnp.arange(4 * 2 * head_dim, dtype=jnp.float32).reshape(
-        4, 2, head_dim
-    )
+    append_key = jnp.arange(4 * 2 * head_dim, dtype=jnp.float32).reshape(4, 2, head_dim)
     append_key = append_key.astype(jnp.bfloat16)
     append_value = (append_key + 1000).astype(jnp.bfloat16)
     batch_indices = jnp.array([0, 1, 0, 1], dtype=jnp.int32)
@@ -163,9 +161,7 @@ def test_paged_decode_attention_flashinfer_matches_reference():
     max_pages_per_sequence = 128
     num_pages = batch * max_pages_per_sequence
     scale = 1.0 / np.sqrt(head_dim)
-    block_tables = jnp.arange(num_pages, dtype=jnp.int32).reshape(
-        batch, max_pages_per_sequence
-    )
+    block_tables = jnp.arange(num_pages, dtype=jnp.int32).reshape(batch, max_pages_per_sequence)
     seq_lens = jnp.array([5, 30], dtype=jnp.int32)
     query = jax.random.normal(
         key,
@@ -248,9 +244,7 @@ def test_paged_decode_fused_append_flashinfer_matches_reference():
     num_pages = batch * max_pages_per_sequence
     layer_id = 1
     scale = 1.0 / np.sqrt(head_dim)
-    block_tables = jnp.arange(num_pages, dtype=jnp.int32).reshape(
-        batch, max_pages_per_sequence
-    )
+    block_tables = jnp.arange(num_pages, dtype=jnp.int32).reshape(batch, max_pages_per_sequence)
     seq_lens = jnp.array([5, 30], dtype=jnp.int32)
     positions = seq_lens - 1
     query = jax.random.normal(
@@ -355,9 +349,9 @@ def test_paged_decode_fused_append_skips_inactive_rows():
     block_tables = jnp.array([[0, 1], [0, 0]], dtype=jnp.int32)
     seq_lens = jnp.array([5, 0], dtype=jnp.int32)
     positions = jnp.array([4, 0], dtype=jnp.int32)
-    query = jax.random.normal(
-        key, (batch, num_heads, head_dim), dtype=jnp.float32
-    ).astype(jnp.bfloat16)
+    query = jax.random.normal(key, (batch, num_heads, head_dim), dtype=jnp.float32).astype(
+        jnp.bfloat16
+    )
     new_k = jax.random.normal(
         jax.random.fold_in(key, 1),
         (batch, num_kv_heads, head_dim),
@@ -445,9 +439,7 @@ def test_backend_rejects_removed_flashinfer_kv_append_opt_in():
     page_size = 4
     head_dim = 256
     layer_id = 1
-    k = jnp.arange(2 * 4 * 2 * head_dim, dtype=jnp.float32).reshape(
-        2, 4, 2, head_dim
-    )
+    k = jnp.arange(2 * 4 * 2 * head_dim, dtype=jnp.float32).reshape(2, 4, 2, head_dim)
     k = k.astype(jnp.bfloat16)
     v = (k + 1000).astype(jnp.bfloat16)
     k_cache = jnp.full((3, 6, page_size, 2, head_dim), -1, dtype=jnp.bfloat16)

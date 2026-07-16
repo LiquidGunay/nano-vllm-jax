@@ -18,9 +18,7 @@ def missing_modules(modules: tuple[str, ...]) -> tuple[str, ...]:
 def require_modules(modules: tuple[str, ...], feature: str) -> None:
     missing = missing_modules(modules)
     if missing:
-        raise KernelUnavailable(
-            f"{feature} requires optional modules: {', '.join(missing)}"
-        )
+        raise KernelUnavailable(f"{feature} requires optional modules: {', '.join(missing)}")
 
 
 __all__ = ["KernelUnavailable", "missing_modules", "require_modules"]

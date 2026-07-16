@@ -12,7 +12,7 @@ def _roll_scatter_reference(x, conv_state, weight, bias, activation):
     """Old roll+scatter implementation for parity check."""
     new_state = jnp.roll(conv_state, shift=-1, axis=-1)
     new_state = new_state.at[:, :, -1].set(x.squeeze(-1))
-    out = jnp.einsum('bdk,dk->bd', new_state, weight)
+    out = jnp.einsum("bdk,dk->bd", new_state, weight)
     if bias is not None:
         out = out + bias
     if activation == "silu":

@@ -14,8 +14,21 @@ metadata, and queue-driven continuous batching.
 ## Start The Server
 
 ```bash
-pip install -e ".[cuda13,flashinfer-ffi,gdn-fla-triton]"
+uv sync --frozen --python 3.11 \
+  --extra cuda13 --extra flashinfer-ffi --extra gdn-fla-triton
 python server.py
+```
+
+The lockfile and Python 3.11 are the reproducible environment contract.
+The current lock resolves JAX/JAXlib and the CUDA 13 plugin to 0.10.0,
+FlashInfer to 0.6.11.post3, JAX-Triton to 0.3.1, and JAX TVM FFI to 0.1.3.
+`uv.lock`, rather than these descriptive version notes, remains authoritative.
+
+An editable pip install remains convenient for development, but it does not
+pin the transitive CUDA stack:
+
+```bash
+pip install -e ".[cuda13,flashinfer-ffi,gdn-fla-triton]"
 ```
 
 [server.yaml](server.yaml) controls model id, serving capacity, bucket sizes,
@@ -89,7 +102,14 @@ text, token ids, and finish reason.
 
 HTTP handlers submit work to `EngineService`. A single worker admits queued
 requests, calls `LLMEngine.step()`, and publishes per-request results so
-independent clients can batch together.
+independent clients can batch together. The service owns engine stepping until
+`stop()` returns. Offline `generate()` owns an otherwise idle engine for one
+call; `add_request()` plus `step()` is the explicit manual lifecycle. A service
+lease rejects manual mutation, and unfinished manual work prevents lease
+acquisition.
+
+The bundled Flask server is intentionally a local pedagogical transport, not a
+production WSGI deployment recipe.
 
 ## Runtime Path
 
@@ -158,6 +178,13 @@ diagnostics stay under `/mountpoint/.exp`.
 [docs/style.md](docs/style.md) defines the repository's lightweight complexity
 budget and review checks.
 
+The local control-plane check does not require a GPU and does not create a CI
+workflow:
+
+```bash
+./scripts/check.sh
+```
+
 Ownership and configuration contract checks:
 
 ```bash
@@ -170,3 +197,5 @@ JAX_PLATFORMS=cuda PYTHONPATH=$PWD python tests/ram_guard.py -- pytest -q \
 
 For GPU correctness, verify CUDA visibility first and run JAX with
 `JAX_PLATFORMS=cuda`; do not hide missing GPU access with CPU fallback.
+
+The project is available under the [MIT License](LICENSE).

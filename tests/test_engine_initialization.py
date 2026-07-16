@@ -1,8 +1,12 @@
+import gc
 import json
+import weakref
 from dataclasses import replace
 from types import SimpleNamespace
 
 import jax.numpy as jnp
+import jax
+import numpy as np
 import pytest
 
 import nanovllm_jax.engine as engine_module
@@ -10,10 +14,13 @@ import nanovllm_jax.weights as weights_module
 from nanovllm_jax.cache import KVCacheSpec, estimate_kv_cache_bytes
 from nanovllm_jax.config import EngineConfig, ModelConfig, RuntimeSpec, WarmupConfig
 from nanovllm_jax.engine import LLMEngine
+from nanovllm_jax.model import init_transformer_block
+from nanovllm_jax.runner import ModelRunner
 from nanovllm_jax.sequence import SamplingParams
 from nanovllm_jax.speculation import DrafterConfig
 from nanovllm_jax.step import FinishReason, RunResult
 from tests.runtime_specs import qwen_text_config
+from tests.runtime_specs import runtime_spec
 
 
 def _small_engine_config(model: str) -> EngineConfig:
@@ -38,8 +45,56 @@ def _small_engine_config(model: str) -> EngineConfig:
     )
 
 
+def test_warmup_block_tables_are_disjoint_or_rejected():
+    runner = object.__new__(ModelRunner)
+    runner.config = SimpleNamespace(
+        capacity=SimpleNamespace(num_kvcache_blocks=6),
+        compile=SimpleNamespace(prefill_layout="packed"),
+    )
+    runner.max_blocks_per_seq = 2
+
+    batch = runner._dummy_batch(
+        batch_size=3,
+        token_bucket=6,
+        is_prefill=True,
+    )
+    rows = batch.host.block_tables
+    assert len({block for row in rows for block in row}) == 6
+
+    with pytest.raises(ValueError, match="warmup_requires_disjoint_blocks"):
+        runner._dummy_batch(
+            batch_size=4,
+            token_bucket=8,
+            is_prefill=True,
+        )
+
+
+def test_linear_attention_initializers_use_independent_keys():
+    model = runtime_spec(
+        model={
+            "hidden_size": 8,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "layer_types": ("linear_attention",),
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 2,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+        }
+    ).model
+
+    params = init_transformer_block(jax.random.PRNGKey(7), model, 0)
+
+    assert params["out_proj"].shape == params["gate_up_proj"][:, 8:].shape
+    assert not np.array_equal(
+        np.asarray(params["out_proj"]),
+        np.asarray(params["gate_up_proj"][:, 8:]),
+    )
+
+
 def test_engine_stops_on_tokenizer_eos_when_checkpoint_eos_differs(tmp_path, monkeypatch):
     model = "example/Qwen3.5"
+    tokenizer_calls = []
 
     class FakeRunner:
         def __init__(self, config, params):
@@ -47,6 +102,12 @@ def test_engine_stops_on_tokenizer_eos_when_checkpoint_eos_differs(tmp_path, mon
 
         def memory_bytes(self):
             return {}
+
+        def release(self, seq_ids):
+            pass
+
+        def release_prefix_hybrid_states(self, handles):
+            pass
 
     monkeypatch.setattr(engine_module, "resolve_checkpoint_metadata", lambda _model: tmp_path)
     monkeypatch.setattr(engine_module, "resolve_checkpoint", lambda *_args, **_kwargs: tmp_path)
@@ -59,10 +120,14 @@ def test_engine_stops_on_tokenizer_eos_when_checkpoint_eos_differs(tmp_path, mon
         engine_module,
         "AutoTokenizer",
         SimpleNamespace(
-            from_pretrained=lambda *_args, **_kwargs: SimpleNamespace(eos_token_id=248046)
+            from_pretrained=lambda *args, **kwargs: (
+                tokenizer_calls.append((args, kwargs)) or SimpleNamespace(eos_token_id=248046)
+            )
         ),
     )
-    monkeypatch.setattr(engine_module, "load_weights_from_hf_streaming", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        engine_module, "load_weights_from_hf_streaming", lambda *_args, **_kwargs: object()
+    )
     monkeypatch.setattr(engine_module, "ModelRunner", FakeRunner)
 
     engine = LLMEngine(model, engine_config=_small_engine_config(model))
@@ -82,6 +147,22 @@ def test_engine_stops_on_tokenizer_eos_when_checkpoint_eos_differs(tmp_path, mon
     assert result.finished[0].reason is FinishReason.EOS
     assert seq.is_finished
     assert seq.output.token_ids() == [248046]
+    assert tokenizer_calls[0][1] == {}
+
+    second_engine = LLMEngine(model, engine_config=_small_engine_config(model))
+    engine_refs = (weakref.ref(engine), weakref.ref(second_engine))
+    owner = object()
+    engine.claim_control(owner)
+    with pytest.raises(RuntimeError, match="stop the active engine owner"):
+        engine.close()
+    engine.release_control(owner)
+    engine.close()
+    engine.close()
+    second_engine.close()
+    assert not hasattr(engine, "model_runner")
+    del engine, second_engine
+    gc.collect()
+    assert all(reference() is None for reference in engine_refs)
 
 
 def test_unsupported_hub_architecture_fails_before_weight_resolution(tmp_path, monkeypatch):
@@ -221,7 +302,9 @@ def test_mtp_kv_byte_cap_includes_predictor_cache(tmp_path, monkeypatch):
         ),
     )
     monkeypatch.setattr(engine_module, "load_weights_from_hf_streaming", lambda *_a, **_k: object())
-    monkeypatch.setattr(engine_module, "load_mtp_weights_from_hf_streaming", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        engine_module, "load_mtp_weights_from_hf_streaming", lambda *_a, **_k: object()
+    )
     monkeypatch.setattr(engine_module, "ModelRunner", FakeRunner)
 
     engine = LLMEngine(

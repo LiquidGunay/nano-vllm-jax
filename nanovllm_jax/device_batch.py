@@ -92,8 +92,7 @@ class BatchMaterializer:
         tokens = [list(row.token_ids) + [0] * (width - row.query_len) for row in plan.rows]
         positions = [list(row.positions) + [0] * (width - row.query_len) for row in plan.rows]
         block_tables = [
-            list(row.block_table) + [0] * (block_width - len(row.block_table))
-            for row in plan.rows
+            list(row.block_table) + [0] * (block_width - len(row.block_table)) for row in plan.rows
         ]
         seq_ids = [row.seq_id for row in plan.rows]
         query_lens = [row.query_len for row in plan.rows]
@@ -118,7 +117,9 @@ class BatchMaterializer:
                 query_lens=query_lens,
             )
             if use_static
-            else self._device_put(tokens, positions, seq_ids, query_start_loc, block_tables, seq_lens)
+            else self._device_put(
+                tokens, positions, seq_ids, query_start_loc, block_tables, seq_lens
+            )
         )
         return DeviceBatch(
             tokens=arrays[0],
@@ -136,9 +137,7 @@ class BatchMaterializer:
                 seq_lens,
                 block_tables,
                 prefill_is_final=(
-                    tuple(row.prefill_is_final for row in plan.rows)
-                    if plan.is_prefill
-                    else ()
+                    tuple(row.prefill_is_final for row in plan.rows) if plan.is_prefill else ()
                 ),
                 decode_steps=1 if plan.is_prefill else plan.decode_steps,
                 uses_static_decode_metadata=use_static,
@@ -214,7 +213,10 @@ class BatchMaterializer:
             and self.execution in {"decode-jit", "jit"}
             and self.device_token_carry
             and plan.bucket.query_tokens == 1
-            and all(row.carries_device_token and int(tokens[index][0]) == 0 for index, row in enumerate(plan.rows))
+            and all(
+                row.carries_device_token and int(tokens[index][0]) == 0
+                for index, row in enumerate(plan.rows)
+            )
         )
 
     def _static_decode_arrays(
@@ -230,7 +232,11 @@ class BatchMaterializer:
     ) -> tuple[jax.Array, ...]:
         token_shape = (len(tokens), len(tokens[0]))
         block_shape = (len(block_tables), len(block_tables[0]))
-        device_seq_ids = [index if query_len > 0 else -1 for index, query_len in enumerate(query_lens)] if self.resident_decode_metadata else seq_ids
+        device_seq_ids = (
+            [index if query_len > 0 else -1 for index, query_len in enumerate(query_lens)]
+            if self.resident_decode_metadata
+            else seq_ids
+        )
         constant_key = (token_shape, tuple(device_seq_ids), tuple(query_lens))
         constants = self._decode_constants.get(constant_key)
         if constants is None:
@@ -245,7 +251,9 @@ class BatchMaterializer:
             token_shape,
             block_shape,
             tuple(query_lens),
-            "resident" if self.resident_decode_metadata else (tuple(seq_ids), tuple(map(tuple, block_tables))),
+            "resident"
+            if self.resident_decode_metadata
+            else (tuple(seq_ids), tuple(map(tuple, block_tables))),
         )
         metadata = self._decode_metadata.get(metadata_key)
         if metadata is None:
@@ -263,7 +271,10 @@ class BatchMaterializer:
             }
             self._decode_metadata[metadata_key] = metadata
         elif not (self.static_decode_seq_lens_carry or self.resident_decode_metadata):
-            metadata = {**metadata, "seq_lens": jax.device_put(np.asarray(seq_lens, dtype=np.int32))}
+            metadata = {
+                **metadata,
+                "seq_lens": jax.device_put(np.asarray(seq_lens, dtype=np.int32)),
+            }
         return (
             constants["tokens"],
             constants["positions"],

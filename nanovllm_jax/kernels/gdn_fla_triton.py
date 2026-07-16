@@ -19,6 +19,7 @@ import jax_triton as jt
 import triton
 import triton.language as tl
 
+
 def _raise_if_gdn_fallback_disabled(reason: str) -> None:
     raise RuntimeError(
         f"{reason}; implicit GDN kernel fallbacks are disabled on the cleaned mainline"
@@ -131,9 +132,7 @@ def _gdn_fla_chunk_local_cumsum_packed_kernel(
     input_offsets = tl.where(input_offsets >= 0, input_offsets, 0)
     input_positions = chunk_start + input_offsets
     chunk_mask = offs < chunk_len
-    store_positions = (
-        chunk_start + tl.where(REVERSE, chunk_len - 1 - offs, offs)
-    )
+    store_positions = chunk_start + tl.where(REVERSE, chunk_len - 1 - offs, offs)
     gate_offsets = input_positions * num_heads + head
     gate_vals = tl.load(
         gate + gate_offsets,
@@ -313,23 +312,16 @@ def _gdn_fla_chunk_scaled_dot_kkt_packed_block_kernel(
 
     row_offsets = offs_t[:, None]
     col_offsets = offs_t[None, :]
-    local_mask = (
-        (row_offsets > col_offsets)
-        & (row_offsets < chunk_len)
-        & (col_offsets < chunk_len)
-    )
+    local_mask = (row_offsets > col_offsets) & (row_offsets < chunk_len) & (col_offsets < chunk_len)
     scores = tl.where(local_mask, scores, 0.0)
 
     out_offsets = (
-        ((chunk_start + row_offsets) * num_output_heads + pid_head) * chunk_size
-        + col_offsets
-    )
+        (chunk_start + row_offsets) * num_output_heads + pid_head
+    ) * chunk_size + col_offsets
     tl.store(
         out + out_offsets,
         scores,
-        mask=head_mask
-        & (row_offsets < chunk_len)
-        & (col_offsets < chunk_size),
+        mask=head_mask & (row_offsets < chunk_len) & (col_offsets < chunk_size),
     )
 
 
@@ -357,7 +349,6 @@ def _gdn_fla_solve_tril_packed_kernel(
     chunk_start = row_start + chunk_id * chunk_size
     chunk_end = tl.minimum(row_end, row_start + (chunk_id + 1) * chunk_size)
     chunk_len = chunk_end - chunk_start
-    row_stride = num_heads * chunk_size
     rows = tl.arange(0, BLOCK)[:, None]
     cols = tl.arange(0, BLOCK)[None, :]
     inv = tl.where(rows == cols, 1.0, 0.0).to(tl.float32)
@@ -373,9 +364,7 @@ def _gdn_fla_solve_tril_packed_kernel(
         for k in range(BLOCK):
             att_mask = head_mask & row_mask & (k < i) & (k < chunk_len) & (k < chunk_size)
             a_k = tl.load(
-                attention_matrix
-                + ((chunk_start + i) * num_heads + pid_head) * chunk_size
-                + k,
+                attention_matrix + ((chunk_start + i) * num_heads + pid_head) * chunk_size + k,
                 mask=att_mask,
                 other=0.0,
             ).to(tl.float32)
@@ -500,18 +489,14 @@ def _gdn_fla_chunk_delta_h_packed_kernel(
             delta = token_u - token_dot
 
             tl.store(
-                out_v_new
-                + (token_index * num_output_heads + pid_head) * value_dim
-                + val_offsets,
+                out_v_new + (token_index * num_output_heads + pid_head) * value_dim + val_offsets,
                 delta,
                 mask=token_mask & val_mask,
             )
 
             if USE_GATE:
                 token_gate = tl.load(
-                    gate_cumsum
-                    + token_index * num_output_heads
-                    + pid_head,
+                    gate_cumsum + token_index * num_output_heads + pid_head,
                     mask=token_mask,
                     other=0.0,
                 ).to(tl.float32)
@@ -726,10 +711,7 @@ def _gdn_fla_chunk_delta_h_packed_block_kernel(
         else:
             v_update = tl.where(valid_t[:, None], v_update, 0.0)
 
-        key_base = (
-            (chunk_start + offs_t[None, :]) * num_key_heads * key_dim
-            + key_head * key_dim
-        )
+        key_base = (chunk_start + offs_t[None, :]) * num_key_heads * key_dim + key_head * key_dim
         k1 = tl.load(
             key + key_base + offs_k[:, None],
             mask=has_tokens & valid_t[None, :] & (offs_k[:, None] < key_dim),
@@ -832,9 +814,7 @@ def _gdn_fla_recompute_w_packed_kernel(
         running = tl.zeros((BLOCK_D,), dtype=tl.float32)
         for k in range(BLOCK_S):
             inv_scale = tl.load(
-                attention_inverse
-                + (row_global * num_output_heads + pid_head) * chunk_size
-                + k,
+                attention_inverse + (row_global * num_output_heads + pid_head) * chunk_size + k,
                 mask=head_mask & row_mask & (k < chunk_len),
                 other=0.0,
             ).to(tl.float32)
@@ -849,9 +829,7 @@ def _gdn_fla_recompute_w_packed_kernel(
                 other=0.0,
             ).to(tl.float32)
             key_val = tl.load(
-                key
-                + ((chunk_start + k) * num_key_heads + key_head) * key_dim
-                + feature_offsets,
+                key + ((chunk_start + k) * num_key_heads + key_head) * key_dim + feature_offsets,
                 mask=head_mask & feature_mask & (k < chunk_len),
                 other=0.0,
             ).to(tl.float32)
@@ -904,9 +882,7 @@ def _gdn_fla_recompute_u_packed_kernel(
         running = tl.zeros((BLOCK_D,), dtype=tl.float32)
         for k in range(BLOCK_S):
             inv_scale = tl.load(
-                attention_inverse
-                + (row_global * num_output_heads + pid_head) * chunk_size
-                + k,
+                attention_inverse + (row_global * num_output_heads + pid_head) * chunk_size + k,
                 mask=head_mask & row_mask & (k < chunk_len),
                 other=0.0,
             ).to(tl.float32)
@@ -1083,9 +1059,7 @@ def _gdn_fla_chunk_fwd_o_packed_kernel(
     key_head = pid_head // head_group
 
     query_row_ptr = (row_token_idx * num_key_heads + key_head) * key_dim
-    state_row_ptr = (
-        (pid_chunk * num_output_heads + pid_head) * value_dim * key_dim
-    )
+    state_row_ptr = (pid_chunk * num_output_heads + pid_head) * value_dim * key_dim
 
     state_out = tl.zeros((BLOCK_T, BLOCK_V), dtype=tl.float32)
     attention = tl.zeros((BLOCK_T, BLOCK_V), dtype=tl.float32)
@@ -1142,10 +1116,9 @@ def _gdn_fla_chunk_fwd_o_packed_kernel(
         state_out *= tl.exp(row_gate)[:, None]
 
     out_vals = (state_out + attention).to(tl.float32)
-    out_offsets = (
-        (row_token_idx[:, None] * num_output_heads + pid_head) * value_dim
-        + val_offsets[None, :]
-    )
+    out_offsets = (row_token_idx[:, None] * num_output_heads + pid_head) * value_dim + val_offsets[
+        None, :
+    ]
     store_mask = valid_rows[:, None] & val_mask[None, :] & head_mask
     tl.store(out + out_offsets, out_vals, mask=store_mask)
 
@@ -1237,9 +1210,7 @@ def _gdn_fla_chunk_fwd_o_packed_block_kernel(
     row_offsets = offs_t[:, None]
     col_offsets = offs_t[None, :]
     local_mask = (
-        (row_offsets >= col_offsets)
-        & (row_offsets < chunk_len)
-        & (col_offsets < chunk_len)
+        (row_offsets >= col_offsets) & (row_offsets < chunk_len) & (col_offsets < chunk_len)
     )
     block_a = tl.where(local_mask, block_a, 0.0)
 
@@ -1665,8 +1636,6 @@ def _gdn_packed_decode_kernel(
     offs_v = i_v * BV + tl.arange(0, BV)
     mask_k = offs_k < K
     mask_v = offs_v < V
-    mask_state = mask_v[:, None] & mask_k[None, :]
-
     p_state = state + ((i_n * HV + i_hv) * V * K)
 
     p_mixed = mixed_qkv + i_n * qkv_dim
@@ -3032,7 +3001,9 @@ def gdn_fla_chunk_delta_h_packed_triton(
             value_dim,
             key_dim,
         ):
-            raise ValueError("initial_state must have shape [batch, output_heads, value_dim, key_dim]")
+            raise ValueError(
+                "initial_state must have shape [batch, output_heads, value_dim, key_dim]"
+            )
         state = initial_state.astype(jnp.float32)
 
     # Derive fallback thresholds from host materialized lengths only in eager mode.
@@ -3042,9 +3013,7 @@ def gdn_fla_chunk_delta_h_packed_triton(
         if is_tracer:
             max_row_chunks = 1024
         else:
-            row_lengths = np.asarray(
-                jax.device_get(cu[1:] - cu[:-1]), dtype=np.int64
-            ).reshape(-1)
+            row_lengths = np.asarray(jax.device_get(cu[1:] - cu[:-1]), dtype=np.int64).reshape(-1)
             if row_lengths.size == 0:
                 max_row_chunks = 0
             else:
@@ -3068,6 +3037,7 @@ def gdn_fla_chunk_delta_h_packed_triton(
             from nanovllm_jax.kernels.gdn_fla import (
                 gdn_fla_chunk_delta_h_packed_reference,
             )
+
             return gdn_fla_chunk_delta_h_packed_reference(
                 key_fp32,
                 w_fp32,
@@ -3130,6 +3100,7 @@ def gdn_fla_chunk_delta_h_packed_triton(
         from nanovllm_jax.kernels.gdn_fla import (
             gdn_fla_chunk_delta_h_packed_reference,
         )
+
         return gdn_fla_chunk_delta_h_packed_reference(
             key_fp32,
             w_fp32,
@@ -4031,7 +4002,11 @@ def gdn_conv_packed_decode_step_bf16_raw_gates(
     state_batch, value_heads, value_dim, key_dim = recurrent_state.shape
     if state_batch != batch or conv_state.shape[0] != batch:
         raise ValueError("state batch dimensions must match mixed_qkv batch")
-    if conv_state.shape[1] != conv_dim or conv_weight.shape[0] != conv_dim or conv_bias.shape[0] != conv_dim:
+    if (
+        conv_state.shape[1] != conv_dim
+        or conv_weight.shape[0] != conv_dim
+        or conv_bias.shape[0] != conv_dim
+    ):
         raise ValueError("conv dimensions must match mixed_qkv")
     if conv_weight.shape[1] != conv_state.shape[2]:
         raise ValueError("conv kernel sizes must match")
@@ -4049,7 +4024,6 @@ def gdn_conv_packed_decode_step_bf16_raw_gates(
     block_k = jt.next_power_of_2(key_dim)
     block_v = _decode_triton_block_v(value_dim)
     num_warps = _decode_triton_num_warps(value_dim)
-    valid_rows = jnp.ones((batch,), dtype=jnp.int32)
     out_shape = (
         jax.ShapeDtypeStruct((batch, value_heads, 1, value_dim), jnp.float32),
         jax.ShapeDtypeStruct(conv_state.shape, jnp.float32),
@@ -4109,7 +4083,9 @@ def gdn_conv_packed_projection_decode_step_bf16_raw_gates(
     if recurrent_state.ndim != 4:
         raise ValueError("recurrent_state must have shape [batch, value_heads, value_dim, key_dim]")
     if packed_proj.dtype != jnp.bfloat16:
-        raise ValueError("gdn_conv_packed_projection_decode_step_bf16_raw_gates requires BF16 packed_proj")
+        raise ValueError(
+            "gdn_conv_packed_projection_decode_step_bf16_raw_gates requires BF16 packed_proj"
+        )
     for name, array in (
         ("decay", decay),
         ("dt_bias", dt_bias),
@@ -4126,7 +4102,11 @@ def gdn_conv_packed_projection_decode_step_bf16_raw_gates(
     state_batch, value_heads, value_dim, key_dim = recurrent_state.shape
     if state_batch != batch or conv_state.shape[0] != batch:
         raise ValueError("state batch dimensions must match packed_proj batch")
-    if conv_state.shape[1] != conv_dim or conv_weight.shape[0] != conv_dim or conv_bias.shape[0] != conv_dim:
+    if (
+        conv_state.shape[1] != conv_dim
+        or conv_weight.shape[0] != conv_dim
+        or conv_bias.shape[0] != conv_dim
+    ):
         raise ValueError("conv dimensions must match qkv_dim")
     if conv_weight.shape[1] != conv_state.shape[2]:
         raise ValueError("conv kernel sizes must match")
@@ -4214,7 +4194,9 @@ def gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail(
     if norm_weight.ndim != 1:
         raise ValueError("norm_weight must have shape [value_dim]")
     if packed_proj.dtype != jnp.bfloat16:
-        raise ValueError("gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail requires BF16 packed_proj")
+        raise ValueError(
+            "gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail requires BF16 packed_proj"
+        )
     for name, array in (
         ("decay", decay),
         ("dt_bias", dt_bias),
@@ -4232,7 +4214,11 @@ def gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail(
     state_batch, value_heads, value_dim, key_dim = recurrent_state.shape
     if state_batch != batch or conv_state.shape[0] != batch:
         raise ValueError("state batch dimensions must match packed_proj batch")
-    if conv_state.shape[1] != conv_dim or conv_weight.shape[0] != conv_dim or conv_bias.shape[0] != conv_dim:
+    if (
+        conv_state.shape[1] != conv_dim
+        or conv_weight.shape[0] != conv_dim
+        or conv_bias.shape[0] != conv_dim
+    ):
         raise ValueError("conv dimensions must match qkv_dim")
     if conv_weight.shape[1] != conv_state.shape[2]:
         raise ValueError("conv kernel sizes must match")
@@ -4321,13 +4307,10 @@ def gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail_state_pool(
     if decay.ndim != 1 or dt_bias.ndim != 1:
         raise ValueError("decay and dt_bias must have shape [value_heads]")
     if conv_state_pool.ndim != 4:
-        raise ValueError(
-            "conv_state_pool must have shape [batch, layers, conv_dim, kernel_size]"
-        )
+        raise ValueError("conv_state_pool must have shape [batch, layers, conv_dim, kernel_size]")
     if recurrent_state_pool.ndim != 5:
         raise ValueError(
-            "recurrent_state_pool must have shape "
-            "[batch, layers, value_heads, value_dim, key_dim]"
+            "recurrent_state_pool must have shape [batch, layers, value_heads, value_dim, key_dim]"
         )
     if conv_weight.ndim != 2 or conv_bias.ndim != 1:
         raise ValueError("conv_weight/conv_bias must have shape [conv_dim, kernel_size]/[conv_dim]")
@@ -4360,7 +4343,11 @@ def gdn_conv_packed_projection_decode_step_bf16_raw_gates_tail_state_pool(
         raise ValueError("conv and recurrent state pools must have the same layer count")
     if not (0 <= int(linear_layer_idx) < int(num_layers)):
         raise ValueError("linear_layer_idx is out of bounds for state pools")
-    if conv_state_dim != conv_dim or conv_weight.shape[0] != conv_dim or conv_bias.shape[0] != conv_dim:
+    if (
+        conv_state_dim != conv_dim
+        or conv_weight.shape[0] != conv_dim
+        or conv_bias.shape[0] != conv_dim
+    ):
         raise ValueError("conv dimensions must match qkv_dim")
     if conv_weight.shape[1] != conv_kernel:
         raise ValueError("conv kernel sizes must match")

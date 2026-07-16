@@ -44,6 +44,7 @@ from nanovllm_jax.lm_head import (
     lm_head_token_ids_and_topk,
 )
 
+
 def _needs_static_prefill_token_count(config: RuntimeSpec) -> bool:
     kernels = config.kernels
     return (
@@ -68,9 +69,7 @@ def _compact_prefill_token_count(
         if max_num_batched_tokens is None or max_num_batched_tokens <= 0:
             return padded_tokens
         return min(padded_tokens, int(max_num_batched_tokens))
-    raise ValueError(
-        f"compact_prefill_token_count_mode must be 'exact' or 'bucket', got {mode!r}"
-    )
+    raise ValueError(f"compact_prefill_token_count_mode must be 'exact' or 'bucket', got {mode!r}")
 
 
 def _static_prefill_token_count_for_batch(
@@ -145,7 +144,9 @@ class ModelExecutor:
             raise ValueError("Scheduled batch tokens and positions must have matching shape")
         if batch.block_tables.ndim != 2:
             raise ValueError("Scheduled batch block_tables must be 2D")
-        metadata_rows = int(batch.block_tables.shape[0]) if batch.packed_prefill else int(batch.tokens.shape[0])
+        metadata_rows = (
+            int(batch.block_tables.shape[0]) if batch.packed_prefill else int(batch.tokens.shape[0])
+        )
         if batch.packed_prefill:
             if not batch.is_prefill:
                 raise ValueError("packed DeviceBatch is supported only for prefill")
@@ -164,11 +165,7 @@ class ModelExecutor:
         if batch.query_start_loc.shape[0] != metadata_rows + 1:
             raise ValueError("Scheduled batch query_start_loc size must be batch_size + 1")
 
-        if (
-            batch.host.query_lens
-            and batch.host.seq_ids
-            and batch.host.seq_lens
-        ):
+        if batch.host.query_lens and batch.host.seq_ids and batch.host.seq_lens:
             self._validate_batch_contract_host(batch)
             return
 
@@ -191,7 +188,9 @@ class ModelExecutor:
             if bool(jnp.any(active_rows != real_rows)):
                 raise ValueError("Decode rows must use seq_id=-1 exactly when query_len is 0")
             if bool(jnp.any(jnp.where(active_rows, batch.seq_lens < 1, batch.seq_lens != 0))):
-                raise ValueError("Decode inactive rows must have seq_len=0 and active rows must have seq_len>=1")
+                raise ValueError(
+                    "Decode inactive rows must have seq_len=0 and active rows must have seq_len>=1"
+                )
 
     @staticmethod
     def _validate_batch_contract_host(batch: DeviceBatch):
@@ -225,7 +224,9 @@ class ModelExecutor:
             if active != real:
                 raise ValueError("Decode rows must use seq_id=-1 exactly when query_len is 0")
             if (active and seq_len < 1) or ((not active) and seq_len != 0):
-                raise ValueError("Decode inactive rows must have seq_len=0 and active rows must have seq_len>=1")
+                raise ValueError(
+                    "Decode inactive rows must have seq_len=0 and active rows must have seq_len>=1"
+                )
 
     def _packed_prefill_max_query_len(self, batch: DeviceBatch) -> int | None:
         if not batch.packed_prefill:
@@ -300,8 +301,14 @@ class ModelExecutor:
             gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
             gathered_hidden = hidden[0, gather_idx, :][:, None, :]
             if return_hidden_with_logits or not return_hidden:
-                normed = rms_norm(gathered_hidden, self.params.norm_weight, self.config.model.rms_norm_eps).astype(jnp.float32)
-                vocab_weight = self.params.lm_head if self.params.lm_head is not None else self.params.embed_tokens
+                normed = rms_norm(
+                    gathered_hidden, self.params.norm_weight, self.config.model.rms_norm_eps
+                ).astype(jnp.float32)
+                vocab_weight = (
+                    self.params.lm_head
+                    if self.params.lm_head is not None
+                    else self.params.embed_tokens
+                )
                 logits = jnp.dot(normed, vocab_weight.T)
                 activations = (gathered_hidden, logits) if return_hidden_with_logits else logits
             else:
@@ -379,7 +386,11 @@ class ModelExecutor:
             ):
                 params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
                 num_query_tokens = query_start_loc[-1].astype(jnp.int32)
-                num_prefill_tokens = static_num_prefill_tokens if static_num_prefill_tokens is not None else num_query_tokens
+                num_prefill_tokens = (
+                    static_num_prefill_tokens
+                    if static_num_prefill_tokens is not None
+                    else num_query_tokens
+                )
                 step_positions = positions
                 if not is_prefill and positions.shape[1] == 1:
                     step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
@@ -415,9 +426,11 @@ class ModelExecutor:
                     kv_lens=step_batch.seq_lens,
                     slot_mapping=attention_metadata.slot_mapping,
                 )
-                model_return_hidden = return_hidden or (last_logits_only and step_batch.packed_prefill)
-                model_return_hidden_with_logits = (
-                    return_hidden_with_logits and not (last_logits_only and step_batch.packed_prefill)
+                model_return_hidden = return_hidden or (
+                    last_logits_only and step_batch.packed_prefill
+                )
+                model_return_hidden_with_logits = return_hidden_with_logits and not (
+                    last_logits_only and step_batch.packed_prefill
                 )
                 activations, updated_kv_state, updated_hybrid_state = model_forward_step(
                     step_batch.tokens,
@@ -441,13 +454,21 @@ class ModelExecutor:
                 if last_logits_only and step_batch.packed_prefill:
                     hidden = activations
                     gather_positions = self._logit_positions(step_batch)
-                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
+                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(
+                        jnp.int32
+                    )
                     gathered_hidden = hidden[0, gather_idx, :][:, None, :]
                     if return_hidden_with_logits or not return_hidden:
-                        normed = rms_norm(gathered_hidden, params.norm_weight, self.config.model.rms_norm_eps).astype(jnp.float32)
-                        vocab_weight = params.lm_head if params.lm_head is not None else params.embed_tokens
+                        normed = rms_norm(
+                            gathered_hidden, params.norm_weight, self.config.model.rms_norm_eps
+                        ).astype(jnp.float32)
+                        vocab_weight = (
+                            params.lm_head if params.lm_head is not None else params.embed_tokens
+                        )
                         logits = jnp.dot(normed, vocab_weight.T)
-                        activations = (gathered_hidden, logits) if return_hidden_with_logits else logits
+                        activations = (
+                            (gathered_hidden, logits) if return_hidden_with_logits else logits
+                        )
                     else:
                         activations = gathered_hidden
                 return (
@@ -464,18 +485,18 @@ class ModelExecutor:
             )
 
         activations, k_cache, v_cache, conv_state, recurrent_state = self._jit_cache[key](
-                self._params_leaves,
-                batch.tokens,
-                batch.positions,
-                batch.query_start_loc,
-                batch.token_row_ids,
-                batch.block_tables,
-                batch.seq_lens,
-                cache_storage.k_cache,
-                cache_storage.v_cache,
-                hybrid_state.conv_state,
-                hybrid_state.recurrent_state,
-            )
+            self._params_leaves,
+            batch.tokens,
+            batch.positions,
+            batch.query_start_loc,
+            batch.token_row_ids,
+            batch.block_tables,
+            batch.seq_lens,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state.conv_state,
+            hybrid_state.recurrent_state,
+        )
         return ExecutorOutput(
             activations=activations,
             cache_storage=KVCacheStorage(k_cache, v_cache),
@@ -545,7 +566,11 @@ class ModelExecutor:
             ):
                 params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
                 num_query_tokens = query_start_loc[-1].astype(jnp.int32)
-                num_prefill_tokens = static_num_prefill_tokens if static_num_prefill_tokens is not None else num_query_tokens
+                num_prefill_tokens = (
+                    static_num_prefill_tokens
+                    if static_num_prefill_tokens is not None
+                    else num_query_tokens
+                )
                 step_positions = positions
                 if not is_prefill and positions.shape[1] == 1:
                     step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
@@ -597,14 +622,20 @@ class ModelExecutor:
                 )
                 if step_batch.packed_prefill:
                     gather_positions = self._logit_positions(step_batch)
-                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
+                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(
+                        jnp.int32
+                    )
                     gathered = hidden[0, gather_idx, :]
                     last_hidden = gathered[:, None, :]
                 elif is_prefill:
                     gather_positions = self._logit_positions(step_batch)
-                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
+                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(
+                        jnp.int32
+                    )
                     gather_idx = gather_idx[:, None, None]
-                    gather_idx = jnp.broadcast_to(gather_idx, (hidden.shape[0], 1, hidden.shape[-1]))
+                    gather_idx = jnp.broadcast_to(
+                        gather_idx, (hidden.shape[0], 1, hidden.shape[-1])
+                    )
                     last_hidden = jnp.take_along_axis(hidden, gather_idx, axis=1)
                 else:
                     last_hidden = hidden[:, :1, :]
@@ -635,18 +666,18 @@ class ModelExecutor:
             )
 
         token_ids, k_cache, v_cache, conv_state, recurrent_state = self._jit_cache[key](
-                self._params_leaves,
-                batch.tokens,
-                batch.positions,
-                batch.query_start_loc,
-                batch.token_row_ids,
-                batch.block_tables,
-                batch.seq_lens,
-                cache_storage.k_cache,
-                cache_storage.v_cache,
-                hybrid_state.conv_state,
-                hybrid_state.recurrent_state,
-            )
+            self._params_leaves,
+            batch.tokens,
+            batch.positions,
+            batch.query_start_loc,
+            batch.token_row_ids,
+            batch.block_tables,
+            batch.seq_lens,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state.conv_state,
+            hybrid_state.recurrent_state,
+        )
         return ExecutorOutput(
             activations=token_ids,
             cache_storage=KVCacheStorage(k_cache, v_cache),
@@ -667,7 +698,9 @@ class ModelExecutor:
         if not batch.is_prefill:
             raise ValueError("forward_prefill_token_ids_table_jit is prefill-only")
         if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
-            raise ValueError("forward_prefill_token_ids_table_jit requires initialized hybrid state tables")
+            raise ValueError(
+                "forward_prefill_token_ids_table_jit requires initialized hybrid state tables"
+            )
         self._validate_batch_contract(batch)
 
         key = (
@@ -787,14 +820,20 @@ class ModelExecutor:
                 )
                 if step_batch.packed_prefill:
                     gather_positions = self._logit_positions(step_batch)
-                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
+                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(
+                        jnp.int32
+                    )
                     gathered = hidden[0, gather_idx, :]
                     last_hidden = gathered[:, None, :]
                 else:
                     gather_positions = self._logit_positions(step_batch)
-                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
+                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(
+                        jnp.int32
+                    )
                     gather_idx = gather_idx[:, None, None]
-                    gather_idx = jnp.broadcast_to(gather_idx, (hidden.shape[0], 1, hidden.shape[-1]))
+                    gather_idx = jnp.broadcast_to(
+                        gather_idx, (hidden.shape[0], 1, hidden.shape[-1])
+                    )
                     last_hidden = jnp.take_along_axis(hidden, gather_idx, axis=1)
                 token_ids, _, _ = lm_head_token_ids_and_topk(
                     last_hidden,
@@ -840,26 +879,25 @@ class ModelExecutor:
             )
 
         activations, k_cache, v_cache, conv_state, recurrent_state = self._jit_cache[key](
-                self._params_leaves,
-                batch.tokens,
-                batch.positions,
-                batch.query_start_loc,
-                batch.token_row_ids,
-                batch.block_tables,
-                batch.seq_lens,
-                cache_storage.k_cache,
-                cache_storage.v_cache,
-                hybrid_state_table.conv_state,
-                hybrid_state_table.recurrent_state,
-                hybrid_slot_ids,
-            )
+            self._params_leaves,
+            batch.tokens,
+            batch.positions,
+            batch.query_start_loc,
+            batch.token_row_ids,
+            batch.block_tables,
+            batch.seq_lens,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state_table.conv_state,
+            hybrid_state_table.recurrent_state,
+            hybrid_slot_ids,
+        )
         return ExecutorOutput(
             activations=activations,
             cache_storage=KVCacheStorage(k_cache, v_cache),
             attention_metadata=None,
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
         )
-
 
     def forward_step_sampled_token_ids_jit(
         self,
@@ -927,7 +965,11 @@ class ModelExecutor:
             ):
                 params = jax.tree_util.tree_unflatten(self._params_treedef, params_leaves)
                 num_query_tokens = query_start_loc[-1].astype(jnp.int32)
-                num_prefill_tokens = static_num_prefill_tokens if static_num_prefill_tokens is not None else num_query_tokens
+                num_prefill_tokens = (
+                    static_num_prefill_tokens
+                    if static_num_prefill_tokens is not None
+                    else num_query_tokens
+                )
                 step_positions = positions
                 if not is_prefill and positions.shape[1] == 1:
                     step_positions = jnp.maximum(seq_lens - 1, 0).astype(jnp.int32)[:, None]
@@ -979,14 +1021,20 @@ class ModelExecutor:
                 )
                 if step_batch.packed_prefill:
                     gather_positions = self._logit_positions(step_batch)
-                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
+                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(
+                        jnp.int32
+                    )
                     gathered = hidden[0, gather_idx, :]
                     last_hidden = gathered[:, None, :]
                 elif is_prefill:
                     gather_positions = self._logit_positions(step_batch)
-                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
+                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(
+                        jnp.int32
+                    )
                     gather_idx = gather_idx[:, None, None]
-                    gather_idx = jnp.broadcast_to(gather_idx, (hidden.shape[0], 1, hidden.shape[-1]))
+                    gather_idx = jnp.broadcast_to(
+                        gather_idx, (hidden.shape[0], 1, hidden.shape[-1])
+                    )
                     last_hidden = jnp.take_along_axis(hidden, gather_idx, axis=1)
                 else:
                     last_hidden = hidden[:, :1, :]
@@ -1019,7 +1067,8 @@ class ModelExecutor:
                 donate_argnums=(7, 8),
             )
 
-        token_ids, updated_rng_counters, k_cache, v_cache, conv_state, recurrent_state = self._jit_cache[key](
+        token_ids, updated_rng_counters, k_cache, v_cache, conv_state, recurrent_state = (
+            self._jit_cache[key](
                 self._params_leaves,
                 batch.tokens,
                 batch.positions,
@@ -1035,6 +1084,7 @@ class ModelExecutor:
                 rng_counters,
                 rng_slots,
             )
+        )
         return ExecutorOutput(
             activations=token_ids,
             cache_storage=KVCacheStorage(k_cache, v_cache),
@@ -1062,7 +1112,9 @@ class ModelExecutor:
         if batch.is_prefill:
             raise ValueError("forward_step_token_ids_table_jit is decode-only")
         if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
-            raise ValueError("forward_step_token_ids_table_jit requires initialized hybrid state tables")
+            raise ValueError(
+                "forward_step_token_ids_table_jit requires initialized hybrid state tables"
+            )
         self._validate_batch_contract(batch)
 
         key = (
@@ -1074,6 +1126,7 @@ class ModelExecutor:
             tuple(hybrid_state_table.recurrent_state.shape),
         )
         if key not in self._jit_cache:
+
             def compiled(
                 params_leaves,
                 tokens,
@@ -1117,12 +1170,12 @@ class ModelExecutor:
                         jnp.full_like(safe_slot_ids, -1),
                     ),
                     query_start_loc=query_start_loc,
-                        is_prefill=False,
-                        num_prefill_tokens=0,
-                        num_decode_tokens=num_query_tokens,
-                        block_tables=block_tables,
-                        seq_lens=seq_lens,
-                    )
+                    is_prefill=False,
+                    num_prefill_tokens=0,
+                    num_decode_tokens=num_query_tokens,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                )
                 attention_metadata = self.backend.build_attention_metadata(
                     positions=step_batch.positions,
                     block_tables=step_batch.block_tables,
@@ -1194,18 +1247,18 @@ class ModelExecutor:
             )
 
         token_ids, k_cache, v_cache, conv_state, recurrent_state = self._jit_cache[key](
-                self._params_leaves,
-                batch.tokens,
-                batch.positions,
-                batch.query_start_loc,
-                batch.block_tables,
-                batch.seq_lens,
-                cache_storage.k_cache,
-                cache_storage.v_cache,
-                hybrid_state_table.conv_state,
-                hybrid_state_table.recurrent_state,
-                hybrid_slot_ids,
-            )
+            self._params_leaves,
+            batch.tokens,
+            batch.positions,
+            batch.query_start_loc,
+            batch.block_tables,
+            batch.seq_lens,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state_table.conv_state,
+            hybrid_state_table.recurrent_state,
+            hybrid_slot_ids,
+        )
         return ExecutorOutput(
             activations=token_ids,
             cache_storage=KVCacheStorage(k_cache, v_cache),
@@ -1374,14 +1427,20 @@ class ModelExecutor:
                 )
                 if step_batch.packed_prefill:
                     gather_positions = self._logit_positions(step_batch)
-                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
+                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(
+                        jnp.int32
+                    )
                     gathered = hidden[0, gather_idx, :]
                     last_hidden = gathered[:, None, :]
                 else:
                     gather_positions = self._logit_positions(step_batch)
-                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(jnp.int32)
+                    gather_idx = jnp.clip(gather_positions, 0, hidden.shape[1] - 1).astype(
+                        jnp.int32
+                    )
                     gather_idx = gather_idx[:, None, None]
-                    gather_idx = jnp.broadcast_to(gather_idx, (hidden.shape[0], 1, hidden.shape[-1]))
+                    gather_idx = jnp.broadcast_to(
+                        gather_idx, (hidden.shape[0], 1, hidden.shape[-1])
+                    )
                     last_hidden = jnp.take_along_axis(hidden, gather_idx, axis=1)
                 token_ids, _, _ = lm_head_token_ids_and_topk(
                     last_hidden,
@@ -1528,26 +1587,26 @@ class ModelExecutor:
             mtp_v_cache,
             draft_token_table,
         ) = self._jit_cache[key](
-                self._params_leaves,
-                batch.tokens,
-                batch.positions,
-                batch.query_start_loc,
-                batch.token_row_ids,
-                batch.block_tables,
-                batch.seq_lens,
-                cache_storage.k_cache,
-                cache_storage.v_cache,
-                hybrid_state_table.conv_state,
-                hybrid_state_table.recurrent_state,
-                hybrid_slot_ids,
-                prefill_final_flags,
-                resident_last_tokens,
-                self._mtp_params_leaves,
-                mtp_k_cache,
-                mtp_v_cache,
-                draft_token_table,
-                next_prompt_token_rows,
-            )
+            self._params_leaves,
+            batch.tokens,
+            batch.positions,
+            batch.query_start_loc,
+            batch.token_row_ids,
+            batch.block_tables,
+            batch.seq_lens,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state_table.conv_state,
+            hybrid_state_table.recurrent_state,
+            hybrid_slot_ids,
+            prefill_final_flags,
+            resident_last_tokens,
+            self._mtp_params_leaves,
+            mtp_k_cache,
+            mtp_v_cache,
+            draft_token_table,
+            next_prompt_token_rows,
+        )
         return ExecutorOutput(
             activations=token_ids,
             cache_storage=KVCacheStorage(k_cache, v_cache),
@@ -1632,7 +1691,9 @@ class ModelExecutor:
         if batch.is_prefill:
             raise ValueError("forward_step_token_ids_slot_carry_table_jit is decode-only")
         if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
-            raise ValueError("forward_step_token_ids_slot_carry_table_jit requires initialized hybrid state tables")
+            raise ValueError(
+                "forward_step_token_ids_slot_carry_table_jit requires initialized hybrid state tables"
+            )
         self._validate_batch_contract(batch)
 
         key = (
@@ -1782,18 +1843,18 @@ class ModelExecutor:
             recurrent_state,
             last_tokens_table,
         ) = self._jit_cache[key](
-                self._params_leaves,
-                batch.positions,
-                batch.query_start_loc,
-                batch.block_tables,
-                batch.seq_lens,
-                cache_storage.k_cache,
-                cache_storage.v_cache,
-                hybrid_state_table.conv_state,
-                hybrid_state_table.recurrent_state,
-                hybrid_slot_ids,
-                resident_last_tokens,
-            )
+            self._params_leaves,
+            batch.positions,
+            batch.query_start_loc,
+            batch.block_tables,
+            batch.seq_lens,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state_table.conv_state,
+            hybrid_state_table.recurrent_state,
+            hybrid_slot_ids,
+            resident_last_tokens,
+        )
         return ExecutorOutput(
             activations=token_ids,
             cache_storage=KVCacheStorage(k_cache, v_cache),
@@ -1823,7 +1884,9 @@ class ModelExecutor:
         if batch.is_prefill:
             raise ValueError("forward_step_token_ids_resident_jit is decode-only")
         if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
-            raise ValueError("forward_step_token_ids_resident_jit requires initialized hybrid state tables")
+            raise ValueError(
+                "forward_step_token_ids_resident_jit requires initialized hybrid state tables"
+            )
         self._validate_batch_contract(batch)
 
         static_block_table_width = int(batch.block_tables.shape[1])
@@ -1975,17 +2038,19 @@ class ModelExecutor:
                 donate_argnums=(2, 3, 4, 5),
             )
 
-        token_ids, k_cache, v_cache, conv_state, recurrent_state, seq_lens_table = self._jit_cache[key](
-                self._params_leaves,
-                batch.tokens,
-                cache_storage.k_cache,
-                cache_storage.v_cache,
-                hybrid_state_table.conv_state,
-                hybrid_state_table.recurrent_state,
-                hybrid_slot_ids,
-                resident_block_tables,
-                resident_seq_lens,
-            )
+        token_ids, k_cache, v_cache, conv_state, recurrent_state, seq_lens_table = self._jit_cache[
+            key
+        ](
+            self._params_leaves,
+            batch.tokens,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state_table.conv_state,
+            hybrid_state_table.recurrent_state,
+            hybrid_slot_ids,
+            resident_block_tables,
+            resident_seq_lens,
+        )
         return ExecutorOutput(
             activations=token_ids,
             cache_storage=KVCacheStorage(k_cache, v_cache),
@@ -2009,7 +2074,9 @@ class ModelExecutor:
         if batch.is_prefill:
             raise ValueError("forward_step_token_ids_resident_slot_carry_jit is decode-only")
         if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
-            raise ValueError("forward_step_token_ids_resident_slot_carry_jit requires initialized hybrid state tables")
+            raise ValueError(
+                "forward_step_token_ids_resident_slot_carry_jit requires initialized hybrid state tables"
+            )
         self._validate_batch_contract(batch)
 
         static_block_table_width = int(batch.block_tables.shape[1])
@@ -2179,16 +2246,16 @@ class ModelExecutor:
             seq_lens_table,
             last_tokens_table,
         ) = self._jit_cache[key](
-                self._params_leaves,
-                cache_storage.k_cache,
-                cache_storage.v_cache,
-                hybrid_state_table.conv_state,
-                hybrid_state_table.recurrent_state,
-                hybrid_slot_ids,
-                resident_block_tables,
-                resident_seq_lens,
-                resident_last_tokens,
-            )
+            self._params_leaves,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state_table.conv_state,
+            hybrid_state_table.recurrent_state,
+            hybrid_slot_ids,
+            resident_block_tables,
+            resident_seq_lens,
+            resident_last_tokens,
+        )
         return ExecutorOutput(
             activations=token_ids,
             cache_storage=KVCacheStorage(k_cache, v_cache),
@@ -2319,9 +2386,7 @@ class ModelExecutor:
                     recurrent_state_table.dtype
                 )
                 updated_conv_table = conv_state_table.at[slot_ids].set(updated_conv)
-                updated_recurrent_table = recurrent_state_table.at[slot_ids].set(
-                    updated_recurrent
-                )
+                updated_recurrent_table = recurrent_state_table.at[slot_ids].set(updated_recurrent)
                 updated_seq_lens_table = seq_lens_table.at[slot_ids].set(seq_lens + 1)
                 updated_last_tokens = last_tokens_table.at[slot_ids].set(token_ids)
                 return (
@@ -2348,16 +2413,16 @@ class ModelExecutor:
             seq_lens_table,
             last_tokens_table,
         ) = self._jit_cache[key](
-                self._params_leaves,
-                cache_storage.k_cache,
-                cache_storage.v_cache,
-                hybrid_state_table.conv_state,
-                hybrid_state_table.recurrent_state,
-                hybrid_slot_ids,
-                resident_block_tables,
-                resident_seq_lens,
-                resident_last_tokens,
-            )
+            self._params_leaves,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state_table.conv_state,
+            hybrid_state_table.recurrent_state,
+            hybrid_slot_ids,
+            resident_block_tables,
+            resident_seq_lens,
+            resident_last_tokens,
+        )
         return ExecutorOutput(
             activations=token_ids,
             cache_storage=KVCacheStorage(k_cache, v_cache),
@@ -2443,11 +2508,7 @@ class ModelExecutor:
             params.norm_weight,
             self.config.model.rms_norm_eps,
         )
-        vocab_weight = (
-            params.lm_head
-            if params.lm_head is not None
-            else params.embed_tokens
-        )
+        vocab_weight = params.lm_head if params.lm_head is not None else params.embed_tokens
         target_token_ids = lm_head_greedy_token_ids_from_normed(
             hidden_normed,
             vocab_weight,
@@ -2459,24 +2520,16 @@ class ModelExecutor:
         )
 
         row_ids = jnp.arange(batch_size, dtype=jnp.int32)
-        selected_conv = prefix_state.conv_state[
-            row_ids, verification.accepted_counts
-        ]
-        selected_recurrent = prefix_state.recurrent_state[
-            row_ids, verification.accepted_counts
-        ]
+        selected_conv = prefix_state.conv_state[row_ids, verification.accepted_counts]
+        selected_recurrent = prefix_state.recurrent_state[row_ids, verification.accepted_counts]
         conv_state_table = conv_state_table.at[slot_ids].set(
             selected_conv.astype(conv_state_table.dtype)
         )
         recurrent_state_table = recurrent_state_table.at[slot_ids].set(
             selected_recurrent.astype(recurrent_state_table.dtype)
         )
-        seq_lens_table = seq_lens_table.at[slot_ids].set(
-            seq_lens + verification.emitted_counts
-        )
-        last_tokens_table = last_tokens_table.at[slot_ids].set(
-            verification.next_token_ids
-        )
+        seq_lens_table = seq_lens_table.at[slot_ids].set(seq_lens + verification.emitted_counts)
+        last_tokens_table = last_tokens_table.at[slot_ids].set(verification.next_token_ids)
         return _PackedTargetTransition(
             verification,
             hidden_normed,
@@ -2680,7 +2733,9 @@ class ModelExecutor:
         """Dense resident decode path that samples token ids in the JIT."""
 
         if batch.is_prefill:
-            raise ValueError("forward_step_sampled_token_ids_resident_dense_slot_carry_jit is decode-only")
+            raise ValueError(
+                "forward_step_sampled_token_ids_resident_dense_slot_carry_jit is decode-only"
+            )
         if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
             raise ValueError(
                 "forward_step_sampled_token_ids_resident_dense_slot_carry_jit requires initialized "
@@ -2792,9 +2847,7 @@ class ModelExecutor:
                     recurrent_state_table.dtype
                 )
                 updated_conv_table = conv_state_table.at[slot_ids].set(updated_conv)
-                updated_recurrent_table = recurrent_state_table.at[slot_ids].set(
-                    updated_recurrent
-                )
+                updated_recurrent_table = recurrent_state_table.at[slot_ids].set(updated_recurrent)
                 updated_seq_lens_table = seq_lens_table.at[slot_ids].set(seq_lens + 1)
                 updated_last_tokens = last_tokens_table.at[slot_ids].set(token_ids)
                 updated_rng_counters = rng_counter_table.at[slot_ids].set(counters + 1)
@@ -2824,18 +2877,18 @@ class ModelExecutor:
             last_tokens_table,
             rng_counter_table,
         ) = self._jit_cache[key](
-                self._params_leaves,
-                cache_storage.k_cache,
-                cache_storage.v_cache,
-                hybrid_state_table.conv_state,
-                hybrid_state_table.recurrent_state,
-                hybrid_slot_ids,
-                resident_block_tables,
-                resident_seq_lens,
-                resident_last_tokens,
-                resident_rng_counters,
-                temperatures,
-            )
+            self._params_leaves,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state_table.conv_state,
+            hybrid_state_table.recurrent_state,
+            hybrid_slot_ids,
+            resident_block_tables,
+            resident_seq_lens,
+            resident_last_tokens,
+            resident_rng_counters,
+            temperatures,
+        )
         return ExecutorOutput(
             activations=token_ids,
             cache_storage=KVCacheStorage(k_cache, v_cache),
@@ -2861,7 +2914,9 @@ class ModelExecutor:
         if decode_steps < 1:
             raise ValueError("decode_steps must be positive")
         if hybrid_state_table.conv_state is None or hybrid_state_table.recurrent_state is None:
-            raise ValueError("forward_greedy_decode_burst_table_jit requires initialized hybrid state tables")
+            raise ValueError(
+                "forward_greedy_decode_burst_table_jit requires initialized hybrid state tables"
+            )
         self._validate_batch_contract(batch)
 
         key = (
@@ -2982,7 +3037,9 @@ class ModelExecutor:
                     next_k_cache = updated_kv_state.k_cache.astype(step_k_cache.dtype)
                     next_v_cache = updated_kv_state.v_cache.astype(step_v_cache.dtype)
                     next_conv_state = updated_hybrid_state.conv_state.astype(step_conv_state.dtype)
-                    next_recurrent_state = updated_hybrid_state.recurrent_state.astype(step_recurrent_state.dtype)
+                    next_recurrent_state = updated_hybrid_state.recurrent_state.astype(
+                        step_recurrent_state.dtype
+                    )
                     return (
                         next_tokens,
                         next_positions,
@@ -3043,18 +3100,18 @@ class ModelExecutor:
             )
 
         token_ids, k_cache, v_cache, conv_state, recurrent_state = self._jit_cache[key](
-                self._params_leaves,
-                batch.tokens,
-                batch.positions,
-                batch.query_start_loc,
-                batch.block_tables,
-                batch.seq_lens,
-                cache_storage.k_cache,
-                cache_storage.v_cache,
-                hybrid_state_table.conv_state,
-                hybrid_state_table.recurrent_state,
-                hybrid_slot_ids,
-            )
+            self._params_leaves,
+            batch.tokens,
+            batch.positions,
+            batch.query_start_loc,
+            batch.block_tables,
+            batch.seq_lens,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state_table.conv_state,
+            hybrid_state_table.recurrent_state,
+            hybrid_slot_ids,
+        )
         return ExecutorOutput(
             activations=token_ids,
             cache_storage=KVCacheStorage(k_cache, v_cache),
@@ -3183,7 +3240,9 @@ class ModelExecutor:
                     next_k_cache = updated_kv_state.k_cache.astype(step_k_cache.dtype)
                     next_v_cache = updated_kv_state.v_cache.astype(step_v_cache.dtype)
                     next_conv_state = updated_hybrid_state.conv_state.astype(step_conv_state.dtype)
-                    next_recurrent_state = updated_hybrid_state.recurrent_state.astype(step_recurrent_state.dtype)
+                    next_recurrent_state = updated_hybrid_state.recurrent_state.astype(
+                        step_recurrent_state.dtype
+                    )
                     return (
                         next_tokens,
                         next_positions,
@@ -3231,24 +3290,23 @@ class ModelExecutor:
             )
 
         token_ids, k_cache, v_cache, conv_state, recurrent_state = self._jit_cache[key](
-                self._params_leaves,
-                batch.tokens,
-                batch.positions,
-                batch.query_start_loc,
-                batch.block_tables,
-                batch.seq_lens,
-                cache_storage.k_cache,
-                cache_storage.v_cache,
-                hybrid_state.conv_state,
-                hybrid_state.recurrent_state,
-            )
+            self._params_leaves,
+            batch.tokens,
+            batch.positions,
+            batch.query_start_loc,
+            batch.block_tables,
+            batch.seq_lens,
+            cache_storage.k_cache,
+            cache_storage.v_cache,
+            hybrid_state.conv_state,
+            hybrid_state.recurrent_state,
+        )
         return ExecutorOutput(
             activations=token_ids,
             cache_storage=KVCacheStorage(k_cache, v_cache),
             attention_metadata=None,
             hybrid_state=HybridLayerState(conv_state, recurrent_state),
         )
-
 
     @staticmethod
     def _logit_positions(batch: DeviceBatch):

@@ -64,8 +64,7 @@ def _bool_value(value: Any, field_name: str) -> bool:
 
 def _layer_pattern(count: int) -> tuple[str, ...]:
     return tuple(
-        "linear_attention" if index % 4 != 3 else "full_attention"
-        for index in range(count)
+        "linear_attention" if index % 4 != 3 else "full_attention" for index in range(count)
     )
 
 
@@ -170,9 +169,7 @@ def _checkpoint_model_fields(checkpoint: str | Path, model: str) -> dict[str, An
             False,
         ),
         "eos_token_id": (
-            int(text["eos_token_id"])
-            if text.get("eos_token_id") is not None
-            else None
+            int(text["eos_token_id"]) if text.get("eos_token_id") is not None else None
         ),
     }
 
@@ -299,7 +296,9 @@ class WarmupConfig:
                 raw.get("decode_block_buckets", cls.decode_block_buckets),
                 "warmup.decode_block_buckets",
             ),
-            include_sampled_routes=_bool_value(raw.get("include_sampled_routes", True), "warmup.include_sampled_routes"),
+            include_sampled_routes=_bool_value(
+                raw.get("include_sampled_routes", True), "warmup.include_sampled_routes"
+            ),
             enabled=_bool_value(raw.get("enabled", True), "warmup.enabled"),
         )
 
@@ -413,7 +412,9 @@ class EngineConfig:
             max_num_resident_seqs=int(
                 raw.get("max_num_resident_seqs", raw.get("max_num_seqs", cls.max_num_resident_seqs))
             ),
-            max_num_batched_tokens=int(raw.get("max_num_batched_tokens", cls.max_num_batched_tokens)),
+            max_num_batched_tokens=int(
+                raw.get("max_num_batched_tokens", cls.max_num_batched_tokens)
+            ),
             max_blocks_per_seq=int(raw.get("max_blocks_per_seq", cls.max_blocks_per_seq)),
             kv_cache_bytes=int(raw.get("kv_cache_bytes", cls.kv_cache_bytes)),
             num_kvcache_blocks=int(raw.get("num_kvcache_blocks", cls.num_kvcache_blocks)),
@@ -423,6 +424,7 @@ class EngineConfig:
             warmup=warmup,
             prefix_cache=_bool_value(raw.get("prefix_cache", True), "prefix_cache"),
         )
+
 
 @dataclass(frozen=True)
 class ServerSettings:
@@ -575,9 +577,7 @@ class RuntimeSpec:
         }
         missing = [name for name, enabled in required.items() if not enabled]
         if missing:
-            raise ValueError(
-                "persistent MTP requires " + ", ".join(missing)
-            )
+            raise ValueError("persistent MTP requires " + ", ".join(missing))
 
     @classmethod
     def promoted(
@@ -587,11 +587,7 @@ class RuntimeSpec:
         kernels: KernelPlan = KERNEL_PLAN,
         drafter: DrafterConfig | None = None,
     ) -> "RuntimeSpec":
-        eos_token_ids = (
-            (model.eos_token_id,)
-            if model.eos_token_id is not None
-            else ()
-        )
+        eos_token_ids = (model.eos_token_id,) if model.eos_token_id is not None else ()
         return cls(
             model=model,
             capacity=CapacitySpec(

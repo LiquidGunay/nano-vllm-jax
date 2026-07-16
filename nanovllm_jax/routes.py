@@ -215,6 +215,7 @@ ROUTE_SPECS = (
     ),
 )
 
+
 @dataclass(frozen=True)
 class RouteRequest:
     phase: BatchPhase
@@ -233,20 +234,12 @@ def decode_warmup_scenarios(
 
     scenarios = []
     if static_token_carry:
-        scenarios.append(
-            WarmupScenario("dense_carry", TokenMode.GREEDY, True, True, True)
-        )
+        scenarios.append(WarmupScenario("dense_carry", TokenMode.GREEDY, True, True, True))
         if sparse_bucket:
-            scenarios.append(
-                WarmupScenario("sparse_carry", TokenMode.GREEDY, False, True, True)
-            )
-    scenarios.append(
-        WarmupScenario("ordinary_greedy", TokenMode.GREEDY, False, False, False)
-    )
+            scenarios.append(WarmupScenario("sparse_carry", TokenMode.GREEDY, False, True, True))
+    scenarios.append(WarmupScenario("ordinary_greedy", TokenMode.GREEDY, False, False, False))
     if include_sampled:
-        scenarios.append(
-            WarmupScenario("sampled", TokenMode.SAMPLED, False, False, False)
-        )
+        scenarios.append(WarmupScenario("sampled", TokenMode.SAMPLED, False, False, False))
     scenarios.extend(
         WarmupScenario(
             f"burst_{steps}",
@@ -303,9 +296,7 @@ def validate_registry(specs: tuple[RouteSpec, ...]) -> None:
                 matches = _maximal_routes(specs, request)
                 if len(matches) > 1:
                     names = ", ".join(sorted(spec.kind.value for spec in matches))
-                    raise RuntimeError(
-                        f"ambiguous {phase.value}/{tokens.value} routes: {names}"
-                    )
+                    raise RuntimeError(f"ambiguous {phase.value}/{tokens.value} routes: {names}")
 
 
 validate_registry(ROUTE_SPECS)
@@ -329,9 +320,7 @@ def select_route(request: RouteRequest) -> RouteKind:
 
     matches = _maximal_routes(ROUTE_SPECS, request)
     if not matches:
-        raise RuntimeError(
-            f"no {request.phase.value}/{request.tokens.value} execution route"
-        )
+        raise RuntimeError(f"no {request.phase.value}/{request.tokens.value} execution route")
     if len(matches) > 1:
         names = ", ".join(sorted(spec.kind.value for spec in matches))
         raise RuntimeError(

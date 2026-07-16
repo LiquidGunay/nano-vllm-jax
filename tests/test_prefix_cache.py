@@ -1,7 +1,9 @@
 from dataclasses import replace
+import struct
 
 import jax
 import pytest
+import xxhash
 
 from nanovllm_jax.block_manager import BlockManager
 from nanovllm_jax.engine import LLMEngine
@@ -19,6 +21,12 @@ def _sequence(tokens, *, seq_id=0, max_tokens=1):
         seq_id=seq_id,
         block_size=2,
     )
+
+
+def test_prefix_hash_uses_stable_little_endian_int32_tokens():
+    expected = xxhash.xxh64(struct.pack("<3i", 1, 256, -2)).intdigest()
+
+    assert BlockManager.compute_hash([1, 256, -2]) == expected
 
 
 def _tiny_hybrid_config(*, prefix_cache, max_num_resident_seqs=1):
@@ -148,9 +156,7 @@ def test_prefix_state_budget_is_lru_and_keeps_kv_metadata():
     manager.reserve(first, total_blocks=2)
     first_entry = manager.publish_computed_prefix(first, 2)
     assert first_entry is not None
-    first_entry = manager.prefix_cache.publish(
-        replace(first_entry, hybrid_state_handle=10)
-    )
+    first_entry = manager.prefix_cache.publish(replace(first_entry, hybrid_state_handle=10))
     manager.deallocate(first)
 
     second = _sequence([4, 5, 6], seq_id=1)
@@ -197,9 +203,7 @@ def test_prefix_churn_keeps_metadata_and_handles_bounded():
         assert entry is not None
         manager.prefix_cache.make_state_room([entry])
         released.extend(manager.take_released_prefix_state_handles())
-        manager.prefix_cache.publish(
-            replace(entry, hybrid_state_handle=index)
-        )
+        manager.prefix_cache.publish(replace(entry, hybrid_state_handle=index))
         manager.deallocate(seq)
 
         stats = manager.stats()
@@ -258,10 +262,7 @@ def test_prefill_budget_does_not_admit_an_unseeded_prefix_hit():
     assert scheduler.take_released_prefix_state_handles() == (10,)
     scheduler.publish_prefix_states(pending, {new_entry.prefix_hash: 13})
     assert scheduler.block_manager.prefix_cache.get(old.prefix_hash) is not None
-    assert (
-        scheduler.block_manager.prefix_cache.get(old.prefix_hash).hybrid_state_handle
-        is None
-    )
+    assert scheduler.block_manager.prefix_cache.get(old.prefix_hash).hybrid_state_handle is None
 
     scheduler.release(filler)
     seqs, _ = scheduler.schedule()
@@ -299,11 +300,7 @@ def test_hybrid_prefix_hit_matches_no_cache_execution():
         "capacity": 1,
     }
     memory = cached.model_runner.memory_bytes()
-    assert (
-        0
-        < memory["prefix_hybrid_state_current"]
-        <= memory["prefix_hybrid_state_capacity"]
-    )
+    assert 0 < memory["prefix_hybrid_state_current"] <= memory["prefix_hybrid_state_capacity"]
     with pytest.raises(AssertionError, match="unknown prefix-state handle"):
         cached.model_runner.release_prefix_hybrid_states((999,))
 

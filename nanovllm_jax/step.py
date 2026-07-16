@@ -32,10 +32,7 @@ class RunResult:
         accepted_draft_tokens: int = 0,
     ) -> "RunResult":
         return cls(
-            tuple(
-                tuple(row) if isinstance(row, (list, tuple)) else (row,)
-                for row in rows
-            ),
+            tuple(tuple(row) if isinstance(row, (list, tuple)) else (row,) for row in rows),
             int(verified_target_tokens),
             int(draft_tokens),
             int(accepted_draft_tokens),

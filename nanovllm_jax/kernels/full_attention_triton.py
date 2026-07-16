@@ -109,10 +109,8 @@ def _packed_paged_prefill_attention_kernel(
             other=0,
         ).to(tl.int32)
         kv_base = (
-            ((page_ids[:, None] * block_size + slot_offsets[:, None]) * num_kv_heads + kv_head)
-            * head_dim
-            + offs_d[None, :]
-        )
+            (page_ids[:, None] * block_size + slot_offsets[:, None]) * num_kv_heads + kv_head
+        ) * head_dim + offs_d[None, :]
         valid_n = kv_pos < kv_len
         k = tl.load(
             k_cache + kv_base,
@@ -269,10 +267,8 @@ def _paged_decode_attention_kernel(
             other=0,
         ).to(tl.int32)
         kv_base = (
-            ((page_ids[:, None] * block_size + slot_offsets[:, None]) * num_kv_heads + kv_head)
-            * head_dim
-            + offs_d[None, :]
-        )
+            (page_ids[:, None] * block_size + slot_offsets[:, None]) * num_kv_heads + kv_head
+        ) * head_dim + offs_d[None, :]
         k = tl.load(
             k_cache + kv_base,
             mask=valid_n[:, None] & (offs_d[None, :] < head_dim),
@@ -416,8 +412,7 @@ def _paged_decode_attention_with_kv_append_kernel(
     cache_layer_base = layer_id * num_pages * block_size * num_kv_heads * head_dim
     append_base = (
         cache_layer_base
-        + ((append_page * block_size + append_slot_offset) * num_kv_heads + kv_head)
-        * head_dim
+        + ((append_page * block_size + append_slot_offset) * num_kv_heads + kv_head) * head_dim
         + offs_d
     )
     new_base = (pid_row * num_kv_heads + kv_head) * head_dim + offs_d
@@ -538,9 +533,7 @@ def paged_decode_attention_with_kv_append_triton(
 
     cache_dtype = k_cache.dtype
     query_for_kernel = (
-        query.astype(cache_dtype)
-        if cache_dtype in (jnp.bfloat16, jnp.float16)
-        else query
+        query.astype(cache_dtype) if cache_dtype in (jnp.bfloat16, jnp.float16) else query
     )
     new_k_for_kernel = new_k.astype(cache_dtype)
     new_v_for_kernel = new_v.astype(cache_dtype)

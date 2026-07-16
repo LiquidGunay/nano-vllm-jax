@@ -10,7 +10,18 @@ import os
 from pathlib import Path
 from threading import Lock
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
+
+from flask import (
+    Flask,
+    Response,
+    current_app,
+    has_app_context,
+    jsonify,
+    request,
+    stream_with_context,
+)
 
 from nanovllm_jax.config import (
     EngineConfig,
@@ -20,24 +31,22 @@ from nanovllm_jax.config import (
     load_engine_config,
 )
 from nanovllm_jax.fastpath import validate_runtime_dependencies
+from nanovllm_jax.sequence import SamplingParams
+
+if TYPE_CHECKING:
+    from nanovllm_jax.engine import LLMEngine
+    from nanovllm_jax.service import EngineService
 
 
 _DEFAULT_XLA_FLAGS = "--xla_gpu_autotune_level=4 --xla_gpu_enable_triton_gemm=false"
 _CHAT_ROLES = {"system", "user", "assistant", "tool"}
 
 
-def _initial_config_path() -> Path:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--config", default=os.getenv("NANO_VLLM_JAX_SERVER_CONFIG", "server.yaml"))
-    args, _ = parser.parse_known_args()
-    path = Path(args.config or "server.yaml")
+def _config_path(value: str | Path) -> Path:
+    path = Path(value)
     if not path.is_absolute() and not path.exists():
         path = Path(__file__).resolve().parent / path
     return path
-
-
-_CONFIG_PATH = _initial_config_path()
-_SETTINGS = load_engine_config(_CONFIG_PATH)
 
 
 def _runtime_root() -> Path:
@@ -79,18 +88,6 @@ def _apply_runtime_config() -> None:
         ) from exc
 
 
-# Configure JAX before importing Flask or the engine stack.
-_apply_runtime_config()
-
-from flask import Flask, Response, jsonify, request, stream_with_context
-
-from nanovllm_jax.engine import LLMEngine
-from nanovllm_jax.sequence import SamplingParams
-from nanovllm_jax.service import EngineService
-
-
-app = Flask(__name__)
-app.config["MAX_TOKENS_DEFAULT"] = _SETTINGS.max_tokens_default
 engine: LLMEngine | None = None
 service: EngineService | None = None
 engine_lock = Lock()
@@ -99,7 +96,11 @@ engine_lock = Lock()
 def _parse_buckets(value: str | tuple[int, ...] | list[int] | None, name: str) -> tuple[int, ...]:
     if value in (None, ""):
         return ()
-    parts = [part.strip() for part in value.split(",") if part.strip()] if isinstance(value, str) else value
+    parts = (
+        [part.strip() for part in value.split(",") if part.strip()]
+        if isinstance(value, str)
+        else value
+    )
     try:
         buckets = tuple(int(part) for part in parts)
     except (TypeError, ValueError) as exc:
@@ -109,12 +110,21 @@ def _parse_buckets(value: str | tuple[int, ...] | list[int] | None, name: str) -
     return buckets
 
 
-def _settings_from_args(args: argparse.Namespace) -> ServerSettings:
+def _settings_from_args(
+    settings: ServerSettings,
+    args: argparse.Namespace,
+) -> ServerSettings:
     warmup = WarmupConfig(
         enabled=not bool(args.skip_compile),
-        prefill_token_buckets=_parse_buckets(args.warmup_prefill_token_buckets, "warmup-prefill-token-buckets"),
-        batch_size_buckets=_parse_buckets(args.warmup_batch_size_buckets, "warmup-batch-size-buckets"),
-        decode_block_buckets=_parse_buckets(args.warmup_decode_block_buckets, "warmup-decode-block-buckets"),
+        prefill_token_buckets=_parse_buckets(
+            args.warmup_prefill_token_buckets, "warmup-prefill-token-buckets"
+        ),
+        batch_size_buckets=_parse_buckets(
+            args.warmup_batch_size_buckets, "warmup-batch-size-buckets"
+        ),
+        decode_block_buckets=_parse_buckets(
+            args.warmup_decode_block_buckets, "warmup-decode-block-buckets"
+        ),
         include_sampled_routes=bool(args.warmup_sampled_routes),
     )
     engine_config = EngineConfig(
@@ -132,7 +142,7 @@ def _settings_from_args(args: argparse.Namespace) -> ServerSettings:
         prefix_cache=bool(args.prefix_cache),
     )
     return replace(
-        _SETTINGS,
+        settings,
         host=args.host,
         port=args.port,
         max_tokens_default=args.max_tokens_default,
@@ -265,14 +275,24 @@ def _inputs_from_request(data: dict[str, Any]) -> tuple[list[str | list[int]], b
 
     if isinstance(prompt, str) and prompt:
         return [prompt], False
-    if isinstance(prompt, list) and prompt and all(isinstance(item, str) and item for item in prompt):
+    if (
+        isinstance(prompt, list)
+        and prompt
+        and all(isinstance(item, str) and item for item in prompt)
+    ):
         return prompt, True
     raise ValueError("prompt must be a non-empty string or list of strings")
 
 
 def _sampling_params(data: dict[str, Any], count: int) -> list[SamplingParams]:
     temperature = data.get("temperature", 0.0)
-    raw_limits = data.get("max_tokens", app.config["MAX_TOKENS_DEFAULT"])
+    raw_limits = data.get("max_tokens")
+    if raw_limits is None:
+        raw_limits = (
+            current_app.config["MAX_TOKENS_DEFAULT"]
+            if has_app_context()
+            else ServerSettings().max_tokens_default
+        )
     limits = raw_limits if isinstance(raw_limits, list) else [raw_limits] * count
     if len(limits) != count:
         raise ValueError("max_tokens list length must match number of prompts")
@@ -293,7 +313,7 @@ def _sampling_params(data: dict[str, Any], count: int) -> list[SamplingParams]:
 def _token_counts(inputs: list[str | list[int]]) -> list[int]:
     if engine is None:
         raise RuntimeError("model is not loaded")
-    return [len(item) if isinstance(item, list) else len(engine._tokenize(item)) for item in inputs]
+    return [len(item) if isinstance(item, list) else len(engine.tokenize(item)) for item in inputs]
 
 
 def _validate_inputs_fit_config(
@@ -312,9 +332,7 @@ def _validate_inputs_fit_config(
             f"request has {len(inputs)} prompts, exceeding max_num_seqs "
             f"{runtime_capacity.max_num_seqs}"
         )
-    for index, (item, prompt_len, params) in enumerate(
-        zip(inputs, prompt_tokens, sampling_params)
-    ):
+    for index, (item, prompt_len, params) in enumerate(zip(inputs, prompt_tokens, sampling_params)):
         if isinstance(item, list):
             engine.validate_token_ids(item, request_index=index)
         engine.validate_request_capacity(
@@ -334,26 +352,49 @@ def _prepare_generation(data: dict[str, Any]):
 
 def load_engine(settings: ServerSettings) -> LLMEngine:
     global engine, service
+    from nanovllm_jax.engine import LLMEngine
+    from nanovllm_jax.service import EngineService
+
     _validate_settings(settings)
-    engine = LLMEngine(settings.engine.model, engine_config=settings.engine)
-    manifest = json.dumps(_runtime_manifest(engine.config), indent=2, sort_keys=True)
+    shutdown_engine()
+    loaded_engine = LLMEngine(settings.engine.model, engine_config=settings.engine)
+    manifest = json.dumps(_runtime_manifest(loaded_engine.config), indent=2, sort_keys=True)
     print("runtime_manifest:\n" + manifest)
 
-    if settings.engine.warmup.enabled:
-        warmup = settings.engine.warmup
-        summary = engine.warmup_compilation(
-            max_prefill_len=max(settings.engine.prefill_token_buckets),
-            max_batch=max(settings.engine.batch_size_buckets),
-            prefill_token_buckets=warmup.prefill_token_buckets,
-            batch_size_buckets=warmup.batch_size_buckets,
-            decode_block_table_buckets=warmup.decode_block_buckets,
-            include_sampled_routes=warmup.include_sampled_routes,
-        )
-        print(f"startup_warmup_complete seconds={summary.get('seconds', 0.0):.2f}")
+    try:
+        if settings.engine.warmup.enabled:
+            warmup = settings.engine.warmup
+            summary = loaded_engine.warmup_compilation(
+                max_prefill_len=max(settings.engine.prefill_token_buckets),
+                max_batch=max(settings.engine.batch_size_buckets),
+                prefill_token_buckets=warmup.prefill_token_buckets,
+                batch_size_buckets=warmup.batch_size_buckets,
+                decode_block_table_buckets=warmup.decode_block_buckets,
+                include_sampled_routes=warmup.include_sampled_routes,
+            )
+            print(f"startup_warmup_complete seconds={summary.get('seconds', 0.0):.2f}")
 
-    service = EngineService(engine, engine_lock=engine_lock)
-    service.start()
+        loaded_service = EngineService(loaded_engine, engine_lock=engine_lock)
+        loaded_service.start()
+    except BaseException:
+        loaded_engine.close()
+        raise
+
+    engine = loaded_engine
+    service = loaded_service
     return engine
+
+
+def shutdown_engine() -> None:
+    """Stop request ownership before releasing accelerator state."""
+
+    global engine, service
+    if service is not None:
+        service.stop()
+        service = None
+    if engine is not None:
+        engine.close()
+        engine = None
 
 
 def _run_generation(inputs: list[str | list[int]], sampling_params: list[SamplingParams]):
@@ -411,7 +452,7 @@ def _completion_payload(results, prompt_tokens: list[int], elapsed: float):
     created = int(time.time())
     model_name = engine.model_id if engine is not None else "unknown"
     return {
-        "id": f"cmpl-{created}",
+        "id": f"cmpl-{uuid4().hex}",
         "object": "text_completion",
         "created": created,
         "model": model_name,
@@ -439,7 +480,6 @@ def _json_error(exc: Exception, status: int):
     return jsonify({"error": str(exc)}), status
 
 
-@app.route("/health", methods=["GET"])
 def health():
     loaded = engine is not None
     worker = service.health() if service is not None else {"state": "stopped"}
@@ -453,23 +493,25 @@ def health():
     ), 200 if healthy else 503
 
 
-@app.route("/v1/generate", methods=["POST"])
 def generate():
     try:
-        inputs, sampling_params, prompt_tokens, is_batch = _prepare_generation(request.get_json(force=True) or {})
+        inputs, sampling_params, prompt_tokens, is_batch = _prepare_generation(
+            request.get_json(force=True) or {}
+        )
         started = time.perf_counter()
         results = _run_generation(inputs, sampling_params)
-        return jsonify(_generation_payload(results, prompt_tokens, time.perf_counter() - started, is_batch))
+        return jsonify(
+            _generation_payload(results, prompt_tokens, time.perf_counter() - started, is_batch)
+        )
     except ValueError as exc:
         return _json_error(exc, 400)
     except RuntimeError as exc:
         return _json_error(exc, 503)
     except Exception as exc:
-        app.logger.exception("Unhandled /v1/generate error")
+        current_app.logger.exception("Unhandled /v1/generate error")
         return _json_error(exc, 500)
 
 
-@app.route("/v1/generate_stream", methods=["POST"])
 def generate_stream():
     try:
         inputs, sampling_params, _, _ = _prepare_generation(request.get_json(force=True) or {})
@@ -492,7 +534,7 @@ def generate_stream():
                 event.setdefault("request_index", 0)
                 yield f"data: {json.dumps(event, sort_keys=True)}\n\n"
         except Exception as exc:
-            app.logger.exception("Unhandled /v1/generate_stream error")
+            current_app.logger.exception("Unhandled /v1/generate_stream error")
             yield f"data: {json.dumps({'event': 'error', 'error': str(exc)}, sort_keys=True)}\n\n"
         finally:
             if handle is not None and not handle.done:
@@ -501,11 +543,12 @@ def generate_stream():
     return Response(stream_with_context(events()), mimetype="text/event-stream")
 
 
-@app.route("/v1/completions", methods=["POST"])
 def completions():
     data = request.get_json(force=True) or {}
     try:
-        inputs, sampling_params, prompt_tokens, _ = _prepare_generation({"prompt": data.get("prompt", ""), **data})
+        inputs, sampling_params, prompt_tokens, _ = _prepare_generation(
+            {"prompt": data.get("prompt", ""), **data}
+        )
         started = time.perf_counter()
         results = _run_generation(inputs, sampling_params)
         return jsonify(_completion_payload(results, prompt_tokens, time.perf_counter() - started))
@@ -514,21 +557,32 @@ def completions():
     except RuntimeError as exc:
         return _json_error(exc, 503)
     except Exception as exc:
-        app.logger.exception("Unhandled /v1/completions error")
+        current_app.logger.exception("Unhandled /v1/completions error")
         return _json_error(exc, 500)
 
 
-def _build_parser(settings: ServerSettings) -> argparse.ArgumentParser:
+def _build_parser(
+    settings: ServerSettings,
+    config_path: Path,
+) -> argparse.ArgumentParser:
     cfg = settings.engine
     parser = argparse.ArgumentParser(description="nano-vllm-jax serving API")
-    parser.add_argument("--config", default=str(_CONFIG_PATH), help="Path to server.yaml")
+    parser.add_argument("--config", default=str(config_path), help="Path to server.yaml")
     parser.add_argument("--model", default=cfg.model)
     parser.add_argument("--host", default=settings.host)
     parser.add_argument("--port", type=int, default=settings.port)
     parser.add_argument("--max-tokens-default", type=int, default=settings.max_tokens_default)
-    parser.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=cfg.prefix_cache)
-    parser.add_argument("--skip-compile", action=argparse.BooleanOptionalAction, default=not cfg.warmup.enabled)
-    parser.add_argument("--warmup-sampled-routes", action=argparse.BooleanOptionalAction, default=cfg.warmup.include_sampled_routes)
+    parser.add_argument(
+        "--prefix-cache", action=argparse.BooleanOptionalAction, default=cfg.prefix_cache
+    )
+    parser.add_argument(
+        "--skip-compile", action=argparse.BooleanOptionalAction, default=not cfg.warmup.enabled
+    )
+    parser.add_argument(
+        "--warmup-sampled-routes",
+        action=argparse.BooleanOptionalAction,
+        default=cfg.warmup.include_sampled_routes,
+    )
 
     for name in (
         "max_num_seqs",
@@ -552,13 +606,47 @@ def _build_parser(settings: ServerSettings) -> argparse.ArgumentParser:
     return parser
 
 
+def create_app(settings: ServerSettings | None = None) -> Flask:
+    """Build the HTTP transport without importing or initializing JAX."""
+
+    application = Flask(__name__)
+    application.config["MAX_TOKENS_DEFAULT"] = (
+        settings.max_tokens_default if settings is not None else ServerSettings().max_tokens_default
+    )
+    application.add_url_rule("/health", view_func=health, methods=["GET"])
+    application.add_url_rule("/v1/generate", view_func=generate, methods=["POST"])
+    application.add_url_rule(
+        "/v1/generate_stream",
+        view_func=generate_stream,
+        methods=["POST"],
+    )
+    application.add_url_rule(
+        "/v1/completions",
+        view_func=completions,
+        methods=["POST"],
+    )
+    return application
+
+
+app = create_app()
+
+
 def main() -> None:
-    args = _build_parser(_SETTINGS).parse_args()
-    settings = _settings_from_args(args)
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument(
+        "--config",
+        default=os.getenv("NANO_VLLM_JAX_SERVER_CONFIG", "server.yaml"),
+    )
+    config_args, _ = config_parser.parse_known_args()
+    config_path = _config_path(config_args.config)
+    base_settings = load_engine_config(config_path)
+    args = _build_parser(base_settings, config_path).parse_args()
+    settings = _settings_from_args(base_settings, args)
     app.config["MAX_TOKENS_DEFAULT"] = settings.max_tokens_default
 
+    _apply_runtime_config()
     print("nano-vllm-jax serving engine")
-    print(f"config_source={Path(args.config)}")
+    print(f"config_source={config_path}")
     print(f"model={settings.engine.model}")
     print(
         "capacity="
@@ -568,12 +656,12 @@ def main() -> None:
     )
     validate_runtime_dependencies()
     load_engine(settings)
+    print("warning=Flask's built-in server is for local pedagogical use")
     print(f"server_ready=http://{settings.host}:{settings.port}")
     try:
         app.run(host=settings.host, port=settings.port, threaded=True)
     finally:
-        if service is not None:
-            service.stop()
+        shutdown_engine()
 
 
 if __name__ == "__main__":
