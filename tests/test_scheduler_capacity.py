@@ -172,7 +172,7 @@ def test_control_lease_rejects_preexisting_manual_requests():
     engine = _bare_engine()
     engine.add_request([1], SamplingParams(max_tokens=1))
 
-    with pytest.raises(RuntimeError, match="idle request queues"):
+    with pytest.raises(RuntimeError, match="requires an idle engine"):
         engine.claim_control(object())
 
 

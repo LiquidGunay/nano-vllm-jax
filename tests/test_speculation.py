@@ -225,6 +225,9 @@ class _Engine(LLMEngine):
         self.scheduler = Scheduler(config)
         self.model_runner = ModelRunner(config, params, mtp_params=mtp_params)
         self._next_seq_id = 0
+        self._closed = False
+        self._control_owner = None
+        self._control_lock = Lock()
 
 
 def _generate(engine, *, max_tokens, prompt=(1, 2, 3), materialize_each_step=False):

@@ -1,5 +1,6 @@
 from dataclasses import replace
 import struct
+from threading import Lock
 
 import jax
 import pytest
@@ -73,6 +74,9 @@ class _TinyEngine(LLMEngine):
         self.scheduler = Scheduler(config)
         self.model_runner = ModelRunner(config, params)
         self._next_seq_id = 0
+        self._closed = False
+        self._control_owner = None
+        self._control_lock = Lock()
 
 
 def _prefix_scheduler(*, max_num_seqs=1, max_num_resident_seqs=1):

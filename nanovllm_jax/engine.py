@@ -215,7 +215,7 @@ class LLMEngine:
                 raise RuntimeError("engine already has an active control owner")
             if not self.scheduler.is_finished():
                 raise RuntimeError(
-                    "engine control requires idle request queues; finish or cancel "
+                    "engine control requires an idle engine; finish or cancel "
                     "manually managed requests first"
                 )
             self._control_owner = owner
