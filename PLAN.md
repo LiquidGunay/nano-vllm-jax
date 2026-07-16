@@ -33,11 +33,13 @@ surface, and diagnostics will not be merged or cherry-picked wholesale.
   Larger models remain rejected until they have a real-weight test on suitable
   hardware.
 - The artifact workload is Qwen3.5-4B, BF16, batch 1, 64 prompt tokens, 64
-  greedy output tokens, and optional K=2 MTP on one A10G. A clean exact run
-  measured JAX base/MTP at `53.95/83.94` decode tok/s and vLLM 0.25.1
-  base/MTP at `50.32/86.82`. JAX MTP is `1.556x` its base and `1.668x`
+  greedy output tokens, and optional K=2 MTP on one A10G. The release run
+  measured JAX base/MTP at `53.94/82.64` decode tok/s and vLLM 0.25.1
+  base/MTP at `50.33/86.60`. JAX MTP is `1.532x` its base and `1.642x`
   vLLM without MTP. TTFT is reported separately; this is a steady-state
-  decode claim, not an end-to-end latency claim.
+  decode claim, not an end-to-end latency claim. Two output hashes differ at
+  one BF16 projection tie and are accepted only through content-addressed
+  full-vocabulary evidence with KL `0.000256` and JS `0.000064`.
 - B=1 is the speculative latency target. B=8 remains a non-regression lane for
   the ordinary engine; no B=1 optimization may silently replace the B=8 path.
 - JAX shape specialization is explicit in compile buckets and route keys. It
@@ -609,69 +611,53 @@ cost and lower 0.8B acceptance explain the weaker small-model gain.
 
 ## v0.1.0 Release Hardening
 
-Status: [ ] in progress from issue
+Status: [ ] implementation complete; review and release pending
 [#17](https://github.com/LiquidGunay/nano-vllm-jax/issues/17)
 
 Feature work is frozen. The remaining work makes the existing engine contract
 exact and releasable without adding another backend, model, route, benchmark,
-or CI workflow. The issue is a release epic, not one review diff.
+or CI workflow. The full hardening pass is one deliberately broad review diff,
+backed by the existing tests and the release gates below.
 
-### Release PR A: resource and request correctness
+### PR #18: complete release hardening
 
-Status: [ ] open as draft PR
-[#18](https://github.com/LiquidGunay/nano-vllm-jax/pull/18) at `787aece`
+Status: [ ] ready for review
+[#18](https://github.com/LiquidGunay/nano-vllm-jax/pull/18) at `e3f57a8`
 
-- Remove the orphaned full-attention NHD sidecar cache and allocation API.
-- Enumerate persistent target and predictor KV allocations and enforce the
-  declared byte cap against the arrays that actually exist.
-- Validate an offline batch completely before queue or sequence-id mutation.
-- Share strict token, sampling, and per-row capacity validation between
-  offline and HTTP entry points.
+- Remove the orphaned full-attention NHD sidecar cache and enumerate every
+  persistent target and predictor KV allocation under the declared byte cap.
+- Validate offline batches atomically and share strict token, sampling, and
+  pairwise capacity checks with HTTP admission.
+- Make offline, manual, and service stepping ownership explicit; add idempotent
+  engine cleanup and context-manager lifetime without a bound `atexit` root.
+- Make warmup block tables physically disjoint, skip impossible shapes
+  explicitly, and use token-bucket terminology.
+- Reduce server import-time runtime mutation and make service replacement and
+  shutdown order explicit.
+- Declare Python 3.11 and frozen `uv` installation as the reproducible runtime;
+  add the license and a restrained local check command, with no CI workflow.
+- Expand the style guide and land the small issue #17 cleanups that delete
+  concepts: dead branches, stable hashes, independent initializer keys,
+  accurate names/types, explicit token references, unique completion ids, and
+  narrow service protocols.
+- Record explicit release decisions for larger runner/executor/model/route
+  refactors that would add machinery without removing a live concept.
 
 The scheduler may still queue more work than can be resident simultaneously.
 Atomic admission means every request is individually valid before the batch is
 enqueued; it does not require aggregate simultaneous residency.
 
-### Release PR B: ownership and lifecycle
-
-Status: [ ] pending
-
-- Require a pristine engine for offline `generate()` and `iter_generate()`;
-  `add_request()` plus `step()` remains the explicit manual lifecycle.
-- Add explicit idempotent engine cleanup and context-manager ownership without
-  a bound process-lifetime `atexit` reference.
-- Make service replacement and shutdown ownership explicit.
-- Make warmup block tables physically disjoint and report capacity-skipped
-  combinations with token-bucket terminology.
-- Reduce server import-time runtime mutation through an explicit startup
-  factory where that can be done without lengthening the ordinary path.
-
-### Release PR C: packaging and bounded cleanup
-
-Status: [ ] pending
-
-- Declare Python 3.11 and the frozen `uv` environment as the reproducible
-  runtime contract; keep editable pip installation best-effort.
-- Add a top-level license and one restrained local CPU-safe check command.
-  CUDA validation and the benchmark remain explicit guarded commands; no CI is
-  added.
-- Expand `docs/style.md` with the distilled issue #17 ownership, mutation,
-  synchronization, resource-lifetime, and proof rules.
-- Land small, local P2 fixes that delete concepts: dead branches, stable prefix
-  hashing, independent initializer keys, accurate names/types, explicit token
-  references, unique completion ids, and narrow service protocols.
-- Triage larger runner/executor/model/route restructuring into focused
-  post-release issues or explicit declines when it would add more machinery
-  than it removes.
-
 ### Release acceptance
 
-Status: [ ] pending
+Status: [ ] merge and tag pending
 
-- Run the documented guarded CPU and CUDA correctness suites from a clean
-  checkout.
-- Rerun the four-route B=1 benchmark because Release PR A changes the persistent
-  device-memory path.
+- [x] Run the documented guarded CPU and CUDA correctness suites from a clean
+  checkout. The release tree passes the local check, 16 artifact-contract
+  tests, the complete guarded correctness shards, real-weight parity, and the
+  scaled CUDA end-to-end generation check.
+- [x] Rerun the four-route B=1 benchmark after changing persistent device-memory
+  ownership. All routes completed with zero measured JIT growth; peak guarded
+  system use was `9.73 GiB` and peak process RSS was `5.21 GiB`.
 - Record the final release revision, close the superseded style issue, resolve
   issue #17, and tag `v0.1.0`.
 
@@ -826,5 +812,9 @@ Do not transplant:
   concise provenance to the smaller-model diagnostics.
 - [x] Review and merge PR #16 at main commit `38c253b`, completing the original
   cleanup, artifact, and MTP promotion sequence.
-- [ ] Decide whether the next mainline pass should be prefix-cache ownership or
-  broader resident decode metadata cleanup.
+- [x] Expand PR #18 into the single issue #17 release-hardening review: resource
+  accounting, atomic admission, lifecycle/control ownership, server and warmup
+  cleanup, packaging/style decisions, and the content-addressed four-route
+  benchmark artifact. No CI workflow was added.
+- [ ] Review and merge PR #18, close the superseded release/style issues, and
+  tag the reviewed mainline revision as `v0.1.0`.
