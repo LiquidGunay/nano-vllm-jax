@@ -618,7 +618,8 @@ or CI workflow. The issue is a release epic, not one review diff.
 
 ### Release PR A: resource and request correctness
 
-Status: [ ] in progress on `agent/release-resource-admission`
+Status: [ ] open as draft PR
+[#18](https://github.com/LiquidGunay/nano-vllm-jax/pull/18) at `787aece`
 
 - Remove the orphaned full-attention NHD sidecar cache and allocation API.
 - Enumerate persistent target and predictor KV allocations and enforce the
