@@ -1,6 +1,6 @@
 # Mainline Cleanup and Speculative Decoding Plan
 
-Last updated: 2026-07-15
+Last updated: 2026-07-16
 
 ## Goal
 
@@ -606,6 +606,73 @@ base/MTP. Smaller non-claim diagnostics show the size trend:
 a valid parity result. JAX MTP was exact for all three sizes. The 0.8B JAX
 route beats its own base but not vLLM base; 2B and 4B beat both. Fixed boundary
 cost and lower 0.8B acceptance explain the weaker small-model gain.
+
+## v0.1.0 Release Hardening
+
+Status: [ ] in progress from issue
+[#17](https://github.com/LiquidGunay/nano-vllm-jax/issues/17)
+
+Feature work is frozen. The remaining work makes the existing engine contract
+exact and releasable without adding another backend, model, route, benchmark,
+or CI workflow. The issue is a release epic, not one review diff.
+
+### Release PR A: resource and request correctness
+
+Status: [ ] in progress on `agent/release-resource-admission`
+
+- Remove the orphaned full-attention NHD sidecar cache and allocation API.
+- Enumerate persistent target and predictor KV allocations and enforce the
+  declared byte cap against the arrays that actually exist.
+- Validate an offline batch completely before queue or sequence-id mutation.
+- Share strict token, sampling, and per-row capacity validation between
+  offline and HTTP entry points.
+
+The scheduler may still queue more work than can be resident simultaneously.
+Atomic admission means every request is individually valid before the batch is
+enqueued; it does not require aggregate simultaneous residency.
+
+### Release PR B: ownership and lifecycle
+
+Status: [ ] pending
+
+- Require a pristine engine for offline `generate()` and `iter_generate()`;
+  `add_request()` plus `step()` remains the explicit manual lifecycle.
+- Add explicit idempotent engine cleanup and context-manager ownership without
+  a bound process-lifetime `atexit` reference.
+- Make service replacement and shutdown ownership explicit.
+- Make warmup block tables physically disjoint and report capacity-skipped
+  combinations with token-bucket terminology.
+- Reduce server import-time runtime mutation through an explicit startup
+  factory where that can be done without lengthening the ordinary path.
+
+### Release PR C: packaging and bounded cleanup
+
+Status: [ ] pending
+
+- Declare Python 3.11 and the frozen `uv` environment as the reproducible
+  runtime contract; keep editable pip installation best-effort.
+- Add a top-level license and one restrained local CPU-safe check command.
+  CUDA validation and the benchmark remain explicit guarded commands; no CI is
+  added.
+- Expand `docs/style.md` with the distilled issue #17 ownership, mutation,
+  synchronization, resource-lifetime, and proof rules.
+- Land small, local P2 fixes that delete concepts: dead branches, stable prefix
+  hashing, independent initializer keys, accurate names/types, explicit token
+  references, unique completion ids, and narrow service protocols.
+- Triage larger runner/executor/model/route restructuring into focused
+  post-release issues or explicit declines when it would add more machinery
+  than it removes.
+
+### Release acceptance
+
+Status: [ ] pending
+
+- Run the documented guarded CPU and CUDA correctness suites from a clean
+  checkout.
+- Rerun the four-route B=1 benchmark because Release PR A changes the persistent
+  device-memory path.
+- Record the final release revision, close the superseded style issue, resolve
+  issue #17, and tag `v0.1.0`.
 
 ## Experimental Transplant Map
 
