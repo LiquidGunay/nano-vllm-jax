@@ -100,7 +100,7 @@ run_jax() {
 
 run_vllm() {
   local route=$1
-  PYTHONPATH="$root" guard_with \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH="$root" guard_with \
     "$vllm_env/bin/python" \
     "$artifact_root/results/vllm-$route.ram.json" \
     "$vllm_env/bin/python" -m benchmarks.run_benchmark vllm \
