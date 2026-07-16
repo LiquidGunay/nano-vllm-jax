@@ -18,6 +18,9 @@ structural decisions that are easy to lose in a large cleanup diff.
   model loading, service startup, and shutdown happen in `main()`.
 - Python 3.11 plus `uv.lock` is the reproducible environment. Local checks are
   intentionally not CI.
+- The A10G artifact runs base and K=2 MTP for JAX and vLLM from one clean
+  commit. Its only non-exact parity case is a content-addressed BF16 tie with
+  full-vocabulary KL/JS evidence; all other output drift fails.
 
 ## Audited And Retained
 

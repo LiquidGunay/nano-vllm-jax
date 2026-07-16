@@ -1,9 +1,10 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "benchmark_id": "qwen35-4b-b1-p64-o64-greedy-mtp2",
-  "benchmark_sha256": "0b8892a5d66ca2dd9d289a320e3bea76fdca5de232b581a00ea16dde68f1ff8d",
-  "recorded_at": "2026-07-15",
-  "implementation_commit": "f991b63c335260150f09113b0bb7cf7d4aa25cca",
+  "benchmark_sha256": "8c1f844a779702da9835ea013fa4491953240ecfa5995983b694f4056c53ed79",
+  "recorded_at": "2026-07-16",
+  "implementation_commit": "1b00c5e31e04e09123d99b5552365f753d7b627c",
+  "parity_evidence_sha256": "c964bb7de62b1a2e777693ea510e983bb929565ed331bd6d226f8c5d3df34912",
   "hardware": {
     "gpu": "NVIDIA A10G",
     "gpu_uuid": "GPU-e5dec035-32bc-c974-42bc-ad80b6fd3553",
@@ -14,6 +15,7 @@
     "jax_base": {
       "valid": true,
       "reference_exact": null,
+      "reference_adjudicated": false,
       "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
       "framework": {
         "jax": "0.10.0",
@@ -22,21 +24,22 @@
         "triton": "3.6.0"
       },
       "samples": [
-        {"ttft_seconds": 0.12429690198041499, "decode_tokens_per_second": 53.95256882925237},
-        {"ttft_seconds": 0.12418342009186745, "decode_tokens_per_second": 53.9183774177377},
-        {"ttft_seconds": 0.12445161584764719, "decode_tokens_per_second": 53.966977931854835}
+        {"ttft_seconds": 0.12437176401726902, "decode_tokens_per_second": 53.92601966388173},
+        {"ttft_seconds": 0.12437251186929643, "decode_tokens_per_second": 53.94270871105017},
+        {"ttft_seconds": 0.12443214491941035, "decode_tokens_per_second": 53.94347926965144}
       ],
-      "median_ttft_seconds": 0.12429690198041499,
-      "median_decode_tokens_per_second": 53.95256882925237,
-      "relative_spread": 0.0009008007435372146,
+      "median_ttft_seconds": 0.12437251186929643,
+      "median_decode_tokens_per_second": 53.94270871105017,
+      "relative_spread": 0.00032366942978768375,
       "measured_executor_route_cache_growth": 0,
-      "guard_peak_process_tree_rss_bytes": 3003199488,
+      "guard_peak_process_tree_rss_bytes": 2985361408,
       "max_observed_device_used_bytes": 18667798528
     },
     "jax_mtp": {
       "valid": true,
-      "reference_exact": true,
-      "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
+      "reference_exact": false,
+      "reference_adjudicated": true,
+      "output_sha256": "7823dab0ed16a15d2a16aa8b0f2c1736bb126d93e50a9faa1e8a48dceb5b163c",
       "framework": {
         "jax": "0.10.0",
         "jaxlib": "0.10.0",
@@ -44,24 +47,25 @@
         "triton": "3.6.0"
       },
       "samples": [
-        {"ttft_seconds": 0.12975622597150505, "decode_tokens_per_second": 83.9376670034473},
-        {"ttft_seconds": 0.1296198528725654, "decode_tokens_per_second": 83.8436377714318},
-        {"ttft_seconds": 0.12966951518319547, "decode_tokens_per_second": 84.06693263757498}
+        {"ttft_seconds": 0.12984770513139665, "decode_tokens_per_second": 83.67670035528099},
+        {"ttft_seconds": 0.12969039101153612, "decode_tokens_per_second": 82.63670817270388},
+        {"ttft_seconds": 0.1300782090984285, "decode_tokens_per_second": 82.23112732116664}
       ],
-      "median_ttft_seconds": 0.12966951518319547,
-      "median_decode_tokens_per_second": 83.9376670034473,
-      "relative_spread": 0.002660246276966538,
+      "median_ttft_seconds": 0.12984770513139665,
+      "median_decode_tokens_per_second": 82.63670817270388,
+      "relative_spread": 0.017493110096946488,
       "draft_tokens_per_repeat": 50,
       "accepted_draft_tokens_per_repeat": 36,
       "verified_target_tokens_per_repeat": 75,
       "measured_executor_route_cache_growth": 0,
-      "guard_peak_process_tree_rss_bytes": 3390173184,
+      "guard_peak_process_tree_rss_bytes": 3196272640,
       "max_observed_device_used_bytes": 18680381440
     },
     "vllm_base": {
       "valid": true,
-      "reference_exact": true,
-      "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
+      "reference_exact": false,
+      "reference_adjudicated": true,
+      "output_sha256": "7823dab0ed16a15d2a16aa8b0f2c1736bb126d93e50a9faa1e8a48dceb5b163c",
       "framework": {
         "vllm": "0.25.1",
         "torch": "2.11.0",
@@ -69,19 +73,20 @@
         "triton": "3.6.0"
       },
       "samples": [
-        {"ttft_seconds": 0.05183553695678711, "decode_tokens_per_second": 50.321436005905184},
-        {"ttft_seconds": 0.05728316307067871, "decode_tokens_per_second": 50.322690579798035},
-        {"ttft_seconds": 0.05170273780822754, "decode_tokens_per_second": 50.31492880588558}
+        {"ttft_seconds": 0.053417205810546875, "decode_tokens_per_second": 50.328066497138394},
+        {"ttft_seconds": 0.05076289176940918, "decode_tokens_per_second": 50.34344806971564},
+        {"ttft_seconds": 0.05018210411071777, "decode_tokens_per_second": 50.33386379480532}
       ],
-      "median_ttft_seconds": 0.05183553695678711,
-      "median_decode_tokens_per_second": 50.321436005905184,
-      "relative_spread": 0.00015424388746667345,
-      "guard_peak_process_tree_rss_bytes": 4761927680,
+      "median_ttft_seconds": 0.05076289176940918,
+      "median_decode_tokens_per_second": 50.33386379480532,
+      "relative_spread": 0.0003055909365502541,
+      "guard_peak_process_tree_rss_bytes": 5076574208,
       "max_observed_device_used_bytes": 9543090176
     },
     "vllm_mtp": {
       "valid": true,
       "reference_exact": true,
+      "reference_adjudicated": false,
       "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
       "framework": {
         "vllm": "0.25.1",
@@ -90,26 +95,31 @@
         "triton": "3.6.0"
       },
       "samples": [
-        {"ttft_seconds": 0.06968450546264648, "decode_tokens_per_second": 86.82285995409659},
-        {"ttft_seconds": 0.0718533992767334, "decode_tokens_per_second": 87.11265117445105},
-        {"ttft_seconds": 0.05652117729187012, "decode_tokens_per_second": 86.75859202600388}
+        {"ttft_seconds": 0.06077718734741211, "decode_tokens_per_second": 86.59635204019074},
+        {"ttft_seconds": 0.06262421607971191, "decode_tokens_per_second": 86.48891988238626},
+        {"ttft_seconds": 0.06481194496154785, "decode_tokens_per_second": 86.71394947945593}
       ],
-      "median_ttft_seconds": 0.06968450546264648,
-      "median_decode_tokens_per_second": 86.82285995409659,
-      "relative_spread": 0.004077948464659597,
+      "median_ttft_seconds": 0.06262421607971191,
+      "median_decode_tokens_per_second": 86.59635204019074,
+      "relative_spread": 0.002598603656713374,
       "draft_tokens_per_repeat": 51,
       "accepted_draft_tokens_per_repeat": 36,
-      "guard_peak_process_tree_rss_bytes": 5203382272,
+      "guard_peak_process_tree_rss_bytes": 5596160000,
       "max_observed_device_used_bytes": 9771679744
     }
   },
   "comparison": {
-    "jax_base_over_vllm_base": 1.072158767943766,
-    "jax_mtp_over_jax_base": 1.5557677572145074,
-    "vllm_mtp_over_vllm_base": 1.725365308412661,
-    "jax_mtp_over_vllm_base": 1.6680300417817424,
-    "jax_mtp_over_vllm_mtp": 0.9667692016575509,
+    "jax_base_over_vllm_base": 1.0716981499961324,
+    "jax_mtp_over_jax_base": 1.5319347164295392,
+    "vllm_mtp_over_vllm_base": 1.7204391936453698,
+    "jax_mtp_over_vllm_base": 1.6417716015123869,
+    "jax_mtp_over_vllm_mtp": 0.9542747035620031,
     "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
-    "output_exact": true
+    "observed_output_sha256": [
+      "7823dab0ed16a15d2a16aa8b0f2c1736bb126d93e50a9faa1e8a48dceb5b163c",
+      "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde"
+    ],
+    "output_exact": false,
+    "adjudicated_routes": ["jax_mtp", "vllm_base"]
   }
 }

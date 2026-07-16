@@ -350,7 +350,7 @@ def test_recorded_result_matches_the_manifest():
         "jax_base": (None, False),
         "jax_mtp": (False, True),
         "vllm_base": (False, True),
-        "vllm_mtp": (False, True),
+        "vllm_mtp": (True, False),
     }
     speeds = {}
     output_hashes = set()
@@ -378,7 +378,6 @@ def test_recorded_result_matches_the_manifest():
     assert recorded["comparison"]["adjudicated_routes"] == [
         "jax_mtp",
         "vllm_base",
-        "vllm_mtp",
     ]
 
     expected_ratios = {
