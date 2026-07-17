@@ -1,10 +1,10 @@
 {
   "schema_version": 3,
   "benchmark_id": "qwen35-4b-b1-p64-o64-greedy-mtp2",
-  "benchmark_sha256": "dc31043bf178b154a1ec17c719c0726a08ae8fb3d28b97969cf694ab4adb8259",
+  "benchmark_sha256": "11fee57f45721013bf307c5f404fe8f6916f24d9ae78bc47c40417525db77457",
   "recorded_at": "2026-07-16",
   "implementation_commit": "1b00c5e31e04e09123d99b5552365f753d7b627c",
-  "parity_evidence_sha256": "23a6f4f2e3ff60f8127fd8b9acd7356839799ff839d6a3a2c5f16c411ca51e9c",
+  "parity_evidence_sha256": "b1c2ac09d9cc93b377b99b63162fb203d7b35ae4276d35a1533f693c49260461",
   "hardware": {
     "gpu": "NVIDIA A10G",
     "gpu_uuid": "GPU-e5dec035-32bc-c974-42bc-ad80b6fd3553",

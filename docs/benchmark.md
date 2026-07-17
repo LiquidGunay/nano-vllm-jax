@@ -95,8 +95,8 @@ different drafted totals reflect different tail grouping; both accepted 36
 draft tokens.
 
 At the one mismatch, the measured bidirectional KL is at most
-`2.57e-4`, JS is `6.41e-5`, and total variation is `0.0103`. The base
-full-precision logits favor token 8343 by only `0.0673`; both candidates round
+`1.50e-4`, JS is `3.73e-5`, and total variation is `0.0080`. The base
+full-precision logits favor token 8343 by only `0.0796`; both candidates round
 to `24.375` in its BF16 reduction. The packed distribution rounds them to
 `24.375` and `24.25`. Fresh compiled processes can therefore choose either
 named output without changing the accepted-prefix or state-commit contract.

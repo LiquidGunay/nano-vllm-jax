@@ -12,19 +12,19 @@
     }
   ],
   "diagnostic": {
-    "captured_at": "2026-07-16",
-    "implementation_commit": "c1533174ffd120ad201bda9189d0e1e8d31262eb",
+    "captured_at": "2026-07-17",
+    "implementation_commit": "fbeabed4d65cd7a89ce6337508bf07b272ab5586",
     "hardware": "NVIDIA A10G",
     "full_vocabulary": true,
     "runtime_source_sha256": "06a07d3e95ebce5916195fc5e47ae84e006a52927370c7b4e413a19d3a464d50",
-    "kl_reference_to_variant": 0.0002562179207149339,
-    "kl_variant_to_reference": 0.0002560357732755577,
-    "jensen_shannon": 0.00006403002531177811,
-    "total_variation": 0.010262839409441544,
-    "centered_logit_rms": 0.015371944791330432,
+    "kl_reference_to_variant": 0.00014908621968294546,
+    "kl_variant_to_reference": 0.0001488940911361341,
+    "jensen_shannon": 0.0000372469434981444,
+    "total_variation": 0.008022780216568073,
+    "centered_logit_rms": 0.01598654030032893,
     "reference_logits": {
-      "5129": 24.3483943939209,
-      "8343": 24.415727615356445
+      "5129": 24.337255477905273,
+      "8343": 24.416812896728516
     },
     "variant_logits": {
       "5129": 24.30021095275879,
