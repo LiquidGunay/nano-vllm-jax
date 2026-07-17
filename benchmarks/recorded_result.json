@@ -2,8 +2,8 @@
   "schema_version": 3,
   "benchmark_id": "qwen35-4b-b1-p64-o64-greedy-mtp2",
   "benchmark_sha256": "11fee57f45721013bf307c5f404fe8f6916f24d9ae78bc47c40417525db77457",
-  "recorded_at": "2026-07-16",
-  "implementation_commit": "1b00c5e31e04e09123d99b5552365f753d7b627c",
+  "recorded_at": "2026-07-17",
+  "implementation_commit": "bdd3df8c18793eb98c782d4ce359eb79d1f4cbfb",
   "parity_evidence_sha256": "b1c2ac09d9cc93b377b99b63162fb203d7b35ae4276d35a1533f693c49260461",
   "hardware": {
     "gpu": "NVIDIA A10G",
@@ -24,15 +24,15 @@
         "triton": "3.6.0"
       },
       "samples": [
-        {"ttft_seconds": 0.12437176401726902, "decode_tokens_per_second": 53.92601966388173},
-        {"ttft_seconds": 0.12437251186929643, "decode_tokens_per_second": 53.94270871105017},
-        {"ttft_seconds": 0.12443214491941035, "decode_tokens_per_second": 53.94347926965144}
+        {"ttft_seconds": 0.12429571199754719, "decode_tokens_per_second": 53.97561921285671},
+        {"ttft_seconds": 0.12433071400300832, "decode_tokens_per_second": 53.97875528820354},
+        {"ttft_seconds": 0.12448324700380908, "decode_tokens_per_second": 53.97457273322765}
       ],
-      "median_ttft_seconds": 0.12437251186929643,
-      "median_decode_tokens_per_second": 53.94270871105017,
-      "relative_spread": 0.00032366942978768375,
+      "median_ttft_seconds": 0.12433071400300832,
+      "median_decode_tokens_per_second": 53.97561921285671,
+      "relative_spread": 0.00007748970807337737,
       "measured_executor_route_cache_growth": 0,
-      "guard_peak_process_tree_rss_bytes": 2985361408,
+      "guard_peak_process_tree_rss_bytes": 3029012480,
       "max_observed_device_used_bytes": 18667798528
     },
     "jax_mtp": {
@@ -47,18 +47,18 @@
         "triton": "3.6.0"
       },
       "samples": [
-        {"ttft_seconds": 0.12984770513139665, "decode_tokens_per_second": 83.67670035528099},
-        {"ttft_seconds": 0.12969039101153612, "decode_tokens_per_second": 82.63670817270388},
-        {"ttft_seconds": 0.1300782090984285, "decode_tokens_per_second": 82.23112732116664}
+        {"ttft_seconds": 0.12967085000127554, "decode_tokens_per_second": 83.06340977341755},
+        {"ttft_seconds": 0.1300379050007905, "decode_tokens_per_second": 83.39709350018755},
+        {"ttft_seconds": 0.12974598700384377, "decode_tokens_per_second": 83.49818326625127}
       ],
-      "median_ttft_seconds": 0.12984770513139665,
-      "median_decode_tokens_per_second": 82.63670817270388,
-      "relative_spread": 0.017493110096946488,
+      "median_ttft_seconds": 0.12974598700384377,
+      "median_decode_tokens_per_second": 83.39709350018755,
+      "relative_spread": 0.005213293108743048,
       "draft_tokens_per_repeat": 50,
       "accepted_draft_tokens_per_repeat": 36,
       "verified_target_tokens_per_repeat": 75,
       "measured_executor_route_cache_growth": 0,
-      "guard_peak_process_tree_rss_bytes": 3196272640,
+      "guard_peak_process_tree_rss_bytes": 3224543232,
       "max_observed_device_used_bytes": 18680381440
     },
     "vllm_base": {
@@ -73,14 +73,14 @@
         "triton": "3.6.0"
       },
       "samples": [
-        {"ttft_seconds": 0.053417205810546875, "decode_tokens_per_second": 50.328066497138394},
-        {"ttft_seconds": 0.05076289176940918, "decode_tokens_per_second": 50.34344806971564},
-        {"ttft_seconds": 0.05018210411071777, "decode_tokens_per_second": 50.33386379480532}
+        {"ttft_seconds": 0.05367684364318848, "decode_tokens_per_second": 50.319984662828524},
+        {"ttft_seconds": 0.05186867713928223, "decode_tokens_per_second": 50.347505716806396},
+        {"ttft_seconds": 0.051192522048950195, "decode_tokens_per_second": 50.33527141830163}
       ],
-      "median_ttft_seconds": 0.05076289176940918,
-      "median_decode_tokens_per_second": 50.33386379480532,
-      "relative_spread": 0.0003055909365502541,
-      "guard_peak_process_tree_rss_bytes": 5076574208,
+      "median_ttft_seconds": 0.05186867713928223,
+      "median_decode_tokens_per_second": 50.33527141830163,
+      "relative_spread": 0.0005467548540498122,
+      "guard_peak_process_tree_rss_bytes": 7033401344,
       "max_observed_device_used_bytes": 9543090176
     },
     "vllm_mtp": {
@@ -95,25 +95,25 @@
         "triton": "3.6.0"
       },
       "samples": [
-        {"ttft_seconds": 0.06077718734741211, "decode_tokens_per_second": 86.59635204019074},
-        {"ttft_seconds": 0.06262421607971191, "decode_tokens_per_second": 86.48891988238626},
-        {"ttft_seconds": 0.06481194496154785, "decode_tokens_per_second": 86.71394947945593}
+        {"ttft_seconds": 0.05898451805114746, "decode_tokens_per_second": 86.62249809344434},
+        {"ttft_seconds": 0.06041693687438965, "decode_tokens_per_second": 86.62961862617317},
+        {"ttft_seconds": 0.057541847229003906, "decode_tokens_per_second": 86.60883038011713}
       ],
-      "median_ttft_seconds": 0.06262421607971191,
-      "median_decode_tokens_per_second": 86.59635204019074,
-      "relative_spread": 0.002598603656713374,
+      "median_ttft_seconds": 0.05898451805114746,
+      "median_decode_tokens_per_second": 86.62249809344434,
+      "relative_spread": 0.00023998668375526741,
       "draft_tokens_per_repeat": 51,
       "accepted_draft_tokens_per_repeat": 36,
-      "guard_peak_process_tree_rss_bytes": 5596160000,
+      "guard_peak_process_tree_rss_bytes": 3523219456,
       "max_observed_device_used_bytes": 9771679744
     }
   },
   "comparison": {
-    "jax_base_over_vllm_base": 1.0716981499961324,
-    "jax_mtp_over_jax_base": 1.5319347164295392,
-    "vllm_mtp_over_vllm_base": 1.7204391936453698,
-    "jax_mtp_over_vllm_base": 1.6417716015123869,
-    "jax_mtp_over_vllm_mtp": 0.9542747035620031,
+    "jax_base_over_vllm_base": 1.0723220058615093,
+    "jax_mtp_over_jax_base": 1.5450882216154884,
+    "vllm_mtp_over_vllm_base": 1.7209105196549883,
+    "jax_mtp_over_vllm_base": 1.6568321010357128,
+    "jax_mtp_over_vllm_mtp": 0.9627648167133512,
     "output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
     "observed_output_sha256": [
       "7823dab0ed16a15d2a16aa8b0f2c1736bb126d93e50a9faa1e8a48dceb5b163c",

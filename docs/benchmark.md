@@ -2,10 +2,10 @@
 
 This repository makes one deliberately small performance claim:
 
-> On an NVIDIA A10G, persistent K=2 MTP raises Nano-VLLM-JAX from 53.94
-> to 82.64 decode tok/s on the pinned Qwen3.5-4B B=1 workload. That is
-> 1.532x its base route and 1.642x vLLM 0.25.1 without MTP. vLLM with
-> K=2 MTP reaches 86.60 decode tok/s on the same workload.
+> On an NVIDIA A10G, persistent K=2 MTP raises Nano-VLLM-JAX from 53.98
+> to 83.40 decode tok/s on the pinned Qwen3.5-4B B=1 workload. That is
+> 1.545x its base route and 1.657x vLLM 0.25.1 without MTP. vLLM with
+> K=2 MTP reaches 86.62 decode tok/s on the same workload.
 
 The four routes produced one of two content-addressed outputs. They differ only
 at output index 44, where BF16 rounding can select token 5129 or 8343. The
@@ -79,17 +79,17 @@ unreported rather than inferred.
 
 These values come from the committed
 [recorded result](../benchmarks/recorded_result.json), measured at implementation
-commit `1b00c5e` on 2026-07-16. The two admitted output hashes are
+commit `bdd3df8` on 2026-07-17. The two admitted output hashes are
 `9d0a61c9...2c32bde` and `7823dab0...5b163c`.
 
 | Framework | Route | Decode tok/s | Own-base ratio | vLLM-base ratio | Median TTFT | Accepted / drafted | Parity |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Nano-VLLM-JAX | base | 53.94 | 1.000x | 1.072x | 124.4 ms | — | reference |
-| Nano-VLLM-JAX | MTP K=2 | 82.64 | 1.532x | 1.642x | 129.8 ms | 36 / 50 | near-tie variant |
-| vLLM 0.25.1 | base | 50.33 | 1.000x | 1.000x | 50.8 ms | — | near-tie variant |
-| vLLM 0.25.1 | MTP K=2 | 86.60 | 1.720x | 1.720x | 62.6 ms | 36 / 51 | reference |
+| Nano-VLLM-JAX | base | 53.98 | 1.000x | 1.072x | 124.3 ms | — | reference |
+| Nano-VLLM-JAX | MTP K=2 | 83.40 | 1.545x | 1.657x | 129.7 ms | 36 / 50 | near-tie variant |
+| vLLM 0.25.1 | base | 50.34 | 1.000x | 1.000x | 51.9 ms | — | near-tie variant |
+| vLLM 0.25.1 | MTP K=2 | 86.62 | 1.721x | 1.721x | 59.0 ms | 36 / 51 | reference |
 
-JAX MTP is 0.954x vLLM MTP on this lane. JAX evaluated 75 target positions
+JAX MTP is 0.963x vLLM MTP on this lane. JAX evaluated 75 target positions
 per repeat and added no executor route-cache entries during measurement. The
 different drafted totals reflect different tail grouping; both accepted 36
 draft tokens.
@@ -102,11 +102,11 @@ to `24.375` in its BF16 reduction. The packed distribution rounds them to
 named output without changing the accepted-prefix or state-commit contract.
 
 The GPU was an NVIDIA A10G (22.5 GiB) with driver 580.159.03. The RAM guard
-observed peak process-tree RSS of 2.78, 2.98, 4.73, and 5.21 GiB
+observed peak process-tree RSS of 2.82, 3.00, 6.55, and 3.28 GiB
 for JAX base, JAX MTP, vLLM base, and vLLM MTP respectively. The corresponding
 largest sampled device use was 17.39, 17.40, 8.89, and 9.10 GiB. These device
 samples are not execution peaks. JAX's declared persistent allocation grows by
-about 231 MiB when MTP is enabled. Peak guarded system use was 9.73 GiB.
+about 231 MiB when MTP is enabled. Peak guarded system use was 5.89 GiB.
 
 This is a steady-state decode-throughput claim, not a TTFT or end-to-end
 latency claim. Raw result and guard JSON stay outside the repository under
