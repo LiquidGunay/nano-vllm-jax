@@ -1,6 +1,6 @@
 # Mainline Cleanup and Speculative Decoding Plan
 
-Last updated: 2026-07-16
+Last updated: 2026-07-17
 
 ## Goal
 
@@ -34,12 +34,12 @@ surface, and diagnostics will not be merged or cherry-picked wholesale.
   hardware.
 - The artifact workload is Qwen3.5-4B, BF16, batch 1, 64 prompt tokens, 64
   greedy output tokens, and optional K=2 MTP on one A10G. The release run
-  measured JAX base/MTP at `53.94/82.64` decode tok/s and vLLM 0.25.1
-  base/MTP at `50.33/86.60`. JAX MTP is `1.532x` its base and `1.642x`
+  measured JAX base/MTP at `53.98/83.40` decode tok/s and vLLM 0.25.1
+  base/MTP at `50.34/86.62`. JAX MTP is `1.545x` its base and `1.657x`
   vLLM without MTP. TTFT is reported separately; this is a steady-state
   decode claim, not an end-to-end latency claim. Two output hashes differ at
   one BF16 projection tie and are accepted only through content-addressed
-  full-vocabulary evidence with KL `0.000256` and JS `0.000064`.
+  full-vocabulary evidence with KL `0.000149` and JS `0.000037`.
 - B=1 is the speculative latency target. B=8 remains a non-regression lane for
   the ordinary engine; no B=1 optimization may silently replace the B=8 path.
 - JAX shape specialization is explicit in compile buckets and route keys. It
@@ -611,7 +611,7 @@ cost and lower 0.8B acceptance explain the weaker small-model gain.
 
 ## v0.1.0 Release Hardening
 
-Status: [ ] implementation complete; review and release pending
+Status: [x] implementation complete; [ ] review and release pending
 [#17](https://github.com/LiquidGunay/nano-vllm-jax/issues/17)
 
 Feature work is frozen. The remaining work makes the existing engine contract
@@ -621,8 +621,8 @@ backed by the existing tests and the release gates below.
 
 ### PR #18: complete release hardening
 
-Status: [ ] ready for review
-[#18](https://github.com/LiquidGunay/nano-vllm-jax/pull/18) at `e3f57a8`
+Status: [ ] ready for re-review
+[#18](https://github.com/LiquidGunay/nano-vllm-jax/pull/18) at `a568ce5`
 
 - Remove the orphaned full-attention NHD sidecar cache and enumerate every
   persistent target and predictor KV allocation under the declared byte cap.
@@ -642,6 +642,13 @@ Status: [ ] ready for review
   narrow service protocols.
 - Record explicit release decisions for larger runner/executor/model/route
   refactors that would add machinery without removing a live concept.
+- Preserve each service submission boundary through atomic worker admission;
+  cover warmup and commit with the single-writer lease; release offline
+  ownership before the terminal event; and make close best-effort across
+  cleanup failures.
+- Warm every reachable static decode width with disjoint live prefixes rather
+  than allocating unique padding pages. Bind bounded parity evidence to the
+  runtime-source digest and run the local check through the frozen environment.
 
 The scheduler may still queue more work than can be resident simultaneously.
 Atomic admission means every request is individually valid before the batch is
@@ -652,12 +659,13 @@ enqueued; it does not require aggregate simultaneous residency.
 Status: [ ] merge and tag pending
 
 - [x] Run the documented guarded CPU and CUDA correctness suites from a clean
-  checkout. The release tree passes the local check, 16 artifact-contract
-  tests, the complete guarded correctness shards, real-weight parity, and the
-  scaled CUDA end-to-end generation check.
+  checkout. The release tree passes the 111-test local check, 17
+  artifact-contract tests, the complete guarded correctness shards,
+  real-weight parity, and the scaled CUDA end-to-end generation check.
 - [x] Rerun the four-route B=1 benchmark after changing persistent device-memory
-  ownership. All routes completed with zero measured JIT growth; peak guarded
-  system use was `9.73 GiB` and peak process RSS was `5.21 GiB`.
+  ownership. Both JAX routes completed with zero measured executor-cache
+  growth; peak guarded system use was `5.89 GiB` and peak process-tree RSS was
+  `6.55 GiB`.
 - Record the final release revision, close the superseded style issue, resolve
   issue #17, and tag `v0.1.0`.
 
@@ -816,5 +824,9 @@ Do not transplant:
   accounting, atomic admission, lifecycle/control ownership, server and warmup
   cleanup, packaging/style decisions, and the content-addressed four-route
   benchmark artifact. No CI workflow was added.
+- [x] Address the PR #18 boundary review at `a568ce5`: atomic service batches,
+  complete lease coverage, terminal cleanup ordering, reachable warmup layouts,
+  frozen expanded local checks, runtime-bound parity evidence, and a fresh
+  guarded four-route result.
 - [ ] Review and merge PR #18, close the superseded release/style issues, and
   tag the reviewed mainline revision as `v0.1.0`.
