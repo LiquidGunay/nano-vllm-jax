@@ -85,7 +85,7 @@ def _bare_engine(*, block_size: int = 2, num_blocks: int = 3) -> LLMEngine:
 def _commit(scheduler: Scheduler, seqs, plan, rows):
     engine = object.__new__(LLMEngine)
     engine.scheduler = scheduler
-    return engine.commit(seqs, plan, RunResult.from_rows(rows))
+    return engine._commit(seqs, plan, RunResult.from_rows(rows))
 
 
 def test_capacity_is_reserved_before_generation_and_never_preempted():
@@ -161,11 +161,24 @@ def test_control_lease_guards_every_mutating_entrypoint():
         engine.add_request([1], SamplingParams(max_tokens=1))
     with pytest.raises(RuntimeError, match="active control owner"):
         engine.step()
+    with pytest.raises(RuntimeError, match="active control owner"):
+        engine.commit([], None, RunResult.from_rows([]))
+    with pytest.raises(RuntimeError, match="active control owner"):
+        engine.warmup_compilation()
 
     admitted = engine.add_request([1], SamplingParams(max_tokens=1), owner=owner)
     assert admitted.seq_id == 0
     engine.cancel_request(admitted, owner=owner)
     engine.release_control(owner)
+
+
+def test_control_lease_rejects_none_owner():
+    engine = _bare_engine()
+
+    with pytest.raises(ValueError, match="cannot be None"):
+        engine.claim_control(None)
+
+    assert engine._control_owner is None
 
 
 def test_control_lease_rejects_preexisting_manual_requests():
@@ -237,6 +250,31 @@ def test_sampling_params_reject_ambiguous_values(factory):
 
 def test_sampling_params_default_to_greedy():
     assert SamplingParams().temperature == 0.0
+
+
+def test_close_drops_heavy_state_even_when_request_release_fails():
+    def fail_release(_seq_ids):
+        raise RuntimeError("release failed")
+
+    engine = _bare_engine()
+    engine.params = object()
+    engine.mtp_params = object()
+    engine.tokenizer = object()
+    engine.model_runner = SimpleNamespace(
+        release=fail_release,
+        release_prefix_hybrid_states=lambda _handles: None,
+    )
+    seq = engine.add_request([1], SamplingParams(max_tokens=1))
+
+    with pytest.raises(RuntimeError, match="release failed"):
+        engine.close()
+
+    assert engine._closed
+    assert seq.is_finished
+    assert engine.scheduler.is_finished()
+    for name in ("model_runner", "params", "mtp_params", "tokenizer"):
+        assert not hasattr(engine, name)
+    engine.close()
 
 
 def test_future_capacity_reservation_does_not_evict_cached_prefix():

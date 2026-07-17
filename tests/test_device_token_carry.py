@@ -1,6 +1,7 @@
 """Focused tests for deferred greedy token materialization."""
 
 from dataclasses import replace
+from threading import Lock
 from types import SimpleNamespace
 
 import jax.numpy as jnp
@@ -15,6 +16,15 @@ from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.sequence import SamplingParams, Sequence
 from nanovllm_jax.step import RunResult
 from tests.runtime_specs import runtime_spec
+
+
+def _commit_engine(scheduler: Scheduler) -> LLMEngine:
+    engine = object.__new__(LLMEngine)
+    engine.scheduler = scheduler
+    engine._closed = False
+    engine._control_owner = None
+    engine._control_lock = Lock()
+    return engine
 
 
 def _batch_materializer(
@@ -563,8 +573,7 @@ def test_scheduler_resident_capacity_can_exceed_execution_batch():
     assert first_decode.bucket.batch_size == 2
     assert len(scheduler.waiting) == 2
 
-    engine = object.__new__(LLMEngine)
-    engine.scheduler = scheduler
+    engine = _commit_engine(scheduler)
     engine.commit(first_decode_seqs, first_decode, RunResult.from_rows([101, 102]))
     assert len(scheduler.running) == 0
 
@@ -864,8 +873,7 @@ def test_engine_commit_materializes_untyped_device_scalar(monkeypatch):
         seq_id=7,
     )
 
-    engine = object.__new__(LLMEngine)
-    engine.scheduler = scheduler
+    engine = _commit_engine(scheduler)
     result = engine.commit(
         [seq],
         SimpleNamespace(is_prefill=False, num_scheduled_tokens=1),
@@ -896,8 +904,7 @@ def test_engine_commit_can_defer_sampled_device_token_ref(monkeypatch):
     )
     token_vector = jnp.asarray([202], dtype=jnp.int32)
 
-    engine = object.__new__(LLMEngine)
-    engine.scheduler = scheduler
+    engine = _commit_engine(scheduler)
     result = engine.commit(
         [seq],
         SimpleNamespace(is_prefill=False, num_scheduled_tokens=1),

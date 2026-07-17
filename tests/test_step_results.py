@@ -100,10 +100,10 @@ class _Engine(LLMEngine):
         self._control_lock = Lock()
         self.trace = trace
 
-    def commit(self, seqs, schedule_plan, run_result):
+    def _commit(self, seqs, schedule_plan, run_result):
         if self.trace is not None:
             self.trace.append("commit")
-        return super().commit(seqs, schedule_plan, run_result)
+        return super()._commit(seqs, schedule_plan, run_result)
 
 
 def test_step_executes_then_commits_one_typed_transition():
@@ -219,3 +219,46 @@ def test_iter_generate_attributes_step_counters_once():
     assert [event["verified_target_tokens"] for event in tokens] == [0, 3, 0, 0]
     assert [event["draft_tokens"] for event in tokens] == [0, 2, 0, 0]
     assert [event["accepted_draft_tokens"] for event in tokens] == [0, 2, 0, 0]
+
+
+def test_done_event_releases_offline_control_before_it_is_observed():
+    config = _config()
+    engine = _Engine(config, _Runner([[101], [102]]))
+    engine.detokenize = lambda token_ids: " ".join(map(str, token_ids))
+    stream = engine.iter_generate(
+        [[1, 2]],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        include_text=False,
+    )
+
+    for event in stream:
+        if event["event"] == "done":
+            break
+
+    assert engine._control_owner is None
+    result = engine.generate(
+        [[3, 4]],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        use_tqdm=False,
+    )
+    assert result[0]["token_ids"] == [102]
+
+
+def test_cleanup_failure_still_releases_offline_control():
+    class CleanupFailRunner(_Runner):
+        def release(self, seq_ids):
+            raise RuntimeError("cleanup failed")
+
+    engine = _Engine(_config(), CleanupFailRunner([]))
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        engine.generate(
+            [[1, 2]],
+            SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+            use_tqdm=False,
+        )
+
+    assert engine._control_owner is None
+    owner = object()
+    engine.claim_control(owner)
+    engine.release_control(owner)

@@ -459,6 +459,8 @@ class ModelRunner:
                 capacity_reason = self._warmup_capacity_reason(
                     int(batch_size),
                     int(self.max_blocks_per_seq),
+                    is_prefill=True,
+                    token_bucket=int(token_bucket),
                 )
                 if capacity_reason is not None:
                     summary["prefill_skipped"].append(
@@ -535,6 +537,8 @@ class ModelRunner:
                     capacity_reason = self._warmup_capacity_reason(
                         int(batch_size),
                         int(block_table_width),
+                        is_prefill=False,
+                        token_bucket=1,
                     )
                     if capacity_reason is not None:
                         summary["decode_skipped"].append(
@@ -568,6 +572,8 @@ class ModelRunner:
                 capacity_reason = self._warmup_capacity_reason(
                     int(batch_size),
                     int(block_table_width),
+                    is_prefill=False,
+                    token_bucket=1,
                 )
                 if capacity_reason is not None:
                     summary["decode_skipped"].append(
@@ -671,18 +677,29 @@ class ModelRunner:
         max_blocks_per_seq: int | None = None,
     ) -> DeviceBatch:
         block_table_width = int(max_blocks_per_seq or self.max_blocks_per_seq)
-        capacity_reason = self._warmup_capacity_reason(batch_size, block_table_width)
+        capacity_reason = self._warmup_capacity_reason(
+            batch_size,
+            block_table_width,
+            is_prefill=is_prefill,
+            token_bucket=token_bucket,
+        )
         if capacity_reason is not None:
             raise ValueError(capacity_reason)
+        seq_lens, live_block_counts = self._warmup_live_layout(
+            batch_size,
+            block_table_width,
+            is_prefill=is_prefill,
+            token_bucket=token_bucket,
+        )
         block_tables = []
-        for row in range(batch_size):
-            start = row * block_table_width
-            block_tables.append(list(range(start, start + block_table_width)))
+        next_block = 0
+        for live_blocks in live_block_counts:
+            live = list(range(next_block, next_block + live_blocks))
+            next_block += live_blocks
+            block_tables.append(live + [0] * (block_table_width - live_blocks))
         if is_prefill and self.config.compile.prefill_layout == "packed":
             token_bucket = int(token_bucket)
-            base = token_bucket // batch_size
-            rem = token_bucket % batch_size
-            query_lens = [base + (1 if row < rem else 0) for row in range(batch_size)]
+            query_lens = seq_lens
             query_start_loc = [0]
             packed_positions = []
             token_row_ids = []
@@ -699,11 +716,11 @@ class ModelRunner:
                 num_prefill_tokens=token_bucket,
                 num_decode_tokens=0,
                 block_tables=jnp.array(block_tables, dtype=jnp.int32),
-                seq_lens=jnp.array(query_lens, dtype=jnp.int32),
+                seq_lens=jnp.array(seq_lens, dtype=jnp.int32),
                 host=HostBatch(
                     seq_ids=tuple(range(batch_size)),
                     query_lens=tuple(query_lens),
-                    seq_lens=tuple(query_lens),
+                    seq_lens=tuple(seq_lens),
                     block_tables=tuple(tuple(int(block) for block in row) for row in block_tables),
                 ),
                 packed_prefill=True,
@@ -715,7 +732,11 @@ class ModelRunner:
         query_start_loc = [0]
         for qlen in query_lens:
             query_start_loc.append(query_start_loc[-1] + qlen)
-        positions = [list(range(query_len)) for _ in range(batch_size)]
+        positions = (
+            [list(range(query_len)) for _ in range(batch_size)]
+            if is_prefill
+            else [[seq_len - 1] for seq_len in seq_lens]
+        )
         return DeviceBatch(
             tokens=jnp.zeros((batch_size, query_len), dtype=jnp.int32),
             positions=jnp.array(positions, dtype=jnp.int32),
@@ -725,28 +746,74 @@ class ModelRunner:
             num_prefill_tokens=sum(query_lens) if is_prefill else 0,
             num_decode_tokens=0 if is_prefill else batch_size,
             block_tables=jnp.array(block_tables, dtype=jnp.int32),
-            seq_lens=jnp.full((batch_size,), query_len if is_prefill else 1, dtype=jnp.int32),
+            seq_lens=jnp.array(seq_lens, dtype=jnp.int32),
             host=HostBatch(
                 seq_ids=tuple(range(batch_size)),
                 query_lens=tuple(query_lens),
-                seq_lens=tuple([query_len if is_prefill else 1] * batch_size),
+                seq_lens=tuple(seq_lens),
                 block_tables=tuple(tuple(int(block) for block in row) for row in block_tables),
             ),
         )
+
+    def _warmup_live_layout(
+        self,
+        batch_size: int,
+        block_table_width: int,
+        *,
+        is_prefill: bool,
+        token_bucket: int,
+    ) -> tuple[list[int], list[int]]:
+        if is_prefill:
+            if self.config.compile.prefill_layout == "packed":
+                base, remainder = divmod(int(token_bucket), int(batch_size))
+                seq_lens = [base + (1 if row < remainder else 0) for row in range(batch_size)]
+            else:
+                seq_lens = [int(token_bucket)] * int(batch_size)
+            live_blocks = [
+                max(1, (seq_len + self.block_size - 1) // self.block_size) for seq_len in seq_lens
+            ]
+            return seq_lens, live_blocks
+
+        buckets = tuple(self.config.compile.decode_block_table_buckets)
+        if block_table_width in buckets:
+            previous = max(
+                (bucket for bucket in buckets if bucket < block_table_width),
+                default=0,
+            )
+            first_live_blocks = previous + 1
+        else:
+            first_live_blocks = block_table_width
+        live_blocks = [first_live_blocks] + [1] * (int(batch_size) - 1)
+        seq_lens = [(blocks - 1) * self.block_size + 1 for blocks in live_blocks]
+        return seq_lens, live_blocks
 
     def _warmup_capacity_reason(
         self,
         batch_size: int,
         block_table_width: int,
+        *,
+        is_prefill: bool,
+        token_bucket: int,
     ) -> str | None:
-        required = int(batch_size) * int(block_table_width)
+        _, live_blocks = self._warmup_live_layout(
+            batch_size,
+            block_table_width,
+            is_prefill=is_prefill,
+            token_bucket=token_bucket,
+        )
+        if any(blocks > int(block_table_width) for blocks in live_blocks):
+            return (
+                "warmup_sequence_exceeds_block_table: "
+                f"block_table_width={block_table_width} live_blocks={live_blocks}"
+            )
+        required = sum(live_blocks)
         available = int(self.config.capacity.num_kvcache_blocks)
         if required <= available:
             return None
         return (
             "warmup_requires_disjoint_blocks: "
             f"batch_size={batch_size} block_table_width={block_table_width} "
-            f"requires={required} available={available}"
+            f"live_blocks={live_blocks} requires={required} available={available}"
         )
 
     def release(self, seq_ids: list[int]):

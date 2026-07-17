@@ -16,6 +16,7 @@
     "implementation_commit": "c1533174ffd120ad201bda9189d0e1e8d31262eb",
     "hardware": "NVIDIA A10G",
     "full_vocabulary": true,
+    "runtime_source_sha256": "06a07d3e95ebce5916195fc5e47ae84e006a52927370c7b4e413a19d3a464d50",
     "kl_reference_to_variant": 0.0002562179207149339,
     "kl_variant_to_reference": 0.0002560357732755577,
     "jensen_shannon": 0.00006403002531177811,

@@ -30,6 +30,11 @@ class _PendingRequest:
     handle: "RequestHandle"
 
 
+@dataclass(frozen=True)
+class _PendingBatch:
+    requests: tuple[_PendingRequest, ...]
+
+
 class ServiceSequence(Protocol):
     seq_id: int
     output: OutputBuffer
@@ -48,6 +53,14 @@ class ServiceEngine(Protocol):
         *,
         owner: object | None = None,
     ) -> ServiceSequence: ...
+
+    def add_requests(
+        self,
+        prompts: list[str | list[int]],
+        sampling_params: list[SamplingParams],
+        *,
+        owner: object | None = None,
+    ) -> list[ServiceSequence]: ...
 
     def step(self, *, owner: object | None = None) -> StepResult: ...
 
@@ -234,7 +247,7 @@ class EngineService:
         if max_queue_size is not None and int(max_queue_size) <= 0:
             raise ValueError("max_queue_size must be positive when provided")
         self._max_requests = None if max_queue_size is None else int(max_queue_size)
-        self._incoming: queue.Queue[_PendingRequest | object] = queue.Queue()
+        self._incoming: queue.Queue[_PendingBatch | object] = queue.Queue()
         self._active: dict[int, _ActiveRequest] = {}
         self._next_request_id = 0
         self._state_lock = threading.Lock()
@@ -339,8 +352,12 @@ class EngineService:
             ]
             self._next_request_id += count
             self._in_flight += count
-            for prompt, param, handle in zip(prompts, params, handles):
-                self._incoming.put(_PendingRequest(prompt, param, handle))
+            requests = tuple(
+                _PendingRequest(prompt, param, handle)
+                for prompt, param, handle in zip(prompts, params, handles)
+            )
+            if requests:
+                self._incoming.put(_PendingBatch(requests))
             return handles
 
     def generate(
@@ -382,8 +399,8 @@ class EngineService:
             self._abort_all_active(stopped)
             self._fail_all_pending(stopped)
 
-    def _take_pending(self, *, block: bool) -> list[_PendingRequest]:
-        pending: list[_PendingRequest] = []
+    def _take_pending(self, *, block: bool) -> list[_PendingBatch]:
+        pending: list[_PendingBatch] = []
         deadline = None
         if block:
             try:
@@ -410,25 +427,34 @@ class EngineService:
                 pending.append(item)
         return pending
 
-    def _admit_pending(self, pending: list[_PendingRequest]) -> None:
+    def _admit_pending(self, pending: list[_PendingBatch]) -> None:
         with self.engine_lock:
-            for request in pending:
-                if request.handle.cancel_requested:
+            for batch in pending:
+                requests = []
+                for request in batch.requests:
+                    if not request.handle.cancel_requested:
+                        requests.append(request)
+                        continue
                     self._finish_handle(
                         request.handle, GenerationResult("", [], FinishReason.CANCELLED)
                     )
+                if not requests:
                     continue
                 try:
-                    seq = self.engine.add_request(
-                        request.prompt,
-                        request.sampling_params,
+                    seqs = self.engine.add_requests(
+                        [request.prompt for request in requests],
+                        [request.sampling_params for request in requests],
                         owner=self,
                     )
                 except BaseException as exc:
-                    self._fail_handle(request.handle, exc)
+                    for request in requests:
+                        self._fail_handle(request.handle, exc)
                     continue
-                request.handle._bind(seq.seq_id, seq.output, self.engine.detokenize)
-                self._active[int(seq.seq_id)] = _ActiveRequest(seq, request.handle)
+                if len(seqs) != len(requests):
+                    raise RuntimeError("engine returned the wrong number of admitted requests")
+                for request, seq in zip(requests, seqs):
+                    request.handle._bind(seq.seq_id, seq.output, self.engine.detokenize)
+                    self._active[int(seq.seq_id)] = _ActiveRequest(seq, request.handle)
 
     def _cancel_requested(self) -> None:
         cancelled = [
@@ -506,8 +532,9 @@ class EngineService:
                 item = self._incoming.get_nowait()
             except queue.Empty:
                 break
-            if isinstance(item, _PendingRequest):
-                self._fail_handle(item.handle, exc)
+            if isinstance(item, _PendingBatch):
+                for request in item.requests:
+                    self._fail_handle(request.handle, exc)
 
     def _mark_failed(self, exc: BaseException) -> None:
         with self._state_lock:

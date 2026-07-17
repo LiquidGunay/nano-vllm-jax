@@ -22,7 +22,47 @@ def _has_cuda():
         return False
 
 
-def _config(*, mtp: bool = False):
+def _config(*, mtp: bool = False, reachable_large_bucket: bool = False):
+    capacity = (
+        {
+            "block_size": 2,
+            "num_kvcache_blocks": 6,
+            "max_kv_cache_bytes": 1 << 20,
+            "max_num_seqs": 2,
+            "max_num_resident_seqs": 2,
+            "max_num_batched_tokens": 6,
+            "max_blocks_per_seq": 4,
+            "prefix_cache": False,
+        }
+        if reachable_large_bucket
+        else {
+            "block_size": 2,
+            "num_kvcache_blocks": 16,
+            "max_kv_cache_bytes": 1 << 20,
+            "max_num_seqs": 4,
+            "max_num_resident_seqs": 4,
+            "max_num_batched_tokens": 4,
+            "max_blocks_per_seq": 4,
+            "prefix_cache": False,
+        }
+    )
+    compile = (
+        {
+            "dtype": "float32",
+            "execution": "jit",
+            "prefill_token_buckets": (6,),
+            "batch_size_buckets": (1, 2),
+            "decode_block_table_buckets": (2, 4),
+        }
+        if reachable_large_bucket
+        else {
+            "dtype": "float32",
+            "execution": "jit",
+            "prefill_token_buckets": (4,),
+            "batch_size_buckets": (1, 2, 3, 4) if mtp else (1, 4),
+            "decode_block_table_buckets": (4,),
+        }
+    )
     return runtime_spec(
         model={
             "vocab_size": 32,
@@ -39,23 +79,8 @@ def _config(*, mtp: bool = False):
             "linear_conv_kernel_size": 4,
             "layer_types": ("linear_attention",),
         },
-        capacity={
-            "block_size": 2,
-            "num_kvcache_blocks": 16,
-            "max_kv_cache_bytes": 1 << 20,
-            "max_num_seqs": 4,
-            "max_num_resident_seqs": 4,
-            "max_num_batched_tokens": 4,
-            "max_blocks_per_seq": 4,
-            "prefix_cache": False,
-        },
-        compile={
-            "dtype": "float32",
-            "execution": "jit",
-            "prefill_token_buckets": (4,),
-            "batch_size_buckets": (1, 2, 3, 4) if mtp else (1, 4),
-            "decode_block_table_buckets": (4,),
-        },
+        capacity=capacity,
+        compile=compile,
         kernels={
             "device_token_carry": True,
             "static_decode_metadata": True,
@@ -161,4 +186,25 @@ def test_warmup_covers_persistent_speculative_route():
 
     assert RouteKind.PREFILL_MTP in routes
     assert RouteKind.DECODE_SPECULATIVE in routes
+    assert set(engine.model_runner.executor._jit_cache) == compiled
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="CUDA is required for JIT warmup")
+def test_warmup_covers_reachable_large_block_table_bucket():
+    config = _config(reachable_large_bucket=True)
+    engine = _Engine(config, init_params(jax.random.PRNGKey(0), config.model))
+
+    summary = engine.warmup_compilation()["runner"]
+    assert not [
+        skipped
+        for skipped in summary["decode_skipped"]
+        if skipped["batch_size"] == 2 and skipped["block_table_width"] == 4
+    ]
+    compiled = set(engine.model_runner.executor._jit_cache)
+
+    sampling = SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True)
+    engine.add_requests([[1, 2, 3, 4, 5], [6]], sampling)
+    while not engine.is_finished():
+        engine.step()
+
     assert set(engine.model_runner.executor._jit_cache) == compiled

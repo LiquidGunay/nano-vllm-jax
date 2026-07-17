@@ -208,6 +208,8 @@ class LLMEngine:
     def claim_control(self, owner: object) -> None:
         """Give one offline call or service exclusive stepping ownership."""
 
+        if owner is None:
+            raise ValueError("engine control owner cannot be None")
         with self._control_lock:
             if self._closed:
                 raise RuntimeError("engine is closed")
@@ -234,27 +236,37 @@ class LLMEngine:
             raise RuntimeError("engine mutation is reserved for its active control owner")
 
     def close(self) -> None:
-        """Release model-owned accelerator state; repeated calls are harmless."""
+        """Best-effort release all heavy state; repeated calls are harmless."""
 
         with self._control_lock:
             if self._closed:
                 return
             if self._control_owner is not None:
                 raise RuntimeError("stop the active engine owner before closing")
+
+            errors = []
+
+            def best_effort(action) -> None:
+                try:
+                    action()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            seqs = list(self.scheduler.waiting) + list(self.scheduler.running)
+            for seq in seqs:
+                best_effort(lambda seq=seq: self.scheduler.release(seq))
+                seq.status = SequenceStatus.FINISHED
+            if seqs:
+                best_effort(lambda: self.model_runner.release([seq.seq_id for seq in seqs]))
+            best_effort(self._release_invalidated_prefix_states)
+
+            del self.model_runner
+            del self.params
+            del self.mtp_params
+            del self.tokenizer
             self._closed = True
-
-        seqs = list(self.scheduler.waiting) + list(self.scheduler.running)
-        for seq in seqs:
-            self.scheduler.release(seq)
-            seq.status = SequenceStatus.FINISHED
-        if seqs:
-            self.model_runner.release([seq.seq_id for seq in seqs])
-        self._release_invalidated_prefix_states()
-
-        del self.model_runner
-        del self.params
-        del self.mtp_params
-        del self.tokenizer
+            if errors:
+                raise errors[0]
 
     def exit(self) -> None:
         """Backward-compatible spelling for :meth:`close`."""
@@ -264,6 +276,7 @@ class LLMEngine:
     def warmup_compilation(
         self,
         *,
+        owner: object | None = None,
         max_prefill_len: int | None = None,
         max_batch: int | None = None,
         include_sampled_routes: bool = True,
@@ -272,6 +285,27 @@ class LLMEngine:
         decode_block_table_buckets: tuple[int, ...] | None = None,
     ) -> dict[str, object]:
         """Compile configured serving buckets without using live request data."""
+        with self._control_lock:
+            self._check_control_locked(owner)
+            return self._warmup_compilation(
+                max_prefill_len=max_prefill_len,
+                max_batch=max_batch,
+                include_sampled_routes=include_sampled_routes,
+                prefill_token_buckets=prefill_token_buckets,
+                batch_size_buckets=batch_size_buckets,
+                decode_block_table_buckets=decode_block_table_buckets,
+            )
+
+    def _warmup_compilation(
+        self,
+        *,
+        max_prefill_len: int | None,
+        max_batch: int | None,
+        include_sampled_routes: bool,
+        prefill_token_buckets: tuple[int, ...] | None,
+        batch_size_buckets: tuple[int, ...] | None,
+        decode_block_table_buckets: tuple[int, ...] | None,
+    ) -> dict[str, object]:
         if not self.scheduler.is_pristine():
             raise RuntimeError("warmup_compilation must run before requests or prefix-cache state")
         if max_prefill_len is None:
@@ -306,12 +340,20 @@ class LLMEngine:
     ) -> Sequence:
         """Admit one manually stepped request, respecting any active lease."""
 
+        return self.add_requests([prompt], [sampling_params], owner=owner)[0]
+
+    def add_requests(
+        self,
+        prompts: list[str | list[int]],
+        sampling_params: SamplingParams | list[SamplingParams] = None,
+        *,
+        owner: object | None = None,
+    ) -> list[Sequence]:
+        """Atomically admit one caller-owned request batch."""
+
         with self._control_lock:
             self._check_control_locked(owner)
-            seq = self._prepare_sequence(prompt, sampling_params, self._next_seq_id)
-            self.scheduler.add_many([seq])
-            self._next_seq_id += 1
-            return seq
+            return self._prepare_generation_sequences(prompts, sampling_params)
 
     def _prepare_sequence(
         self,
@@ -416,8 +458,21 @@ class LLMEngine:
         seqs: list[Sequence],
         schedule_plan: SchedulePlan,
         run_result: RunResult,
+        *,
+        owner: object | None = None,
     ) -> StepResult:
         """Commit one runner result to logical request state."""
+
+        with self._control_lock:
+            self._check_control_locked(owner)
+            return self._commit(seqs, schedule_plan, run_result)
+
+    def _commit(
+        self,
+        seqs: list[Sequence],
+        schedule_plan: SchedulePlan,
+        run_result: RunResult,
+    ) -> StepResult:
         if len(run_result.rows) != len(seqs):
             raise ValueError("run result rows must align with scheduled sequences")
 
@@ -513,7 +568,7 @@ class LLMEngine:
                         pending,
                     )
                     self.scheduler.publish_prefix_states(pending, handles)
-            step_result = self.commit(seqs, schedule_plan, run_result)
+            step_result = self._commit(seqs, schedule_plan, run_result)
             finished_seq_ids = [request.seq_id for request in step_result.finished]
             if finished_seq_ids:
                 self.model_runner.release(finished_seq_ids)
@@ -552,8 +607,9 @@ class LLMEngine:
             return results
         finally:
             if started and not complete:
-                self._cancel_all_requests(owner=owner)
-            self.release_control(owner)
+                self._cancel_and_release_control(owner)
+            else:
+                self.release_control(owner)
 
     def _generate(
         self,
@@ -563,7 +619,7 @@ class LLMEngine:
         *,
         owner: object,
     ) -> list[dict[str, Any]]:
-        seqs = self._prepare_generation_sequences(prompts, sampling_params)
+        seqs = self.add_requests(prompts, sampling_params, owner=owner)
         seqs_by_id = {seq.seq_id: seq for seq in seqs}
         if use_tqdm:
             try:
@@ -630,19 +686,20 @@ class LLMEngine:
 
         owner = object()
         self.claim_control(owner)
-        started = False
+        released = False
         try:
-            started = True
-            yield from self._iter_generate(
+            terminal = yield from self._iter_generate(
                 prompts,
                 sampling_params,
                 include_text=include_text,
                 owner=owner,
             )
+            self._cancel_and_release_control(owner)
+            released = True
+            yield terminal
         finally:
-            if started:
-                self._cancel_all_requests(owner=owner)
-            self.release_control(owner)
+            if not released:
+                self._cancel_and_release_control(owner)
 
     def _iter_generate(
         self,
@@ -652,7 +709,7 @@ class LLMEngine:
         include_text: bool,
         owner: object,
     ):
-        seqs = self._prepare_generation_sequences(prompts, sampling_params)
+        seqs = self.add_requests(prompts, sampling_params, owner=owner)
         seq_to_request = {seq.seq_id: index for index, seq in enumerate(seqs)}
         seqs_by_id = {seq.seq_id: seq for seq in seqs}
         stream_start = perf_counter()
@@ -706,7 +763,7 @@ class LLMEngine:
 
         OutputBuffer.snapshot_many(seq.output for seq in seqs).prefetch().materialize()
 
-        yield {
+        return {
             "event": "done",
             "elapsed_seconds": perf_counter() - stream_start,
             "results": [
@@ -718,6 +775,12 @@ class LLMEngine:
                 for index, seq in enumerate(seqs)
             ],
         }
+
+    def _cancel_and_release_control(self, owner: object) -> None:
+        try:
+            self._cancel_all_requests(owner=owner)
+        finally:
+            self.release_control(owner)
 
     def _cancel_all_requests(self, *, owner: object) -> None:
         seqs = list(self.scheduler.waiting) + list(self.scheduler.running)

@@ -14,9 +14,9 @@ metadata, and queue-driven continuous batching.
 ## Start The Server
 
 ```bash
-uv sync --frozen --python 3.11 \
-  --extra cuda13 --extra flashinfer-ffi --extra gdn-fla-triton
-python server.py
+uv run --frozen --python 3.11 \
+  --extra cuda13 --extra flashinfer-ffi --extra gdn-fla-triton \
+  python server.py
 ```
 
 The lockfile and Python 3.11 are the reproducible environment contract.
@@ -187,7 +187,11 @@ workflow:
 ./scripts/check.sh
 ```
 
-Ownership and configuration contract checks:
+The check creates or refreshes `.venv` from the frozen lock, then runs the
+CPU-safe ownership, admission, configuration, server, route, and commit suites
+under the 70% RAM guard. The benchmark remains a separate explicit command.
+
+GPU correctness matrix:
 
 ```bash
 JAX_PLATFORMS=cuda PYTHONPATH=$PWD python tests/ram_guard.py -- pytest -q \

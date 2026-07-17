@@ -17,6 +17,7 @@ from benchmarks.run_benchmark import (
     load_parity_evidence,
     prompt_rows,
     run,
+    runtime_source_sha256,
 )
 
 
@@ -96,6 +97,19 @@ def test_manifest_content_addresses_bounded_parity_evidence():
     ]
     assert evidence["diagnostic"]["kl_reference_to_variant"] < 0.001
     assert evidence["diagnostic"]["jensen_shannon"] < 0.00025
+    assert evidence["diagnostic"]["runtime_source_sha256"] == runtime_source_sha256()
+
+
+def test_parity_evidence_rejects_a_different_runtime_tree(monkeypatch):
+    benchmark = ROOT / "benchmarks/benchmark.json"
+    manifest = load_manifest(benchmark)
+    monkeypatch.setattr(
+        "benchmarks.run_benchmark.runtime_source_sha256",
+        lambda _root: "changed",
+    )
+
+    with pytest.raises(ValueError, match="runtime source tree"):
+        load_parity_evidence(benchmark, manifest)
 
 
 def test_parity_adjudication_accepts_only_the_named_token_change():

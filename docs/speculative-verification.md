@@ -101,8 +101,8 @@ accounting must still follow the packed target distribution exactly.
 The committed B=1 claim has one such content-addressed equivalence in
 [`parity_evidence.json`](../benchmarks/parity_evidence.json): two 64-token
 outputs differing only at index 44. The benchmark accepts those two hashes in
-either direction and rejects every other mismatch; this is not a general
-tolerance for token drift.
+either direction only while the serving-source digest also matches, and rejects
+every other mismatch; this is not a general tolerance for token drift.
 
 Because of that numerical limitation, MTP remains experimental even when a
 checkpoint passes an exact generation run. Promotion checks use identical base

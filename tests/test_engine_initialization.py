@@ -49,8 +49,12 @@ def test_warmup_block_tables_are_disjoint_or_rejected():
     runner = object.__new__(ModelRunner)
     runner.config = SimpleNamespace(
         capacity=SimpleNamespace(num_kvcache_blocks=6),
-        compile=SimpleNamespace(prefill_layout="packed"),
+        compile=SimpleNamespace(
+            prefill_layout="packed",
+            decode_block_table_buckets=(2,),
+        ),
     )
+    runner.block_size = 1
     runner.max_blocks_per_seq = 2
 
     batch = runner._dummy_batch(
@@ -67,6 +71,35 @@ def test_warmup_block_tables_are_disjoint_or_rejected():
             token_bucket=8,
             is_prefill=True,
         )
+
+
+def test_warmup_uses_disjoint_live_blocks_and_ignored_padding():
+    runner = object.__new__(ModelRunner)
+    runner.config = SimpleNamespace(
+        capacity=SimpleNamespace(num_kvcache_blocks=6),
+        compile=SimpleNamespace(
+            prefill_layout="packed",
+            decode_block_table_buckets=(2, 4),
+        ),
+    )
+    runner.block_size = 2
+    runner.max_blocks_per_seq = 4
+
+    batch = runner._dummy_batch(
+        batch_size=2,
+        token_bucket=1,
+        is_prefill=False,
+        max_blocks_per_seq=4,
+    )
+
+    assert batch.host.seq_lens == (5, 1)
+    assert batch.host.block_tables == ((0, 1, 2, 0), (3, 0, 0, 0))
+    live_blocks = {
+        block
+        for row, seq_len in zip(batch.host.block_tables, batch.host.seq_lens)
+        for block in row[: (seq_len + runner.block_size - 1) // runner.block_size]
+    }
+    assert live_blocks == {0, 1, 2, 3}
 
 
 def test_linear_attention_initializers_use_independent_keys():

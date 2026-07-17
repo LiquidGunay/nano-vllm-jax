@@ -20,6 +20,24 @@ ROOT = Path(__file__).resolve().parents[1]
 ROUTES = ("base", "mtp")
 
 
+def runtime_source_sha256(root: Path = ROOT) -> str:
+    """Hash the serving sources that can affect benchmark output."""
+
+    paths = sorted((root / "nanovllm_jax").rglob("*.py"))
+    paths.extend(
+        root / relative
+        for relative in ("benchmarks/backends/jax.py", "benchmarks/backends/vllm.py")
+    )
+    digest = hashlib.sha256()
+    for path in paths:
+        relative = path.relative_to(root).as_posix().encode()
+        digest.update(relative)
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def load_manifest(path: Path) -> dict[str, Any]:
     manifest = json.loads(path.read_text())
     required = {
@@ -125,6 +143,8 @@ def load_parity_evidence(path: Path, manifest: dict[str, Any]) -> dict[str, Any]
     diagnostic = evidence["diagnostic"]
     if not diagnostic.get("full_vocabulary"):
         raise ValueError("parity evidence must cover the full vocabulary")
+    if diagnostic.get("runtime_source_sha256") != runtime_source_sha256(path.parent.parent):
+        raise ValueError("parity evidence does not match the runtime source tree")
     metrics = {
         "kl_reference_to_variant": limits["max_bidirectional_kl"],
         "kl_variant_to_reference": limits["max_bidirectional_kl"],

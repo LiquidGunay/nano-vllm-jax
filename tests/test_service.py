@@ -35,11 +35,19 @@ class _FakeEngine:
         self.control_owner = None
 
     def add_request(self, prompt, sampling_params, *, owner=None):
+        return self.add_requests([prompt], [sampling_params], owner=owner)[0]
+
+    def add_requests(self, prompts, sampling_params, *, owner=None):
         assert owner is self.control_owner
-        seq = _FakeSeq(seq_id=self._next_seq_id, sampling_params=sampling_params)
-        self._next_seq_id += 1
-        self.seqs.append(seq)
-        return seq
+        if any(any(token < 0 for token in prompt) for prompt in prompts):
+            raise ValueError("invalid prompt")
+        seqs = [
+            _FakeSeq(seq_id=self._next_seq_id + index, sampling_params=params)
+            for index, params in enumerate(sampling_params)
+        ]
+        self._next_seq_id += len(seqs)
+        self.seqs.extend(seqs)
+        return seqs
 
     def step(self, *, owner=None):
         assert owner is self.control_owner
@@ -274,6 +282,24 @@ def test_generate_many_reserves_its_whole_batch_atomically():
         assert handle.request_id == 0
         assert handle.wait(timeout=1.0).finish_reason is FinishReason.LENGTH
         assert len(engine.seqs) == 1
+    finally:
+        service.stop()
+
+
+@pytest.mark.parametrize("prompts", ([[-1], [11]], [[11], [-1]]))
+def test_generate_many_rejects_every_row_before_engine_admission(prompts):
+    engine = _FakeEngine()
+    service = EngineService(engine, batch_window_seconds=0.0)
+    sampling = SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True)
+    service.start()
+    try:
+        with pytest.raises(ValueError, match="invalid prompt"):
+            service.generate_many(prompts, sampling)
+
+        assert engine.seqs == []
+        assert engine._next_seq_id == 0
+        assert engine.step_batches == []
+        assert service.health()["in_flight"] == 0
     finally:
         service.stop()
 

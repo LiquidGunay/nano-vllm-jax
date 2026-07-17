@@ -11,7 +11,9 @@ The four routes produced one of two content-addressed outputs. They differ only
 at output index 44, where BF16 rounding can select token 5129 or 8343. The
 [parity evidence](../benchmarks/parity_evidence.json) records the full-vocabulary
 KL/JS check and is itself pinned by [benchmark.json](../benchmarks/benchmark.json).
-That executable contract also pins the model revision, BF16 weights and
+The evidence also pins a digest of the serving source tree and both benchmark
+backend adapters, so a later runtime change cannot silently reuse the
+exception. That executable contract pins the model revision, BF16 weights and
 activations, one committed 64-token natural-language prompt, 64 output tokens,
 greedy sampling, ignored EOS, a prefix-cache miss, and two MTP draft positions.
 

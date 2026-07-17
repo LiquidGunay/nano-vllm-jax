@@ -7,20 +7,23 @@ structural decisions that are easy to lose in a large cleanup diff.
 
 - Persistent KV memory has one target owner and one optional predictor owner;
   the removed NHD sidecar had no reads.
-- Offline batch admission is atomic, HTTP capacity is validated per request,
-  and strict token and sampling checks happen before scheduler mutation.
+- Offline and service-submitted multi-request admission is atomic, HTTP
+  capacity is validated per request, and strict token and sampling checks
+  happen before scheduler mutation.
 - `EngineService`, offline generation, and the manual stepping API have an
-  explicit single-writer contract. Engine cleanup is idempotent and releases
-  heavy references without a process-lifetime `atexit` root.
-- Warmup uses disjoint physical block tables. Impossible bucket combinations
-  are reported as skipped instead of aliasing cache blocks.
+  explicit single-writer contract covering admission, warmup, commit,
+  cancellation, and cleanup. A terminal offline event releases that ownership
+  before it becomes observable.
+- Warmup uses disjoint live page prefixes and ignored padding. Only bucket
+  shapes whose minimum reachable live layout exceeds capacity are skipped.
 - Server import constructs only the HTTP transport. CUDA/JAX configuration,
   model loading, service startup, and shutdown happen in `main()`.
-- Python 3.11 plus `uv.lock` is the reproducible environment. Local checks are
-  intentionally not CI.
+- Python 3.11 plus `uv.lock` is the reproducible environment. The local check
+  refreshes `.venv` from that lock and remains intentionally separate from CI.
 - The A10G artifact runs base and K=2 MTP for JAX and vLLM from one clean
   commit. Its only non-exact parity case is a content-addressed BF16 tie with
-  full-vocabulary KL/JS evidence; all other output drift fails.
+  full-vocabulary KL/JS evidence bound to the serving-source digest; all other
+  output drift fails.
 
 ## Audited And Retained
 
