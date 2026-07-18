@@ -40,6 +40,17 @@ def compare_results(
     if any(result[field] != reference[field] for result in results.values() for field in fields):
         raise ValueError("result benchmark contracts differ")
 
+    allowed_sets = {
+        tuple(result["correctness"].get("allowed_output_sha256", ())) for result in results.values()
+    }
+    if len(allowed_sets) != 1 or not next(iter(allowed_sets)):
+        raise ValueError("result output-hash contracts differ")
+    allowed_hashes = set(next(iter(allowed_sets)))
+    if any(
+        result["correctness"]["output_sha256"] not in allowed_hashes for result in results.values()
+    ):
+        raise ValueError("result output hash is outside the parity contract")
+
     reference_hash = jax_base["correctness"]["output_sha256"]
     hashes = {reference_hash}
     adjudicated_routes = []

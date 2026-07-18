@@ -286,6 +286,16 @@ def test_generate_many_reserves_its_whole_batch_atomically():
         service.stop()
 
 
+def test_generate_many_rejects_an_empty_batch():
+    service = EngineService(_FakeEngine(), batch_window_seconds=0.0)
+    sampling = SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True)
+
+    with pytest.raises(ValueError, match="prompts must be a non-empty list"):
+        service.generate_many([], sampling)
+
+    assert service.health()["in_flight"] == 0
+
+
 @pytest.mark.parametrize("prompts", ([[-1], [11]], [[11], [-1]]))
 def test_generate_many_rejects_every_row_before_engine_admission(prompts):
     engine = _FakeEngine()

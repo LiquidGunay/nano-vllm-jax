@@ -262,3 +262,27 @@ def test_cleanup_failure_still_releases_offline_control():
     owner = object()
     engine.claim_control(owner)
     engine.release_control(owner)
+
+
+def test_cleanup_continues_after_one_request_release_fails():
+    class FirstCleanupFailRunner(_Runner):
+        def release(self, seq_ids):
+            self.released.extend(seq_ids)
+            if len(self.released) == 1:
+                raise RuntimeError("first cleanup failed")
+
+    engine = _Engine(_config(), FirstCleanupFailRunner([]))
+    owner = object()
+    engine.claim_control(owner)
+    seqs = engine.add_requests(
+        [[1, 2], [3, 4]],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        owner=owner,
+    )
+
+    with pytest.raises(RuntimeError, match="first cleanup failed"):
+        engine._cancel_and_release_control(owner)
+
+    assert engine.model_runner.released == [seq.seq_id for seq in seqs]
+    assert engine.scheduler.is_finished()
+    assert engine._control_owner is None

@@ -329,11 +329,18 @@ class ModelRunner:
         scenario: WarmupScenario,
     ) -> tuple[list[Sequence], DeviceBatch]:
         active_rows = batch_size if scenario.full_bucket else 1
+        write_slots = scenario.decode_steps
+        if scenario.tokens is TokenMode.SPECULATIVE:
+            if self.config.drafter is None:
+                raise ValueError("speculative warmup requires a drafter")
+            write_slots = self.config.drafter.decode_lookahead_slots
+        # seq_len already includes the scheduled token; write slots include it too.
         batch = self._dummy_batch(
             batch_size=active_rows,
             token_bucket=1,
             is_prefill=False,
             max_blocks_per_seq=block_table_width,
+            write_ahead_tokens=max(0, int(write_slots) - 1),
         )
         batch = self._pad_decode_batch_to_rows(batch, batch_size)
         batch = replace(
@@ -424,6 +431,9 @@ class ModelRunner:
 
         warm_sampled = bool(include_sampled_routes) and self.sampled_token_fastpath
         greedy_decode_burst_steps = self.config.kernels.greedy_decode_burst_steps
+        prefill_write_ahead = (
+            self.config.drafter.prefill_lookahead_tokens if self.config.drafter is not None else 0
+        )
 
         for token_bucket in prefill_buckets:
             if self.execution != "jit":
@@ -461,6 +471,7 @@ class ModelRunner:
                     int(self.max_blocks_per_seq),
                     is_prefill=True,
                     token_bucket=int(token_bucket),
+                    write_ahead_tokens=prefill_write_ahead,
                 )
                 if capacity_reason is not None:
                     summary["prefill_skipped"].append(
@@ -475,6 +486,7 @@ class ModelRunner:
                     batch_size=batch_size,
                     token_bucket=token_bucket,
                     is_prefill=True,
+                    write_ahead_tokens=prefill_write_ahead,
                 )
                 route = self._warm_route(
                     self._warmup_sequences(batch_size, temperature=0.0),
@@ -539,6 +551,7 @@ class ModelRunner:
                         int(block_table_width),
                         is_prefill=False,
                         token_bucket=1,
+                        write_ahead_tokens=self.config.drafter.decode_lookahead_slots - 1,
                     )
                     if capacity_reason is not None:
                         summary["decode_skipped"].append(
@@ -569,22 +582,6 @@ class ModelRunner:
 
         for batch_size in batch_buckets:
             for block_table_width in decode_block_table_buckets:
-                capacity_reason = self._warmup_capacity_reason(
-                    int(batch_size),
-                    int(block_table_width),
-                    is_prefill=False,
-                    token_bucket=1,
-                )
-                if capacity_reason is not None:
-                    summary["decode_skipped"].append(
-                        {
-                            "batch_size": int(batch_size),
-                            "block_table_width": int(block_table_width),
-                            "scenario": "all_non_speculative",
-                            "reason": capacity_reason,
-                        }
-                    )
-                    continue
                 scenarios = decode_warmup_scenarios(
                     static_token_carry=bool(
                         self.greedy_token_fastpath
@@ -597,6 +594,24 @@ class ModelRunner:
                 )
 
                 for scenario in scenarios:
+                    active_rows = int(batch_size) if scenario.full_bucket else 1
+                    capacity_reason = self._warmup_capacity_reason(
+                        active_rows,
+                        int(block_table_width),
+                        is_prefill=False,
+                        token_bucket=1,
+                        write_ahead_tokens=max(0, int(scenario.decode_steps) - 1),
+                    )
+                    if capacity_reason is not None:
+                        summary["decode_skipped"].append(
+                            {
+                                "batch_size": int(batch_size),
+                                "block_table_width": int(block_table_width),
+                                "scenario": scenario.name,
+                                "reason": capacity_reason,
+                            }
+                        )
+                        continue
                     seqs, batch = self._warmup_decode_inputs(
                         batch_size,
                         int(block_table_width),
@@ -675,6 +690,7 @@ class ModelRunner:
         token_bucket: int,
         is_prefill: bool,
         max_blocks_per_seq: int | None = None,
+        write_ahead_tokens: int = 0,
     ) -> DeviceBatch:
         block_table_width = int(max_blocks_per_seq or self.max_blocks_per_seq)
         capacity_reason = self._warmup_capacity_reason(
@@ -682,6 +698,7 @@ class ModelRunner:
             block_table_width,
             is_prefill=is_prefill,
             token_bucket=token_bucket,
+            write_ahead_tokens=write_ahead_tokens,
         )
         if capacity_reason is not None:
             raise ValueError(capacity_reason)
@@ -690,6 +707,7 @@ class ModelRunner:
             block_table_width,
             is_prefill=is_prefill,
             token_bucket=token_bucket,
+            write_ahead_tokens=write_ahead_tokens,
         )
         block_tables = []
         next_block = 0
@@ -762,7 +780,10 @@ class ModelRunner:
         *,
         is_prefill: bool,
         token_bucket: int,
+        write_ahead_tokens: int = 0,
     ) -> tuple[list[int], list[int]]:
+        if write_ahead_tokens < 0:
+            raise ValueError("warmup write-ahead tokens must be nonnegative")
         if is_prefill:
             if self.config.compile.prefill_layout == "packed":
                 base, remainder = divmod(int(token_bucket), int(batch_size))
@@ -770,7 +791,11 @@ class ModelRunner:
             else:
                 seq_lens = [int(token_bucket)] * int(batch_size)
             live_blocks = [
-                max(1, (seq_len + self.block_size - 1) // self.block_size) for seq_len in seq_lens
+                max(
+                    1,
+                    (seq_len + write_ahead_tokens + self.block_size - 1) // self.block_size,
+                )
+                for seq_len in seq_lens
             ]
             return seq_lens, live_blocks
 
@@ -783,8 +808,12 @@ class ModelRunner:
             first_live_blocks = previous + 1
         else:
             first_live_blocks = block_table_width
-        live_blocks = [first_live_blocks] + [1] * (int(batch_size) - 1)
-        seq_lens = [(blocks - 1) * self.block_size + 1 for blocks in live_blocks]
+        visible_blocks = [first_live_blocks] + [1] * (int(batch_size) - 1)
+        seq_lens = [(blocks - 1) * self.block_size + 1 for blocks in visible_blocks]
+        live_blocks = [
+            (seq_len + write_ahead_tokens + self.block_size - 1) // self.block_size
+            for seq_len in seq_lens
+        ]
         return seq_lens, live_blocks
 
     def _warmup_capacity_reason(
@@ -794,12 +823,14 @@ class ModelRunner:
         *,
         is_prefill: bool,
         token_bucket: int,
+        write_ahead_tokens: int = 0,
     ) -> str | None:
         _, live_blocks = self._warmup_live_layout(
             batch_size,
             block_table_width,
             is_prefill=is_prefill,
             token_bucket=token_bucket,
+            write_ahead_tokens=write_ahead_tokens,
         )
         if any(blocks > int(block_table_width) for blocks in live_blocks):
             return (

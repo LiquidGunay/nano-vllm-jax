@@ -97,7 +97,7 @@
   },
   "parity": {
     "evidence": "parity_evidence.json",
-    "sha256": "b1c2ac09d9cc93b377b99b63162fb203d7b35ae4276d35a1533f693c49260461"
+    "sha256": "d9353840143aed325a735fa31668700f9c1d1d50788c585ff23751fb1d0874aa"
   },
   "frameworks": {
     "vllm": "0.25.1"

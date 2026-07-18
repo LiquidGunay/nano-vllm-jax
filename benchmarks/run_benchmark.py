@@ -38,6 +38,19 @@ def runtime_source_sha256(root: Path = ROOT) -> str:
     return digest.hexdigest()
 
 
+def dependency_inputs_sha256(root: Path = ROOT) -> str:
+    """Hash the frozen dependency inputs used by the parity capture."""
+
+    digest = hashlib.sha256()
+    for relative in ("uv.lock", "benchmarks/vllm-requirements.txt"):
+        path = root / relative
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def load_manifest(path: Path) -> dict[str, Any]:
     manifest = json.loads(path.read_text())
     required = {
@@ -145,6 +158,8 @@ def load_parity_evidence(path: Path, manifest: dict[str, Any]) -> dict[str, Any]
         raise ValueError("parity evidence must cover the full vocabulary")
     if diagnostic.get("runtime_source_sha256") != runtime_source_sha256(path.parent.parent):
         raise ValueError("parity evidence does not match the runtime source tree")
+    if diagnostic.get("dependency_inputs_sha256") != dependency_inputs_sha256(path.parent.parent):
+        raise ValueError("parity evidence does not match the frozen dependency inputs")
     metrics = {
         "kl_reference_to_variant": limits["max_bidirectional_kl"],
         "kl_variant_to_reference": limits["max_bidirectional_kl"],
@@ -355,6 +370,7 @@ def invalid_reasons(
     samples: list[dict[str, Any]],
     output_rows: list[list[int]],
     *,
+    allowed_output_sha256: frozenset[str],
     repeat_exact: bool,
     reference_exact: bool | None,
     reference_adjudicated: bool = False,
@@ -366,6 +382,8 @@ def invalid_reasons(
     )
     speeds = [sample["decode_tokens_per_second"] for sample in samples]
     spread = (max(speeds) - min(speeds)) / median(speeds)
+    if _output_hash(output_rows) not in allowed_output_sha256:
+        reasons.append("output hash is outside the content-addressed parity contract")
     if not repeat_exact:
         reasons.append("measured repeats produced different tokens")
     if reference_exact is False and not reference_adjudicated:
@@ -474,6 +492,12 @@ def run(
         manifest,
         samples,
         control["output_token_ids"],
+        allowed_output_sha256=frozenset(
+            {
+                parity_evidence["reference_output_sha256"],
+                parity_evidence["variant_output_sha256"],
+            }
+        ),
         repeat_exact=repeat_exact,
         reference_exact=reference_exact,
         reference_adjudicated=parity_adjudication is not None,
@@ -523,6 +547,12 @@ def run(
             "reference_adjudicated": parity_adjudication is not None,
             "parity_evidence": parity_adjudication,
             "output_sha256": _output_hash(control["output_token_ids"]),
+            "allowed_output_sha256": sorted(
+                {
+                    parity_evidence["reference_output_sha256"],
+                    parity_evidence["variant_output_sha256"],
+                }
+            ),
             "output_token_ids": control["output_token_ids"],
             "measured_executor_route_cache_growth": route_cache_growth,
         },

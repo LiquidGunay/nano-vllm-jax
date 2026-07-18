@@ -370,6 +370,8 @@ class EngineService:
         prompts: list[str | list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
     ) -> list[GenerationResult]:
+        if not prompts:
+            raise ValueError("prompts must be a non-empty list")
         if isinstance(sampling_params, list):
             if len(sampling_params) != len(prompts):
                 raise ValueError("sampling_params length must match prompts length")

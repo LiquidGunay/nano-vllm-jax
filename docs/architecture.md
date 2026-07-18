@@ -140,8 +140,10 @@ booleans.
 Startup warmup enumerates the public dense-carry, sparse-carry, ordinary
 no-carry, sampled, and configured burst scenarios for each decode bucket. Each
 scenario goes through normal route selection and execution. Dummy block-table
-rows use disjoint physical ids; a bucket product larger than cache capacity is
-reported as skipped rather than compiled with aliased state.
+rows use disjoint physical ids through the farthest target or predictor write.
+Only columns beyond that boundary use an ignored placeholder. A scenario whose
+live prefixes exceed its static width or physical cache is reported as skipped
+rather than compiled with aliased state.
 
 Compilation warmup is a startup-only transition. The engine rejects it after a
 request has been admitted or any prefix metadata has been published, so runner

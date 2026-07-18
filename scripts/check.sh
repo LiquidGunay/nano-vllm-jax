@@ -20,6 +20,7 @@ fi
   --rss-gib 4 \
   --min-available-gib 2 \
   -- "$python" -m pytest -q \
+  tests/test_benchmark_artifact.py \
   tests/test_engine_initialization.py \
   tests/test_fastpath_config.py \
   tests/test_public_imports.py \

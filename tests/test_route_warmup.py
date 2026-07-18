@@ -154,6 +154,19 @@ def test_warmup_covers_persistent_speculative_route():
         init_params(jax.random.PRNGKey(0), config.model),
         init_mtp_params(jax.random.PRNGKey(1), config),
     )
+    warmed_batches = {}
+    warm_route = engine.model_runner._warm_route
+
+    def record_warm_batch(seqs, batch):
+        route = warm_route(seqs, batch)
+        if len(batch.host.seq_ids) == 2 and route.kind in {
+            RouteKind.PREFILL_MTP,
+            RouteKind.DECODE_SPECULATIVE,
+        }:
+            warmed_batches[route.kind] = batch
+        return route
+
+    engine.model_runner._warm_route = record_warm_batch
 
     summary = engine.warmup_compilation()["runner"]
 
@@ -167,6 +180,38 @@ def test_warmup_covers_persistent_speculative_route():
     assert summary["include_sampled_routes"] is False
     assert summary["sampled_token_fastpath_runs"] == []
     assert RouteKind.DECODE_SAMPLED.value not in summary["warmed_routes"]
+
+    drafter = config.drafter
+    assert drafter is not None
+
+    def physical_slots(batch, position_ranges):
+        rows = []
+        for block_table, positions in zip(batch.host.block_tables, position_ranges):
+            rows.append(
+                {
+                    block_table[position // config.capacity.block_size] * config.capacity.block_size
+                    + position % config.capacity.block_size
+                    for position in positions
+                }
+            )
+        return rows
+
+    prefill = warmed_batches[RouteKind.PREFILL_MTP]
+    prefill_slots = physical_slots(
+        prefill,
+        [range(seq_len + drafter.prefill_lookahead_tokens) for seq_len in prefill.host.seq_lens],
+    )
+    speculative = warmed_batches[RouteKind.DECODE_SPECULATIVE]
+    speculative_slots = physical_slots(
+        speculative,
+        [
+            range(seq_len - 1, seq_len + drafter.decode_lookahead_slots - 1)
+            for seq_len in speculative.host.seq_lens
+        ],
+    )
+    assert prefill_slots[0].isdisjoint(prefill_slots[1])
+    assert speculative_slots[0].isdisjoint(speculative_slots[1])
+
     compiled = set(engine.model_runner.executor._jit_cache)
     routes = []
     select_route = engine.model_runner._select_route

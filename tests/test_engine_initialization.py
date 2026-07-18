@@ -53,6 +53,7 @@ def test_warmup_block_tables_are_disjoint_or_rejected():
             prefill_layout="packed",
             decode_block_table_buckets=(2,),
         ),
+        drafter=None,
     )
     runner.block_size = 1
     runner.max_blocks_per_seq = 2
@@ -81,6 +82,7 @@ def test_warmup_uses_disjoint_live_blocks_and_ignored_padding():
             prefill_layout="packed",
             decode_block_table_buckets=(2, 4),
         ),
+        drafter=None,
     )
     runner.block_size = 2
     runner.max_blocks_per_seq = 4

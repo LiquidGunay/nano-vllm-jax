@@ -188,8 +188,9 @@ workflow:
 ```
 
 The check creates or refreshes `.venv` from the frozen lock, then runs the
-CPU-safe ownership, admission, configuration, server, route, and commit suites
-under the 70% RAM guard. The benchmark remains a separate explicit command.
+CPU-safe ownership, admission, configuration, server, route, commit, and
+benchmark-contract suites under the 70% RAM guard. The benchmark execution
+remains a separate explicit command.
 
 GPU correctness matrix:
 

@@ -784,8 +784,15 @@ class LLMEngine:
 
     def _cancel_all_requests(self, *, owner: object) -> None:
         seqs = list(self.scheduler.waiting) + list(self.scheduler.running)
+        first_error: BaseException | None = None
         for seq in seqs:
-            self.cancel_request(seq, owner=owner)
+            try:
+                self.cancel_request(seq, owner=owner)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def tokenize(self, text: str) -> list[int]:
         """Tokenize text using Qwen tokenizer."""

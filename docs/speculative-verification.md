@@ -31,6 +31,11 @@ For draft width `K`, the scheduler derives three physical allowances:
   `K + 1` output group can leave that many predictor writes beyond the logical
   end.
 
+Warmup uses those same allowances. Its packed-prefill rows remain disjoint
+through the prompt plus `K - 1` predictor positions, and speculative decode
+rows remain disjoint through the scheduler's complete `2K` write window.
+Static block-table padding begins only after the farthest physical write.
+
 ```text
 packed prefill
   -> target hidden + shifted prompt tokens
