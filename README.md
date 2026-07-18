@@ -63,10 +63,10 @@ observation, not a pass threshold for new runs.
 
 | Framework | Base decode tok/s | MTP decode tok/s | MTP/base |
 | --- | ---: | ---: | ---: |
-| Nano-VLLM-JAX | 53.98 | 83.40 | 1.545x |
-| vLLM 0.25.1 | 50.34 | 86.62 | 1.721x |
+| Nano-VLLM-JAX | 53.99 | 82.72 | 1.532x |
+| vLLM 0.25.1 | 50.34 | 86.60 | 1.720x |
 
-JAX MTP is 1.657x vLLM without MTP and 0.963x vLLM with MTP on this fixed
+JAX MTP is 1.643x vLLM without MTP and 0.955x vLLM with MTP on this fixed
 workload. The four routes resolve one BF16 near-tie in either direction; the
 two exact output hashes and full-vocabulary KL/JS evidence are content-addressed
 by the benchmark contract. Any other output still fails validation.
