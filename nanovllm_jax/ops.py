@@ -16,13 +16,11 @@ import jax.numpy as jnp
 from nanovllm_jax.fastpath import KernelPlan
 from nanovllm_jax.cache import (
     AttentionMetadata,
-    FullAttentionNHDKVCacheStorage,
     KVCacheSpec,
     KVCacheStorage,
     cap_num_kv_cache_blocks,
     compute_slot_mapping,
     init_kv_cache,
-    init_full_attention_nhd_kv_cache,
     paged_attention,
     paged_attention_prefill,
     paged_attention_prefill_packed,
@@ -69,9 +67,7 @@ def _require_finalized_kv_cache_spec(
 ) -> KVCacheSpec:
     resolved = resolve_kv_cache_spec(spec, plan)
     if resolved.dtype != spec.dtype or resolved.num_blocks != spec.num_blocks:
-        raise ValueError(
-            "KVCacheSpec must be finalized before scheduler and runner construction"
-        )
+        raise ValueError("KVCacheSpec must be finalized before scheduler and runner construction")
     return replace(resolved, max_kv_cache_bytes=None)
 
 
@@ -109,8 +105,7 @@ def gdn_disable_fallbacks_enabled(plan: KernelPlan) -> bool:
 def _raise_if_gdn_fallback_disabled(reason: str, plan: KernelPlan) -> None:
     if _gdn_disable_fallbacks(plan):
         raise RuntimeError(
-            f"{reason}; implicit GDN kernel fallbacks are disabled by "
-            "gdn_disable_fallbacks=True"
+            f"{reason}; implicit GDN kernel fallbacks are disabled by gdn_disable_fallbacks=True"
         )
 
 
@@ -139,7 +134,9 @@ def _gdn_prefill_post_conv_impl(plan: KernelPlan) -> str:
     value = plan.gdn_prefill
     if value in {"off", "reference", "triton_fla_padded"}:
         return value
-    raise ValueError("gdn_prefill_post_conv_impl must be 'off', 'reference', or 'triton_fla_padded'")
+    raise ValueError(
+        "gdn_prefill_post_conv_impl must be 'off', 'reference', or 'triton_fla_padded'"
+    )
 
 
 def gdn_prefill_post_conv_enabled(plan: KernelPlan) -> bool:
@@ -215,9 +212,7 @@ def _static_packed_gdn_chunk_metadata(
         row_count,
     )
     chunk_indices = jnp.stack((rows, chunks), axis=1)
-    chunk_offsets = (
-        jnp.arange(row_count + 1, dtype=jnp.int32) * jnp.int32(max_row_chunks)
-    )
+    chunk_offsets = jnp.arange(row_count + 1, dtype=jnp.int32) * jnp.int32(max_row_chunks)
     return chunk_indices, chunk_offsets, max_row_chunks
 
 
@@ -250,9 +245,7 @@ def _prepare_packed_gdn_post_conv_inputs_from_decay(
     value_dim = num_value_heads * value_head_dim
     expected_conv_dim = 2 * key_dim + value_dim
     if conv_dim != expected_conv_dim:
-        raise ValueError(
-            f"conv_out last dimension must be {expected_conv_dim}, got {conv_dim}"
-        )
+        raise ValueError(f"conv_out last dimension must be {expected_conv_dim}, got {conv_dim}")
     if a.shape != (1, token_bucket, num_value_heads):
         raise ValueError("a must have shape [1, token_bucket, value_heads]")
     if b.shape != (1, token_bucket, num_value_heads):
@@ -292,10 +285,7 @@ def _prepare_packed_gdn_post_conv_inputs_from_decay(
         query = l2norm(query.astype(jnp.float32), axis=-1, eps=1e-6)
         key = l2norm(key.astype(jnp.float32), axis=-1, eps=1e-6)
 
-    valid = (
-        jnp.arange(token_bucket, dtype=jnp.int32)
-        < query_start_loc[-1].astype(jnp.int32)
-    )
+    valid = jnp.arange(token_bucket, dtype=jnp.int32) < query_start_loc[-1].astype(jnp.int32)
     query = jnp.where(valid[None, :, None, None], query, 0.0)
     key = jnp.where(valid[None, :, None, None], key, 0.0)
     value = jnp.where(valid[None, :, None, None], value, 0.0)
@@ -331,8 +321,7 @@ class ServingOpsProtocol(Protocol):
         return_prefix_state: bool,
         return_first_prefix_state: bool,
         has_initial_state: bool,
-    ) -> GDNDecodeMode:
-        ...
+    ) -> GDNDecodeMode: ...
 
     def use_gdn_post_conv_prefill(
         self,
@@ -341,23 +330,14 @@ class ServingOpsProtocol(Protocol):
         return_prefix_state: bool,
         return_first_prefix_state: bool,
         packed: bool,
-    ) -> bool:
-        ...
+    ) -> bool: ...
 
     def allocate_kv_cache(
         self,
         spec: KVCacheSpec,
         max_seqs: int,
         max_blocks_per_seq: int,
-    ) -> KVCacheStorage:
-        ...
-
-    def allocate_full_attention_nhd_kv_cache(
-        self,
-        spec: KVCacheSpec,
-        full_attention_layers: tuple[int, ...],
-    ) -> FullAttentionNHDKVCacheStorage | None:
-        ...
+    ) -> KVCacheStorage: ...
 
     def build_attention_metadata(
         self,
@@ -371,8 +351,7 @@ class ServingOpsProtocol(Protocol):
         num_decode_tokens: int | None = None,
         token_row_ids: jnp.ndarray | None = None,
         max_query_len: int | None = None,
-    ) -> AttentionMetadata:
-        ...
+    ) -> AttentionMetadata: ...
 
     def write_kv(
         self,
@@ -381,8 +360,7 @@ class ServingOpsProtocol(Protocol):
         v: jnp.ndarray,
         cache: KVCacheStorage,
         metadata: AttentionMetadata,
-    ) -> KVCacheStorage:
-        ...
+    ) -> KVCacheStorage: ...
 
     def attention(
         self,
@@ -394,8 +372,7 @@ class ServingOpsProtocol(Protocol):
         scale: float,
         num_key_value_groups: int,
         is_prefill: bool,
-    ) -> jnp.ndarray:
-        ...
+    ) -> jnp.ndarray: ...
 
     def write_kv_and_attention(
         self,
@@ -409,8 +386,7 @@ class ServingOpsProtocol(Protocol):
         scale: float,
         num_key_value_groups: int,
         is_prefill: bool,
-    ) -> tuple[KVCacheStorage, jnp.ndarray]:
-        ...
+    ) -> tuple[KVCacheStorage, jnp.ndarray]: ...
 
     def gated_delta_prefill(
         self,
@@ -422,8 +398,7 @@ class ServingOpsProtocol(Protocol):
         chunk_size: int,
         initial_state: jnp.ndarray | None,
         use_qk_l2norm_in_kernel: bool,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        ...
+    ) -> tuple[jnp.ndarray, jnp.ndarray]: ...
 
     def gated_delta_prefill_post_conv(
         self,
@@ -441,8 +416,7 @@ class ServingOpsProtocol(Protocol):
         chunk_size: int,
         initial_state: jnp.ndarray | None,
         use_qk_l2norm_in_kernel: bool,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        ...
+    ) -> tuple[jnp.ndarray, jnp.ndarray]: ...
 
     def gated_delta_packed_prefill_post_conv(
         self,
@@ -462,8 +436,7 @@ class ServingOpsProtocol(Protocol):
         use_qk_l2norm_in_kernel: bool,
         max_row_tokens: int | None = None,
         return_prefix_state: bool = False,
-    ) -> tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        ...
+    ) -> tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]: ...
 
     def gated_delta_decode(
         self,
@@ -474,8 +447,7 @@ class ServingOpsProtocol(Protocol):
         beta: jnp.ndarray,
         initial_state: jnp.ndarray | None,
         use_qk_l2norm_in_kernel: bool,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        ...
+    ) -> tuple[jnp.ndarray, jnp.ndarray]: ...
 
     def gated_delta_packed_decode(
         self,
@@ -486,9 +458,7 @@ class ServingOpsProtocol(Protocol):
         dt_bias: jnp.ndarray,
         initial_state: jnp.ndarray,
         use_qk_l2norm_in_kernel: bool,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        ...
-
+    ) -> tuple[jnp.ndarray, jnp.ndarray]: ...
 
 
 class ServingOps:
@@ -562,21 +532,10 @@ class ServingOps:
         packed: bool,
     ) -> bool:
         enabled = self.gdn_prefill_post_conv_impl != "off"
-        packed_prefix = (
-            packed
-            and return_prefix_state
-            and not return_first_prefix_state
-        )
-        use_post_conv = (
-            enabled
-            and (
-                packed_prefix
-                or (
-                    not recurrent
-                    and not return_prefix_state
-                    and not return_first_prefix_state
-                )
-            )
+        packed_prefix = packed and return_prefix_state and not return_first_prefix_state
+        use_post_conv = enabled and (
+            packed_prefix
+            or (not recurrent and not return_prefix_state and not return_first_prefix_state)
         )
         if self.plan.gdn_disable_fallbacks and not use_post_conv:
             reasons = []
@@ -615,19 +574,6 @@ class ServingOps:
         )
         return state.storage
 
-    def allocate_full_attention_nhd_kv_cache(
-        self,
-        spec: KVCacheSpec,
-        full_attention_layers: tuple[int, ...],
-    ) -> FullAttentionNHDKVCacheStorage | None:
-        if self.full_attention_decode_impl != "flashinfer_paged":
-            return None
-        finalized_spec = _require_finalized_kv_cache_spec(spec, self.plan)
-        return init_full_attention_nhd_kv_cache(
-            spec=finalized_spec,
-            full_attention_layers=full_attention_layers,
-        )
-
     def build_attention_metadata(
         self,
         positions: jnp.ndarray,
@@ -661,9 +607,7 @@ class ServingOps:
             )
         else:
             if positions.shape[0] != block_tables.shape[0]:
-                raise ValueError(
-                    "positions and block_tables batch dimensions must match"
-                )
+                raise ValueError("positions and block_tables batch dimensions must match")
             if positions.shape[0] != seq_lens.shape[0]:
                 raise ValueError("positions and seq_lens batch dimensions must match")
             slot_mapping = compute_slot_mapping(
@@ -710,9 +654,12 @@ class ServingOps:
             raise AssertionError("KV append policy was validated incorrectly")
         if metadata.token_row_ids is not None:
             actual_tokens = metadata.query_start_loc[-1].astype(jnp.int32)
-            valid_mask = jnp.arange(metadata.slot_mapping.size, dtype=jnp.int32).reshape(
-                metadata.slot_mapping.shape
-            ) < actual_tokens
+            valid_mask = (
+                jnp.arange(metadata.slot_mapping.size, dtype=jnp.int32).reshape(
+                    metadata.slot_mapping.shape
+                )
+                < actual_tokens
+            )
         else:
             query_lens = jnp.diff(metadata.query_start_loc).astype(jnp.int32)
             valid_mask = jnp.arange(metadata.slot_mapping.shape[1])[None, :] < query_lens[:, None]
@@ -795,7 +742,10 @@ class ServingOps:
             if cache.k_cache.dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
                 raise ValueError("FlashInfer decode requires BF16/FP16 NHD KV cache")
             from nanovllm_jax.kernels.flashinfer_ffi import paged_decode_attention_gqa_nhd
-            from nanovllm_jax.kernels.paged_attention import dense_block_tables_to_kv_indptr, kv_last_page_len_from_seq_lens
+            from nanovllm_jax.kernels.paged_attention import (
+                dense_block_tables_to_kv_indptr,
+                kv_last_page_len_from_seq_lens,
+            )
 
             kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
                 metadata.block_tables,
@@ -846,8 +796,13 @@ class ServingOps:
                 raise ValueError("FlashInfer decode requires NHD cache storage")
             if cache.k_cache.dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
                 raise ValueError("FlashInfer decode requires BF16/FP16 NHD KV cache")
-            from nanovllm_jax.kernels.flashinfer_ffi import paged_decode_attention_with_kv_append_gqa_nhd
-            from nanovllm_jax.kernels.paged_attention import dense_block_tables_to_kv_indptr, kv_last_page_len_from_seq_lens
+            from nanovllm_jax.kernels.flashinfer_ffi import (
+                paged_decode_attention_with_kv_append_gqa_nhd,
+            )
+            from nanovllm_jax.kernels.paged_attention import (
+                dense_block_tables_to_kv_indptr,
+                kv_last_page_len_from_seq_lens,
+            )
 
             kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(
                 metadata.block_tables,
@@ -857,7 +812,9 @@ class ServingOps:
             k_cache, v_cache, outputs = cache.k_cache, cache.v_cache, []
             width = int(query.shape[1])
             for token_idx in range(width):
-                seq_lens_step = metadata.seq_lens - jnp.asarray(width - 1 - token_idx, dtype=metadata.seq_lens.dtype)
+                seq_lens_step = metadata.seq_lens - jnp.asarray(
+                    width - 1 - token_idx, dtype=metadata.seq_lens.dtype
+                )
                 out, k_cache, v_cache = paged_decode_attention_with_kv_append_gqa_nhd(
                     query[:, token_idx].astype(cache.k_cache.dtype),
                     k[:, token_idx].astype(cache.k_cache.dtype),
@@ -957,6 +914,7 @@ class ServingOps:
                 prepare_gdn_post_conv_prefill_fla_inputs_from_decay,
                 gdn_fla_prefill_chunk32_fp32_reference,
             )
+
             try:
                 from nanovllm_jax.kernels.gdn_fla_triton import (
                     gdn_fla_chunk_gated_delta_rule_packed_triton,
@@ -1022,26 +980,16 @@ class ServingOps:
                 -1,
                 prepared.beta.shape[2],
             )
-            batch, seq_len, num_key_heads_out, key_head_dim_prepared = (
-                prepared.query.shape
-            )
+            batch, seq_len, num_key_heads_out, key_head_dim_prepared = prepared.query.shape
             if key_head_dim_prepared != key_head_dim:
-                raise ValueError(
-                    "prepared query head dim must match configured key_head_dim"
-                )
+                raise ValueError("prepared query head dim must match configured key_head_dim")
             value_dim = prepared.value.shape[-1]
-            packed_cu_seqlens = (
-                jnp.arange(batch + 1, dtype=jnp.int32) * jnp.int32(seq_len)
-            )
+            packed_cu_seqlens = jnp.arange(batch + 1, dtype=jnp.int32) * jnp.int32(seq_len)
             max_chunks_per_row = (seq_len + chunk_size - 1) // chunk_size
             row_ids = jnp.repeat(jnp.arange(batch, dtype=jnp.int32), max_chunks_per_row)
-            chunk_ids = jnp.tile(
-                jnp.arange(max_chunks_per_row, dtype=jnp.int32), batch
-            )
+            chunk_ids = jnp.tile(jnp.arange(max_chunks_per_row, dtype=jnp.int32), batch)
             packed_chunk_indices = jnp.stack((row_ids, chunk_ids), axis=1)
-            packed_chunk_offsets = (
-                jnp.arange(batch + 1, dtype=jnp.int32) * max_chunks_per_row
-            )
+            packed_chunk_offsets = jnp.arange(batch + 1, dtype=jnp.int32) * max_chunks_per_row
 
             if gdn_fla_chunk_gated_delta_rule_packed_triton is None:
                 _raise_if_gdn_fallback_disabled(
@@ -1082,7 +1030,6 @@ class ServingOps:
             output = _cast_gdn_prefill_post_conv_output(output, self.plan)
             return output.transpose(0, 2, 1, 3), final_state
 
-
         raise AssertionError(f"Unhandled GDN post-conv prefill implementation {impl!r}")
 
     def gated_delta_packed_prefill_post_conv(
@@ -1106,9 +1053,7 @@ class ServingOps:
     ) -> tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         impl = self.gdn_prefill_post_conv_impl
         if impl == "off":
-            raise RuntimeError(
-                "gdn_prefill_post_conv_impl is off; use reference packed prefill"
-            )
+            raise RuntimeError("gdn_prefill_post_conv_impl is off; use reference packed prefill")
 
         token_bucket = int(conv_out.shape[1])
         row_count = int(query_start_loc.shape[0]) - 1
@@ -1145,7 +1090,9 @@ class ServingOps:
             plan=self.plan,
         )
 
-        def reference_scan() -> tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        def reference_scan() -> (
+            tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+        ):
             token_positions = jnp.arange(token_bucket, dtype=jnp.int32)
             cu = query_start_loc.astype(jnp.int32)
             row_ids = jnp.sum(
@@ -1153,9 +1100,7 @@ class ServingOps:
                 axis=1,
             ).astype(jnp.int32)
             safe_rows = jnp.clip(row_ids, 0, row_count - 1)
-            query_tokens = packed_query.astype(jnp.float32) * (
-                1.0 / jnp.sqrt(key_head_dim)
-            )
+            query_tokens = packed_query.astype(jnp.float32) * (1.0 / jnp.sqrt(key_head_dim))
             key_tokens = packed_key.astype(jnp.float32)
             value_tokens = packed_value.astype(jnp.float32)
             gate_tokens = packed_gate.astype(jnp.float32)
@@ -1260,13 +1205,11 @@ class ServingOps:
             )
             return output[None, :, :, :], final_state, prefix_states
 
-        chunk_indices, chunk_offsets, max_row_chunks = (
-            _static_packed_gdn_chunk_metadata(
-                row_count=row_count,
-                token_bucket=token_bucket,
-                chunk_size=chunk_size,
-                max_row_tokens=max_row_tokens,
-            )
+        chunk_indices, chunk_offsets, max_row_chunks = _static_packed_gdn_chunk_metadata(
+            row_count=row_count,
+            token_bucket=token_bucket,
+            chunk_size=chunk_size,
+            max_row_tokens=max_row_tokens,
         )
         output, final_state = gdn_fla_chunk_gated_delta_rule_packed_triton(
             packed_query,

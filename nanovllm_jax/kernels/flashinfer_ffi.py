@@ -10,7 +10,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from nanovllm_jax.kernels import KernelUnavailable, missing_modules, require_modules
+from nanovllm_jax.kernels import missing_modules, require_modules
 
 _APPEND_PAGED_KV_CACHE_TARGET = "nanovllm_jax_flashinfer_append_paged_kv_cache"
 _RADIX_TOPK_TARGET = "nanovllm_jax_flashinfer_radix_topk"
@@ -179,9 +179,7 @@ def _write_batch_decode_jax_plan_binding(path: Path) -> None:
     plan_args = ",\n                                    ".join(
         f"int64_t plan_{idx}" for idx in range(_FLASHINFER_BATCH_DECODE_PLAN_FIELDS)
     )
-    plan_values = ", ".join(
-        f"plan_{idx}" for idx in range(_FLASHINFER_BATCH_DECODE_PLAN_FIELDS)
-    )
+    plan_values = ", ".join(f"plan_{idx}" for idx in range(_FLASHINFER_BATCH_DECODE_PLAN_FIELDS))
     source = f"""/*
  * JAX-facing FlashInfer batch decode binding.
  *
@@ -251,9 +249,7 @@ def _write_batch_decode_fused_append_jax_plan_binding(path: Path) -> None:
     plan_args = ",\n    ".join(
         f"int64_t plan_{idx}" for idx in range(_FLASHINFER_BATCH_DECODE_PLAN_FIELDS)
     )
-    plan_values = ", ".join(
-        f"plan_{idx}" for idx in range(_FLASHINFER_BATCH_DECODE_PLAN_FIELDS)
-    )
+    plan_values = ", ".join(f"plan_{idx}" for idx in range(_FLASHINFER_BATCH_DECODE_PLAN_FIELDS))
     source = f"""/*
  * JAX-facing fused append + FlashInfer batch decode binding.
  *
@@ -549,10 +545,7 @@ def _register_batch_decode(dtype: jnp.dtype, head_dim: int) -> str:
         from flashinfer.jit.core import gen_jit_spec
         from jax_tvm_ffi import register_ffi_target
 
-        uri = (
-            f"nanovllm_jax_batch_decode_jax_plan_{dtype_key}_"
-            f"hd{int(head_dim)}"
-        )
+        uri = f"nanovllm_jax_batch_decode_jax_plan_{dtype_key}_hd{int(head_dim)}"
         base_spec = gen_customize_batch_decode_module(
             uri,
             torch_dtype,
@@ -573,8 +566,7 @@ def _register_batch_decode(dtype: jnp.dtype, head_dim: int) -> str:
         )
         custom_binding = Path(base_spec.sources[0]).parent / "batch_decode_jax_plan_binding.cu"
         fused_binding = (
-            Path(base_spec.sources[0]).parent
-            / "batch_decode_fused_append_jax_plan_binding.cu"
+            Path(base_spec.sources[0]).parent / "batch_decode_fused_append_jax_plan_binding.cu"
         )
         _write_batch_decode_jax_plan_binding(custom_binding)
         _write_batch_decode_fused_append_jax_plan_binding(fused_binding)
@@ -584,18 +576,13 @@ def _register_batch_decode(dtype: jnp.dtype, head_dim: int) -> str:
         )
         module = spec.build_and_load()
         target = f"{_BATCH_DECODE_TARGET_PREFIX}_{dtype_key}_hd{int(head_dim)}"
-        fused_target = (
-            f"{_BATCH_DECODE_FUSED_APPEND_TARGET_PREFIX}_{dtype_key}_hd{int(head_dim)}"
-        )
+        fused_target = f"{_BATCH_DECODE_FUSED_APPEND_TARGET_PREFIX}_{dtype_key}_hd{int(head_dim)}"
         register_ffi_target(
             target,
             module.run_jax_plan,
             arg_spec=[
                 "args",
-                *[
-                    f"attrs.plan_{idx}"
-                    for idx in range(_FLASHINFER_BATCH_DECODE_PLAN_FIELDS)
-                ],
+                *[f"attrs.plan_{idx}" for idx in range(_FLASHINFER_BATCH_DECODE_PLAN_FIELDS)],
                 "rets",
                 "attrs.kv_layout_code",
                 "attrs.window_left",
@@ -613,10 +600,7 @@ def _register_batch_decode(dtype: jnp.dtype, head_dim: int) -> str:
             module.run_jax_plan_fused_append,
             arg_spec=[
                 "args",
-                *[
-                    f"attrs.plan_{idx}"
-                    for idx in range(_FLASHINFER_BATCH_DECODE_PLAN_FIELDS)
-                ],
+                *[f"attrs.plan_{idx}" for idx in range(_FLASHINFER_BATCH_DECODE_PLAN_FIELDS)],
                 "attrs.layer_id",
                 "attrs.kv_layout_code",
                 "attrs.window_left",
@@ -660,7 +644,9 @@ def _validate_kv_append_inputs(
     if append_key.ndim != 3:
         raise ValueError("append_key must have shape [nnz_tokens, num_kv_heads, head_dim]")
     if k_cache.ndim != 4:
-        raise ValueError("k_cache must have NHD shape [num_pages, page_size, num_kv_heads, head_dim]")
+        raise ValueError(
+            "k_cache must have NHD shape [num_pages, page_size, num_kv_heads, head_dim]"
+        )
     if append_key.shape[1:] != k_cache.shape[2:]:
         raise ValueError("append_key trailing dimensions must match cache [num_kv_heads, head_dim]")
     if k_cache.dtype != v_cache.dtype:
@@ -724,7 +710,9 @@ def kv_append_paged_nhd_reference(
     if append_key.ndim != 3:
         raise ValueError("append_key must have shape [nnz_tokens, num_kv_heads, head_dim]")
     if k_cache.ndim != 4:
-        raise ValueError("k_cache must have NHD shape [num_pages, page_size, num_kv_heads, head_dim]")
+        raise ValueError(
+            "k_cache must have NHD shape [num_pages, page_size, num_kv_heads, head_dim]"
+        )
     nnz_tokens = append_key.shape[0]
     if batch_indices.shape != (nnz_tokens,) or positions.shape != (nnz_tokens,):
         raise ValueError("batch_indices and positions must both have shape [nnz_tokens]")
@@ -816,7 +804,11 @@ def radix_topk(
     logits = _as_jax_array("logits", logits)
     if logits.ndim != 2:
         raise ValueError("FlashInfer radix_topk expects logits with shape [batch, vocab]")
-    if logits.dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16)):
+    if logits.dtype not in (
+        jnp.dtype(jnp.float32),
+        jnp.dtype(jnp.float16),
+        jnp.dtype(jnp.bfloat16),
+    ):
         raise ValueError("FlashInfer radix_topk supports FP32/FP16/BF16 logits")
     k = int(top_k)
     if k < 1 or k > int(logits.shape[1]):
@@ -1046,11 +1038,7 @@ def _batch_decode_plan_info(
         kv_tile_indices_offset + max(1, padded_batch_size) * 4,
         o_indptr_offset + (max(1, padded_batch_size) + 1) * 4,
         kv_chunk_size_ptr_offset + 4,
-        (
-            block_valid_mask_offset + max(1, padded_batch_size)
-            if enable_cuda_graph
-            else 0
-        ),
+        (block_valid_mask_offset + max(1, padded_batch_size) if enable_cuda_graph else 0),
     )
     # FlashInfer's plan writes scheduler tables into int_workspace; run reads
     # them back using the offsets stored in plan_info. Copy only the populated
@@ -1104,7 +1092,11 @@ def paged_decode_attention_gqa_nhd(
             "FlashInfer batch decode supports only FP16/BF16 through this JAX FFI route; "
             f"got {query.dtype}"
         )
-    if kv_indptr.dtype != jnp.int32 or kv_indices.dtype != jnp.int32 or kv_last_page_len.dtype != jnp.int32:
+    if (
+        kv_indptr.dtype != jnp.int32
+        or kv_indices.dtype != jnp.int32
+        or kv_last_page_len.dtype != jnp.int32
+    ):
         raise ValueError("FlashInfer page metadata must use int32 dtype")
     batch, num_qo_heads, head_dim = query.shape
     num_pages, page_size, num_kv_heads, cache_head_dim = k_cache_layer.shape
@@ -1210,7 +1202,11 @@ def paged_decode_attention_with_kv_append_gqa_nhd(
             "FlashInfer fused append+decode supports only FP16/BF16 through this JAX FFI route; "
             f"got {query.dtype}"
         )
-    if kv_indptr.dtype != jnp.int32 or kv_indices.dtype != jnp.int32 or kv_last_page_len.dtype != jnp.int32:
+    if (
+        kv_indptr.dtype != jnp.int32
+        or kv_indices.dtype != jnp.int32
+        or kv_last_page_len.dtype != jnp.int32
+    ):
         raise ValueError("FlashInfer page metadata must use int32 dtype")
     batch, num_qo_heads, head_dim = query.shape
     num_layers, _num_pages, page_size, num_kv_heads, cache_head_dim = k_cache.shape
@@ -1283,4 +1279,6 @@ def paged_decode_attention_with_kv_append_gqa_nhd(
 
 def paged_prefill_attention_gqa_nhd(*args: Any, **kwargs: Any):
     require_available()
-    raise NotImplementedError("paged_prefill_attention_gqa_nhd FlashInfer FFI wrapper is not implemented yet")
+    raise NotImplementedError(
+        "paged_prefill_attention_gqa_nhd FlashInfer FFI wrapper is not implemented yet"
+    )

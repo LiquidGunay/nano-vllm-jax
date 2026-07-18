@@ -52,17 +52,22 @@ def test_lm_head_token_ids_and_topk_matches_full_logits(monkeypatch):
         top_k=2,
     )
 
-    hidden_norm = rms_norm(
-        hidden, params.norm_weight, config.model.rms_norm_eps
-    ).astype(jnp.float32)
+    hidden_norm = rms_norm(hidden, params.norm_weight, config.model.rms_norm_eps).astype(
+        jnp.float32
+    )
     logits = jnp.dot(hidden_norm, embed_tokens.T)
-    expected_top_values, expected_top_indices = jnp.flip(
-        jnp.sort(logits, axis=-1)[..., -2:],
-        axis=-1,
-    ), jnp.argsort(logits, axis=-1)[..., -2:][..., ::-1]
+    expected_top_values, expected_top_indices = (
+        jnp.flip(
+            jnp.sort(logits, axis=-1)[..., -2:],
+            axis=-1,
+        ),
+        jnp.argsort(logits, axis=-1)[..., -2:][..., ::-1],
+    )
 
     np.testing.assert_array_equal(np.array(token_ids), np.array(jnp.argmax(logits, axis=-1)))
-    np.testing.assert_allclose(np.array(top_values), np.array(expected_top_values), rtol=0, atol=1e-6)
+    np.testing.assert_allclose(
+        np.array(top_values), np.array(expected_top_values), rtol=0, atol=1e-6
+    )
     np.testing.assert_array_equal(np.array(top_indices), np.array(expected_top_indices))
 
     normed_token_ids, _, _ = lm_head_token_ids_and_topk(
@@ -214,9 +219,9 @@ def test_lm_head_sample_token_ids_matches_greedy_and_categorical(monkeypatch):
         is_prefill=False,
     )
 
-    hidden_norm = rms_norm(
-        hidden, params.norm_weight, config.model.rms_norm_eps
-    ).astype(jnp.float32)
+    hidden_norm = rms_norm(hidden, params.norm_weight, config.model.rms_norm_eps).astype(
+        jnp.float32
+    )
     logits = jnp.dot(hidden_norm, embed_tokens.T)[:, 0]
     expected = jnp.array(
         [

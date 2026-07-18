@@ -518,16 +518,14 @@ def _packed_decode_expected(
     value = value.astype(jnp.float32)
     gate = -decay.astype(jnp.float32)[None, :] * jax.nn.softplus(a + dt_bias[None, :])
     beta = jax.nn.sigmoid(b).astype(jnp.float32)
-    return (
-        jax_recurrent_gated_delta_rule(
-            query,
-            key,
-            value,
-            gate[:, :, None],
-            beta[:, :, None],
-            initial_state=state,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        )
+    return jax_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        gate[:, :, None],
+        beta[:, :, None],
+        initial_state=state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
 
@@ -719,6 +717,8 @@ def test_packed_gdn_decode_pre_normalize_qk_matches_reference():
         np.asarray(expected_state),
         rtol=1e-5,
     )
+
+
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 def test_gdn_state_k_last_roundtrip_preserves_local_layout():
     state = jnp.arange(2 * 3 * 4 * 5, dtype=jnp.float32).reshape(2, 3, 4, 5)

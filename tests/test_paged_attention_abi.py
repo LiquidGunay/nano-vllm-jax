@@ -34,18 +34,21 @@ def test_paged_decode_attention_gqa_nhd_reference_matches_current_decode_path():
         dtype=jnp.int32,
     )
     k_cache = (
-        jnp.arange(num_pages * page_size * num_kv_heads * head_dim, dtype=jnp.float32)
-        .reshape(num_pages, page_size, num_kv_heads, head_dim)
+        jnp.arange(num_pages * page_size * num_kv_heads * head_dim, dtype=jnp.float32).reshape(
+            num_pages, page_size, num_kv_heads, head_dim
+        )
         / 100.0
     )
     v_cache = (
-        jnp.arange(num_pages * page_size * num_kv_heads * head_dim, dtype=jnp.float32)
-        .reshape(num_pages, page_size, num_kv_heads, head_dim)
+        jnp.arange(num_pages * page_size * num_kv_heads * head_dim, dtype=jnp.float32).reshape(
+            num_pages, page_size, num_kv_heads, head_dim
+        )
         / 70.0
     )
     q = (
-        jnp.arange(batch * num_q_heads * head_dim, dtype=jnp.float32)
-        .reshape(batch, num_q_heads, head_dim)
+        jnp.arange(batch * num_q_heads * head_dim, dtype=jnp.float32).reshape(
+            batch, num_q_heads, head_dim
+        )
         / 50.0
     )
     kv_indices, kv_indptr = dense_block_tables_to_kv_indptr(

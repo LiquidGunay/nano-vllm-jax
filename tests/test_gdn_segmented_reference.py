@@ -160,22 +160,26 @@ def test_gdn_fla_chunk_local_cumsum_packed_triton_matches_reference():
 
     np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=0, atol=0)
     np.testing.assert_allclose(
-        np.asarray(gdn_fla_chunk_local_cumsum_packed_triton(
-            gate,
-            cu_seqlens,
-            chunk_size=8,
-            reverse=True,
-        )),
+        np.asarray(
+            gdn_fla_chunk_local_cumsum_packed_triton(
+                gate,
+                cu_seqlens,
+                chunk_size=8,
+                reverse=True,
+            )
+        ),
         np.asarray(expected_reverse),
         rtol=0,
         atol=0,
     )
     np.testing.assert_allclose(
-        np.asarray(gdn_fla_chunk_local_cumsum_packed_triton(
-            gate,
-            cu_seqlens,
-            chunk_size=8,
-        )),
+        np.asarray(
+            gdn_fla_chunk_local_cumsum_packed_triton(
+                gate,
+                cu_seqlens,
+                chunk_size=8,
+            )
+        ),
         np.asarray(expected),
         rtol=0,
         atol=0,
@@ -205,9 +209,7 @@ def test_gdn_fla_chunk_local_cumsum_packed_reference_handles_zero_length_rows():
 def test_gdn_fla_chunk_scaled_dot_kkt_packed_reference_matches_formula():
     cu_seqlens = jnp.array([0, 0, 5, 13], dtype=jnp.int32)
     key = jnp.arange(13 * 2 * 3, dtype=jnp.float32).reshape(13, 2, 3) * 0.02
-    beta = (
-        jnp.arange(13 * 4, dtype=jnp.float32).reshape(13, 4) * 0.01 + 0.25
-    )
+    beta = jnp.arange(13 * 4, dtype=jnp.float32).reshape(13, 4) * 0.01 + 0.25
     gate = jnp.linspace(-0.5, 0.5, 13 * 4, dtype=jnp.float32).reshape(13, 4)
     chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=4)
 
@@ -251,9 +253,7 @@ def test_gdn_fla_chunk_scaled_dot_kkt_packed_triton_matches_reference():
 
     cu_seqlens = jnp.array([0, 0, 5, 13], dtype=jnp.int32)
     key = jnp.arange(13 * 2 * 3, dtype=jnp.float32).reshape(13, 2, 3) * 0.02
-    beta = (
-        jnp.arange(13 * 4, dtype=jnp.float32).reshape(13, 4) * 0.01 + 0.25
-    )
+    beta = jnp.arange(13 * 4, dtype=jnp.float32).reshape(13, 4) * 0.01 + 0.25
     gate = jnp.linspace(-0.5, 0.5, 13 * 4, dtype=jnp.float32).reshape(13, 4)
     chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=4)
 
@@ -278,9 +278,7 @@ def test_gdn_fla_chunk_scaled_dot_kkt_packed_triton_matches_reference():
     # reduction-association differences in stage-local matmul-like accumulation.
     # This is a local arithmetic-drift gate for testing parity of the stage
     # output itself, not an end-to-end serving relaxation.
-    np.testing.assert_allclose(
-        np.asarray(actual), np.asarray(expected), rtol=0, atol=1e-6
-    )
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=0, atol=1e-6)
 
     actual_none_gate = gdn_fla_chunk_scaled_dot_kkt_packed_triton(
         key,
@@ -524,12 +522,8 @@ def test_vllm_like_recompute_w_u_quantizes_rhs_before_dot():
 
     cu_seqlens = jnp.array([0, 4], dtype=jnp.int32)
     chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=4)
-    key = jnp.array(
-        np.linspace(-0.7, 0.9, 4 * 1 * 3, dtype=np.float32).reshape(4, 1, 3)
-    )
-    value = jnp.array(
-        np.linspace(0.15, 1.25, 4 * 1 * 2, dtype=np.float32).reshape(4, 1, 2)
-    )
+    key = jnp.array(np.linspace(-0.7, 0.9, 4 * 1 * 3, dtype=np.float32).reshape(4, 1, 3))
+    value = jnp.array(np.linspace(0.15, 1.25, 4 * 1 * 2, dtype=np.float32).reshape(4, 1, 2))
     beta = jnp.array([[0.17], [0.31], [0.43], [0.59]], dtype=jnp.float32)
     gate = jnp.array([[-0.2], [0.05], [0.17], [0.33]], dtype=jnp.float32)
     attention_inverse = jnp.array(
@@ -578,15 +572,9 @@ def test_vllm_like_chunk_delta_h_quantizes_delta_after_gate_for_recurrence():
         cu_seqlens,
         chunk_size=4,
     )
-    key = jnp.array(
-        np.linspace(-0.35, 0.55, 4 * 1 * 3, dtype=np.float32).reshape(4, 1, 3)
-    )
-    w = jnp.array(
-        np.linspace(0.12, 0.82, 4 * 1 * 3, dtype=np.float32).reshape(4, 1, 3)
-    )
-    u = jnp.array(
-        np.linspace(-0.44, 0.63, 4 * 1 * 2, dtype=np.float32).reshape(4, 1, 2)
-    )
+    key = jnp.array(np.linspace(-0.35, 0.55, 4 * 1 * 3, dtype=np.float32).reshape(4, 1, 3))
+    w = jnp.array(np.linspace(0.12, 0.82, 4 * 1 * 3, dtype=np.float32).reshape(4, 1, 3))
+    u = jnp.array(np.linspace(-0.44, 0.63, 4 * 1 * 2, dtype=np.float32).reshape(4, 1, 2))
     gate = jnp.array([[-0.3], [-0.05], [0.1], [0.27]], dtype=jnp.float32)
     initial_state = jnp.array(
         np.linspace(-0.2, 0.4, 1 * 1 * 2 * 3, dtype=np.float32).reshape(1, 1, 2, 3)
@@ -611,8 +599,7 @@ def test_vllm_like_chunk_delta_h_quantizes_delta_after_gate_for_recurrence():
     last_gate = np.asarray(gate)[-1, 0]
     update_delta = bf16(delta * np.exp(last_gate - np.asarray(gate)[:, 0])[:, None])
     expected_final = (
-        state_for_dot * np.exp(last_gate)
-        + update_delta.T @ bf16(np.asarray(key)[:, 0])
+        state_for_dot * np.exp(last_gate) + update_delta.T @ bf16(np.asarray(key)[:, 0])
     )[None, None, :, :]
 
     np.testing.assert_allclose(np.asarray(actual_h)[0, 0], state_for_dot, rtol=0, atol=0)
@@ -622,7 +609,7 @@ def test_vllm_like_chunk_delta_h_quantizes_delta_after_gate_for_recurrence():
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax_triton is required")
-def test_gdn_fla_recompute_w_u_packed_triton_matches_reference():
+def test_gdn_fla_recompute_w_u_packed_triton_matches_ragged_reference():
     from nanovllm_jax.kernels.gdn_fla_triton import (
         gdn_fla_recompute_w_u_packed_triton,
     )
@@ -630,9 +617,7 @@ def test_gdn_fla_recompute_w_u_packed_triton_matches_reference():
     cu_seqlens = jnp.array([0, 0, 5, 13], dtype=jnp.int32)
     key = jnp.arange(13 * 2 * 3, dtype=jnp.float32).reshape(13, 2, 3) * 0.01
     value = jnp.arange(13 * 4 * 5, dtype=jnp.float32).reshape(13, 4, 5) * 0.02
-    beta = (
-        jnp.arange(13 * 4, dtype=jnp.float32).reshape(13, 4) * 0.01 + 0.25
-    )
+    beta = jnp.arange(13 * 4, dtype=jnp.float32).reshape(13, 4) * 0.01 + 0.25
     gate = jnp.linspace(-0.25, 0.25, 13 * 4, dtype=jnp.float32).reshape(13, 4)
     chunk_indices, _ = prepare_gdn_fla_chunk_metadata(cu_seqlens, chunk_size=4)
     attention_matrix = gdn_fla_chunk_scaled_dot_kkt_packed_reference(
@@ -691,7 +676,7 @@ def test_gdn_fla_recompute_w_u_packed_triton_matches_reference():
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax_triton is required")
-def test_gdn_fla_recompute_w_u_packed_triton_matches_reference():
+def test_gdn_fla_recompute_w_u_packed_triton_matches_long_reference():
     from nanovllm_jax.kernels.gdn_fla_triton import (
         gdn_fla_recompute_w_u_packed_triton,
     )
@@ -704,9 +689,7 @@ def test_gdn_fla_recompute_w_u_packed_triton_matches_reference():
     value = jax.random.normal(keys[1], (96, 4, 64), dtype=jnp.float32) * 0.03
     beta = jax.random.uniform(keys[2], (96, 4), dtype=jnp.float32, minval=0.2, maxval=0.7)
     gate = jax.random.normal(keys[3], (96, 4), dtype=jnp.float32) * 0.01
-    attention_inverse = jax.random.normal(
-        keys[4], (96, 4, chunk_size), dtype=jnp.float32
-    ) * 0.02
+    attention_inverse = jax.random.normal(keys[4], (96, 4, chunk_size), dtype=jnp.float32) * 0.02
 
     actual_w, actual_u = gdn_fla_recompute_w_u_packed_triton(
         key,
@@ -795,13 +778,9 @@ def test_gdn_fla_recompute_w_u_packed_reference_matches_formula():
                 chunk_gate = gate_np[start:end, head].astype(np.float32)
                 chunk_value = value_np[start:end, head, :].astype(np.float32)
                 chunk_key = key_np[start:end, key_head, :].astype(np.float32)
-                expected_u[start:end, head, :] = matrix @ (
-                    chunk_value * chunk_beta[:, None]
-                )
+                expected_u[start:end, head, :] = matrix @ (chunk_value * chunk_beta[:, None])
                 expected_w[start:end, head, :] = matrix @ (
-                    chunk_key
-                    * chunk_beta[:, None]
-                    * np.exp(chunk_gate)[:, None]
+                    chunk_key * chunk_beta[:, None] * np.exp(chunk_gate)[:, None]
                 )
 
     np.testing.assert_allclose(np.asarray(actual_w), expected_w, rtol=1e-5, atol=1e-6)
@@ -818,9 +797,7 @@ def test_gdn_fla_chunk_delta_h_packed_reference_matches_formula():
     value = jnp.arange(13 * 4 * 5, dtype=jnp.float32).reshape(13, 4, 5) * 0.02
     beta = jnp.linspace(0.2, 0.7, 13 * 4, dtype=jnp.float32).reshape(13, 4)
     gate = jnp.linspace(-0.25, 0.25, 13 * 4, dtype=jnp.float32).reshape(13, 4)
-    initial_state = (
-        jnp.arange(3 * 4 * 5 * 3, dtype=jnp.float32).reshape(3, 4, 5, 3) * 0.001
-    )
+    initial_state = jnp.arange(3 * 4 * 5 * 3, dtype=jnp.float32).reshape(3, 4, 5, 3) * 0.001
     attention_matrix = gdn_fla_chunk_scaled_dot_kkt_packed_reference(
         key,
         beta,
@@ -877,17 +854,13 @@ def test_gdn_fla_chunk_delta_h_packed_reference_matches_formula():
                 key_head = head // 2
                 head_state = row_state[head]
                 expected_h[flat_chunk, head] = head_state
-                delta = (
-                    u_np[start:end, head, :]
-                    - w_np[start:end, head, :] @ head_state.T
-                )
+                delta = u_np[start:end, head, :] - w_np[start:end, head, :] @ head_state.T
                 expected_v_new[start:end, head, :] = delta
                 chunk_gate = gate_np[start:end, head].astype(np.float32)
                 last_gate = chunk_gate[-1]
                 update_delta = delta * np.exp(last_gate - chunk_gate)[:, None]
                 row_state[head] = (
-                    head_state * np.exp(last_gate)
-                    + update_delta.T @ key_np[start:end, key_head, :]
+                    head_state * np.exp(last_gate) + update_delta.T @ key_np[start:end, key_head, :]
                 )
         expected_final[row] = row_state
 
@@ -908,7 +881,7 @@ def test_gdn_fla_chunk_delta_h_packed_reference_matches_formula():
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
-def test_gdn_fla_chunk_delta_h_packed_triton_matches_reference():
+def test_gdn_fla_chunk_delta_h_packed_triton_matches_ragged_reference():
     from nanovllm_jax.kernels.gdn_fla_triton import (
         gdn_fla_chunk_delta_h_packed_triton,
     )
@@ -920,13 +893,9 @@ def test_gdn_fla_chunk_delta_h_packed_triton_matches_reference():
     )
     key = jnp.arange(13 * 2 * 3, dtype=jnp.float32).reshape(13, 2, 3) * 0.01
     value = jnp.arange(13 * 4 * 5, dtype=jnp.float32).reshape(13, 4, 5) * 0.02
-    beta = (
-        jnp.arange(13 * 4, dtype=jnp.float32).reshape(13, 4) * 0.01 + 0.25
-    )
+    beta = jnp.arange(13 * 4, dtype=jnp.float32).reshape(13, 4) * 0.01 + 0.25
     gate = jnp.linspace(-0.25, 0.25, 13 * 4, dtype=jnp.float32).reshape(13, 4)
-    initial_state = (
-        jnp.arange(3 * 4 * 5 * 3, dtype=jnp.float32).reshape(3, 4, 5, 3) * 0.001
-    )
+    initial_state = jnp.arange(3 * 4 * 5 * 3, dtype=jnp.float32).reshape(3, 4, 5, 3) * 0.001
     attention_matrix = gdn_fla_chunk_scaled_dot_kkt_packed_reference(
         key,
         beta,
@@ -992,7 +961,7 @@ def test_gdn_fla_chunk_delta_h_packed_triton_matches_reference():
 
 @pytest.mark.skipif(not _has_cuda_backend(), reason="CUDA JAX backend is required")
 @pytest.mark.skipif(not _has_jax_triton(), reason="jax-triton is required")
-def test_gdn_fla_chunk_delta_h_packed_triton_matches_reference():
+def test_gdn_fla_chunk_delta_h_packed_triton_matches_long_reference():
     from nanovllm_jax.kernels.gdn_fla_triton import (
         gdn_fla_chunk_delta_h_packed_triton,
     )
@@ -1064,9 +1033,7 @@ def test_gdn_fla_chunk_fwd_o_packed_reference_matches_formula():
     value = jnp.arange(13 * 4 * 5, dtype=jnp.float32).reshape(13, 4, 5) * 0.02
     beta = jnp.linspace(0.2, 0.7, 13 * 4, dtype=jnp.float32).reshape(13, 4)
     gate = jnp.linspace(-0.25, 0.25, 13 * 4, dtype=jnp.float32).reshape(13, 4)
-    initial_state = (
-        jnp.arange(3 * 4 * 5 * 3, dtype=jnp.float32).reshape(3, 4, 5, 3) * 0.001
-    )
+    initial_state = jnp.arange(3 * 4 * 5 * 3, dtype=jnp.float32).reshape(3, 4, 5, 3) * 0.001
     attention_matrix = gdn_fla_chunk_scaled_dot_kkt_packed_reference(
         key,
         beta,
@@ -1163,9 +1130,7 @@ def test_gdn_fla_chunk_fwd_o_packed_triton_matches_reference():
     value = jnp.arange(13 * 4 * 5, dtype=jnp.float32).reshape(13, 4, 5) * 0.02
     beta = jnp.linspace(0.2, 0.7, 13 * 4, dtype=jnp.float32).reshape(13, 4)
     gate = jnp.linspace(-0.25, 0.25, 13 * 4, dtype=jnp.float32).reshape(13, 4)
-    initial_state = (
-        jnp.arange(3 * 4 * 5 * 3, dtype=jnp.float32).reshape(3, 4, 5, 3) * 0.001
-    )
+    initial_state = jnp.arange(3 * 4 * 5 * 3, dtype=jnp.float32).reshape(3, 4, 5, 3) * 0.001
     attention_matrix = gdn_fla_chunk_scaled_dot_kkt_packed_reference(
         key,
         beta,
@@ -1337,11 +1302,14 @@ def test_gdn_fla_chunk_gated_delta_rule_packed_reference_matches_segmented():
         (batch, num_heads, seq_len, value_dim),
         dtype=jnp.float32,
     )
-    gate = jax.random.normal(
-        keys[3],
-        (batch, num_heads, seq_len),
-        dtype=jnp.float32,
-    ) * 0.05
+    gate = (
+        jax.random.normal(
+            keys[3],
+            (batch, num_heads, seq_len),
+            dtype=jnp.float32,
+        )
+        * 0.05
+    )
     beta = jax.random.uniform(
         keys[4],
         (batch, num_heads, seq_len),
@@ -1349,11 +1317,14 @@ def test_gdn_fla_chunk_gated_delta_rule_packed_reference_matches_segmented():
         minval=0.05,
         maxval=0.95,
     )
-    initial_state = jax.random.normal(
-        keys[5],
-        (batch, num_heads, value_dim, key_dim),
-        dtype=jnp.float32,
-    ) * 0.01
+    initial_state = (
+        jax.random.normal(
+            keys[5],
+            (batch, num_heads, value_dim, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.01
+    )
 
     query = jnp.where(valid[:, None, :, None], query, 0.0)
     key = jnp.where(valid[:, None, :, None], key, 0.0)
@@ -1474,11 +1445,14 @@ def test_gdn_fla_chunk_gated_delta_rule_packed_triton_matches_reference():
         (batch, num_heads, seq_len, value_dim),
         dtype=jnp.float32,
     )
-    gate = jax.random.normal(
-        keys[3],
-        (batch, num_heads, seq_len),
-        dtype=jnp.float32,
-    ) * 0.05
+    gate = (
+        jax.random.normal(
+            keys[3],
+            (batch, num_heads, seq_len),
+            dtype=jnp.float32,
+        )
+        * 0.05
+    )
     beta = jax.random.uniform(
         keys[4],
         (batch, num_heads, seq_len),
@@ -1486,11 +1460,14 @@ def test_gdn_fla_chunk_gated_delta_rule_packed_triton_matches_reference():
         minval=0.05,
         maxval=0.95,
     )
-    initial_state = jax.random.normal(
-        keys[5],
-        (batch, num_heads, value_dim, key_dim),
-        dtype=jnp.float32,
-    ) * 0.01
+    initial_state = (
+        jax.random.normal(
+            keys[5],
+            (batch, num_heads, value_dim, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.01
+    )
 
     query = jnp.where(valid[:, None, :, None], query, 0.0)
     key = jnp.where(valid[:, None, :, None], key, 0.0)
@@ -1567,26 +1544,38 @@ def test_gdn_fla_chunk_gated_delta_rule_packed_triton_mixed_lengths():
     key_dim = 64
     value_dim = 64
     keys = jax.random.split(jax.random.PRNGKey(20260604), 6)
-    query = jax.random.normal(
-        keys[0],
-        (total_tokens, num_heads, key_dim),
-        dtype=jnp.float32,
-    ) * 0.02
-    key = jax.random.normal(
-        keys[1],
-        (total_tokens, num_heads, key_dim),
-        dtype=jnp.float32,
-    ) * 0.02
-    value = jax.random.normal(
-        keys[2],
-        (total_tokens, num_heads, value_dim),
-        dtype=jnp.float32,
-    ) * 0.03
-    gate = jax.random.normal(
-        keys[3],
-        (total_tokens, num_heads),
-        dtype=jnp.float32,
-    ) * 0.01
+    query = (
+        jax.random.normal(
+            keys[0],
+            (total_tokens, num_heads, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.02
+    )
+    key = (
+        jax.random.normal(
+            keys[1],
+            (total_tokens, num_heads, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.02
+    )
+    value = (
+        jax.random.normal(
+            keys[2],
+            (total_tokens, num_heads, value_dim),
+            dtype=jnp.float32,
+        )
+        * 0.03
+    )
+    gate = (
+        jax.random.normal(
+            keys[3],
+            (total_tokens, num_heads),
+            dtype=jnp.float32,
+        )
+        * 0.01
+    )
     beta = jax.random.uniform(
         keys[4],
         (total_tokens, num_heads),
@@ -1594,11 +1583,14 @@ def test_gdn_fla_chunk_gated_delta_rule_packed_triton_mixed_lengths():
         minval=0.2,
         maxval=0.7,
     )
-    initial_state = jax.random.normal(
-        keys[5],
-        (batch, num_heads, value_dim, key_dim),
-        dtype=jnp.float32,
-    ) * 0.01
+    initial_state = (
+        jax.random.normal(
+            keys[5],
+            (batch, num_heads, value_dim, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.01
+    )
 
     actual_out, actual_state = gdn_fla_chunk_gated_delta_rule_packed_triton(
         query,
@@ -1656,26 +1648,38 @@ def test_gdn_fla_packed_triton_static_bucket_metadata_matches_reference():
     key_dim = 8
     value_dim = 8
     keys = jax.random.split(jax.random.PRNGKey(20260605), 6)
-    query = jax.random.normal(
-        keys[0],
-        (token_bucket, num_heads, key_dim),
-        dtype=jnp.float32,
-    ) * 0.02
-    key = jax.random.normal(
-        keys[1],
-        (token_bucket, num_heads, key_dim),
-        dtype=jnp.float32,
-    ) * 0.02
-    value = jax.random.normal(
-        keys[2],
-        (token_bucket, num_heads, value_dim),
-        dtype=jnp.float32,
-    ) * 0.03
-    gate = jax.random.normal(
-        keys[3],
-        (token_bucket, num_heads),
-        dtype=jnp.float32,
-    ) * 0.01
+    query = (
+        jax.random.normal(
+            keys[0],
+            (token_bucket, num_heads, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.02
+    )
+    key = (
+        jax.random.normal(
+            keys[1],
+            (token_bucket, num_heads, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.02
+    )
+    value = (
+        jax.random.normal(
+            keys[2],
+            (token_bucket, num_heads, value_dim),
+            dtype=jnp.float32,
+        )
+        * 0.03
+    )
+    gate = (
+        jax.random.normal(
+            keys[3],
+            (token_bucket, num_heads),
+            dtype=jnp.float32,
+        )
+        * 0.01
+    )
     beta = jax.random.uniform(
         keys[4],
         (token_bucket, num_heads),
@@ -1683,24 +1687,25 @@ def test_gdn_fla_packed_triton_static_bucket_metadata_matches_reference():
         minval=0.2,
         maxval=0.7,
     )
-    initial_state = jax.random.normal(
-        keys[5],
-        (row_count, num_heads, value_dim, key_dim),
-        dtype=jnp.float32,
-    ) * 0.01
+    initial_state = (
+        jax.random.normal(
+            keys[5],
+            (row_count, num_heads, value_dim, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.01
+    )
     valid = jnp.arange(token_bucket, dtype=jnp.int32) < cu_seqlens[-1]
     query = jnp.where(valid[:, None, None], query, 0.0)
     key = jnp.where(valid[:, None, None], key, 0.0)
     value = jnp.where(valid[:, None, None], value, 0.0)
     gate = jnp.where(valid[:, None], gate, 0.0)
     beta = jnp.where(valid[:, None], beta, 0.0)
-    chunk_indices, chunk_offsets, max_row_chunks = (
-        _static_packed_gdn_chunk_metadata(
-            row_count=row_count,
-            token_bucket=token_bucket,
-            chunk_size=chunk_size,
-            max_row_tokens=24,
-        )
+    chunk_indices, chunk_offsets, max_row_chunks = _static_packed_gdn_chunk_metadata(
+        row_count=row_count,
+        token_bucket=token_bucket,
+        chunk_size=chunk_size,
+        max_row_tokens=24,
     )
 
     actual_out, actual_state = gdn_fla_chunk_gated_delta_rule_packed_triton(
@@ -1779,11 +1784,14 @@ def test_gdn_fla_chunk_gated_delta_rule_triton_stage_diagnostics():
         (batch, num_heads, seq_len, value_dim),
         dtype=jnp.float32,
     )
-    gate = jax.random.normal(
-        keys[3],
-        (batch, num_heads, seq_len),
-        dtype=jnp.float32,
-    ) * 0.05
+    gate = (
+        jax.random.normal(
+            keys[3],
+            (batch, num_heads, seq_len),
+            dtype=jnp.float32,
+        )
+        * 0.05
+    )
     beta = jax.random.uniform(
         keys[4],
         (batch, num_heads, seq_len),
@@ -1791,11 +1799,14 @@ def test_gdn_fla_chunk_gated_delta_rule_triton_stage_diagnostics():
         minval=0.05,
         maxval=0.95,
     )
-    initial_state = jax.random.normal(
-        keys[5],
-        (batch, num_heads, value_dim, key_dim),
-        dtype=jnp.float32,
-    ) * 0.01
+    initial_state = (
+        jax.random.normal(
+            keys[5],
+            (batch, num_heads, value_dim, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.01
+    )
 
     query = jnp.where(valid[:, None, :, None], query, 0.0)
     key = jnp.where(valid[:, None, :, None], key, 0.0)
@@ -2002,21 +2013,27 @@ def test_segmented_gdn_prefill_reference_matches_padded_chunk32():
         (batch, num_heads, seq_len, value_dim),
         dtype=jnp.float32,
     )
-    gate = jax.random.normal(
-        keys[3],
-        (batch, num_heads, seq_len),
-        dtype=jnp.float32,
-    ) * 0.1
+    gate = (
+        jax.random.normal(
+            keys[3],
+            (batch, num_heads, seq_len),
+            dtype=jnp.float32,
+        )
+        * 0.1
+    )
     beta = jax.random.uniform(
         keys[4],
         (batch, num_heads, seq_len),
         dtype=jnp.float32,
     )
-    initial_state = jax.random.normal(
-        keys[5],
-        (batch, num_heads, value_dim, key_dim),
-        dtype=jnp.float32,
-    ) * 0.01
+    initial_state = (
+        jax.random.normal(
+            keys[5],
+            (batch, num_heads, value_dim, key_dim),
+            dtype=jnp.float32,
+        )
+        * 0.01
+    )
 
     query = jnp.where(valid[:, None, :, None], query, 0.0)
     key = jnp.where(valid[:, None, :, None], key, 0.0)
@@ -2084,8 +2101,8 @@ def test_segmented_gdn_prefill_reference_matches_padded_chunk32():
         padded_segmented_out.astype(jnp.float32) - padded_out.astype(jnp.float32),
         0.0,
     )
-    padded_state_diff = (
-        padded_segmented_state.astype(jnp.float32) - padded_state.astype(jnp.float32)
+    padded_state_diff = padded_segmented_state.astype(jnp.float32) - padded_state.astype(
+        jnp.float32
     )
 
     assert np.asarray(packed_query).shape[0] == int(np.asarray(lengths).sum())
@@ -2108,8 +2125,12 @@ def test_gdn_segmented_prefill_chunk32_rejects_implicit_l2norm_fallback(monkeypa
     key = jax.random.normal(keys[1], (batch, num_heads, 5, key_dim), dtype=jnp.float32)
     value = jax.random.normal(keys[2], (batch, num_heads, 5, value_dim), dtype=jnp.float32)
     gate = jax.random.normal(keys[3], (batch, num_heads, 5), dtype=jnp.float32) * 0.05
-    beta = jax.random.uniform(keys[4], (batch, num_heads, 5), dtype=jnp.float32, minval=0.05, maxval=0.95)
-    initial_state = jax.random.normal(keys[5], (batch, num_heads, value_dim, key_dim), dtype=jnp.float32) * 0.01
+    beta = jax.random.uniform(
+        keys[4], (batch, num_heads, 5), dtype=jnp.float32, minval=0.05, maxval=0.95
+    )
+    initial_state = (
+        jax.random.normal(keys[5], (batch, num_heads, value_dim, key_dim), dtype=jnp.float32) * 0.01
+    )
 
     valid = jnp.arange(5, dtype=jnp.int32)[None, :] < lengths[:, None]
     query = jnp.where(valid[:, None, :, None], query, 0.0)
@@ -2130,6 +2151,7 @@ def test_gdn_segmented_prefill_chunk32_rejects_implicit_l2norm_fallback(monkeypa
     # Monkeypatch require_available so this test reaches the explicit
     # unsupported-shape guard in the Triton wrapper.
     import nanovllm_jax.kernels.gdn_fla as _gdn_fla_mod
+
     monkeypatch.setattr(_gdn_fla_mod, "require_available", lambda: None)
 
     with pytest.raises(RuntimeError, match="implicit GDN kernel fallbacks are disabled"):

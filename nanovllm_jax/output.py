@@ -15,9 +15,7 @@ class DeviceTokenRef:
 
 
 def is_device_token(value: Any) -> bool:
-    return isinstance(value, DeviceTokenRef) or (
-        hasattr(value, "dtype") and hasattr(value, "shape")
-    )
+    return isinstance(value, DeviceTokenRef)
 
 
 @dataclass(frozen=True)
@@ -26,7 +24,7 @@ class OutputSlot:
 
     buffer: "OutputBuffer"
     index: int
-    token: Any
+    token: DeviceTokenRef
 
 
 class OutputBuffer:
@@ -34,7 +32,7 @@ class OutputBuffer:
 
     def __init__(self) -> None:
         self._token_ids: list[int] = []
-        self._deferred: dict[int, Any] = {}
+        self._deferred: dict[int, DeviceTokenRef] = {}
 
     def __len__(self) -> int:
         return len(self._token_ids)
@@ -43,7 +41,9 @@ class OutputBuffer:
         self._token_ids.append(int(token_id))
         return len(self._token_ids) - 1
 
-    def append_device(self, token: Any) -> int:
+    def append_device(self, token: DeviceTokenRef) -> int:
+        if not isinstance(token, DeviceTokenRef):
+            raise TypeError("deferred output tokens must use DeviceTokenRef")
         index = len(self._token_ids)
         self._token_ids.append(0)
         self._deferred[index] = token
@@ -54,7 +54,7 @@ class OutputBuffer:
         return self._token_ids[-1]
 
     @property
-    def last_device_token(self) -> Any | None:
+    def last_device_token(self) -> DeviceTokenRef | None:
         return self._deferred.get(len(self._token_ids) - 1)
 
     @property
@@ -101,9 +101,7 @@ class OutputBuffer:
 
     @staticmethod
     def snapshot_many(buffers: Iterable["OutputBuffer"]) -> "OutputSnapshot":
-        return OutputSnapshot(
-            tuple(slot for buffer in buffers for slot in buffer.snapshot().slots)
-        )
+        return OutputSnapshot(tuple(slot for buffer in buffers for slot in buffer.snapshot().slots))
 
     @staticmethod
     def materialize_many(buffers: Iterable["OutputBuffer"]) -> list[list[int]]:
@@ -121,11 +119,7 @@ class OutputSnapshot:
     def prefetch(self) -> "OutputSnapshot":
         seen: set[int] = set()
         for slot in self.slots:
-            array = (
-                slot.token.tokens
-                if isinstance(slot.token, DeviceTokenRef)
-                else slot.token
-            )
+            array = slot.token.tokens
             if id(array) in seen:
                 continue
             seen.add(id(array))
@@ -135,40 +129,26 @@ class OutputSnapshot:
         return self
 
     def materialize(self) -> None:
-        slots = [
-            slot
-            for slot in self.slots
-            if slot.buffer._deferred.get(slot.index) is slot.token
-        ]
+        slots = [slot for slot in self.slots if slot.buffer._deferred.get(slot.index) is slot.token]
         if not slots:
             return
 
         import jax
         import jax.numpy as jnp
 
-        scalars: list[Any] = []
         vectors: list[Any] = []
         vector_indices: dict[int, int] = {}
-        locations: list[tuple[str, int, int]] = []
+        locations: list[tuple[int, int]] = []
         for slot in slots:
-            if isinstance(slot.token, DeviceTokenRef):
-                vector = slot.token.tokens
-                vector_index = vector_indices.setdefault(id(vector), len(vectors))
-                if vector_index == len(vectors):
-                    vectors.append(jnp.asarray(vector, dtype=jnp.int32).reshape(-1))
-                locations.append(("vector", vector_index, int(slot.token.row)))
-            else:
-                locations.append(("scalar", len(scalars), 0))
-                scalars.append(jnp.asarray(slot.token, dtype=jnp.int32).reshape(()))
+            vector = slot.token.tokens
+            vector_index = vector_indices.setdefault(id(vector), len(vectors))
+            if vector_index == len(vectors):
+                vectors.append(jnp.asarray(vector, dtype=jnp.int32).reshape(-1))
+            locations.append((vector_index, int(slot.token.row)))
 
-        scalar_values = jax.device_get(jnp.stack(scalars)).tolist() if scalars else []
-        vector_values = jax.device_get(vectors) if vectors else []
-        for slot, (kind, array_index, row) in zip(slots, locations):
-            value = (
-                scalar_values[array_index]
-                if kind == "scalar"
-                else vector_values[array_index][row]
-            )
+        vector_values = jax.device_get(vectors)
+        for slot, (array_index, row) in zip(slots, locations):
+            value = vector_values[array_index][row]
             if slot.buffer._deferred.get(slot.index) is slot.token:
                 slot.buffer._token_ids[slot.index] = int(value)
                 del slot.buffer._deferred[slot.index]

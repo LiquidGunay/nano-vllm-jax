@@ -10,7 +10,6 @@ import jax.numpy as jnp
 
 from nanovllm_jax.cache import (
     AttentionMetadata,
-    KVCacheState,
     KVCacheStorage,
 )
 from nanovllm_jax.config import RuntimeSpec
@@ -48,14 +47,20 @@ def init_mtp_params(key: jax.Array, config: RuntimeSpec) -> MTPParams:
     keys = jax.random.split(key, 7)
     query_dim = model.num_attention_heads * model.head_dim
     kv_dim = model.num_key_value_heads * model.head_dim
-    packed_qkv = jax.random.normal(
-        keys[1],
-        (model.hidden_size, 2 * query_dim + 2 * kv_dim),
-    ) * model.hidden_size**-0.5
-    gate_up = jax.random.normal(
-        keys[4],
-        (model.hidden_size, 2 * model.intermediate_size),
-    ) * model.hidden_size**-0.5
+    packed_qkv = (
+        jax.random.normal(
+            keys[1],
+            (model.hidden_size, 2 * query_dim + 2 * kv_dim),
+        )
+        * model.hidden_size**-0.5
+    )
+    gate_up = (
+        jax.random.normal(
+            keys[4],
+            (model.hidden_size, 2 * model.intermediate_size),
+        )
+        * model.hidden_size**-0.5
+    )
     return MTPParams(
         input_projection=jax.random.normal(
             keys[0],

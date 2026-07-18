@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -14,6 +14,8 @@ from nanovllm_jax.layers import rms_norm
 _GDN_DECODE_IN_PROJ_PACKED_KEY = "in_proj_qkv_abz"
 _FULL_ATTN_DECODE_QKV_PACKED_KEY = "qkv_proj_decode"
 _MLP_GATE_UP_PACKED_KEY = "gate_up_proj"
+
+
 def _causal_conv1d(
     x: jnp.ndarray,
     weight: jnp.ndarray,
@@ -37,7 +39,9 @@ def _causal_conv1d(
     return out
 
 
-def _tokenwise_decode_dot(x: jnp.ndarray, weight: jnp.ndarray, *, force_width1: bool = False) -> jnp.ndarray:
+def _tokenwise_decode_dot(
+    x: jnp.ndarray, weight: jnp.ndarray, *, force_width1: bool = False
+) -> jnp.ndarray:
     """Apply a tokenwise linear with width-1 matmul shapes for multi-token decode.
 
     BF16 matmuls can be shape dependent. For cached decode, the first token in
@@ -93,7 +97,9 @@ def _packed_causal_conv1d_prefill(
         raise ValueError("packed prefill requires at least one row")
 
     kernel_size = int(initial_conv_state.shape[-1])
-    row_query_len = token_bucket if max_row_tokens is None else min(token_bucket, int(max_row_tokens))
+    row_query_len = (
+        token_bucket if max_row_tokens is None else min(token_bucket, int(max_row_tokens))
+    )
     row_query_len = max(1, row_query_len)
     row_offsets = jnp.arange(row_query_len, dtype=jnp.int32)
     row_starts = query_start_loc[:-1].astype(jnp.int32)
@@ -162,7 +168,11 @@ def _decode_width1_rms_norm(
         if lowered_decode_rms_norm_enabled():
             return decode_rms_norm(x, weight, eps)
     if not force_width1 or x.ndim < 3 or x.shape[1] <= 1:
-        return _stable_rmsnorm_fp32(x, weight, eps) if stable_decode_norm and force_width1 else rms_norm(x, weight, eps)
+        return (
+            _stable_rmsnorm_fp32(x, weight, eps)
+            if stable_decode_norm and force_width1
+            else rms_norm(x, weight, eps)
+        )
     norm_fn = _stable_rmsnorm_fp32 if stable_decode_norm else rms_norm
     parts = [norm_fn(x[:, t : t + 1, ...], weight, eps) for t in range(x.shape[1])]
     return jnp.concatenate(parts, axis=1)
@@ -185,9 +195,7 @@ def _lm_head_decode_activation_dtype(plan: KernelPlan) -> jnp.dtype:
         return jnp.float32
     if value in {"bf16", "bfloat16"}:
         return jnp.bfloat16
-    raise ValueError(
-        f"lm_head_decode_act_dtype must be fp32 or bf16, got {value!r}"
-    )
+    raise ValueError(f"lm_head_decode_act_dtype must be fp32 or bf16, got {value!r}")
 
 
 def _decode_padded_gemm_enabled(plan: KernelPlan) -> bool:
@@ -320,13 +328,11 @@ def _decode_projection_activation_dtype(
         return jnp.bfloat16
     if value in {"bf16_single_seq", "bfloat16_single_seq", "bf16_single_sequence"}:
         return jnp.bfloat16 if batch_size == 1 else jnp.float32
-    raise ValueError(
-        f"decode_proj_act_dtype must be fp32, bf16, or bf16_single_seq, got {value!r}"
-    )
+    raise ValueError(f"decode_proj_act_dtype must be fp32, bf16, or bf16_single_seq, got {value!r}")
 
 
 def _use_gdn_decode_packed_in_proj(
-    params: Dict[str, jnp.ndarray],
+    params: dict[str, jnp.ndarray],
     *,
     is_prefill: bool,
     batch: int,
@@ -343,7 +349,7 @@ def _use_gdn_decode_packed_in_proj(
 
 
 def _use_gdn_prefill_packed_in_proj(
-    params: Dict[str, jnp.ndarray],
+    params: dict[str, jnp.ndarray],
     *,
     is_prefill: bool,
     plan: KernelPlan,
@@ -357,22 +363,19 @@ def _use_gdn_prefill_packed_in_proj(
 
 
 def _use_full_attention_decode_packed_qkv(
-    params: Dict[str, jnp.ndarray],
+    params: dict[str, jnp.ndarray],
     *,
     is_prefill: bool,
     batch: int,
     seq_len: int,
 ) -> bool:
     return (
-        not is_prefill
-        and batch > 1
-        and seq_len == 1
-        and _FULL_ATTN_DECODE_QKV_PACKED_KEY in params
+        not is_prefill and batch > 1 and seq_len == 1 and _FULL_ATTN_DECODE_QKV_PACKED_KEY in params
     )
 
 
 def _use_full_attention_prefill_packed_qkv(
-    params: Dict[str, jnp.ndarray],
+    params: dict[str, jnp.ndarray],
     *,
     is_prefill: bool,
     plan: KernelPlan,
@@ -413,12 +416,7 @@ def _compact_prefill_dot_if_enabled(
     enabled: bool,
 ) -> jnp.ndarray:
     """Run a tokenwise projection only on true ragged prefill tokens."""
-    if (
-        not enabled
-        or valid_token_mask is None
-        or compact_num_tokens is None
-        or x.ndim != 3
-    ):
+    if not enabled or valid_token_mask is None or compact_num_tokens is None or x.ndim != 3:
         return jnp.dot(x, weight)
     batch, seq_len, _ = x.shape
     output_features = weight.shape[-1]

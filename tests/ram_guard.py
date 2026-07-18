@@ -156,9 +156,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rss_limit = int(args.rss_gib * GIB)
     available_floor = int(args.min_available_gib * GIB)
-    if args.max_system_ram_percent is not None and not (
-        0 < args.max_system_ram_percent <= 100
-    ):
+    if args.max_system_ram_percent is not None and not (0 < args.max_system_ram_percent <= 100):
         parser.error("--max-system-ram-percent must be in (0, 100]")
     total_memory = _mem_total_bytes()
     percent_limit = (
@@ -167,9 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         else total_memory * args.max_system_ram_percent / 100
     )
     percent_text = (
-        "disabled"
-        if args.max_system_ram_percent is None
-        else f"{args.max_system_ram_percent:.1f}%"
+        "disabled" if args.max_system_ram_percent is None else f"{args.max_system_ram_percent:.1f}%"
     )
     print(
         "ram_guard: rss_limit="
@@ -214,9 +210,7 @@ def main(argv: list[str] | None = None) -> int:
         rss = _tree_rss_bytes(proc.pid)
         available = _mem_available_bytes()
         system_used = (
-            None
-            if total_memory is None or available is None
-            else total_memory - available
+            None if total_memory is None or available is None else total_memory - available
         )
         peak_rss = max(peak_rss, rss)
         if system_used is not None:
@@ -243,16 +237,11 @@ def main(argv: list[str] | None = None) -> int:
             return finish(
                 _terminate(
                     proc,
-                    f"MemAvailable {available / GIB:.1f}GiB below "
-                    f"{args.min_available_gib:.1f}GiB",
+                    f"MemAvailable {available / GIB:.1f}GiB below {args.min_available_gib:.1f}GiB",
                     args.grace_seconds,
                 )
             )
-        if (
-            percent_limit is not None
-            and system_used is not None
-            and system_used > percent_limit
-        ):
+        if percent_limit is not None and system_used is not None and system_used > percent_limit:
             return finish(
                 _terminate(
                     proc,

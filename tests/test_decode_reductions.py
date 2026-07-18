@@ -20,7 +20,9 @@ def _has_gpu() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(not _has_gpu(), reason="Pallas decode reductions require a GPU backend")
+pytestmark = pytest.mark.skipif(
+    not _has_gpu(), reason="Pallas decode reductions require a GPU backend"
+)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])

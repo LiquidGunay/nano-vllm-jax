@@ -32,8 +32,18 @@ from nanovllm_jax.projection import (
     _can_use_decode_padded_gemm,
 )
 
-def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initial_state=None,
-                                output_final_state=False, use_qk_l2norm_in_kernel=False):
+
+def jax_chunk_gated_delta_rule(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    chunk_size=64,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+):
     """
     JAX implementation of chunk gated delta rule (matching HF torch_chunk_gated_delta_rule).
     Input shapes: [B, H, T, D] for query/key/value, [B, H, T] for g/beta
@@ -99,7 +109,7 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
     # Compute k_beta @ key.transpose(-1, -2) for each chunk
     # k_beta_chunks: [B, H, n, cs, K], key_chunks: [B, H, n, cs, K]
     # Result: [B, H, n, cs, cs] where result[b,h,n,i,j] = sum_k(k_beta[b,h,n,i,k] * key[b,h,n,j,k])
-    kkt = jnp.einsum('bhnck,bhnjk->bhncj', k_beta_chunks, key_chunks)
+    kkt = jnp.einsum("bhnck,bhnjk->bhncj", k_beta_chunks, key_chunks)
 
     # attn = -((k_beta @ k.T) * decay_mask), masked to lower triangle
     attn = -(kkt * decay_mask)
@@ -121,12 +131,14 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
 
         # Extract submatrix [0:i, 0:i] -> shape [B, H, n, cs, cs] but only [0:i, 0:i] is valid
         # Multiply by mask on both dimensions
-        sub_i = attn_carry * mask[None, None, None, :, None] * mask[None, None, None, None, :]  # [B, H, n, cs, cs]
+        sub_i = (
+            attn_carry * mask[None, None, None, :, None] * mask[None, None, None, None, :]
+        )  # [B, H, n, cs, cs]
 
         # HF: (row.unsqueeze(-1) * sub).sum(-2)
         # This computes: contribution[k] = sum_j(row[j] * sub[j, k]) for j,k in 0:i
         # Using einsum: 'bhnj,bhnjk->bhnk'
-        contribution = jnp.einsum('bhnj,bhnjk->bhnk', row_i, sub_i)  # [B, H, n, cs]
+        contribution = jnp.einsum("bhnj,bhnjk->bhnk", row_i, sub_i)  # [B, H, n, cs]
 
         # new_row for cols 0:i
         new_row = row_i + contribution
@@ -145,10 +157,12 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
     # value_transformed = attn @ v_beta
     # attn: [B, H, n, cs, cs], v_beta: [B, H, n, cs, V]
     # result: [B, H, n, cs, V]
-    value_transformed = jnp.einsum('bhnct,bhntv->bhncv', attn, v_beta_chunks)
+    value_transformed = jnp.einsum("bhnct,bhntv->bhncv", attn, v_beta_chunks)
 
     # Initial-state correction uses decay from the start of each chunk.
-    k_cumdecay = jnp.einsum('bhnct,bhntv->bhncv', attn, k_beta_chunks * jnp.exp(g_cumsum)[..., None])
+    k_cumdecay = jnp.einsum(
+        "bhnct,bhntv->bhncv", attn, k_beta_chunks * jnp.exp(g_cumsum)[..., None]
+    )
 
     # Initialize state [B, H, V, K].
     if initial_state is None:
@@ -159,21 +173,21 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
     # Process each chunk sequentially
     def process_chunk(carry, i):
         state = carry
-        q_i = query_chunks[:, :, i]      # [B, H, cs, K]
-        k_i = key_chunks[:, :, i]        # [B, H, cs, K]
-        v_i = value_transformed[:, :, i] # [B, H, cs, V]
+        q_i = query_chunks[:, :, i]  # [B, H, cs, K]
+        k_i = key_chunks[:, :, i]  # [B, H, cs, K]
+        v_i = value_transformed[:, :, i]  # [B, H, cs, V]
         decay_mask_i = decay_mask[:, :, i]  # [B, H, cs, cs]
         k_cumdecay_i = k_cumdecay[:, :, i]  # [B, H, cs, K]
-        g_cumsum_i = g_cumsum[:, :, i]    # [B, H, cs] - use cumsum version!
+        g_cumsum_i = g_cumsum[:, :, i]  # [B, H, cs] - use cumsum version!
 
         # Within-chunk attention: attn = (q @ k.T * decay_mask), masked to strict upper triangle
-        attn_i = jnp.einsum('bhck,bhdk->bhcd', q_i, k_i) * decay_mask_i
+        attn_i = jnp.einsum("bhck,bhdk->bhcd", q_i, k_i) * decay_mask_i
         attn_i = jnp.where(mask_strict_upper, 0.0, attn_i)
 
         # v_prime = k_cumdecay @ state
         # k_cumdecay_i: [B, H, cs, K], state: [B, H, V, K]
         # v_prime[b,h,c,v] = sum_k(k_cumdecay_i[b,h,c,k] * state[b,h,v,k])
-        v_prime = jnp.einsum('bhck,bhvk->bhcv', k_cumdecay_i, state)
+        v_prime = jnp.einsum("bhck,bhvk->bhcv", k_cumdecay_i, state)
 
         # v_new = v_i - v_prime
         v_new = v_i - v_prime
@@ -181,12 +195,12 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
         # attn_inter = (q * exp(g)) @ state
         # q_i * exp(g_cumsum_i): [B, H, cs, K]
         # result: [B, H, cs, V] = sum_K(q[b,h,c,k] * exp(g_cumsum[b,h,c]) * state[b,h,v,k])
-        attn_inter = jnp.einsum('bhck,bhvk->bhcv', q_i * jnp.exp(g_cumsum_i)[..., None], state)
+        attn_inter = jnp.einsum("bhck,bhvk->bhcv", q_i * jnp.exp(g_cumsum_i)[..., None], state)
 
         # core_attn_out = attn_inter + attn @ v_new
         # attn_i: [B, H, cs, cs], v_new: [B, H, cs, V]
         # result: [B, H, cs, V] = sum_d(attn_i[b,h,c,d] * v_new[b,h,d,v])
-        attn_v_new = jnp.einsum('bhcd,bhdv->bhcv', attn_i, v_new)
+        attn_v_new = jnp.einsum("bhcd,bhdv->bhcv", attn_i, v_new)
         core_attn_out_i = attn_inter + attn_v_new
 
         # Update state
@@ -196,7 +210,7 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
         # k_weighted[b,h,c,k] = k_i[b,h,c,k] * exp(g_last_minus_g[b,h,c])
         k_weighted = k_i * jnp.exp(g_last_minus_g)[..., None]  # [B, H, cs, K]
         # state_update[b,h,v,k] = sum_c(v_new[b,h,c,v] * k_weighted[b,h,c,k])
-        state_update = jnp.einsum('bhcv,bhck->bhvk', v_new, k_weighted)
+        state_update = jnp.einsum("bhcv,bhck->bhvk", v_new, k_weighted)
         state = state * jnp.exp(g_cumsum_i[..., -1, None, None]) + state_update
 
         return state, core_attn_out_i
@@ -221,7 +235,11 @@ def jax_chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=64, initia
 
 
 def jax_recurrent_gated_delta_rule(
-    query, key, value, g, beta,
+    query,
+    key,
+    value,
+    g,
+    beta,
     initial_state=None,
     use_qk_l2norm_in_kernel=False,
     return_state_sequence: bool = False,
@@ -264,15 +282,15 @@ def jax_recurrent_gated_delta_rule(
         g_t = jnp.exp(g_t_raw)  # [B, H]
 
         # Reshape for broadcasting
-        g_t_exp = g_t[:, :, None, None]    # [B, H, 1, 1]
-        beta_t_exp = beta_t[:, :, None]    # [B, H, 1]
-        k_t_exp = k_t[:, :, None, :]       # [B, H, 1, K]
+        g_t_exp = g_t[:, :, None, None]  # [B, H, 1, 1]
+        beta_t_exp = beta_t[:, :, None]  # [B, H, 1]
+        k_t_exp = k_t[:, :, None, :]  # [B, H, 1, K]
 
         # Decay state: state * exp(g_t)
         state = state * g_t_exp
 
         # kv_mem = (state * k_t[..., None]).sum(-2)
-        kv_mem = jnp.einsum('bhvk,bhk->bhv', state, k_t)
+        kv_mem = jnp.einsum("bhvk,bhk->bhv", state, k_t)
 
         # delta = (v_t - kv_mem) * beta_t
         delta = (v_t - kv_mem) * beta_t_exp  # [B, H, V]
@@ -281,7 +299,7 @@ def jax_recurrent_gated_delta_rule(
         state = state + delta[:, :, :, None] * k_t_exp
 
         # output_t = (state * q_t[:, :, None, :]).sum(-1)
-        out_t = jnp.einsum('bhvk,bhk->bhv', state, q_t)
+        out_t = jnp.einsum("bhvk,bhk->bhv", state, q_t)
 
         return state, out_t
 
@@ -324,6 +342,7 @@ def jax_recurrent_gated_delta_rule(
         return output, state_1
 
     if return_state_sequence:
+
         def step_fn(carry, t):
             next_state, out_t = step_index(carry, t)
             return next_state, (out_t, next_state)
@@ -335,6 +354,7 @@ def jax_recurrent_gated_delta_rule(
         return output, final_state, state_sequence
 
     if return_first_state:
+
         def step_fn(carry, t):
             next_state, out_t = step_index(carry, t)
             return next_state, (out_t, next_state)
@@ -406,11 +426,11 @@ def gated_deltanet_block(
 
     # Check if we can use cached states
     use_cached = (
-        not is_prefill and
-        hybrid_state is not None and
-        hybrid_state.conv_state is not None and
-        hybrid_state.recurrent_state is not None and
-        seq_len <= 2
+        not is_prefill
+        and hybrid_state is not None
+        and hybrid_state.conv_state is not None
+        and hybrid_state.recurrent_state is not None
+        and seq_len <= 2
     )
     use_cached_prefill = (
         is_prefill
@@ -419,12 +439,10 @@ def gated_deltanet_block(
         and hybrid_state.recurrent_state is not None
     )
     use_recurrent_prefill = (
-        use_cached_prefill
-        and seq_len <= config.kernels.gdn_recurrent_prefill_threshold
+        use_cached_prefill and seq_len <= config.kernels.gdn_recurrent_prefill_threshold
     )
     linear_layer_idx = sum(
-        linear_layer < layer_idx
-        for linear_layer in config.model.linear_attn_layers
+        linear_layer < layer_idx for linear_layer in config.model.linear_attn_layers
     )
     row_valid = None
 
@@ -499,7 +517,9 @@ def gated_deltanet_block(
                 enabled=_enable_compact_prefill_gdn_z(config.kernels),
             ).reshape(batch, seq_len, -1)
         else:
-            z = _tokenwise_decode_dot(x_cast, params["in_proj_z"], force_width1=force_width1_dot).reshape(batch, seq_len, -1)
+            z = _tokenwise_decode_dot(
+                x_cast, params["in_proj_z"], force_width1=force_width1_dot
+            ).reshape(batch, seq_len, -1)
         a = _tokenwise_decode_dot(
             x_cast,
             params["in_proj_a"],
@@ -516,7 +536,9 @@ def gated_deltanet_block(
             if hybrid_state_is_layer
             else hybrid_state.conv_state[:, linear_layer_idx]
         )
-        conv_weight = params["conv1d_weight"].reshape(conv_dim, config.model.linear_conv_kernel_size)
+        conv_weight = params["conv1d_weight"].reshape(
+            conv_dim, config.model.linear_conv_kernel_size
+        )
         conv_bias = params.get("conv1d_bias")
         initial_recurrent = (
             hybrid_state.recurrent_state
@@ -535,8 +557,12 @@ def gated_deltanet_block(
         use_packed_multitoken_decode = decode_mode is GDNDecodeMode.PACKED_SEQUENCE
 
         if a is None or b is None:
-            a = packed_decode_projection[:, :, qkv_end:a_end].reshape(batch, seq_len, config.model.linear_num_value_heads)
-            b = packed_decode_projection[:, :, a_end:b_end].reshape(batch, seq_len, config.model.linear_num_value_heads)
+            a = packed_decode_projection[:, :, qkv_end:a_end].reshape(
+                batch, seq_len, config.model.linear_num_value_heads
+            )
+            b = packed_decode_projection[:, :, a_end:b_end].reshape(
+                batch, seq_len, config.model.linear_num_value_heads
+            )
 
         mixed_qkv_t = mixed_qkv.transpose(0, 2, 1)
 
@@ -573,7 +599,9 @@ def gated_deltanet_block(
             prefix_layer_conv_state = (
                 new_layer_conv_state[:, None, :, :]
                 if return_prefix_state
-                else new_layer_conv_state if return_first_prefix_state else None
+                else new_layer_conv_state
+                if return_first_prefix_state
+                else None
             )
         conv_out = conv_out_steps.transpose(1, 0, 2, 3).reshape(batch, seq_len, conv_dim)
 
@@ -614,9 +642,18 @@ def gated_deltanet_block(
             )
             prefix_recurrent_state_single = None
         else:
-            query = conv_out[:, :, :key_dim].reshape(batch, seq_len, config.model.linear_num_key_heads, config.model.linear_key_head_dim)
-            key = conv_out[:, :, key_dim:key_dim * 2].reshape(batch, seq_len, config.model.linear_num_key_heads, config.model.linear_key_head_dim)
-            value = conv_out[:, :, key_dim * 2:].reshape(batch, seq_len, config.model.linear_num_value_heads, config.model.linear_value_head_dim)
+            query = conv_out[:, :, :key_dim].reshape(
+                batch, seq_len, config.model.linear_num_key_heads, config.model.linear_key_head_dim
+            )
+            key = conv_out[:, :, key_dim : key_dim * 2].reshape(
+                batch, seq_len, config.model.linear_num_key_heads, config.model.linear_key_head_dim
+            )
+            value = conv_out[:, :, key_dim * 2 :].reshape(
+                batch,
+                seq_len,
+                config.model.linear_num_value_heads,
+                config.model.linear_value_head_dim,
+            )
             beta = nn.sigmoid(b)
             g = -params["A"] * nn.softplus(a + params["dt_bias"])
             if v_heads_per_k > 1:
@@ -628,26 +665,30 @@ def gated_deltanet_block(
             g = g.transpose(0, 2, 1)
             beta = beta.transpose(0, 2, 1)
             if return_prefix_state:
-                core_attn_out, new_recurrent_state_single, prefix_recurrent_state_single = jax_recurrent_gated_delta_rule(
-                    query,
-                    key,
-                    value,
-                    g,
-                    beta,
-                    initial_state=initial_recurrent,
-                    use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
-                    return_state_sequence=True,
+                core_attn_out, new_recurrent_state_single, prefix_recurrent_state_single = (
+                    jax_recurrent_gated_delta_rule(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        initial_state=initial_recurrent,
+                        use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
+                        return_state_sequence=True,
+                    )
                 )
             elif return_first_prefix_state:
-                core_attn_out, new_recurrent_state_single, prefix_recurrent_state_single = jax_recurrent_gated_delta_rule(
-                    query,
-                    key,
-                    value,
-                    g,
-                    beta,
-                    initial_state=initial_recurrent,
-                    use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
-                    return_first_state=True,
+                core_attn_out, new_recurrent_state_single, prefix_recurrent_state_single = (
+                    jax_recurrent_gated_delta_rule(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        initial_state=initial_recurrent,
+                        use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
+                        return_first_state=True,
+                    )
                 )
             elif seq_len > 1:
                 core_attn_out, new_recurrent_state_single = jax_recurrent_gated_delta_rule(
@@ -690,14 +731,20 @@ def gated_deltanet_block(
                     initial_recurrent,
                 )
             if return_first_prefix_state and prefix_layer_conv_state is not None:
-                prefix_layer_conv_state = jnp.where(conv_keep, prefix_layer_conv_state, layer_conv_state)
+                prefix_layer_conv_state = jnp.where(
+                    conv_keep, prefix_layer_conv_state, layer_conv_state
+                )
 
         if hybrid_state_is_layer:
             new_recurrent_state = new_recurrent_state_single
             new_conv_state = new_layer_conv_state
         else:
-            new_recurrent_state = hybrid_state.recurrent_state.at[:, linear_layer_idx].set(new_recurrent_state_single)
-            new_conv_state = hybrid_state.conv_state.at[:, linear_layer_idx].set(new_layer_conv_state)
+            new_recurrent_state = hybrid_state.recurrent_state.at[:, linear_layer_idx].set(
+                new_recurrent_state_single
+            )
+            new_conv_state = hybrid_state.conv_state.at[:, linear_layer_idx].set(
+                new_layer_conv_state
+            )
         hybrid_state = replace(
             hybrid_state,
             conv_state=new_conv_state,
@@ -720,11 +767,15 @@ def gated_deltanet_block(
             if packed_query_start_loc is None:
                 raise ValueError("packed_query_start_loc is required for packed GDN prefill")
             if batch != 1:
-                raise ValueError("packed GDN prefill expects token tensors shaped [1, token_bucket, ...]")
+                raise ValueError(
+                    "packed GDN prefill expects token tensors shaped [1, token_bucket, ...]"
+                )
 
             row_count = int(packed_query_start_loc.shape[0]) - 1
             token_rows = packed_token_row_ids.reshape(-1).astype(jnp.int32)
-            valid_tokens = jnp.arange(seq_len, dtype=jnp.int32) < packed_query_start_loc[-1].astype(jnp.int32)
+            valid_tokens = jnp.arange(seq_len, dtype=jnp.int32) < packed_query_start_loc[-1].astype(
+                jnp.int32
+            )
             safe_rows = jnp.clip(token_rows, 0, row_count - 1)
             max_row_tokens = (
                 max(config.compile.prefill_token_buckets)
@@ -734,18 +785,12 @@ def gated_deltanet_block(
             row_query_len = (
                 max(1, seq_len // row_count)
                 if return_prefix_state or return_first_prefix_state
-                else (
-                    seq_len
-                    if max_row_tokens is None
-                    else min(seq_len, int(max_row_tokens))
-                )
+                else (seq_len if max_row_tokens is None else min(seq_len, int(max_row_tokens)))
             )
             row_query_len = max(1, row_query_len)
             row_offsets = jnp.arange(row_query_len, dtype=jnp.int32)
             row_starts = packed_query_start_loc[:-1].astype(jnp.int32)
-            row_lens = (
-                packed_query_start_loc[1:] - packed_query_start_loc[:-1]
-            ).astype(jnp.int32)
+            row_lens = (packed_query_start_loc[1:] - packed_query_start_loc[:-1]).astype(jnp.int32)
             token_indices_by_row = row_starts[:, None] + row_offsets[None, :]
             valid_queries_by_row = row_offsets[None, :] < row_lens[:, None]
             safe_token_indices_by_row = jnp.clip(
@@ -759,7 +804,9 @@ def gated_deltanet_block(
                 return_first_prefix_state=return_first_prefix_state,
                 packed=True,
             )
-            conv_weight = params["conv1d_weight"].reshape(conv_dim, config.model.linear_conv_kernel_size)
+            conv_weight = params["conv1d_weight"].reshape(
+                conv_dim, config.model.linear_conv_kernel_size
+            )
             conv_bias = params.get("conv1d_bias")
             if use_cached_prefill:
                 initial_conv_state = (
@@ -831,13 +878,13 @@ def gated_deltanet_block(
                     config.model.linear_num_key_heads,
                     config.model.linear_key_head_dim,
                 )
-                key = conv_out[:, :, key_dim:key_dim * 2].reshape(
+                key = conv_out[:, :, key_dim : key_dim * 2].reshape(
                     1,
                     seq_len,
                     config.model.linear_num_key_heads,
                     config.model.linear_key_head_dim,
                 )
-                value = conv_out[:, :, key_dim * 2:].reshape(
+                value = conv_out[:, :, key_dim * 2 :].reshape(
                     1,
                     seq_len,
                     config.model.linear_num_value_heads,
@@ -891,7 +938,9 @@ def gated_deltanet_block(
                 if return_prefix_state or return_first_prefix_state:
                     flat_prefix_recurrent_state = recurrent_state_tokens
 
-            if (return_prefix_state or return_first_prefix_state) and flat_prefix_recurrent_state is not None:
+            if (
+                return_prefix_state or return_first_prefix_state
+            ) and flat_prefix_recurrent_state is not None:
                 prefix_recurrent_rows = flat_prefix_recurrent_state[safe_token_indices_by_row]
                 prefix_recurrent_rows = jnp.where(
                     valid_queries_by_row[
@@ -905,9 +954,7 @@ def gated_deltanet_block(
                     initial_recurrent[:, None, :, :, :],
                 )
                 prefix_recurrent_state_single = (
-                    prefix_recurrent_rows
-                    if return_prefix_state
-                    else prefix_recurrent_rows[:, 0]
+                    prefix_recurrent_rows if return_prefix_state else prefix_recurrent_rows[:, 0]
                 )
                 mixed_rows = mixed_qkv[0][safe_token_indices_by_row]
                 mixed_rows = jnp.where(
@@ -924,10 +971,13 @@ def gated_deltanet_block(
                 )
                 kernel_size = config.model.linear_conv_kernel_size
                 gather_starts = row_offsets + 1
-                gather_idx = gather_starts[:, None] + jnp.arange(
-                    kernel_size,
-                    dtype=jnp.int32,
-                )[None, :]
+                gather_idx = (
+                    gather_starts[:, None]
+                    + jnp.arange(
+                        kernel_size,
+                        dtype=jnp.int32,
+                    )[None, :]
+                )
                 gather_idx = jnp.broadcast_to(
                     gather_idx[None, :, None, :],
                     (
@@ -974,7 +1024,9 @@ def gated_deltanet_block(
                     new_conv_state = hybrid_state.conv_state.at[:, linear_layer_idx].set(
                         final_conv_state.astype(dtype)
                     )
-                    new_recurrent_state = hybrid_state.recurrent_state.at[:, linear_layer_idx].set(final_state)
+                    new_recurrent_state = hybrid_state.recurrent_state.at[:, linear_layer_idx].set(
+                        final_state
+                    )
                 hybrid_state = replace(
                     hybrid_state,
                     conv_state=new_conv_state,
@@ -1082,9 +1134,18 @@ def gated_deltanet_block(
                 use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
             )
         else:
-            query = conv_out[:, :, :key_dim].reshape(batch, seq_len, config.model.linear_num_key_heads, config.model.linear_key_head_dim)
-            key = conv_out[:, :, key_dim:key_dim*2].reshape(batch, seq_len, config.model.linear_num_key_heads, config.model.linear_key_head_dim)
-            value = conv_out[:, :, key_dim*2:].reshape(batch, seq_len, config.model.linear_num_value_heads, config.model.linear_value_head_dim)
+            query = conv_out[:, :, :key_dim].reshape(
+                batch, seq_len, config.model.linear_num_key_heads, config.model.linear_key_head_dim
+            )
+            key = conv_out[:, :, key_dim : key_dim * 2].reshape(
+                batch, seq_len, config.model.linear_num_key_heads, config.model.linear_key_head_dim
+            )
+            value = conv_out[:, :, key_dim * 2 :].reshape(
+                batch,
+                seq_len,
+                config.model.linear_num_value_heads,
+                config.model.linear_value_head_dim,
+            )
 
             beta = nn.sigmoid(b)
             g = -params["A"] * nn.softplus(a + params["dt_bias"])
@@ -1112,15 +1173,17 @@ def gated_deltanet_block(
                 # Small cached suffixes can use the recurrent path directly and remain
                 # aligned with iterative decode.
                 if return_prefix_state and use_cached_prefill:
-                    core_attn_out, final_state, recurrent_state_steps = jax_recurrent_gated_delta_rule(
-                        query,
-                        key,
-                        value,
-                        g,
-                        beta,
-                        initial_state=initial_recurrent,
-                        use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
-                        return_state_sequence=True,
+                    core_attn_out, final_state, recurrent_state_steps = (
+                        jax_recurrent_gated_delta_rule(
+                            query,
+                            key,
+                            value,
+                            g,
+                            beta,
+                            initial_state=initial_recurrent,
+                            use_qk_l2norm_in_kernel=config.model.use_qk_norm_in_gdn,
+                            return_state_sequence=True,
+                        )
                     )
                     prefix_recurrent_state_single = recurrent_state_steps
                 else:
@@ -1197,8 +1260,12 @@ def gated_deltanet_block(
                 new_recurrent_state = final_state
                 new_conv_state = layer_conv_state.astype(dtype)
             else:
-                new_recurrent_state = hybrid_state.recurrent_state.at[:, linear_layer_idx].set(final_state)
-                new_conv_state = hybrid_state.conv_state.at[:, linear_layer_idx].set(layer_conv_state.astype(dtype))
+                new_recurrent_state = hybrid_state.recurrent_state.at[:, linear_layer_idx].set(
+                    final_state
+                )
+                new_conv_state = hybrid_state.conv_state.at[:, linear_layer_idx].set(
+                    layer_conv_state.astype(dtype)
+                )
             hybrid_state = replace(
                 hybrid_state,
                 conv_state=new_conv_state,
@@ -1218,7 +1285,9 @@ def gated_deltanet_block(
     # === OUTPUT PROCESSING (same for both modes) ===
     core_attn_out = core_attn_out.reshape(batch * seq_len, -1, config.model.linear_value_head_dim)
     z = z.reshape(batch * seq_len, -1, config.model.linear_value_head_dim)
-    core_attn_out = _stable_rmsnorm_fp32(core_attn_out, params["norm_weight"], config.model.rms_norm_eps)
+    core_attn_out = _stable_rmsnorm_fp32(
+        core_attn_out, params["norm_weight"], config.model.rms_norm_eps
+    )
     core_attn_out = core_attn_out * nn.silu(z)
     core_attn_out = core_attn_out.reshape(batch, seq_len, -1)
     core_attn_out_proj = core_attn_out.astype(

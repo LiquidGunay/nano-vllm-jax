@@ -1,8 +1,10 @@
+from dataclasses import FrozenInstanceError, replace
+from threading import Lock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from dataclasses import FrozenInstanceError, replace
 
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.model import init_params
@@ -125,15 +127,10 @@ def test_mtp_engine_rejects_incompatible_requests_before_admission():
     engine = object.__new__(LLMEngine)
     engine.config = _runtime(mtp=True)
     engine._next_seq_id = 0
-
-    class Queue:
-        def __init__(self):
-            self.seqs = []
-
-        def add(self, seq):
-            self.seqs.append(seq)
-
-    engine.scheduler = Queue()
+    engine.scheduler = Scheduler(engine.config)
+    engine._closed = False
+    engine._control_owner = None
+    engine._control_lock = Lock()
 
     with pytest.raises(ValueError, match="persistent MTP requires"):
         engine.generate([[1, 2, 3]], use_tqdm=False)
@@ -150,7 +147,7 @@ def test_mtp_engine_rejects_incompatible_requests_before_admission():
         with pytest.raises(ValueError, match="persistent MTP requires"):
             engine.add_request([4, 5, 6], sampling)
 
-    assert engine.scheduler.seqs == [compatible]
+    assert list(engine.scheduler.waiting) == [compatible]
 
 
 def test_scheduler_derives_mtp_capacity_from_frozen_width():
@@ -228,6 +225,9 @@ class _Engine(LLMEngine):
         self.scheduler = Scheduler(config)
         self.model_runner = ModelRunner(config, params, mtp_params=mtp_params)
         self._next_seq_id = 0
+        self._closed = False
+        self._control_owner = None
+        self._control_lock = Lock()
 
 
 def _generate(engine, *, max_tokens, prompt=(1, 2, 3), materialize_each_step=False):
@@ -248,9 +248,7 @@ def _replace_slot_drafts(engine, seq, token_ids):
     slot = runner._hybrid_slots[seq.seq_id]
     runner.mtp_state = MTPState(
         state.cache_storage,
-        state.draft_token_ids.at[slot].set(
-            jnp.asarray(token_ids, dtype=jnp.int32)
-        ),
+        state.draft_token_ids.at[slot].set(jnp.asarray(token_ids, dtype=jnp.int32)),
     )
 
 
@@ -383,7 +381,7 @@ def test_rejected_speculative_kv_is_safe_after_cancellation_and_slot_reuse():
     config = _runtime(mtp=True)
     params = init_params(jax.random.PRNGKey(1), config.model)
     control = _Engine(base_config, params)
-    first_expected = _generate(control, max_tokens=10)
+    _generate(control, max_tokens=10)
     second_expected = _generate(control, max_tokens=8, prompt=(4, 5, 6))
     engine = _Engine(
         config,

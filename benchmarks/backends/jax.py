@@ -64,9 +64,7 @@ class Backend:
             prefix_cache=False,
         )
         drafter = (
-            DrafterConfig.mtp(manifest["speculation"]["draft_tokens"])
-            if route == "mtp"
-            else None
+            DrafterConfig.mtp(manifest["speculation"]["draft_tokens"]) if route == "mtp" else None
         )
         self.engine = LLMEngine(
             checkpoint,
@@ -94,9 +92,7 @@ class Backend:
         }
 
     def run_once(self) -> dict[str, Any]:
-        seqs = [
-            self.engine.add_request(prompt, self.sampling) for prompt in self.prompts
-        ]
+        seqs = [self.engine.add_request(prompt, self.sampling) for prompt in self.prompts]
         started = perf_counter()
         first_token_time = None
         decode_tokens = 0

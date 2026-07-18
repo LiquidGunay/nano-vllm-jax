@@ -1,3 +1,7 @@
+from threading import Lock
+
+import pytest
+
 from nanovllm_jax.engine import LLMEngine
 from nanovllm_jax.scheduler import Scheduler
 from nanovllm_jax.sequence import SamplingParams, Sequence
@@ -91,12 +95,15 @@ class _Engine(LLMEngine):
         )
         self.model_runner = runner
         self._next_seq_id = 0
+        self._closed = False
+        self._control_owner = None
+        self._control_lock = Lock()
         self.trace = trace
 
-    def commit(self, seqs, schedule_plan, run_result):
+    def _commit(self, seqs, schedule_plan, run_result):
         if self.trace is not None:
             self.trace.append("commit")
-        return super().commit(seqs, schedule_plan, run_result)
+        return super()._commit(seqs, schedule_plan, run_result)
 
 
 def test_step_executes_then_commits_one_typed_transition():
@@ -143,6 +150,24 @@ def test_cancel_request_releases_scheduler_and_runner_state():
     assert seq.is_finished
     assert engine.scheduler.is_finished()
     assert engine.model_runner.released == [seq.seq_id]
+
+
+def test_offline_generation_rejects_a_manual_request():
+    config = _config()
+    engine = _Engine(config, _Runner([]))
+    engine.add_request(
+        [1, 2],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+    )
+
+    with pytest.raises(RuntimeError, match="requires an idle engine"):
+        engine.generate(
+            [[3, 4]],
+            SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+            use_tqdm=False,
+        )
+
+    assert len(engine.scheduler.waiting) == 1
 
 
 def test_step_reuses_runner_owned_prefix_state_by_handle():
@@ -194,3 +219,70 @@ def test_iter_generate_attributes_step_counters_once():
     assert [event["verified_target_tokens"] for event in tokens] == [0, 3, 0, 0]
     assert [event["draft_tokens"] for event in tokens] == [0, 2, 0, 0]
     assert [event["accepted_draft_tokens"] for event in tokens] == [0, 2, 0, 0]
+
+
+def test_done_event_releases_offline_control_before_it_is_observed():
+    config = _config()
+    engine = _Engine(config, _Runner([[101], [102]]))
+    engine.detokenize = lambda token_ids: " ".join(map(str, token_ids))
+    stream = engine.iter_generate(
+        [[1, 2]],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        include_text=False,
+    )
+
+    for event in stream:
+        if event["event"] == "done":
+            break
+
+    assert engine._control_owner is None
+    result = engine.generate(
+        [[3, 4]],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        use_tqdm=False,
+    )
+    assert result[0]["token_ids"] == [102]
+
+
+def test_cleanup_failure_still_releases_offline_control():
+    class CleanupFailRunner(_Runner):
+        def release(self, seq_ids):
+            raise RuntimeError("cleanup failed")
+
+    engine = _Engine(_config(), CleanupFailRunner([]))
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        engine.generate(
+            [[1, 2]],
+            SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+            use_tqdm=False,
+        )
+
+    assert engine._control_owner is None
+    owner = object()
+    engine.claim_control(owner)
+    engine.release_control(owner)
+
+
+def test_cleanup_continues_after_one_request_release_fails():
+    class FirstCleanupFailRunner(_Runner):
+        def release(self, seq_ids):
+            self.released.extend(seq_ids)
+            if len(self.released) == 1:
+                raise RuntimeError("first cleanup failed")
+
+    engine = _Engine(_config(), FirstCleanupFailRunner([]))
+    owner = object()
+    engine.claim_control(owner)
+    seqs = engine.add_requests(
+        [[1, 2], [3, 4]],
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        owner=owner,
+    )
+
+    with pytest.raises(RuntimeError, match="first cleanup failed"):
+        engine._cancel_and_release_control(owner)
+
+    assert engine.model_runner.released == [seq.seq_id for seq in seqs]
+    assert engine.scheduler.is_finished()
+    assert engine._control_owner is None

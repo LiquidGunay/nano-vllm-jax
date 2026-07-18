@@ -17,6 +17,7 @@ from nanovllm_jax.projection import (
     _tokenwise_decode_dot,
 )
 
+
 def _lm_head_normed_hidden_and_weight(
     hidden: jnp.ndarray,
     params: Any,
@@ -62,7 +63,10 @@ def _lm_head_logits_from_normed(
         logits = _tokenwise_decode_dot(
             hidden_norm,
             projection_weight,
-            force_width1=(not is_prefill) and hidden_norm.ndim == 3 and hidden_norm.shape[1] > 1 and _force_width1_decode_math(),
+            force_width1=(not is_prefill)
+            and hidden_norm.ndim == 3
+            and hidden_norm.shape[1] > 1
+            and _force_width1_decode_math(),
         )
     return logits
 
@@ -118,9 +122,7 @@ def lm_head_greedy_token_ids_from_normed(
 ) -> jnp.ndarray:
     """Greedy full-vocabulary projection for already-normalized hidden rows."""
 
-    hidden_norm = hidden_norm.astype(
-        _lm_head_decode_activation_dtype(config.kernels)
-    )
+    hidden_norm = hidden_norm.astype(_lm_head_decode_activation_dtype(config.kernels))
     if hidden_norm.ndim != 3:
         raise ValueError("greedy LM head expects hidden shape [batch, width, hidden]")
     batch, width, hidden_dim = hidden_norm.shape

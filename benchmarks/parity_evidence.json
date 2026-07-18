@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "qwen35-4b-b1-p64-o64-greedy-mtp2",
+  "reference_output_sha256": "9d0a61c943f4fdd957d3feef6b42e2bd18f6c624b7e6f2424a747b9822c32bde",
+  "variant_output_sha256": "7823dab0ed16a15d2a16aa8b0f2c1736bb126d93e50a9faa1e8a48dceb5b163c",
+  "mismatches": [
+    {
+      "row": 0,
+      "output_index": 44,
+      "reference_token": 5129,
+      "variant_token": 8343
+    }
+  ],
+  "diagnostic": {
+    "captured_at": "2026-07-17",
+    "implementation_commit": "fbeabed4d65cd7a89ce6337508bf07b272ab5586",
+    "hardware": "NVIDIA A10G",
+    "full_vocabulary": true,
+    "runtime_source_sha256": "3598bc080e045f8605ba119f5a4524afaaac982e2c118d13f82de1d6105882e4",
+    "dependency_inputs_sha256": "d5aa91969e21d91f243705304979dd1a86daf4553d59d86e4d97c758b365bc5a",
+    "kl_reference_to_variant": 0.00014908621968294546,
+    "kl_variant_to_reference": 0.0001488940911361341,
+    "jensen_shannon": 0.0000372469434981444,
+    "total_variation": 0.008022780216568073,
+    "centered_logit_rms": 0.01598654030032893,
+    "reference_logits": {
+      "5129": 24.337255477905273,
+      "8343": 24.416812896728516
+    },
+    "variant_logits": {
+      "5129": 24.30021095275879,
+      "8343": 24.4175968170166
+    },
+    "reference_bf16_bins": {
+      "5129": 24.375,
+      "8343": 24.375
+    },
+    "variant_bf16_bins": {
+      "5129": 24.25,
+      "8343": 24.375
+    }
+  },
+  "limits": {
+    "max_bidirectional_kl": 0.001,
+    "max_jensen_shannon": 0.00025,
+    "max_total_variation": 0.02,
+    "max_mismatches": 1
+  }
+}

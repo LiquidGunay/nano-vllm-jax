@@ -12,7 +12,6 @@ Invariant:
 
 from collections import deque
 from dataclasses import replace
-from typing import Deque, List, Tuple
 
 from nanovllm_jax.config import RuntimeSpec
 from nanovllm_jax.batch import BucketShape, ScheduledRow, SchedulePlan
@@ -20,9 +19,10 @@ from nanovllm_jax.output import is_device_token
 from nanovllm_jax.sequence import Sequence, SequenceStatus
 from nanovllm_jax.block_manager import BlockManager, PrefixCacheEntry
 
+
 class Scheduler:
     """Scheduler for continuous batching.
-    
+
     Manages:
     - Waiting queue (sequences waiting to start)
     - Running queue (sequences being generated)
@@ -53,9 +53,7 @@ class Scheduler:
                 if self.prefill_token_buckets
                 else max(
                     64,
-                    self.max_num_batched_tokens
-                    if self.max_num_batched_tokens > 0
-                    else 64,
+                    self.max_num_batched_tokens if self.max_num_batched_tokens > 0 else 64,
                 )
             )
         self.decode_lookahead_tokens = 1
@@ -72,8 +70,8 @@ class Scheduler:
             ),
         )
 
-        self.waiting: Deque[Sequence] = deque()
-        self.running: Deque[Sequence] = deque()
+        self.waiting: deque[Sequence] = deque()
+        self.running: deque[Sequence] = deque()
 
     def _speculative_lookahead(self, seq: Sequence, remaining_tokens: int) -> int:
         if self.drafter is None:
@@ -96,17 +94,56 @@ class Scheduler:
             total_blocks=self._required_blocks(seq),
             use_prefix_cache=self.prefix_cache_enabled,
             initial_lookahead_tokens=(
-                self.drafter.prefill_lookahead_tokens
-                if self.drafter is not None
-                else 0
+                self.drafter.prefill_lookahead_tokens if self.drafter is not None else 0
             ),
         )
 
     def _required_blocks(self, seq: Sequence) -> int:
-        total_tokens = seq.num_prompt_tokens + seq.max_tokens
+        return self._required_blocks_for(seq.num_prompt_tokens, seq.max_tokens)
+
+    def _required_blocks_for(self, prompt_tokens: int, max_tokens: int) -> int:
+        total_tokens = int(prompt_tokens) + int(max_tokens)
         if self.drafter is not None:
             total_tokens += self.drafter.capacity_padding_tokens
         return (total_tokens + self.block_size - 1) // self.block_size
+
+    def validate_request_capacity(
+        self,
+        prompt_tokens: int,
+        max_tokens: int,
+        *,
+        request_index: int | None = None,
+    ) -> None:
+        """Validate one request without mutating queues or block state."""
+
+        owner = "request" if request_index is None else f"request[{request_index}]"
+        if int(prompt_tokens) <= 0:
+            raise ValueError(f"{owner} prompt must contain at least one token")
+        padding = self.drafter.capacity_padding_tokens if self.drafter is not None else 0
+        requested_tokens = int(prompt_tokens) + int(max_tokens) + padding
+        required_blocks = self._required_blocks_for(prompt_tokens, max_tokens)
+        total_blocks = len(self.block_manager.blocks)
+        if required_blocks > total_blocks:
+            raise ValueError(
+                f"{owner} needs {required_blocks} blocks but the engine has {total_blocks}"
+            )
+        token_capacity = self.max_blocks_per_seq * self.block_size
+        if requested_tokens > token_capacity:
+            raise ValueError(
+                f"{owner} needs {requested_tokens} total tokens but per-sequence "
+                f"capacity is {token_capacity}"
+            )
+
+    def validate(self, seq: Sequence, *, request_index: int | None = None) -> None:
+        """Validate a candidate sequence without admitting it."""
+
+        if seq.block_size != self.block_size:
+            raise ValueError("sequence and scheduler use different block sizes")
+        self.validate_request_capacity(
+            seq.num_prompt_tokens,
+            seq.max_tokens,
+            request_index=request_index,
+        )
 
     def _admit_first_fitting_waiter(self) -> Sequence | None:
         """Return the first request that fits without stalling later waiters."""
@@ -120,7 +157,7 @@ class Scheduler:
 
     def cached_prefix_entries(
         self,
-        seqs: List[Sequence],
+        seqs: list[Sequence],
     ) -> dict[int, PrefixCacheEntry]:
         """Return exact host metadata for prefixes selected during admission."""
         if not self.block_manager.prefix_cache.requires_state:
@@ -145,8 +182,8 @@ class Scheduler:
 
     def record_computed_prefixes(
         self,
-        seqs: List[Sequence],
-        prefill_chunk_lengths: List[int],
+        seqs: list[Sequence],
+        prefill_chunk_lengths: list[int],
     ) -> dict[int, PrefixCacheEntry]:
         """Publish KV metadata and return prefixes that still need GDN state."""
         if not self.prefix_cache_enabled:
@@ -184,9 +221,7 @@ class Scheduler:
             handle = handles_by_hash.get(entry.prefix_hash)
             if handle is None:
                 raise RuntimeError(f"runner did not cache prefix {entry.prefix_hash}")
-            self.block_manager.prefix_cache.publish(
-                replace(entry, hybrid_state_handle=handle)
-            )
+            self.block_manager.prefix_cache.publish(replace(entry, hybrid_state_handle=handle))
             published.add(entry.prefix_hash)
 
     def take_released_prefix_state_handles(self) -> tuple[int, ...]:
@@ -201,47 +236,31 @@ class Scheduler:
         """Whether runner warmup can reset state without dangling host metadata."""
         return self.is_finished() and not self.block_manager.prefix_cache.entries
 
-    def add(self, seq: Sequence):
-        """Add a sequence to the waiting queue."""
-        if seq.block_size != self.block_size:
-            raise ValueError("sequence and scheduler use different block sizes")
-        required_blocks = self._required_blocks(seq)
-        if required_blocks > len(self.block_manager.blocks):
-            raise ValueError(
-                f"request needs {required_blocks} blocks but the engine has "
-                f"{len(self.block_manager.blocks)}"
-            )
-        if self.max_blocks_per_seq is not None:
-            max_tokens_per_seq = self.max_blocks_per_seq * seq.block_size
-            requested_tokens = seq.num_tokens + seq.max_tokens
-            if self.drafter is not None:
-                requested_tokens += self.drafter.capacity_padding_tokens
-            if seq.num_blocks > self.max_blocks_per_seq:
-                raise ValueError(
-                    f"prompt needs {seq.num_blocks} blocks but max_blocks_per_seq is {self.max_blocks_per_seq}"
-                )
-            if requested_tokens > max_tokens_per_seq:
-                raise ValueError(
-                    f"request needs {requested_tokens} total tokens but per-sequence capacity is {max_tokens_per_seq}"
-                )
-        self.waiting.append(seq)
+    def add_many(self, seqs: list[Sequence]) -> None:
+        """Atomically validate and append a batch to the waiting queue."""
 
-    def schedule(self) -> Tuple[List[Sequence], SchedulePlan]:
+        for index, seq in enumerate(seqs):
+            self.validate(seq, request_index=index if len(seqs) > 1 else None)
+        self.waiting.extend(seqs)
+
+    def add(self, seq: Sequence) -> None:
+        """Add a sequence to the waiting queue."""
+        self.add_many([seq])
+
+    def schedule(self) -> tuple[list[Sequence], SchedulePlan]:
         """Schedule sequences for execution.
-        
+
         Returns:
             Tuple of scheduled sequences and their host execution plan.
         """
-        scheduled_seqs: List[Sequence] = []
+        scheduled_seqs: list[Sequence] = []
         num_seqs = 0
         num_batched_tokens = 0
-        prefill_chunk_lens: List[int] = []
-        scheduled_running: List[Sequence] = []
+        prefill_chunk_lens: list[int] = []
+        scheduled_running: list[Sequence] = []
         prefill_token_budget = self._max_prefill_token_budget()
         ready_decode_rows = sum(
-            1
-            for seq in self.running
-            if seq.num_cached_tokens >= seq.num_prompt_tokens
+            1 for seq in self.running if seq.num_cached_tokens >= seq.num_prompt_tokens
         )
         defer_waiting_prefill_for_decode = (
             self.max_num_resident_seqs > self.max_num_seqs
@@ -325,7 +344,7 @@ class Scheduler:
                 is_prefill=True,
                 prefill_chunk_lens=prefill_chunk_lens,
             )
-        
+
         # Phase 2: Decode - schedule running sequences
         running_candidates = 0
         running_budget = len(self.running)
@@ -335,7 +354,7 @@ class Scheduler:
             if seq.num_cached_tokens < seq.num_prompt_tokens:
                 self.running.append(seq)
                 continue
-            
+
             # Complete capacity credits were reserved before prefill, so decode
             # can allocate physical pages without eviction or recomputation.
             remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
@@ -353,7 +372,7 @@ class Scheduler:
             num_seqs += 1
             self.block_manager.may_append_slots(seq, lookahead_tokens)
             scheduled_seqs.append(seq)
-        
+
         if not scheduled_seqs:
             raise RuntimeError(self._capacity_exhausted_message())
         self.running.extendleft(reversed(scheduled_seqs))
@@ -364,8 +383,8 @@ class Scheduler:
             decode_step_count=decode_step_count,
         )
 
-    def _decode_step_count(self, seqs: List[Sequence]) -> int:
-        step_counts: List[int] = []
+    def _decode_step_count(self, seqs: list[Sequence]) -> int:
+        step_counts: list[int] = []
         for seq in seqs:
             remaining_tokens = max(1, seq.max_tokens - seq.num_completion_tokens)
             if self._speculative_lookahead(seq, remaining_tokens):
@@ -391,17 +410,17 @@ class Scheduler:
 
     def build_schedule_plan(
         self,
-        seqs: List[Sequence],
+        seqs: list[Sequence],
         *,
         is_prefill: bool,
         query_len_bucket: int | None = None,
         batch_size_bucket: int | None = None,
         max_blocks_per_seq: int | None = None,
-        prefill_chunk_lens: List[int] | None = None,
+        prefill_chunk_lens: list[int] | None = None,
         decode_step_count: int = 1,
     ) -> SchedulePlan:
         """Describe one step without allocating accelerator arrays."""
-        rows: List[ScheduledRow] = []
+        rows: list[ScheduledRow] = []
 
         actual_max_blocks = max(1, max(len(seq.block_table) for seq in seqs))
         block_table_width = actual_max_blocks
@@ -432,14 +451,10 @@ class Scheduler:
                 chunk_len = seq.num_tokens - start
                 if prefill_chunk_lens is not None:
                     if index >= len(prefill_chunk_lens):
-                        raise ValueError(
-                            "prefill_chunk_lens length must match scheduled sequences"
-                        )
+                        raise ValueError("prefill_chunk_lens length must match scheduled sequences")
                     chunk_len = prefill_chunk_lens[index]
                 if chunk_len <= 0:
-                    raise ValueError(
-                        f"Scheduled sequence {seq.seq_id} has no executable tokens"
-                    )
+                    raise ValueError(f"Scheduled sequence {seq.seq_id} has no executable tokens")
                 end = start + chunk_len
                 tokens = seq.token_ids[start:end]
                 positions = range(start, end)
@@ -463,7 +478,7 @@ class Scheduler:
                         not is_prefill
                         and seq.temperature == 0
                         and seq.ignore_eos
-                        and is_device_token(getattr(seq, "last_token_device", None))
+                        and is_device_token(seq.last_token_device)
                     ),
                 )
             )
@@ -478,9 +493,7 @@ class Scheduler:
         max_query_len = max(row.query_len for row in rows)
         packed_prefill = is_prefill and self.prefill_layout == "packed"
         if packed_prefill:
-            query_tokens = self._select_prefill_token_bucket(
-                sum(row.query_len for row in rows)
-            )
+            query_tokens = self._select_prefill_token_bucket(sum(row.query_len for row in rows))
         else:
             if query_len_bucket is None and is_prefill:
                 query_len_bucket = self._select_prefill_query_bucket(max_query_len)
@@ -510,6 +523,7 @@ class Scheduler:
             ),
             decode_steps=1 if is_prefill else max(1, int(decode_step_count)),
         )
+
     @staticmethod
     def _select_bucket(size: int, buckets: tuple[int, ...], name: str) -> int:
         for bucket in sorted(buckets):

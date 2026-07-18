@@ -82,10 +82,7 @@ def _capture_hf_traces(model, tokenizer, device: torch.device) -> tuple[PromptTr
     traces: list[PromptTrace] = []
 
     for prompt in PROMPTS:
-        captures = {
-            layer_idx: {}
-            for layer_idx in range(len(model.model.layers))
-        }
+        captures = {layer_idx: {} for layer_idx in range(len(model.model.layers))}
         final_capture = {}
         handles = []
 
@@ -134,7 +131,10 @@ def _capture_hf_traces(model, tokenizer, device: torch.device) -> tuple[PromptTr
                 ),
             )
 
-        add_hook(model.model.norm, lambda module, inputs, output: final_capture.__setitem__("final_norm", _to_np(output)))
+        add_hook(
+            model.model.norm,
+            lambda module, inputs, output: final_capture.__setitem__("final_norm", _to_np(output)),
+        )
 
         first_linear_layer = model.model.layers[0]
         linear_norm_capture = {}
@@ -159,7 +159,9 @@ def _capture_hf_traces(model, tokenizer, device: torch.device) -> tuple[PromptTr
             handle.remove()
 
         for layer_idx, layer_capture in captures.items():
-            layer_capture["attn_residual"] = layer_capture["block_input"] + layer_capture["mixer_out"]
+            layer_capture["attn_residual"] = (
+                layer_capture["block_input"] + layer_capture["mixer_out"]
+            )
 
         stages = np.stack(
             [
@@ -208,9 +210,7 @@ def real_weight_artifacts() -> RealWeightArtifacts:
     torch.cuda.empty_cache()
 
     runtime_config = runtime_spec()
-    params = load_weights_from_hf_streaming(
-        MODEL_NAME, runtime_config.model, "bfloat16"
-    )
+    params = load_weights_from_hf_streaming(MODEL_NAME, runtime_config.model, "bfloat16")
     return RealWeightArtifacts(config=runtime_config, params=params, traces=traces)
 
 

@@ -100,7 +100,7 @@ run_jax() {
 
 run_vllm() {
   local route=$1
-  PYTHONPATH="$root" guard_with \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH="$root" guard_with \
     "$vllm_env/bin/python" \
     "$artifact_root/results/vllm-$route.ram.json" \
     "$vllm_env/bin/python" -m benchmarks.run_benchmark vllm \
@@ -113,7 +113,7 @@ gpu_preflight
 case "$target" in
   jax-base|jax-mtp)
     [[ "$target" != jax-mtp || -f "$artifact_root/results/jax-base.json" ]] || {
-      echo "run jax-base first so JAX MTP has an exact-token reference" >&2
+      echo "run jax-base first so JAX MTP has a parity reference" >&2
       exit 2
     }
     setup_jax
@@ -128,7 +128,7 @@ case "$target" in
     ;;
   vllm-base|vllm-mtp)
     [[ -f "$artifact_root/results/jax-base.json" ]] || {
-      echo "run jax-base first so vLLM has a base-token reference" >&2
+      echo "run jax-base first so vLLM has a parity reference" >&2
       exit 2
     }
     setup_vllm

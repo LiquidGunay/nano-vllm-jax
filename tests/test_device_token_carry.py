@@ -1,6 +1,7 @@
 """Focused tests for deferred greedy token materialization."""
 
 from dataclasses import replace
+from threading import Lock
 from types import SimpleNamespace
 
 import jax.numpy as jnp
@@ -17,6 +18,15 @@ from nanovllm_jax.step import RunResult
 from tests.runtime_specs import runtime_spec
 
 
+def _commit_engine(scheduler: Scheduler) -> LLMEngine:
+    engine = object.__new__(LLMEngine)
+    engine.scheduler = scheduler
+    engine._closed = False
+    engine._control_owner = None
+    engine._control_lock = Lock()
+    return engine
+
+
 def _batch_materializer(
     *,
     resident: bool = False,
@@ -29,6 +39,39 @@ def _batch_materializer(
         resident_decode_metadata=resident,
         static_decode_seq_lens_carry=seq_lens_carry,
     )
+
+
+def _device_carry_runner(config=None) -> ModelRunner:
+    """Build the complete runner-owned state used by carry-focused tests."""
+
+    config = config or runtime_spec(kernels={"device_token_carry": True})
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = config
+    runner.block_size = config.capacity.block_size
+    runner.max_blocks_per_seq = config.capacity.max_blocks_per_seq
+    runner.device_token_carry = config.kernels.device_token_carry
+    runner.static_decode_seq_lens_carry = config.kernels.static_decode_seq_lens_carry
+    max_seqs = config.capacity.max_num_resident_seqs
+    runner._hybrid_slots = {}
+    runner._free_hybrid_slots = list(range(max_seqs))
+    runner._mtp_ready_seq_ids = set()
+    runner._resident_last_tokens = jnp.zeros((max_seqs,), dtype=jnp.int32)
+    runner._resident_last_tokens_stale_seq_ids = set()
+    runner._resident_block_tables_host = [
+        tuple(0 for _ in range(runner.max_blocks_per_seq)) for _ in range(max_seqs)
+    ]
+    runner._resident_block_counts_host = [0 for _ in range(max_seqs)]
+    runner._resident_seq_lens_host = [0 for _ in range(max_seqs)]
+    runner._resident_rng_counters = jnp.zeros((max_seqs,), dtype=jnp.int32)
+    runner._resident_rng_counter_reset_slots = set()
+    runner._resident_update_slots_device_cache = {}
+    runner._resident_metadata_scatter_cache = {}
+    runner._device_token_carry_seq_ids = None
+    runner._device_token_carry_tokens = None
+    runner._device_token_carry_by_seq_id = {}
+    runner._device_seq_lens_carry_seq_ids = None
+    runner._device_seq_lens_carry = None
+    return runner
 
 
 class _AsyncScalar:
@@ -59,7 +102,7 @@ def test_device_token_carry_comes_from_config():
 def test_output_buffer_materializes_deferred_device_tokens():
     seq = Sequence([11, 22], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
 
-    seq.output.append_device(jnp.asarray(33, dtype=jnp.int32))
+    seq.output.append_device(DeviceTokenRef(tokens=jnp.asarray([33], dtype=jnp.int32), row=0))
 
     assert seq.num_completion_tokens == 1
     assert seq.output.has_deferred_tokens
@@ -71,12 +114,19 @@ def test_output_buffer_materializes_deferred_device_tokens():
     assert seq.last_token == 33
 
 
+def test_output_buffer_requires_an_explicit_device_token_ref():
+    output = OutputBuffer()
+
+    with pytest.raises(TypeError, match="DeviceTokenRef"):
+        output.append_device(jnp.asarray(33, dtype=jnp.int32))
+
+
 def test_output_buffer_materializes_deferred_device_tokens_for_multiple_sequences():
     seq_a = Sequence([11], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
     seq_b = Sequence([22], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
 
-    seq_a.output.append_device(jnp.asarray(33, dtype=jnp.int32))
-    seq_b.output.append_device(jnp.asarray(44, dtype=jnp.int32))
+    seq_a.output.append_device(DeviceTokenRef(tokens=jnp.asarray([33], dtype=jnp.int32), row=0))
+    seq_b.output.append_device(DeviceTokenRef(tokens=jnp.asarray([44], dtype=jnp.int32), row=0))
 
     OutputBuffer.materialize_many([seq_a.output, seq_b.output])
 
@@ -107,9 +157,9 @@ def test_output_buffer_materializes_deferred_device_token_refs_for_multiple_sequ
 def test_output_snapshot_does_not_clear_newer_tokens():
     seq = Sequence([11], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True))
 
-    seq.output.append_device(jnp.asarray(33, dtype=jnp.int32))
+    seq.output.append_device(DeviceTokenRef(tokens=jnp.asarray([33], dtype=jnp.int32), row=0))
     snapshot = seq.output.snapshot().prefetch()
-    seq.output.append_device(jnp.asarray(44, dtype=jnp.int32))
+    seq.output.append_device(DeviceTokenRef(tokens=jnp.asarray([44], dtype=jnp.int32), row=0))
 
     snapshot.materialize()
 
@@ -132,10 +182,12 @@ def test_output_prefetches_snapshot_before_later_materialization():
     second_token = _AsyncScalar(44, events)
     seq = Sequence([11], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True))
 
-    seq.output.append_device(first_token)
+    first_ref = DeviceTokenRef(tokens=first_token, row=0)
+    second_ref = DeviceTokenRef(tokens=second_token, row=0)
+    seq.output.append_device(first_ref)
     snapshot = seq.output.snapshot()
     prefetched = snapshot.prefetch()
-    seq.output.append_device(second_token)
+    seq.output.append_device(second_ref)
 
     assert prefetched == snapshot
     assert first_token.prefetch_count == 1
@@ -147,7 +199,7 @@ def test_output_prefetches_snapshot_before_later_materialization():
     assert seq.output.materialized_prefix() == [33]
     assert seq.token_ids == [11, 33, 0]
     assert seq.output.has_deferred_tokens
-    assert seq.last_token_device is second_token
+    assert seq.last_token_device is second_ref
     assert events == ["prefetch-33", "materialize-33"]
 
 
@@ -211,13 +263,7 @@ def _prefill_batch(
 
 
 def test_model_runner_device_token_carry_uses_whole_vector_when_seq_ids_match(monkeypatch):
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.config = runtime_spec(kernels={"device_token_carry": True})
-    runner.device_token_carry = True
-    runner.static_decode_seq_lens_carry = False
-    runner._device_token_carry_seq_ids = None
-    runner._device_token_carry_tokens = None
-    runner._device_token_carry_by_seq_id = {}
+    runner = _device_carry_runner()
     seq_a = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
     seq_b = Sequence([2], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=8)
     previous_batch = _decode_batch((7, 8), [10, 20])
@@ -237,13 +283,7 @@ def test_model_runner_device_token_carry_uses_whole_vector_when_seq_ids_match(mo
 
 
 def test_model_runner_device_token_carry_records_full_static_decode_rows(monkeypatch):
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.config = runtime_spec(kernels={"device_token_carry": True})
-    runner.device_token_carry = True
-    runner.static_decode_seq_lens_carry = False
-    runner._device_token_carry_seq_ids = None
-    runner._device_token_carry_tokens = None
-    runner._device_token_carry_by_seq_id = {}
+    runner = _device_carry_runner()
     seq_a = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
     seq_b = Sequence([2], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=8)
     batch = _decode_batch((7, 8, -1, -1), [0, 0, 0, 0], seq_lens=[4, 5, 0, 0])
@@ -267,13 +307,7 @@ def test_model_runner_device_token_carry_records_full_static_decode_rows(monkeyp
 
 
 def test_model_runner_device_token_carry_updates_resident_last_tokens(monkeypatch):
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.config = runtime_spec(kernels={"device_token_carry": True})
-    runner.device_token_carry = True
-    runner.static_decode_seq_lens_carry = False
-    runner._device_token_carry_seq_ids = None
-    runner._device_token_carry_tokens = None
-    runner._device_token_carry_by_seq_id = {}
+    runner = _device_carry_runner()
     runner._resident_last_tokens = jnp.zeros((4,), dtype=jnp.int32)
     runner._hybrid_slots = {7: 2, 8: 1}
     seq_a = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
@@ -297,13 +331,7 @@ def test_model_runner_device_token_carry_updates_resident_last_tokens(monkeypatc
 def test_model_runner_device_token_carry_clears_resident_stale_when_tokens_already_current(
     monkeypatch,
 ):
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.config = runtime_spec(kernels={"device_token_carry": True})
-    runner.device_token_carry = True
-    runner.static_decode_seq_lens_carry = False
-    runner._device_token_carry_seq_ids = None
-    runner._device_token_carry_tokens = None
-    runner._device_token_carry_by_seq_id = {}
+    runner = _device_carry_runner()
     runner._resident_last_tokens_stale_seq_ids = {7, 8, 99}
     seq_a = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
     seq_b = Sequence([2], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=8)
@@ -326,13 +354,7 @@ def test_model_runner_device_token_carry_clears_resident_stale_when_tokens_alrea
 def test_model_runner_device_token_carry_marks_resident_stale_when_not_updated(
     monkeypatch,
 ):
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.config = runtime_spec(kernels={"device_token_carry": True})
-    runner.device_token_carry = True
-    runner.static_decode_seq_lens_carry = False
-    runner._device_token_carry_seq_ids = None
-    runner._device_token_carry_tokens = None
-    runner._device_token_carry_by_seq_id = {}
+    runner = _device_carry_runner()
     runner._resident_last_tokens_stale_seq_ids = {99}
     seq = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
     batch = _decode_batch((7,), [0], seq_lens=[4])
@@ -350,13 +372,7 @@ def test_model_runner_device_token_carry_marks_resident_stale_when_not_updated(
 
 
 def test_model_runner_device_token_carry_follows_seq_ids_after_row_order_change(monkeypatch):
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.config = runtime_spec(kernels={"device_token_carry": True})
-    runner.device_token_carry = True
-    runner.static_decode_seq_lens_carry = False
-    runner._device_token_carry_seq_ids = None
-    runner._device_token_carry_tokens = None
-    runner._device_token_carry_by_seq_id = {}
+    runner = _device_carry_runner()
     seq_a = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
     seq_b = Sequence([2], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=8)
     previous_batch = _decode_batch((7, 8, -1), [10, 20, 0])
@@ -376,13 +392,7 @@ def test_model_runner_device_token_carry_follows_seq_ids_after_row_order_change(
 
 
 def test_model_runner_device_token_carry_survives_nonfinal_prefill_chunk(monkeypatch):
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.config = runtime_spec(kernels={"device_token_carry": True})
-    runner.device_token_carry = True
-    runner.static_decode_seq_lens_carry = False
-    runner._device_token_carry_seq_ids = None
-    runner._device_token_carry_tokens = None
-    runner._device_token_carry_by_seq_id = {}
+    runner = _device_carry_runner()
     seq_a = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
     seq_b = Sequence([2], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=8)
 
@@ -416,14 +426,7 @@ def test_model_runner_device_token_carry_survives_nonfinal_prefill_chunk(monkeyp
 
 
 def test_model_runner_release_preserves_carry_for_still_running_rows():
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.config = runtime_spec(kernels={"device_token_carry": True})
-    runner.device_token_carry = True
-    runner.static_decode_seq_lens_carry = False
-    runner.hybrid_states = {}
-    runner._hybrid_slots = {}
-    runner._free_hybrid_slots = []
-    runner._mtp_ready_seq_ids = set()
+    runner = _device_carry_runner()
     token_vector = jnp.asarray([70, 80], dtype=jnp.int32)
     runner._device_token_carry_seq_ids = (7, 8)
     runner._device_token_carry_tokens = token_vector
@@ -438,6 +441,22 @@ def test_model_runner_release_preserves_carry_for_still_running_rows():
     assert runner._device_token_carry_tokens is None
     assert set(runner._device_token_carry_by_seq_id) == {8}
     assert runner._device_token_carry_by_seq_id[8].row == 1
+
+
+def test_released_slot_resets_sampling_counter_before_reuse():
+    runner = _device_carry_runner()
+    runner._hybrid_slots = {7: 0}
+    runner._free_hybrid_slots.remove(0)
+    runner._resident_rng_counters = runner._resident_rng_counters.at[0].set(9)
+
+    runner.release([7])
+    _, counters = runner._sample_rng_slots_and_counters_device(
+        _decode_batch((8,), [0]),
+        [0],
+    )
+
+    assert int(counters[0]) == 0
+    assert runner._resident_rng_counter_reset_slots == set()
 
 
 def test_materializer_reuses_fixed_decode_arrays(monkeypatch):
@@ -457,8 +476,12 @@ def test_materializer_reuses_fixed_decode_arrays(monkeypatch):
         )
     )
     materializer = _batch_materializer()
-    seq_a = Sequence([1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7)
-    seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
+    seq_a = Sequence(
+        [1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7
+    )
+    seq_b = Sequence(
+        [3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8
+    )
     seq_a.block_table = [0]
     seq_b.block_table = [1]
     seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
@@ -550,8 +573,7 @@ def test_scheduler_resident_capacity_can_exceed_execution_batch():
     assert first_decode.bucket.batch_size == 2
     assert len(scheduler.waiting) == 2
 
-    engine = object.__new__(LLMEngine)
-    engine.scheduler = scheduler
+    engine = _commit_engine(scheduler)
     engine.commit(first_decode_seqs, first_decode, RunResult.from_rows([101, 102]))
     assert len(scheduler.running) == 0
 
@@ -588,8 +610,12 @@ def test_materializer_can_reuse_seq_lens_placeholder(monkeypatch):
         )
     )
     materializer = _batch_materializer(seq_lens_carry=True)
-    seq_a = Sequence([1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7)
-    seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
+    seq_a = Sequence(
+        [1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7
+    )
+    seq_b = Sequence(
+        [3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8
+    )
     seq_a.block_table = [0]
     seq_b.block_table = [1]
     seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
@@ -628,8 +654,12 @@ def test_materializer_uses_resident_metadata_placeholders(monkeypatch):
         )
     )
     materializer = _batch_materializer(resident=True)
-    seq_a = Sequence([1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7)
-    seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
+    seq_a = Sequence(
+        [1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7
+    )
+    seq_b = Sequence(
+        [3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8
+    )
     seq_a.block_table = [1]
     seq_b.block_table = [2]
     seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
@@ -674,8 +704,12 @@ def test_materializer_reuses_resident_placeholders_across_seq_ids(monkeypatch):
         )
     )
     materializer = _batch_materializer(resident=True)
-    seq_a = Sequence([1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7)
-    seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8)
+    seq_a = Sequence(
+        [1, 2], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=7
+    )
+    seq_b = Sequence(
+        [3, 4], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=8
+    )
     seq_a.block_table = [1]
     seq_b.block_table = [2]
     seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
@@ -685,8 +719,12 @@ def test_materializer_reuses_resident_placeholders_across_seq_ids(monkeypatch):
         scheduler.build_schedule_plan([seq_a, seq_b], is_prefill=False)
     )
 
-    seq_c = Sequence([5, 6], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=17)
-    seq_d = Sequence([7, 8], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=18)
+    seq_c = Sequence(
+        [5, 6], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=17
+    )
+    seq_d = Sequence(
+        [7, 8], SamplingParams(temperature=0.0, max_tokens=3, ignore_eos=True), seq_id=18
+    )
     seq_c.block_table = [3]
     seq_d.block_table = [4]
     seq_c.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
@@ -728,8 +766,12 @@ def test_materializer_preserves_greedy_burst_width(monkeypatch):
         )
     )
     materializer = _batch_materializer()
-    seq_a = Sequence([1, 2], SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True), seq_id=7)
-    seq_b = Sequence([3, 4], SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True), seq_id=8)
+    seq_a = Sequence(
+        [1, 2], SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True), seq_id=7
+    )
+    seq_b = Sequence(
+        [3, 4], SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True), seq_id=8
+    )
     seq_a.block_table = [0]
     seq_b.block_table = [1]
     seq_a.output.append_device(DeviceTokenRef(tokens=token_vector, row=0))
@@ -748,13 +790,7 @@ def test_materializer_preserves_greedy_burst_width(monkeypatch):
 
 
 def test_model_runner_static_decode_metadata_requires_token_carry(monkeypatch):
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.config = runtime_spec(kernels={"device_token_carry": True})
-    runner.device_token_carry = True
-    runner.static_decode_seq_lens_carry = False
-    runner._device_token_carry_seq_ids = None
-    runner._device_token_carry_tokens = None
-    runner._device_token_carry_by_seq_id = {}
+    runner = _device_carry_runner()
     batch = _decode_batch((7,), [0])
     batch.host = replace(batch.host, uses_static_decode_metadata=True)
 
@@ -763,20 +799,14 @@ def test_model_runner_static_decode_metadata_requires_token_carry(monkeypatch):
 
 
 def test_model_runner_static_decode_metadata_applies_carried_seq_lens(monkeypatch):
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.config = runtime_spec(
-        kernels={
-            "device_token_carry": True,
-            "static_decode_seq_lens_carry": True,
-        }
+    runner = _device_carry_runner(
+        runtime_spec(
+            kernels={
+                "device_token_carry": True,
+                "static_decode_seq_lens_carry": True,
+            }
+        )
     )
-    runner.device_token_carry = True
-    runner.static_decode_seq_lens_carry = True
-    runner._device_token_carry_seq_ids = None
-    runner._device_token_carry_tokens = None
-    runner._device_token_carry_by_seq_id = {}
-    runner._device_seq_lens_carry_seq_ids = None
-    runner._device_seq_lens_carry = None
     seq_a = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
     seq_b = Sequence([2], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=8)
     previous_batch = _decode_batch((7, 8), [10, 20], seq_lens=[5, 9])
@@ -798,20 +828,14 @@ def test_model_runner_static_decode_metadata_applies_carried_seq_lens(monkeypatc
 
 
 def test_model_runner_first_static_decode_can_use_scheduler_seq_lens(monkeypatch):
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.config = runtime_spec(
-        kernels={
-            "device_token_carry": True,
-            "static_decode_seq_lens_carry": True,
-        }
+    runner = _device_carry_runner(
+        runtime_spec(
+            kernels={
+                "device_token_carry": True,
+                "static_decode_seq_lens_carry": True,
+            }
+        )
     )
-    runner.device_token_carry = True
-    runner.static_decode_seq_lens_carry = True
-    runner._device_token_carry_seq_ids = None
-    runner._device_token_carry_tokens = None
-    runner._device_token_carry_by_seq_id = {}
-    runner._device_seq_lens_carry_seq_ids = None
-    runner._device_seq_lens_carry = None
     seq_a = Sequence([1], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=7)
     seq_b = Sequence([2], SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True), seq_id=8)
     previous_prefill = _prefill_batch((7, 8), [10, 20], final_flags=(True, True))
@@ -832,7 +856,7 @@ def test_model_runner_first_static_decode_can_use_scheduler_seq_lens(monkeypatch
     np.testing.assert_array_equal(np.asarray(carried_batch.seq_lens), np.asarray([5, 9]))
 
 
-def test_engine_commit_can_defer_greedy_device_token(monkeypatch):
+def test_engine_commit_materializes_untyped_device_scalar(monkeypatch):
     scheduler = Scheduler(
         runtime_spec(
             capacity={
@@ -849,8 +873,7 @@ def test_engine_commit_can_defer_greedy_device_token(monkeypatch):
         seq_id=7,
     )
 
-    engine = object.__new__(LLMEngine)
-    engine.scheduler = scheduler
+    engine = _commit_engine(scheduler)
     result = engine.commit(
         [seq],
         SimpleNamespace(is_prefill=False, num_scheduled_tokens=1),
@@ -859,8 +882,8 @@ def test_engine_commit_can_defer_greedy_device_token(monkeypatch):
 
     assert result.finished == ()
     assert seq.num_completion_tokens == 1
-    assert seq.output.has_deferred_tokens
-    assert seq.output.materialize() == [202]
+    assert not seq.output.has_deferred_tokens
+    assert seq.output.token_ids() == [202]
 
 
 def test_engine_commit_can_defer_sampled_device_token_ref(monkeypatch):
@@ -881,8 +904,7 @@ def test_engine_commit_can_defer_sampled_device_token_ref(monkeypatch):
     )
     token_vector = jnp.asarray([202], dtype=jnp.int32)
 
-    engine = object.__new__(LLMEngine)
-    engine.scheduler = scheduler
+    engine = _commit_engine(scheduler)
     result = engine.commit(
         [seq],
         SimpleNamespace(is_prefill=False, num_scheduled_tokens=1),

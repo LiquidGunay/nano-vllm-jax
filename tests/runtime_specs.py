@@ -34,8 +34,7 @@ def qwen_text_config(size: str = "4B") -> dict[str, object]:
         "full_attention_interval": 4,
         "max_position_embeddings": 262144,
         "layer_types": [
-            "linear_attention" if index % 4 != 3 else "full_attention"
-            for index in range(layers)
+            "linear_attention" if index % 4 != 3 else "full_attention" for index in range(layers)
         ],
         "hidden_act": "silu",
         "rms_norm_eps": 1e-6,

@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -19,6 +20,37 @@ ROOT = Path(__file__).resolve().parents[1]
 ROUTES = ("base", "mtp")
 
 
+def runtime_source_sha256(root: Path = ROOT) -> str:
+    """Hash the serving sources that can affect benchmark output."""
+
+    paths = sorted((root / "nanovllm_jax").rglob("*.py"))
+    paths.extend(
+        root / relative
+        for relative in ("benchmarks/backends/jax.py", "benchmarks/backends/vllm.py")
+    )
+    digest = hashlib.sha256()
+    for path in paths:
+        relative = path.relative_to(root).as_posix().encode()
+        digest.update(relative)
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def dependency_inputs_sha256(root: Path = ROOT) -> str:
+    """Hash the frozen dependency inputs used by the parity capture."""
+
+    digest = hashlib.sha256()
+    for relative in ("uv.lock", "benchmarks/vllm-requirements.txt"):
+        path = root / relative
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def load_manifest(path: Path) -> dict[str, Any]:
     manifest = json.loads(path.read_text())
     required = {
@@ -29,11 +61,12 @@ def load_manifest(path: Path) -> dict[str, Any]:
         "speculation",
         "capacity",
         "measurement",
+        "parity",
         "frameworks",
     }
     if set(manifest) != required:
         raise ValueError(f"manifest keys must be exactly {sorted(required)}")
-    if manifest["schema_version"] != 2:
+    if manifest["schema_version"] != 3:
         raise ValueError("unsupported manifest schema")
     workload = manifest["workload"]
     if workload["batch_size"] != 1:
@@ -44,12 +77,9 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise ValueError("the benchmark requires a prefix miss")
     prompt = workload["prompt_token_ids"]
     if len(prompt) != workload["prompt_tokens"] or any(
-        isinstance(token, bool) or not isinstance(token, int) or token < 0
-        for token in prompt
+        isinstance(token, bool) or not isinstance(token, int) or token < 0 for token in prompt
     ):
-        raise ValueError(
-            "prompt_token_ids must contain prompt_tokens nonnegative integers"
-        )
+        raise ValueError("prompt_token_ids must contain prompt_tokens nonnegative integers")
     speculation = manifest["speculation"]
     if set(speculation) != {"method", "draft_tokens"}:
         raise ValueError("speculation must define method and draft_tokens")
@@ -58,7 +88,103 @@ def load_manifest(path: Path) -> dict[str, Any]:
     measurement = manifest["measurement"]
     if measurement["warmup_repeats"] < 1 or measurement["repeats"] < 1:
         raise ValueError("warmup and measured repeats must be positive")
+    parity = manifest["parity"]
+    if set(parity) != {"evidence", "sha256"}:
+        raise ValueError("parity must define evidence and sha256")
+    if Path(parity["evidence"]).name != parity["evidence"]:
+        raise ValueError("parity evidence must be a filename beside the manifest")
+    if len(parity["sha256"]) != 64:
+        raise ValueError("parity evidence must have a SHA-256 digest")
     return manifest
+
+
+def load_parity_evidence(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Load the one content-addressed output equivalence admitted by the contract."""
+
+    parity = manifest["parity"]
+    evidence_path = path.parent / parity["evidence"]
+    if _file_hash(evidence_path) != parity["sha256"]:
+        raise ValueError("parity evidence digest does not match the manifest")
+    evidence = json.loads(evidence_path.read_text())
+    required = {
+        "schema_version",
+        "benchmark_id",
+        "reference_output_sha256",
+        "variant_output_sha256",
+        "mismatches",
+        "diagnostic",
+        "limits",
+    }
+    if set(evidence) != required or evidence["schema_version"] != 1:
+        raise ValueError("unsupported parity evidence schema")
+    if evidence["benchmark_id"] != manifest["benchmark_id"]:
+        raise ValueError("parity evidence benchmark does not match the manifest")
+    if evidence["reference_output_sha256"] == evidence["variant_output_sha256"]:
+        raise ValueError("parity evidence must describe two different outputs")
+
+    limits = evidence["limits"]
+    if set(limits) != {
+        "max_bidirectional_kl",
+        "max_jensen_shannon",
+        "max_total_variation",
+        "max_mismatches",
+    }:
+        raise ValueError("parity evidence limits are incomplete")
+    if any(
+        not isinstance(limits[name], (int, float))
+        or isinstance(limits[name], bool)
+        or not math.isfinite(limits[name])
+        or limits[name] <= 0
+        for name in ("max_bidirectional_kl", "max_jensen_shannon", "max_total_variation")
+    ):
+        raise ValueError("parity divergence limits must be finite and positive")
+    if isinstance(limits["max_mismatches"], bool) or limits["max_mismatches"] < 1:
+        raise ValueError("max_mismatches must be positive")
+
+    mismatches = evidence["mismatches"]
+    mismatch_fields = {"row", "output_index", "reference_token", "variant_token"}
+    if not mismatches or len(mismatches) > limits["max_mismatches"]:
+        raise ValueError("parity evidence mismatch count exceeds its limit")
+    if any(
+        set(item) != mismatch_fields
+        or any(isinstance(item[name], bool) or not isinstance(item[name], int) for name in item)
+        or any(item[name] < 0 for name in item)
+        for item in mismatches
+    ):
+        raise ValueError("parity mismatches must contain nonnegative integer coordinates and ids")
+
+    diagnostic = evidence["diagnostic"]
+    if not diagnostic.get("full_vocabulary"):
+        raise ValueError("parity evidence must cover the full vocabulary")
+    if diagnostic.get("runtime_source_sha256") != runtime_source_sha256(path.parent.parent):
+        raise ValueError("parity evidence does not match the runtime source tree")
+    if diagnostic.get("dependency_inputs_sha256") != dependency_inputs_sha256(path.parent.parent):
+        raise ValueError("parity evidence does not match the frozen dependency inputs")
+    metrics = {
+        "kl_reference_to_variant": limits["max_bidirectional_kl"],
+        "kl_variant_to_reference": limits["max_bidirectional_kl"],
+        "jensen_shannon": limits["max_jensen_shannon"],
+        "total_variation": limits["max_total_variation"],
+    }
+    for name, upper in metrics.items():
+        value = diagnostic.get(name)
+        if (
+            not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0 <= value <= upper
+        ):
+            raise ValueError(f"parity evidence {name} exceeds its limit")
+
+    mismatch = mismatches[0]
+    reference = str(mismatch["reference_token"])
+    variant = str(mismatch["variant_token"])
+    reference_bins = diagnostic["reference_bf16_bins"]
+    variant_bins = diagnostic["variant_bf16_bins"]
+    if reference_bins[reference] != reference_bins[variant]:
+        raise ValueError("reference BF16 logits do not demonstrate a tie")
+    if variant_bins[variant] <= variant_bins[reference]:
+        raise ValueError("variant BF16 logits do not select the variant token")
+    return evidence
 
 
 def prompt_rows(manifest: dict[str, Any]) -> list[list[int]]:
@@ -117,13 +243,9 @@ def _device_used_bytes() -> int:
 
 
 def _git_state() -> dict[str, Any]:
-    commit = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-    ).strip()
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     dirty = bool(
-        subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=ROOT, text=True
-        ).strip()
+        subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip()
     )
     return {"commit": commit, "dirty": dirty}
 
@@ -160,10 +282,68 @@ def _reference_rows(
         "workload",
         "speculation",
         "capacity",
+        "parity",
     ):
         if result[field] != manifest[field]:
             raise ValueError(f"reference {field} does not match the manifest")
     return result["correctness"]["output_token_ids"]
+
+
+def adjudicate_reference(
+    evidence: dict[str, Any] | None,
+    reference_rows: list[list[int]] | None,
+    output_rows: list[list[int]],
+    *,
+    evidence_sha256: str,
+) -> dict[str, Any] | None:
+    """Accept only the finite, measured token variant named by the evidence."""
+
+    if evidence is None or reference_rows is None:
+        return None
+    reference_hash = _output_hash(reference_rows)
+    output_hash = _output_hash(output_rows)
+    allowed_hashes = {
+        evidence["reference_output_sha256"],
+        evidence["variant_output_sha256"],
+    }
+    if reference_hash == output_hash or {reference_hash, output_hash} != allowed_hashes:
+        return None
+    if len(reference_rows) != len(output_rows):
+        return None
+    observed = []
+    for row, (reference, output) in enumerate(zip(reference_rows, output_rows)):
+        if len(reference) != len(output):
+            return None
+        observed.extend(
+            {
+                "row": row,
+                "output_index": index,
+                "reference_token": reference_token,
+                "variant_token": variant_token,
+            }
+            for index, (reference_token, variant_token) in enumerate(zip(reference, output))
+            if reference_token != variant_token
+        )
+    expected = evidence["mismatches"]
+    if reference_hash == evidence["variant_output_sha256"]:
+        expected = [
+            {
+                **item,
+                "reference_token": item["variant_token"],
+                "variant_token": item["reference_token"],
+            }
+            for item in expected
+        ]
+    if observed != expected:
+        return None
+    return {
+        "evidence_sha256": evidence_sha256,
+        "output_sha256": output_hash,
+        "equivalent_output_sha256": sorted(allowed_hashes),
+        "mismatches": observed,
+        "diagnostic": evidence["diagnostic"],
+        "limits": evidence["limits"],
+    }
 
 
 def _validate_reference_role(
@@ -190,8 +370,10 @@ def invalid_reasons(
     samples: list[dict[str, Any]],
     output_rows: list[list[int]],
     *,
+    allowed_output_sha256: frozenset[str],
     repeat_exact: bool,
     reference_exact: bool | None,
+    reference_adjudicated: bool = False,
     route_cache_growth: int | None,
 ) -> list[str]:
     reasons = []
@@ -200,9 +382,11 @@ def invalid_reasons(
     )
     speeds = [sample["decode_tokens_per_second"] for sample in samples]
     spread = (max(speeds) - min(speeds)) / median(speeds)
+    if _output_hash(output_rows) not in allowed_output_sha256:
+        reasons.append("output hash is outside the content-addressed parity contract")
     if not repeat_exact:
         reasons.append("measured repeats produced different tokens")
-    if reference_exact is False:
+    if reference_exact is False and not reference_adjudicated:
         reasons.append("backend tokens differ from the reference backend")
     if any(sample["decode_tokens"] != expected_tokens for sample in samples):
         reasons.append("decode token count does not match the contract")
@@ -229,8 +413,7 @@ def invalid_reasons(
             reasons.append("base decode reported speculative work")
             break
         if route == "mtp" and (
-            drafted == 0
-            or (backend_name == "jax" and (verified is None or verified == 0))
+            drafted == 0 or (backend_name == "jax" and (verified is None or verified == 0))
         ):
             reasons.append("MTP decode did not report target-verified drafts")
             break
@@ -243,6 +426,7 @@ def run(
     manifest: dict[str, Any],
     benchmark_sha256: str,
     reference_path: Path | None,
+    parity_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     _validate_reference_role(backend_name, route, reference_path)
     prompts = prompt_rows(manifest)
@@ -276,9 +460,7 @@ def run(
     for _ in range(manifest["measurement"]["repeats"]):
         sample = backend.run_once()
         repeat_exact &= sample["output_token_ids"] == control["output_token_ids"]
-        samples.append(
-            {key: value for key, value in sample.items() if key != "output_token_ids"}
-        )
+        samples.append({key: value for key, value in sample.items() if key != "output_token_ids"})
         _sample_memory(memory)
     route_cache_after = backend.route_cache_fingerprint()
 
@@ -291,9 +473,17 @@ def run(
     median_speed = median(speeds)
     relative_spread = (max(speeds) - min(speeds)) / median_speed
     reference_exact = (
+        None if reference_rows is None else reference_rows == control["output_token_ids"]
+    )
+    parity_adjudication = (
         None
-        if reference_rows is None
-        else reference_rows == control["output_token_ids"]
+        if reference_exact is not False
+        else adjudicate_reference(
+            parity_evidence,
+            reference_rows,
+            control["output_token_ids"],
+            evidence_sha256=manifest["parity"]["sha256"],
+        )
     )
 
     reasons = invalid_reasons(
@@ -302,8 +492,15 @@ def run(
         manifest,
         samples,
         control["output_token_ids"],
+        allowed_output_sha256=frozenset(
+            {
+                parity_evidence["reference_output_sha256"],
+                parity_evidence["variant_output_sha256"],
+            }
+        ),
         repeat_exact=repeat_exact,
         reference_exact=reference_exact,
+        reference_adjudicated=parity_adjudication is not None,
         route_cache_growth=route_cache_growth,
     )
 
@@ -312,7 +509,7 @@ def run(
     )
     backend_memory = backend.memory()
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "benchmark_id": manifest["benchmark_id"],
         "benchmark_sha256": benchmark_sha256,
         "backend": backend_name,
@@ -321,6 +518,7 @@ def run(
         "workload": manifest["workload"],
         "speculation": manifest["speculation"],
         "capacity": manifest["capacity"],
+        "parity": manifest["parity"],
         "environment": {
             "python": platform.python_version(),
             "platform": platform.platform(),
@@ -340,15 +538,21 @@ def run(
             "median_ttft_seconds": median(ttfts),
             "median_decode_tokens_per_second": median_speed,
             "relative_spread": relative_spread,
-            "decode_definition": (
-                "tokens after the first / time from first token to completion"
-            ),
+            "decode_definition": ("tokens after the first / time from first token to completion"),
         },
         "warmup": warmup,
         "correctness": {
             "repeat_exact": repeat_exact,
             "reference_exact": reference_exact,
+            "reference_adjudicated": parity_adjudication is not None,
+            "parity_evidence": parity_adjudication,
             "output_sha256": _output_hash(control["output_token_ids"]),
+            "allowed_output_sha256": sorted(
+                {
+                    parity_evidence["reference_output_sha256"],
+                    parity_evidence["variant_output_sha256"],
+                }
+            ),
             "output_token_ids": control["output_token_ids"],
             "measured_executor_route_cache_growth": route_cache_growth,
         },
@@ -366,20 +570,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("backend", choices=("jax", "vllm"))
     parser.add_argument("--route", choices=ROUTES, required=True)
-    parser.add_argument(
-        "--manifest", type=Path, default=ROOT / "benchmarks/benchmark.json"
-    )
+    parser.add_argument("--manifest", type=Path, default=ROOT / "benchmarks/benchmark.json")
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
 
     manifest = load_manifest(args.manifest)
+    parity_evidence = load_parity_evidence(args.manifest, manifest)
     result = run(
         args.backend,
         args.route,
         manifest,
         _file_hash(args.manifest),
         args.reference,
+        parity_evidence,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")

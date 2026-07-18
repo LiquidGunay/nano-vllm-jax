@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import queue
 import threading
 import time
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Protocol
 
 from nanovllm_jax.output import OutputBuffer
 from nanovllm_jax.sequence import SamplingParams
@@ -30,9 +30,53 @@ class _PendingRequest:
     handle: "RequestHandle"
 
 
+@dataclass(frozen=True)
+class _PendingBatch:
+    requests: tuple[_PendingRequest, ...]
+
+
+class ServiceSequence(Protocol):
+    seq_id: int
+    output: OutputBuffer
+    is_finished: bool
+
+
+class ServiceEngine(Protocol):
+    def claim_control(self, owner: object) -> None: ...
+
+    def release_control(self, owner: object) -> None: ...
+
+    def add_request(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+        *,
+        owner: object | None = None,
+    ) -> ServiceSequence: ...
+
+    def add_requests(
+        self,
+        prompts: list[str | list[int]],
+        sampling_params: list[SamplingParams],
+        *,
+        owner: object | None = None,
+    ) -> list[ServiceSequence]: ...
+
+    def step(self, *, owner: object | None = None) -> StepResult: ...
+
+    def cancel_request(
+        self,
+        seq: ServiceSequence,
+        *,
+        owner: object | None = None,
+    ) -> bool: ...
+
+    def detokenize(self, token_ids: list[int]) -> str: ...
+
+
 @dataclass
 class _ActiveRequest:
-    seq: Any
+    seq: ServiceSequence
     handle: "RequestHandle"
 
 
@@ -40,11 +84,15 @@ def _text_delta(decoded: str, previous: str, terminal: bool) -> tuple[str, str]:
     stable = decoded if terminal else decoded.rstrip("\ufffd")
     if not stable.startswith(previous):
         return "", previous
-    return stable[len(previous):], stable
+    return stable[len(previous) :], stable
 
 
 class RequestHandle:
-    """One result and a one-slot notification channel for streaming."""
+    """One request whose result is published by the engine worker.
+
+    Callers may wait, cancel, or consume one event iterator. Only the worker
+    mutates the bound sequence, output cursor, and terminal result.
+    """
 
     def __init__(self, request_id: int, *, stream: bool = False):
         self.request_id = int(request_id)
@@ -187,7 +235,7 @@ class EngineService:
 
     def __init__(
         self,
-        engine: Any,
+        engine: ServiceEngine,
         *,
         engine_lock: threading.Lock | threading.RLock | None = None,
         batch_window_seconds: float = 0.002,
@@ -199,7 +247,7 @@ class EngineService:
         if max_queue_size is not None and int(max_queue_size) <= 0:
             raise ValueError("max_queue_size must be positive when provided")
         self._max_requests = None if max_queue_size is None else int(max_queue_size)
-        self._incoming: queue.Queue[_PendingRequest | object] = queue.Queue()
+        self._incoming: queue.Queue[_PendingBatch | object] = queue.Queue()
         self._active: dict[int, _ActiveRequest] = {}
         self._next_request_id = 0
         self._state_lock = threading.Lock()
@@ -207,6 +255,7 @@ class EngineService:
         self._stop = threading.Event()
         self._failed: BaseException | None = None
         self._thread: threading.Thread | None = None
+        self._owns_engine = False
 
     def start(self) -> None:
         with self._state_lock:
@@ -214,11 +263,19 @@ class EngineService:
                 return
             if self._failed is not None:
                 raise RuntimeError("engine service is failed and must be recreated")
+            self.engine.claim_control(self)
+            self._owns_engine = True
             self._stop.clear()
             self._thread = threading.Thread(
                 target=self._run, name="nanovllm-engine-service", daemon=True
             )
-            self._thread.start()
+            try:
+                self._thread.start()
+            except BaseException:
+                self._thread = None
+                self._owns_engine = False
+                self.engine.release_control(self)
+                raise
 
     def stop(self, timeout: float | None = 5.0) -> None:
         with self._state_lock:
@@ -238,6 +295,9 @@ class EngineService:
         with self._state_lock:
             if self._thread is thread:
                 self._thread = None
+            if self._owns_engine:
+                self._owns_engine = False
+                self.engine.release_control(self)
 
     def health(self) -> dict[str, Any]:
         with self._state_lock:
@@ -292,11 +352,17 @@ class EngineService:
             ]
             self._next_request_id += count
             self._in_flight += count
-            for prompt, param, handle in zip(prompts, params, handles):
-                self._incoming.put(_PendingRequest(prompt, param, handle))
+            requests = tuple(
+                _PendingRequest(prompt, param, handle)
+                for prompt, param, handle in zip(prompts, params, handles)
+            )
+            if requests:
+                self._incoming.put(_PendingBatch(requests))
             return handles
 
-    def generate(self, prompt: str | list[int], sampling_params: SamplingParams) -> GenerationResult:
+    def generate(
+        self, prompt: str | list[int], sampling_params: SamplingParams
+    ) -> GenerationResult:
         return self.submit(prompt, sampling_params).wait()
 
     def generate_many(
@@ -304,6 +370,8 @@ class EngineService:
         prompts: list[str | list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
     ) -> list[GenerationResult]:
+        if not prompts:
+            raise ValueError("prompts must be a non-empty list")
         if isinstance(sampling_params, list):
             if len(sampling_params) != len(prompts):
                 raise ValueError("sampling_params length must match prompts length")
@@ -323,7 +391,7 @@ class EngineService:
                 if self._stop.is_set() or not self._active:
                     continue
                 with self.engine_lock:
-                    step_result = self.engine.step()
+                    step_result = self.engine.step(owner=self)
                 self._publish_progress(step_result)
                 self._publish_finished(step_result)
         except BaseException as exc:
@@ -333,8 +401,8 @@ class EngineService:
             self._abort_all_active(stopped)
             self._fail_all_pending(stopped)
 
-    def _take_pending(self, *, block: bool) -> list[_PendingRequest]:
-        pending: list[_PendingRequest] = []
+    def _take_pending(self, *, block: bool) -> list[_PendingBatch]:
+        pending: list[_PendingBatch] = []
         deadline = None
         if block:
             try:
@@ -361,22 +429,34 @@ class EngineService:
                 pending.append(item)
         return pending
 
-    def _admit_pending(self, pending: list[_PendingRequest]) -> None:
-        detokenize = getattr(self.engine, "_detokenize", None)
+    def _admit_pending(self, pending: list[_PendingBatch]) -> None:
         with self.engine_lock:
-            for request in pending:
-                if request.handle.cancel_requested:
+            for batch in pending:
+                requests = []
+                for request in batch.requests:
+                    if not request.handle.cancel_requested:
+                        requests.append(request)
+                        continue
                     self._finish_handle(
                         request.handle, GenerationResult("", [], FinishReason.CANCELLED)
                     )
+                if not requests:
                     continue
                 try:
-                    seq = self.engine.add_request(request.prompt, request.sampling_params)
+                    seqs = self.engine.add_requests(
+                        [request.prompt for request in requests],
+                        [request.sampling_params for request in requests],
+                        owner=self,
+                    )
                 except BaseException as exc:
-                    self._fail_handle(request.handle, exc)
+                    for request in requests:
+                        self._fail_handle(request.handle, exc)
                     continue
-                request.handle._bind(seq.seq_id, seq.output, detokenize)
-                self._active[int(seq.seq_id)] = _ActiveRequest(seq, request.handle)
+                if len(seqs) != len(requests):
+                    raise RuntimeError("engine returned the wrong number of admitted requests")
+                for request, seq in zip(requests, seqs):
+                    request.handle._bind(seq.seq_id, seq.output, self.engine.detokenize)
+                    self._active[int(seq.seq_id)] = _ActiveRequest(seq, request.handle)
 
     def _cancel_requested(self) -> None:
         cancelled = [
@@ -389,7 +469,7 @@ class EngineService:
         OutputBuffer.materialize_many(active.seq.output for _, active in cancelled)
         with self.engine_lock:
             for _, active in cancelled:
-                self.engine.cancel_request(active.seq)
+                self.engine.cancel_request(active.seq, owner=self)
         for seq_id, active in cancelled:
             self._finish_active(active, FinishReason.CANCELLED)
             self._active.pop(seq_id, None)
@@ -402,16 +482,12 @@ class EngineService:
                 through[token.seq_id] = max(
                     through.get(token.seq_id, 0), token.completion_index + 1
                 )
-        OutputBuffer.materialize_many(
-            self._active[seq_id].seq.output for seq_id in through
-        )
+        OutputBuffer.materialize_many(self._active[seq_id].seq.output for seq_id in through)
         for seq_id, count in through.items():
             self._active[seq_id].handle._publish_through(count)
 
     def _publish_finished(self, step: StepResult) -> None:
-        finished = [
-            (request, self._active.get(request.seq_id)) for request in step.finished
-        ]
+        finished = [(request, self._active.get(request.seq_id)) for request in step.finished]
         OutputBuffer.materialize_many(
             active.seq.output for _, active in finished if active is not None
         )
@@ -423,8 +499,7 @@ class EngineService:
 
     def _finish_active(self, active: _ActiveRequest, reason: FinishReason) -> None:
         token_ids = active.seq.output.token_ids()
-        detokenize = getattr(self.engine, "_detokenize", None)
-        text = detokenize(token_ids) if detokenize is not None else ""
+        text = self.engine.detokenize(token_ids)
         self._finish_handle(active.handle, GenerationResult(text, token_ids, reason))
 
     def _finish_handle(self, handle: RequestHandle, result: GenerationResult) -> None:
@@ -447,7 +522,7 @@ class EngineService:
         with self.engine_lock:
             for request in active:
                 try:
-                    self.engine.cancel_request(request.seq)
+                    self.engine.cancel_request(request.seq, owner=self)
                 except BaseException:
                     pass
         for request in active:
@@ -459,8 +534,9 @@ class EngineService:
                 item = self._incoming.get_nowait()
             except queue.Empty:
                 break
-            if isinstance(item, _PendingRequest):
-                self._fail_handle(item.handle, exc)
+            if isinstance(item, _PendingBatch):
+                for request in item.requests:
+                    self._fail_handle(request.handle, exc)
 
     def _mark_failed(self, exc: BaseException) -> None:
         with self._state_lock:

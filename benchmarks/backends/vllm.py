@@ -106,6 +106,4 @@ class Backend:
         return {package: version(package) for package in packages}
 
     def memory(self) -> dict[str, Any]:
-        return {
-            "configured_kv_cache_bytes": self.manifest["capacity"]["kv_cache_bytes"]
-        }
+        return {"configured_kv_cache_bytes": self.manifest["capacity"]["kv_cache_bytes"]}

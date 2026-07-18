@@ -3,7 +3,9 @@
 from copy import copy
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List, Optional
+import math
+from numbers import Integral, Real
+from typing import Optional
 
 from nanovllm_jax.output import OutputBuffer
 
@@ -14,13 +16,29 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 
-@dataclass
+@dataclass(frozen=True)
 class SamplingParams:
     """Sampling parameters for generation."""
 
-    temperature: float = 1.0
+    temperature: float = 0.0
     max_tokens: int = 256
     ignore_eos: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.temperature, bool) or not isinstance(self.temperature, Real):
+            raise TypeError("temperature must be a real number")
+        temperature = float(self.temperature)
+        if not math.isfinite(temperature) or temperature < 0:
+            raise ValueError("temperature must be finite and non-negative")
+        if isinstance(self.max_tokens, bool) or not isinstance(self.max_tokens, Integral):
+            raise TypeError("max_tokens must be an integer")
+        max_tokens = int(self.max_tokens)
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if not isinstance(self.ignore_eos, bool):
+            raise TypeError("ignore_eos must be a boolean")
+        object.__setattr__(self, "temperature", temperature)
+        object.__setattr__(self, "max_tokens", max_tokens)
 
 
 class Sequence:
@@ -28,7 +46,7 @@ class Sequence:
 
     def __init__(
         self,
-        token_ids: List[int],
+        token_ids: list[int],
         sampling_params: Optional[SamplingParams] = None,
         seq_id: int = 0,
         block_size: int = 16,
@@ -45,7 +63,7 @@ class Sequence:
         self.cached_prefix_hash: int | None = None
         self.cached_prefix_hybrid_seeded = False
         self.prefix_cache_enabled = False
-        self.block_table: List[int] = []
+        self.block_table: list[int] = []
         sampling_params = sampling_params or SamplingParams()
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -102,10 +120,4 @@ class Sequence:
     def block(self, index: int) -> list[int]:
         assert 0 <= index < self.num_blocks
         start = index * self.block_size
-        return self.token_ids[start:start + self.block_size]
-
-    def get_absolute_positions(self) -> List[int]:
-        return list(range(self.num_tokens))
-
-    def get_new_positions(self) -> List[int]:
-        return list(range(self.num_cached_tokens, self.num_tokens))
+        return self.token_ids[start : start + self.block_size]

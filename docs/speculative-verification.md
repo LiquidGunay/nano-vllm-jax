@@ -31,6 +31,11 @@ For draft width `K`, the scheduler derives three physical allowances:
   `K + 1` output group can leave that many predictor writes beyond the logical
   end.
 
+Warmup uses those same allowances. Its packed-prefill rows remain disjoint
+through the prompt plus `K - 1` predictor positions, and speculative decode
+rows remain disjoint through the scheduler's complete `2K` write window.
+Static block-table padding begins only after the farthest physical write.
+
 ```text
 packed prefill
   -> target hidden + shifted prompt tokens
@@ -97,6 +102,12 @@ exact token parity as the strongest result, but permits isolated top-1 changes
 only when an explicit full-vocabulary KL/JS and logit-margin check shows that
 they are numerical near ties. Acceptance, state advancement, and emitted-token
 accounting must still follow the packed target distribution exactly.
+
+The committed B=1 claim has one such content-addressed equivalence in
+[`parity_evidence.json`](../benchmarks/parity_evidence.json): two 64-token
+outputs differing only at index 44. The benchmark accepts those two hashes in
+either direction only while the serving-source digest also matches, and rejects
+every other mismatch; this is not a general tolerance for token drift.
 
 Because of that numerical limitation, MTP remains experimental even when a
 checkpoint passes an exact generation run. Promotion checks use identical base

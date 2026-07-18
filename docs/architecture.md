@@ -31,6 +31,14 @@ Health is derived from the worker thread rather than model allocation alone,
 and shutdown succeeds only after that worker has actually stopped. If a stop
 deadline expires, the worker still fails remaining handles when it later exits.
 
+The service holds the engine's single-writer lease from `start()` through
+`stop()`. Offline generation acquires the same lease and requires empty request
+queues. Manual `add_request()` plus `step()` is intentionally lower-level: its
+caller owns serialization and may interleave requests explicitly. A live lease
+rejects manual mutation, and lease acquisition rejects unfinished manual work.
+`close()` rejects a live lease, is idempotent after release, and drops
+model-owned device references.
+
 The control boundary is explicit:
 
 ```text
@@ -113,6 +121,10 @@ the selected bucket shape. It neither imports JAX nor allocates device arrays.
 - device token carry,
 - compile-bucket lookup.
 
+Target KV has one canonical `[layers, pages, page_size, kv_heads, head_dim]`
+allocation. FlashInfer consumes an NHD layer slice of that allocation directly;
+MTP adds only its separately enumerated predictor KV allocation.
+
 Materialization produces device arrays plus one immutable `HostBatch` containing
 the Python facts still needed for commit and resident-state bookkeeping. This
 keeps the host mirror explicit without eight optional `*_host` fields on the
@@ -127,7 +139,11 @@ booleans.
 
 Startup warmup enumerates the public dense-carry, sparse-carry, ordinary
 no-carry, sampled, and configured burst scenarios for each decode bucket. Each
-scenario goes through normal route selection and execution.
+scenario goes through normal route selection and execution. Dummy block-table
+rows use disjoint physical ids through the farthest target or predictor write.
+Only columns beyond that boundary use an ignored placeholder. A scenario whose
+live prefixes exceed its static width or physical cache is reported as skipped
+rather than compiled with aliased state.
 
 Compilation warmup is a startup-only transition. The engine rejects it after a
 request has been admitted or any prefix metadata has been published, so runner
@@ -155,6 +171,13 @@ commits those rows into `OutputBuffer`, advances logical/cache state, assigns
 EOS or length finish reasons, and returns a `StepResult` of token and finish
 events. The service consumes those events directly instead of scanning
 sequences for new output.
+
+Temperature sampling is deterministic for a fixed admission history. The
+runner keys sampling by resident slot and a per-slot counter, advances the
+counter only when that row samples, and resets it before a released slot is
+reused. Cancellation therefore cannot leak a previous request's RNG position
+into the next owner of the slot; changing concurrent admission order may still
+change slot assignment and is not promised to preserve samples.
 
 Checkpoint `config.json` owns model dimensions and layer types. The loader
 accepts the validated Qwen3.5 0.8B, 2B, and 4B text configurations, validates

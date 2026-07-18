@@ -23,14 +23,34 @@ class _FakeEngine:
         self.seqs: list[_FakeSeq] = []
         self.step_batches: list[tuple[int, ...]] = []
         self.cancelled: list[int] = []
+        self.control_owner = None
 
-    def add_request(self, prompt, sampling_params):
-        seq = _FakeSeq(seq_id=self._next_seq_id, sampling_params=sampling_params)
-        self._next_seq_id += 1
-        self.seqs.append(seq)
-        return seq
+    def claim_control(self, owner):
+        if self.control_owner is not None:
+            raise RuntimeError("engine already has an active control owner")
+        self.control_owner = owner
 
-    def step(self):
+    def release_control(self, owner):
+        assert self.control_owner is owner
+        self.control_owner = None
+
+    def add_request(self, prompt, sampling_params, *, owner=None):
+        return self.add_requests([prompt], [sampling_params], owner=owner)[0]
+
+    def add_requests(self, prompts, sampling_params, *, owner=None):
+        assert owner is self.control_owner
+        if any(any(token < 0 for token in prompt) for prompt in prompts):
+            raise ValueError("invalid prompt")
+        seqs = [
+            _FakeSeq(seq_id=self._next_seq_id + index, sampling_params=params)
+            for index, params in enumerate(sampling_params)
+        ]
+        self._next_seq_id += len(seqs)
+        self.seqs.extend(seqs)
+        return seqs
+
+    def step(self, *, owner=None):
+        assert owner is self.control_owner
         active = [seq for seq in self.seqs if not seq.is_finished]
         self.step_batches.append(tuple(seq.seq_id for seq in active))
         emitted = []
@@ -47,7 +67,8 @@ class _FakeEngine:
     def next_token(self, seq):
         return 100 + seq.seq_id + len(seq.output)
 
-    def cancel_request(self, seq):
+    def cancel_request(self, seq, *, owner=None):
+        assert owner is self.control_owner
         if seq.is_finished:
             return False
         seq.is_finished = True
@@ -57,12 +78,13 @@ class _FakeEngine:
     def is_finished(self):
         return all(seq.is_finished for seq in self.seqs)
 
-    def _detokenize(self, token_ids):
+    def detokenize(self, token_ids):
         return " ".join(str(token_id) for token_id in token_ids)
 
 
 class _FailingEngine(_FakeEngine):
-    def step(self):
+    def step(self, *, owner=None):
+        assert owner is self.control_owner
         raise RuntimeError("accelerator failed")
 
 
@@ -72,11 +94,12 @@ class _BlockingEngine(_FakeEngine):
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def step(self):
+    def step(self, *, owner=None):
+        assert owner is self.control_owner
         self.entered.set()
         if not self.release.wait(timeout=2.0):
             raise TimeoutError("test engine remained blocked")
-        return super().step()
+        return super().step(owner=owner)
 
 
 class _PacedUnicodeEngine(_FakeEngine):
@@ -84,15 +107,16 @@ class _PacedUnicodeEngine(_FakeEngine):
         super().__init__()
         self.permits = threading.Semaphore(0)
 
-    def step(self):
+    def step(self, *, owner=None):
+        assert owner is self.control_owner
         if not self.permits.acquire(timeout=2.0):
             raise TimeoutError("test engine was not released")
-        return super().step()
+        return super().step(owner=owner)
 
     def next_token(self, seq):
         return (1, 2, 3)[len(seq.output)]
 
-    def _detokenize(self, token_ids):
+    def detokenize(self, token_ids):
         return {
             (1,): "\ufffd",
             (1, 2): "é",
@@ -101,7 +125,7 @@ class _PacedUnicodeEngine(_FakeEngine):
 
 
 class _BadDetokenizer:
-    def _detokenize(self, token_ids):
+    def detokenize(self, token_ids):
         raise ValueError("decode failed")
 
 
@@ -207,6 +231,19 @@ def test_service_stop_fails_pending_requests_before_start():
         handle.wait(timeout=0.1)
 
 
+def test_service_owns_engine_control_until_stopped():
+    engine = _FakeEngine()
+    service = EngineService(engine, batch_window_seconds=0.0)
+
+    service.start()
+    assert engine.control_owner is service
+    with pytest.raises(RuntimeError, match="active control owner"):
+        engine.claim_control(object())
+
+    service.stop()
+    assert engine.control_owner is None
+
+
 def test_service_rejects_when_queue_is_full():
     engine = _BlockingEngine()
     service = EngineService(engine, batch_window_seconds=0.0, max_queue_size=1)
@@ -245,6 +282,34 @@ def test_generate_many_reserves_its_whole_batch_atomically():
         assert handle.request_id == 0
         assert handle.wait(timeout=1.0).finish_reason is FinishReason.LENGTH
         assert len(engine.seqs) == 1
+    finally:
+        service.stop()
+
+
+def test_generate_many_rejects_an_empty_batch():
+    service = EngineService(_FakeEngine(), batch_window_seconds=0.0)
+    sampling = SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True)
+
+    with pytest.raises(ValueError, match="prompts must be a non-empty list"):
+        service.generate_many([], sampling)
+
+    assert service.health()["in_flight"] == 0
+
+
+@pytest.mark.parametrize("prompts", ([[-1], [11]], [[11], [-1]]))
+def test_generate_many_rejects_every_row_before_engine_admission(prompts):
+    engine = _FakeEngine()
+    service = EngineService(engine, batch_window_seconds=0.0)
+    sampling = SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True)
+    service.start()
+    try:
+        with pytest.raises(ValueError, match="invalid prompt"):
+            service.generate_many(prompts, sampling)
+
+        assert engine.seqs == []
+        assert engine._next_seq_id == 0
+        assert engine.step_batches == []
+        assert service.health()["in_flight"] == 0
     finally:
         service.stop()
 

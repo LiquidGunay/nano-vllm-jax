@@ -30,9 +30,7 @@ class DrafterConfig:
         except TypeError as exc:
             raise TypeError("draft width must be an integer") from exc
         if not 1 <= width <= MAX_DRAFT_WIDTH:
-            raise ValueError(
-                f"draft width must be between 1 and {MAX_DRAFT_WIDTH}"
-            )
+            raise ValueError(f"draft width must be between 1 and {MAX_DRAFT_WIDTH}")
         object.__setattr__(self, "width", width)
 
     @classmethod

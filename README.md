@@ -14,8 +14,21 @@ metadata, and queue-driven continuous batching.
 ## Start The Server
 
 ```bash
+uv run --frozen --python 3.11 \
+  --extra cuda13 --extra flashinfer-ffi --extra gdn-fla-triton \
+  python server.py
+```
+
+The lockfile and Python 3.11 are the reproducible environment contract.
+The current lock resolves JAX/JAXlib and the CUDA 13 plugin to 0.10.0,
+FlashInfer to 0.6.11.post3, JAX-Triton to 0.3.1, and JAX TVM FFI to 0.1.3.
+`uv.lock`, rather than these descriptive version notes, remains authoritative.
+
+An editable pip install remains convenient for development, but it does not
+pin the transitive CUDA stack:
+
+```bash
 pip install -e ".[cuda13,flashinfer-ffi,gdn-fla-triton]"
-python server.py
 ```
 
 [server.yaml](server.yaml) controls model id, serving capacity, bucket sizes,
@@ -35,6 +48,9 @@ branch.
 
 The offline `LLM.generate(..., use_tqdm=True)` progress bar uses the optional
 `progress` extra. Serving does not require it.
+`SamplingParams` defaults to greedy decoding (`temperature=0`), matching HTTP;
+explicit token-id prompts are checked against the checkpoint vocabulary before
+the request enters the scheduler.
 
 ## Run The Benchmark
 
@@ -47,11 +63,13 @@ observation, not a pass threshold for new runs.
 
 | Framework | Base decode tok/s | MTP decode tok/s | MTP/base |
 | --- | ---: | ---: | ---: |
-| Nano-VLLM-JAX | 53.95 | 83.94 | 1.556x |
-| vLLM 0.25.1 | 50.32 | 86.82 | 1.725x |
+| Nano-VLLM-JAX | 53.99 | 82.72 | 1.532x |
+| vLLM 0.25.1 | 50.34 | 86.60 | 1.720x |
 
-All four routes produced the same tokens. JAX MTP is 1.668x vLLM without MTP
-and 0.967x vLLM with MTP on this fixed workload.
+JAX MTP is 1.643x vLLM without MTP and 0.955x vLLM with MTP on this fixed
+workload. The four routes resolve one BF16 near-tie in either direction; the
+two exact output hashes and full-vocabulary KL/JS evidence are content-addressed
+by the benchmark contract. Any other output still fails validation.
 
 ```bash
 ./scripts/run_benchmark.sh both
@@ -86,7 +104,14 @@ text, token ids, and finish reason.
 
 HTTP handlers submit work to `EngineService`. A single worker admits queued
 requests, calls `LLMEngine.step()`, and publishes per-request results so
-independent clients can batch together.
+independent clients can batch together. The service owns engine stepping until
+`stop()` returns. Offline `generate()` owns an otherwise idle engine for one
+call; `add_request()` plus `step()` is the explicit manual lifecycle. A service
+lease rejects manual mutation, and unfinished manual work prevents lease
+acquisition.
+
+The bundled Flask server is intentionally a local pedagogical transport, not a
+production WSGI deployment recipe.
 
 ## Runtime Path
 
@@ -155,7 +180,19 @@ diagnostics stay under `/mountpoint/.exp`.
 [docs/style.md](docs/style.md) defines the repository's lightweight complexity
 budget and review checks.
 
-Ownership and configuration contract checks:
+The local control-plane check does not require a GPU and does not create a CI
+workflow:
+
+```bash
+./scripts/check.sh
+```
+
+The check creates or refreshes `.venv` from the frozen lock, then runs the
+CPU-safe ownership, admission, configuration, server, route, commit, and
+benchmark-contract suites under the 70% RAM guard. The benchmark execution
+remains a separate explicit command.
+
+GPU correctness matrix:
 
 ```bash
 JAX_PLATFORMS=cuda PYTHONPATH=$PWD python tests/ram_guard.py -- pytest -q \
@@ -167,3 +204,5 @@ JAX_PLATFORMS=cuda PYTHONPATH=$PWD python tests/ram_guard.py -- pytest -q \
 
 For GPU correctness, verify CUDA visibility first and run JAX with
 `JAX_PLATFORMS=cuda`; do not hide missing GPU access with CPU fallback.
+
+The project is available under the [MIT License](LICENSE).

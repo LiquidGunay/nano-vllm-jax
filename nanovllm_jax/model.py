@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
 
 from nanovllm_jax.attention import full_attention_block
-from nanovllm_jax.cache import AttentionMetadata, HybridLayerState, KVCacheState, init_linear_attention_states
+from nanovllm_jax.cache import (
+    AttentionMetadata,
+    HybridLayerState,
+    KVCacheState,
+    init_linear_attention_states,
+)
 from nanovllm_jax.config import ModelSpec
 from nanovllm_jax.gdn import gated_deltanet_block
 from nanovllm_jax.layers import causal_mask, get_activation, rms_norm
@@ -31,14 +36,13 @@ from nanovllm_jax.projection import (
     _tokenwise_decode_dot,
 )
 
+
 @dataclass
 class ModelParams:
     embed_tokens: jnp.ndarray
-    layers: List[Dict[str, jnp.ndarray]]
+    layers: list[dict[str, jnp.ndarray]]
     norm_weight: jnp.ndarray
     lm_head: Optional[jnp.ndarray] = None
-
-
 
 
 def _model_params_flatten(params: ModelParams):
@@ -61,17 +65,13 @@ def _model_params_flatten(params: ModelParams):
         params.norm_weight,
         params.lm_head if params.lm_head is not None else jnp.zeros((1,), dtype=jnp.float16),
     )
-    aux_data = (
-        len(params.layers),
-        layer_aux,
-        params.lm_head is not None,
-    )
+    aux_data = (layer_aux, params.lm_head is not None)
     return children, aux_data
 
 
 def _model_params_unflatten(aux_data, children):
     """Unflatten children and auxiliary data into ModelParams."""
-    num_layers, layer_aux, has_lm_head = aux_data
+    layer_aux, has_lm_head = aux_data
 
     # Reconstruct layers
     layers = []
@@ -96,35 +96,54 @@ def _model_params_unflatten(aux_data, children):
     )
 
 
-jax.tree_util.register_pytree_node(
-    ModelParams,
-    _model_params_flatten,
-    _model_params_unflatten
-)
+jax.tree_util.register_pytree_node(ModelParams, _model_params_flatten, _model_params_unflatten)
 
 
 def init_params(key: jax.Array, config: ModelSpec) -> ModelParams:
     keys = jax.random.split(key, config.num_hidden_layers + 3)
-    embed_tokens = jax.random.normal(keys[0], (config.vocab_size, config.hidden_size)) * (config.hidden_size ** -0.5)
-    layers = [init_transformer_block(keys[i + 1], config, i) for i in range(config.num_hidden_layers)]
+    embed_tokens = jax.random.normal(keys[0], (config.vocab_size, config.hidden_size)) * (
+        config.hidden_size**-0.5
+    )
+    layers = [
+        init_transformer_block(keys[i + 1], config, i) for i in range(config.num_hidden_layers)
+    ]
     norm_weight = jnp.ones(config.hidden_size)
-    lm_head = None if config.tie_word_embeddings else jax.random.normal(
-        keys[-2],
-        (config.vocab_size, config.hidden_size),
-    ) * (config.hidden_size ** -0.5)
-    return ModelParams(embed_tokens=embed_tokens, layers=layers, norm_weight=norm_weight, lm_head=lm_head)
+    lm_head = (
+        None
+        if config.tie_word_embeddings
+        else jax.random.normal(
+            keys[-2],
+            (config.vocab_size, config.hidden_size),
+        )
+        * (config.hidden_size**-0.5)
+    )
+    return ModelParams(
+        embed_tokens=embed_tokens, layers=layers, norm_weight=norm_weight, lm_head=lm_head
+    )
 
 
-def init_transformer_block(key: jax.Array, config: ModelSpec, layer_idx: int) -> Dict[str, jnp.ndarray]:
-    keys = jax.random.split(key, 10)
+def init_transformer_block(
+    key: jax.Array, config: ModelSpec, layer_idx: int
+) -> dict[str, jnp.ndarray]:
     if config.layer_types[layer_idx] == "full_attention":
+        q_key, k_key, v_key, out_key, gate_key, up_key, down_key = jax.random.split(key, 7)
         # Qwen3.5 full attention: q_proj outputs [query, gate] each of size num_attention_heads * head_dim
         attn_out_dim = config.num_attention_heads * config.head_dim
-        q_proj = jax.random.normal(keys[0], (config.hidden_size, attn_out_dim * 2)) * (config.hidden_size ** -0.5)
-        k_proj = jax.random.normal(keys[1], (config.hidden_size, config.num_key_value_heads * config.head_dim)) * (config.hidden_size ** -0.5)
-        v_proj = jax.random.normal(keys[2], (config.hidden_size, config.num_key_value_heads * config.head_dim)) * (config.hidden_size ** -0.5)
-        gate_proj = jax.random.normal(keys[5], (config.hidden_size, config.intermediate_size)) * (config.hidden_size ** -0.5)
-        up_proj = jax.random.normal(keys[6], (config.hidden_size, config.intermediate_size)) * (config.hidden_size ** -0.5)
+        q_proj = jax.random.normal(q_key, (config.hidden_size, attn_out_dim * 2)) * (
+            config.hidden_size**-0.5
+        )
+        k_proj = jax.random.normal(
+            k_key, (config.hidden_size, config.num_key_value_heads * config.head_dim)
+        ) * (config.hidden_size**-0.5)
+        v_proj = jax.random.normal(
+            v_key, (config.hidden_size, config.num_key_value_heads * config.head_dim)
+        ) * (config.hidden_size**-0.5)
+        gate_proj = jax.random.normal(gate_key, (config.hidden_size, config.intermediate_size)) * (
+            config.hidden_size**-0.5
+        )
+        up_proj = jax.random.normal(up_key, (config.hidden_size, config.intermediate_size)) * (
+            config.hidden_size**-0.5
+        )
         return {
             "q_proj": q_proj,
             "k_proj": k_proj,
@@ -133,24 +152,49 @@ def init_transformer_block(key: jax.Array, config: ModelSpec, layer_idx: int) ->
                 [q_proj, k_proj, v_proj],
                 axis=1,
             ),
-            "o_proj": jax.random.normal(keys[3], (attn_out_dim, config.hidden_size)) * (config.hidden_size ** -0.5),
+            "o_proj": jax.random.normal(out_key, (attn_out_dim, config.hidden_size))
+            * (config.hidden_size**-0.5),
             "q_norm": jnp.ones((config.num_attention_heads, config.head_dim)),
             "k_norm": jnp.ones((config.num_key_value_heads, config.head_dim)),
             "input_norm": jnp.ones(config.hidden_size),
             _MLP_GATE_UP_PACKED_KEY: jnp.concatenate([gate_proj, up_proj], axis=1),
-            "down_proj": jax.random.normal(keys[7], (config.intermediate_size, config.hidden_size)) * (config.hidden_size ** -0.5),
+            "down_proj": jax.random.normal(down_key, (config.intermediate_size, config.hidden_size))
+            * (config.hidden_size**-0.5),
             "ffn_norm": jnp.ones(config.hidden_size),
         }
     else:
+        (
+            qkv_key,
+            z_key,
+            a_key,
+            b_key,
+            conv_key,
+            out_key,
+            gate_key,
+            up_key,
+            down_key,
+        ) = jax.random.split(key, 9)
         key_dim = config.linear_num_key_heads * config.linear_key_head_dim
         value_dim = config.linear_num_value_heads * config.linear_value_head_dim
         conv_dim = key_dim * 2 + value_dim
-        in_proj_qkv = jax.random.normal(keys[0], (config.hidden_size, conv_dim)) * (config.hidden_size ** -0.5)
-        in_proj_z = jax.random.normal(keys[1], (config.hidden_size, value_dim)) * (config.hidden_size ** -0.5)
-        in_proj_a = jax.random.normal(keys[2], (config.hidden_size, config.linear_num_value_heads)) * (config.hidden_size ** -0.5)
-        in_proj_b = jax.random.normal(keys[3], (config.hidden_size, config.linear_num_value_heads)) * (config.hidden_size ** -0.5)
-        gate_proj = jax.random.normal(keys[5], (config.hidden_size, config.intermediate_size)) * (config.hidden_size ** -0.5)
-        up_proj = jax.random.normal(keys[6], (config.hidden_size, config.intermediate_size)) * (config.hidden_size ** -0.5)
+        in_proj_qkv = jax.random.normal(qkv_key, (config.hidden_size, conv_dim)) * (
+            config.hidden_size**-0.5
+        )
+        in_proj_z = jax.random.normal(z_key, (config.hidden_size, value_dim)) * (
+            config.hidden_size**-0.5
+        )
+        in_proj_a = jax.random.normal(
+            a_key, (config.hidden_size, config.linear_num_value_heads)
+        ) * (config.hidden_size**-0.5)
+        in_proj_b = jax.random.normal(
+            b_key, (config.hidden_size, config.linear_num_value_heads)
+        ) * (config.hidden_size**-0.5)
+        gate_proj = jax.random.normal(gate_key, (config.hidden_size, config.intermediate_size)) * (
+            config.hidden_size**-0.5
+        )
+        up_proj = jax.random.normal(up_key, (config.hidden_size, config.intermediate_size)) * (
+            config.hidden_size**-0.5
+        )
         return {
             "input_norm": jnp.ones(config.hidden_size),
             "in_proj_qkv": in_proj_qkv,
@@ -161,17 +205,18 @@ def init_transformer_block(key: jax.Array, config: ModelSpec, layer_idx: int) ->
                 [in_proj_qkv, in_proj_a, in_proj_b, in_proj_z],
                 axis=1,
             ),
-            "conv1d_weight": jax.random.normal(keys[4], (conv_dim, config.linear_conv_kernel_size)) * 0.02,
+            "conv1d_weight": jax.random.normal(conv_key, (conv_dim, config.linear_conv_kernel_size))
+            * 0.02,
             "dt_bias": jnp.ones(config.linear_num_value_heads),
             "A": jnp.exp(jnp.full(config.linear_num_value_heads, 0.0)),
             "norm_weight": jnp.ones(config.linear_value_head_dim),
-            "out_proj": jax.random.normal(keys[6], (value_dim, config.hidden_size)) * (config.hidden_size ** -0.5),
+            "out_proj": jax.random.normal(out_key, (value_dim, config.hidden_size))
+            * (config.hidden_size**-0.5),
             _MLP_GATE_UP_PACKED_KEY: jnp.concatenate([gate_proj, up_proj], axis=1),
-            "down_proj": jax.random.normal(keys[7], (config.intermediate_size, config.hidden_size)) * (config.hidden_size ** -0.5),
+            "down_proj": jax.random.normal(down_key, (config.intermediate_size, config.hidden_size))
+            * (config.hidden_size**-0.5),
             "ffn_norm": jnp.ones(config.hidden_size),
         }
-
-
 
 
 def transformer_block(
@@ -207,13 +252,14 @@ def transformer_block(
     valid_token_mask = None
     if attention_metadata is not None:
         if attention_metadata.token_row_ids is not None:
-            valid_token_mask = (
-                jnp.arange(x.shape[1], dtype=jnp.int32)[None, :]
-                < attention_metadata.query_start_loc[-1].astype(jnp.int32)
-            )
+            valid_token_mask = jnp.arange(x.shape[1], dtype=jnp.int32)[
+                None, :
+            ] < attention_metadata.query_start_loc[-1].astype(jnp.int32)
         else:
             query_lens = jnp.diff(attention_metadata.query_start_loc).astype(jnp.int32)
-            valid_token_mask = jnp.arange(x.shape[1], dtype=jnp.int32)[None, :] < query_lens[:, None]
+            valid_token_mask = (
+                jnp.arange(x.shape[1], dtype=jnp.int32)[None, :] < query_lens[:, None]
+            )
     compact_prefill_tokens = (
         int(attention_metadata.num_prefill_tokens)
         if (
@@ -260,7 +306,9 @@ def transformer_block(
             ),
             packed_query_start_loc=(
                 attention_metadata.query_start_loc
-                if is_prefill and attention_metadata is not None and attention_metadata.token_row_ids is not None
+                if is_prefill
+                and attention_metadata is not None
+                and attention_metadata.token_row_ids is not None
                 else None
             ),
         )
@@ -269,21 +317,20 @@ def transformer_block(
                 x, hybrid_state, prefix_layer_state = result
                 if prefix_hybrid_state is not None and prefix_layer_state is not None:
                     linear_layer_idx = sum(
-                        linear_layer < layer_idx
-                        for linear_layer in config.model.linear_attn_layers
+                        linear_layer < layer_idx for linear_layer in config.model.linear_attn_layers
                     )
                     if return_prefix_hybrid:
                         prefix_hybrid_state = replace(
                             prefix_hybrid_state,
-                            conv_state=prefix_hybrid_state.conv_state.at[:, :, linear_layer_idx].set(
-                                prefix_layer_state.conv_state
-                            )
+                            conv_state=prefix_hybrid_state.conv_state.at[
+                                :, :, linear_layer_idx
+                            ].set(prefix_layer_state.conv_state)
                             if prefix_hybrid_state.conv_state is not None
                             and prefix_layer_state.conv_state is not None
                             else prefix_hybrid_state.conv_state,
-                            recurrent_state=prefix_hybrid_state.recurrent_state.at[:, :, linear_layer_idx].set(
-                                prefix_layer_state.recurrent_state
-                            )
+                            recurrent_state=prefix_hybrid_state.recurrent_state.at[
+                                :, :, linear_layer_idx
+                            ].set(prefix_layer_state.recurrent_state)
                             if prefix_hybrid_state.recurrent_state is not None
                             and prefix_layer_state.recurrent_state is not None
                             else prefix_hybrid_state.recurrent_state,
@@ -297,9 +344,9 @@ def transformer_block(
                             if prefix_hybrid_state.conv_state is not None
                             and prefix_layer_state.conv_state is not None
                             else prefix_hybrid_state.conv_state,
-                            recurrent_state=prefix_hybrid_state.recurrent_state.at[:, linear_layer_idx].set(
-                                prefix_layer_state.recurrent_state
-                            )
+                            recurrent_state=prefix_hybrid_state.recurrent_state.at[
+                                :, linear_layer_idx
+                            ].set(prefix_layer_state.recurrent_state)
                             if prefix_hybrid_state.recurrent_state is not None
                             and prefix_layer_state.recurrent_state is not None
                             else prefix_hybrid_state.recurrent_state,
@@ -341,7 +388,9 @@ def transformer_block(
         )
 
     # MLP computation (stays in bfloat16)
-    force_width1_dot = (not is_prefill) and x.ndim == 3 and x.shape[1] > 1 and _force_width1_decode_math()
+    force_width1_dot = (
+        (not is_prefill) and x.ndim == 3 and x.shape[1] > 1 and _force_width1_decode_math()
+    )
     activation_fn = get_activation(config.model.hidden_act)
     if is_prefill:
         if _MLP_GATE_UP_PACKED_KEY in params:
@@ -372,11 +421,12 @@ def transformer_block(
         else:
             x_proj = x.astype(_decode_projection_activation_dtype(x.shape[0], config.kernels))
         if fused_mlp_gate_up is None and _MLP_GATE_UP_PACKED_KEY in params:
-            if (
-                _decode_padded_gemm_gate_up_enabled(config.kernels)
-                and _can_use_decode_padded_gemm(x_proj, params[_MLP_GATE_UP_PACKED_KEY], config.kernels)
+            if _decode_padded_gemm_gate_up_enabled(config.kernels) and _can_use_decode_padded_gemm(
+                x_proj, params[_MLP_GATE_UP_PACKED_KEY], config.kernels
             ):
-                gate_up = _decode_padded_gemm_dot(x_proj, params[_MLP_GATE_UP_PACKED_KEY], config.kernels)
+                gate_up = _decode_padded_gemm_dot(
+                    x_proj, params[_MLP_GATE_UP_PACKED_KEY], config.kernels
+                )
             else:
                 gate_up = _tokenwise_decode_dot(
                     x_proj,
@@ -393,7 +443,9 @@ def transformer_block(
                 gate = _decode_padded_gemm_dot(x_proj, params["gate_proj"], config.kernels)
                 up = _decode_padded_gemm_dot(x_proj, params["up_proj"], config.kernels)
             else:
-                gate = _tokenwise_decode_dot(x_proj, params["gate_proj"], force_width1=force_width1_dot)
+                gate = _tokenwise_decode_dot(
+                    x_proj, params["gate_proj"], force_width1=force_width1_dot
+                )
                 up = _tokenwise_decode_dot(x_proj, params["up_proj"], force_width1=force_width1_dot)
         x = activation_fn(gate) * up
         if _can_use_decode_padded_gemm(x, params["down_proj"], config.kernels):
@@ -444,8 +496,7 @@ def forward_step(
     if return_prefix_hybrid and hybrid_state is not None:
         packed_token_rows = (
             attention_metadata.token_row_ids
-            if attention_metadata is not None
-            and attention_metadata.token_row_ids is not None
+            if attention_metadata is not None and attention_metadata.token_row_ids is not None
             else None
         )
         if packed_token_rows is not None:
@@ -468,8 +519,7 @@ def forward_step(
                 else None,
                 recurrent_state=jnp.broadcast_to(
                     hybrid_state.recurrent_state[:, None, ...],
-                    (row_count, row_query_len)
-                    + hybrid_state.recurrent_state.shape[1:],
+                    (row_count, row_query_len) + hybrid_state.recurrent_state.shape[1:],
                 )
                 if hybrid_state.recurrent_state is not None
                 else None,
@@ -507,12 +557,10 @@ def forward_step(
     )
     if use_layerwise_hybrid:
         hybrid_conv_layers = [
-            hybrid_state.conv_state[:, linear_idx]
-            for linear_idx in range(num_linear_layers)
+            hybrid_state.conv_state[:, linear_idx] for linear_idx in range(num_linear_layers)
         ]
         hybrid_recurrent_layers = [
-            hybrid_state.recurrent_state[:, linear_idx]
-            for linear_idx in range(num_linear_layers)
+            hybrid_state.recurrent_state[:, linear_idx] for linear_idx in range(num_linear_layers)
         ]
         linear_layer_cursor = 0
 
@@ -545,7 +593,9 @@ def forward_step(
         x, kv_cache_state, block_updated_hybrid_state = block_result[:3]
         if block_hybrid_state_is_layer:
             hybrid_conv_layers[linear_layer_cursor] = block_updated_hybrid_state.conv_state
-            hybrid_recurrent_layers[linear_layer_cursor] = block_updated_hybrid_state.recurrent_state
+            hybrid_recurrent_layers[linear_layer_cursor] = (
+                block_updated_hybrid_state.recurrent_state
+            )
             linear_layer_cursor += 1
         else:
             hybrid_state = block_updated_hybrid_state

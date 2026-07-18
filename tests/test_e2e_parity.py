@@ -14,6 +14,7 @@ Success Criteria:
 
 import sys
 import os
+
 # Ensure we import from the correct location
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -23,13 +24,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 torch = pytest.importorskip("torch")
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from typing import List, Optional
+from typing import Optional
 from tests.runtime_specs import runtime_spec
 from nanovllm_jax.weights import load_weights_from_hf_streaming
 from nanovllm_jax.model import forward
- 
+
 jax.config.update("jax_default_matmul_precision", "highest")
 
 MODEL_NAME = os.getenv("HF_PARITY_MODEL", "Qwen/Qwen3.5-0.8B")
@@ -54,7 +56,7 @@ def load_models(model_name: str = MODEL_NAME):
     """Load both HF and JAX models."""
     hf_device = resolve_hf_device()
     print(f"\nLoading models from {model_name}...")
-    
+
     # Load HF model
     print("  Loading HF model...")
     try:
@@ -81,14 +83,12 @@ def load_models(model_name: str = MODEL_NAME):
     except OSError as exc:
         pytest.skip(f"Could not load local HF artifacts for {model_name}: {exc}")
     hf_model.eval()
-    
+
     # Load JAX model with HF weights
     print("  Loading JAX model...")
     config = runtime_spec()
-    params = load_weights_from_hf_streaming(
-        model_name, config.model, "bfloat16"
-    )
-    
+    params = load_weights_from_hf_streaming(model_name, config.model, "bfloat16")
+
     print("  ✓ Models loaded")
     return hf_model, tokenizer, config, params, hf_device
 
@@ -99,7 +99,7 @@ def e2e_models():
     return load_models()
 
 
-def _default_prompts() -> List[str]:
+def _default_prompts() -> list[str]:
     return [
         "The future of artificial intelligence is poised to revolutionize",
         "In the beginning, there was nothing but an infinite void of darkness",
@@ -116,7 +116,7 @@ def _default_prompts() -> List[str]:
 
 def test_logits_parity(
     e2e_models,
-    prompts: Optional[List[str]] = None,
+    prompts: Optional[list[str]] = None,
 ):
     """Test that top 5 logits match exactly between HF and JAX."""
     hf_model, tokenizer, config, params, hf_device = e2e_models
@@ -127,30 +127,30 @@ def test_logits_parity(
 
     total_mse = 0.0
     num_tests = 0
-    
+
     for i, prompt in enumerate(prompts):
         print(
-            f"\n[Prompt {i+1}/{len(prompts)}] \"{prompt[:50]}...\""
+            f'\n[Prompt {i + 1}/{len(prompts)}] "{prompt[:50]}..."'
             if len(prompt) > 50
-            else f"\n[Prompt {i+1}/{len(prompts)}] \"{prompt}\""
+            else f'\n[Prompt {i + 1}/{len(prompts)}] "{prompt}"'
         )
-        
+
         # Tokenize
         inputs = tokenizer(prompt, return_tensors="pt").to(hf_device)
         input_ids = inputs["input_ids"]
-        
+
         if input_ids.shape[1] < 10:
             print(f"  ⚠ Skipping: sequence length {input_ids.shape[1]} < 10")
             continue
-        
+
         # HF forward
         with torch.no_grad():
             hf_outputs = hf_model(input_ids)
             hf_logits = hf_outputs.logits[0, -1, :].float().cpu().numpy()  # Last token logits
-        
+
         # JAX forward (prefill mode) - no KV cache for simple test
         input_ids_jax = jnp.array(input_ids.cpu().numpy())
-        
+
         # Forward pass (no KV cache for simple logits test)
         logits_jax, _ = forward(
             input_ids_jax,
@@ -160,17 +160,17 @@ def test_logits_parity(
             is_prefill=True,
         )
         jax_logits = np.array(logits_jax[0, -1, :])  # Last token logits
-        
+
         # Compare logits
         mse = np.mean((hf_logits - jax_logits) ** 2)
         total_mse += mse
-        
+
         # Get top 5 tokens
         hf_top5 = np.argsort(hf_logits)[-5:][::-1].copy()
         jax_top5 = np.argsort(jax_logits)[-5:][::-1].copy()
-        
+
         top5_match = np.array_equal(hf_top5, jax_top5)
-        
+
         print(f"  HF top 5 tokens: {hf_top5}")
         print(f"  JAX top 5 tokens: {jax_top5}")
         print(f"  MSE: {mse:.2e}")
@@ -179,18 +179,18 @@ def test_logits_parity(
         assert top5_match, f"Top 5 tokens do not match for prompt {i}"
         assert mse < 1e-8, f"MSE {mse:.2e} >= 1e-8 for prompt {i}"
         num_tests += 1
-    
+
     avg_mse = total_mse / num_tests if num_tests > 0 else 0.0
-    
+
     print("\n" + "-" * 80)
     print(f"Average MSE: {avg_mse:.2e}")
-    print(f"Target: MSE < 1e-4")
+    print("Target: MSE < 1e-4")
     assert num_tests > 0
 
 
 def test_generation_parity(
     e2e_models,
-    prompts: Optional[List[str]] = None,
+    prompts: Optional[list[str]] = None,
     max_new_tokens: int = 10,
 ):
     """Test that generated tokens match between HF and JAX."""
@@ -200,16 +200,13 @@ def test_generation_parity(
     print("TESTING GENERATION PARITY")
     print("=" * 80)
 
-    encoded_prompts = [
-        tokenizer(prompt, return_tensors="pt").to(hf_device)
-        for prompt in prompts
-    ]
-    fixed_length = max(int(inputs["input_ids"].shape[1]) for inputs in encoded_prompts) + max_new_tokens
+    encoded_prompts = [tokenizer(prompt, return_tensors="pt").to(hf_device) for prompt in prompts]
+    fixed_length = (
+        max(int(inputs["input_ids"].shape[1]) for inputs in encoded_prompts) + max_new_tokens
+    )
 
-    for i, (prompt, inputs) in enumerate(zip(prompts, encoded_prompts)):
-        print(f"\n[Prompt {i+1}/{len(prompts)}] \"{prompt[:50]}...\"" if len(prompt) > 50 else f"\n[Prompt {i+1}/{len(prompts)}] \"{prompt}\"")
-        
-        # HF generation
+    hf_generations = []
+    for inputs in encoded_prompts:
         with torch.no_grad():
             hf_output_ids = hf_model.generate(
                 inputs["input_ids"],
@@ -217,33 +214,45 @@ def test_generation_parity(
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        hf_generated = tokenizer.decode(hf_output_ids[0], skip_special_tokens=True)
-        
-        # Keep one JAX shape for every decode step. Future padding is causally
-        # invisible at the current position, so this is identical to growing
-        # the sequence while avoiding a compile per length.
-        generated_ids = list(inputs["input_ids"][0].cpu().numpy())
-        padded_ids = generated_ids + [tokenizer.eos_token_id] * (fixed_length - len(generated_ids))
-        for _ in range(max_new_tokens):
-            current_position = len(generated_ids) - 1
-            logits, _ = forward(
-                jnp.array([padded_ids]),
-                params,
-                config,
-                kv_cache_state=None,
-                is_prefill=True,
-                last_logits_only=True,
-                logit_positions=jnp.array([current_position], dtype=jnp.int32),
-            )
-            next_token = int(jnp.argmax(logits[0, 0, :]))
-            generated_ids.append(next_token)
-            padded_ids[current_position + 1] = next_token
-        
-        jax_generated = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        
+        hf_generations.append(tokenizer.decode(hf_output_ids[0], skip_special_tokens=True))
+
+    # Keep one serving-shaped JAX batch and one static shape for every decode
+    # step. Future padding is causally invisible at each row's current position.
+    generated_ids = [list(inputs["input_ids"][0].cpu().numpy()) for inputs in encoded_prompts]
+    padded_ids = [
+        row + [tokenizer.eos_token_id] * (fixed_length - len(row)) for row in generated_ids
+    ]
+    for _ in range(max_new_tokens):
+        current_positions = np.array([len(row) - 1 for row in generated_ids], dtype=np.int32)
+        logits, _ = forward(
+            jnp.array(padded_ids),
+            params,
+            config,
+            kv_cache_state=None,
+            is_prefill=True,
+            last_logits_only=True,
+            logit_positions=jnp.array(current_positions),
+        )
+        next_tokens = np.asarray(jnp.argmax(logits[:, 0, :], axis=-1))
+        for row, padded, position, token in zip(
+            generated_ids, padded_ids, current_positions, next_tokens
+        ):
+            row.append(int(token))
+            padded[int(position) + 1] = int(token)
+
+    for i, (prompt, hf_generated, token_ids) in enumerate(
+        zip(prompts, hf_generations, generated_ids)
+    ):
+        print(
+            f'\n[Prompt {i + 1}/{len(prompts)}] "{prompt[:50]}..."'
+            if len(prompt) > 50
+            else f'\n[Prompt {i + 1}/{len(prompts)}] "{prompt}"'
+        )
+        jax_generated = tokenizer.decode(token_ids, skip_special_tokens=True)
+
         # Compare
         match = hf_generated == jax_generated
-        print(f"  HF:  \"{hf_generated}\"")
-        print(f"  JAX: \"{jax_generated}\"")
+        print(f'  HF:  "{hf_generated}"')
+        print(f'  JAX: "{jax_generated}"')
         print(f"  Match: {'✓' if match else '✗'}")
         assert match
